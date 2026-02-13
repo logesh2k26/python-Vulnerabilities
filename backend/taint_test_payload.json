@@ -1,0 +1,4 @@
+{
+    "content": "import os\n\ndef test():\n    user_input = input('cmd')\n    intermediate = user_input\n    os.system(intermediate)",
+    "filename": "taint_test.py"
+}

@@ -1,0 +1,4 @@
+{
+    "content": "import subprocess\ndef safe_command(user_input):\n    subprocess.run(['echo', user_input], shell=False)",
+    "filename": "safe_test.py"
+}
