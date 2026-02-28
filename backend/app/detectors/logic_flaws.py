@@ -107,10 +107,12 @@ class LogicFlawDetector(BaseDetector):
                 metadata={"function": f"{module}.{func_name}"}
             ))
         return results
-    
     def _has_string_formatting(self, call_node: ASTNode, nodes: List[ASTNode]) -> bool:
+        start_line = call_node.lineno
+        end_line = call_node.end_lineno or start_line
+        
         for node in nodes:
-            if node.lineno != call_node.lineno:
+            if not (start_line <= node.lineno <= end_line):
                 continue
             if node.node_type in ("JoinedStr", "FormattedValue"):
                 return True

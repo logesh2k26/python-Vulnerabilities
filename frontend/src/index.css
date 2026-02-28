@@ -514,3 +514,59 @@ body::after {
     min-height: 400px;
   }
 }
+
+/* Click-to-Line Flash Highlight */
+.highlight-flash {
+  background: rgba(0, 212, 255, 0.25) !important;
+  border-left: 3px solid #00d4ff !important;
+  animation: flash-fade 1.5s ease-out forwards;
+}
+
+@keyframes flash-fade {
+  0% {
+    background: rgba(0, 212, 255, 0.35);
+  }
+
+  50% {
+    background: rgba(0, 212, 255, 0.2);
+  }
+
+  100% {
+    background: transparent;
+  }
+}
+
+/* Clickable Line Badges */
+.clickable-line {
+  cursor: pointer;
+  transition: all 0.2s ease;
+  user-select: none;
+}
+
+.clickable-line:hover {
+  background: rgba(0, 113, 227, 0.2) !important;
+  color: var(--accent-blue) !important;
+  transform: scale(1.05);
+  box-shadow: 0 0 8px rgba(0, 113, 227, 0.3);
+}
+
+/* Vulnerability Card Click */
+.vuln-card[style*="cursor: pointer"]:hover {
+  border-color: var(--accent-blue);
+}
+
+/* Monaco Highlight Classes */
+.highlight-critical {
+  background: rgba(255, 59, 48, 0.15) !important;
+  border-left: 3px solid var(--accent-red) !important;
+}
+
+.highlight-high {
+  background: rgba(255, 149, 0, 0.12) !important;
+  border-left: 3px solid var(--accent-orange) !important;
+}
+
+.highlight-medium {
+  background: rgba(0, 113, 227, 0.1) !important;
+  border-left: 3px solid var(--accent-blue) !important;
+}

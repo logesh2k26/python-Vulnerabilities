@@ -1,6 +1,6 @@
 import TraceVisualizer from './TraceVisualizer'
 
-function ResultsPanel({ result, isLoading }) {
+function ResultsPanel({ result, isLoading, onLineClick }) {
     if (isLoading) {
         return (
             <div className="results-panel">
@@ -86,7 +86,7 @@ function ResultsPanel({ result, isLoading }) {
                     </h3>
                     <div className="vulnerabilities-list">
                         {vulnerabilities.map((vuln, idx) => (
-                            <VulnerabilityCard key={idx} vulnerability={vuln} />
+                            <VulnerabilityCard key={idx} vulnerability={vuln} onLineClick={onLineClick} />
                         ))}
                     </div>
                 </div>
@@ -105,14 +105,25 @@ const TYPE_LABELS = {
     ssrf: 'SSRF Attack'
 }
 
-function VulnerabilityCard({ vulnerability }) {
+function VulnerabilityCard({ vulnerability, onLineClick }) {
     const {
         type, confidence, severity, description, remediation,
         affected_lines, status, mitigations, taint_path, metadata
     } = vulnerability
 
+    const handleCardClick = () => {
+        if (onLineClick && affected_lines?.length > 0) {
+            onLineClick(affected_lines[0])
+        }
+    }
+
     return (
-        <div className={`glass-card vuln-card ${severity}`}>
+        <div
+            className={`glass-card vuln-card ${severity}`}
+            onClick={handleCardClick}
+            style={{ cursor: affected_lines?.length > 0 ? 'pointer' : 'default' }}
+            title={affected_lines?.length > 0 ? `Click to jump to line ${affected_lines[0]}` : ''}
+        >
             <div className="vuln-header">
                 <div className="vuln-type">
                     <span className={`severity-badge ${severity}`}>{severity}</span>
@@ -139,7 +150,17 @@ function VulnerabilityCard({ vulnerability }) {
             {affected_lines?.length > 0 && (
                 <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 12 }}>
                     {affected_lines.map(line => (
-                        <span key={line} className="vuln-line">📍 Line {line}</span>
+                        <span
+                            key={line}
+                            className="vuln-line clickable-line"
+                            onClick={(e) => {
+                                e.stopPropagation()
+                                onLineClick?.(line)
+                            }}
+                            title={`Jump to line ${line}`}
+                        >
+                            📍 Line {line}
+                        </span>
                     ))}
                 </div>
             )}

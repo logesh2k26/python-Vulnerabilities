@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react'
+import { useState, useRef, useCallback } from 'react'
 import CodeEditor from './CodeEditor'
 import ResultsPanel from './ResultsPanel'
 import FileUpload from './FileUpload'
@@ -55,12 +55,25 @@ def sanitized_command(user_input):
 function Dashboard({ analysisResult, isLoading, error, onAnalyze, onUpload }) {
     const [code, setCode] = useState(SAMPLE_CODE)
     const [showUpload, setShowUpload] = useState(false)
+    const [targetLine, setTargetLine] = useState(null)
+    const editorRef = useRef(null)
 
     const handleAnalyze = () => {
         if (code.trim()) {
             onAnalyze(code)
         }
     }
+
+    const handleLineClick = useCallback((lineNumber) => {
+        // Use ref method for immediate scroll
+        if (editorRef.current) {
+            editorRef.current.scrollToLine(lineNumber)
+        }
+        // Also update targetLine state as fallback
+        setTargetLine(lineNumber)
+        // Reset after a tick so clicking the same line again works
+        setTimeout(() => setTargetLine(null), 100)
+    }, [])
 
     return (
         <main className="main-grid">
@@ -103,14 +116,16 @@ function Dashboard({ analysisResult, isLoading, error, onAnalyze, onUpload }) {
 
                 <div className="code-editor-container">
                     <CodeEditor
+                        ref={editorRef}
                         value={code}
                         onChange={setCode}
                         highlights={analysisResult?.highlighted_lines || []}
+                        targetLine={targetLine}
                     />
                 </div>
             </div>
 
-            <ResultsPanel result={analysisResult} isLoading={isLoading} />
+            <ResultsPanel result={analysisResult} isLoading={isLoading} onLineClick={handleLineClick} />
         </main>
     )
 }

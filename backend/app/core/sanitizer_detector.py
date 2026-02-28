@@ -180,26 +180,29 @@ class SanitizerDetector:
             if func_name not in ("execute", "executemany"):
                 continue
             
-            # Check if line contains parameterized query patterns
-            if node.lineno <= len(lines):
-                line = lines[node.lineno - 1]
+            # Check if line(s) contain parameterized query patterns
+            start_idx = node.lineno - 1
+            end_idx = (node.end_lineno or node.lineno) - 1
+            
+            call_text = ""
+            for i in range(start_idx, min(len(lines), end_idx + 1)):
+                call_text += lines[i].lower()
                 
-                # Check for placeholders
-                if "?" in line or "%s" in line or ":param" in line.lower():
-                    # Also need to verify there's a second argument
-                    num_args = node.attributes.get("num_args", 0)
-                    if num_args >= 2:
-                        match = SanitizerMatch(
-                            sanitizer_type=SanitizerType.PARAMETERIZED_QUERY,
-                            line=node.lineno,
-                            node_id=node.node_id,
-                            variable=None,
-                            description="SQL query uses parameterized placeholders",
-                            effectiveness=0.95,
-                            mitigates=["sql_injection"]
-                        )
-                        self.sanitizers.append(match)
-    
+            # Check for placeholders in the call text
+            if "?" in call_text or "%s" in call_text or ":param" in call_text:
+                # Also need to verify there's a second argument
+                num_args = node.attributes.get("num_args", 0)
+                if num_args >= 2:
+                    match = SanitizerMatch(
+                        sanitizer_type=SanitizerType.PARAMETERIZED_QUERY,
+                        line=node.lineno,
+                        node_id=node.node_id,
+                        variable=None,
+                        description="SQL query uses parameterized placeholders",
+                        effectiveness=0.95,
+                        mitigates=["sql_injection"]
+                    )
+                    self.sanitizers.append(match)
     def _detect_validation_patterns(self, nodes: List[ASTNode], lines: List[str]):
         """Detect input validation patterns in source code."""
         for i, line in enumerate(lines):

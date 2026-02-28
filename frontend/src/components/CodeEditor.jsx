@@ -1,7 +1,59 @@
 import Editor from '@monaco-editor/react'
-import { useMemo } from 'react'
+import { useMemo, useRef, useImperativeHandle, forwardRef, useEffect } from 'react'
 
-function CodeEditor({ value, onChange, highlights = [] }) {
+const CodeEditor = forwardRef(function CodeEditor({ value, onChange, highlights = [], targetLine }, ref) {
+    const editorRef = useRef(null)
+    const monacoRef = useRef(null)
+
+    useImperativeHandle(ref, () => ({
+        scrollToLine(lineNumber) {
+            if (editorRef.current) {
+                editorRef.current.revealLineInCenter(lineNumber)
+                editorRef.current.setPosition({ lineNumber, column: 1 })
+                editorRef.current.focus()
+
+                // Flash highlight on the target line
+                if (monacoRef.current) {
+                    const flashDecoration = editorRef.current.createDecorationsCollection([
+                        {
+                            range: new monacoRef.current.Range(lineNumber, 1, lineNumber, 1000),
+                            options: {
+                                isWholeLine: true,
+                                className: 'highlight-flash',
+                                minimap: { color: '#00d4ff', position: 1 }
+                            }
+                        }
+                    ])
+                    // Remove flash after animation
+                    setTimeout(() => flashDecoration.clear(), 1500)
+                }
+            }
+        }
+    }))
+
+    // React to targetLine changes from parent
+    useEffect(() => {
+        if (targetLine && editorRef.current) {
+            editorRef.current.revealLineInCenter(targetLine)
+            editorRef.current.setPosition({ lineNumber: targetLine, column: 1 })
+            editorRef.current.focus()
+
+            if (monacoRef.current) {
+                const flashDecoration = editorRef.current.createDecorationsCollection([
+                    {
+                        range: new monacoRef.current.Range(targetLine, 1, targetLine, 1000),
+                        options: {
+                            isWholeLine: true,
+                            className: 'highlight-flash',
+                            minimap: { color: '#00d4ff', position: 1 }
+                        }
+                    }
+                ])
+                setTimeout(() => flashDecoration.clear(), 1500)
+            }
+        }
+    }, [targetLine])
+
     const decorations = useMemo(() => {
         return highlights.map(h => ({
             range: {
@@ -21,6 +73,9 @@ function CodeEditor({ value, onChange, highlights = [] }) {
     }, [highlights])
 
     const handleEditorMount = (editor, monaco) => {
+        editorRef.current = editor
+        monacoRef.current = monaco
+
         monaco.editor.defineTheme('vuln-dark', {
             base: 'vs-dark',
             inherit: true,
@@ -74,6 +129,6 @@ function CodeEditor({ value, onChange, highlights = [] }) {
             }}
         />
     )
-}
+})
 
 export default CodeEditor

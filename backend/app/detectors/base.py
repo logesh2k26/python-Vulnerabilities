@@ -66,7 +66,12 @@ class BaseDetector(ABC):
         input_funcs = {'input', 'request', 'get', 'post', 'recv', 'read'}
         input_vars = {'request', 'data', 'params', 'query', 'user_input', 'args'}
         
+        # Simple proximity check: only look for inputs BEFORE the target call
+        # In a real engine, we'd use the DFG, but this heuristic reduces FP
         for node in nodes:
+            if node.lineno > target_node.lineno:
+                continue
+                
             if node.node_type == "Call":
                 func_name = node.attributes.get("func_name", "")
                 if func_name in input_funcs:
