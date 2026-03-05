@@ -42,7 +42,12 @@ class Settings(BaseSettings):
         "unsafe_deserialization",
         "hardcoded_secrets",
         "sql_injection",
-        "path_traversal"
+        "path_traversal",
+        "ssrf",
+        "insecure_cryptography",
+        "xxe",
+        "redos",
+        "xss"
     ]
     
     class Config:

@@ -35,3 +35,11 @@ yarn-error.log
 .DS_Store
 backend/training/dummy_data/
 backend/training/dummy_model.pt
+backend/data/
+backend/pretrained/
+*.txt
+!backend/requirements.txt
+!README.md
+!walkthrough.md
+!system_architecture.md
+

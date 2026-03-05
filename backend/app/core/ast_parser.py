@@ -179,6 +179,13 @@ class ASTParser:
                     attrs["module"] = node.func.value.id
             attrs["num_args"] = len(node.args)
             attrs["num_kwargs"] = len(node.keywords)
+            if len(node.args) > 0:
+                first_arg = node.args[0]
+                # Check for constant types (handles various Python versions)
+                is_const = isinstance(first_arg, (ast.Constant, ast.Str, ast.Bytes, ast.Num))
+                attrs["first_arg_is_constant"] = is_const
+                attrs["first_arg_type"] = type(first_arg).__name__
+
             
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             attrs["num_args"] = len(node.args.args)

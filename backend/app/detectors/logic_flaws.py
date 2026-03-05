@@ -14,6 +14,10 @@ class LogicFlawDetector(BaseDetector):
     PATH_FUNCTIONS = {"open", "read", "write", "join", "abspath"}
     REQUEST_FUNCTIONS = {"get", "post", "put", "delete", "request", "urlopen"}
     
+    SQL_KEYWORDS = {"SELECT", "INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER", "WHERE", "FROM"}
+    DB_OBJECT_NAMES = {"cursor", "db", "conn", "connection", "database", "query", "sql"}
+
+    
     def detect(self, nodes: List[ASTNode]) -> List[DetectionResult]:
         results = []
         results.extend(self._detect_sql_injection(nodes))
@@ -31,24 +35,57 @@ class LogicFlawDetector(BaseDetector):
             if func_name not in self.SQL_FUNCTIONS:
                 continue
             
+            # Heuristic 1: Check if the object name looks like a database object
+            # In our AST, module might contain the object name if it was obj.execute()
+            module = node.attributes.get("module", "").lower()
+            is_db_object = any(name in module for name in self.DB_OBJECT_NAMES)
+            
+            # Heuristic 2: Check for SQL keywords in the first argument if it's a constant
+            # This is hard without child traversal, so we'll check the source line segment
+            line_content = self.get_line_content(node.lineno)
+            is_sql_query = any(kw in line_content.upper() for kw in self.SQL_KEYWORDS)
+            
+            if not (is_db_object or is_sql_query):
+                continue
+
+            # Heuristic 3: If it has more than one argument, it's likely using parameters (safe)
+            # execute(query, params)
+            num_args = node.attributes.get("num_args", 0)
+            if num_args > 1:
+                continue
+
             # Check for string formatting in SQL
             has_format = self._has_string_formatting(node, nodes)
+            
+            # Heuristic 4: If it's a constant literal string (first_arg_is_constant) 
+            # and no formatting is detected, it's a fixed query and safe.
+            is_constant = node.attributes.get("first_arg_is_constant", False)
+            if is_constant and not has_format:
+                continue
+
             sources = self._find_data_sources(nodes, node)
             
             if has_format or sources:
+                # If it's not a constant and has formatting, it's very likely vulnerable
+                # If it's not a constant but no specific source is found, it's still suspicious
                 confidence = 0.9 if has_format and sources else 0.7
+                if not is_constant and has_format:
+                    confidence = 0.95
+                
                 results.append(DetectionResult(
                     vulnerability_type="sql_injection",
                     confidence=confidence,
                     affected_lines=[node.lineno],
                     affected_nodes=[node.node_id],
-                    description="SQL query constructed with string formatting",
+                    description="Potential SQL injection: Query constructed with dynamic formatting or untrusted source",
                     severity="critical",
-                    remediation="Use parameterized queries with placeholders",
+                    remediation="Use parameterized queries with placeholders instead of string formatting or dynamic concatenation",
                     code_snippet=self.get_code_snippet(node.lineno, node.end_lineno or node.lineno),
-                    metadata={"function": func_name, "has_formatting": has_format}
+                    metadata={"function": func_name, "has_formatting": has_format, "is_constant": is_constant}
                 ))
         return results
+
+
     
     def _detect_path_traversal(self, nodes: List[ASTNode]) -> List[DetectionResult]:
         results = []

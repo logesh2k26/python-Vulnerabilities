@@ -54,3 +54,34 @@ class HealthResponse(BaseModel):
     status: str
     device: str
     model_loaded: bool
+
+
+class CategoryInfo(BaseModel):
+    count: int
+    valid: int = 0
+    invalid: int = 0
+
+
+class DatasetStatus(BaseModel):
+    status: str  # OK, WARNINGS, ERROR
+    total_files: int
+    valid_files: int = 0
+    invalid_files: int = 0
+    duplicate_files: int = 0
+    categories: Dict[str, CategoryInfo] = Field(default_factory=dict)
+    issues: List[str] = Field(default_factory=list)
+
+
+class TrainingRequest(BaseModel):
+    epochs: int = Field(default=100, ge=1, le=1000)
+    learning_rate: float = Field(default=0.001, gt=0, lt=1)
+
+
+class TrainingResult(BaseModel):
+    status: str  # success, error
+    epochs_completed: int = 0
+    final_loss: float = 0.0
+    final_accuracy: float = 0.0
+    final_f1: float = 0.0
+    model_path: str = ""
+    message: str = ""

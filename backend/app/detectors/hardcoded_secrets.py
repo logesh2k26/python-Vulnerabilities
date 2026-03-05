@@ -26,9 +26,10 @@ class HardcodedSecretsDetector(BaseDetector):
     ]
     
     SECRET_VAR_NAMES = {
-        "password", "passwd", "pwd", "secret", "api_key", "apikey",
+        "password", "passwd", "pwd", "pass", "secret", "api_key", "apikey",
         "auth_token", "token", "private_key", "secret_key", "credentials"
     }
+
     
     def detect(self, nodes: List[ASTNode]) -> List[DetectionResult]:
         results = []
@@ -42,6 +43,11 @@ class HardcodedSecretsDetector(BaseDetector):
                 result = self._check_string_constant(node)
                 if result:
                     results.append(result)
+            elif node.node_type == "Compare":
+                result = self._check_comparison(node, nodes)
+                if result:
+                    results.append(result)
+
         
         return results
     
@@ -56,7 +62,7 @@ class HardcodedSecretsDetector(BaseDetector):
                 value_node = self._find_value_node(node, nodes)
                 
                 if value_node and isinstance(value_node.name, str):
-                    if len(value_node.name) > 4 and value_node.name not in ("None", "True", "False"):
+                    if len(value_node.name) >= 4 and value_node.name not in ("None", "True", "False"):
                         confidence = self._calculate_confidence(target_lower, value_node.name)
                         return DetectionResult(
                             vulnerability_type="hardcoded_secrets",
@@ -71,10 +77,48 @@ class HardcodedSecretsDetector(BaseDetector):
                         )
         return None
     
+    def _check_comparison(self, node: ASTNode, nodes: List[ASTNode]) -> DetectionResult:
+        # Check for password comparisons like: if user_pw == "secret":
+        # Usually shows up as a Compare node with Eq op
+        if "Eq" not in node.attributes.get("ops", []):
+            return None
+            
+        # Find children of the Compare node
+        children = [n for n in nodes if n.parent_id == node.node_id]
+        
+        has_secret_var = False
+        constant_val = None
+        
+        for child in children:
+            if child.node_type == "Name":
+                name_lower = child.name.lower() if child.name else ""
+                if any(kw in name_lower for kw in self.SECRET_VAR_NAMES):
+                    has_secret_var = True
+            elif child.node_type == "Constant" and isinstance(child.name, str):
+                constant_val = child.name
+        
+        if has_secret_var and constant_val:
+            # We found a comparison between a "password-like" variable and a hardcoded string
+            if len(constant_val) >= 4: # Lowered threshold
+                return DetectionResult(
+                    vulnerability_type="hardcoded_secrets",
+                    confidence=0.8,
+                    affected_lines=[node.lineno],
+                    affected_nodes=[node.node_id],
+                    description="Hardcoded secret used in comparison",
+                    severity="high",
+                    remediation="Compare against a hashed version or use a secure authentication mechanism",
+                    code_snippet=self.get_code_snippet(node.lineno, node.end_lineno or node.lineno),
+                    metadata={"constant_value": "***", "comparison": True}
+                )
+        return None
+
     def _check_string_constant(self, node: ASTNode) -> DetectionResult:
         value = node.name
-        if not isinstance(value, str) or len(value) < 8:
+        if not isinstance(value, str) or len(value) < 4:
             return None
+
+
         
         for pattern, secret_type in self.SECRET_PATTERNS:
             if re.search(pattern, value):
@@ -112,7 +156,7 @@ class HardcodedSecretsDetector(BaseDetector):
     
     def _calculate_confidence(self, var_name: str, value: str) -> float:
         confidence = 0.7
-        if any(kw in var_name for kw in ["password", "secret", "key"]):
+        if any(kw in var_name for kw in ["password", "pass", "secret", "key"]):
             confidence += 0.15
         if len(value) > 10:
             confidence += 0.05
@@ -133,7 +177,7 @@ class HardcodedSecretsDetector(BaseDetector):
         return entropy
     
     def _identify_secret_type(self, var_name: str) -> str:
-        if "password" in var_name or "passwd" in var_name or "pwd" in var_name:
+        if any(kw in var_name for kw in ["password", "passwd", "pwd", "pass"]):
             return "password"
         if "api" in var_name and "key" in var_name:
             return "api_key"
@@ -142,3 +186,4 @@ class HardcodedSecretsDetector(BaseDetector):
         if "secret" in var_name:
             return "secret"
         return "credential"
+

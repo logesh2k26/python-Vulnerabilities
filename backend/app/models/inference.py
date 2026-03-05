@@ -13,7 +13,8 @@ from app.core.severity_adjuster import SeverityAdjuster, AdjustedResult, VulnSta
 from app.models.gnn_model import VulnerabilityGNN
 from app.detectors import (
     EvalExecDetector, CommandInjectionDetector,
-    DeserializationDetector, HardcodedSecretsDetector, LogicFlawDetector
+    DeserializationDetector, HardcodedSecretsDetector, LogicFlawDetector,
+    InsecureCryptographyDetector, XXEDetector, ReDoSDetector, XSSDetector
 )
 from app.detectors.base import DetectionResult
 
@@ -50,7 +51,11 @@ class VulnerabilityInference:
             CommandInjectionDetector(),
             DeserializationDetector(),
             HardcodedSecretsDetector(),
-            LogicFlawDetector()
+            LogicFlawDetector(),
+            InsecureCryptographyDetector(),
+            XXEDetector(),
+            ReDoSDetector(),
+            XSSDetector()
         ]
     
     def _load_pretrained(self):
@@ -138,10 +143,16 @@ class VulnerabilityInference:
             probs, attention = self.model(x, edge_index, return_attention=True)
             probs = probs.squeeze().cpu().numpy()
         
-        return {
-            vuln_type: float(probs[i])
-            for i, vuln_type in enumerate(settings.VULNERABILITY_TYPES)
-        }
+        # Map model outputs to the first 7 vulnerability types
+        results = {}
+        for i, vuln_type in enumerate(settings.VULNERABILITY_TYPES):
+            if i < settings.NUM_CLASSES:
+                results[vuln_type] = float(probs[i])
+            else:
+                # Rule-based only for now
+                results[vuln_type] = 0.0
+        
+        return results
     
     def _empty_predictions(self) -> Dict:
         return {vuln_type: 0.0 for vuln_type in settings.VULNERABILITY_TYPES}
