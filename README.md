@@ -6,10 +6,15 @@ AI-powered security scanner for Python code using semantic AST embeddings and Gr
 
 - 🔍 **Deep Code Analysis** - AST parsing with data flow and control flow analysis
 - 🧠 **AI-Powered Detection** - Graph Neural Network with attention mechanism
-- 🛡️ **6+ Vulnerability Types** - eval/exec, command injection, deserialization, secrets, SQL injection, path traversal
+- 🛡️ **11+ Vulnerability Types** - eval/exec, command injection, deserialization, secrets, SQL injection, path traversal, SSRF, Cryptography, XXE, ReDoS, XSS
 - 📊 **Confidence Scores** - Softmax-based probability scores
-- 🎯 **Explainability** - Line-level highlighting of vulnerable code
+- 🎯 **Explainability** - Line-level highlighting with GNN attention mapping
 - 🌐 **Modern Web UI** - Glassmorphism dark theme with real-time analysis
+
+## Documentation
+
+- [System Architecture](system_architecture.md) - Deep dive into GNN and AST engine
+- [Walkthrough & Verification](walkthrough.md) - Proof of work and testing results
 
 ## Quick Start
 
@@ -63,9 +68,14 @@ Open http://localhost:5173 in your browser.
 - **Command Injection** - OS command execution
 - **Unsafe Deserialization** - pickle, yaml, marshal
 - **Hardcoded Secrets** - API keys, passwords, tokens
-- **SQL Injection** - Unparameterized queries
+- **SQL Injection** - Unparameterized queries (Optimized heuristics)
 - **Path Traversal** - File path manipulation
 - **SSRF** - Server-side request forgery
+- **Insecure Cryptography** - [NEW] Weak hashes and insecure randomness
+- **XXE** - [NEW] XML External Entity expansion
+- **ReDoS** - [NEW] Regex Denial of Service patterns
+- **XSS** - [NEW] Cross-Site Scripting in web responses
+
 
 ## Tech Stack
 
