@@ -16,7 +16,7 @@ class Settings(BaseSettings):
 
     # Security
     API_SECRET_KEY: str = ""  # Set in .env for production
-    OPENROUTER_API_KEY: str = "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"  # For generative AI explanation
+    OPENROUTER_API_KEY: str = ""  # Set via .env or environment variable
 
     # CORS Settings — only the dev frontend by default
     CORS_ORIGINS: List[str] = ["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:5174", "http://127.0.0.1:5174"]
