@@ -16,7 +16,7 @@ class Settings(BaseSettings):
 
     # Security
     API_SECRET_KEY: str = ""  # Set in .env for production
-    OPENROUTER_API_KEY: str = ""  # Set via .env or environment variable
+    OPENROUTER_API_KEY: str = ""  # Set in .env for production
 
     # CORS Settings — only the dev frontend by default
     CORS_ORIGINS: List[str] = ["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:5174", "http://127.0.0.1:5174"]
