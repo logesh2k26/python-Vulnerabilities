@@ -1,171 +1,73 @@
 # Source: CVEFixes dataset
-# Safety: vulnerable
+# Safety: safe
 # Category: safe
 
-# coding: utf-8
+from rest_framework.status import HTTP_400_BAD_REQUEST, HTTP_403_FORBIDDEN
 
+from rest_framework.views import APIView
 
 
-from __future__ import division, absolute_import, unicode_literals
 
+from backend.response import FormattedResponse
 
+from config import config
 
-from owlmixin import util
+from backend.permissions import AdminOrAnonymousReadOnly
 
 
 
 
 
-class TestReplaceKeys:
+class ConfigView(APIView):
 
-    def test_need_not_snake(self):
+    throttle_scope = "config"
 
-        keymap = {
+    permission_classes = (AdminOrAnonymousReadOnly,)
 
-            "self": "_self",
 
-            "before": "after"
 
-        }
+    def get(self, request, name=None):
 
-        d = {
+        if name is None:
 
-            "before": 1,
+            if request.user.is_superuser:
 
-            "before2": 2,
+                return FormattedResponse(config.get_all())
 
-            "self": 3,
+            return FormattedResponse(config.get_all_non_sensitive())
 
-            "self2": 4,
+        if not config.is_sensitive(name) or request.is_superuser:
 
-            "UpperCamelCase": True,
+            return FormattedResponse(config.get(name))
 
-            "lowerCamelCase": True,
+        return FormattedResponse(status=HTTP_403_FORBIDDEN)
 
-            "snake_case": True,
 
-            "chain-case": True,
 
-        }
+    def post(self, request, name):
 
+        if "value" not in request.data:
 
+            return FormattedResponse(status=HTTP_400_BAD_REQUEST)
 
-        expected = {
+        config.set(name, request.data.get("value"))
 
-            "after": 1,
+        return FormattedResponse()
 
-            "before2": 2,
 
-            "_self": 3,
 
-            "self2": 4,
+    def patch(self, request, name):
 
-            "UpperCamelCase": True,
+        if "value" not in request.data:
 
-            "lowerCamelCase": True,
+            return FormattedResponse(status=HTTP_400_BAD_REQUEST)
 
-            "snake_case": True,
+        if config.get(name) is not None and isinstance(config.get(name), list):
 
-            "chain-case": True
+            config.set("name", config.get(name).append(request.data["value"]))
 
-        }
+            return FormattedResponse()
 
+        config.set(name, request.data.get("value"))
 
-
-        assert util.replace_keys(d, keymap, False) == expected
-
-
-
-    def test_need_must_snake(self):
-
-        keymap = {
-
-            "self": "_self",
-
-            "before": "after"
-
-        }
-
-        d = {
-
-            "before": 1,
-
-            "before2": 2,
-
-            "self": 3,
-
-            "self2": 4,
-
-            "UpperCamelCase": True,
-
-            "lowerCamelCase": True,
-
-            "snake_case": True,
-
-            "chain-case": True
-
-        }
-
-
-
-        expected = {
-
-            "after": 1,
-
-            "before2": 2,
-
-            "_self": 3,
-
-            "self2": 4,
-
-            "upper_camel_case": True,
-
-            "lower_camel_case": True,
-
-            "snake_case": True,
-
-            "chain_case": True
-
-        }
-
-
-
-        assert util.replace_keys(d, keymap, True) == expected
-
-
-
-
-
-class TestToSnake:
-
-    def test_lower_camel(self):
-
-        assert util.to_snake("lowerCamelCase") == "lower_camel_case"
-
-
-
-    def test_upper_camel(self):
-
-        assert util.to_snake("UpperCamelCase") == "upper_camel_case"
-
-
-
-    def test_chain(self):
-
-        assert util.to_snake("chain-case-example") == "chain_case_example"
-
-
-
-    def test_snake(self):
-
-        assert util.to_snake("snake_case_is_same") == "snake_case_is_same"
-
-
-
-    def test_docopt(self):
-
-        assert util.to_snake("<file_list>") == "file_list"
-
-        assert util.to_snake("-o") == "o"
-
-        assert util.to_snake("--detail-option") == "detail_option"
+        return FormattedResponse()

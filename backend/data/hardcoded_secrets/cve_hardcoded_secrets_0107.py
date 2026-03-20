@@ -2,234 +2,818 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# This file is dual licensed under the terms of the Apache License, Version
+# -*- coding: utf-8 -*-
 
-# 2.0, and the BSD License. See the LICENSE file in the root of this repository
+'''
 
-# for complete details.
+    feedgen.ext.dc
 
+    ~~~~~~~~~~~~~~~~~~~
 
 
-from __future__ import absolute_import, division, print_function
 
+    Extends the FeedGenerator to add Dubline Core Elements to the feeds.
 
 
-import six
 
+    Descriptions partly taken from
 
+    http://dublincore.org/documents/dcmi-terms/#elements-coverage
 
-from cryptography import utils
 
-from cryptography.exceptions import (
 
-    AlreadyFinalized, InvalidKey, UnsupportedAlgorithm, _Reasons
+    :copyright: 2013-2017, Lars Kiesow <lkiesow@uos.de>
 
-)
 
-from cryptography.hazmat.backends.interfaces import HMACBackend
 
-from cryptography.hazmat.primitives import constant_time, hmac
+    :license: FreeBSD and LGPL, see license.* for more details.
 
-from cryptography.hazmat.primitives.kdf import KeyDerivationFunction
+'''
 
 
 
+from lxml import etree
 
 
-@utils.register_interface(KeyDerivationFunction)
 
-class HKDF(object):
+from feedgen.ext.base import BaseExtension
 
-    def __init__(self, algorithm, length, salt, info, backend):
 
-        if not isinstance(backend, HMACBackend):
 
-            raise UnsupportedAlgorithm(
 
-                "Backend object does not implement HMACBackend.",
 
-                _Reasons.BACKEND_MISSING_INTERFACE
+class DcBaseExtension(BaseExtension):
 
-            )
+    '''Dublin Core Elements extension for podcasts.
 
+    '''
 
 
-        self._algorithm = algorithm
 
+    def __init__(self):
 
+        # http://dublincore.org/documents/usageguide/elements.shtml
 
-        if not (salt is None or isinstance(salt, bytes)):
+        # http://dublincore.org/documents/dces/
 
-            raise TypeError("salt must be bytes.")
+        # http://dublincore.org/documents/dcmi-terms/
 
+        self._dcelem_contributor = None
 
+        self._dcelem_coverage = None
 
-        if salt is None:
+        self._dcelem_creator = None
 
-            salt = b"\x00" * (self._algorithm.digest_size // 8)
+        self._dcelem_date = None
 
+        self._dcelem_description = None
 
+        self._dcelem_format = None
 
-        self._salt = salt
+        self._dcelem_identifier = None
 
+        self._dcelem_language = None
 
+        self._dcelem_publisher = None
 
-        self._backend = backend
+        self._dcelem_relation = None
 
+        self._dcelem_rights = None
 
+        self._dcelem_source = None
 
-        self._hkdf_expand = HKDFExpand(self._algorithm, length, info, backend)
+        self._dcelem_subject = None
 
+        self._dcelem_title = None
 
+        self._dcelem_type = None
 
-    def _extract(self, key_material):
 
-        h = hmac.HMAC(self._salt, self._algorithm, backend=self._backend)
 
-        h.update(key_material)
+    def extend_ns(self):
 
-        return h.finalize()
+        return {'dc': 'http://purl.org/dc/elements/1.1/'}
 
 
 
-    def derive(self, key_material):
+    def _extend_xml(self, xml_elem):
 
-        if not isinstance(key_material, bytes):
+        '''Extend xml_elem with set DC fields.
 
-            raise TypeError("key_material must be bytes.")
 
 
+        :param xml_elem: etree element
 
-        return self._hkdf_expand.derive(self._extract(key_material))
+        '''
 
+        DCELEMENTS_NS = 'http://purl.org/dc/elements/1.1/'
 
 
-    def verify(self, key_material, expected_key):
 
-        if not constant_time.bytes_eq(self.derive(key_material), expected_key):
+        for elem in ['contributor', 'coverage', 'creator', 'date',
 
-            raise InvalidKey
+                     'description', 'language', 'publisher', 'relation',
 
+                     'rights', 'source', 'subject', 'title', 'type', 'format',
 
+                     'identifier']:
 
+            if hasattr(self, '_dcelem_%s' % elem):
 
+                for val in getattr(self, '_dcelem_%s' % elem) or []:
 
-@utils.register_interface(KeyDerivationFunction)
+                    node = etree.SubElement(xml_elem,
 
-class HKDFExpand(object):
+                                            '{%s}%s' % (DCELEMENTS_NS, elem))
 
-    def __init__(self, algorithm, length, info, backend):
+                    node.text = val
 
-        if not isinstance(backend, HMACBackend):
 
-            raise UnsupportedAlgorithm(
 
-                "Backend object does not implement HMACBackend.",
+    def extend_atom(self, atom_feed):
 
-                _Reasons.BACKEND_MISSING_INTERFACE
+        '''Extend an Atom feed with the set DC fields.
 
-            )
 
 
+        :param atom_feed: The feed root element
 
-        self._algorithm = algorithm
+        :returns: The feed root element
 
+        '''
 
 
-        self._backend = backend
 
+        self._extend_xml(atom_feed)
 
 
-        max_length = 255 * (algorithm.digest_size // 8)
 
+        return atom_feed
 
 
-        if length > max_length:
 
-            raise ValueError(
+    def extend_rss(self, rss_feed):
 
-                "Can not derive keys larger than {0} octets.".format(
+        '''Extend a RSS feed with the set DC fields.
 
-                    max_length
 
-                ))
 
+        :param rss_feed: The feed root element
 
+        :returns: The feed root element.
 
-        self._length = length
+        '''
 
+        channel = rss_feed[0]
 
+        self._extend_xml(channel)
 
-        if not (info is None or isinstance(info, bytes)):
 
-            raise TypeError("info must be bytes.")
 
+        return rss_feed
 
 
-        if info is None:
 
-            info = b""
+    def dc_contributor(self, contributor=None, replace=False):
 
+        '''Get or set the dc:contributor which is an entity responsible for
 
+        making contributions to the resource.
 
-        self._info = info
 
 
+        For more information see:
 
-        self._used = False
+        http://dublincore.org/documents/dcmi-terms/#elements-contributor
 
 
 
-    def _expand(self, key_material):
+        :param contributor: Contributor or list of contributors.
 
-        output = [b""]
+        :param replace: Replace alredy set contributors (deault: False).
 
-        counter = 1
+        :returns: List of contributors.
 
+        '''
 
+        if contributor is not None:
 
-        while (self._algorithm.digest_size // 8) * len(output) < self._length:
+            if not isinstance(contributor, list):
 
-            h = hmac.HMAC(key_material, self._algorithm, backend=self._backend)
+                contributor = [contributor]
 
-            h.update(output[-1])
+            if replace or not self._dcelem_contributor:
 
-            h.update(self._info)
+                self._dcelem_contributor = []
 
-            h.update(six.int2byte(counter))
+            self._dcelem_contributor += contributor
 
-            output.append(h.finalize())
+        return self._dcelem_contributor
 
-            counter += 1
 
 
+    def dc_coverage(self, coverage=None, replace=True):
 
-        return b"".join(output)[:self._length]
+        '''Get or set the dc:coverage which indicated the spatial or temporal
 
+        topic of the resource, the spatial applicability of the resource, or
 
+        the jurisdiction under which the resource is relevant.
 
-    def derive(self, key_material):
 
-        if not isinstance(key_material, bytes):
 
-            raise TypeError("key_material must be bytes.")
+        Spatial topic and spatial applicability may be a named place or a
 
+        location specified by its geographic coordinates. Temporal topic may be
 
+        a named period, date, or date range. A jurisdiction may be a named
 
-        if self._used:
+        administrative entity or a geographic place to which the resource
 
-            raise AlreadyFinalized
+        applies. Recommended best practice is to use a controlled vocabulary
 
+        such as the Thesaurus of Geographic Names [TGN]. Where appropriate,
 
+        named places or time periods can be used in preference to numeric
 
-        self._used = True
+        identifiers such as sets of coordinates or date ranges.
 
-        return self._expand(key_material)
 
 
+        References:
 
-    def verify(self, key_material, expected_key):
+        [TGN] http://www.getty.edu/research/tools/vocabulary/tgn/index.html
 
-        if not constant_time.bytes_eq(self.derive(key_material), expected_key):
 
-            raise InvalidKey
+
+        :param coverage: Coverage of the feed.
+
+        :param replace: Replace already set coverage (default: True).
+
+        :returns: Coverage of the feed.
+
+        '''
+
+        if coverage is not None:
+
+            if not isinstance(coverage, list):
+
+                coverage = [coverage]
+
+            if replace or not self._dcelem_coverage:
+
+                self._dcelem_coverage = []
+
+            self._dcelem_coverage = coverage
+
+        return self._dcelem_coverage
+
+
+
+    def dc_creator(self, creator=None, replace=False):
+
+        '''Get or set the dc:creator which is an entity primarily responsible
+
+        for making the resource.
+
+
+
+        For more information see:
+
+        http://dublincore.org/documents/dcmi-terms/#elements-creator
+
+
+
+        :param creator: Creator or list of creators.
+
+        :param replace: Replace alredy set creators (deault: False).
+
+        :returns: List of creators.
+
+        '''
+
+        if creator is not None:
+
+            if not isinstance(creator, list):
+
+                creator = [creator]
+
+            if replace or not self._dcelem_creator:
+
+                self._dcelem_creator = []
+
+            self._dcelem_creator += creator
+
+        return self._dcelem_creator
+
+
+
+    def dc_date(self, date=None, replace=True):
+
+        '''Get or set the dc:date which describes a point or period of time
+
+        associated with an event in the lifecycle of the resource.
+
+
+
+        For more information see:
+
+        http://dublincore.org/documents/dcmi-terms/#elements-date
+
+
+
+        :param date: Date or list of dates.
+
+        :param replace: Replace alredy set dates (deault: True).
+
+        :returns: List of dates.
+
+        '''
+
+        if date is not None:
+
+            if not isinstance(date, list):
+
+                date = [date]
+
+            if replace or not self._dcelem_date:
+
+                self._dcelem_date = []
+
+            self._dcelem_date += date
+
+        return self._dcelem_date
+
+
+
+    def dc_description(self, description=None, replace=True):
+
+        '''Get or set the dc:description which is an account of the resource.
+
+
+
+        For more information see:
+
+        http://dublincore.org/documents/dcmi-terms/#elements-description
+
+
+
+        :param description: Description or list of descriptions.
+
+        :param replace: Replace alredy set descriptions (deault: True).
+
+        :returns: List of descriptions.
+
+        '''
+
+        if description is not None:
+
+            if not isinstance(description, list):
+
+                description = [description]
+
+            if replace or not self._dcelem_description:
+
+                self._dcelem_description = []
+
+            self._dcelem_description += description
+
+        return self._dcelem_description
+
+
+
+    def dc_format(self, format=None, replace=True):
+
+        '''Get or set the dc:format which describes the file format, physical
+
+        medium, or dimensions of the resource.
+
+
+
+        For more information see:
+
+        http://dublincore.org/documents/dcmi-terms/#elements-format
+
+
+
+        :param format: Format of the resource or list of formats.
+
+        :param replace: Replace alredy set format (deault: True).
+
+        :returns: Format of the resource.
+
+        '''
+
+        if format is not None:
+
+            if not isinstance(format, list):
+
+                format = [format]
+
+            if replace or not self._dcelem_format:
+
+                self._dcelem_format = []
+
+            self._dcelem_format += format
+
+        return self._dcelem_format
+
+
+
+    def dc_identifier(self, identifier=None, replace=True):
+
+        '''Get or set the dc:identifier which should be an unambiguous
+
+        reference to the resource within a given context.
+
+
+
+        For more inidentifierion see:
+
+        http://dublincore.org/documents/dcmi-terms/#elements-identifier
+
+
+
+        :param identifier: Identifier of the resource or list of identifiers.
+
+        :param replace: Replace alredy set identifier (deault: True).
+
+        :returns: Identifiers of the resource.
+
+        '''
+
+        if identifier is not None:
+
+            if not isinstance(identifier, list):
+
+                identifier = [identifier]
+
+            if replace or not self._dcelem_identifier:
+
+                self._dcelem_identifier = []
+
+            self._dcelem_identifier += identifier
+
+        return self._dcelem_identifier
+
+
+
+    def dc_language(self, language=None, replace=True):
+
+        '''Get or set the dc:language which describes a language of the
+
+        resource.
+
+
+
+        For more information see:
+
+        http://dublincore.org/documents/dcmi-terms/#elements-language
+
+
+
+        :param language: Language or list of languages.
+
+        :param replace: Replace alredy set languages (deault: True).
+
+        :returns: List of languages.
+
+        '''
+
+        if language is not None:
+
+            if not isinstance(language, list):
+
+                language = [language]
+
+            if replace or not self._dcelem_language:
+
+                self._dcelem_language = []
+
+            self._dcelem_language += language
+
+        return self._dcelem_language
+
+
+
+    def dc_publisher(self, publisher=None, replace=False):
+
+        '''Get or set the dc:publisher which is an entity responsible for
+
+        making the resource available.
+
+
+
+        For more information see:
+
+        http://dublincore.org/documents/dcmi-terms/#elements-publisher
+
+
+
+        :param publisher: Publisher or list of publishers.
+
+        :param replace: Replace alredy set publishers (deault: False).
+
+        :returns: List of publishers.
+
+        '''
+
+        if publisher is not None:
+
+            if not isinstance(publisher, list):
+
+                publisher = [publisher]
+
+            if replace or not self._dcelem_publisher:
+
+                self._dcelem_publisher = []
+
+            self._dcelem_publisher += publisher
+
+        return self._dcelem_publisher
+
+
+
+    def dc_relation(self, relation=None, replace=False):
+
+        '''Get or set the dc:relation which describes a related resource.
+
+
+
+        For more information see:
+
+        http://dublincore.org/documents/dcmi-terms/#elements-relation
+
+
+
+        :param relation: Relation or list of relations.
+
+        :param replace: Replace alredy set relations (deault: False).
+
+        :returns: List of relations.
+
+        '''
+
+        if relation is not None:
+
+            if not isinstance(relation, list):
+
+                relation = [relation]
+
+            if replace or not self._dcelem_relation:
+
+                self._dcelem_relation = []
+
+            self._dcelem_relation += relation
+
+        return self._dcelem_relation
+
+
+
+    def dc_rights(self, rights=None, replace=False):
+
+        '''Get or set the dc:rights which may contain information about rights
+
+        held in and over the resource.
+
+
+
+        For more information see:
+
+        http://dublincore.org/documents/dcmi-terms/#elements-rights
+
+
+
+        :param rights: Rights information or list of rights information.
+
+        :param replace: Replace alredy set rightss (deault: False).
+
+        :returns: List of rights information.
+
+        '''
+
+        if rights is not None:
+
+            if not isinstance(rights, list):
+
+                rights = [rights]
+
+            if replace or not self._dcelem_rights:
+
+                self._dcelem_rights = []
+
+            self._dcelem_rights += rights
+
+        return self._dcelem_rights
+
+
+
+    def dc_source(self, source=None, replace=False):
+
+        '''Get or set the dc:source which is a related resource from which the
+
+        described resource is derived.
+
+
+
+        The described resource may be derived from the related resource in
+
+        whole or in part. Recommended best practice is to identify the related
+
+        resource by means of a string conforming to a formal identification
+
+        system.
+
+
+
+        For more information see:
+
+        http://dublincore.org/documents/dcmi-terms/#elements-source
+
+
+
+        :param source: Source or list of sources.
+
+        :param replace: Replace alredy set sources (deault: False).
+
+        :returns: List of sources.
+
+        '''
+
+        if source is not None:
+
+            if not isinstance(source, list):
+
+                source = [source]
+
+            if replace or not self._dcelem_source:
+
+                self._dcelem_source = []
+
+            self._dcelem_source += source
+
+        return self._dcelem_source
+
+
+
+    def dc_subject(self, subject=None, replace=False):
+
+        '''Get or set the dc:subject which describes the topic of the resource.
+
+
+
+        For more information see:
+
+        http://dublincore.org/documents/dcmi-terms/#elements-subject
+
+
+
+        :param subject: Subject or list of subjects.
+
+        :param replace: Replace alredy set subjects (deault: False).
+
+        :returns: List of subjects.
+
+        '''
+
+        if subject is not None:
+
+            if not isinstance(subject, list):
+
+                subject = [subject]
+
+            if replace or not self._dcelem_subject:
+
+                self._dcelem_subject = []
+
+            self._dcelem_subject += subject
+
+        return self._dcelem_subject
+
+
+
+    def dc_title(self, title=None, replace=True):
+
+        '''Get or set the dc:title which is a name given to the resource.
+
+
+
+        For more information see:
+
+        http://dublincore.org/documents/dcmi-terms/#elements-title
+
+
+
+        :param title: Title or list of titles.
+
+        :param replace: Replace alredy set titles (deault: False).
+
+        :returns: List of titles.
+
+        '''
+
+        if title is not None:
+
+            if not isinstance(title, list):
+
+                title = [title]
+
+            if replace or not self._dcelem_title:
+
+                self._dcelem_title = []
+
+            self._dcelem_title += title
+
+        return self._dcelem_title
+
+
+
+    def dc_type(self, type=None, replace=False):
+
+        '''Get or set the dc:type which describes the nature or genre of the
+
+        resource.
+
+
+
+        For more information see:
+
+        http://dublincore.org/documents/dcmi-terms/#elements-type
+
+
+
+        :param type: Type or list of types.
+
+        :param replace: Replace alredy set types (deault: False).
+
+        :returns: List of types.
+
+        '''
+
+        if type is not None:
+
+            if not isinstance(type, list):
+
+                type = [type]
+
+            if replace or not self._dcelem_type:
+
+                self._dcelem_type = []
+
+            self._dcelem_type += type
+
+        return self._dcelem_type
+
+
+
+
+
+class DcExtension(DcBaseExtension):
+
+    '''Dublin Core Elements extension for podcasts.
+
+    '''
+
+
+
+
+
+class DcEntryExtension(DcBaseExtension):
+
+    '''Dublin Core Elements extension for podcasts.
+
+    '''
+
+    def extend_atom(self, entry):
+
+        '''Add dc elements to an atom item. Alters the item itself.
+
+
+
+        :param entry: An atom entry element.
+
+        :returns: The entry element.
+
+        '''
+
+        self._extend_xml(entry)
+
+        return entry
+
+
+
+    def extend_rss(self, item):
+
+        '''Add dc elements to a RSS item. Alters the item itself.
+
+
+
+        :param item: A RSS item element.
+
+        :returns: The item element.
+
+        '''
+
+        self._extend_xml(item)
+
+        return item

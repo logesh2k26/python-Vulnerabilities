@@ -2,172 +2,90 @@
 # Safety: safe
 # Category: safe
 
-# -*- coding: utf-8 -*-
+"""Tornado handlers for frontend config storage."""
 
-from django.conf import settings
 
-from django.contrib.auth import login as django_login
 
-from django.contrib.auth import logout as django_logout
+# Copyright (c) IPython Development Team.
 
-from django.core.exceptions import ObjectDoesNotExist
+# Distributed under the terms of the Modified BSD License.
 
-from django.utils.decorators import method_decorator
+import json
 
-from django.utils.translation import ugettext_lazy as _
+import os
 
-from django.views.decorators.debug import sensitive_post_parameters
+import io
 
-from rest_framework import status
+import errno
 
-from rest_framework.authtoken.models import Token
+from tornado import web
 
-from rest_framework.generics import GenericAPIView
 
-from rest_framework.permissions import AllowAny
 
-from rest_framework.response import Response
+from IPython.utils.py3compat import PY3
 
-from rest_framework.views import APIView
+from ...base.handlers import APIHandler, json_errors
 
 
 
-from nopassword.rest import serializers
+class ConfigHandler(APIHandler):
 
+    SUPPORTED_METHODS = ('GET', 'PUT', 'PATCH')
 
 
 
+    @web.authenticated
 
-class LoginView(GenericAPIView):
+    @json_errors
 
-    serializer_class = serializers.LoginSerializer
+    def get(self, section_name):
 
-    permission_classes = (AllowAny,)
+        self.set_header("Content-Type", 'application/json')
 
+        self.finish(json.dumps(self.config_manager.get(section_name)))
 
 
-    def post(self, request, *args, **kwargs):
 
-        serializer = self.get_serializer(data=request.data)
+    @web.authenticated
 
-        serializer.is_valid(raise_exception=True)
+    @json_errors
 
-        serializer.save()
+    def put(self, section_name):
 
+        data = self.get_json_body()  # Will raise 400 if content is not valid JSON
 
+        self.config_manager.set(section_name, data)
 
-        return Response(
+        self.set_status(204)
 
-            {"detail": _("Login code has been sent.")},
 
-            status=status.HTTP_200_OK
 
-        )
+    @web.authenticated
 
+    @json_errors
 
+    def patch(self, section_name):
 
+        new_data = self.get_json_body()
 
+        section = self.config_manager.update(section_name, new_data)
 
-@method_decorator(sensitive_post_parameters('code'), 'dispatch')
+        self.finish(json.dumps(section))
 
-class LoginCodeView(GenericAPIView):
 
-    permission_classes = (AllowAny,)
 
-    serializer_class = serializers.LoginCodeSerializer
 
-    token_serializer_class = serializers.TokenSerializer
 
-    token_model = Token
+# URL to handler mappings
 
 
 
-    def process_login(self):
+section_name_regex = r"(?P<section_name>\w+)"
 
-        django_login(self.request, self.user)
 
 
+default_handlers = [
 
-    def login(self):
+    (r"/api/config/%s" % section_name_regex, ConfigHandler),
 
-        self.user = self.serializer.validated_data['user']
-
-        self.token, created = self.token_model.objects.get_or_create(user=self.user)
-
-
-
-        if getattr(settings, 'REST_SESSION_LOGIN', True):
-
-            self.process_login()
-
-
-
-    def get_response(self):
-
-        token_serializer = self.token_serializer_class(
-
-            instance=self.token,
-
-            context=self.get_serializer_context(),
-
-        )
-
-        data = token_serializer.data
-
-        data['next'] = self.serializer.validated_data['user'].login_code.next
-
-        return Response(data, status=status.HTTP_200_OK)
-
-
-
-    def post(self, request, *args, **kwargs):
-
-        self.serializer = self.get_serializer(data=request.data)
-
-        self.serializer.is_valid(raise_exception=True)
-
-        self.serializer.save()
-
-        self.login()
-
-        return self.get_response()
-
-
-
-
-
-class LogoutView(APIView):
-
-    permission_classes = (AllowAny,)
-
-
-
-    def post(self, request, *args, **kwargs):
-
-        return self.logout(request)
-
-
-
-    def logout(self, request):
-
-        try:
-
-            request.user.auth_token.delete()
-
-        except (AttributeError, ObjectDoesNotExist):
-
-            pass
-
-
-
-        django_logout(request)
-
-
-
-        return Response(
-
-            {"detail": _("Successfully logged out.")},
-
-            status=status.HTTP_200_OK,
-
-        )
+]

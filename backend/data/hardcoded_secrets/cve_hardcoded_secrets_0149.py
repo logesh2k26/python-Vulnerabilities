@@ -2,2106 +2,798 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
+#!/usr/bin/env python
+
+
+
+# Copyright 2012 - 2017, New York University and the TUF contributors
+
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+
+
+"""
+
+<Program Name>
+
+  sig.py
+
+
+
+<Author>
+
+  Vladimir Diaz <vladimir.v.diaz@gmail.com>
+
+
+
+<Started>
+
+  February 28, 2012.   Based on a previous version by Geremy Condra.
+
+
+
+<Copyright>
+
+  See LICENSE-MIT OR LICENSE for licensing information.
+
+
+
+<Purpose>
+
+  Survivable key compromise is one feature of a secure update system
+
+  incorporated into TUF's design. Responsibility separation through
+
+  the use of multiple roles, multi-signature trust, and explicit and
+
+  implicit key revocation are some of the mechanisms employed towards
+
+  this goal of survivability.  These mechanisms can all be seen in
+
+  play by the functions available in this module.
+
+
+
+  The signed metadata files utilized by TUF to download target files
+
+  securely are used and represented here as the 'signable' object.
+
+  More precisely, the signature structures contained within these metadata
+
+  files are packaged into 'signable' dictionaries.  This module makes it
+
+  possible to capture the states of these signatures by organizing the
+
+  keys into different categories.  As keys are added and removed, the
+
+  system must securely and efficiently verify the status of these signatures.
+
+  For instance, a bunch of keys have recently expired. How many valid keys
+
+  are now available to the Snapshot role?  This question can be answered by
+
+  get_signature_status(), which will return a full 'status report' of these
+
+  'signable' dicts.  This module also provides a convenient verify() function
+
+  that will determine if a role still has a sufficient number of valid keys.
+
+  If a caller needs to update the signatures of a 'signable' object, there
+
+  is also a function for that.
+
+"""
+
+
+
+# Help with Python 3 compatibility, where the print statement is a function, an
+
+# implicit relative import is invalid, and the '/' operator performs true
+
+# division.  Example:  print 'hello world' raises a 'SyntaxError' exception.
+
 from __future__ import print_function
 
+from __future__ import absolute_import
+
+from __future__ import division
+
+from __future__ import unicode_literals
 
 
-import argparse
-
-import json
-
-from oauthlib.oauth2 import LegacyApplicationClient
 
 import logging
 
-import logging.handlers
 
-from requests_oauthlib import OAuth2Session
 
-import os
+import tuf
 
-import requests
+import tuf.keydb
 
-import six
+import tuf.roledb
 
-import sys
+import tuf.formats
 
-import traceback
 
 
+import securesystemslib
 
-from six.moves.urllib.parse import quote as urlquote
 
-from six.moves.urllib.parse import urlparse
 
+# See 'log.py' to learn how logging is handled in TUF.
 
+logger = logging.getLogger('tuf.sig')
 
 
 
-# ------------------------------------------------------------------------------
+# Disable 'iso8601' logger messages to prevent 'iso8601' from clogging the
 
+# log file.
 
+iso8601_logger = logging.getLogger('iso8601')
 
-logger = None
+iso8601_logger.disabled = True
 
-prog_name = os.path.basename(sys.argv[0])
 
-AUTH_ROLES = ['root-admin', 'realm-admin', 'anonymous']
 
 
 
-LOG_FILE_ROTATION_COUNT = 3
+def get_signature_status(signable, role=None, repository_name='default',
 
+    threshold=None, keyids=None):
 
+  """
 
-TOKEN_URL_TEMPLATE = (
+  <Purpose>
 
-    '{server}/auth/realms/{realm}/protocol/openid-connect/token')
+    Return a dictionary representing the status of the signatures listed in
 
-GET_SERVER_INFO_TEMPLATE = (
+    'signable'.  Given an object conformant to SIGNABLE_SCHEMA, a set of public
 
-    '{server}/auth/admin/serverinfo/')
+    keys in 'tuf.keydb', a set of roles in 'tuf.roledb', and a role,
 
-GET_REALMS_URL_TEMPLATE = (
+    the status of these signatures can be determined.  This method will iterate
 
-    '{server}/auth/admin/realms')
+    the signatures in 'signable' and enumerate all the keys that are valid,
 
-CREATE_REALM_URL_TEMPLATE = (
+    invalid, unrecognized, or unauthorized.
 
-    '{server}/auth/admin/realms')
 
-DELETE_REALM_URL_TEMPLATE = (
 
-    '{server}/auth/admin/realms/{realm}')
+  <Arguments>
 
-GET_REALM_METADATA_TEMPLATE = (
+    signable:
 
-    '{server}/auth/realms/{realm}/protocol/saml/descriptor')
+      A dictionary containing a list of signatures and a 'signed' identifier.
 
+      signable = {'signed': 'signer',
 
+                  'signatures': [{'keyid': keyid,
 
-CLIENT_REPRESENTATION_TEMPLATE = (
+                                  'sig': sig}]}
 
-    '{server}/auth/admin/realms/{realm}/clients/{id}')
 
-GET_CLIENTS_URL_TEMPLATE = (
 
-    '{server}/auth/admin/realms/{realm}/clients')
+      Conformant to tuf.formats.SIGNABLE_SCHEMA.
 
-CLIENT_DESCRIPTOR_URL_TEMPLATE = (
 
-    '{server}/auth/admin/realms/{realm}/client-description-converter')
 
-CREATE_CLIENT_URL_TEMPLATE = (
+    role:
 
-    '{server}/auth/admin/realms/{realm}/clients')
+      TUF role (e.g., 'root', 'targets', 'snapshot').
 
 
 
-GET_INITIAL_ACCESS_TOKEN_TEMPLATE = (
+    threshold:
 
-    '{server}/auth/admin/realms/{realm}/clients-initial-access')
+      Rather than reference the role's threshold as set in tuf.roledb.py, use
 
-SAML2_CLIENT_REGISTRATION_TEMPLATE = (
+      the given 'threshold' to calculate the signature status of 'signable'.
 
-  '{server}/auth/realms/{realm}/clients-registrations/saml2-entity-descriptor')
+      'threshold' is an integer value that sets the role's threshold value, or
 
+      the minimum number of signatures needed for metadata to be considered
 
+      fully signed.
 
-GET_CLIENT_PROTOCOL_MAPPERS_TEMPLATE = (
 
-    '{server}/auth/admin/realms/{realm}/clients/{id}/protocol-mappers/models')
 
-GET_CLIENT_PROTOCOL_MAPPERS_BY_PROTOCOL_TEMPLATE = (
+    keyids:
 
-    '{server}/auth/admin/realms/{realm}/clients/{id}/protocol-mappers/protocol/{protocol}')
+      Similar to the 'threshold' argument, use the supplied list of 'keyids'
 
+      to calculate the signature status, instead of referencing the keyids
 
+      in tuf.roledb.py for 'role'.
 
-POST_CLIENT_PROTOCOL_MAPPER_TEMPLATE = (
 
-    '{server}/auth/admin/realms/{realm}/clients/{id}/protocol-mappers/models')
 
+  <Exceptions>
 
+    securesystemslib.exceptions.FormatError, if 'signable' does not have the
 
+    correct format.
 
 
-ADMIN_CLIENT_ID = 'admin-cli'
 
+    tuf.exceptions.UnknownRoleError, if 'role' is not recognized.
 
 
-# ------------------------------------------------------------------------------
 
+  <Side Effects>
 
+    None.
 
 
 
-class RESTError(Exception):
+  <Returns>
 
-    def __init__(self, status_code, status_reason,
+    A dictionary representing the status of the signatures in 'signable'.
 
-                 response_json, response_text, cmd):
+    Conformant to tuf.formats.SIGNATURESTATUS_SCHEMA.
 
-        self.status_code = status_code
+  """
 
-        self.status_reason = status_reason
 
-        self.error_description = None
 
-        self.error = None
+  # Do the arguments have the correct format?  This check will ensure that
 
-        self.response_json = response_json
+  # arguments have the appropriate number of objects and object types, and that
 
-        self.response_text = response_text
+  # all dict keys are properly named.  Raise
 
-        self.cmd = cmd
+  # 'securesystemslib.exceptions.FormatError' if the check fails.
 
+  tuf.formats.SIGNABLE_SCHEMA.check_match(signable)
 
+  securesystemslib.formats.NAME_SCHEMA.check_match(repository_name)
 
-        self.message = '{status_reason}({status_code}): '.format(
 
-            status_reason=self.status_reason,
 
-            status_code=self.status_code)
+  if role is not None:
 
+    tuf.formats.ROLENAME_SCHEMA.check_match(role)
 
 
-        if response_json:
 
-            self.error_description = response_json.get('error_description')
+  if threshold is not None:
 
-            if self.error_description is None:
+    tuf.formats.THRESHOLD_SCHEMA.check_match(threshold)
 
-                self.error_description = response_json.get('errorMessage')
 
-            self.error = response_json.get('error')
 
-            self.message += '"{error_description}" [{error}]'.format(
+  if keyids is not None:
 
-                error_description=self.error_description,
+    securesystemslib.formats.KEYIDS_SCHEMA.check_match(keyids)
 
-                error=self.error)
 
-        else:
 
-            self.message += '"{response_text}"'.format(
+  # The signature status dictionary returned.
 
-                response_text=self.response_text)
+  signature_status = {}
 
 
 
-        self.args = (self.message,)
+  # The fields of the signature_status dict, where each field stores keyids.  A
 
+  # description of each field:
 
+  #
 
-    def __str__(self):
+  # good_sigs = keys confirmed to have produced 'sig' using 'signed', which are
 
-        return self.message
+  # associated with 'role';
 
+  #
 
+  # bad_sigs = negation of good_sigs;
 
-# ------------------------------------------------------------------------------
+  #
 
+  # unknown_sigs = keys not found in the 'keydb' database;
 
+  #
 
+  # untrusted_sigs = keys that are not in the list of keyids associated with
 
+  # 'role';
 
-def configure_logging(options):
+  #
 
-    global logger  # pylint: disable=W0603
+  # unknown_signing_scheme = signing schemes specified in keys that are
 
+  # unsupported;
 
+  good_sigs = []
 
-    log_dir = os.path.dirname(options.log_file)
+  bad_sigs = []
 
-    if os.path.exists(log_dir):
+  unknown_sigs = []
 
-        if not os.path.isdir(log_dir):
+  untrusted_sigs = []
 
-            raise ValueError('logging directory "{log_dir}" exists but is not '
+  unknown_signing_schemes = []
 
-                             'directory'.format(log_dir=log_dir))
+
+
+  # Extract the relevant fields from 'signable' that will allow us to identify
+
+  # the different classes of keys (i.e., good_sigs, bad_sigs, etc.).
+
+  signed = securesystemslib.formats.encode_canonical(signable['signed']).encode('utf-8')
+
+  signatures = signable['signatures']
+
+
+
+  # Iterate the signatures and enumerate the signature_status fields.
+
+  # (i.e., good_sigs, bad_sigs, etc.).
+
+  for signature in signatures:
+
+    keyid = signature['keyid']
+
+
+
+    # Does the signature use an unrecognized key?
+
+    try:
+
+      key = tuf.keydb.get_key(keyid, repository_name)
+
+
+
+    except tuf.exceptions.UnknownKeyError:
+
+      unknown_sigs.append(keyid)
+
+      continue
+
+
+
+    # Does the signature use an unknown/unsupported signing scheme?
+
+    try:
+
+      valid_sig = securesystemslib.keys.verify_signature(key, signature, signed)
+
+
+
+    except securesystemslib.exceptions.UnsupportedAlgorithmError:
+
+      unknown_signing_schemes.append(keyid)
+
+      continue
+
+
+
+    # We are now dealing with either a trusted or untrusted key...
+
+    if valid_sig:
+
+      if role is not None:
+
+
+
+        # Is this an unauthorized key? (a keyid associated with 'role')
+
+        # Note that if the role is not known, tuf.exceptions.UnknownRoleError
+
+        # is raised here.
+
+        if keyids is None:
+
+          keyids = tuf.roledb.get_role_keyids(role, repository_name)
+
+
+
+        if keyid not in keyids:
+
+          untrusted_sigs.append(keyid)
+
+          continue
+
+
+
+      # This is an unset role, thus an unknown signature.
+
+      else:
+
+        unknown_sigs.append(keyid)
+
+        continue
+
+
+
+      # Identify good/authorized key.
+
+      good_sigs.append(keyid)
+
+
 
     else:
 
-        os.makedirs(log_dir)
+      # This is a bad signature for a trusted key.
+
+      bad_sigs.append(keyid)
 
 
 
-    log_level = logging.ERROR
+  # Retrieve the threshold value for 'role'.  Raise
 
-    if options.verbose:
+  # tuf.exceptions.UnknownRoleError if we were given an invalid role.
 
-        log_level = logging.INFO
+  if role is not None:
 
-    if options.debug:
+    if threshold is None:
 
-        log_level = logging.DEBUG
+      # Note that if the role is not known, tuf.exceptions.UnknownRoleError is
 
+      # raised here.
 
+      threshold = tuf.roledb.get_role_threshold(
 
-        # These two lines enable debugging at httplib level
-
-        # (requests->urllib3->http.client) You will see the REQUEST,
-
-        # including HEADERS and DATA, and RESPONSE with HEADERS but
-
-        # without DATA.  The only thing missing will be the
-
-        # response.body which is not logged.
-
-        try:
-
-            import http.client as http_client  # Python 3
-
-        except ImportError:
-
-            import httplib as http_client      # Python 2
-
-
-
-        http_client.HTTPConnection.debuglevel = 1
-
-
-
-        # Turn on cookielib debugging
-
-        if False:
-
-            try:
-
-                import http.cookiejar as cookiejar
-
-            except ImportError:
-
-                import cookielib as cookiejar  # Python 2
-
-            cookiejar.debug = True
-
-
-
-    logger = logging.getLogger(prog_name)
-
-
-
-    try:
-
-        file_handler = logging.handlers.RotatingFileHandler(
-
-            options.log_file, backupCount=LOG_FILE_ROTATION_COUNT)
-
-    except IOError as e:
-
-        print('Unable to open log file %s (%s)' % (options.log_file, e),
-
-              file=sys.stderr)
+          role, repository_name=repository_name)
 
 
 
     else:
 
-        formatter = logging.Formatter(
+      logger.debug('Not using roledb.py\'s threshold for ' + repr(role))
 
-            '%(asctime)s %(name)s %(levelname)s: %(message)s')
 
-        file_handler.setFormatter(formatter)
 
-        file_handler.setLevel(logging.DEBUG)
+  else:
 
-        logger.addHandler(file_handler)
+    threshold = 0
 
 
 
-    console_handler = logging.StreamHandler(sys.stdout)
+  # Build the signature_status dict.
 
-    formatter = logging.Formatter('%(message)s')
+  signature_status['threshold'] = threshold
 
-    console_handler.setFormatter(formatter)
+  signature_status['good_sigs'] = good_sigs
 
-    console_handler.setLevel(log_level)
+  signature_status['bad_sigs'] = bad_sigs
 
-    logger.addHandler(console_handler)
+  signature_status['unknown_sigs'] = unknown_sigs
 
+  signature_status['untrusted_sigs'] = untrusted_sigs
 
+  signature_status['unknown_signing_schemes'] = unknown_signing_schemes
 
-    # Set the log level on the logger to the lowest level
 
-    # possible. This allows the message to be emitted from the logger
 
-    # to it's handlers where the level will be filtered on a per
+  return signature_status
 
-    # handler basis.
 
-    logger.setLevel(1)
 
 
 
-# ------------------------------------------------------------------------------
 
 
 
 
 
-def json_pretty(text):
 
-    return json.dumps(json.loads(text),
+def verify(signable, role, repository_name='default', threshold=None,
 
-                      indent=4, sort_keys=True)
+    keyids=None):
 
+  """
 
+  <Purpose>
 
+    Verify whether the authorized signatures of 'signable' meet the minimum
 
+    required by 'role'.  Authorized signatures are those with valid keys
 
-def py_json_pretty(py_json):
+    associated with 'role'.  'signable' must conform to SIGNABLE_SCHEMA
 
-    return json_pretty(json.dumps(py_json))
+    and 'role' must not equal 'None' or be less than zero.
 
 
 
+  <Arguments>
 
+    signable:
 
-def server_name_from_url(url):
+      A dictionary containing a list of signatures and a 'signed' identifier.
 
-    return urlparse(url).netloc
+      signable = {'signed':, 'signatures': [{'keyid':, 'method':, 'sig':}]}
 
 
 
+    role:
 
+      TUF role (e.g., 'root', 'targets', 'snapshot').
 
-def get_realm_names_from_realms(realms):
 
-    return [x['realm'] for x in realms]
 
+    threshold:
 
+      Rather than reference the role's threshold as set in tuf.roledb.py, use
 
+      the given 'threshold' to calculate the signature status of 'signable'.
 
+      'threshold' is an integer value that sets the role's threshold value, or
 
-def get_client_client_ids_from_clients(clients):
+      the minimum number of signatures needed for metadata to be considered
 
-    return [x['clientId'] for x in clients]
+      fully signed.
 
 
 
+    keyids:
 
+      Similar to the 'threshold' argument, use the supplied list of 'keyids'
 
-def find_client_by_name(clients, client_id):
+      to calculate the signature status, instead of referencing the keyids
 
-    for client in clients:
+      in tuf.roledb.py for 'role'.
 
-        if client.get('clientId') == client_id:
 
-            return client
 
-    raise KeyError('{item} not found'.format(item=client_id))
+  <Exceptions>
 
+    tuf.exceptions.UnknownRoleError, if 'role' is not recognized.
 
 
 
+    securesystemslib.exceptions.FormatError, if 'signable' is not formatted
 
-# ------------------------------------------------------------------------------
+    correctly.
 
 
 
-class KeycloakREST(object):
+    securesystemslib.exceptions.Error, if an invalid threshold is encountered.
 
 
 
-    def __init__(self, server, auth_role=None, session=None):
+  <Side Effects>
 
-        self.server = server
+    tuf.sig.get_signature_status() called.  Any exceptions thrown by
 
-        self.auth_role = auth_role
+    get_signature_status() will be caught here and re-raised.
 
-        self.session = session
 
 
+  <Returns>
 
-    def get_initial_access_token(self, realm_name):
+    Boolean.  True if the number of good signatures >= the role's threshold,
 
-        cmd_name = "get initial access token for realm '{realm}'".format(
+    False otherwise.
 
-            realm=realm_name)
+  """
 
-        url = GET_INITIAL_ACCESS_TOKEN_TEMPLATE.format(
 
-            server=self.server, realm=urlquote(realm_name))
 
+  tuf.formats.SIGNABLE_SCHEMA.check_match(signable)
 
+  tuf.formats.ROLENAME_SCHEMA.check_match(role)
 
-        logger.debug("%s on server %s", cmd_name, self.server)
+  securesystemslib.formats.NAME_SCHEMA.check_match(repository_name)
 
 
 
-        params = {"expiration": 60,  # seconds
+  # Retrieve the signature status.  tuf.sig.get_signature_status() raises:
 
-                  "count": 1}
+  # tuf.exceptions.UnknownRoleError
 
+  # securesystemslib.exceptions.FormatError.  'threshold' and 'keyids' are also
 
+  # validated.
 
-        response = self.session.post(url, json=params)
+  status = get_signature_status(signable, role, repository_name, threshold, keyids)
 
-        logger.debug("%s response code: %s %s",
 
-                     cmd_name, response.status_code, response.reason)
 
+  # Retrieve the role's threshold and the authorized keys of 'status'
 
+  threshold = status['threshold']
 
-        try:
+  good_sigs = status['good_sigs']
 
-            response_json = response.json()
 
-        except ValueError as e:
 
-            response_json = None
+  # Does 'status' have the required threshold of signatures?
 
+  # First check for invalid threshold values before returning result.
 
+  # Note: get_signature_status() is expected to verify that 'threshold' is
 
-        if (not response_json or
+  # not None or <= 0.
 
-            response.status_code != requests.codes.ok):
+  if threshold is None or threshold <= 0: #pragma: no cover
 
-            logger.error("%s error: status=%s (%s) text=%s",
+    raise securesystemslib.exceptions.Error("Invalid threshold: " + repr(threshold))
 
-                         cmd_name, response.status_code, response.reason,
 
-                         response.text)
 
-            raise RESTError(response.status_code, response.reason,
+  return len(good_sigs) >= threshold
 
-                            response_json, response.text, cmd_name)
 
 
 
-        logger.debug("%s response = %s", cmd_name, json_pretty(response.text))
 
 
 
-        return response_json    # ClientInitialAccessPresentation
 
 
 
-    def get_server_info(self):
 
-        cmd_name = "get server info"
+def may_need_new_keys(signature_status):
 
-        url = GET_SERVER_INFO_TEMPLATE.format(server=self.server)
+  """
 
+  <Purpose>
 
+    Return true iff downloading a new set of keys might tip this
 
-        logger.debug("%s on server %s", cmd_name, self.server)
+    signature status over to valid.  This is determined by checking
 
-        response = self.session.get(url)
+    if either the number of unknown or untrusted keys is > 0.
 
-        logger.debug("%s response code: %s %s",
 
-                     cmd_name, response.status_code, response.reason)
 
+  <Arguments>
 
+    signature_status:
 
-        try:
+      The dictionary returned by tuf.sig.get_signature_status().
 
-            response_json = response.json()
 
-        except ValueError as e:
 
-            response_json = None
+  <Exceptions>
 
+    securesystemslib.exceptions.FormatError, if 'signature_status does not have
 
+    the correct format.
 
-        if (not response_json or
 
-            response.status_code != requests.codes.ok):
 
-            logger.error("%s error: status=%s (%s) text=%s",
+  <Side Effects>
 
-                         cmd_name, response.status_code, response.reason,
+    None.
 
-                         response.text)
 
-            raise RESTError(response.status_code, response.reason,
 
-                            response_json, response.text, cmd_name)
+  <Returns>
 
+    Boolean.
 
+  """
 
-        logger.debug("%s response = %s", cmd_name, json_pretty(response.text))
 
 
+  # Does 'signature_status' have the correct format?
 
-        return response_json
+  # This check will ensure 'signature_status' has the appropriate number
 
+  # of objects and object types, and that all dict keys are properly named.
 
+  # Raise 'securesystemslib.exceptions.FormatError' if the check fails.
 
-    def get_realms(self):
+  tuf.formats.SIGNATURESTATUS_SCHEMA.check_match(signature_status)
 
-        cmd_name = "get realms"
 
-        url = GET_REALMS_URL_TEMPLATE.format(server=self.server)
 
+  unknown = signature_status['unknown_sigs']
 
+  untrusted = signature_status['untrusted_sigs']
 
-        logger.debug("%s on server %s", cmd_name, self.server)
 
-        response = self.session.get(url)
 
-        logger.debug("%s response code: %s %s",
+  return len(unknown) or len(untrusted)
 
-                     cmd_name, response.status_code, response.reason)
 
 
 
-        try:
 
-            response_json = response.json()
 
-        except ValueError as e:
 
-            response_json = None
 
 
 
-        if (not response_json or
 
-            response.status_code != requests.codes.ok):
+def generate_rsa_signature(signed, rsakey_dict):
 
-            logger.error("%s error: status=%s (%s) text=%s",
+  """
 
-                         cmd_name, response.status_code, response.reason,
+  <Purpose>
 
-                         response.text)
+    Generate a new signature dict presumably to be added to the 'signatures'
 
-            raise RESTError(response.status_code, response.reason,
+    field of 'signable'.  The 'signable' dict is of the form:
 
-                            response_json, response.text, cmd_name)
 
 
+    {'signed': 'signer',
 
-        logger.debug("%s response = %s", cmd_name, json_pretty(response.text))
+               'signatures': [{'keyid': keyid,
 
+                               'method': 'evp',
 
+                               'sig': sig}]}
 
-        return response_json
 
 
+    The 'signed' argument is needed here for the signing process.
 
-    def create_realm(self, realm_name):
+    The 'rsakey_dict' argument is used to generate 'keyid', 'method', and 'sig'.
 
-        cmd_name = "create realm '{realm}'".format(realm=realm_name)
 
-        url = CREATE_REALM_URL_TEMPLATE.format(server=self.server)
 
+    The caller should ensure the returned signature is not already in
 
+    'signable'.
 
-        logger.debug("%s on server %s", cmd_name, self.server)
 
 
+  <Arguments>
 
-        params = {"enabled": True,
+    signed:
 
-                  "id": realm_name,
+      The data used by 'securesystemslib.keys.create_signature()' to generate
 
-                  "realm": realm_name,
+      signatures.  It is stored in the 'signed' field of 'signable'.
 
-                  }
 
 
+    rsakey_dict:
 
-        response = self.session.post(url, json=params)
+      The RSA key, a 'securesystemslib.formats.RSAKEY_SCHEMA' dictionary.
 
-        logger.debug("%s response code: %s %s",
+      Used here to produce 'keyid', 'method', and 'sig'.
 
-                     cmd_name, response.status_code, response.reason)
 
 
+  <Exceptions>
 
-        try:
+    securesystemslib.exceptions.FormatError, if 'rsakey_dict' does not have the
 
-            response_json = response.json()
+    correct format.
 
-        except ValueError as e:
 
-            response_json = None
 
+    TypeError, if a private key is not defined for 'rsakey_dict'.
 
 
-        if response.status_code != requests.codes.created:
 
-            logger.error("%s error: status=%s (%s) text=%s",
+  <Side Effects>
 
-                         cmd_name, response.status_code, response.reason,
+    None.
 
-                         response.text)
 
-            raise RESTError(response.status_code, response.reason,
 
-                            response_json, response.text, cmd_name)
+  <Returns>
 
+    Signature dictionary conformant to securesystemslib.formats.SIGNATURE_SCHEMA.
 
+    Has the form:
 
-        logger.debug("%s response = %s", cmd_name, response.text)
+    {'keyid': keyid, 'method': 'evp', 'sig': sig}
 
+  """
 
 
-    def delete_realm(self, realm_name):
 
-        cmd_name = "delete realm '{realm}'".format(realm=realm_name)
+  # We need 'signed' in canonical JSON format to generate
 
-        url = DELETE_REALM_URL_TEMPLATE.format(
+  # the 'method' and 'sig' fields of the signature.
 
-            server=self.server, realm=urlquote(realm_name))
+  signed = securesystemslib.formats.encode_canonical(signed).encode('utf-8')
 
 
 
-        logger.debug("%s on server %s", cmd_name, self.server)
+  # Generate the RSA signature.
 
-        response = self.session.delete(url)
+  # Raises securesystemslib.exceptions.FormatError and TypeError.
 
-        logger.debug("%s response code: %s %s",
+  signature = securesystemslib.keys.create_signature(rsakey_dict, signed)
 
-                     cmd_name, response.status_code, response.reason)
 
 
-
-        try:
-
-            response_json = response.json()
-
-        except ValueError as e:
-
-            response_json = None
-
-
-
-        if response.status_code != requests.codes.no_content:
-
-            logger.error("%s error: status=%s (%s) text=%s",
-
-                         cmd_name, response.status_code, response.reason,
-
-                         response.text)
-
-            raise RESTError(response.status_code, response.reason,
-
-                            response_json, response.text, cmd_name)
-
-
-
-        logger.debug("%s response = %s", cmd_name, response.text)
-
-
-
-    def get_realm_metadata(self, realm_name):
-
-        cmd_name = "get metadata for realm '{realm}'".format(realm=realm_name)
-
-        url = GET_REALM_METADATA_TEMPLATE.format(
-
-            server=self.server, realm=urlquote(realm_name))
-
-
-
-        logger.debug("%s on server %s", cmd_name, self.server)
-
-        response = self.session.get(url)
-
-        logger.debug("%s response code: %s %s",
-
-                     cmd_name, response.status_code, response.reason)
-
-
-
-        try:
-
-            response_json = response.json()
-
-        except ValueError as e:
-
-            response_json = None
-
-
-
-        if response.status_code != requests.codes.ok:
-
-            logger.error("%s error: status=%s (%s) text=%s",
-
-                         cmd_name, response.status_code, response.reason,
-
-                         response.text)
-
-            raise RESTError(response.status_code, response.reason,
-
-                            response_json, response.text, cmd_name)
-
-
-
-        logger.debug("%s response = %s", cmd_name, response.text)
-
-        return response.text
-
-
-
-    def get_clients(self, realm_name):
-
-        cmd_name = "get clients in realm '{realm}'".format(realm=realm_name)
-
-        url = GET_CLIENTS_URL_TEMPLATE.format(
-
-            server=self.server, realm=urlquote(realm_name))
-
-
-
-        logger.debug("%s on server %s", cmd_name, self.server)
-
-        response = self.session.get(url)
-
-        logger.debug("%s response code: %s %s",
-
-                     cmd_name, response.status_code, response.reason)
-
-
-
-        try:
-
-            response_json = response.json()
-
-        except ValueError as e:
-
-            response_json = None
-
-
-
-        if (not response_json or
-
-            response.status_code != requests.codes.ok):
-
-            logger.error("%s error: status=%s (%s) text=%s",
-
-                         cmd_name, response.status_code, response.reason,
-
-                         response.text)
-
-            raise RESTError(response.status_code, response.reason,
-
-                            response_json, response.text, cmd_name)
-
-
-
-        logger.debug("%s response = %s", cmd_name, json_pretty(response.text))
-
-
-
-        return response_json
-
-
-
-
-
-    def get_client_by_id(self, realm_name, id):
-
-        cmd_name = "get client id {id} in realm '{realm}'".format(
-
-            id=id, realm=realm_name)
-
-        url = GET_CLIENTS_URL_TEMPLATE.format(
-
-            server=self.server, realm=urlquote(realm_name))
-
-
-
-        params = {'clientID': id}
-
-
-
-        logger.debug("%s on server %s", cmd_name, self.server)
-
-        response = self.session.get(url, params=params)
-
-        logger.debug("%s response code: %s %s",
-
-                     cmd_name, response.status_code, response.reason)
-
-
-
-        try:
-
-            response_json = response.json()
-
-        except ValueError as e:
-
-            response_json = None
-
-
-
-        if (not response_json or
-
-            response.status_code != requests.codes.ok):
-
-            logger.error("%s error: status=%s (%s) text=%s",
-
-                         cmd_name, response.status_code, response.reason,
-
-                         response.text)
-
-            raise RESTError(response.status_code, response.reason,
-
-                            response_json, response.text, cmd_name)
-
-
-
-        logger.debug("%s response = %s", cmd_name, json_pretty(response.text))
-
-
-
-        return response_json
-
-
-
-
-
-    def get_client_by_name(self, realm_name, client_name):
-
-        clients = self.get_clients(realm_name)
-
-        client = find_client_by_name(clients, client_name)
-
-        id = client.get('id')
-
-        logger.debug("client name '%s' mapped to id '%s'",
-
-                     client_name, id)
-
-        logger.debug("client %s\n%s", client_name, py_json_pretty(client))
-
-        return client
-
-
-
-    def get_client_id_by_name(self, realm_name, client_name):
-
-        client = self.get_client_by_name(realm_name, client_name)
-
-        id = client.get('id')
-
-        return id
-
-
-
-    def get_client_descriptor(self, realm_name, metadata):
-
-        cmd_name = "get client descriptor realm '{realm}'".format(
-
-            realm=realm_name)
-
-        url = CLIENT_DESCRIPTOR_URL_TEMPLATE.format(
-
-            server=self.server, realm=urlquote(realm_name))
-
-
-
-        logger.debug("%s on server %s", cmd_name, self.server)
-
-
-
-        headers = {'Content-Type': 'application/xml;charset=utf-8'}
-
-
-
-        response = self.session.post(url, headers=headers, data=metadata)
-
-        logger.debug("%s response code: %s %s",
-
-                     cmd_name, response.status_code, response.reason)
-
-
-
-        try:
-
-            response_json = response.json()
-
-        except ValueError as e:
-
-            response_json = None
-
-
-
-        if (not response_json or
-
-            response.status_code != requests.codes.ok):
-
-            logger.error("%s error: status=%s (%s) text=%s",
-
-                         cmd_name, response.status_code, response.reason,
-
-                         response.text)
-
-            raise RESTError(response.status_code, response.reason,
-
-                            response_json, response.text, cmd_name)
-
-
-
-        logger.debug("%s response = %s", cmd_name, json_pretty(response.text))
-
-
-
-        return response_json
-
-
-
-    def create_client_from_descriptor(self, realm_name, descriptor):
-
-        cmd_name = "create client from descriptor "
-
-        "'{client_id}'in realm '{realm}'".format(
-
-            client_id=descriptor['clientId'], realm=realm_name)
-
-        url = CREATE_CLIENT_URL_TEMPLATE.format(
-
-            server=self.server, realm=urlquote(realm_name))
-
-
-
-        logger.debug("%s on server %s", cmd_name, self.server)
-
-
-
-        response = self.session.post(url, json=descriptor)
-
-        logger.debug("%s response code: %s %s",
-
-                     cmd_name, response.status_code, response.reason)
-
-
-
-        try:
-
-            response_json = response.json()
-
-        except ValueError as e:
-
-            response_json = None
-
-
-
-        if response.status_code != requests.codes.created:
-
-            logger.error("%s error: status=%s (%s) text=%s",
-
-                         cmd_name, response.status_code, response.reason,
-
-                         response.text)
-
-            raise RESTError(response.status_code, response.reason,
-
-                            response_json, response.text, cmd_name)
-
-
-
-        logger.debug("%s response = %s", cmd_name, response.text)
-
-
-
-    def create_client(self, realm_name, metadata):
-
-        logger.debug("create client in realm %s on server %s",
-
-                     realm_name, self.server)
-
-        descriptor = self.get_client_descriptor(realm_name, metadata)
-
-        self.create_client_from_descriptor(realm_name, descriptor)
-
-        return descriptor
-
-
-
-    def register_client(self, initial_access_token, realm_name, metadata):
-
-        cmd_name = "register_client realm '{realm}'".format(
-
-            realm=realm_name)
-
-        url = SAML2_CLIENT_REGISTRATION_TEMPLATE.format(
-
-            server=self.server, realm=urlquote(realm_name))
-
-
-
-        logger.debug("%s on server %s", cmd_name, self.server)
-
-
-
-        headers = {'Content-Type': 'application/xml;charset=utf-8'}
-
-
-
-        if initial_access_token:
-
-            headers['Authorization'] = 'Bearer {token}'.format(
-
-                token=initial_access_token)
-
-
-
-        response = self.session.post(url, headers=headers, data=metadata)
-
-        logger.debug("%s response code: %s %s",
-
-                     cmd_name, response.status_code, response.reason)
-
-
-
-        try:
-
-            response_json = response.json()
-
-        except ValueError as e:
-
-            response_json = None
-
-
-
-        if (not response_json or
-
-            response.status_code != requests.codes.created):
-
-            logger.error("%s error: status=%s (%s) text=%s",
-
-                         cmd_name, response.status_code, response.reason,
-
-                         response.text)
-
-            raise RESTError(response.status_code, response.reason,
-
-                            response_json, response.text, cmd_name)
-
-
-
-        logger.debug("%s response = %s", cmd_name, json_pretty(response.text))
-
-
-
-        return response_json    # ClientRepresentation
-
-
-
-    def delete_client_by_name(self, realm_name, client_name):
-
-        id = self.get_client_id_by_name(realm_name, client_name)
-
-        self.delete_client_by_id(realm_name, id)
-
-
-
-
-
-    def delete_client_by_id(self, realm_name, id):
-
-        cmd_name = "delete client id '{id}'in realm '{realm}'".format(
-
-            id=id, realm=realm_name)
-
-        url = CLIENT_REPRESENTATION_TEMPLATE.format(
-
-            server=self.server, realm=urlquote(realm_name),
-
-            id=urlquote(id))
-
-
-
-        logger.debug("%s on server %s", cmd_name, self.server)
-
-        response = self.session.delete(url)
-
-        logger.debug("%s response code: %s %s",
-
-                     cmd_name, response.status_code, response.reason)
-
-
-
-        try:
-
-            response_json = response.json()
-
-        except ValueError as e:
-
-            response_json = None
-
-
-
-        if response.status_code != requests.codes.no_content:
-
-            logger.error("%s error: status=%s (%s) text=%s",
-
-                         cmd_name, response.status_code, response.reason,
-
-                         response.text)
-
-            raise RESTError(response.status_code, response.reason,
-
-                            response_json, response.text, cmd_name)
-
-
-
-        logger.debug("%s response = %s", cmd_name, response.text)
-
-
-
-    def update_client(self, realm_name, client):
-
-        id = client['id']
-
-        cmd_name = "update client {id} in realm '{realm}'".format(
-
-            id=client['clientId'], realm=realm_name)
-
-        url = CLIENT_REPRESENTATION_TEMPLATE.format(
-
-            server=self.server, realm=urlquote(realm_name),
-
-            id=urlquote(id))
-
-
-
-        logger.debug("%s on server %s", cmd_name, self.server)
-
-
-
-        response = self.session.put(url, json=client)
-
-        logger.debug("%s response code: %s %s",
-
-                     cmd_name, response.status_code, response.reason)
-
-
-
-        try:
-
-            response_json = response.json()
-
-        except ValueError as e:
-
-            response_json = None
-
-
-
-        if response.status_code != requests.codes.no_content:
-
-            logger.error("%s error: status=%s (%s) text=%s",
-
-                         cmd_name, response.status_code, response.reason,
-
-                         response.text)
-
-            raise RESTError(response.status_code, response.reason,
-
-                            response_json, response.text, cmd_name)
-
-
-
-        logger.debug("%s response = %s", cmd_name, response.text)
-
-
-
-
-
-    def update_client_attributes(self, realm_name, client, update_attrs):
-
-        client_id = client['clientId']
-
-        logger.debug("update client attrs: client_id=%s "
-
-        "current attrs=%s update=%s" % (client_id, client['attributes'],
-
-                                update_attrs))
-
-        client['attributes'].update(update_attrs)
-
-        logger.debug("update client attrs: client_id=%s "
-
-        "new attrs=%s" % (client_id, client['attributes']))
-
-        self.update_client(realm_name, client);
-
-
-
-
-
-    def update_client_by_name_attributes(self, realm_name, client_name,
-
-                                         update_attrs):
-
-        client = self.get_client_by_name(realm_name, client_name)
-
-        self.update_client_attributes(realm_name, client, update_attrs)
-
-
-
-    def new_saml_group_protocol_mapper(self, mapper_name, attribute_name,
-
-                                       friendly_name=None,
-
-                                       single_attribute=True):
-
-        mapper = {
-
-            'protocol': 'saml',
-
-            'name': mapper_name,
-
-            'protocolMapper': 'saml-group-membership-mapper',
-
-            'config': {
-
-                'attribute.name': attribute_name,
-
-                'attribute.nameformat': 'Basic',
-
-                'single': single_attribute,
-
-                'full.path': False,
-
-            },
-
-        }
-
-
-
-        if friendly_name:
-
-            mapper['config']['friendly.name'] = friendly_name
-
-
-
-        return mapper
-
-
-
-    def create_client_protocol_mapper(self, realm_name, client, mapper):
-
-        id = client['id']
-
-        cmd_name = ("create protocol-mapper '{mapper_name}' for client {id} "
-
-                    "in realm '{realm}'".format(
-
-                        mapper_name=mapper['name'],id=client['clientId'], realm=realm_name))
-
-        url = POST_CLIENT_PROTOCOL_MAPPER_TEMPLATE.format(
-
-            server=self.server,
-
-            realm=urlquote(realm_name),
-
-            id=urlquote(id))
-
-
-
-        logger.debug("%s on server %s", cmd_name, self.server)
-
-
-
-        response = self.session.post(url, json=mapper)
-
-        logger.debug("%s response code: %s %s",
-
-                     cmd_name, response.status_code, response.reason)
-
-
-
-        try:
-
-            response_json = response.json()
-
-        except ValueError as e:
-
-            response_json = None
-
-
-
-        if response.status_code != requests.codes.created:
-
-            logger.error("%s error: status=%s (%s) text=%s",
-
-                         cmd_name, response.status_code, response.reason,
-
-                         response.text)
-
-            raise RESTError(response.status_code, response.reason,
-
-                            response_json, response.text, cmd_name)
-
-
-
-        logger.debug("%s response = %s", cmd_name, response.text)
-
-
-
-
-
-    def create_client_by_name_protocol_mapper(self, realm_name, client_name,
-
-                                              mapper):
-
-        client = self.get_client_by_name(realm_name, client_name)
-
-        self.create_client_protocol_mapper(realm_name, client, mapper)
-
-
-
-
-
-
-
-    def add_client_by_name_redirect_uris(self, realm_name, client_name, uris):
-
-        client = self.get_client_by_name(realm_name, client_name)
-
-
-
-        uris = set(uris)
-
-        redirect_uris = set(client['redirectUris'])
-
-        redirect_uris |= uris
-
-        client['redirectUris'] = list(redirect_uris)
-
-        self.update_client(realm_name, client);
-
-
-
-    def remove_client_by_name_redirect_uris(self, realm_name, client_name, uris):
-
-        client = self.get_client_by_name(realm_name, client_name)
-
-
-
-        uris = set(uris)
-
-        redirect_uris = set(client['redirectUris'])
-
-        redirect_uris -= uris
-
-        client['redirectUris'] = list(redirect_uris)
-
-
-
-        self.update_client(realm_name, client);
-
-
-
-
-
-# ------------------------------------------------------------------------------
-
-
-
-
-
-class KeycloakAdminConnection(KeycloakREST):
-
-
-
-    def __init__(self, server, auth_role, realm, client_id,
-
-                 username, password, tls_verify):
-
-        super(KeycloakAdminConnection, self).__init__(server, auth_role)
-
-
-
-        self.realm = realm
-
-        self.client_id = client_id
-
-        self.username = username
-
-        self.password = password
-
-
-
-        self.session = self._create_session(tls_verify)
-
-
-
-    def _create_session(self, tls_verify):
-
-        token_url = TOKEN_URL_TEMPLATE.format(
-
-            server=self.server, realm=urlquote(self.realm))
-
-        refresh_url = token_url
-
-
-
-        client = LegacyApplicationClient(client_id=self.client_id)
-
-        session = OAuth2Session(client=client,
-
-                                auto_refresh_url=refresh_url,
-
-                                auto_refresh_kwargs={
-
-                                    'client_id': self.client_id})
-
-
-
-        session.verify = tls_verify
-
-        token = session.fetch_token(token_url=token_url,
-
-                                    username=self.username,
-
-                                    password=self.password,
-
-                                    client_id=self.client_id,
-
-                                    verify=session.verify)
-
-
-
-        return session
-
-
-
-
-
-class KeycloakAnonymousConnection(KeycloakREST):
-
-
-
-    def __init__(self, server, tls_verify):
-
-        super(KeycloakAnonymousConnection, self).__init__(server, 'anonymous')
-
-        self.session = self._create_session(tls_verify)
-
-
-
-
-
-    def _create_session(self, tls_verify):
-
-        session = requests.Session()
-
-        session.verify = tls_verify
-
-
-
-        return session
-
-
-
-# ------------------------------------------------------------------------------
-
-
-
-
-
-def do_server_info(options, conn):
-
-    server_info = conn.get_server_info()
-
-    print(json_pretty(server_info))
-
-
-
-
-
-def do_list_realms(options, conn):
-
-    realms = conn.get_realms()
-
-    realm_names = get_realm_names_from_realms(realms)
-
-    print('\n'.join(sorted(realm_names)))
-
-
-
-
-
-def do_create_realm(options, conn):
-
-    conn.create_realm(options.realm_name)
-
-
-
-
-
-def do_delete_realm(options, conn):
-
-    conn.delete_realm(options.realm_name)
-
-
-
-
-
-def do_get_realm_metadata(options, conn):
-
-    metadata = conn.get_realm_metadata(options.realm_name)
-
-    print(metadata)
-
-
-
-
-
-def do_list_clients(options, conn):
-
-    clients = conn.get_clients(options.realm_name)
-
-    client_ids = get_client_client_ids_from_clients(clients)
-
-    print('\n'.join(sorted(client_ids)))
-
-
-
-
-
-def do_create_client(options, conn):
-
-    metadata = options.metadata.read()
-
-    descriptor = conn.create_client(options.realm_name, metadata)
-
-
-
-
-
-def do_register_client(options, conn):
-
-    metadata = options.metadata.read()
-
-    client_representation = conn.register_client(
-
-        options.initial_access_token,
-
-        options.realm_name, metadata)
-
-
-
-
-
-def do_delete_client(options, conn):
-
-    conn.delete_client_by_name(options.realm_name, options.client_name)
-
-
-
-def do_client_test(options, conn):
-
-    'experimental test code used during development'
-
-
-
-    uri = 'https://openstack.jdennis.oslab.test:5000/v3/mellon/fooResponse'
-
-
-
-    conn.remove_client_by_name_redirect_uri(options.realm_name,
-
-                                            options.client_name,
-
-                                            uri)
-
-
-
-# ------------------------------------------------------------------------------
-
-
-
-verbose_help = '''
-
-
-
-The structure of the command line arguments is "noun verb" where noun
-
-is one of Keycloak's data items (e.g. realm, client, etc.) and the
-
-verb is an action to perform on the item. Each of the nouns and verbs
-
-may have their own set of arguments which must follow the noun or
-
-verb.
-
-
-
-For example to delete the client XYZ in the realm ABC:
-
-
-
-echo password | {prog_name} -s http://example.com:8080 -P - client delete -r ABC -c XYZ
-
-
-
-where 'client' is the noun, 'delete' is the verb and -r ABC -c XYZ are
-
-arguments to the delete action.
-
-
-
-If the command completes successfully the exit status is 0. The exit
-
-status is 1 if an authenticated connection with the server cannont be
-
-successfully established. The exit status is 2 if the REST operation
-
-fails.
-
-
-
-The server should be a scheme://hostname:port URL.
-
-'''
-
-
-
-
-
-class TlsVerifyAction(argparse.Action):
-
-    def __init__(self, option_strings, dest, nargs=None, **kwargs):
-
-        if nargs is not None:
-
-            raise ValueError("nargs not allowed")
-
-        super(TlsVerifyAction, self).__init__(option_strings, dest, **kwargs)
-
-
-
-    def __call__(self, parser, namespace, values, option_string=None):
-
-        if values.lower() in ['true', 'yes', 'on']:
-
-            verify = True
-
-        elif values.lower() in ['false', 'no', 'off']:
-
-            verify = False
-
-        else:
-
-            verify = values
-
-            
-
-        setattr(namespace, self.dest, verify)
-
-
-
-def main():
-
-    global logger
-
-    result = 0
-
-
-
-    parser = argparse.ArgumentParser(description='Keycloak REST client',
-
-                    prog=prog_name,
-
-                    epilog=verbose_help.format(prog_name=prog_name),
-
-                    formatter_class=argparse.RawDescriptionHelpFormatter)
-
-
-
-    parser.add_argument('-v', '--verbose', action='store_true',
-
-                        help='be chatty')
-
-
-
-    parser.add_argument('-d', '--debug', action='store_true',
-
-                        help='turn on debug info')
-
-
-
-    parser.add_argument('--show-traceback', action='store_true',
-
-                        help='exceptions print traceback in addition to '
-
-                             'error message')
-
-
-
-    parser.add_argument('--log-file',
-
-                        default='/tmp/{prog_name}.log'.format(
-
-                            prog_name=prog_name),
-
-                        help='log file pathname')
-
-
-
-    parser.add_argument('--permit-insecure-transport',  action='store_true',
-
-                        help='Normally secure transport such as TLS '
-
-                        'is required, defeat this check')
-
-
-
-    parser.add_argument('--tls-verify', action=TlsVerifyAction,
-
-                        default=True,
-
-                        help='TLS certificate verification for requests to'
-
-                        ' the server. May be one of case insenstive '
-
-                        '[true, yes, on] to enable,'
-
-                        '[false, no, off] to disable.'
-
-                        'Or the pathname to a OpenSSL CA bundle to use.'
-
-                        ' Default is True.')
-
-
-
-    group = parser.add_argument_group('Server')
-
-
-
-    group.add_argument('-s', '--server',
-
-                       required=True,
-
-                       help='DNS name or IP address of Keycloak server')
-
-
-
-    group.add_argument('-a', '--auth-role',
-
-                       choices=AUTH_ROLES,
-
-                       default='root-admin',
-
-                       help='authenticating as what type of user (default: root-admin)')
-
-
-
-    group.add_argument('-u', '--admin-username',
-
-                       default='admin',
-
-                       help='admin user name (default: admin)')
-
-
-
-    group.add_argument('-P', '--admin-password-file',
-
-                       type=argparse.FileType('rb'),
-
-                       help=('file containing admin password '
-
-                             '(or use a hyphen "-" to read the password '
-
-                             'from stdin)'))
-
-
-
-    group.add_argument('--admin-realm',
-
-                       default='master',
-
-                       help='realm admin belongs to')
-
-
-
-    cmd_parsers = parser.add_subparsers(help='available commands')
-
-
-
-    # --- realm commands ---
-
-    realm_parser = cmd_parsers.add_parser('realm',
-
-                                          help='realm operations')
-
-
-
-    sub_parser = realm_parser.add_subparsers(help='realm commands')
-
-
-
-    cmd_parser = sub_parser.add_parser('server_info',
-
-                                       help='dump server info')
-
-    cmd_parser.set_defaults(func=do_server_info)
-
-
-
-    cmd_parser = sub_parser.add_parser('list',
-
-                                       help='list realm names')
-
-    cmd_parser.set_defaults(func=do_list_realms)
-
-
-
-    cmd_parser = sub_parser.add_parser('create',
-
-                                       help='create new realm')
-
-    cmd_parser.add_argument('-r', '--realm-name', required=True,
-
-                            help='realm name')
-
-    cmd_parser.set_defaults(func=do_create_realm)
-
-
-
-    cmd_parser = sub_parser.add_parser('delete',
-
-                                       help='delete existing realm')
-
-    cmd_parser.add_argument('-r', '--realm-name', required=True,
-
-                            help='realm name')
-
-    cmd_parser.set_defaults(func=do_delete_realm)
-
-
-
-    cmd_parser = sub_parser.add_parser('metadata',
-
-                                       help='retrieve realm metadata')
-
-    cmd_parser.add_argument('-r', '--realm-name', required=True,
-
-                            help='realm name')
-
-    cmd_parser.set_defaults(func=do_get_realm_metadata)
-
-
-
-    # --- client commands ---
-
-    client_parser = cmd_parsers.add_parser('client',
-
-                                           help='client operations')
-
-
-
-    sub_parser = client_parser.add_subparsers(help='client commands')
-
-
-
-    cmd_parser = sub_parser.add_parser('list',
-
-                                       help='list client names')
-
-    cmd_parser.add_argument('-r', '--realm-name', required=True,
-
-                            help='realm name')
-
-
-
-    cmd_parser.set_defaults(func=do_list_clients)
-
-
-
-    cmd_parser = sub_parser.add_parser('create',
-
-                                       help='create new client')
-
-    cmd_parser.add_argument('-r', '--realm-name', required=True,
-
-                            help='realm name')
-
-    cmd_parser.add_argument('-m', '--metadata', type=argparse.FileType('rb'),
-
-                            required=True,
-
-                            help='SP metadata file or stdin')
-
-    cmd_parser.set_defaults(func=do_create_client)
-
-
-
-    cmd_parser = sub_parser.add_parser('register',
-
-                                       help='register new client')
-
-    cmd_parser.add_argument('-r', '--realm-name', required=True,
-
-                            help='realm name')
-
-    cmd_parser.add_argument('-m', '--metadata', type=argparse.FileType('rb'),
-
-                            required=True,
-
-                            help='SP metadata file or stdin')
-
-    cmd_parser.add_argument('--initial-access-token', required=True,
-
-                            help='realm initial access token for '
-
-                            'client registeration')
-
-    cmd_parser.set_defaults(func=do_register_client)
-
-
-
-    cmd_parser = sub_parser.add_parser('delete',
-
-                                       help='delete existing client')
-
-    cmd_parser.add_argument('-r', '--realm-name', required=True,
-
-                            help='realm name')
-
-    cmd_parser.add_argument('-c', '--client-name', required=True,
-
-                            help='client name')
-
-    cmd_parser.set_defaults(func=do_delete_client)
-
-
-
-    cmd_parser = sub_parser.add_parser('test',
-
-                                       help='experimental test used during '
-
-                                       'development')
-
-    cmd_parser.add_argument('-r', '--realm-name', required=True,
-
-                            help='realm name')
-
-    cmd_parser.add_argument('-c', '--client-name', required=True,
-
-                            help='client name')
-
-    cmd_parser.set_defaults(func=do_client_test)
-
-
-
-    # Process command line arguments
-
-    options = parser.parse_args()
-
-    configure_logging(options)
-
-
-
-    if options.permit_insecure_transport:
-
-        os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
-
-
-
-    # Get admin password
-
-    options.admin_password = None
-
-
-
-    # 1. Try password file
-
-    if options.admin_password_file is not None:
-
-        options.admin_password = options.keycloak_admin_password_file.readline().strip()
-
-        options.keycloak_admin_password_file.close()
-
-
-
-    # 2. Try KEYCLOAK_ADMIN_PASSWORD environment variable
-
-    if options.admin_password is None:
-
-        if (('KEYCLOAK_ADMIN_PASSWORD' in os.environ) and
-
-            (os.environ['KEYCLOAK_ADMIN_PASSWORD'])):
-
-            options.admin_password = os.environ['KEYCLOAK_ADMIN_PASSWORD']
-
-
-
-    try:
-
-        anonymous_conn = KeycloakAnonymousConnection(options.server,
-
-                                                     options.tls_verify)
-
-
-
-        admin_conn = KeycloakAdminConnection(options.server,
-
-                                             options.auth_role,
-
-                                             options.admin_realm,
-
-                                             ADMIN_CLIENT_ID,
-
-                                             options.admin_username,
-
-                                             options.admin_password,
-
-                                             options.tls_verify)
-
-    except Exception as e:
-
-        if options.show_traceback:
-
-            traceback.print_exc()
-
-        print(six.text_type(e), file=sys.stderr)
-
-        result = 1
-
-        return result
-
-
-
-    try:
-
-        if options.func == do_register_client:
-
-            conn = admin_conn
-
-        else:
-
-            conn = admin_conn
-
-        result = options.func(options, conn)
-
-    except Exception as e:
-
-        if options.show_traceback:
-
-            traceback.print_exc()
-
-        print(six.text_type(e), file=sys.stderr)
-
-        result = 2
-
-        return result
-
-
-
-    return result
-
-
-
-# ------------------------------------------------------------------------------
-
-
-
-if __name__ == '__main__':
-
-    sys.exit(main())
-
-else:
-
-    logger = logging.getLogger('keycloak-cli')
+  return signature

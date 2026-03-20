@@ -1,1759 +1,733 @@
 # Source: CVEFixes dataset
-# Safety: vulnerable
+# Safety: safe
 # Category: safe
 
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
+import json
 
+import os
 
+import re
 
-# Copyright 2012 OpenStack LLC
+import tempfile
 
-#
 
-# Licensed under the Apache License, Version 2.0 (the "License"); you may
 
-# not use this file except in compliance with the License. You may obtain
+import anchore_engine.configuration.localconfig
 
-# a copy of the License at
+from anchore_engine.utils import run_command, run_command_list, manifest_to_digest, AnchoreException
 
-#
+from anchore_engine.subsys import logger
 
-#      http://www.apache.org/licenses/LICENSE-2.0
+from anchore_engine.common.errors import AnchoreError
 
-#
 
-# Unless required by applicable law or agreed to in writing, software
 
-# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+def manifest_to_digest_shellout(rawmanifest):
 
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+    ret = None
 
-# License for the specific language governing permissions and limitations
+    tmpmanifest = None
 
-# under the License.
+    try:
 
+        fd,tmpmanifest = tempfile.mkstemp()
 
+        os.write(fd, rawmanifest.encode('utf-8'))
 
-import uuid
+        os.close(fd)
 
 
 
-import nose.exc
+        localconfig = anchore_engine.configuration.localconfig.get_config()
 
+        global_timeout = localconfig.get('skopeo_global_timeout', 0)
 
+        try:
 
-from keystone import test
+            global_timeout = int(global_timeout)
 
+            if global_timeout < 0:
 
+                global_timeout = 0
 
-import default_fixtures
+        except:
 
+            global_timeout = 0
 
 
-OPENSTACK_REPO = 'https://review.openstack.org/p/openstack'
 
-KEYSTONECLIENT_REPO = '%s/python-keystoneclient.git' % OPENSTACK_REPO
+        if global_timeout:
 
-
-
-
-
-class CompatTestCase(test.TestCase):
-
-    def setUp(self):
-
-        super(CompatTestCase, self).setUp()
-
-
-
-        revdir = test.checkout_vendor(*self.get_checkout())
-
-        self.add_path(revdir)
-
-        self.clear_module('keystoneclient')
-
-
-
-        self.load_backends()
-
-        self.load_fixtures(default_fixtures)
-
-
-
-        self.public_server = self.serveapp('keystone', name='main')
-
-        self.admin_server = self.serveapp('keystone', name='admin')
-
-
-
-        # TODO(termie): is_admin is being deprecated once the policy stuff
-
-        #               is all working
-
-        # TODO(termie): add an admin user to the fixtures and use that user
-
-        # override the fixtures, for now
-
-        self.metadata_foobar = self.identity_api.update_metadata(
-
-            self.user_foo['id'], self.tenant_bar['id'],
-
-            dict(roles=['keystone_admin'], is_admin='1'))
-
-
-
-    def tearDown(self):
-
-        self.public_server.kill()
-
-        self.admin_server.kill()
-
-        self.public_server = None
-
-        self.admin_server = None
-
-        super(CompatTestCase, self).tearDown()
-
-
-
-    def _public_url(self):
-
-        public_port = self.public_server.socket_info['socket'][1]
-
-        return "http://localhost:%s/v2.0" % public_port
-
-
-
-    def _admin_url(self):
-
-        admin_port = self.admin_server.socket_info['socket'][1]
-
-        return "http://localhost:%s/v2.0" % admin_port
-
-
-
-    def _client(self, admin=False, **kwargs):
-
-        from keystoneclient.v2_0 import client as ks_client
-
-
-
-        url = self._admin_url() if admin else self._public_url()
-
-        kc = ks_client.Client(endpoint=url,
-
-                              auth_url=self._public_url(),
-
-                              **kwargs)
-
-        kc.authenticate()
-
-        # have to manually overwrite the management url after authentication
-
-        kc.management_url = url
-
-        return kc
-
-
-
-    def get_client(self, user_ref=None, tenant_ref=None, admin=False):
-
-        if user_ref is None:
-
-            user_ref = self.user_foo
-
-        if tenant_ref is None:
-
-            for user in default_fixtures.USERS:
-
-                if user['id'] == user_ref['id']:
-
-                    tenant_id = user['tenants'][0]
+            global_timeout_str = "--command-timeout {}s".format(global_timeout)
 
         else:
 
-            tenant_id = tenant_ref['id']
+            global_timeout_str = ""
 
 
 
-        return self._client(username=user_ref['name'],
+        cmd = "skopeo {} manifest-digest {}".format(global_timeout_str, tmpmanifest)
 
-                            password=user_ref['password'],
+        rc, sout, serr = run_command(cmd)
 
-                            tenant_id=tenant_id,
+        if rc == 0 and re.match("^sha256:.*", str(sout, 'utf-8')):
 
-                            admin=admin)
+            ret = sout.strip()
 
+        else:
 
+            logger.warn("failed to calculate digest from schema v1 manifest: cmd={} rc={} sout={} serr={}".format(cmd, rc, sout, serr))
 
+            raise SkopeoError(cmd=cmd, rc=rc, err=serr, out=sout, msg='Failed to calculate digest from schema v1 manifest', )
 
+    except Exception as err:
 
-class KeystoneClientTests(object):
+        raise err
 
-    """Tests for all versions of keystoneclient."""
+    finally:
 
+        if tmpmanifest:
 
+            os.remove(tmpmanifest)
 
-    def test_authenticate_tenant_name_and_tenants(self):
 
-        client = self.get_client()
 
-        tenants = client.tenants.list()
+    return(ret)
 
-        self.assertEquals(tenants[0].id, self.tenant_bar['id'])
 
 
+def copy_image_from_docker_archive(source_archive, dest_dir):
 
-    def test_authenticate_tenant_id_and_tenants(self):
+    cmdstr = "skopeo copy docker-archive:{} oci:{}:image".format(source_archive, dest_dir)
 
-        client = self._client(username=self.user_foo['name'],
+    cmd = cmdstr.split()
 
-                              password=self.user_foo['password'],
+    try:
 
-                              tenant_id='bar')
+        rc, sout, serr = run_command_list(cmd)
 
-        tenants = client.tenants.list()
+        if rc != 0:
 
-        self.assertEquals(tenants[0].id, self.tenant_bar['id'])
+            raise SkopeoError(cmd=cmd, rc=rc, out=sout, err=serr)
 
+        else:
 
+            logger.debug("command succeeded: cmd="+str(cmdstr)+" stdout="+str(sout).strip()+" stderr="+str(serr).strip())
 
-    def test_authenticate_invalid_tenant_id(self):
 
-        from keystoneclient import exceptions as client_exceptions
 
-        self.assertRaises(client_exceptions.Unauthorized,
+    except Exception as err:
 
-                          self._client,
+        logger.error("command failed with exception - " + str(err))
 
-                          username=self.user_foo['name'],
+        raise err
 
-                          password=self.user_foo['password'],
 
-                          tenant_id='baz')
 
+def download_image(fulltag, copydir, user=None, pw=None, verify=True, manifest=None, parent_manifest=None, use_cache_dir=None, dest_type='oci'):
 
+    try:
 
-    def test_authenticate_token_no_tenant(self):
+        proc_env = os.environ.copy()
 
-        client = self.get_client()
+        if user and pw:
 
-        token = client.auth_token
+            proc_env['SKOPUSER'] = user
 
-        token_client = self._client(token=token)
+            proc_env['SKOPPASS'] = pw
 
-        tenants = token_client.tenants.list()
+            credstr = '--src-creds \"${SKOPUSER}\":\"${SKOPPASS}\"'
 
-        self.assertEquals(tenants[0].id, self.tenant_bar['id'])
+        else:
 
+            credstr = ""
 
 
-    def test_authenticate_token_tenant_id(self):
 
-        client = self.get_client()
+        if verify:
 
-        token = client.auth_token
+            tlsverifystr = "--src-tls-verify=true"
 
-        token_client = self._client(token=token, tenant_id='bar')
+        else:
 
-        tenants = token_client.tenants.list()
+            tlsverifystr = "--src-tls-verify=false"
 
-        self.assertEquals(tenants[0].id, self.tenant_bar['id'])
 
 
+        if use_cache_dir and os.path.exists(use_cache_dir):
 
-    def test_authenticate_token_invalid_tenant_id(self):
+            cachestr = "--dest-shared-blob-dir " + use_cache_dir
 
-        from keystoneclient import exceptions as client_exceptions
+        else:
 
-        client = self.get_client()
+            cachestr = ""
 
-        token = client.auth_token
 
-        self.assertRaises(client_exceptions.AuthorizationFailure,
 
-                          self._client, token=token, tenant_id='baz')
+        localconfig = anchore_engine.configuration.localconfig.get_config()
 
+        global_timeout = localconfig.get('skopeo_global_timeout', 0)
 
+        try:
 
-    def test_authenticate_token_tenant_name(self):
+            global_timeout = int(global_timeout)
 
-        client = self.get_client()
+            if global_timeout < 0:
 
-        token = client.auth_token
+                global_timeout = 0
 
-        token_client = self._client(token=token, tenant_name='BAR')
+        except:
 
-        tenants = token_client.tenants.list()
+            global_timeout = 0
 
-        self.assertEquals(tenants[0].id, self.tenant_bar['id'])
 
-        self.assertEquals(tenants[0].id, self.tenant_bar['id'])
 
+        if global_timeout:
 
+            global_timeout_str = "--command-timeout {}s".format(global_timeout)
 
-    def test_authenticate_and_delete_token(self):
+        else:
 
-        from keystoneclient import exceptions as client_exceptions
+            global_timeout_str = ""
 
 
 
-        client = self.get_client(admin=True)
+        os_overrides = [""]
 
-        token = client.auth_token
+        if manifest:
 
-        token_client = self._client(token=token)
+            manifest_data = json.loads(manifest)
 
-        tenants = token_client.tenants.list()
 
-        self.assertEquals(tenants[0].id, self.tenant_bar['id'])
 
+            # skopeo doesn't support references in manifests for copy/download operations, with oci dest type - if found, override with dir dest_type
 
+            for l in manifest_data.get('layers', []):
 
-        client.tokens.delete(token_client.auth_token)
+                if 'foreign.diff' in l.get('mediaType', ""):
 
+                    dest_type = 'dir'
 
 
-        self.assertRaises(client_exceptions.Unauthorized,
 
-                          token_client.tenants.list)
+            if parent_manifest:
 
+                parent_manifest_data = json.loads(parent_manifest)
 
+            else:
 
-    def test_authenticate_no_password(self):
+                parent_manifest_data = {}
 
-        from keystoneclient import exceptions as client_exceptions
 
 
+            if parent_manifest_data:
 
-        user_ref = self.user_foo.copy()
+                for mlist in parent_manifest_data.get('manifests', []):
 
-        user_ref['password'] = None
+                    imageos = mlist.get('platform', {}).get('os', "")
 
-        self.assertRaises(client_exceptions.AuthorizationFailure,
+                    if imageos not in ["", 'linux']:
 
-                          self.get_client,
+                        # add a windows os override to the list of override attempts, to complete the options that are supported by skopeo
 
-                          user_ref)
+                        dest_type = 'dir'
 
+                        os_overrides.insert(0, "windows")
 
+                        break
 
-    def test_authenticate_no_username(self):
 
-        from keystoneclient import exceptions as client_exceptions
 
+        for os_override in os_overrides:
 
+            success = False
 
-        user_ref = self.user_foo.copy()
+            if os_override not in ["", 'linux']:
 
-        user_ref['name'] = None
+                dest_type = 'dir'
 
-        self.assertRaises(client_exceptions.AuthorizationFailure,
+                os_override_str = "--override-os {}".format(os_override)
 
-                          self.get_client,
+            else:
 
-                          user_ref)
+                os_override_str = ""
 
+                
 
+            if dest_type == 'oci':
 
-    # FIXME(ja): this test should require the "keystone:admin" roled
+                if manifest:
 
-    #            (probably the role set via --keystone_admin_role flag)
+                    with open(os.path.join(copydir, "manifest.json"), 'w') as OFH:
 
-    # FIXME(ja): add a test that admin endpoint is only sent to admin user
+                        OFH.write(manifest)
 
-    # FIXME(ja): add a test that admin endpoint returns unauthorized if not
 
-    #            admin
 
-    def test_tenant_create_update_and_delete(self):
+                if parent_manifest:
 
-        from keystoneclient import exceptions as client_exceptions
+                    with open(os.path.join(copydir, "parent_manifest.json"), 'w') as OFH:
 
+                        OFH.write(parent_manifest)
 
+                        
 
-        tenant_name = 'original_tenant'
+                cmd = ["/bin/sh", "-c", "skopeo {} {} copy {} {} {} docker://{} oci:{}:image".format(os_override_str, global_timeout_str, tlsverifystr, credstr, cachestr, fulltag, copydir)]
 
-        tenant_description = 'My original tenant!'
+            else:
 
-        tenant_enabled = True
+                cmd = ["/bin/sh", "-c", "skopeo {} {} copy {} {} docker://{} dir:{}".format(os_override_str, global_timeout_str, tlsverifystr, credstr, fulltag, copydir)]
 
-        client = self.get_client(admin=True)
 
 
+            cmdstr = ' '.join(cmd)
 
-        # create, get, and list a tenant
+            try:
 
-        tenant = client.tenants.create(tenant_name=tenant_name,
+                rc, sout, serr = run_command_list(cmd, env=proc_env)
 
-                                       description=tenant_description,
+                if rc != 0:
 
-                                       enabled=tenant_enabled)
+                    skopeo_error = SkopeoError(cmd=cmd, rc=rc, out=sout, err=serr)
 
-        self.assertEquals(tenant.name, tenant_name)
+                    if skopeo_error.error_code != AnchoreError.OSARCH_MISMATCH.name:
 
-        self.assertEquals(tenant.description, tenant_description)
+                        raise SkopeoError(cmd=cmd, rc=rc, out=sout, err=serr)                    
 
-        self.assertEquals(tenant.enabled, tenant_enabled)
+                else:
 
+                    logger.debug("command succeeded: cmd="+str(cmdstr)+" stdout="+str(sout).strip()+" stderr="+str(serr).strip())
 
+                    success = True                    
 
-        tenant = client.tenants.get(tenant_id=tenant.id)
 
-        self.assertEquals(tenant.name, tenant_name)
 
-        self.assertEquals(tenant.description, tenant_description)
+            except Exception as err:
 
-        self.assertEquals(tenant.enabled, tenant_enabled)
+                logger.error("command failed with exception - " + str(err))
 
+                raise err
 
 
-        tenant = [t for t in client.tenants.list() if t.id == tenant.id].pop()
 
-        self.assertEquals(tenant.name, tenant_name)
-
-        self.assertEquals(tenant.description, tenant_description)
-
-        self.assertEquals(tenant.enabled, tenant_enabled)
-
-
-
-        # update, get, and list a tenant
-
-        tenant_name = 'updated_tenant'
-
-        tenant_description = 'Updated tenant!'
-
-        tenant_enabled = False
-
-        tenant = client.tenants.update(tenant_id=tenant.id,
-
-                                       tenant_name=tenant_name,
-
-                                       enabled=tenant_enabled,
-
-                                       description=tenant_description)
-
-        self.assertEquals(tenant.name, tenant_name)
-
-        self.assertEquals(tenant.description, tenant_description)
-
-        self.assertEquals(tenant.enabled, tenant_enabled)
-
-
-
-        tenant = client.tenants.get(tenant_id=tenant.id)
-
-        self.assertEquals(tenant.name, tenant_name)
-
-        self.assertEquals(tenant.description, tenant_description)
-
-        self.assertEquals(tenant.enabled, tenant_enabled)
-
-
-
-        tenant = [t for t in client.tenants.list() if t.id == tenant.id].pop()
-
-        self.assertEquals(tenant.name, tenant_name)
-
-        self.assertEquals(tenant.description, tenant_description)
-
-        self.assertEquals(tenant.enabled, tenant_enabled)
-
-
-
-        # delete, get, and list a tenant
-
-        client.tenants.delete(tenant=tenant.id)
-
-        self.assertRaises(client_exceptions.NotFound, client.tenants.get,
-
-                          tenant.id)
-
-        self.assertFalse([t for t in client.tenants.list()
-
-                           if t.id == tenant.id])
-
-
-
-    def test_tenant_delete_404(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-        client = self.get_client(admin=True)
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.tenants.delete,
-
-                          tenant=uuid.uuid4().hex)
-
-
-
-    def test_tenant_get_404(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-        client = self.get_client(admin=True)
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.tenants.get,
-
-                          tenant_id=uuid.uuid4().hex)
-
-
-
-    def test_tenant_update_404(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-        client = self.get_client(admin=True)
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.tenants.update,
-
-                          tenant_id=uuid.uuid4().hex)
-
-
-
-    def test_tenant_list(self):
-
-        client = self.get_client()
-
-        tenants = client.tenants.list()
-
-        self.assertEquals(len(tenants), 1)
-
-
-
-        # Admin endpoint should return *all* tenants
-
-        client = self.get_client(admin=True)
-
-        tenants = client.tenants.list()
-
-        self.assertEquals(len(tenants), len(default_fixtures.TENANTS))
-
-
-
-    def test_invalid_password(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-
-
-        good_client = self._client(username=self.user_foo['name'],
-
-                                   password=self.user_foo['password'])
-
-        good_client.tenants.list()
-
-
-
-        self.assertRaises(client_exceptions.Unauthorized,
-
-                          self._client,
-
-                          username=self.user_foo['name'],
-
-                          password='invalid')
-
-
-
-    def test_invalid_user_password(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-
-
-        self.assertRaises(client_exceptions.Unauthorized,
-
-                          self._client,
-
-                          username='blah',
-
-                          password='blah')
-
-
-
-    def test_user_create_update_delete(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-
-
-        test_username = 'new_user'
-
-        client = self.get_client(admin=True)
-
-        user = client.users.create(name=test_username,
-
-                                   password='password',
-
-                                   email='user1@test.com')
-
-        self.assertEquals(user.name, test_username)
-
-
-
-        user = client.users.get(user=user.id)
-
-        self.assertEquals(user.name, test_username)
-
-
-
-        user = client.users.update(user=user,
-
-                                   name=test_username,
-
-                                   email='user2@test.com')
-
-        self.assertEquals(user.email, 'user2@test.com')
-
-
-
-        # NOTE(termie): update_enabled doesn't return anything, probably a bug
-
-        client.users.update_enabled(user=user, enabled=False)
-
-        user = client.users.get(user.id)
-
-        self.assertFalse(user.enabled)
-
-
-
-        self.assertRaises(client_exceptions.AuthorizationFailure,
-
-                  self._client,
-
-                  username=test_username,
-
-                  password='password')
-
-        client.users.update_enabled(user, True)
-
-
-
-        user = client.users.update_password(user=user, password='password2')
-
-
-
-        self._client(username=test_username,
-
-                     password='password2')
-
-
-
-        user = client.users.update_tenant(user=user, tenant='bar')
-
-        # TODO(ja): once keystonelight supports default tenant
-
-        #           when you login without specifying tenant, the
-
-        #           token should be scoped to tenant 'bar'
-
-
-
-        client.users.delete(user.id)
-
-        self.assertRaises(client_exceptions.NotFound, client.users.get,
-
-                          user.id)
-
-
-
-        # Test creating a user with a tenant (auto-add to tenant)
-
-        user2 = client.users.create(name=test_username,
-
-                                    password='password',
-
-                                    email='user1@test.com',
-
-                                    tenant_id='bar')
-
-        self.assertEquals(user2.name, test_username)
-
-
-
-    def test_user_create_404(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-        client = self.get_client(admin=True)
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.users.create,
-
-                          name=uuid.uuid4().hex,
-
-                          password=uuid.uuid4().hex,
-
-                          email=uuid.uuid4().hex,
-
-                          tenant_id=uuid.uuid4().hex)
-
-
-
-    def test_user_get_404(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-        client = self.get_client(admin=True)
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.users.get,
-
-                          user=uuid.uuid4().hex)
-
-
-
-    def test_user_list_404(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-        client = self.get_client(admin=True)
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.users.list,
-
-                          tenant_id=uuid.uuid4().hex)
-
-
-
-    def test_user_update_404(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-        client = self.get_client(admin=True)
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.users.update,
-
-                          user=uuid.uuid4().hex)
-
-
-
-    def test_user_update_tenant_404(self):
-
-        raise nose.exc.SkipTest('N/A')
-
-        from keystoneclient import exceptions as client_exceptions
-
-        client = self.get_client(admin=True)
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.users.update,
-
-                          user=self.user_foo['id'],
-
-                          tenant_id=uuid.uuid4().hex)
-
-
-
-    def test_user_update_password_404(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-        client = self.get_client(admin=True)
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.users.update_password,
-
-                          user=uuid.uuid4().hex,
-
-                          password=uuid.uuid4().hex)
-
-
-
-    def test_user_delete_404(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-        client = self.get_client(admin=True)
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.users.delete,
-
-                          user=uuid.uuid4().hex)
-
-
-
-    def test_user_list(self):
-
-        client = self.get_client(admin=True)
-
-        users = client.users.list()
-
-        self.assertTrue(len(users) > 0)
-
-        user = users[0]
-
-        self.assertRaises(AttributeError, lambda: user.password)
-
-
-
-    def test_user_get(self):
-
-        client = self.get_client(admin=True)
-
-        user = client.users.get(user=self.user_foo['id'])
-
-        self.assertRaises(AttributeError, lambda: user.password)
-
-
-
-    def test_role_get(self):
-
-        client = self.get_client(admin=True)
-
-        role = client.roles.get(role='keystone_admin')
-
-        self.assertEquals(role.id, 'keystone_admin')
-
-
-
-    def test_role_crud(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-
-
-        test_role = 'new_role'
-
-        client = self.get_client(admin=True)
-
-        role = client.roles.create(name=test_role)
-
-        self.assertEquals(role.name, test_role)
-
-
-
-        role = client.roles.get(role=role.id)
-
-        self.assertEquals(role.name, test_role)
-
-
-
-        client.roles.delete(role=role.id)
-
-
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.roles.delete,
-
-                          role=role.id)
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.roles.get,
-
-                          role=role.id)
-
-
-
-    def test_role_get_404(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-        client = self.get_client(admin=True)
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.roles.get,
-
-                          role=uuid.uuid4().hex)
-
-
-
-    def test_role_delete_404(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-        client = self.get_client(admin=True)
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.roles.delete,
-
-                          role=uuid.uuid4().hex)
-
-
-
-    def test_role_list_404(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-        client = self.get_client(admin=True)
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.roles.roles_for_user,
-
-                          user=uuid.uuid4().hex,
-
-                          tenant=uuid.uuid4().hex)
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.roles.roles_for_user,
-
-                          user=self.user_foo['id'],
-
-                          tenant=uuid.uuid4().hex)
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.roles.roles_for_user,
-
-                          user=uuid.uuid4().hex,
-
-                          tenant=self.tenant_bar['id'])
-
-
-
-    def test_role_list(self):
-
-        client = self.get_client(admin=True)
-
-        roles = client.roles.list()
-
-        # TODO(devcamcar): This assert should be more specific.
-
-        self.assertTrue(len(roles) > 0)
-
-
-
-    def test_ec2_credential_crud(self):
-
-        client = self.get_client()
-
-        creds = client.ec2.list(user_id=self.user_foo['id'])
-
-        self.assertEquals(creds, [])
-
-
-
-        cred = client.ec2.create(user_id=self.user_foo['id'],
-
-                                 tenant_id=self.tenant_bar['id'])
-
-        creds = client.ec2.list(user_id=self.user_foo['id'])
-
-        self.assertEquals(creds, [cred])
-
-
-
-        got = client.ec2.get(user_id=self.user_foo['id'], access=cred.access)
-
-        self.assertEquals(cred, got)
-
-
-
-        client.ec2.delete(user_id=self.user_foo['id'], access=cred.access)
-
-        creds = client.ec2.list(user_id=self.user_foo['id'])
-
-        self.assertEquals(creds, [])
-
-
-
-    def test_ec2_credentials_create_404(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-        client = self.get_client()
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.ec2.create,
-
-                          user_id=uuid.uuid4().hex,
-
-                          tenant_id=self.tenant_bar['id'])
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.ec2.create,
-
-                          user_id=self.user_foo['id'],
-
-                          tenant_id=uuid.uuid4().hex)
-
-
-
-    def test_ec2_credentials_delete_404(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-        client = self.get_client()
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.ec2.delete,
-
-                          user_id=uuid.uuid4().hex,
-
-                          access=uuid.uuid4().hex)
-
-
-
-    def test_ec2_credentials_get_404(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-        client = self.get_client()
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.ec2.get,
-
-                          user_id=uuid.uuid4().hex,
-
-                          access=uuid.uuid4().hex)
-
-
-
-    def test_ec2_credentials_list_404(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-        client = self.get_client()
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.ec2.list,
-
-                          user_id=uuid.uuid4().hex)
-
-
-
-    def test_ec2_credentials_list_user_forbidden(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-
-
-        two = self.get_client(self.user_two)
-
-        self.assertRaises(client_exceptions.Forbidden, two.ec2.list,
-
-                          user_id=self.user_foo['id'])
-
-
-
-    def test_ec2_credentials_get_user_forbidden(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-
-
-        foo = self.get_client()
-
-        cred = foo.ec2.create(user_id=self.user_foo['id'],
-
-                              tenant_id=self.tenant_bar['id'])
-
-
-
-        two = self.get_client(self.user_two)
-
-        self.assertRaises(client_exceptions.Forbidden, two.ec2.get,
-
-                          user_id=self.user_foo['id'], access=cred.access)
-
-
-
-        foo.ec2.delete(user_id=self.user_foo['id'], access=cred.access)
-
-
-
-    def test_ec2_credentials_delete_user_forbidden(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-
-
-        foo = self.get_client()
-
-        cred = foo.ec2.create(user_id=self.user_foo['id'],
-
-                              tenant_id=self.tenant_bar['id'])
-
-
-
-        two = self.get_client(self.user_two)
-
-        self.assertRaises(client_exceptions.Forbidden, two.ec2.delete,
-
-                          user_id=self.user_foo['id'], access=cred.access)
-
-
-
-        foo.ec2.delete(user_id=self.user_foo['id'], access=cred.access)
-
-
-
-    def test_service_create_and_delete(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-
-
-        test_service = 'new_service'
-
-        client = self.get_client(admin=True)
-
-        service = client.services.create(name=test_service,
-
-                                         service_type='test',
-
-                                         description='test')
-
-        self.assertEquals(service.name, test_service)
-
-
-
-        service = client.services.get(id=service.id)
-
-        self.assertEquals(service.name, test_service)
-
-
-
-        client.services.delete(id=service.id)
-
-        self.assertRaises(client_exceptions.NotFound, client.services.get,
-
-                          id=service.id)
-
-
-
-    def test_service_list(self):
-
-        client = self.get_client(admin=True)
-
-        test_service = 'new_service'
-
-        service = client.services.create(name=test_service,
-
-                                         service_type='test',
-
-                                         description='test')
-
-        services = client.services.list()
-
-        # TODO(devcamcar): This assert should be more specific.
-
-        self.assertTrue(len(services) > 0)
-
-
-
-    def test_service_delete_404(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-        client = self.get_client(admin=True)
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.services.delete,
-
-                          id=uuid.uuid4().hex)
-
-
-
-    def test_service_get_404(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-        client = self.get_client(admin=True)
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.services.get,
-
-                          id=uuid.uuid4().hex)
-
-
-
-    def test_endpoint_create_404(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-        client = self.get_client(admin=True)
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.endpoints.create,
-
-                          region=uuid.uuid4().hex,
-
-                          service_id=uuid.uuid4().hex,
-
-                          publicurl=uuid.uuid4().hex,
-
-                          adminurl=uuid.uuid4().hex,
-
-                          internalurl=uuid.uuid4().hex)
-
-
-
-    def test_endpoint_delete_404(self):
-
-        # the catalog backend is expected to return Not Implemented
-
-        from keystoneclient import exceptions as client_exceptions
-
-        client = self.get_client(admin=True)
-
-        self.assertRaises(client_exceptions.HTTPNotImplemented,
-
-                          client.endpoints.delete,
-
-                          id=uuid.uuid4().hex)
-
-
-
-    def test_admin_requires_adminness(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-        # FIXME(ja): this should be Unauthorized
-
-        exception = client_exceptions.ClientException
-
-
-
-        two = self.get_client(self.user_two, admin=True)  # non-admin user
-
-
-
-        # USER CRUD
-
-        self.assertRaises(exception,
-
-                          two.users.list)
-
-        self.assertRaises(exception,
-
-                          two.users.get,
-
-                          user=self.user_two['id'])
-
-        self.assertRaises(exception,
-
-                          two.users.create,
-
-                          name='oops',
-
-                          password='password',
-
-                          email='oops@test.com')
-
-        self.assertRaises(exception,
-
-                          two.users.delete,
-
-                          user=self.user_foo['id'])
-
-
-
-        # TENANT CRUD
-
-        self.assertRaises(exception,
-
-                          two.tenants.list)
-
-        self.assertRaises(exception,
-
-                          two.tenants.get,
-
-                          tenant_id=self.tenant_bar['id'])
-
-        self.assertRaises(exception,
-
-                          two.tenants.create,
-
-                          tenant_name='oops',
-
-                          description="shouldn't work!",
-
-                          enabled=True)
-
-        self.assertRaises(exception,
-
-                          two.tenants.delete,
-
-                          tenant=self.tenant_baz['id'])
-
-
-
-        # ROLE CRUD
-
-        self.assertRaises(exception,
-
-                          two.roles.get,
-
-                          role='keystone_admin')
-
-        self.assertRaises(exception,
-
-                          two.roles.list)
-
-        self.assertRaises(exception,
-
-                          two.roles.create,
-
-                          name='oops')
-
-        self.assertRaises(exception,
-
-                          two.roles.delete,
-
-                          role='keystone_admin')
-
-
-
-        # TODO(ja): MEMBERSHIP CRUD
-
-        # TODO(ja): determine what else todo
-
-
-
-
-
-class KcMasterTestCase(CompatTestCase, KeystoneClientTests):
-
-    def get_checkout(self):
-
-        return KEYSTONECLIENT_REPO, 'master'
-
-
-
-    def test_tenant_add_and_remove_user(self):
-
-        client = self.get_client(admin=True)
-
-        client.roles.add_user_role(tenant=self.tenant_baz['id'],
-
-                                   user=self.user_foo['id'],
-
-                                   role=self.role_useless['id'])
-
-        user_refs = client.tenants.list_users(tenant=self.tenant_baz['id'])
-
-        self.assert_(self.user_foo['id'] in [x.id for x in user_refs])
-
-        client.roles.remove_user_role(tenant=self.tenant_baz['id'],
-
-                                      user=self.user_foo['id'],
-
-                                      role=self.role_useless['id'])
-
-        user_refs = client.tenants.list_users(tenant=self.tenant_baz['id'])
-
-        self.assert_(self.user_foo['id'] not in [x.id for x in user_refs])
-
-
-
-    def test_user_role_add_404(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-        client = self.get_client(admin=True)
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.roles.add_user_role,
-
-                          tenant=uuid.uuid4().hex,
-
-                          user=self.user_foo['id'],
-
-                          role=self.role_useless['id'])
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.roles.add_user_role,
-
-                          tenant=self.tenant_baz['id'],
-
-                          user=uuid.uuid4().hex,
-
-                          role=self.role_useless['id'])
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.roles.add_user_role,
-
-                          tenant=self.tenant_baz['id'],
-
-                          user=self.user_foo['id'],
-
-                          role=uuid.uuid4().hex)
-
-
-
-    def test_user_role_remove_404(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-        client = self.get_client(admin=True)
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.roles.remove_user_role,
-
-                          tenant=uuid.uuid4().hex,
-
-                          user=self.user_foo['id'],
-
-                          role=self.role_useless['id'])
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.roles.remove_user_role,
-
-                          tenant=self.tenant_baz['id'],
-
-                          user=uuid.uuid4().hex,
-
-                          role=self.role_useless['id'])
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.roles.remove_user_role,
-
-                          tenant=self.tenant_baz['id'],
-
-                          user=self.user_foo['id'],
-
-                          role=uuid.uuid4().hex)
-
-        self.assertRaises(client_exceptions.NotFound,
-
-                          client.roles.remove_user_role,
-
-                          tenant=self.tenant_baz['id'],
-
-                          user=self.user_foo['id'],
-
-                          role=self.role_useless['id'])
-
-
-
-    def test_tenant_list_marker(self):
-
-        client = self.get_client()
-
-
-
-        # Add two arbitrary tenants to user for testing purposes
-
-        for i in range(2):
-
-            tenant_id = uuid.uuid4().hex
-
-            tenant = {'name': 'tenant-%s' % tenant_id, 'id': tenant_id}
-
-            self.identity_api.create_tenant(tenant_id, tenant)
-
-            self.identity_api.add_user_to_tenant(tenant_id,
-
-                                                 self.user_foo['id'])
-
-
-
-        tenants = client.tenants.list()
-
-        self.assertEqual(len(tenants), 3)
-
-
-
-        tenants_marker = client.tenants.list(marker=tenants[0].id)
-
-        self.assertEqual(len(tenants_marker), 2)
-
-        self.assertEqual(tenants[1].name, tenants_marker[0].name)
-
-        self.assertEqual(tenants[2].name, tenants_marker[1].name)
-
-
-
-    def test_tenant_list_marker_not_found(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-
-
-        client = self.get_client()
-
-        self.assertRaises(client_exceptions.BadRequest,
-
-                          client.tenants.list, marker=uuid.uuid4().hex)
-
-
-
-    def test_tenant_list_limit(self):
-
-        client = self.get_client()
-
-
-
-        # Add two arbitrary tenants to user for testing purposes
-
-        for i in range(2):
-
-            tenant_id = uuid.uuid4().hex
-
-            tenant = {'name': 'tenant-%s' % tenant_id, 'id': tenant_id}
-
-            self.identity_api.create_tenant(tenant_id, tenant)
-
-            self.identity_api.add_user_to_tenant(tenant_id,
-
-                                                 self.user_foo['id'])
-
-
-
-        tenants = client.tenants.list()
-
-        self.assertEqual(len(tenants), 3)
-
-
-
-        tenants_limited = client.tenants.list(limit=2)
-
-        self.assertEqual(len(tenants_limited), 2)
-
-        self.assertEqual(tenants[0].name, tenants_limited[0].name)
-
-        self.assertEqual(tenants[1].name, tenants_limited[1].name)
-
-
-
-    def test_tenant_list_limit_bad_value(self):
-
-        from keystoneclient import exceptions as client_exceptions
-
-
-
-        client = self.get_client()
-
-        self.assertRaises(client_exceptions.BadRequest,
-
-                          client.tenants.list, limit='a')
-
-        self.assertRaises(client_exceptions.BadRequest,
-
-                          client.tenants.list, limit=-1)
-
-
-
-    def test_roles_get_by_user(self):
-
-        client = self.get_client(admin=True)
-
-        roles = client.roles.roles_for_user(user=self.user_foo['id'],
-
-                                            tenant=self.tenant_bar['id'])
-
-        self.assertTrue(len(roles) > 0)
-
-
-
-
-
-class KcEssex3TestCase(CompatTestCase, KeystoneClientTests):
-
-    def get_checkout(self):
-
-        return KEYSTONECLIENT_REPO, 'essex-3'
-
-
-
-    def test_tenant_add_and_remove_user(self):
-
-        client = self.get_client(admin=True)
-
-        client.roles.add_user_to_tenant(tenant_id=self.tenant_baz['id'],
-
-                                        user_id=self.user_foo['id'],
-
-                                        role_id=self.role_useless['id'])
-
-        role_refs = client.roles.get_user_role_refs(
-
-                user_id=self.user_foo['id'])
-
-        self.assert_(self.tenant_baz['id'] in [x.tenantId for x in role_refs])
-
-
-
-        # get the "role_refs" so we get the proper id, this is how the clients
-
-        # do it
-
-        roleref_refs = client.roles.get_user_role_refs(
-
-                user_id=self.user_foo['id'])
-
-        for roleref_ref in roleref_refs:
-
-            if (roleref_ref.roleId == self.role_useless['id']
-
-                and roleref_ref.tenantId == self.tenant_baz['id']):
-
-                # use python's scope fall through to leave roleref_ref set
+            if success:
 
                 break
 
+        if not success:
 
+            logger.error("could not download image")
 
-        client.roles.remove_user_from_tenant(tenant_id=self.tenant_baz['id'],
+            raise Exception("could not download image")
 
-                                             user_id=self.user_foo['id'],
+    except Exception as err:
 
-                                             role_id=roleref_ref.id)
+        raise err
 
 
 
-        role_refs = client.roles.get_user_role_refs(
+    return(True)
 
-                user_id=self.user_foo['id'])
 
-        self.assert_(self.tenant_baz['id'] not in
 
-                     [x.tenantId for x in role_refs])
+def get_repo_tags_skopeo(url, registry, repo, user=None, pw=None, verify=None, lookuptag=None):
 
+    try:
 
+        proc_env = os.environ.copy()
 
-    def test_roles_get_by_user(self):
+        if user and pw:
 
-        client = self.get_client(admin=True)
+            proc_env['SKOPUSER'] = user
 
-        roles = client.roles.get_user_role_refs(user_id='foo')
+            proc_env['SKOPPASS'] = pw
 
-        self.assertTrue(len(roles) > 0)
+            credstr = '--creds \"${SKOPUSER}\":\"${SKOPPASS}\"'
 
+        else:
 
+            credstr = ""
 
-    def test_role_list_404(self):
 
-        raise nose.exc.SkipTest('N/A')
 
+        if verify:
 
+            tlsverifystr = "--tls-verify=true"
 
-    def test_authenticate_and_delete_token(self):
+        else:
 
-        raise nose.exc.SkipTest('N/A')
+            tlsverifystr = "--tls-verify=false"
 
+            
 
+        localconfig = anchore_engine.configuration.localconfig.get_config()
 
-    def test_user_create_update_delete(self):
+        global_timeout = localconfig.get('skopeo_global_timeout', 0)
 
-        from keystoneclient import exceptions as client_exceptions
+        try:
 
+            global_timeout = int(global_timeout)
 
+            if global_timeout < 0:
 
-        test_username = 'new_user'
+                global_timeout = 0
 
-        client = self.get_client(admin=True)
+        except:
 
-        user = client.users.create(name=test_username,
+            global_timeout = 0
 
-                                   password='password',
 
-                                   email='user1@test.com')
 
-        self.assertEquals(user.name, test_username)
+        if global_timeout:
 
+            global_timeout_str = "--command-timeout {}s".format(global_timeout)
 
+        else:
 
-        user = client.users.get(user=user.id)
+            global_timeout_str = ""
 
-        self.assertEquals(user.name, test_username)
 
 
+        pullstring = registry + "/" + repo
 
-        user = client.users.update_email(user=user, email='user2@test.com')
+        if lookuptag:
 
-        self.assertEquals(user.email, 'user2@test.com')
+            pullstring = pullstring + ":" + lookuptag
 
 
 
-        # NOTE(termie): update_enabled doesn't return anything, probably a bug
+        repotags = []
 
-        client.users.update_enabled(user=user, enabled=False)
 
-        user = client.users.get(user.id)
 
-        self.assertFalse(user.enabled)
+        cmd = ["/bin/sh", "-c", "skopeo {} inspect {} {} docker://{}".format(global_timeout_str, tlsverifystr, credstr, pullstring)]
 
+        cmdstr = ' '.join(cmd)
 
+        try:
 
-        self.assertRaises(client_exceptions.AuthorizationFailure,
+            rc, sout, serr = run_command_list(cmd, env=proc_env)
 
-                  self._client,
+            sout = str(sout, 'utf-8') if sout else None
 
-                  username=test_username,
+            if rc != 0:
 
-                  password='password')
+                raise SkopeoError(cmd=cmd, rc=rc, out=sout, err=serr)
 
-        client.users.update_enabled(user, True)
+            else:
 
+                logger.debug("command succeeded: cmd="+str(cmdstr)+" stdout="+str(sout).strip()+" stderr="+str(serr).strip())
 
+        except Exception as err:
 
-        user = client.users.update_password(user=user, password='password2')
+            logger.error("command failed with exception - " + str(err))
 
+            raise err
 
 
-        self._client(username=test_username,
 
-                     password='password2')
+        data = json.loads(sout)
 
+        repotags = data.get('RepoTags', [])
 
+    except Exception as err:
 
-        user = client.users.update_tenant(user=user, tenant='bar')
+        raise err
 
-        # TODO(ja): once keystonelight supports default tenant
 
-        #           when you login without specifying tenant, the
 
-        #           token should be scoped to tenant 'bar'
+    if not repotags:
 
+        raise Exception("no tags found for input repo from skopeo")
 
 
-        client.users.delete(user.id)
 
-        self.assertRaises(client_exceptions.NotFound, client.users.get,
+    return(repotags)
 
-                          user.id)
 
 
+def get_image_manifest_skopeo_raw(pullstring, user=None, pw=None, verify=True):
 
-    def test_user_update_404(self):
+    ret = None
 
-        raise nose.exc.SkipTest('N/A')
+    try:
 
+        proc_env = os.environ.copy()
 
+        if user and pw:
 
-    def test_endpoint_create_404(self):
+            proc_env['SKOPUSER'] = user
 
-        raise nose.exc.SkipTest('N/A')
+            proc_env['SKOPPASS'] = pw
 
+            credstr = '--creds \"${SKOPUSER}\":\"${SKOPPASS}\"'
 
+        else:
 
-    def test_endpoint_delete_404(self):
+            credstr = ""
 
-        raise nose.exc.SkipTest('N/A')
+
+
+        if verify:
+
+            tlsverifystr = "--tls-verify=true"
+
+        else:
+
+            tlsverifystr = "--tls-verify=false"
+
+
+
+        localconfig = anchore_engine.configuration.localconfig.get_config()
+
+        global_timeout = localconfig.get('skopeo_global_timeout', 0)            
+
+        try:
+
+            global_timeout = int(global_timeout)
+
+            if global_timeout < 0:
+
+                global_timeout = 0
+
+        except:
+
+            global_timeout = 0
+
+
+
+        if global_timeout:
+
+            global_timeout_str = "--command-timeout {}s".format(global_timeout)
+
+        else:
+
+            global_timeout_str = ""
+
+
+
+        os_override_strs = ["", "--override-os windows"]
+
+        try:
+
+            success = False
+
+            for os_override_str in os_override_strs:
+
+                cmd = ["/bin/sh", "-c", "skopeo {} {} inspect --raw {} {} docker://{}".format(global_timeout_str, os_override_str, tlsverifystr, credstr, pullstring)]
+
+                cmdstr = ' '.join(cmd)
+
+                try:
+
+                    rc, sout, serr = run_command_list(cmd, env=proc_env)
+
+                    if rc != 0:
+
+                        skopeo_error = SkopeoError(cmd=cmd, rc=rc, out=sout, err=serr)
+
+                        if skopeo_error.error_code != AnchoreError.OSARCH_MISMATCH.name:
+
+                            raise SkopeoError(cmd=cmd, rc=rc, out=sout, err=serr)
+
+                    else:
+
+                        logger.debug("command succeeded: cmd="+str(cmdstr)+" stdout="+str(sout).strip()+" stderr="+str(serr).strip())
+
+                        success = True
+
+                except Exception as err:
+
+                    logger.error("command failed with exception - " + str(err))
+
+                    raise err
+
+
+
+                if success:
+
+                    sout = str(sout, 'utf-8') if sout else None    
+
+                    ret = sout
+
+                    break
+
+
+
+            if not success:
+
+                logger.error("could not retrieve manifest")
+
+                raise Exception("could not retrieve manifest")
+
+            
+
+        except Exception as err:
+
+            raise err
+
+    except Exception as err:
+
+        raise err
+
+
+
+    return(ret)
+
+
+
+def get_image_manifest_skopeo(url, registry, repo, intag=None, indigest=None, topdigest=None, user=None, pw=None, verify=True, topmanifest=None):
+
+    manifest = {}
+
+    digest = None
+
+    testDigest = None
+
+
+
+    if indigest:
+
+        pullstring = registry + "/" + repo + "@" + indigest
+
+    elif intag:
+
+        pullstring = registry + "/" + repo + ":" + intag
+
+    else:
+
+        raise Exception("invalid input - must supply either an intag or indigest")
+
+
+
+    try:
+
+        try:
+
+            rawmanifest = get_image_manifest_skopeo_raw(pullstring, user=user, pw=pw, verify=verify)
+
+            digest = manifest_to_digest(rawmanifest)
+
+            manifest = json.loads(rawmanifest)
+
+            if topmanifest is None:
+
+                topmanifest = json.loads(rawmanifest)
+
+            if not topdigest:
+
+                topdigest = digest
+
+
+
+            if manifest.get('schemaVersion') == 2 and manifest.get('mediaType') == 'application/vnd.docker.distribution.manifest.list.v2+json':
+
+                # Get the arch-specific version for amd64 and linux
+
+                new_digest = None
+
+                for entry in manifest.get('manifests'):
+
+                    platform = entry.get('platform')
+
+                    if platform and platform.get('architecture') in ['amd64'] and platform.get('os') in ['linux', 'windows']:
+
+                        new_digest = entry.get('digest')
+
+                        break
+
+
+
+                return get_image_manifest_skopeo(url=url, registry=registry, repo=repo, intag=None, indigest=new_digest, user=user, pw=pw, verify=verify, topdigest=topdigest, topmanifest=topmanifest)
+
+        except Exception as err:
+
+            logger.warn("CMD failed - exception: " + str(err))
+
+            raise err
+
+
+
+    except Exception as err:
+
+        import traceback
+
+        traceback.print_exc()
+
+        raise err
+
+
+
+    if not manifest or not digest:
+
+        raise SkopeoError(msg="No digest/manifest from skopeo")
+
+
+
+    return(manifest, digest, topdigest, topmanifest)
+
+
+
+class SkopeoError(AnchoreException):
+
+
+
+    def __init__(self, cmd=None, rc=None, err=None, out=None, msg='Error encountered in skopeo operation'):
+
+        from anchore_engine.common.errors import AnchoreError
+
+
+
+        self.cmd = ' '.join(cmd) if isinstance(cmd, list) else cmd
+
+        self.exitcode = rc
+
+        self.stderr = str(err).replace('\r', ' ').replace('\n', ' ').strip() if err else None
+
+        self.stdout = str(out).replace('\r', ' ').replace('\n', ' ').strip() if out else None
+
+        self.msg = msg
+
+        try:
+
+            if "unauthorized" in self.stderr:
+
+                self.error_code = AnchoreError.REGISTRY_PERMISSION_DENIED.name
+
+            elif "manifest unknown" in self.stderr:
+
+                self.error_code = AnchoreError.REGISTRY_IMAGE_NOT_FOUND.name
+
+            elif "connection refused" in self.stderr or "no route to host" in self.stderr:
+
+                self.error_code = AnchoreError.REGISTRY_NOT_ACCESSIBLE.name
+
+            elif "error pinging registry" in self.stderr:
+
+                self.error_code = AnchoreError.REGISTRY_NOT_SUPPORTED.name
+
+            elif "no image found in manifest list for architecture amd64, OS linux" in self.stderr:
+
+                self.error_code = AnchoreError.OSARCH_MISMATCH.name
+
+            else:
+
+                self.error_code = AnchoreError.SKOPEO_UNKNOWN_ERROR.name
+
+        except:
+
+            self.error_code = AnchoreError.UNKNOWN.name
+
+        
+
+
+
+    def __repr__(self):
+
+        return '{}. cmd={}, rc={}, stdout={}, stderr={}, error_code={}'.format(self.msg, self.cmd, self.exitcode, self.stdout, self.stderr, self.error_code)
+
+
+
+    def __str__(self):
+
+        return '{}. cmd={}, rc={}, stdout={}, stderr={}, error_code={}'.format(self.msg, self.cmd, self.exitcode, self.stdout, self.stderr, self.error_code)

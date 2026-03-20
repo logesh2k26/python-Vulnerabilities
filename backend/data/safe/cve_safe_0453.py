@@ -2,2226 +2,1292 @@
 # Safety: safe
 # Category: safe
 
-# Copyright (C) 2016 JWCrypto Project Contributors - see LICENSE file
-
-
-
-import abc
-
 import os
 
-import struct
+import shutil
 
-from binascii import hexlify, unhexlify
+import sys
 
 
 
-from cryptography.exceptions import InvalidSignature
+from PIL import Image
 
-from cryptography.hazmat.backends import default_backend
+from PIL._util import py3
 
-from cryptography.hazmat.primitives import constant_time, hashes, hmac
 
-from cryptography.hazmat.primitives.asymmetric import ec
 
-from cryptography.hazmat.primitives.asymmetric import padding
+from .helper import PillowTestCase, hopper, unittest
 
-from cryptography.hazmat.primitives.asymmetric import utils as ec_utils
 
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-from cryptography.hazmat.primitives.kdf.concatkdf import ConcatKDFHash
 
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-from cryptography.hazmat.primitives.padding import PKCS7
+class TestImage(PillowTestCase):
 
+    def test_image_modes_success(self):
 
+        for mode in [
 
-import six
+            "1",
 
+            "P",
 
+            "PA",
 
-from jwcrypto.common import InvalidCEKeyLength
+            "L",
 
-from jwcrypto.common import InvalidJWAAlgorithm
+            "LA",
 
-from jwcrypto.common import InvalidJWEKeyLength
+            "La",
 
-from jwcrypto.common import InvalidJWEKeyType
+            "F",
 
-from jwcrypto.common import InvalidJWEOperation
+            "I",
 
-from jwcrypto.common import base64url_decode, base64url_encode
+            "I;16",
 
-from jwcrypto.common import json_decode
+            "I;16L",
 
-from jwcrypto.jwk import JWK
+            "I;16B",
 
+            "I;16N",
 
+            "RGB",
 
-# Implements RFC 7518 - JSON Web Algorithms (JWA)
+            "RGBX",
 
+            "RGBA",
 
+            "RGBa",
 
+            "CMYK",
 
+            "YCbCr",
 
-@six.add_metaclass(abc.ABCMeta)
+            "LAB",
 
-class JWAAlgorithm(object):
+            "HSV",
 
+        ]:
 
+            Image.new(mode, (1, 1))
 
-    @abc.abstractproperty
 
-    def name(self):
 
-        """The algorithm Name"""
+    def test_image_modes_fail(self):
 
-        pass
+        for mode in [
 
+            "",
 
+            "bad",
 
-    @abc.abstractproperty
+            "very very long",
 
-    def description(self):
+            "BGR;15",
 
-        """A short description"""
+            "BGR;16",
 
-        pass
+            "BGR;24",
 
+            "BGR;32",
 
+        ]:
 
-    @abc.abstractproperty
+            with self.assertRaises(ValueError) as e:
 
-    def keysize(self):
+                Image.new(mode, (1, 1))
 
-        """The actual/recommended/minimum key size"""
+            self.assertEqual(str(e.exception), "unrecognized image mode")
 
-        pass
 
 
+    def test_sanity(self):
 
-    @abc.abstractproperty
 
-    def algorithm_usage_location(self):
 
-        """One of 'alg', 'enc' or 'JWK'"""
+        im = Image.new("L", (100, 100))
 
-        pass
+        self.assertEqual(repr(im)[:45], "<PIL.Image.Image image mode=L size=100x100 at")
 
+        self.assertEqual(im.mode, "L")
 
+        self.assertEqual(im.size, (100, 100))
 
-    @abc.abstractproperty
 
-    def algorithm_use(self):
 
-        """One of 'sig', 'kex', 'enc'"""
+        im = Image.new("RGB", (100, 100))
 
-        pass
+        self.assertEqual(repr(im)[:45], "<PIL.Image.Image image mode=RGB size=100x100 ")
 
+        self.assertEqual(im.mode, "RGB")
 
+        self.assertEqual(im.size, (100, 100))
 
 
 
-def _bitsize(x):
+        Image.new("L", (100, 100), None)
 
-    return len(x) * 8
+        im2 = Image.new("L", (100, 100), 0)
 
+        im3 = Image.new("L", (100, 100), "black")
 
 
 
+        self.assertEqual(im2.getcolors(), [(10000, 0)])
 
-def _inbytes(x):
+        self.assertEqual(im3.getcolors(), [(10000, 0)])
 
-    return x // 8
 
 
+        self.assertRaises(ValueError, Image.new, "X", (100, 100))
 
+        self.assertRaises(ValueError, Image.new, "", (100, 100))
 
+        # self.assertRaises(MemoryError, Image.new, "L", (1000000, 1000000))
 
-def _randombits(x):
 
-    if x % 8 != 0:
 
-        raise ValueError("lenght must be a multiple of 8")
+    def test_width_height(self):
 
-    return os.urandom(_inbytes(x))
+        im = Image.new("RGB", (1, 2))
 
+        self.assertEqual(im.width, 1)
 
+        self.assertEqual(im.height, 2)
 
 
 
-# Note: the number of bits should be a multiple of 16
+        with self.assertRaises(AttributeError):
 
-def _encode_int(n, bits):
+            im.size = (3, 4)
 
-    e = '{:x}'.format(n)
 
-    ilen = ((bits + 7) // 8) * 2  # number of bytes rounded up times 2 bytes
 
-    return unhexlify(e.rjust(ilen, '0')[:ilen])
+    def test_invalid_image(self):
 
+        if py3:
 
+            import io
 
 
 
-def _decode_int(n):
-
-    return int(hexlify(n), 16)
-
-
-
-
-
-class _RawJWS(object):
-
-
-
-    def sign(self, key, payload):
-
-        raise NotImplementedError
-
-
-
-    def verify(self, key, payload, signature):
-
-        raise NotImplementedError
-
-
-
-
-
-class _RawHMAC(_RawJWS):
-
-
-
-    def __init__(self, hashfn):
-
-        self.backend = default_backend()
-
-        self.hashfn = hashfn
-
-
-
-    def _hmac_setup(self, key, payload):
-
-        h = hmac.HMAC(key, self.hashfn, backend=self.backend)
-
-        h.update(payload)
-
-        return h
-
-
-
-    def sign(self, key, payload):
-
-        skey = base64url_decode(key.get_op_key('sign'))
-
-        h = self._hmac_setup(skey, payload)
-
-        return h.finalize()
-
-
-
-    def verify(self, key, payload, signature):
-
-        vkey = base64url_decode(key.get_op_key('verify'))
-
-        h = self._hmac_setup(vkey, payload)
-
-        h.verify(signature)
-
-
-
-
-
-class _RawRSA(_RawJWS):
-
-    def __init__(self, padfn, hashfn):
-
-        self.padfn = padfn
-
-        self.hashfn = hashfn
-
-
-
-    def sign(self, key, payload):
-
-        skey = key.get_op_key('sign')
-
-        signer = skey.signer(self.padfn, self.hashfn)
-
-        signer.update(payload)
-
-        return signer.finalize()
-
-
-
-    def verify(self, key, payload, signature):
-
-        pkey = key.get_op_key('verify')
-
-        verifier = pkey.verifier(signature, self.padfn, self.hashfn)
-
-        verifier.update(payload)
-
-        verifier.verify()
-
-
-
-
-
-class _RawEC(_RawJWS):
-
-    def __init__(self, curve, hashfn):
-
-        self._curve = curve
-
-        self.hashfn = hashfn
-
-
-
-    @property
-
-    def curve(self):
-
-        return self._curve
-
-
-
-    def sign(self, key, payload):
-
-        skey = key.get_op_key('sign', self._curve)
-
-        signer = skey.signer(ec.ECDSA(self.hashfn))
-
-        signer.update(payload)
-
-        signature = signer.finalize()
-
-        r, s = ec_utils.decode_rfc6979_signature(signature)
-
-        l = key.get_curve(self._curve).key_size
-
-        return _encode_int(r, l) + _encode_int(s, l)
-
-
-
-    def verify(self, key, payload, signature):
-
-        pkey = key.get_op_key('verify', self._curve)
-
-        r = signature[:len(signature) // 2]
-
-        s = signature[len(signature) // 2:]
-
-        enc_signature = ec_utils.encode_rfc6979_signature(
-
-            int(hexlify(r), 16), int(hexlify(s), 16))
-
-        verifier = pkey.verifier(enc_signature, ec.ECDSA(self.hashfn))
-
-        verifier.update(payload)
-
-        verifier.verify()
-
-
-
-
-
-class _RawNone(_RawJWS):
-
-
-
-    def sign(self, key, payload):
-
-        return ''
-
-
-
-    def verify(self, key, payload, signature):
-
-        raise InvalidSignature('The "none" signature cannot be verified')
-
-
-
-
-
-class _HS256(_RawHMAC, JWAAlgorithm):
-
-
-
-    name = "HS256"
-
-    description = "HMAC using SHA-256"
-
-    keysize = 256
-
-    algorithm_usage_location = 'alg'
-
-    algorithm_use = 'sig'
-
-
-
-    def __init__(self):
-
-        super(_HS256, self).__init__(hashes.SHA256())
-
-
-
-
-
-class _HS384(_RawHMAC, JWAAlgorithm):
-
-
-
-    name = "HS384"
-
-    description = "HMAC using SHA-384"
-
-    keysize = 384
-
-    algorithm_usage_location = 'alg'
-
-    algorithm_use = 'sig'
-
-
-
-    def __init__(self):
-
-        super(_HS384, self).__init__(hashes.SHA384())
-
-
-
-
-
-class _HS512(_RawHMAC, JWAAlgorithm):
-
-
-
-    name = "HS512"
-
-    description = "HMAC using SHA-512"
-
-    keysize = 512
-
-    algorithm_usage_location = 'alg'
-
-    algorithm_use = 'sig'
-
-
-
-    def __init__(self):
-
-        super(_HS512, self).__init__(hashes.SHA512())
-
-
-
-
-
-class _RS256(_RawRSA, JWAAlgorithm):
-
-
-
-    name = "RS256"
-
-    description = "RSASSA-PKCS1-v1_5 using SHA-256"
-
-    keysize = 2048
-
-    algorithm_usage_location = 'alg'
-
-    algorithm_use = 'sig'
-
-
-
-    def __init__(self):
-
-        super(_RS256, self).__init__(padding.PKCS1v15(), hashes.SHA256())
-
-
-
-
-
-class _RS384(_RawRSA, JWAAlgorithm):
-
-
-
-    name = "RS384"
-
-    description = "RSASSA-PKCS1-v1_5 using SHA-384"
-
-    keysize = 2048
-
-    algorithm_usage_location = 'alg'
-
-    algorithm_use = 'sig'
-
-
-
-    def __init__(self):
-
-        super(_RS384, self).__init__(padding.PKCS1v15(), hashes.SHA384())
-
-
-
-
-
-class _RS512(_RawRSA, JWAAlgorithm):
-
-
-
-    name = "RS512"
-
-    description = "RSASSA-PKCS1-v1_5 using SHA-512"
-
-    keysize = 2048
-
-    algorithm_usage_location = 'alg'
-
-    algorithm_use = 'sig'
-
-
-
-    def __init__(self):
-
-        super(_RS512, self).__init__(padding.PKCS1v15(), hashes.SHA512())
-
-
-
-
-
-class _ES256(_RawEC, JWAAlgorithm):
-
-
-
-    name = "ES256"
-
-    description = "ECDSA using P-256 and SHA-256"
-
-    keysize = 256
-
-    algorithm_usage_location = 'alg'
-
-    algorithm_use = 'sig'
-
-
-
-    def __init__(self):
-
-        super(_ES256, self).__init__('P-256', hashes.SHA256())
-
-
-
-
-
-class _ES384(_RawEC, JWAAlgorithm):
-
-
-
-    name = "ES384"
-
-    description = "ECDSA using P-384 and SHA-384"
-
-    keysize = 384
-
-    algorithm_usage_location = 'alg'
-
-    algorithm_use = 'sig'
-
-
-
-    def __init__(self):
-
-        super(_ES384, self).__init__('P-384', hashes.SHA384())
-
-
-
-
-
-class _ES512(_RawEC, JWAAlgorithm):
-
-
-
-    name = "ES512"
-
-    description = "ECDSA using P-521 and SHA-512"
-
-    keysize = 512
-
-    algorithm_usage_location = 'alg'
-
-    algorithm_use = 'sig'
-
-
-
-    def __init__(self):
-
-        super(_ES512, self).__init__('P-521', hashes.SHA512())
-
-
-
-
-
-class _PS256(_RawRSA, JWAAlgorithm):
-
-
-
-    name = "PS256"
-
-    description = "RSASSA-PSS using SHA-256 and MGF1 with SHA-256"
-
-    keysize = 2048
-
-    algorithm_usage_location = 'alg'
-
-    algorithm_use = 'sig'
-
-
-
-    def __init__(self):
-
-        padfn = padding.PSS(padding.MGF1(hashes.SHA256()),
-
-                            hashes.SHA256.digest_size)
-
-        super(_PS256, self).__init__(padfn, hashes.SHA256())
-
-
-
-
-
-class _PS384(_RawRSA, JWAAlgorithm):
-
-
-
-    name = "PS384"
-
-    description = "RSASSA-PSS using SHA-384 and MGF1 with SHA-384"
-
-    keysize = 2048
-
-    algorithm_usage_location = 'alg'
-
-    algorithm_use = 'sig'
-
-
-
-    def __init__(self):
-
-        padfn = padding.PSS(padding.MGF1(hashes.SHA384()),
-
-                            hashes.SHA384.digest_size)
-
-        super(_PS384, self).__init__(padfn, hashes.SHA384())
-
-
-
-
-
-class _PS512(_RawRSA, JWAAlgorithm):
-
-
-
-    name = "PS512"
-
-    description = "RSASSA-PSS using SHA-512 and MGF1 with SHA-512"
-
-    keysize = 2048
-
-    algorithm_usage_location = 'alg'
-
-    algorithm_use = 'sig'
-
-
-
-    def __init__(self):
-
-        padfn = padding.PSS(padding.MGF1(hashes.SHA512()),
-
-                            hashes.SHA512.digest_size)
-
-        super(_PS512, self).__init__(padfn, hashes.SHA512())
-
-
-
-
-
-class _None(_RawNone, JWAAlgorithm):
-
-
-
-    name = "none"
-
-    description = "No digital signature or MAC performed"
-
-    keysize = 0
-
-    algorithm_usage_location = 'alg'
-
-    algorithm_use = 'sig'
-
-
-
-
-
-class _RawKeyMgmt(object):
-
-
-
-    def wrap(self, key, bitsize, cek, headers):
-
-        raise NotImplementedError
-
-
-
-    def unwrap(self, key, bitsize, ek, headers):
-
-        raise NotImplementedError
-
-
-
-
-
-class _RSA(_RawKeyMgmt):
-
-
-
-    def __init__(self, padfn):
-
-        self.padfn = padfn
-
-
-
-    def _check_key(self, key):
-
-        if not isinstance(key, JWK):
-
-            raise ValueError('key is not a JWK object')
-
-        if key.key_type != 'RSA':
-
-            raise InvalidJWEKeyType('RSA', key.key_type)
-
-
-
-    # FIXME: get key size and insure > 2048 bits
-
-    def wrap(self, key, bitsize, cek, headers):
-
-        self._check_key(key)
-
-        if not cek:
-
-            cek = _randombits(bitsize)
-
-        rk = key.get_op_key('wrapKey')
-
-        ek = rk.encrypt(cek, self.padfn)
-
-        return {'cek': cek, 'ek': ek}
-
-
-
-    def unwrap(self, key, bitsize, ek, headers):
-
-        self._check_key(key)
-
-        rk = key.get_op_key('decrypt')
-
-        cek = rk.decrypt(ek, self.padfn)
-
-        if _bitsize(cek) != bitsize:
-
-            raise InvalidJWEKeyLength(bitsize, _bitsize(cek))
-
-        return cek
-
-
-
-
-
-class _Rsa15(_RSA, JWAAlgorithm):
-
-
-
-    name = 'RSA1_5'
-
-    description = "RSAES-PKCS1-v1_5"
-
-    keysize = 2048
-
-    algorithm_usage_location = 'alg'
-
-    algorithm_use = 'kex'
-
-
-
-    def __init__(self):
-
-        super(_Rsa15, self).__init__(padding.PKCS1v15())
-
-
-
-    def unwrap(self, key, bitsize, ek, headers):
-
-        self._check_key(key)
-
-        # Address MMA attack by implementing RFC 3218 - 2.3.2. Random Filling
-
-        # provides a random cek that will cause the decryption engine to
-
-        # run to the end, but will fail decryption later.
-
-
-
-        # always generate a random cek so we spend roughly the
-
-        # same time as in the exception side of the branch
-
-        cek = _randombits(bitsize)
-
-        try:
-
-            cek = super(_Rsa15, self).unwrap(key, bitsize, ek, headers)
-
-            # always raise so we always run through the exception handling
-
-            # code in all cases
-
-            raise Exception('Dummy')
-
-        except Exception:  # pylint: disable=broad-except
-
-            return cek
-
-
-
-
-
-class _RsaOaep(_RSA, JWAAlgorithm):
-
-
-
-    name = 'RSA-OAEP'
-
-    description = "RSAES OAEP using default parameters"
-
-    keysize = 2048
-
-    algorithm_usage_location = 'alg'
-
-    algorithm_use = 'kex'
-
-
-
-    def __init__(self):
-
-        super(_RsaOaep, self).__init__(
-
-            padding.OAEP(padding.MGF1(hashes.SHA1()),
-
-                         hashes.SHA1(), None))
-
-
-
-
-
-class _RsaOaep256(_RSA, JWAAlgorithm):  # noqa: ignore=N801
-
-
-
-    name = 'RSA-OAEP-256'
-
-    description = "RSAES OAEP using SHA-256 and MGF1 with SHA-256"
-
-    keysize = 2048
-
-    algorithm_usage_location = 'alg'
-
-    algorithm_use = 'kex'
-
-
-
-    def __init__(self):
-
-        super(_RsaOaep256, self).__init__(
-
-            padding.OAEP(padding.MGF1(hashes.SHA256()),
-
-                         hashes.SHA256(), None))
-
-
-
-
-
-class _AesKw(_RawKeyMgmt):
-
-
-
-    keysize = None
-
-
-
-    def __init__(self):
-
-        self.backend = default_backend()
-
-
-
-    def _get_key(self, key, op):
-
-        if not isinstance(key, JWK):
-
-            raise ValueError('key is not a JWK object')
-
-        if key.key_type != 'oct':
-
-            raise InvalidJWEKeyType('oct', key.key_type)
-
-        rk = base64url_decode(key.get_op_key(op))
-
-        if _bitsize(rk) != self.keysize:
-
-            raise InvalidJWEKeyLength(self.keysize, _bitsize(rk))
-
-        return rk
-
-
-
-    def wrap(self, key, bitsize, cek, headers):
-
-        rk = self._get_key(key, 'encrypt')
-
-        if not cek:
-
-            cek = _randombits(bitsize)
-
-
-
-        # Implement RFC 3394 Key Unwrap - 2.2.2
-
-        # TODO: Use cryptography once issue #1733 is resolved
-
-        iv = 'a6a6a6a6a6a6a6a6'
-
-        a = unhexlify(iv)
-
-        r = [cek[i:i + 8] for i in range(0, len(cek), 8)]
-
-        n = len(r)
-
-        for j in range(0, 6):
-
-            for i in range(0, n):
-
-                e = Cipher(algorithms.AES(rk), modes.ECB(),
-
-                           backend=self.backend).encryptor()
-
-                b = e.update(a + r[i]) + e.finalize()
-
-                a = _encode_int(_decode_int(b[:8]) ^ ((n * j) + i + 1), 64)
-
-                r[i] = b[-8:]
-
-        ek = a
-
-        for i in range(0, n):
-
-            ek += r[i]
-
-        return {'cek': cek, 'ek': ek}
-
-
-
-    def unwrap(self, key, bitsize, ek, headers):
-
-        rk = self._get_key(key, 'decrypt')
-
-
-
-        # Implement RFC 3394 Key Unwrap - 2.2.3
-
-        # TODO: Use cryptography once issue #1733 is resolved
-
-        iv = 'a6a6a6a6a6a6a6a6'
-
-        aiv = unhexlify(iv)
-
-
-
-        r = [ek[i:i + 8] for i in range(0, len(ek), 8)]
-
-        a = r.pop(0)
-
-        n = len(r)
-
-        for j in range(5, -1, -1):
-
-            for i in range(n - 1, -1, -1):
-
-                da = _decode_int(a)
-
-                atr = _encode_int((da ^ ((n * j) + i + 1)), 64) + r[i]
-
-                d = Cipher(algorithms.AES(rk), modes.ECB(),
-
-                           backend=self.backend).decryptor()
-
-                b = d.update(atr) + d.finalize()
-
-                a = b[:8]
-
-                r[i] = b[-8:]
-
-
-
-        if a != aiv:
-
-            raise RuntimeError('Decryption Failed')
-
-
-
-        cek = b''.join(r)
-
-        if _bitsize(cek) != bitsize:
-
-            raise InvalidJWEKeyLength(bitsize, _bitsize(cek))
-
-        return cek
-
-
-
-
-
-class _A128KW(_AesKw, JWAAlgorithm):
-
-
-
-    name = 'A128KW'
-
-    description = "AES Key Wrap using 128-bit key"
-
-    keysize = 128
-
-    algorithm_usage_location = 'alg'
-
-    algorithm_use = 'kex'
-
-
-
-
-
-class _A192KW(_AesKw, JWAAlgorithm):
-
-
-
-    name = 'A192KW'
-
-    description = "AES Key Wrap using 192-bit key"
-
-    keysize = 192
-
-    algorithm_usage_location = 'alg'
-
-    algorithm_use = 'kex'
-
-
-
-
-
-class _A256KW(_AesKw, JWAAlgorithm):
-
-
-
-    name = 'A256KW'
-
-    description = "AES Key Wrap using 256-bit key"
-
-    keysize = 256
-
-    algorithm_usage_location = 'alg'
-
-    algorithm_use = 'kex'
-
-
-
-
-
-class _AesGcmKw(_RawKeyMgmt):
-
-
-
-    keysize = None
-
-
-
-    def __init__(self):
-
-        self.backend = default_backend()
-
-
-
-    def _get_key(self, key, op):
-
-        if not isinstance(key, JWK):
-
-            raise ValueError('key is not a JWK object')
-
-        if key.key_type != 'oct':
-
-            raise InvalidJWEKeyType('oct', key.key_type)
-
-        rk = base64url_decode(key.get_op_key(op))
-
-        if _bitsize(rk) != self.keysize:
-
-            raise InvalidJWEKeyLength(self.keysize, _bitsize(rk))
-
-        return rk
-
-
-
-    def wrap(self, key, bitsize, cek, headers):
-
-        rk = self._get_key(key, 'encrypt')
-
-        if not cek:
-
-            cek = _randombits(bitsize)
-
-
-
-        iv = _randombits(96)
-
-        cipher = Cipher(algorithms.AES(rk), modes.GCM(iv),
-
-                        backend=self.backend)
-
-        encryptor = cipher.encryptor()
-
-        ek = encryptor.update(cek) + encryptor.finalize()
-
-
-
-        tag = encryptor.tag
-
-        return {'cek': cek, 'ek': ek,
-
-                'header': {'iv': base64url_encode(iv),
-
-                           'tag': base64url_encode(tag)}}
-
-
-
-    def unwrap(self, key, bitsize, ek, headers):
-
-        rk = self._get_key(key, 'decrypt')
-
-
-
-        if 'iv' not in headers:
-
-            raise ValueError('Invalid Header, missing "iv" parameter')
-
-        iv = base64url_decode(headers['iv'])
-
-        if 'tag' not in headers:
-
-            raise ValueError('Invalid Header, missing "tag" parameter')
-
-        tag = base64url_decode(headers['tag'])
-
-
-
-        cipher = Cipher(algorithms.AES(rk), modes.GCM(iv, tag),
-
-                        backend=self.backend)
-
-        decryptor = cipher.decryptor()
-
-        cek = decryptor.update(ek) + decryptor.finalize()
-
-        if _bitsize(cek) != bitsize:
-
-            raise InvalidJWEKeyLength(bitsize, _bitsize(cek))
-
-        return cek
-
-
-
-
-
-class _A128GcmKw(_AesGcmKw, JWAAlgorithm):
-
-
-
-    name = 'A128GCMKW'
-
-    description = "Key wrapping with AES GCM using 128-bit key"
-
-    keysize = 128
-
-    algorithm_usage_location = 'alg'
-
-    algorithm_use = 'kex'
-
-
-
-
-
-class _A192GcmKw(_AesGcmKw, JWAAlgorithm):
-
-
-
-    name = 'A192GCMKW'
-
-    description = "Key wrapping with AES GCM using 192-bit key"
-
-    keysize = 192
-
-    algorithm_usage_location = 'alg'
-
-    algorithm_use = 'kex'
-
-
-
-
-
-class _A256GcmKw(_AesGcmKw, JWAAlgorithm):
-
-
-
-    name = 'A256GCMKW'
-
-    description = "Key wrapping with AES GCM using 256-bit key"
-
-    keysize = 256
-
-    algorithm_usage_location = 'alg'
-
-    algorithm_use = 'kex'
-
-
-
-
-
-class _Pbes2HsAesKw(_RawKeyMgmt):
-
-
-
-    name = None
-
-    keysize = None
-
-    hashsize = None
-
-
-
-    def __init__(self):
-
-        self.backend = default_backend()
-
-        self.aeskwmap = {128: _A128KW, 192: _A192KW, 256: _A256KW}
-
-
-
-    def _get_key(self, alg, key, p2s, p2c):
-
-        if isinstance(key, bytes):
-
-            plain = key
+            im = io.BytesIO(b"")
 
         else:
 
-            plain = key.encode('utf8')
+            import StringIO
 
-        salt = bytes(self.name.encode('utf8')) + b'\x00' + p2s
 
 
+            im = StringIO.StringIO("")
 
-        if self.hashsize == 256:
+        self.assertRaises(IOError, Image.open, im)
 
-            hashalg = hashes.SHA256()
 
-        elif self.hashsize == 384:
 
-            hashalg = hashes.SHA384()
+    def test_bad_mode(self):
 
-        elif self.hashsize == 512:
+        self.assertRaises(ValueError, Image.open, "filename", "bad mode")
 
-            hashalg = hashes.SHA512()
 
-        else:
 
-            raise ValueError('Unknown Hash Size')
+    @unittest.skipUnless(Image.HAS_PATHLIB, "requires pathlib/pathlib2")
 
+    def test_pathlib(self):
 
+        from PIL.Image import Path
 
-        kdf = PBKDF2HMAC(algorithm=hashalg, length=_inbytes(self.keysize),
 
-                         salt=salt, iterations=p2c, backend=self.backend)
 
-        rk = kdf.derive(plain)
+        im = Image.open(Path("Tests/images/multipage-mmap.tiff"))
 
-        if _bitsize(rk) != self.keysize:
+        self.assertEqual(im.mode, "P")
 
-            raise InvalidJWEKeyLength(self.keysize, len(rk))
+        self.assertEqual(im.size, (10, 10))
 
-        return JWK(kty="oct", use="enc", k=base64url_encode(rk))
 
 
+        im = Image.open(Path("Tests/images/hopper.jpg"))
 
-    def wrap(self, key, bitsize, cek, headers):
+        self.assertEqual(im.mode, "RGB")
 
-        p2s = _randombits(128)
+        self.assertEqual(im.size, (128, 128))
 
-        p2c = 8192
 
-        kek = self._get_key(headers['alg'], key, p2s, p2c)
 
+        temp_file = self.tempfile("temp.jpg")
 
+        if os.path.exists(temp_file):
 
-        aeskw = self.aeskwmap[self.keysize]()
+            os.remove(temp_file)
 
-        ret = aeskw.wrap(kek, bitsize, cek, headers)
+        im.save(Path(temp_file))
 
-        ret['header'] = {'p2s': base64url_encode(p2s), 'p2c': p2c}
 
-        return ret
 
+    def test_fp_name(self):
 
+        temp_file = self.tempfile("temp.jpg")
 
-    def unwrap(self, key, bitsize, ek, headers):
 
-        if 'p2s' not in headers:
 
-            raise ValueError('Invalid Header, missing "p2s" parameter')
+        class FP(object):
 
-        if 'p2c' not in headers:
+            def write(a, b):
 
-            raise ValueError('Invalid Header, missing "p2c" parameter')
+                pass
 
-        p2s = base64url_decode(headers['p2s'])
 
-        p2c = headers['p2c']
 
-        kek = self._get_key(headers['alg'], key, p2s, p2c)
+        fp = FP()
 
+        fp.name = temp_file
 
 
-        aeskw = self.aeskwmap[self.keysize]()
 
-        return aeskw.unwrap(kek, bitsize, ek, headers)
+        im = hopper()
 
+        im.save(fp)
 
 
 
+    def test_tempfile(self):
 
-class _Pbes2Hs256A128Kw(_Pbes2HsAesKw, JWAAlgorithm):
+        # see #1460, pathlib support breaks tempfile.TemporaryFile on py27
 
+        # Will error out on save on 3.0.0
 
+        import tempfile
 
-    name = 'PBES2-HS256+A128KW'
 
-    description = 'PBES2 with HMAC SHA-256 and "A128KW" wrapping'
 
-    keysize = 128
+        im = hopper()
 
-    algorithm_usage_location = 'alg'
+        with tempfile.TemporaryFile() as fp:
 
-    algorithm_use = 'kex'
+            im.save(fp, "JPEG")
 
-    hashsize = 256
+            fp.seek(0)
 
+            reloaded = Image.open(fp)
 
+            self.assert_image_similar(im, reloaded, 20)
 
 
 
-class _Pbes2Hs384A192Kw(_Pbes2HsAesKw, JWAAlgorithm):
+    def test_unknown_extension(self):
 
+        im = hopper()
 
+        temp_file = self.tempfile("temp.unknown")
 
-    name = 'PBES2-HS384+A192KW'
+        self.assertRaises(ValueError, im.save, temp_file)
 
-    description = 'PBES2 with HMAC SHA-384 and "A192KW" wrapping'
 
-    keysize = 192
 
-    algorithm_usage_location = 'alg'
+    def test_internals(self):
 
-    algorithm_use = 'kex'
+        im = Image.new("L", (100, 100))
 
-    hashsize = 384
+        im.readonly = 1
 
+        im._copy()
 
+        self.assertFalse(im.readonly)
 
 
 
-class _Pbes2Hs512A256Kw(_Pbes2HsAesKw, JWAAlgorithm):
+        im.readonly = 1
 
+        im.paste(0, (0, 0, 100, 100))
 
+        self.assertFalse(im.readonly)
 
-    name = 'PBES2-HS512+A256KW'
 
-    description = 'PBES2 with HMAC SHA-512 and "A256KW" wrapping'
 
-    keysize = 256
+    @unittest.skipIf(
 
-    algorithm_usage_location = 'alg'
+        sys.platform.startswith("win32"), "Test requires opening tempfile twice"
 
-    algorithm_use = 'kex'
+    )
 
-    hashsize = 512
+    def test_readonly_save(self):
 
+        temp_file = self.tempfile("temp.bmp")
 
+        shutil.copy("Tests/images/rgb32bf-rgba.bmp", temp_file)
 
 
 
-class _Direct(_RawKeyMgmt, JWAAlgorithm):
+        im = Image.open(temp_file)
 
+        self.assertTrue(im.readonly)
 
+        im.save(temp_file)
 
-    name = 'dir'
 
-    description = "Direct use of a shared symmetric key"
 
-    keysize = 128
+    def test_dump(self):
 
-    algorithm_usage_location = 'alg'
+        im = Image.new("L", (10, 10))
 
-    algorithm_use = 'kex'
+        im._dump(self.tempfile("temp_L.ppm"))
 
 
 
-    def _check_key(self, key):
+        im = Image.new("RGB", (10, 10))
 
-        if not isinstance(key, JWK):
+        im._dump(self.tempfile("temp_RGB.ppm"))
 
-            raise ValueError('key is not a JWK object')
 
-        if key.key_type != 'oct':
 
-            raise InvalidJWEKeyType('oct', key.key_type)
+        im = Image.new("HSV", (10, 10))
 
+        self.assertRaises(ValueError, im._dump, self.tempfile("temp_HSV.ppm"))
 
 
-    def wrap(self, key, bitsize, cek, headers):
 
-        self._check_key(key)
+    def test_comparison_with_other_type(self):
 
-        if cek:
+        # Arrange
 
-            return (cek, None)
+        item = Image.new("RGB", (25, 25), "#000")
 
-        k = base64url_decode(key.get_op_key('encrypt'))
+        num = 12
 
-        if _bitsize(k) != bitsize:
 
-            raise InvalidCEKeyLength(bitsize, _bitsize(k))
 
-        return {'cek': k}
+        # Act/Assert
 
+        # Shouldn't cause AttributeError (#774)
 
+        self.assertFalse(item is None)
 
-    def unwrap(self, key, bitsize, ek, headers):
+        self.assertFalse(item == num)
 
-        self._check_key(key)
 
-        if ek != b'':
 
-            raise ValueError('Invalid Encryption Key.')
+    def test_expand_x(self):
 
-        cek = base64url_decode(key.get_op_key('decrypt'))
+        # Arrange
 
-        if _bitsize(cek) != bitsize:
+        im = hopper()
 
-            raise InvalidJWEKeyLength(bitsize, _bitsize(cek))
+        orig_size = im.size
 
-        return cek
+        xmargin = 5
 
 
 
+        # Act
 
+        im = im._expand(xmargin)
 
-class _EcdhEs(_RawKeyMgmt):
 
 
+        # Assert
 
-    name = 'ECDH-ES'
+        self.assertEqual(im.size[0], orig_size[0] + 2 * xmargin)
 
-    description = "ECDH-ES using Concat KDF"
+        self.assertEqual(im.size[1], orig_size[1] + 2 * xmargin)
 
-    algorithm_usage_location = 'alg'
 
-    algorithm_use = 'kex'
 
-    keysize = None
+    def test_expand_xy(self):
 
+        # Arrange
 
+        im = hopper()
 
-    def __init__(self):
+        orig_size = im.size
 
-        self.backend = default_backend()
+        xmargin = 5
 
-        self.aeskwmap = {128: _A128KW, 192: _A192KW, 256: _A256KW}
+        ymargin = 3
 
 
 
-    def _check_key(self, key):
+        # Act
 
-        if not isinstance(key, JWK):
+        im = im._expand(xmargin, ymargin)
 
-            raise ValueError('key is not a JWK object')
 
-        if key.key_type != 'EC':
 
-            raise InvalidJWEKeyType('EC', key.key_type)
+        # Assert
 
+        self.assertEqual(im.size[0], orig_size[0] + 2 * xmargin)
 
+        self.assertEqual(im.size[1], orig_size[1] + 2 * ymargin)
 
-    def _derive(self, privkey, pubkey, alg, bitsize, headers):
 
-        # OtherInfo is defined in NIST SP 56A 5.8.1.2.1
 
+    def test_getbands(self):
 
+        # Assert
 
-        # AlgorithmID
+        self.assertEqual(hopper("RGB").getbands(), ("R", "G", "B"))
 
-        otherinfo = struct.pack('>I', len(alg))
+        self.assertEqual(hopper("YCbCr").getbands(), ("Y", "Cb", "Cr"))
 
-        otherinfo += bytes(alg.encode('utf8'))
 
 
+    def test_getchannel_wrong_params(self):
 
-        # PartyUInfo
+        im = hopper()
 
-        apu = base64url_decode(headers['apu']) if 'apu' in headers else b''
 
-        otherinfo += struct.pack('>I', len(apu))
 
-        otherinfo += apu
+        self.assertRaises(ValueError, im.getchannel, -1)
 
+        self.assertRaises(ValueError, im.getchannel, 3)
 
+        self.assertRaises(ValueError, im.getchannel, "Z")
 
-        # PartyVInfo
+        self.assertRaises(ValueError, im.getchannel, "1")
 
-        apv = base64url_decode(headers['apv']) if 'apv' in headers else b''
 
-        otherinfo += struct.pack('>I', len(apv))
 
-        otherinfo += apv
+    def test_getchannel(self):
 
+        im = hopper("YCbCr")
 
+        Y, Cb, Cr = im.split()
 
-        # SuppPubInfo
 
-        otherinfo += struct.pack('>I', bitsize)
 
+        self.assert_image_equal(Y, im.getchannel(0))
 
+        self.assert_image_equal(Y, im.getchannel("Y"))
 
-        # no SuppPrivInfo
+        self.assert_image_equal(Cb, im.getchannel(1))
 
+        self.assert_image_equal(Cb, im.getchannel("Cb"))
 
+        self.assert_image_equal(Cr, im.getchannel(2))
 
-        shared_key = privkey.exchange(ec.ECDH(), pubkey)
+        self.assert_image_equal(Cr, im.getchannel("Cr"))
 
-        ckdf = ConcatKDFHash(algorithm=hashes.SHA256(),
 
-                             length=_inbytes(bitsize),
 
-                             otherinfo=otherinfo,
+    def test_getbbox(self):
 
-                             backend=self.backend)
+        # Arrange
 
-        return ckdf.derive(shared_key)
+        im = hopper()
 
 
 
-    def wrap(self, key, bitsize, cek, headers):
+        # Act
 
-        self._check_key(key)
+        bbox = im.getbbox()
 
-        if self.keysize is None:
 
-            if cek is not None:
 
-                raise InvalidJWEOperation('ECDH-ES cannot use an existing CEK')
+        # Assert
 
-            alg = headers['enc']
+        self.assertEqual(bbox, (0, 0, 128, 128))
 
-        else:
 
-            bitsize = self.keysize
 
-            alg = headers['alg']
+    def test_ne(self):
 
+        # Arrange
 
+        im1 = Image.new("RGB", (25, 25), "black")
 
-        epk = JWK.generate(kty=key.key_type, crv=key.key_curve)
+        im2 = Image.new("RGB", (25, 25), "white")
 
-        dk = self._derive(epk.get_op_key('unwrapKey'),
 
-                          key.get_op_key('wrapKey'),
 
-                          alg, bitsize, headers)
+        # Act / Assert
 
+        self.assertNotEqual(im1, im2)
 
 
-        if self.keysize is None:
 
-            ret = {'cek': dk}
+    def test_alpha_composite(self):
 
-        else:
+        # https://stackoverflow.com/questions/3374878
 
-            aeskw = self.aeskwmap[bitsize]()
+        # Arrange
 
-            kek = JWK(kty="oct", use="enc", k=base64url_encode(dk))
+        from PIL import ImageDraw
 
-            ret = aeskw.wrap(kek, bitsize, cek, headers)
 
 
+        expected_colors = sorted(
 
-        ret['header'] = {'epk': json_decode(epk.export_public())}
+            [
 
-        return ret
+                (1122, (128, 127, 0, 255)),
 
+                (1089, (0, 255, 0, 255)),
 
+                (3300, (255, 0, 0, 255)),
 
-    def unwrap(self, key, bitsize, ek, headers):
+                (1156, (170, 85, 0, 192)),
 
-        if 'epk' not in headers:
+                (1122, (0, 255, 0, 128)),
 
-            raise ValueError('Invalid Header, missing "epk" parameter')
+                (1122, (255, 0, 0, 128)),
 
-        self._check_key(key)
+                (1089, (0, 255, 0, 0)),
 
-        if self.keysize is None:
+            ]
 
-            alg = headers['enc']
+        )
 
-        else:
 
-            bitsize = self.keysize
 
-            alg = headers['alg']
+        dst = Image.new("RGBA", size=(100, 100), color=(0, 255, 0, 255))
 
+        draw = ImageDraw.Draw(dst)
 
+        draw.rectangle((0, 33, 100, 66), fill=(0, 255, 0, 128))
 
-        epk = JWK(**headers['epk'])
+        draw.rectangle((0, 67, 100, 100), fill=(0, 255, 0, 0))
 
-        dk = self._derive(key.get_op_key('unwrapKey'),
+        src = Image.new("RGBA", size=(100, 100), color=(255, 0, 0, 255))
 
-                          epk.get_op_key('wrapKey'),
+        draw = ImageDraw.Draw(src)
 
-                          alg, bitsize, headers)
+        draw.rectangle((33, 0, 66, 100), fill=(255, 0, 0, 128))
 
-        if self.keysize is None:
+        draw.rectangle((67, 0, 100, 100), fill=(255, 0, 0, 0))
 
-            return dk
 
-        else:
 
-            aeskw = self.aeskwmap[bitsize]()
+        # Act
 
-            kek = JWK(kty="oct", use="enc", k=base64url_encode(dk))
+        img = Image.alpha_composite(dst, src)
 
-            cek = aeskw.unwrap(kek, bitsize, ek, headers)
 
-            return cek
 
+        # Assert
 
+        img_colors = sorted(img.getcolors())
 
+        self.assertEqual(img_colors, expected_colors)
 
 
-class _EcdhEsAes128Kw(_EcdhEs, JWAAlgorithm):
 
+    def test_alpha_inplace(self):
 
+        src = Image.new("RGBA", (128, 128), "blue")
 
-    name = 'ECDH-ES+A128KW'
 
-    description = 'ECDH-ES using Concat KDF and "A128KW" wrapping'
 
-    keysize = 128
+        over = Image.new("RGBA", (128, 128), "red")
 
-    algorithm_usage_location = 'alg'
+        mask = hopper("L")
 
-    algorithm_use = 'kex'
+        over.putalpha(mask)
 
 
 
+        target = Image.alpha_composite(src, over)
 
 
-class _EcdhEsAes192Kw(_EcdhEs, JWAAlgorithm):
 
+        # basic
 
+        full = src.copy()
 
-    name = 'ECDH-ES+A192KW'
+        full.alpha_composite(over)
 
-    description = 'ECDH-ES using Concat KDF and "A192KW" wrapping'
+        self.assert_image_equal(full, target)
 
-    keysize = 192
 
-    algorithm_usage_location = 'alg'
 
-    algorithm_use = 'kex'
+        # with offset down to right
 
+        offset = src.copy()
 
+        offset.alpha_composite(over, (64, 64))
 
+        self.assert_image_equal(
 
+            offset.crop((64, 64, 127, 127)), target.crop((0, 0, 63, 63))
 
-class _EcdhEsAes256Kw(_EcdhEs, JWAAlgorithm):
+        )
 
+        self.assertEqual(offset.size, (128, 128))
 
 
-    name = 'ECDH-ES+A256KW'
 
-    description = 'ECDH-ES using Concat KDF and "A128KW" wrapping'
+        # offset and crop
 
-    keysize = 256
+        box = src.copy()
 
-    algorithm_usage_location = 'alg'
+        box.alpha_composite(over, (64, 64), (0, 0, 32, 32))
 
-    algorithm_use = 'kex'
+        self.assert_image_equal(box.crop((64, 64, 96, 96)), target.crop((0, 0, 32, 32)))
 
+        self.assert_image_equal(box.crop((96, 96, 128, 128)), src.crop((0, 0, 32, 32)))
 
+        self.assertEqual(box.size, (128, 128))
 
 
 
-class _RawJWE(object):
+        # source point
 
+        source = src.copy()
 
+        source.alpha_composite(over, (32, 32), (32, 32, 96, 96))
 
-    def encrypt(self, k, a, m):
 
-        raise NotImplementedError
 
+        self.assert_image_equal(
 
+            source.crop((32, 32, 96, 96)), target.crop((32, 32, 96, 96))
 
-    def decrypt(self, k, a, iv, e, t):
+        )
 
-        raise NotImplementedError
+        self.assertEqual(source.size, (128, 128))
 
 
 
+        # errors
 
+        self.assertRaises(ValueError, source.alpha_composite, over, "invalid source")
 
-class _AesCbcHmacSha2(_RawJWE):
+        self.assertRaises(
 
+            ValueError, source.alpha_composite, over, (0, 0), "invalid destination"
 
+        )
 
-    keysize = None
+        self.assertRaises(ValueError, source.alpha_composite, over, 0)
 
+        self.assertRaises(ValueError, source.alpha_composite, over, (0, 0), 0)
 
+        self.assertRaises(ValueError, source.alpha_composite, over, (0, -1))
 
-    def __init__(self, hashfn):
+        self.assertRaises(ValueError, source.alpha_composite, over, (0, 0), (0, -1))
 
-        self.backend = default_backend()
 
-        self.hashfn = hashfn
 
-        self.blocksize = algorithms.AES.block_size
+    def test_registered_extensions_uninitialized(self):
 
-        self.wrap_key_size = self.keysize * 2
+        # Arrange
 
+        Image._initialized = 0
 
+        extension = Image.EXTENSION
 
-    def _mac(self, k, a, iv, e):
+        Image.EXTENSION = {}
 
-        al = _encode_int(_bitsize(a), 64)
 
-        h = hmac.HMAC(k, self.hashfn, backend=self.backend)
 
-        h.update(a)
+        # Act
 
-        h.update(iv)
+        Image.registered_extensions()
 
-        h.update(e)
 
-        h.update(al)
 
-        m = h.finalize()
+        # Assert
 
-        return m[:_inbytes(self.keysize)]
+        self.assertEqual(Image._initialized, 2)
 
 
 
-    # RFC 7518 - 5.2.2
+        # Restore the original state and assert
 
-    def encrypt(self, k, a, m):
+        Image.EXTENSION = extension
 
-        """ Encrypt according to the selected encryption and hashing
+        self.assertTrue(Image.EXTENSION)
 
-        functions.
 
 
+    def test_registered_extensions(self):
 
-        :param k: Encryption key (optional)
+        # Arrange
 
-        :param a: Additional Authentication Data
+        # Open an image to trigger plugin registration
 
-        :param m: Plaintext
+        Image.open("Tests/images/rgb.jpg")
 
 
 
-        Returns a dictionary with the computed data.
+        # Act
 
-        """
+        extensions = Image.registered_extensions()
 
-        hkey = k[:_inbytes(self.keysize)]
 
-        ekey = k[_inbytes(self.keysize):]
 
+        # Assert
 
+        self.assertTrue(extensions)
 
-        # encrypt
+        for ext in [".cur", ".icns", ".tif", ".tiff"]:
 
-        iv = _randombits(self.blocksize)
+            self.assertIn(ext, extensions)
 
-        cipher = Cipher(algorithms.AES(ekey), modes.CBC(iv),
 
-                        backend=self.backend)
 
-        encryptor = cipher.encryptor()
+    def test_effect_mandelbrot(self):
 
-        padder = PKCS7(self.blocksize).padder()
+        # Arrange
 
-        padded_data = padder.update(m) + padder.finalize()
+        size = (512, 512)
 
-        e = encryptor.update(padded_data) + encryptor.finalize()
+        extent = (-3, -2.5, 2, 2.5)
 
+        quality = 100
 
 
-        # mac
 
-        t = self._mac(hkey, a, iv, e)
+        # Act
 
+        im = Image.effect_mandelbrot(size, extent, quality)
 
 
-        return (iv, e, t)
 
+        # Assert
 
+        self.assertEqual(im.size, (512, 512))
 
-    def decrypt(self, k, a, iv, e, t):
+        im2 = Image.open("Tests/images/effect_mandelbrot.png")
 
-        """ Decrypt according to the selected encryption and hashing
+        self.assert_image_equal(im, im2)
 
-        functions.
 
-        :param k: Encryption key (optional)
 
-        :param a: Additional Authenticated Data
+    def test_effect_mandelbrot_bad_arguments(self):
 
-        :param iv: Initialization Vector
+        # Arrange
 
-        :param e: Ciphertext
+        size = (512, 512)
 
-        :param t: Authentication Tag
+        # Get coordinates the wrong way round:
 
+        extent = (+3, +2.5, -2, -2.5)
 
+        # Quality < 2:
 
-        Returns plaintext or raises an error
+        quality = 1
 
-        """
 
-        hkey = k[:_inbytes(self.keysize)]
 
-        dkey = k[_inbytes(self.keysize):]
+        # Act/Assert
 
+        self.assertRaises(ValueError, Image.effect_mandelbrot, size, extent, quality)
 
 
-        # verify mac
 
-        if not constant_time.bytes_eq(t, self._mac(hkey, a, iv, e)):
+    def test_effect_noise(self):
 
-            raise InvalidSignature('Failed to verify MAC')
+        # Arrange
 
+        size = (100, 100)
 
+        sigma = 128
 
-        # decrypt
 
-        cipher = Cipher(algorithms.AES(dkey), modes.CBC(iv),
 
-                        backend=self.backend)
+        # Act
 
-        decryptor = cipher.decryptor()
+        im = Image.effect_noise(size, sigma)
 
-        d = decryptor.update(e) + decryptor.finalize()
 
-        unpadder = PKCS7(self.blocksize).unpadder()
 
-        return unpadder.update(d) + unpadder.finalize()
+        # Assert
 
+        self.assertEqual(im.size, (100, 100))
 
+        self.assertEqual(im.mode, "L")
 
+        p0 = im.getpixel((0, 0))
 
+        p1 = im.getpixel((0, 1))
 
-class _A128CbcHs256(_AesCbcHmacSha2, JWAAlgorithm):
+        p2 = im.getpixel((0, 2))
 
+        p3 = im.getpixel((0, 3))
 
+        p4 = im.getpixel((0, 4))
 
-    name = 'A128CBC-HS256'
+        self.assert_not_all_same([p0, p1, p2, p3, p4])
 
-    description = "AES_128_CBC_HMAC_SHA_256 authenticated"
 
-    keysize = 128
 
-    algorithm_usage_location = 'enc'
+    def test_effect_spread(self):
 
-    algorithm_use = 'enc'
+        # Arrange
 
+        im = hopper()
 
+        distance = 10
 
-    def __init__(self):
 
-        super(_A128CbcHs256, self).__init__(hashes.SHA256())
 
+        # Act
 
+        im2 = im.effect_spread(distance)
 
 
 
-class _A192CbcHs384(_AesCbcHmacSha2, JWAAlgorithm):
+        # Assert
 
+        self.assertEqual(im.size, (128, 128))
 
+        im3 = Image.open("Tests/images/effect_spread.png")
 
-    name = 'A192CBC-HS384'
+        self.assert_image_similar(im2, im3, 110)
 
-    description = "AES_192_CBC_HMAC_SHA_384 authenticated"
 
-    keysize = 192
 
-    algorithm_usage_location = 'enc'
+    def test_check_size(self):
 
-    algorithm_use = 'enc'
+        # Checking that the _check_size function throws value errors
 
+        # when we want it to.
 
+        with self.assertRaises(ValueError):
 
-    def __init__(self):
+            Image.new("RGB", 0)  # not a tuple
 
-        super(_A192CbcHs384, self).__init__(hashes.SHA384())
+        with self.assertRaises(ValueError):
 
+            Image.new("RGB", (0,))  # Tuple too short
 
+        with self.assertRaises(ValueError):
 
+            Image.new("RGB", (-1, -1))  # w,h < 0
 
 
-class _A256CbcHs512(_AesCbcHmacSha2, JWAAlgorithm):
 
+        # this should pass with 0 sized images, #2259
 
+        im = Image.new("L", (0, 0))
 
-    name = 'A256CBC-HS512'
+        self.assertEqual(im.size, (0, 0))
 
-    description = "AES_256_CBC_HMAC_SHA_512 authenticated"
 
-    keysize = 256
 
-    algorithm_usage_location = 'enc'
+        im = Image.new("L", (0, 100))
 
-    algorithm_use = 'enc'
+        self.assertEqual(im.size, (0, 100))
 
 
 
-    def __init__(self):
+        im = Image.new("L", (100, 0))
 
-        super(_A256CbcHs512, self).__init__(hashes.SHA512())
+        self.assertEqual(im.size, (100, 0))
 
 
 
+        self.assertTrue(Image.new("RGB", (1, 1)))
 
+        # Should pass lists too
 
-class _AesGcm(_RawJWE):
+        i = Image.new("RGB", [1, 1])
 
+        self.assertIsInstance(i.size, tuple)
 
 
-    keysize = None
 
+    def test_storage_neg(self):
 
+        # Storage.c accepted negative values for xsize, ysize.  Was
 
-    def __init__(self):
+        # test_neg_ppm, but the core function for that has been
 
-        self.backend = default_backend()
+        # removed Calling directly into core to test the error in
 
-        self.wrap_key_size = self.keysize
+        # Storage.c, rather than the size check above
 
 
 
-    # RFC 7518 - 5.3
+        with self.assertRaises(ValueError):
 
-    def encrypt(self, k, a, m):
+            Image.core.fill("RGB", (2, -2), (0, 0, 0))
 
-        """ Encrypt accoriding to the selected encryption and hashing
 
-        functions.
 
+    def test_offset_not_implemented(self):
 
+        # Arrange
 
-        :param k: Encryption key (optional)
+        im = hopper()
 
-        :param a: Additional Authentication Data
 
-        :param m: Plaintext
 
+        # Act / Assert
 
+        self.assertRaises(NotImplementedError, im.offset, None)
 
-        Returns a dictionary with the computed data.
 
-        """
 
-        iv = _randombits(96)
+    def test_fromstring(self):
 
-        cipher = Cipher(algorithms.AES(k), modes.GCM(iv),
+        self.assertRaises(NotImplementedError, Image.fromstring)
 
-                        backend=self.backend)
 
-        encryptor = cipher.encryptor()
 
-        encryptor.authenticate_additional_data(a)
+    def test_linear_gradient_wrong_mode(self):
 
-        e = encryptor.update(m) + encryptor.finalize()
+        # Arrange
 
+        wrong_mode = "RGB"
 
 
-        return (iv, e, encryptor.tag)
 
+        # Act / Assert
 
+        self.assertRaises(ValueError, Image.linear_gradient, wrong_mode)
 
-    def decrypt(self, k, a, iv, e, t):
 
-        """ Decrypt accoriding to the selected encryption and hashing
 
-        functions.
+    def test_linear_gradient(self):
 
-        :param k: Encryption key (optional)
 
-        :param a: Additional Authenticated Data
 
-        :param iv: Initialization Vector
+        # Arrange
 
-        :param e: Ciphertext
+        target_file = "Tests/images/linear_gradient.png"
 
-        :param t: Authentication Tag
+        for mode in ["L", "P"]:
 
 
 
-        Returns plaintext or raises an error
+            # Act
 
-        """
+            im = Image.linear_gradient(mode)
 
-        cipher = Cipher(algorithms.AES(k), modes.GCM(iv, t),
 
-                        backend=self.backend)
 
-        decryptor = cipher.decryptor()
+            # Assert
 
-        decryptor.authenticate_additional_data(a)
+            self.assertEqual(im.size, (256, 256))
 
-        return decryptor.update(e) + decryptor.finalize()
+            self.assertEqual(im.mode, mode)
 
+            self.assertEqual(im.getpixel((0, 0)), 0)
 
+            self.assertEqual(im.getpixel((255, 255)), 255)
 
+            target = Image.open(target_file).convert(mode)
 
+            self.assert_image_equal(im, target)
 
-class _A128Gcm(_AesGcm, JWAAlgorithm):
 
 
+    def test_radial_gradient_wrong_mode(self):
 
-    name = 'A128GCM'
+        # Arrange
 
-    description = "AES GCM using 128-bit key"
+        wrong_mode = "RGB"
 
-    keysize = 128
 
-    algorithm_usage_location = 'enc'
 
-    algorithm_use = 'enc'
+        # Act / Assert
 
+        self.assertRaises(ValueError, Image.radial_gradient, wrong_mode)
 
 
 
+    def test_radial_gradient(self):
 
-class _A192Gcm(_AesGcm, JWAAlgorithm):
 
 
+        # Arrange
 
-    name = 'A192GCM'
+        target_file = "Tests/images/radial_gradient.png"
 
-    description = "AES GCM using 192-bit key"
+        for mode in ["L", "P"]:
 
-    keysize = 192
 
-    algorithm_usage_location = 'enc'
 
-    algorithm_use = 'enc'
+            # Act
 
+            im = Image.radial_gradient(mode)
 
 
 
+            # Assert
 
-class _A256Gcm(_AesGcm, JWAAlgorithm):
+            self.assertEqual(im.size, (256, 256))
 
+            self.assertEqual(im.mode, mode)
 
+            self.assertEqual(im.getpixel((0, 0)), 255)
 
-    name = 'A256GCM'
+            self.assertEqual(im.getpixel((128, 128)), 0)
 
-    description = "AES GCM using 256-bit key"
+            target = Image.open(target_file).convert(mode)
 
-    keysize = 256
+            self.assert_image_equal(im, target)
 
-    algorithm_usage_location = 'enc'
 
-    algorithm_use = 'enc'
 
+    def test_register_extensions(self):
 
+        test_format = "a"
 
+        exts = ["b", "c"]
 
+        for ext in exts:
 
-class JWA(object):
+            Image.register_extension(test_format, ext)
 
-    """JWA Signing Algorithms.
+        ext_individual = Image.EXTENSION.copy()
 
+        for ext in exts:
 
+            del Image.EXTENSION[ext]
 
-    This class provides access to all JWA algorithms.
 
-    """
 
+        Image.register_extensions(test_format, exts)
 
+        ext_multiple = Image.EXTENSION.copy()
 
-    algorithms_registry = {
+        for ext in exts:
 
-        'HS256': _HS256,
+            del Image.EXTENSION[ext]
 
-        'HS384': _HS384,
 
-        'HS512': _HS512,
 
-        'RS256': _RS256,
+        self.assertEqual(ext_individual, ext_multiple)
 
-        'RS384': _RS384,
 
-        'RS512': _RS512,
 
-        'ES256': _ES256,
+    def test_remap_palette(self):
 
-        'ES384': _ES384,
+        # Test illegal image mode
 
-        'ES512': _ES512,
+        im = hopper()
 
-        'PS256': _PS256,
+        self.assertRaises(ValueError, im.remap_palette, None)
 
-        'PS384': _PS384,
 
-        'PS512': _PS512,
 
-        'none': _None,
+    def test__new(self):
 
-        'RSA1_5': _Rsa15,
+        from PIL import ImagePalette
 
-        'RSA-OAEP': _RsaOaep,
 
-        'RSA-OAEP-256': _RsaOaep256,
 
-        'A128KW': _A128KW,
+        im = hopper("RGB")
 
-        'A192KW': _A192KW,
+        im_p = hopper("P")
 
-        'A256KW': _A256KW,
 
-        'dir': _Direct,
 
-        'ECDH-ES': _EcdhEs,
+        blank_p = Image.new("P", (10, 10))
 
-        'ECDH-ES+A128KW': _EcdhEsAes128Kw,
+        blank_pa = Image.new("PA", (10, 10))
 
-        'ECDH-ES+A192KW': _EcdhEsAes192Kw,
+        blank_p.palette = None
 
-        'ECDH-ES+A256KW': _EcdhEsAes256Kw,
+        blank_pa.palette = None
 
-        'A128GCMKW': _A128GcmKw,
 
-        'A192GCMKW': _A192GcmKw,
 
-        'A256GCMKW': _A256GcmKw,
+        def _make_new(base_image, im, palette_result=None):
 
-        'PBES2-HS256+A128KW': _Pbes2Hs256A128Kw,
+            new_im = base_image._new(im)
 
-        'PBES2-HS384+A192KW': _Pbes2Hs384A192Kw,
+            self.assertEqual(new_im.mode, im.mode)
 
-        'PBES2-HS512+A256KW': _Pbes2Hs512A256Kw,
+            self.assertEqual(new_im.size, im.size)
 
-        'A128CBC-HS256': _A128CbcHs256,
+            self.assertEqual(new_im.info, base_image.info)
 
-        'A192CBC-HS384': _A192CbcHs384,
+            if palette_result is not None:
 
-        'A256CBC-HS512': _A256CbcHs512,
+                self.assertEqual(new_im.palette.tobytes(), palette_result.tobytes())
 
-        'A128GCM': _A128Gcm,
+            else:
 
-        'A192GCM': _A192Gcm,
+                self.assertIsNone(new_im.palette)
 
-        'A256GCM': _A256Gcm
 
-    }
 
+        _make_new(im, im_p, im_p.palette)
 
+        _make_new(im_p, im, None)
 
-    @classmethod
+        _make_new(im, blank_p, ImagePalette.ImagePalette())
 
-    def instantiate_alg(cls, name, use=None):
+        _make_new(im, blank_pa, ImagePalette.ImagePalette())
 
-        alg = cls.algorithms_registry[name]
 
-        if use is not None and alg.algorithm_use != use:
 
-            raise KeyError
+    def test_p_from_rgb_rgba(self):
 
-        return alg()
+        for mode, color in [
 
+            ("RGB", "#DDEEFF"),
 
+            ("RGB", (221, 238, 255)),
 
-    @classmethod
+            ("RGBA", (221, 238, 255, 255)),
 
-    def signing_alg(cls, name):
+        ]:
 
-        try:
+            im = Image.new("P", (100, 100), color)
 
-            return cls.instantiate_alg(name, use='sig')
+            expected = Image.new(mode, (100, 100), color)
 
-        except KeyError:
+            self.assert_image_equal(im.convert(mode), expected)
 
-            raise InvalidJWAAlgorithm(
 
-                '%s is not a valid Signign algorithm name' % name)
 
+    def test_no_resource_warning_on_save(self):
 
+        # https://github.com/python-pillow/Pillow/issues/835
 
-    @classmethod
+        # Arrange
 
-    def keymgmt_alg(cls, name):
+        test_file = "Tests/images/hopper.png"
 
-        try:
+        temp_file = self.tempfile("temp.jpg")
 
-            return cls.instantiate_alg(name, use='kex')
 
-        except KeyError:
 
-            raise InvalidJWAAlgorithm(
+        # Act/Assert
 
-                '%s is not a valid Key Management algorithm name' % name)
+        with Image.open(test_file) as im:
 
+            self.assert_warning(None, im.save, temp_file)
 
 
-    @classmethod
 
-    def encryption_alg(cls, name):
+    def test_load_on_nonexclusive_multiframe(self):
 
-        try:
+        with open("Tests/images/frozenpond.mpo", "rb") as fp:
 
-            return cls.instantiate_alg(name, use='enc')
 
-        except KeyError:
 
-            raise InvalidJWAAlgorithm(
+            def act(fp):
 
-                '%s is not a valid Encryption algorithm name' % name)
+                im = Image.open(fp)
+
+                im.load()
+
+
+
+            act(fp)
+
+
+
+            with Image.open(fp) as im:
+
+                im.load()
+
+
+
+            self.assertFalse(fp.closed)
+
+
+
+    def test_overrun(self):
+
+        for file in [
+
+            "fli_overrun.bin",
+
+            "sgi_overrun.bin",
+
+            "sgi_overrun_expandrow.bin",
+
+            "sgi_overrun_expandrow2.bin",
+
+            "pcx_overrun.bin",
+
+            "pcx_overrun2.bin",
+
+        ]:
+
+            im = Image.open(os.path.join("Tests/images", file))
+
+            try:
+
+                im.load()
+
+                self.assertFail()
+
+            except IOError as e:
+
+                self.assertEqual(str(e), "buffer overrun when reading image file")
+
+
+
+        with Image.open("Tests/images/fli_overrun2.bin") as im:
+
+            try:
+
+                im.seek(1)
+
+                self.assertFail()
+
+            except IOError as e:
+
+                self.assertEqual(str(e), "buffer overrun when reading image file")
+
+
+
+
+
+class MockEncoder(object):
+
+    pass
+
+
+
+
+
+def mock_encode(*args):
+
+    encoder = MockEncoder()
+
+    encoder.args = args
+
+    return encoder
+
+
+
+
+
+class TestRegistry(PillowTestCase):
+
+    def test_encode_registry(self):
+
+
+
+        Image.register_encoder("MOCK", mock_encode)
+
+        self.assertIn("MOCK", Image.ENCODERS)
+
+
+
+        enc = Image._getencoder("RGB", "MOCK", ("args",), extra=("extra",))
+
+
+
+        self.assertIsInstance(enc, MockEncoder)
+
+        self.assertEqual(enc.args, ("RGB", "args", "extra"))
+
+
+
+    def test_encode_registry_fail(self):
+
+        self.assertRaises(
+
+            IOError,
+
+            Image._getencoder,
+
+            "RGB",
+
+            "DoesNotExist",
+
+            ("args",),
+
+            extra=("extra",),
+
+        )

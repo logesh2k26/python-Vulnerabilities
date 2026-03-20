@@ -1,147 +1,425 @@
 # Source: CVEFixes dataset
-# Safety: safe
+# Safety: vulnerable
 # Category: safe
 
 # -*- coding: utf-8 -*-
 
 #
 
-# This file is part of Radicale Server - Calendar Server
+# Copyright © 2012 Red Hat, Inc.
 
 #
 
-# This library is free software: you can redistribute it and/or modify
+# This software is licensed to you under the GNU General Public
 
-# it under the terms of the GNU General Public License as published by
+# License as published by the Free Software Foundation; either version
 
-# the Free Software Foundation, either version 3 of the License, or
+# 2 of the License (GPLv2) or (at your option) any later version.
 
-# (at your option) any later version.
+# There is NO WARRANTY for this software, express or implied,
 
-#
+# including the implied warranties of MERCHANTABILITY,
 
-# This library is distributed in the hope that it will be useful,
+# NON-INFRINGEMENT, or FITNESS FOR A PARTICULAR PURPOSE. You should
 
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# have received a copy of GPLv2 along with this software; if not, see
 
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# http://www.gnu.org/licenses/old-licenses/gpl-2.0.txt.
 
-# GNU General Public License for more details.
 
-#
 
-# You should have received a copy of the GNU General Public License
+from pulp.bindings.base import PulpAPI
 
-# along with Radicale.  If not, see <http://www.gnu.org/licenses/>.
+from pulp.bindings.search import SearchAPI
 
 
 
-"""
+# Default for update APIs to differentiate between None and not updating the value
 
-Helper functions for working with paths
+UNSPECIFIED = object()
 
 
 
-"""
 
 
+class ConsumerAPI(PulpAPI):
 
-import os
+    """
 
-import posixpath
+    Connection class to access consumer specific calls
 
+    """
 
+    def __init__(self, pulp_connection):
 
-from . import log
+        super(ConsumerAPI, self).__init__(pulp_connection)
 
+        self.base_path = "/v2/consumers/"
 
 
 
+    def consumers(self, **options):
 
-def sanitize_path(path):
+        """
 
-    """Make absolute (with leading slash) to prevent access to other data.
+        options:
 
-       Preserves an potential trailing slash."""
+          details (bool) - include all details
 
-    trailing_slash = "/" if path.endswith("/") else ""
+          bindings (bool) - include bindings
 
-    path = posixpath.normpath(path)
+        """
 
-    new_path = "/"
+        path = self.base_path
 
-    for part in path.split("/"):
+        return self.server.GET(path, options)
 
-        if not part or part in (".", ".."):
 
-            continue
 
-        new_path = posixpath.join(new_path, part)
+    def register(self, id, name=None, description=None, notes=None, rsa_pub=None):
 
-    trailing_slash = "" if new_path.endswith("/") else trailing_slash
+        path = self.base_path
 
-    return new_path + trailing_slash
+        body = {
 
+            "id": id,
 
+            "display_name": name,
 
+            "description": description,
 
+            "notes": notes,
 
-def is_safe_filesystem_path_component(path):
+            "rsa_pub": rsa_pub
 
-    """Checks if path is a single component of a local filesystem path
+        }
 
-       and is safe to join"""
+        return self.server.POST(path, body)
 
-    if not path:
 
-        return False
 
-    drive, _ = os.path.splitdrive(path)
+    def consumer(self, id):
 
-    if drive:
+        path = self.base_path + ("%s/" % id)
 
-        return False
+        return self.server.GET(path)
 
-    head, _ = os.path.split(path)
 
-    if head:
 
-        return False
+    def unregister(self, id):
 
-    if path in (os.curdir, os.pardir):
+        path = self.base_path + "%s/" % id
 
-        return False
+        return self.server.DELETE(path)
 
-    return True
 
 
+    def update(self, id, delta):
 
+        path = self.base_path + "%s/" % id
 
+        body = {'delta' : delta}
 
-def path_to_filesystem(path, base_folder):
+        return self.server.PUT(path, body)
 
-    """Converts path to a local filesystem path relative to base_folder
 
-        in a secure manner or raises ValueError."""
 
-    sane_path = sanitize_path(path).strip("/")
 
-    safe_path = base_folder
 
-    if not sane_path:
+class ConsumerSearchAPI(SearchAPI):
 
-        return safe_path
+    PATH = "/v2/consumers/search/"
 
-    for part in sane_path.split("/"):
 
-        if not is_safe_filesystem_path_component(part):
 
-            log.LOGGER.debug("Can't translate path safely to filesystem: %s",
 
-                             path)
 
-            raise ValueError("Unsafe path")
+class ConsumerContentAPI(PulpAPI):
 
-        safe_path = os.path.join(safe_path, part)
+    """
 
-    return safe_path
+    Connection class to access consumer content install/uninstall/update calls
+
+    """
+
+    def __init__(self, pulp_connection):
+
+        super(ConsumerContentAPI, self).__init__(pulp_connection)
+
+        self.base_path = "/v2/consumers/%s/actions/content/"
+
+
+
+    def install(self, id, units, options={}):
+
+        path = self.base_path % id + "install/"
+
+        data = {"units": units,
+
+                "options": options,}
+
+        return self.server.POST(path, data)
+
+
+
+    def update(self, id, units, options={}):
+
+        path = self.base_path % id + "update/"
+
+        data = {"units": units,
+
+                "options": options,}
+
+        return self.server.POST(path, data)
+
+
+
+    def uninstall(self, id, units, options={}):
+
+        path = self.base_path % id + "uninstall/"
+
+        data = {"units": units,
+
+                "options": options,}
+
+        return self.server.POST(path, data)
+
+
+
+
+
+class ConsumerContentSchedulesAPI(PulpAPI):
+
+    """
+
+    Connection class to access consumer calls related to scheduled content install/uninstall/update
+
+    Each function inside the class accepts an additional 'action' parameter. This is to specify a particular
+
+    schedule action. Possible values are 'install', 'update' and 'uninstall'.
+
+    """
+
+    def __init__(self, pulp_connection):
+
+        """
+
+        @type:   pulp_connection: pulp.bindings.server.PulpConnection
+
+        """
+
+        super(ConsumerContentSchedulesAPI, self).__init__(pulp_connection)
+
+        self.base_path = "/v2/consumers/%s/schedules/content/"
+
+
+
+    def list_schedules(self, action, consumer_id):
+
+        url = self.base_path % consumer_id + action + '/'
+
+        return self.server.GET(url)
+
+
+
+    def get_schedule(self, action, consumer_id, schedule_id):
+
+        url = self.base_path % consumer_id + action + '/%s/' % schedule_id
+
+        return self.server.GET(url)
+
+    
+
+    def add_schedule(self, action, consumer_id, schedule, units, failure_threshold=UNSPECIFIED,
+
+                     enabled=UNSPECIFIED, options=UNSPECIFIED):
+
+        url = self.base_path % consumer_id + action + '/'
+
+        body = {
+
+            'schedule' : schedule,
+
+            'units': units,
+
+            'failure_threshold' : failure_threshold,
+
+            'enabled' : enabled,
+
+            'options': options,
+
+            }
+
+        # Strip out anything that wasn't specified by the caller
+
+        body = dict([(k, v) for k, v in body.items() if v is not UNSPECIFIED])
+
+        return self.server.POST(url, body)
+
+ 
+
+    def delete_schedule(self, action, consumer_id, schedule_id):
+
+        url = self.base_path % consumer_id + action + '/%s/' % schedule_id
+
+        return self.server.DELETE(url)
+
+
+
+    def update_schedule(self, action, consumer_id, schedule_id, schedule=UNSPECIFIED, units=UNSPECIFIED,
+
+                        failure_threshold=UNSPECIFIED, remaining_runs=UNSPECIFIED, enabled=UNSPECIFIED,
+
+                        options=UNSPECIFIED):
+
+        url = self.base_path % consumer_id + action + '/%s/' % schedule_id
+
+        body = {
+
+            'schedule' : schedule,
+
+            'units': units,
+
+            'failure_threshold' : failure_threshold,
+
+            'remaining_runs' : remaining_runs,
+
+            'enabled' : enabled,
+
+            'options': options,
+
+            }
+
+        # Strip out anything that wasn't specified by the caller
+
+        body = dict([(k, v) for k, v in body.items() if v is not UNSPECIFIED])
+
+        self.server.PUT(url, body)
+
+
+
+
+
+class BindingsAPI(PulpAPI):
+
+
+
+    BASE_PATH = '/v2/consumers/%s/bindings/'
+
+
+
+    def find_by_id(self, consumer_id, repo_id=None):
+
+        path = self.BASE_PATH % consumer_id
+
+        if repo_id:
+
+            path += '%s/' % repo_id
+
+        return self.server.GET(path)
+
+    
+
+    def bind(self, consumer_id, repo_id, distributor_id, notify_agent=True, binding_config=None):
+
+        path = self.BASE_PATH % consumer_id
+
+        data = {
+
+            'repo_id' :repo_id,
+
+            'distributor_id' :distributor_id,
+
+            'notify_agent': notify_agent,
+
+            'binding_config': binding_config or {}
+
+        }
+
+        return self.server.POST(path, data)
+
+    
+
+    def unbind(self, consumer_id, repo_id, distributor_id, force=False):
+
+        path = self.BASE_PATH % consumer_id + "%s/" % repo_id + "%s/" % distributor_id
+
+        body = dict(force=force)
+
+        return self.server.DELETE(path, body)
+
+
+
+
+
+class BindingSearchAPI(SearchAPI):
+
+    PATH = "/v2/consumers/binding/search/"
+
+
+
+
+
+class ProfilesAPI(PulpAPI):
+
+
+
+    BASE_PATH = '/v2/consumers/%s/profiles/'
+
+
+
+    def send(self, id, content_type, profile):
+
+        path = self.BASE_PATH % id
+
+        data = { 'content_type':content_type, 'profile':profile }
+
+        return self.server.POST(path, data)
+
+
+
+
+
+class ConsumerHistoryAPI(PulpAPI):
+
+    """
+
+    Connection class to access consumer history retrieval calls
+
+    """
+
+    def __init__(self, pulp_connection):
+
+        super(ConsumerHistoryAPI, self).__init__(pulp_connection)
+
+        self.base_path = "/v2/consumers/%s/history/"
+
+
+
+    def history(self, consumer_id, event_type=None, limit=None, sort=None, start_date=None, end_date=None):
+
+        path = self.base_path % consumer_id
+
+        queries = {}
+
+        if event_type:
+
+            queries['event_type'] = event_type
+
+        if limit:
+
+            queries['limit'] = limit
+
+        if sort:
+
+            queries['sort'] = sort
+
+        if start_date:
+
+            queries['start_date'] = start_date
+
+        if end_date:
+
+            queries['end_date'] = end_date
+
+        return self.server.GET(path, queries)

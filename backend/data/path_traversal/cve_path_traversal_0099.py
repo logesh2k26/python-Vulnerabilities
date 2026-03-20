@@ -2,1014 +2,1458 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-# vim: ft=python fileencoding=utf-8 sts=4 sw=4 et:
+"""
+
+A Cobbler System.
 
 
 
-# Copyright 2016-2018 Florian Bruhin (The Compiler) <mail@qutebrowser.org>
+Copyright 2006-2009, Red Hat, Inc and Others
 
-#
-
-# This file is part of qutebrowser.
-
-#
-
-# qutebrowser is free software: you can redistribute it and/or modify
-
-# it under the terms of the GNU General Public License as published by
-
-# the Free Software Foundation, either version 3 of the License, or
-
-# (at your option) any later version.
-
-#
-
-# qutebrowser is distributed in the hope that it will be useful,
-
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-
-# GNU General Public License for more details.
-
-#
-
-# You should have received a copy of the GNU General Public License
-
-# along with qutebrowser.  If not, see <http://www.gnu.org/licenses/>.
+Michael DeHaan <michael.dehaan AT gmail>
 
 
 
-"""Backend-independent qute://* code.
+This program is free software; you can redistribute it and/or modify
+
+it under the terms of the GNU General Public License as published by
+
+the Free Software Foundation; either version 2 of the License, or
+
+(at your option) any later version.
 
 
 
-Module attributes:
+This program is distributed in the hope that it will be useful,
 
-    pyeval_output: The output of the last :pyeval command.
+but WITHOUT ANY WARRANTY; without even the implied warranty of
 
-    _HANDLERS: The handlers registered via decorators.
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+
+GNU General Public License for more details.
+
+
+
+You should have received a copy of the GNU General Public License
+
+along with this program; if not, write to the Free Software
+
+Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
+
+02110-1301  USA
 
 """
 
 
 
-import json
+import utils
 
-import os
+import item
 
 import time
 
-import textwrap
+from cexceptions import *
 
-import mimetypes
+from utils import _
 
-import urllib
 
-import collections
 
+# this datastructure is described in great detail in item_distro.py -- read the comments there.
 
 
-import pkg_resources
 
-import sip
+FIELDS = [
 
-from PyQt5.QtCore import QUrlQuery, QUrl
+  ["name","",0,"Name",True,"Ex: vanhalen.example.org",0,"str"],
 
+  ["uid","",0,"",False,"",0,"str"],
 
+  ["owners","SETTINGS:default_ownership",0,"Owners",True,"Owners list for authz_ownership (space delimited)",0,"list"],
 
-import qutebrowser
+  ["profile",None,0,"Profile",True,"Parent profile",[],"str"],
 
-from qutebrowser.config import config, configdata, configexc, configdiff
+  ["image",None,0,"Image",True,"Parent image (if not a profile)",0,"str"],
 
-from qutebrowser.utils import (version, utils, jinja, log, message, docutils,
+  ["status","production",0,"Status",True,"System status",["development","testing","acceptance","production"],"str"],
 
-                               objreg, urlutils)
+  ["kernel_options",{},0,"Kernel Options",True,"Ex: selinux=permissive",0,"dict"],
 
-from qutebrowser.misc import objects
+  ["kernel_options_post",{},0,"Kernel Options (Post Install)",True,"Ex: clocksource=pit noapic",0,"dict"],
 
+  ["ks_meta",{},0,"Kickstart Metadata",True,"Ex: dog=fang agent=86",0,"dict"],
 
+  ["enable_gpxe","SETTINGS:enable_gpxe",0,"Enable gPXE?",True,"Use gPXE instead of PXELINUX for advanced booting options",0,"bool"],
 
+  ["proxy","<<inherit>>",0,"Proxy",True,"Proxy URL",0,"str"],
 
+  ["netboot_enabled",True,0,"Netboot Enabled",True,"PXE (re)install this machine at next boot?",0,"bool"],
 
-pyeval_output = ":pyeval was never called"
+  ["kickstart","<<inherit>>",0,"Kickstart",True,"Path to kickstart template",0,"str"],
 
-spawn_output = ":spawn was never called"
+  ["comment","",0,"Comment",True,"Free form text description",0,"str"],
 
+  ["depth",2,0,"",False,"",0,"int"],
 
+  ["server","<<inherit>>",0,"Server Override",True,"See manpage or leave blank",0,"str"],
 
+  ["virt_path","<<inherit>>",0,"Virt Path",True,"Ex: /directory or VolGroup00",0,"str"],
 
+  ["virt_type","<<inherit>>",0,"Virt Type",True,"Virtualization technology to use",["xenpv","xenfv","qemu","kvm","vmware"],"str"],
 
-_HANDLERS = {}
+  ["virt_cpus","<<inherit>>",0,"Virt CPUs",True,"",0,"int"],
 
+  ["virt_file_size","<<inherit>>",0,"Virt File Size(GB)",True,"",0,"float"],
 
+  ["virt_disk_driver","<<inherit>>",0,"Virt Disk Driver Type",True,"The on-disk format for the virtualization disk","raw","str"],
 
+  ["virt_ram","<<inherit>>",0,"Virt RAM (MB)",True,"",0,"int"],
 
+  ["virt_auto_boot","<<inherit>>",0,"Virt Auto Boot",True,"Auto boot this VM?",0,"bool"],
 
-class NoHandlerFound(Exception):
+  ["ctime",0,0,"",False,"",0,"float"],
 
+  ["mtime",0,0,"",False,"",0,"float"],
 
+  ["power_type","SETTINGS:power_management_default_type",0,"Type",True,"Power management script to use",utils.get_power_types(),"str"],
 
-    """Raised when no handler was found for the given URL."""
+  ["power_address","",0,"Address",True,"Ex: power-device.example.org",0,"str"],
 
+  ["power_user","",0,"Username ",True,"",0,"str"],
 
+  ["power_pass","",0,"Password",True,"",0,"str"],
 
-    pass
+  ["power_id","",0,"ID",True,"Usually a plug number or blade name, if power type requires it",0,"str"],
 
+  ["hostname","",0,"Hostname",True,"",0,"str"],
 
+  ["gateway","",0,"Gateway",True,"",0,"str"],
 
+  ["name_servers",[],0,"Name Servers",True,"space delimited",0,"list"],
 
+  ["name_servers_search",[],0,"Name Servers Search Path",True,"space delimited",0,"list"],
 
-class QuteSchemeOSError(Exception):
+  ["ipv6_default_device","",0,"IPv6 Default Device",True,"",0,"str"],
 
+  ["ipv6_autoconfiguration",False,0,"IPv6 Autoconfiguration",True,"",0,"bool"],
 
+  ["network_widget_a","",0,"Add Interface",True,"",0,"str"], # not a real field, a marker for the web app
 
-    """Called when there was an OSError inside a handler."""
+  ["network_widget_b","",0,"Edit Interface",True,"",0,"str"], # not a real field, a marker for the web app
 
+  ["*mac_address","",0,"MAC Address",True,"(Place \"random\" in this field for a random MAC Address.)",0,"str"],
 
+  ["network_widget_c","",0,"",True,"",0,"str"], # not a real field, a marker for the web app
 
-    pass
+  ["*mtu","",0,"MTU",True,"",0,"str"],
 
+  ["*ip_address","",0,"IP Address",True,"",0,"str"],
 
+  ["*interface_type","na",0,"Interface Type",True,"",["na","master","slave","bond","bond_slave","bridge","bridge_slave"],"str"],
 
+  ["*interface_master","",0,"Master Interface",True,"",0,"str"],
 
+  ["*bonding_opts","",0,"Bonding Opts",True,"",0,"str"],
 
-class QuteSchemeError(Exception):
+  ["*bridge_opts","",0,"Bridge Opts",True,"",0,"str"],
 
+  ["*management",False,0,"Management Interface",True,"Is this the management interface?",0,"bool"],
 
+  ["*static",False,0,"Static",True,"Is this interface static?",0,"bool"],
 
-    """Exception to signal that a handler should return an ErrorReply.
+  ["*netmask","",0,"Subnet Mask",True,"",0,"str"],
 
+  ["*dhcp_tag","",0,"DHCP Tag",True,"",0,"str"],
 
+  ["*dns_name","",0,"DNS Name",True,"",0,"str"],
 
-    Attributes correspond to the arguments in
+  ["*static_routes",[],0,"Static Routes",True,"",0,"list"],
 
-    networkreply.ErrorNetworkReply.
+  ["*virt_bridge","",0,"Virt Bridge",True,"",0,"str"],
 
+  ["*ipv6_address","",0,"IPv6 Address",True,"",0,"str"],
 
+  ["*ipv6_secondaries",[],0,"IPv6 Secondaries",True,"space delimited",0,"list"],
 
-    Attributes:
+  ["*ipv6_mtu","",0,"IPv6 MTU",True,"",0,"str"],
 
-        errorstring: Error string to print.
+  ["*ipv6_static_routes",[],0,"IPv6 Static Routes",True,"",0,"list"],
 
-        error: Numerical error value.
+  ["*ipv6_default_gateway","",0,"IPv6 Default Gateway",True,"",0,"str"],
 
-    """
+  ["mgmt_classes",[],0,"Management Classes",True,"For external config management",0,"list"],
 
+  ["mgmt_parameters","<<inherit>>",0,"Management Parameters",True,"Parameters which will be handed to your management application (Must be valid YAML dictionary)", 0,"str"],
 
+  [ "boot_files",{},'<<inherit>>',"TFTP Boot Files",True,"Files copied into tftpboot beyond the kernel/initrd",0,"list"],
 
-    def __init__(self, errorstring, error):
+  ["fetchable_files",{},'<<inherit>>',"Fetchable Files",True,"Templates for tftp or wget",0,"dict"],
 
-        self.errorstring = errorstring
+  ["template_files",{},0,"Template Files",True,"File mappings for built-in configuration management",0,"dict"],
 
-        self.error = error
+  ["redhat_management_key","<<inherit>>",0,"Red Hat Management Key",True,"Registration key for RHN, Satellite, or Spacewalk",0,"str"],
 
-        super().__init__(errorstring)
+  ["redhat_management_server","<<inherit>>",0,"Red Hat Management Server",True,"Address of Satellite or Spacewalk Server",0,"str"],
 
+  ["template_remote_kickstarts", "SETTINGS:template_remote_kickstarts", "SETTINGS:template_remote_kickstarts", "", False, "", 0, "bool"],
 
+  ["repos_enabled",False,0,"Repos Enabled",True,"(re)configure local repos on this machine at next config update?",0,"bool"],
 
+  ["ldap_enabled",False,0,"LDAP Enabled",True,"(re)configure LDAP on this machine at next config update?",0,"bool"],
 
+  ["ldap_type","SETTINGS:ldap_management_default_type",0,"LDAP Management Type",True,"Ex: authconfig",0,"str"],
 
-class Redirect(Exception):
+  ["monit_enabled",False,0,"Monit Enabled",True,"(re)configure monit on this machine at next config update?",0,"bool"],
 
+]
 
 
-    """Exception to signal a redirect should happen.
 
+class System(item.Item):
 
 
-    Attributes:
 
-        url: The URL to redirect to, as a QUrl.
+    TYPE_NAME = _("system")
 
-    """
+    COLLECTION_TYPE = "system"
 
 
 
-    def __init__(self, url):
+    def get_fields(self):
 
-        super().__init__(url.toDisplayString())
+        return FIELDS
 
-        self.url = url
 
 
+    def make_clone(self):
 
+        ds = self.to_datastruct()
 
+        cloned = System(self.config)
 
-class add_handler:  # noqa: N801,N806 pylint: disable=invalid-name
+        cloned.from_datastruct(ds)
 
+        return cloned
 
 
-    """Decorator to register a qute://* URL handler.
 
+    def delete_interface(self,name):
 
+        """
 
-    Attributes:
+        Used to remove an interface.
 
-        _name: The 'foo' part of qute://foo
+        """
 
-        backend: Limit which backends the handler can run with.
+        if self.interfaces.has_key(name) and len(self.interfaces) > 1:
 
-    """
-
-
-
-    def __init__(self, name, backend=None):
-
-        self._name = name
-
-        self._backend = backend
-
-        self._function = None
-
-
-
-    def __call__(self, function):
-
-        self._function = function
-
-        _HANDLERS[self._name] = self.wrapper
-
-        return function
-
-
-
-    def wrapper(self, *args, **kwargs):
-
-        """Call the underlying function."""
-
-        if self._backend is not None and objects.backend != self._backend:
-
-            return self.wrong_backend_handler(*args, **kwargs)
+            del self.interfaces[name]
 
         else:
 
-            return self._function(*args, **kwargs)
+            if not self.interfaces.has_key(name):
+
+                # no interface here to delete
+
+                pass
+
+            else:
+
+                raise CX(_("At least one interface needs to be defined."))
 
 
 
-    def wrong_backend_handler(self, url):
+        return True
 
-        """Show an error page about using the invalid backend."""
-
-        html = jinja.render('error.html',
-
-                            title="Error while opening qute://url",
-
-                            url=url.toDisplayString(),
-
-                            error='{} is not available with this '
-
-                                  'backend'.format(url.toDisplayString()))
-
-        return 'text/html', html
+        
 
 
 
-
-
-def data_for_url(url):
-
-    """Get the data to show for the given URL.
+    def __get_interface(self,name):
 
 
 
-    Args:
+        if not self.interfaces.has_key(name):
 
-        url: The QUrl to show.
+            self.interfaces[name] = {
+
+                "mac_address"          : "",
+
+                "mtu"                  : "",
+
+                "ip_address"           : "",
+
+                "dhcp_tag"             : "",
+
+                "subnet"               : "", # deprecated
+
+                "netmask"              : "",
+
+                "virt_bridge"          : "",
+
+                "static"               : False,
+
+                "interface_type"       : "",
+
+                "interface_master"     : "",
+
+                "bonding"              : "", # deprecated
+
+                "bonding_master"       : "", # deprecated
+
+                "bonding_opts"         : "",
+
+                "bridge_opts"          : "",
+
+                "management"           : False,
+
+                "dns_name"             : "",
+
+                "static_routes"        : [],
+
+                "ipv6_address"         : "",
+
+                "ipv6_secondaries"     : [],
+
+                "ipv6_mtu"             : "",
+
+                "ipv6_static_routes"   : [],
+
+                "ipv6_default_gateway" : "",
+
+            }
 
 
 
-    Return:
-
-        A (mimetype, data) tuple.
-
-    """
-
-    norm_url = url.adjusted(QUrl.NormalizePathSegments |
-
-                            QUrl.StripTrailingSlash)
-
-    if norm_url != url:
-
-        raise Redirect(norm_url)
+        return self.interfaces[name]
 
 
 
-    path = url.path()
 
-    host = url.host()
 
-    query = urlutils.query_string(url)
+    def from_datastruct(self,seed_data):
 
-    # A url like "qute:foo" is split as "scheme:path", not "scheme:host".
+        # FIXME: most definitely doesn't grok interfaces yet.
 
-    log.misc.debug("url: {}, path: {}, host {}".format(
+        return utils.from_datastruct_from_fields(self,seed_data,FIELDS)
 
-        url.toDisplayString(), path, host))
 
-    if not path or not host:
 
-        new_url = QUrl()
+    def get_parent(self):
 
-        new_url.setScheme('qute')
+        """
 
-        # When path is absent, e.g. qute://help (with no trailing slash)
+        Return object next highest up the tree.
 
-        if host:
+        """
 
-            new_url.setHost(host)
+        if (self.parent is None or self.parent == '') and self.profile:
 
-        # When host is absent, e.g. qute:help
+            return self.config.profiles().find(name=self.profile)
+
+        elif (self.parent is None or self.parent == '') and self.image:
+
+            return self.config.images().find(name=self.image)
 
         else:
 
-            new_url.setHost(path)
+            return self.config.systems().find(name=self.parent)
 
 
 
-        new_url.setPath('/')
+    def set_name(self,name):
 
-        if query:
+        """
 
-            new_url.setQuery(query)
+        Set the name.  If the name is a MAC or IP, and the first MAC and/or IP is not defined, go ahead
 
-        if new_url.host():  # path was a valid host
+        and fill that value in.  
 
-            raise Redirect(new_url)
+        """
 
 
 
-    try:
+        if self.name not in ["",None] and self.parent not in ["",None] and self.name == self.parent:
 
-        handler = _HANDLERS[host]
+            raise CX(_("self parentage is weird"))
 
-    except KeyError:
+        if not isinstance(name, basestring):
 
-        raise NoHandlerFound(url)
+            raise CX(_("name must be a string"))
 
+        for x in name:
 
+            if not x.isalnum() and not x in [ "_", "-", ".", ":", "+" ] :
 
-    try:
+                raise CX(_("invalid characters in name: %s") % x)
 
-        mimetype, data = handler(url)
 
-    except OSError as e:
 
-        # FIXME:qtwebengine how to handle this?
+        # Stuff here defaults to eth0. Yes, it's ugly and hardcoded, but so was
 
-        raise QuteSchemeOSError(e)
+        # the default interface behaviour that's now removed. ;)
 
-    except QuteSchemeError:
+        # --Jasper Capel
 
-        raise
+        if utils.is_mac(name):
 
+           intf = self.__get_interface("eth0")
 
+           if intf["mac_address"] == "":
 
-    assert mimetype is not None, url
+               intf["mac_address"] = name
 
-    if mimetype == 'text/html' and isinstance(data, str):
+        elif utils.is_ip(name):
 
-        # We let handlers return HTML as text
+           intf = self.__get_interface("eth0")
 
-        data = data.encode('utf-8', errors='xmlcharrefreplace')
+           if intf["ip_address"] == "":
 
+               intf["ip_address"] = name
 
+        self.name = name 
 
-    return mimetype, data
 
 
+        return True
 
 
 
-@add_handler('bookmarks')
+    def set_redhat_management_key(self,key):
 
-def qute_bookmarks(_url):
+        return utils.set_redhat_management_key(self,key)
 
-    """Handler for qute://bookmarks. Display all quickmarks / bookmarks."""
 
-    bookmarks = sorted(objreg.get('bookmark-manager').marks.items(),
 
-                       key=lambda x: x[1])  # Sort by title
+    def set_redhat_management_server(self,server):
 
-    quickmarks = sorted(objreg.get('quickmark-manager').marks.items(),
+        return utils.set_redhat_management_server(self,server)
 
-                        key=lambda x: x[0])  # Sort by name
 
 
+    def set_server(self,server):
 
-    html = jinja.render('bookmarks.html',
+        """
 
-                        title='Bookmarks',
+        If a system can't reach the boot server at the value configured in settings
 
-                        bookmarks=bookmarks,
+        because it doesn't have the same name on it's subnet this is there for an override.
 
-                        quickmarks=quickmarks)
+        """
 
-    return 'text/html', html
+        if server is None or server == "":
 
+            server = "<<inherit>>"
 
+        self.server = server
 
+        return True
 
 
-@add_handler('tabs')
 
-def qute_tabs(_url):
+    def set_proxy(self,proxy):
 
-    """Handler for qute://tabs. Display information about all open tabs."""
+        if proxy is None or proxy == "":
 
-    tabs = collections.defaultdict(list)
+            proxy = "<<inherit>>"
 
-    for win_id, window in objreg.window_registry.items():
+        self.proxy = proxy
 
-        if sip.isdeleted(window):
+        return True
 
-            continue
 
-        tabbed_browser = objreg.get('tabbed-browser',
 
-                                    scope='window',
+    def get_mac_address(self,interface):
 
-                                    window=win_id)
+        """
 
-        for tab in tabbed_browser.widgets():
+        Get the mac address, which may be implicit in the object name or explicit with --mac-address.
 
-            if tab.url() not in [QUrl("qute://tabs/"), QUrl("qute://tabs")]:
+        Use the explicit location first.
 
-                urlstr = tab.url().toDisplayString()
+        """
 
-                tabs[str(win_id)].append((tab.title(), urlstr))
 
 
+        intf = self.__get_interface(interface)
 
-    html = jinja.render('tabs.html',
 
-                        title='Tabs',
 
-                        tab_list_by_window=tabs)
+        if intf["mac_address"] != "":
 
-    return 'text/html', html
+            return intf["mac_address"].strip()
 
+        else:
 
+            return None
 
 
 
-def history_data(start_time, offset=None):
+    def get_ip_address(self,interface):
 
-    """Return history data.
+        """
 
+        Get the IP address, which may be implicit in the object name or explict with --ip-address.
 
+        Use the explicit location first.
 
-    Arguments:
+        """
 
-        start_time: select history starting from this timestamp.
 
-        offset: number of items to skip
 
-    """
+        intf = self.__get_interface(interface)
 
-    # history atimes are stored as ints, ensure start_time is not a float
 
-    start_time = int(start_time)
 
-    hist = objreg.get('web-history')
+        if intf["ip_address"] != "": 
 
-    if offset is not None:
+            return intf["ip_address"].strip()
 
-        entries = hist.entries_before(start_time, limit=1000, offset=offset)
+        else:
 
-    else:
+            return ""
 
-        # end is 24hrs earlier than start
 
-        end_time = start_time - 24*60*60
 
-        entries = hist.entries_between(end_time, start_time)
+    def is_management_supported(self,cidr_ok=True):
 
+        """
 
+        Can only add system PXE records if a MAC or IP address is available, else it's a koan
 
-    return [{"url": e.url, "title": e.title or e.url, "time": e.atime}
+        only record.  Actually Itanium goes beyond all this and needs the IP all of the time
 
-            for e in entries]
+        though this is enforced elsewhere (action_sync.py).
 
+        """
 
+        if self.name == "default":
 
+           return True
 
+        for (name,x) in self.interfaces.iteritems():
 
-@add_handler('history')
+            mac = x.get("mac_address",None)
 
-def qute_history(url):
+            ip  = x.get("ip_address",None)
 
-    """Handler for qute://history. Display and serve history."""
+            if ip is not None and not cidr_ok and ip.find("/") != -1:
 
-    if url.path() == '/data':
+                # ip is in CIDR notation
 
-        try:
+                return False
 
-            offset = QUrlQuery(url).queryItemValue("offset")
+            if mac is not None or ip is not None:
 
-            offset = int(offset) if offset else None
+                # has ip and/or mac
 
-        except ValueError as e:
+                return True
 
-            raise QuteSchemeError("Query parameter offset is invalid", e)
+        return False
 
-        # Use start_time in query or current time.
 
-        try:
 
-            start_time = QUrlQuery(url).queryItemValue("start_time")
+    def set_dhcp_tag(self,dhcp_tag,interface):
 
-            start_time = float(start_time) if start_time else time.time()
+        intf = self.__get_interface(interface)
 
-        except ValueError as e:
+        intf["dhcp_tag"] = dhcp_tag
 
-            raise QuteSchemeError("Query parameter start_time is invalid", e)
+        return True
 
 
 
-        return 'text/html', json.dumps(history_data(start_time, offset))
+    def set_dns_name(self,dns_name,interface):
 
-    else:
+        intf = self.__get_interface(interface)
 
-        return 'text/html', jinja.render(
+        # FIXME: move duplicate supression code to the object validation
 
-            'history.html',
+        # functions to take a harder line on supression?
 
-            title='History',
+        if dns_name != "" and not str(self.config._settings.allow_duplicate_hostnames).lower() in [ "1", "y", "yes"]:
 
-            gap_interval=config.val.history_gap_interval
+           matched = self.config.api.find_items("system", {"dns_name" : dns_name})
 
-        )
+           for x in matched:
 
+               if x.name != self.name:
 
+                   raise CX("dns-name duplicated: %s" % dns_name)
 
 
 
-@add_handler('javascript')
 
-def qute_javascript(url):
 
-    """Handler for qute://javascript.
+        intf["dns_name"] = dns_name
 
+        return True
 
+ 
 
-    Return content of file given as query parameter.
+    def set_static_routes(self,routes,interface):
 
-    """
+        intf = self.__get_interface(interface)
 
-    path = url.path()
+        data = utils.input_string_or_list(routes)
 
-    if path:
+        intf["static_routes"] = data
 
-        path = "javascript" + os.sep.join(path.split('/'))
+        return True
 
-        return 'text/html', utils.read_file(path, binary=False)
 
-    else:
 
-        raise QuteSchemeError("No file specified", ValueError())
+    def set_hostname(self,hostname):
 
+        if hostname is None:
 
+           hostname = ""
 
+        self.hostname = hostname
 
+        return True
 
-@add_handler('pyeval')
 
-def qute_pyeval(_url):
 
-    """Handler for qute://pyeval."""
+    def set_status(self,status):
 
-    html = jinja.render('pre.html', title='pyeval', content=pyeval_output)
+        self.status = status
 
-    return 'text/html', html
+        return True
 
 
 
+    def set_static(self,truthiness,interface):
 
+        intf = self.__get_interface(interface)
 
-@add_handler('spawn-output')
+        intf["static"] = utils.input_boolean(truthiness)
 
-def qute_spawn_output(_url):
+        return True
 
-    """Handler for qute://spawn-output."""
 
-    html = jinja.render('pre.html', title='spawn output', content=spawn_output)
 
-    return 'text/html', html
+    def set_management(self,truthiness,interface):
 
+        intf = self.__get_interface(interface)
 
+        intf["management"] = utils.input_boolean(truthiness)
 
+        return True
 
 
-@add_handler('version')
 
-@add_handler('verizon')
+    def set_ip_address(self,address,interface):
 
-def qute_version(_url):
+        """
 
-    """Handler for qute://version."""
+        Assign a IP or hostname in DHCP when this MAC boots.
 
-    html = jinja.render('version.html', title='Version info',
+        Only works if manage_dhcp is set in /etc/cobbler/settings
 
-                        version=version.version(),
+        """
 
-                        copyright=qutebrowser.__copyright__)
+        intf = self.__get_interface(interface)
 
-    return 'text/html', html
 
 
+        # FIXME: move duplicate supression code to the object validation
 
+        # functions to take a harder line on supression?
 
+        if address != "" and not str(self.config._settings.allow_duplicate_ips).lower() in [ "1", "y", "yes"]:
 
-@add_handler('plainlog')
+           matched = self.config.api.find_items("system", {"ip_address" : address})
 
-def qute_plainlog(url):
+           for x in matched:
 
-    """Handler for qute://plainlog.
+               if x.name != self.name:
 
+                   raise CX("IP address duplicated: %s" % address)
 
 
-    An optional query parameter specifies the minimum log level to print.
 
-    For example, qute://log?level=warning prints warnings and errors.
 
-    Level can be one of: vdebug, debug, info, warning, error, critical.
 
-    """
+        if address == "" or utils.is_ip(address):
 
-    if log.ram_handler is None:
+           intf["ip_address"] = address.strip()
 
-        text = "Log output was disabled."
+           return True
 
-    else:
+        raise CX(_("invalid format for IP address (%s)") % address)
 
-        level = QUrlQuery(url).queryItemValue('level')
 
-        if not level:
 
-            level = 'vdebug'
+    def set_mac_address(self,address,interface):
 
-        text = log.ram_handler.dump_log(html=False, level=level)
+        if address == "random":
 
-    html = jinja.render('pre.html', title='log', content=text)
+           address = utils.get_random_mac(self.config.api)
 
-    return 'text/html', html
 
 
+        # FIXME: move duplicate supression code to the object validation
 
+        # functions to take a harder line on supression?
 
+        if address != "" and not str(self.config._settings.allow_duplicate_macs).lower() in [ "1", "y", "yes"]:
 
-@add_handler('log')
+           matched = self.config.api.find_items("system", {"mac_address" : address})
 
-def qute_log(url):
+           for x in matched:
 
-    """Handler for qute://log.
+               if x.name != self.name:
 
+                   raise CX("MAC address duplicated: %s" % address)
 
 
-    An optional query parameter specifies the minimum log level to print.
 
-    For example, qute://log?level=warning prints warnings and errors.
+        intf = self.__get_interface(interface)
 
-    Level can be one of: vdebug, debug, info, warning, error, critical.
+        if address == "" or utils.is_mac(address):
 
-    """
+           intf["mac_address"] = address.strip()
 
-    if log.ram_handler is None:
+           return True
 
-        html_log = None
+        raise CX(_("invalid format for MAC address (%s)" % address))
 
-    else:
 
-        level = QUrlQuery(url).queryItemValue('level')
 
-        if not level:
 
-            level = 'vdebug'
 
-        html_log = log.ram_handler.dump_log(html=True, level=level)
+    def set_gateway(self,gateway):
 
+        if gateway is None:
 
+           gateway = ""
 
-    html = jinja.render('log.html', title='log', content=html_log)
+        if utils.is_ip(gateway) or gateway == "":
 
-    return 'text/html', html
+           self.gateway = gateway
 
+        else:
 
+           raise CX(_("invalid format for gateway IP address (%s)") % gateway)
 
+        return True
 
+ 
 
-@add_handler('gpl')
+    def set_name_servers(self,data):
 
-def qute_gpl(_url):
+        if data == "<<inherit>>":
 
-    """Handler for qute://gpl. Return HTML content as string."""
+           data = []
 
-    return 'text/html', utils.read_file('html/license.html')
+        data = utils.input_string_or_list(data)
 
+        self.name_servers = data
 
+        return True
 
 
 
-@add_handler('help')
+    def set_name_servers_search(self,data):
 
-def qute_help(url):
+        if data == "<<inherit>>":
 
-    """Handler for qute://help."""
+           data = []
 
-    urlpath = url.path()
+        data = utils.input_string_or_list(data)
 
-    if not urlpath or urlpath == '/':
+        self.name_servers_search = data
 
-        urlpath = 'index.html'
+        return True
 
-    else:
 
-        urlpath = urlpath.lstrip('/')
 
-    if not docutils.docs_up_to_date(urlpath):
+    def set_netmask(self,netmask,interface):
 
-        message.error("Your documentation is outdated! Please re-run "
+        intf = self.__get_interface(interface)
 
-                      "scripts/asciidoc2html.py.")
+        intf["netmask"] = netmask
 
+        return True
 
+    
 
-    path = 'html/doc/{}'.format(urlpath)
+    def set_virt_bridge(self,bridge,interface):
 
-    if not urlpath.endswith('.html'):
+        if bridge == "":
 
-        try:
+            bridge = self.settings.default_virt_bridge
 
-            bdata = utils.read_file(path, binary=True)
+        intf = self.__get_interface(interface)
 
-        except OSError as e:
+        intf["virt_bridge"] = bridge
 
-            raise QuteSchemeOSError(e)
+        return True
 
-        mimetype, _encoding = mimetypes.guess_type(urlpath)
 
-        assert mimetype is not None, url
 
-        return mimetype, bdata
+    def set_interface_type(self,type,interface):
 
+        # master and slave are deprecated, and will
 
+        # be assumed to mean bonding slave/master
 
-    try:
+        interface_types = ["bridge","bridge_slave","bond","bond_slave","master","slave","na",""]
 
-        data = utils.read_file(path)
+        if type not in interface_types:
 
-    except OSError:
+            raise CX(_("interface type value must be one of: %s or blank" % interface_types.join(",")))
 
-        # No .html around, let's see if we find the asciidoc
+        if type == "na":
 
-        asciidoc_path = path.replace('.html', '.asciidoc')
+            type = ""
 
-        if asciidoc_path.startswith('html/doc/'):
+        elif type == "master":
 
-            asciidoc_path = asciidoc_path.replace('html/doc/', '../doc/help/')
+            type = "bond"
 
+        elif type == "slave":
 
+            type = "bond_slave"
 
-        try:
+        intf = self.__get_interface(interface)
 
-            asciidoc = utils.read_file(asciidoc_path)
+        intf["interface_type"] = type
 
-        except OSError:
+        return True
 
-            asciidoc = None
 
 
+    def set_interface_master(self,interface_master,interface):
 
-        if asciidoc is None:
+        intf = self.__get_interface(interface)
 
-            raise
+        intf["interface_master"] = interface_master
 
+        return True
 
 
-        preamble = textwrap.dedent("""
 
-            There was an error loading the documentation!
+    def set_bonding_opts(self,bonding_opts,interface):
 
+        intf = self.__get_interface(interface)
 
+        intf["bonding_opts"] = bonding_opts
 
-            This most likely means the documentation was not generated
+        return True
 
-            properly. If you are running qutebrowser from the git repository,
 
-            please (re)run scripts/asciidoc2html.py and reload this page.
 
+    def set_bridge_opts(self,bridge_opts,interface):
 
+        intf = self.__get_interface(interface)
 
-            If you're running a released version this is a bug, please use
+        intf["bridge_opts"] = bridge_opts
 
-            :report to report it.
+        return True
 
 
 
-            Falling back to the plaintext version.
+    def set_ipv6_autoconfiguration(self,truthiness):
 
+        self.ipv6_autoconfiguration = utils.input_boolean(truthiness)
 
+        return True
 
-            ---------------------------------------------------------------
 
 
+    def set_ipv6_default_device(self,interface_name):
 
+        if interface_name is None:
 
+           interface_name = ""
 
-        """)
+        self.ipv6_default_device = interface_name
 
-        return 'text/plain', (preamble + asciidoc).encode('utf-8')
+        return True
 
-    else:
 
-        return 'text/html', data
 
+    def set_ipv6_address(self,address,interface):
 
+        """
 
+        Assign a IP or hostname in DHCP when this MAC boots.
 
+        Only works if manage_dhcp is set in /etc/cobbler/settings
 
-@add_handler('backend-warning')
+        """
 
-def qute_backend_warning(_url):
+        intf = self.__get_interface(interface)
 
-    """Handler for qute://backend-warning."""
+        if address == "" or utils.is_ip(address):
 
-    html = jinja.render('backend-warning.html',
+           intf["ipv6_address"] = address.strip()
 
-                        distribution=version.distribution(),
+           return True
 
-                        Distribution=version.Distribution,
+        raise CX(_("invalid format for IPv6 IP address (%s)") % address)
 
-                        version=pkg_resources.parse_version,
 
-                        title="Legacy backend warning")
 
-    return 'text/html', html
+    def set_ipv6_secondaries(self,addresses,interface):
 
+        intf = self.__get_interface(interface)
 
+        data = utils.input_string_or_list(addresses)
 
+        secondaries = []
 
+        for address in data:
 
-def _qute_settings_set(url):
+           if address == "" or utils.is_ip(address):
 
-    """Handler for qute://settings/set."""
+               secondaries.append(address)
 
-    query = QUrlQuery(url)
+           else:
 
-    option = query.queryItemValue('option', QUrl.FullyDecoded)
+               raise CX(_("invalid format for IPv6 IP address (%s)") % address)
 
-    value = query.queryItemValue('value', QUrl.FullyDecoded)
 
 
+        intf["ipv6_secondaries"] = secondaries
 
-    # https://github.com/qutebrowser/qutebrowser/issues/727
+        return True
 
-    if option == 'content.javascript.enabled' and value == 'false':
 
-        msg = ("Refusing to disable javascript via qute://settings "
 
-               "as it needs javascript support.")
+    def set_ipv6_default_gateway(self,address,interface):
 
-        message.error(msg)
+        intf = self.__get_interface(interface)
 
-        return 'text/html', b'error: ' + msg.encode('utf-8')
+        if address == "" or utils.is_ip(address):
 
+           intf["ipv6_default_gateway"] = address.strip()
 
+           return True
 
-    try:
+        raise CX(_("invalid format for IPv6 IP address (%s)") % address)
 
-        config.instance.set_str(option, value, save_yaml=True)
 
-        return 'text/html', b'ok'
 
-    except configexc.Error as e:
+    def set_ipv6_static_routes(self,routes,interface):
 
-        message.error(str(e))
+        intf = self.__get_interface(interface)
 
-        return 'text/html', b'error: ' + str(e).encode('utf-8')
+        data = utils.input_string_or_list(routes)
 
+        intf["ipv6_static_routes"] = data
 
+        return True
 
 
 
-@add_handler('settings')
+    def set_ipv6_mtu(self,mtu,interface):
 
-def qute_settings(url):
+        intf = self.__get_interface(interface)
 
-    """Handler for qute://settings. View/change qute configuration."""
+        intf["ipv6_mtu"] = mtu
 
-    if url.path() == '/set':
+        return True
 
-        return _qute_settings_set(url)
 
 
+    def set_mtu(self,mtu,interface):
 
-    html = jinja.render('settings.html', title='settings',
+        intf = self.__get_interface(interface)
 
-                        configdata=configdata,
+        intf["mtu"] = mtu
 
-                        confget=config.instance.get_str)
+        return True
 
-    return 'text/html', html
 
 
+    def set_enable_gpxe(self,enable_gpxe):
 
+        """
 
+        Sets whether or not the system will use gPXE for booting.
 
-@add_handler('bindings')
+        """
 
-def qute_bindings(_url):
+        self.enable_gpxe = utils.input_boolean(enable_gpxe)
 
-    """Handler for qute://bindings. View keybindings."""
+        return True
 
-    bindings = {}
 
-    defaults = config.val.bindings.default
 
-    modes = set(defaults.keys()).union(config.val.bindings.commands)
+    def set_profile(self,profile_name):
 
-    modes.remove('normal')
+        """
 
-    modes = ['normal'] + sorted(list(modes))
+        Set the system to use a certain named profile.  The profile
 
-    for mode in modes:
+        must have already been loaded into the Profiles collection.
 
-        bindings[mode] = config.key_instance.get_bindings_for(mode)
+        """
 
+        old_parent = self.get_parent()
 
+        if profile_name in [ "delete", "None", "~", ""] or profile_name is None:
 
-    html = jinja.render('bindings.html', title='Bindings',
+            self.profile = ""
 
-                        bindings=bindings)
+            if isinstance(old_parent, item.Item):
 
-    return 'text/html', html
+                old_parent.children.pop(self.name, 'pass')
 
+            return True
 
 
 
+        self.image = "" # mutual exclusion rule
 
-@add_handler('back')
 
-def qute_back(url):
 
-    """Handler for qute://back.
+        p = self.config.profiles().find(name=profile_name)
 
+        if p is not None:
 
+            self.profile = profile_name
 
-    Simple page to free ram / lazy load a site, goes back on focusing the tab.
+            self.depth = p.depth + 1 # subprofiles have varying depths.
 
-    """
+            if isinstance(old_parent, item.Item):
 
-    html = jinja.render(
+                old_parent.children.pop(self.name, 'pass')
 
-        'back.html',
+            new_parent = self.get_parent()
 
-        title='Suspended: ' + urllib.parse.unquote(url.fragment()))
+            if isinstance(new_parent, item.Item):
 
-    return 'text/html', html
+                new_parent.children[self.name] = self
 
+            return True
 
+        raise CX(_("invalid profile name: %s") % profile_name)
 
 
 
-@add_handler('configdiff')
+    def set_image(self,image_name):
 
-def qute_configdiff(url):
+        """
 
-    """Handler for qute://configdiff."""
+        Set the system to use a certain named image.  Works like set_profile
 
-    if url.path() == '/old':
+        but cannot be used at the same time.  It's one or the other.
 
-        try:
+        """
 
-            return 'text/html', configdiff.get_diff()
+        old_parent = self.get_parent()
 
-        except OSError as e:
+        if image_name in [ "delete", "None", "~", ""] or image_name is None:
 
-            error = (b'Failed to read old config: ' +
+            self.image = ""
 
-                     str(e.strerror).encode('utf-8'))
+            if isinstance(old_parent, item.Item):
 
-            return 'text/plain', error
+                old_parent.children.pop(self.name, 'pass')
 
-    else:
+            return True
 
-        data = config.instance.dump_userconfig().encode('utf-8')
 
-        return 'text/plain', data
 
+        self.profile = "" # mutual exclusion rule
 
 
 
+        img = self.config.images().find(name=image_name)
 
-@add_handler('pastebin-version')
 
-def qute_pastebin_version(_url):
 
-    """Handler that pastebins the version string."""
+        if img is not None:
 
-    version.pastebin_version()
+            self.image = image_name
 
-    return 'text/plain', b'Paste called.'
+            self.depth = img.depth + 1
+
+            if isinstance(old_parent, item.Item):
+
+                old_parent.children.pop(self.name, 'pass')
+
+            new_parent = self.get_parent()
+
+            if isinstance(new_parent, item.Item):
+
+                new_parent.children[self.name] = self
+
+            return True
+
+        raise CX(_("invalid image name (%s)") % image_name)
+
+
+
+    def set_virt_cpus(self,num):
+
+        return utils.set_virt_cpus(self,num)
+
+
+
+    def set_virt_file_size(self,num):
+
+        return utils.set_virt_file_size(self,num)
+
+
+
+    def set_virt_disk_driver(self,driver):
+
+        return utils.set_virt_disk_driver(self,driver)
+
+ 
+
+    def set_virt_auto_boot(self,num):
+
+        return utils.set_virt_auto_boot(self,num)
+
+
+
+    def set_virt_ram(self,num):
+
+        return utils.set_virt_ram(self,num)
+
+
+
+    def set_virt_type(self,vtype):
+
+        return utils.set_virt_type(self,vtype)
+
+
+
+    def set_virt_path(self,path):
+
+        return utils.set_virt_path(self,path,for_system=True)
+
+
+
+    def set_netboot_enabled(self,netboot_enabled):
+
+        """
+
+        If true, allows per-system PXE files to be generated on sync (or add).  If false,
+
+        these files are not generated, thus eliminating the potential for an infinite install
+
+        loop when systems are set to PXE boot first in the boot order.  In general, users
+
+        who are PXE booting first in the boot order won't create system definitions, so this
+
+        feature primarily comes into play for programmatic users of the API, who want to
+
+        initially create a system with netboot enabled and then disable it after the system installs, 
+
+        as triggered by some action in kickstart %post.   For this reason, this option is not
+
+        surfaced in the CLI, output, or documentation (yet).
+
+
+
+        Use of this option does not affect the ability to use PXE menus.  If an admin has machines 
+
+        set up to PXE only after local boot fails, this option isn't even relevant.
+
+        """
+
+        self.netboot_enabled = utils.input_boolean(netboot_enabled)
+
+        return True
+
+
+
+    def set_kickstart(self,kickstart):
+
+        """
+
+        Sets the kickstart.  This must be a NFS, HTTP, or FTP URL.
+
+        Or filesystem path. Minor checking of the URL is performed here.
+
+
+
+        NOTE -- usage of the --kickstart parameter in the profile
+
+        is STRONGLY encouraged.  This is only for exception cases
+
+        where a user already has kickstarts made for each system
+
+        and can't leverage templating.  Profiles provide an important
+
+        abstraction layer -- assigning systems to defined and repeatable 
+
+        roles.
+
+        """
+
+        if kickstart is None or kickstart in [ "", "delete", "<<inherit>>" ]:
+
+            self.kickstart = "<<inherit>>"
+
+            return True
+
+        kickstart = utils.find_kickstart(kickstart)
+
+        if kickstart:
+
+            self.kickstart = kickstart
+
+            return True
+
+        raise CX(_("kickstart not found: %s" % kickstart))
+
+
+
+
+
+    def set_power_type(self, power_type):
+
+        # FIXME: modularize this better
+
+        if power_type is None:
+
+            power_type = ""
+
+        choices = utils.get_power_types()
+
+        choices.sort()
+
+        if power_type not in choices:
+
+            raise CX("power management type must be one of: %s" % ",".join(choices))
+
+        self.power_type = power_type
+
+        return True
+
+
+
+    def set_power_user(self, power_user):
+
+        if power_user is None:
+
+           power_user = ""
+
+        utils.safe_filter(power_user)
+
+        self.power_user = power_user
+
+        return True 
+
+
+
+    def set_power_pass(self, power_pass):
+
+        if power_pass is None:
+
+           power_pass = ""
+
+        utils.safe_filter(power_pass)
+
+        self.power_pass = power_pass
+
+        return True    
+
+
+
+    def set_power_address(self, power_address):
+
+        if power_address is None:
+
+           power_address = ""
+
+        utils.safe_filter(power_address)
+
+        self.power_address = power_address
+
+        return True
+
+
+
+    def set_power_id(self, power_id):
+
+        if power_id is None:
+
+           power_id = ""
+
+        utils.safe_filter(power_id)
+
+        self.power_id = power_id
+
+        return True
+
+
+
+    def modify_interface(self, hash):
+
+        """
+
+        Used by the WUI to modify an interface more-efficiently
+
+        """
+
+        for (key,value) in hash.iteritems():
+
+            (field,interface) = key.split("-")
+
+            field = field.replace("_","").replace("-","")
+
+            if field == "macaddress"          : self.set_mac_address(value, interface)
+
+            if field == "mtu"                 : self.set_mtu(value, interface)
+
+            if field == "ipaddress"           : self.set_ip_address(value, interface)
+
+            if field == "dnsname"             : self.set_dns_name(value, interface)
+
+            if field == "static"              : self.set_static(value, interface)
+
+            if field == "dhcptag"             : self.set_dhcp_tag(value, interface)
+
+            if field == "netmask"             : self.set_netmask(value, interface)
+
+            if field == "subnet"              : self.set_netmask(value, interface)
+
+            if field == "virtbridge"          : self.set_virt_bridge(value, interface)
+
+            if field == "interfacetype"       : self.set_interface_type(value, interface)
+
+            if field == "interfacemaster"     : self.set_interface_master(value, interface)
+
+            if field == "bonding"             : self.set_interface_type(value, interface)   # deprecated
+
+            if field == "bondingmaster"       : self.set_interface_master(value, interface) # deprecated
+
+            if field == "bondingopts"         : self.set_bonding_opts(value, interface)
+
+            if field == "bridgeopts"          : self.set_bridge_opts(value, interface)
+
+            if field == "management"          : self.set_management(value, interface)
+
+            if field == "staticroutes"        : self.set_static_routes(value, interface)
+
+            if field == "ipv6address"         : self.set_ipv6_address(value, interface)
+
+            if field == "ipv6secondaries"     : self.set_ipv6_secondaries(value, interface)
+
+            if field == "ipv6mtu"             : self.set_ipv6_mtu(value, interface)
+
+            if field == "ipv6staticroutes"    : self.set_ipv6_static_routes(value, interface)
+
+            if field == "ipv6defaultgateway"  : self.set_ipv6_default_gateway(value, interface)
+
+
+
+        return True
+
+
+
+    def check_if_valid(self):
+
+        if self.name is None or self.name == "":
+
+            raise CX("name is required")
+
+        if self.profile is None or self.profile == "":
+
+            if self.image is None or self.image == "":
+
+                raise CX("Error with system %s - profile or image is required" % (self.name))
+
+            
+
+    def set_template_remote_kickstarts(self, template):
+
+        """
+
+        Sets whether or not the server is configured to template remote 
+
+        kickstarts.
+
+        """
+
+        self.template_remote_kickstarts = utils.input_boolean(template)
+
+        return True
+
+    
+
+    def set_monit_enabled(self,monit_enabled):
+
+        """
+
+        If true, allows per-system to start Monit to monitor system services such as apache.
+
+        If monit is not running it will start the service.
+
+        
+
+        If false, no management of monit will take place. If monit is not running it will not
+
+        be started. If monit is running it will not be stopped or restarted.
+
+        """
+
+        self.monit_enabled = utils.input_boolean(monit_enabled)
+
+        return True
+
+    
+
+    def set_ldap_enabled(self,ldap_enabled):
+
+        """
+
+        If true, allows per-system to start Monit to monitor system services such as apache.
+
+        If monit is not running it will start the service.
+
+        
+
+        If false, no management of monit will take place. If monit is not running it will not
+
+        be started. If monit is running it will not be stopped or restarted.
+
+        """
+
+        self.ldap_enabled = utils.input_boolean(ldap_enabled)
+
+        return True
+
+    
+
+    def set_repos_enabled(self,repos_enabled):
+
+        """
+
+        If true, allows per-system to start Monit to monitor system services such as apache.
+
+        If monit is not running it will start the service.
+
+        
+
+        If false, no management of monit will take place. If monit is not running it will not
+
+        be started. If monit is running it will not be stopped or restarted.
+
+        """
+
+        self.repos_enabled = utils.input_boolean(repos_enabled)
+
+        return True
+
+    
+
+    def set_ldap_type(self, ldap_type):
+
+        if ldap_type is None:
+
+            ldap_type = ""
+
+        ldap_type = ldap_type.lower()
+
+        self.ldap_type = ldap_type
+
+        return True

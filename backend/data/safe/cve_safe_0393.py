@@ -2,548 +2,210 @@
 # Safety: safe
 # Category: safe
 
-import itertools
+#
+
+# djblets_js.py -- JavaScript-related template tags
+
+#
+
+# Copyright (c) 2007-2009  Christian Hammond
+
+# Copyright (c) 2007-2009  David Trowbridge
+
+#
+
+# Permission is hereby granted, free of charge, to any person obtaining
+
+# a copy of this software and associated documentation files (the
+
+# "Software"), to deal in the Software without restriction, including
+
+# without limitation the rights to use, copy, modify, merge, publish,
+
+# distribute, sublicense, and/or sell copies of the Software, and to
+
+# permit persons to whom the Software is furnished to do so, subject to
+
+# the following conditions:
+
+#
+
+# The above copyright notice and this permission notice shall be included
+
+# in all copies or substantial portions of the Software.
+
+#
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+
+# IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+
+# CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+
+# TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 
 
-from flask import request, abort, _app_ctx_stack, redirect
-
-from flask_security.core import AnonymousUser
-
-from security_monkey.datastore import User
+from __future__ import unicode_literals
 
 
-
-try:
-
-    from flask.ext.login import current_user
-
-except ImportError:
-
-    current_user = None
-
-
-
-from .models import RBACRole, RBACUserMixin
-
-
-
-from . import anonymous
-
-
-
-from flask import Response
 
 import json
 
 
 
+from django import template
+
+from django.core.serializers import serialize
+
+from django.db.models.query import QuerySet
+
+from django.utils import six
+
+from django.utils.encoding import force_text
+
+from django.utils.safestring import mark_safe
 
 
-class AccessControlList(object):
+
+from djblets.util.serializers import DjbletsJSONEncoder
+
+
+
+
+
+register = template.Library()
+
+
+
+_safe_js_escapes = {
+
+    ord('&'): '\\u0026',
+
+    ord('<'): '\\u003C',
+
+    ord('>'): '\\u003E',
+
+}
+
+
+
+
+
+@register.simple_tag
+
+def form_dialog_fields(form):
 
     """
 
-    This class record rules for access controling.
+    Translates a Django Form object into a JavaScript list of fields.
+
+    The resulting list of fields can be used to represent the form
+
+    dynamically.
 
     """
 
+    s = ''
 
 
-    def __init__(self):
 
-        self._allowed = []
+    for field in form:
 
-        self._exempt = []
+        s += "{ name: '%s', " % field.name
 
-        self.seted = False
 
 
+        if field.is_hidden:
 
-    def allow(self, role, method, resource, with_children=True):
+            s += "hidden: true, "
 
-        """Add allowing rules.
+        else:
 
+            s += "label: '%s', " % field.label_tag(field.label + ":")
 
 
-        :param role: Role of this rule.
 
-        :param method: Method to allow in rule, include GET, POST, PUT etc.
+            if field.field.required:
 
-        :param resource: Resource also view function.
+                s += "required: true, "
 
-        :param with_children: Allow role's children in rule as well
 
-                              if with_children is `True`
 
-        """
+            if field.field.help_text:
 
+                s += "help_text: '%s', " % field.field.help_text
 
 
-        if with_children:
 
-            for r in role.get_children():
+        s += "widget: '%s' }," % six.text_type(field)
 
-                permission = (r.name, method, resource)
 
-                if permission not in self._allowed:
 
-                    self._allowed.append(permission)
+    # Chop off the last ','
 
-        permission = (role.name, method, resource)
+    return "[ %s ]" % s[:-1]
 
-        if permission not in self._allowed:
 
-            self._allowed.append(permission)
 
 
 
-    def exempt(self, view_func):
+@register.filter
 
-        """Exempt a view function from being checked permission
+def json_dumps(value, indent=None):
 
+    if isinstance(value, QuerySet):
 
+        result = serialize('json', value, indent=indent)
 
-        :param view_func: The view function exempt from checking.
+    else:
 
-        """
+        result = json.dumps(value, indent=indent, cls=DjbletsJSONEncoder)
 
-        if not view_func in self._exempt:
 
-            self._exempt.append(view_func)
 
+    return mark_safe(force_text(result).translate(_safe_js_escapes))
 
 
-    def is_allowed(self, role, method, resource):
 
-        """Check whether role is allowed to access resource
 
 
+@register.filter
 
-        :param role: Role to be checked.
+def json_dumps_items(d, append=''):
 
-        :param method: Method to be checked.
+    """Dumps a list of keys/values from a dictionary, without braces.
 
-        :param resource: View function to be checked.
 
-        """
 
-        return (role, method, resource) in self._allowed
+    This works very much like ``json_dumps``, but doesn't output the
 
+    surrounding braces. This allows it to be used within a JavaScript
 
+    object definition alongside other custom keys.
 
-    def is_exempt(self, view_func):
 
-        """Return whether view_func is exempted.
 
+    If the dictionary is not empty, and ``append`` is passed, it will be
 
+    appended onto the results. This is most useful when you want to append
 
-        :param view_func: View function to be checked.
+    a comma after all the dictionary items, in order to provide further
 
-        """
-
-        return view_func in self._exempt
-
-
-
-
-
-class _RBACState(object):
-
-    """Records configuration for Flask-RBAC"""
-
-    def __init__(self, rbac, app):
-
-        self.rbac = rbac
-
-        self.app = app
-
-
-
-
-
-class RBAC(object):
+    keys in the template.
 
     """
 
-    This class implements role-based access control module in Flask.
+    if not d:
 
-    There are two way to initialize Flask-RBAC::
+        return ''
 
 
 
-        app = Flask(__name__)
-
-        rbac = RBAC(app)
-
-
-
-    :param app: the Flask object
-
-    """
-
-
-
-    _role_model = RBACRole
-
-    _user_model = RBACUserMixin
-
-
-
-    def __init__(self, app):
-
-        self.acl = AccessControlList()
-
-        self.before_acl = []
-
-
-
-        self.app = app
-
-        self.init_app(app)
-
-
-
-    def init_app(self, app):
-
-        # Add (RBAC, app) to flask extensions.
-
-        # Add hook to authenticate permission before request.
-
-
-
-        if not hasattr(app, 'extensions'):
-
-            app.extensions = {}
-
-        app.extensions['rbac'] = _RBACState(self, app)
-
-
-
-        self.acl.allow(anonymous, 'GET', app.view_functions['static'].__name__)
-
-        app.before_first_request(self._setup_acl)
-
-        app.before_request(self._authenticate)
-
-
-
-    def has_permission(self, method, endpoint, user=None):
-
-        """Return whether the current user can access the resource.
-
-        Example::
-
-
-
-            @app.route('/some_url', methods=['GET', 'POST'])
-
-            @rbac.allow(['anonymous'], ['GET'])
-
-            def a_view_func():
-
-                return Response('Blah Blah...')
-
-
-
-        If you are not logged.
-
-
-
-        `rbac.has_permission('GET', 'a_view_func')` return True.
-
-        `rbac.has_permission('POST', 'a_view_func')` return False.
-
-
-
-        :param method: The method wait to check.
-
-        :param endpoint: The application endpoint.
-
-        :param user: user who you need to check. Current user by default.
-
-        """
-
-        app = self.get_app()
-
-        _user = user or current_user
-
-        roles = _user.get_roles()
-
-        view_func = app.view_functions[endpoint]
-
-        return self._check_permission(roles, method, view_func)
-
-
-
-    def check_perm(self, role, method, callback=None):
-
-        def decorator(view_func):
-
-            if not self._check_permission([role], method, view_func):
-
-                if callable(callback):
-
-                    callback()
-
-                else:
-
-                    self._deny_hook()
-
-            return view_func
-
-        return decorator
-
-
-
-    def allow(self, roles, methods, with_children=True):
-
-        """Decorator: allow roles to access the view func with it.
-
-
-
-        :param roles: List, each name of roles. Please note that,
-
-                      `anonymous` is refered to anonymous.
-
-                      If you add `anonymous` to the rule,
-
-                      everyone can access the resource,
-
-                      unless you deny other roles.
-
-        :param methods: List, each name of methods.
-
-                        methods is valid in ['GET', 'POST', 'PUT', 'DELETE']
-
-        :param with_children: Whether allow children of roles as well.
-
-                              True by default.
-
-        """
-
-        def decorator(view_func):
-
-            _methods = [m.upper() for m in methods]
-
-            for r, m, v in itertools.product(roles, _methods, [view_func.__name__]):
-
-                self.before_acl.append((r, m, v, with_children))
-
-            return view_func
-
-        return decorator
-
-
-
-    def exempt(self, view_func):
-
-        """
-
-        Decorator function
-
-        Exempt a view function from being checked permission.
-
-        """
-
-        self.acl.exempt(view_func.__name__)
-
-        return view_func
-
-
-
-    def get_app(self, reference_app=None):
-
-        """
-
-        Helper to look up an app.
-
-        """
-
-        if reference_app is not None:
-
-            return reference_app
-
-        if self.app is not None:
-
-            return self.app
-
-        ctx = _app_ctx_stack.top
-
-        if ctx is not None:
-
-            return ctx.app
-
-        raise RuntimeError('application not registered on rbac '
-
-                           'instance and no application bound '
-
-                           'to current context')
-
-
-
-    def _authenticate(self):
-
-        app = self.get_app()
-
-        assert app, "Please initialize your application into Flask-RBAC."
-
-        assert self._role_model, "Please set role model before authenticate."
-
-        assert self._user_model, "Please set user model before authenticate."
-
-        user = current_user
-
-        if not isinstance(user._get_current_object(), self._user_model) and not isinstance(user._get_current_object(), AnonymousUser):
-
-            raise TypeError(
-
-                "%s is not an instance of %s" %
-
-                (user, self._user_model.__class__))
-
-
-
-        endpoint = request.endpoint
-
-        resource = app.view_functions.get(endpoint, None)
-
-
-
-        if not resource:
-
-            abort(404)
-
-
-
-        method = request.method
-
-        if not hasattr(user, 'get_roles'):
-
-            roles = [anonymous]
-
-        else:
-
-            roles = user.get_roles()
-
-
-
-        permit = self._check_permission(roles, method, resource)
-
-        if not permit:
-
-            return self._deny_hook(resource=resource)
-
-
-
-    def _check_permission(self, roles, method, resource):
-
-
-
-        resource = resource.__name__
-
-        if self.acl.is_exempt(resource):
-
-            return True
-
-
-
-        if not self.acl.seted:
-
-            self._setup_acl()
-
-
-
-        _roles = set()
-
-        _methods = {'*', method}
-
-        _resources = {None, resource}
-
-
-
-        _roles.add(anonymous)
-
-
-
-        _roles.update(roles)
-
-
-
-        for r, m, res in itertools.product(_roles, _methods, _resources):
-
-            if self.acl.is_allowed(r.name, m, res):
-
-                return True
-
-
-
-        return False
-
-
-
-    def _deny_hook(self, resource=None):
-
-        app = self.get_app()
-
-        if current_user.is_authenticated:
-
-            status = 403
-
-        else:
-
-            status = 401
-
-        #abort(status)
-
-
-
-        if app.config.get('FRONTED_BY_NGINX'):
-
-                url = "https://{}:{}{}".format(app.config.get('FQDN'), app.config.get('NGINX_PORT'), '/login')
-
-        else:
-
-                url = "http://{}:{}{}".format(app.config.get('FQDN'), app.config.get('API_PORT'), '/login')
-
-        if current_user.is_authenticated:
-
-            auth_dict = {
-
-                "authenticated": True,
-
-                "user": current_user.email,
-
-                "roles": current_user.role,
-
-            }
-
-        else:
-
-            auth_dict = {
-
-                "authenticated": False,
-
-                "user": None,
-
-                "url": url
-
-            }
-
-
-
-        return Response(response=json.dumps({"auth": auth_dict}), status=status, mimetype="application/json")
-
-
-
-
-
-    def _setup_acl(self):
-
-        for rn, method, resource, with_children in self.before_acl:
-
-            role = self._role_model.get_by_name(rn)
-
-            self.acl.allow(role, method, resource, with_children)
-
-        self.acl.seted = True
+    return mark_safe(json_dumps(d)[1:-1] + append)

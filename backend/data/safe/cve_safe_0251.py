@@ -2,376 +2,1170 @@
 # Safety: safe
 # Category: safe
 
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
+# -*- coding: iso-8859-1 -*-
 
+"""
 
+    MoinMoin - feed some FCKeditor dialogues
 
-# Copyright 2012 OpenStack LLC
 
-#
 
-# Licensed under the Apache License, Version 2.0 (the "License"); you may
+    @copyright: 2005-2006 Bastian Blank, Florian Festi, Thomas Waldmann
 
-# not use this file except in compliance with the License. You may obtain
+    @license: GNU GPL, see COPYING for details.
 
-# a copy of the License at
+"""
 
-#
 
-#      http://www.apache.org/licenses/LICENSE-2.0
 
-#
+from MoinMoin import config, wikiutil
 
-# Unless required by applicable law or agreed to in writing, software
+from MoinMoin.action.AttachFile import _get_files
 
-# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+from MoinMoin.Page import Page
 
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+import re
 
-# License for the specific language governing permissions and limitations
 
-# under the License.
 
+##############################################################################
 
+### Macro dialog
 
-import webob.dec
+##############################################################################
 
 
 
-from keystone.common import serializer
+def macro_dialog(request):
 
-from keystone.common import utils
+    help = get_macro_help(request)
 
-from keystone.common import wsgi
+    request.write(
 
-from keystone import config
+        '''<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.0 Transitional//EN">
 
-from keystone import exception
+<html>
 
-from keystone.openstack.common import jsonutils
+ <head>
 
+  <title>Insert Macro</title>
 
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
 
+  <meta content="noindex,nofollow" name="robots">
 
+  <script src="%s/applets/FCKeditor/editor/dialog/common/fck_dialog_common.js" type="text/javascript"></script>
 
-CONF = config.CONF
+  <script language="javascript">
 
 
 
+var oEditor = window.parent.InnerDialogLoaded() ;
 
+var FCKLang = oEditor.FCKLang ;
 
-# Header used to transmit the auth token
+var FCKMacros = oEditor.FCKMacros ;
 
-AUTH_TOKEN_HEADER = 'X-Auth-Token'
 
 
+window.onload = function ()
 
+{
 
+ // First of all, translate the dialog box texts
 
-# Environment variable used to pass the request context
+ oEditor.FCKLanguageManager.TranslatePage( document ) ;
 
-CONTEXT_ENV = wsgi.CONTEXT_ENV
 
 
+ OnChange( "BR" );
 
 
 
-# Environment variable used to pass the request params
+ // Show the "Ok" button.
 
-PARAMS_ENV = wsgi.PARAMS_ENV
+ window.parent.SetOkButton( true ) ;
 
+}
 
 
 
+function Ok()
 
-class TokenAuthMiddleware(wsgi.Middleware):
+{
 
-    def process_request(self, request):
+ if ( document.getElementById('txtName').value.length == 0 )
 
-        token = request.headers.get(AUTH_TOKEN_HEADER)
+ {
 
-        context = request.environ.get(CONTEXT_ENV, {})
+  alert( FCKLang.MacroErrNoName ) ;
 
-        context['token_id'] = token
+  return false ;
 
-        request.environ[CONTEXT_ENV] = context
+ }
 
 
 
+ FCKMacros.Add( txtName.value ) ;
 
+ return true ;
 
-class AdminTokenAuthMiddleware(wsgi.Middleware):
+}
 
-    """A trivial filter that checks for a pre-defined admin token.
 
 
+function OnChange( sMacro )
 
-    Sets 'is_admin' to true in the context, expected to be checked by
+{
 
-    methods that are admin-only.
+  // sMacro = GetE("txtName").value;
 
+  oHelp = GetE("help");
 
+  for (var i=0; i<oHelp.childNodes.length; i++)
 
-    """
+  {
 
+    var oDiv = oHelp.childNodes[i];
 
+    if (oDiv.nodeType==1)
 
-    def process_request(self, request):
+    {
 
-        token = request.headers.get(AUTH_TOKEN_HEADER)
+      // oDiv.style.display = (GetAttribute(oDiv, "id", "")==sMacro) ? '' : 'none';
 
-        context = request.environ.get(CONTEXT_ENV, {})
+      if (GetAttribute(oDiv, "id", "") == sMacro)
 
-        context['is_admin'] = (token == CONF.admin_token)
+      {
 
-        request.environ[CONTEXT_ENV] = context
+          oDiv.style.display = '' ;
 
+          // alert("enabled div id " + sMacro) ;
 
+      }
 
+      else
 
+      {
 
-class PostParamsMiddleware(wsgi.Middleware):
+          oDiv.style.display = 'none' ;
 
-    """Middleware to allow method arguments to be passed as POST parameters.
+      }
 
+    }
 
+  }
 
-    Filters out the parameters `self`, `context` and anything beginning with
+}
 
-    an underscore.
 
 
+  </script>
 
-    """
+ </head>
 
+ <body scroll="no" style="OVERFLOW: hidden">
 
+  <table height="100%%" cellSpacing="0" cellPadding="0" width="100%%" border="0">
 
-    def process_request(self, request):
+   <tr>
 
-        params_parsed = request.params
+    <td>
 
-        params = {}
+     <table cellSpacing="0" cellPadding="0" align="center" border="0">
 
-        for k, v in params_parsed.iteritems():
+      <tr>
 
-            if k in ('self', 'context'):
+       <td valign="top">
 
-                continue
+       <span fckLang="MacroDlgName">Macro Name</span><br>
 
-            if k.startswith('_'):
+       <select id="txtName" size="10" onchange="OnChange(this.value);">
 
-                continue
+''' % request.cfg.url_prefix_static)
 
-            params[k] = v
 
 
+    macros = []
 
-        request.environ[PARAMS_ENV] = params
+    for macro in macro_list(request):
 
+        if macro == "BR":
 
+            selected = ' selected="selected"'
 
+        else:
 
+            selected = ''
 
-class JsonBodyMiddleware(wsgi.Middleware):
+        if macro in help:
 
-    """Middleware to allow method arguments to be passed as serialized JSON.
+            macros.append('<option value="%s"%s>%s</option>' %
 
+                          (help[macro].group('prototype'), selected, macro))
 
+        else:
 
-    Accepting arguments as JSON is useful for accepting data that may be more
+            macros.append('<option value="%s"%s>%s</option>' %
 
-    complex than simple primitives.
+                          (macro, selected, macro))
 
 
 
-    In this case we accept it as urlencoded data under the key 'json' as in
+    request.write('\n'.join(macros))
 
-    json=<urlencoded_json> but this could be extended to accept raw JSON
+    request.write('''
 
-    in the POST body.
+       </select>
 
+     </td>
 
+     <td id="help">''')
 
-    Filters out the parameters `self`, `context` and anything beginning with
 
-    an underscore.
 
+    helptexts = []
 
+    for macro in macro_list(request):
 
-    """
+        if macro in help:
 
-    def process_request(self, request):
+            match = help[macro]
 
-        # Abort early if we don't have any work to do
+            prototype = match.group('prototype')
 
-        params_json = request.body
+            helptext = match.group('help')
 
-        if not params_json:
+        else:
 
-            return
+            prototype = macro
 
+            helptext = ""
 
+        helptexts.append(
 
-        # Reject unrecognized content types. Empty string indicates
+            '''<div id="%s" style="DISPLAY: none">
 
-        # the client did not explicitly set the header
+               <b>&lt;&lt;%s&gt;&gt;</b>
 
-        if not request.content_type in ('application/json', ''):
+               <br/>
 
-            e = exception.ValidationError(attribute='application/json',
+               <textarea style="color:#000000" cols="37" rows="10" disabled="disabled">%s</textarea>
 
-                                          target='Content-Type header')
+               </div>'''
 
-            return wsgi.render_exception(e)
+            % (prototype, prototype, helptext))
 
 
 
-        params_parsed = {}
+    request.write(''.join(helptexts))
 
-        try:
+    request.write('''
 
-            params_parsed = jsonutils.loads(params_json)
+     </td>
 
-        except ValueError:
+    </tr>
 
-            e = exception.ValidationError(attribute='valid JSON',
+   </table>
 
-                                          target='request body')
+  </td>
 
-            return wsgi.render_exception(e)
+ </tr>
 
-        finally:
+</table>
 
-            if not params_parsed:
+</body>
 
-                params_parsed = {}
+</html>
 
+''')
 
 
-        params = {}
 
-        for k, v in params_parsed.iteritems():
+def macro_list(request):
 
-            if k in ('self', 'context'):
+    from MoinMoin import macro
 
-                continue
+    macros = macro.getNames(request.cfg)
 
-            if k.startswith('_'):
+    macros.sort()
 
-                continue
+    return macros
 
-            params[k] = v
 
 
+def get_macro_help(request):
 
-        request.environ[PARAMS_ENV] = params
+    """ Read help texts from SystemPage('HelpOnMacros')"""
 
+    helppage = wikiutil.getLocalizedPage(request, "HelpOnMacros")
 
+    content = helppage.get_raw_body()
 
+    macro_re = re.compile(
 
+        r"\|\|(<.*?>)?\{\{\{" +
 
-class XmlBodyMiddleware(wsgi.Middleware):
+        r"<<(?P<prototype>(?P<macro>\w*).*)>>" +
 
-    """De/serializes XML to/from JSON."""
+        r"\}\}\}\s*\|\|" +
 
+        r"[^|]*\|\|[^|]*\|\|<[^>]*>" +
 
+        r"\s*(?P<help>.*?)\s*\|\|\s*(?P<example>.*?)\s*(<<[^>]*>>)*\s*\|\|$", re.U|re.M)
 
-    def process_request(self, request):
+    help = {}
 
-        """Transform the request from XML to JSON."""
+    for match in macro_re.finditer(content):
 
-        incoming_xml = 'application/xml' in str(request.content_type)
+        help[match.group('macro')] = match
 
-        if incoming_xml and request.body:
+    return help
 
-            request.content_type = 'application/json'
 
-            request.body = jsonutils.dumps(serializer.from_xml(request.body))
 
+##############################################################################
 
+### Link dialog
 
-    def process_response(self, request, response):
+##############################################################################
 
-        """Transform the response from JSON to XML."""
 
-        outgoing_xml = 'application/xml' in str(request.accept)
 
-        if outgoing_xml and response.body:
+def page_list(request):
 
-            response.content_type = 'application/xml'
+    from MoinMoin import search
 
-            try:
+    name = request.values.get("pagename", "")
 
-                body_obj = jsonutils.loads(response.body)
+    if name:
 
-                response.body = serializer.to_xml(body_obj)
+        searchresult = search.searchPages(request, 't:"%s"' % name)
 
-            except Exception:
+        pages = [p.page_name for p in searchresult.hits]
 
-                raise exception.Error(message=response.body)
+    else:
 
-        return response
+        pages = [name]
 
+    request.write(
 
+        '''<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.0 Transitional//EN">
 
+<html>
 
+ <head>
 
-class NormalizingFilter(wsgi.Middleware):
+  <title>Insert Page Link</title>
 
-    """Middleware filter to handle URL normalization."""
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
 
+  <meta content="noindex,nofollow" name="robots">
 
+ </head>
 
-    def process_request(self, request):
+ <body scroll="no" style="OVERFLOW: hidden">
 
-        """Normalizes URLs."""
+  <table height="100%%" cellSpacing="0" cellPadding="0" width="100%%" border="0">
 
-        # Removes a trailing slash from the given path, if any.
+   <tr>
 
-        if (len(request.environ['PATH_INFO']) > 1 and
+    <td>
 
-                request.environ['PATH_INFO'][-1] == '/'):
+     <table cellSpacing="0" cellPadding="0" align="center" border="0">
 
-            request.environ['PATH_INFO'] = request.environ['PATH_INFO'][:-1]
+      <tr>
 
-        # Rewrites path to root if no path is given.
+       <td>
 
-        elif not request.environ['PATH_INFO']:
+       <span fckLang="PageDlgName">Page name</span><br>
 
-            request.environ['PATH_INFO'] = '/'
+       <select id="txtName" size="1">
 
+       %s
 
+       </select>
 
+     </td>
 
+    </tr>
 
-class RequestBodySizeLimiter(wsgi.Middleware):
+   </table>
 
-    """Limit the size of an incoming request."""
+  </td>
 
+ </tr>
 
+</table>
 
-    def __init__(self, *args, **kwargs):
+</body>
 
-        super(RequestBodySizeLimiter, self).__init__(*args, **kwargs)
+</html>
 
+''' % "".join(["<option>%s</option>\n" % wikiutil.escape(p) for p in pages]))
 
 
-    @webob.dec.wsgify(RequestClass=wsgi.Request)
 
-    def __call__(self, req):
+def link_dialog(request):
 
+    # list of wiki pages
 
+    name = request.values.get("pagename", "")
 
-        if req.content_length > CONF.max_request_body_size:
+    name_escaped = wikiutil.escape(name)
 
-            raise exception.RequestTooLarge()
+    if name:
 
-        if req.content_length is None and req.is_body_readable:
+        from MoinMoin import search
 
-            limiter = utils.LimitingReader(req.body_file,
+        # XXX error handling!
 
-                                           CONF.max_request_body_size)
+        searchresult = search.searchPages(request, 't:"%s"' % name)
 
-            req.body_file = limiter
 
-        return self.application
+
+        pages = [p.page_name for p in searchresult.hits]
+
+        pages.sort()
+
+        pages[0:0] = [name]
+
+        page_list = '''
+
+         <tr>
+
+          <td colspan=2>
+
+           <select id="sctPagename" size="1" onchange="OnChangePagename(this.value);">
+
+           %s
+
+           </select>
+
+          <td>
+
+         </tr>
+
+''' % "\n".join(['<option value="%s">%s</option>' % (wikiutil.escape(page), wikiutil.escape(page))
+
+                 for page in pages])
+
+    else:
+
+        page_list = ""
+
+
+
+    # list of interwiki names
+
+    interwiki_list = wikiutil.load_wikimap(request)
+
+    interwiki = interwiki_list.keys()
+
+    interwiki.sort()
+
+    iwpreferred = request.cfg.interwiki_preferred[:]
+
+    if not iwpreferred or iwpreferred and iwpreferred[-1] is not None:
+
+        resultlist = iwpreferred
+
+        for iw in interwiki:
+
+            if not iw in iwpreferred:
+
+                resultlist.append(iw)
+
+    else:
+
+        resultlist = iwpreferred[:-1]
+
+    interwiki = "\n".join(
+
+        ['<option value="%s">%s</option>' % (wikiutil.escape(key), wikiutil.escape(key))
+
+         for key in resultlist])
+
+
+
+    # wiki url
+
+    url_prefix_static = request.cfg.url_prefix_static
+
+    scriptname = request.script_root + '/'
+
+    action = scriptname
+
+    basepage = wikiutil.escape(request.page.page_name)
+
+    request.write(u'''
+
+<!--
+
+ * FCKeditor - The text editor for internet
+
+ * Copyright (C) 2003-2004 Frederico Caldeira Knabben
+
+ *
+
+ * Licensed under the terms of the GNU Lesser General Public License:
+
+ *   http://www.opensource.org/licenses/lgpl-license.php
+
+ *
+
+ * For further information visit:
+
+ *   http://www.fckeditor.net/
+
+ *
+
+ * File Name: fck_link.html
+
+ *  Link dialog window.
+
+ *
+
+ * Version:  2.0 FC (Preview)
+
+ * Modified: 2005-02-18 23:55:22
+
+ *
+
+ * File Authors:
+
+ *   Frederico Caldeira Knabben (fredck@fckeditor.net)
+
+-->
+
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.0 Transitional//EN">
+
+<meta http-equiv="Content-Type" content="text/html;charset=utf-8">
+
+<meta name="robots" content="index,nofollow">
+
+<html>
+
+ <head>
+
+  <title>Link Properties</title>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+
+  <meta name="robots" content="noindex,nofollow" />
+
+  <script src="%(url_prefix_static)s/applets/FCKeditor/editor/dialog/common/fck_dialog_common.js" type="text/javascript"></script>
+
+  <script src="%(url_prefix_static)s/applets/moinFCKplugins/moinlink/fck_link.js" type="text/javascript"></script>
+
+  <script src="%(url_prefix_static)s/applets/moinFCKplugins/moinurllib.js" type="text/javascript"></script>
+
+ </head>
+
+ <body scroll="no" style="OVERFLOW: hidden">
+
+  <div id="divInfo" style="DISPLAY: none">
+
+   <span fckLang="DlgLnkType">Link Type</span><br />
+
+   <select id="cmbLinkType" onchange="SetLinkType(this.value);">
+
+    <option value="wiki" selected="selected">WikiPage</option>
+
+    <option value="interwiki">Interwiki</option>
+
+    <option value="url" fckLang="DlgLnkTypeURL">URL</option>
+
+   </select>
+
+   <br />
+
+   <br />
+
+   <div id="divLinkTypeWiki">
+
+    <table height="100%%" cellSpacing="0" cellPadding="0" width="100%%" border="0">
+
+     <tr>
+
+      <td>
+
+       <form action=%(action)s method="GET">
+
+       <input type="hidden" name="action" value="fckdialog">
+
+       <input type="hidden" name="dialog" value="link">
+
+       <input type="hidden" id="basepage" name="basepage" value="%(basepage)s">
+
+       <table cellSpacing="0" cellPadding="0" align="center" border="0">
+
+        <tr>
+
+         <td>
+
+          <span fckLang="PageDlgName">Page Name</span><br>
+
+          <input id="txtPagename" name="pagename" size="30" value="%(name_escaped)s">
+
+         </td>
+
+         <td valign="bottom">
+
+           <input id=btnSearchpage type="submit" value="Search">
+
+         </td>
+
+        </tr>
+
+        %(page_list)s
+
+       </table>
+
+       </form>
+
+      </td>
+
+     </tr>
+
+    </table>
+
+   </div>
+
+   <div id="divLinkTypeInterwiki">
+
+    <table height="100%%" cellSpacing="0" cellPadding="0" width="100%%" border="0">
+
+     <tr>
+
+      <td>
+
+       <table cellSpacing="0" cellPadding="0" align="center" border="0">
+
+        <tr>
+
+         <td>
+
+          <span fckLang="WikiDlgName">Wiki:PageName</span><br>
+
+          <select id="sctInterwiki" size="1">
+
+          %(interwiki)s
+
+          </select>:
+
+          <input id="txtInterwikipagename"></input>
+
+         </td>
+
+        </tr>
+
+       </table>
+
+      </td>
+
+     </tr>
+
+    </table>
+
+   </div>
+
+   <div id="divLinkTypeUrl">
+
+    <table cellspacing="0" cellpadding="0" width="100%%" border="0">
+
+     <tr>
+
+      <td nowrap="nowrap">
+
+       <span fckLang="DlgLnkProto">Protocol</span><br />
+
+       <select id="cmbLinkProtocol">
+
+        <option value="http://" selected="selected">http://</option>
+
+        <option value="https://">https://</option>
+
+        <option value="ftp://">ftp://</option>
+
+        <option value="file://">file://</option>
+
+        <option value="news://">news://</option>
+
+        <option value="mailto:">mailto:</option>
+
+        <option value="" fckLang="DlgLnkProtoOther">&lt;other&gt;</option>
+
+       </select>
+
+      </td>
+
+      <td nowrap="nowrap">&nbsp;</td>
+
+      <td nowrap="nowrap" width="100%%">
+
+       <span fckLang="DlgLnkURL">URL</span><br />
+
+       <input id="txtUrl" style="WIDTH: 100%%" type="text" onkeyup="OnUrlChange();" onchange="OnUrlChange();" />
+
+      </td>
+
+     </tr>
+
+    </table>
+
+    <br />
+
+   </div>
+
+  </div>
+
+ </body>
+
+</html>
+
+''' % locals())
+
+
+
+
+
+def attachment_dialog(request):
+
+    """ Attachment dialog for GUI editor. """
+
+    """ Features: This dialog can... """
+
+    """ - list attachments in a drop down list """
+
+    """ - list attachments also for a different page than the current one """
+
+    """ - create new attachment """
+
+    _ = request.getText
+
+    url_prefix_static = request.cfg.url_prefix_static
+
+
+
+    # wiki url
+
+    action = request.script_root + "/"
+
+
+
+    # The following code lines implement the feature "list attachments for a different page".
+
+    # Meaning of the variables:
+
+    # - requestedPagename : Name of the page where attachments shall be listed from.
+
+    # - attachmentsPagename : Name of the page where the attachments where retrieved from.
+
+    # - destinationPagename : Name of the page where attachment will be placed on.
+
+
+
+    requestedPagename = wikiutil.escape(request.values.get("requestedPagename", ""), quote=True)
+
+    destinationPagename = wikiutil.escape(request.values.get("destinationPagename", request.page.page_name), quote=True)
+
+
+
+    attachmentsPagename = requestedPagename or wikiutil.escape(request.page.page_name)
+
+    attachments = _get_files(request, attachmentsPagename)
+
+    attachments.sort()
+
+    attachmentList = '''
+
+        <select id="sctAttachments" size="10" style="width:100%%;visibility:hidden;" onchange="OnAttachmentListChange();">
+
+        %s
+
+        </select>
+
+''' % "\n".join(['<option value="%s">%s</option>' % (wikiutil.escape(attachment, quote=True), wikiutil.escape(attachment, quote=True))
+
+                 for attachment in attachments])
+
+
+
+    # Translation of dialog texts.
+
+    langAttachmentLocation = _("Attachment location")
+
+    langPagename = _("Page name")
+
+    langAttachmentname = _("Attachment name")
+
+    langListAttachmentsButton = _("Refresh attachment list")
+
+    langAttachmentList = _("List of attachments")
+
+
+
+    if len(attachmentsPagename) > 50:
+
+        shortenedPagename = "%s ... %s" % (attachmentsPagename[0:25], attachmentsPagename[-25:])
+
+    else:
+
+        shortenedPagename = attachmentsPagename
+
+    langAvailableAttachments = "%s: %s" % (_("Available attachments for page"), shortenedPagename)
+
+
+
+    request.write('''
+
+<!--
+
+ * FCKeditor - The text editor for internet
+
+ * Copyright (C) 2003-2004 Frederico Caldeira Knabben
+
+ *
+
+ * Licensed under the terms of the GNU Lesser General Public License:
+
+ *   http://www.opensource.org/licenses/lgpl-license.php
+
+ *
+
+ * For further information visit:
+
+ *   http://www.fckeditor.net/
+
+ *
+
+ * File Name: fck_attachment.html
+
+ *  Attachment dialog window.
+
+ *
+
+ * Version:  2.0 FC (Preview)
+
+ * Modified: 2005-02-18 23:55:22
+
+ *
+
+ * File Authors:
+
+ *   Frederico Caldeira Knabben (fredck@fckeditor.net)
+
+-->
+
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.0 Transitional//EN">
+
+<meta http-equiv="Content-Type" content="text/html;charset=utf-8">
+
+<meta name="robots" content="index,nofollow">
+
+<html>
+
+ <head>
+
+  <title>Attachment Properties</title>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+
+  <meta name="robots" content="noindex,nofollow" />
+
+  <script src="%(url_prefix_static)s/applets/FCKeditor/editor/dialog/common/fck_dialog_common.js" type="text/javascript"></script>
+
+  <script src="%(url_prefix_static)s/applets/moinFCKplugins/moinattachment/fck_attachment.js" type="text/javascript"></script>
+
+  <script src="%(url_prefix_static)s/applets/moinFCKplugins/moinurllib.js" type="text/javascript"></script>
+
+ </head>
+
+ <body scroll="no" style="OVERFLOW: hidden">
+
+    <form id="DlgAttachmentForm" name="DlgAttachmentForm" action=%(action)s method="GET">
+
+    <input type="hidden" name="action" value="fckdialog">
+
+    <input type="hidden" name="dialog" value="attachment">
+
+    <input type="hidden" id="requestedPagename" name="requestedPagename" value="%(requestedPagename)s">
+
+    <input type="hidden" id="attachmentsPagename" name="attachmentsPagename" value="%(attachmentsPagename)s">
+
+    <input type="hidden" id="destinationPagename" name="destinationPagename" value="%(destinationPagename)s">
+
+
+
+    <div id="divInfo" style="valign=top;">
+
+    <div id="divLinkTypeAttachment">
+
+    <fieldset>
+
+    <legend>%(langAttachmentLocation)s</legend>
+
+    <table cellSpacing="0" cellPadding="0" width="100%%" border="0">
+
+        <tr>
+
+            <td valign="bottom" style="width:90%%" style="padding-bottom:10px">
+
+                <span>%(langPagename)s</span><br>
+
+            </td>
+
+        </tr>
+
+        <tr>
+
+            <td valign="bottom" style="width:100%%" style="padding-bottom:10px;padding-right:10px;">
+
+                <input id="txtPagename" type="text" onkeyup="OnPagenameChange();" onchange="OnPagenameChange();" style="width:98%%">
+
+            </td>
+
+        </tr>
+
+        <tr>
+
+            <td valign="bottom" style="width:90%%" style="padding-bottom:10px;">
+
+                <span>%(langAttachmentname)s</span><br>
+
+            </td>
+
+        </tr>
+
+        <tr valign="bottom">
+
+            <td valign="bottom" style="width:100%%" style="padding-bottom:10px;padding-right:10px;">
+
+                <input id="txtAttachmentname" type="text" onkeyup="OnAttachmentnameChange();" onchange="OnPagenameChange();" style="width:98%%"><br>
+
+            </td>
+
+        </tr>
+
+    </table>
+
+    </fieldset>
+
+    <fieldset>
+
+    <legend>%(langAvailableAttachments)s</legend>
+
+    <table cellSpacing="0" cellPadding="0" width="100%%" border="0">
+
+        <tr>
+
+            <td valign="bottom" style="width:100%%" style="padding-bottom:10px">
+
+                <input id="btnListAttachments" type="submit" value="%(langListAttachmentsButton)s">
+
+            </td>
+
+        </tr>
+
+        <tr>
+
+            <td valign="top" style="padding-top:10px">
+
+                <label for="sctAttachments">%(langAttachmentList)s</label><br>
+
+                %(attachmentList)s
+
+            </td>
+
+        </tr>
+
+    </table>
+
+    </fieldset>
+
+   </div>
+
+  </div>
+
+   </form>
+
+ </body>
+
+</html>
+
+''' % locals())
+
+
+
+
+
+##############################################################################
+
+### Image dialog
+
+##############################################################################
+
+
+
+def image_dialog(request):
+
+    url_prefix_static = request.cfg.url_prefix_static
+
+    request.write('''
+
+<!--
+
+ * FCKeditor - The text editor for internet
+
+ * Copyright (C) 2003-2004 Frederico Caldeira Knabben
+
+ *
+
+ * Licensed under the terms of the GNU Lesser General Public License:
+
+ *   http://www.opensource.org/licenses/lgpl-license.php
+
+ *
+
+ * For further information visit:
+
+ *   http://www.fckeditor.net/
+
+ *
+
+ * File Authors:
+
+ *   Frederico Caldeira Knabben (fredck@fckeditor.net)
+
+ *   Florian Festi
+
+-->
+
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.0 Transitional//EN">
+
+<html>
+
+ <head>
+
+  <title>Link Properties</title>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+
+  <meta name="robots" content="noindex,nofollow" />
+
+  <script src="%(url_prefix_static)s/applets/FCKeditor/editor/dialog/common/fck_dialog_common.js" type="text/javascript"></script>
+
+  <script src="%(url_prefix_static)s/applets/moinFCKplugins/moinimage/fck_image.js" type="text/javascript"></script>
+
+  <script src="%(url_prefix_static)s/applets/moinFCKplugins/moinurllib.js" type="text/javascript"></script>
+
+ </head>
+
+ <body scroll="no" style="OVERFLOW: hidden">
+
+    <table cellspacing="0" cellpadding="0" width="100%%" border="0">
+
+     <tr>
+
+      <td nowrap="nowrap">
+
+       <span fckLang="DlgLnkProto">Protocol</span><br />
+
+       <select id="cmbLinkProtocol" onchange="OnProtocolChange();">
+
+        <option value="attachment:" selected="selected">attachment:</option>
+
+        <option value="http://">http://</option>
+
+        <option value="https://">https://</option>
+
+        <!-- crashes often: <option value="drawing:">drawing:</option> -->
+
+        <option value="" fckLang="DlgLnkProtoOther">&lt;other&gt;</option>
+
+       </select>
+
+      </td>
+
+      <td nowrap="nowrap">&nbsp;</td>
+
+      <td nowrap="nowrap" width="100%%">
+
+       <span fckLang="DlgLnkURL">URL or File Name (attachment:)</span><br />
+
+       <input id="txtUrl" style="WIDTH: 100%%" type="text" onkeyup="OnUrlChange();" onchange="OnUrlChange();" />
+
+      </td>
+
+     </tr>
+
+     <tr>
+
+      <td colspan=2>
+
+       <div id="divChkLink">
+
+        <input id="chkLink" type="checkbox"> Link to
+
+       </div>
+
+      </td>
+
+    </table>
+
+ </body>
+
+</html>
+
+''' % locals())
+
+
+
+
+
+#############################################################################
+
+### Main
+
+#############################################################################
+
+
+
+def execute(pagename, request):
+
+    dialog = request.values.get("dialog", "")
+
+
+
+    if dialog == "macro":
+
+        macro_dialog(request)
+
+    elif dialog == "macrolist":
+
+        macro_list(request)
+
+    elif dialog == "pagelist":
+
+        page_list(request)
+
+    elif dialog == "link":
+
+        link_dialog(request)
+
+    elif dialog == "attachment":
+
+        attachment_dialog(request)
+
+    elif dialog == 'image':
+
+        image_dialog(request)
+
+    else:
+
+        from MoinMoin.Page import Page
+
+        request.theme.add_msg("Dialog unknown!", "error")
+
+        Page(request, pagename).send_page()

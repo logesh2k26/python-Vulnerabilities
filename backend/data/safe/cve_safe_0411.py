@@ -2,794 +2,974 @@
 # Safety: safe
 # Category: safe
 
-#!/usr/bin/python
-
-from k5test import *
+"""Base Tornado handlers for the notebook.
 
 
 
-# Skip this test if pkinit wasn't built.
-
-if not os.path.exists(os.path.join(plugins, 'preauth', 'pkinit.so')):
-
-    skip_rest('PKINIT tests', 'PKINIT module not built')
+Authors:
 
 
 
-# Check if soft-pkcs11.so is available.
+* Brian Granger
+
+"""
+
+
+
+#-----------------------------------------------------------------------------
+
+#  Copyright (C) 2011  The IPython Development Team
+
+#
+
+#  Distributed under the terms of the BSD License.  The full license is in
+
+#  the file COPYING, distributed as part of this software.
+
+#-----------------------------------------------------------------------------
+
+
+
+#-----------------------------------------------------------------------------
+
+# Imports
+
+#-----------------------------------------------------------------------------
+
+
+
+
+
+import functools
+
+import json
+
+import logging
+
+import os
+
+import re
+
+import sys
+
+import traceback
 
 try:
 
-    import ctypes
+    # py3
 
-    lib = ctypes.LibraryLoader(ctypes.CDLL).LoadLibrary('soft-pkcs11.so')
+    from http.client import responses
 
-    del lib
+except ImportError:
 
-    have_soft_pkcs11 = True
+    from httplib import responses
 
-except:
+try:
 
-    have_soft_pkcs11 = False
+    from urllib.parse import urlparse # Py 3
 
+except ImportError:
 
+    from urlparse import urlparse # Py 2
 
-# Construct a krb5.conf fragment configuring pkinit.
 
-certs = os.path.join(srctop, 'tests', 'dejagnu', 'pkinit-certs')
 
-ca_pem = os.path.join(certs, 'ca.pem')
+from jinja2 import TemplateNotFound
 
-kdc_pem = os.path.join(certs, 'kdc.pem')
+from tornado import web
 
-user_pem = os.path.join(certs, 'user.pem')
 
-privkey_pem = os.path.join(certs, 'privkey.pem')
 
-privkey_enc_pem = os.path.join(certs, 'privkey-enc.pem')
+try:
 
-user_p12 = os.path.join(certs, 'user.p12')
+    from tornado.log import app_log
 
-user_enc_p12 = os.path.join(certs, 'user-enc.p12')
+except ImportError:
 
-user_upn_p12 = os.path.join(certs, 'user-upn.p12')
+    app_log = logging.getLogger()
 
-user_upn2_p12 = os.path.join(certs, 'user-upn2.p12')
 
-user_upn3_p12 = os.path.join(certs, 'user-upn3.p12')
 
-generic_p12 = os.path.join(certs, 'generic.p12')
+from IPython.config import Application
 
-path = os.path.join(os.getcwd(), 'testdir', 'tmp-pkinit-certs')
+from IPython.utils.path import filefind
 
-path_enc = os.path.join(os.getcwd(), 'testdir', 'tmp-pkinit-certs-enc')
+from IPython.utils.py3compat import string_types
 
+from IPython.html.utils import is_hidden
 
 
-pkinit_krb5_conf = {'realms': {'$realm': {
 
-            'pkinit_anchors': 'FILE:%s' % ca_pem}}}
+#-----------------------------------------------------------------------------
 
-pkinit_kdc_conf = {'realms': {'$realm': {
+# Top-level handlers
 
-            'default_principal_flags': '+preauth',
+#-----------------------------------------------------------------------------
 
-            'pkinit_eku_checking': 'none',
+non_alphanum = re.compile(r'[^A-Za-z0-9]')
 
-            'pkinit_identity': 'FILE:%s,%s' % (kdc_pem, privkey_pem),
 
-            'pkinit_indicator': ['indpkinit1', 'indpkinit2']}}}
 
-restrictive_kdc_conf = {'realms': {'$realm': {
+class AuthenticatedHandler(web.RequestHandler):
 
-            'restrict_anonymous_to_tgt': 'true' }}}
+    """A RequestHandler with an authenticated user."""
 
 
 
-testprincs = {'krbtgt/KRBTEST.COM': {'keys': 'aes128-cts'},
+    def set_default_headers(self):
 
-              'user': {'keys': 'aes128-cts', 'flags': '+preauth'},
+        headers = self.settings.get('headers', {})
 
-              'user2': {'keys': 'aes128-cts', 'flags': '+preauth'}}
 
-alias_kdc_conf = {'realms': {'$realm': {
 
-            'default_principal_flags': '+preauth',
+        if "X-Frame-Options" not in headers:
 
-            'pkinit_eku_checking': 'none',
+            headers["X-Frame-Options"] = "SAMEORIGIN"
 
-            'pkinit_allow_upn': 'true',
 
-            'pkinit_identity': 'FILE:%s,%s' % (kdc_pem, privkey_pem),
 
-            'database_module': 'test'}},
+        for header_name,value in headers.items() :
 
-                  'dbmodules': {'test': {
+            try:
 
-                      'db_library': 'test',
+                self.set_header(header_name, value)
 
-                      'alias': {'user@krbtest.com': 'user'},
+            except Exception:
 
-                      'princs': testprincs}}}
+                # tornado raise Exception (not a subclass)
 
+                # if method is unsupported (websocket and Access-Control-Allow-Origin
 
+                # for example, so just ignore)
 
-file_identity = 'FILE:%s,%s' % (user_pem, privkey_pem)
+                pass
 
-file_enc_identity = 'FILE:%s,%s' % (user_pem, privkey_enc_pem)
+    
 
-dir_identity = 'DIR:%s' % path
+    def clear_login_cookie(self):
 
-dir_enc_identity = 'DIR:%s' % path_enc
+        self.clear_cookie(self.cookie_name)
 
-dir_file_identity = 'FILE:%s,%s' % (os.path.join(path, 'user.crt'),
+    
 
-                                    os.path.join(path, 'user.key'))
+    def get_current_user(self):
 
-dir_file_enc_identity = 'FILE:%s,%s' % (os.path.join(path_enc, 'user.crt'),
+        user_id = self.get_secure_cookie(self.cookie_name)
 
-                                        os.path.join(path_enc, 'user.key'))
+        # For now the user_id should not return empty, but it could eventually
 
-p12_identity = 'PKCS12:%s' % user_p12
+        if user_id == '':
 
-p12_upn_identity = 'PKCS12:%s' % user_upn_p12
+            user_id = 'anonymous'
 
-p12_upn2_identity = 'PKCS12:%s' % user_upn2_p12
+        if user_id is None:
 
-p12_upn3_identity = 'PKCS12:%s' % user_upn3_p12
+            # prevent extra Invalid cookie sig warnings:
 
-p12_generic_identity = 'PKCS12:%s' % generic_p12
+            self.clear_login_cookie()
 
-p12_enc_identity = 'PKCS12:%s' % user_enc_p12
+            if not self.login_available:
 
-p11_identity = 'PKCS11:soft-pkcs11.so'
+                user_id = 'anonymous'
 
-p11_token_identity = ('PKCS11:module_name=soft-pkcs11.so:'
+        return user_id
 
-                      'slotid=1:token=SoftToken (token)')
 
 
+    @property
 
-# Start a realm with the test kdb module for the following UPN SAN tests.
+    def cookie_name(self):
 
-realm = K5Realm(krb5_conf=pkinit_krb5_conf, kdc_conf=alias_kdc_conf,
+        default_cookie_name = non_alphanum.sub('-', 'username-{}'.format(
 
-                create_kdb=False)
+            self.request.host
 
-realm.start_kdc()
+        ))
 
+        return self.settings.get('cookie_name', default_cookie_name)
 
+    
 
-# Compatibility check: cert contains UPN "user", which matches the
+    @property
 
-# request principal user@KRBTEST.COM if parsed as a normal principal.
+    def password(self):
 
-realm.kinit(realm.user_princ,
+        """our password"""
 
-            flags=['-X', 'X509_user_identity=%s' % p12_upn2_identity])
+        return self.settings.get('password', '')
 
+    
 
+    @property
 
-# Compatibility check: cert contains UPN "user@KRBTEST.COM", which matches
+    def logged_in(self):
 
-# the request principal user@KRBTEST.COM if parsed as a normal principal.
+        """Is a user currently logged in?
 
-realm.kinit(realm.user_princ,
 
-            flags=['-X', 'X509_user_identity=%s' % p12_upn3_identity])
 
+        """
 
+        user = self.get_current_user()
 
-# Cert contains UPN "user@krbtest.com" which is aliased to the request
+        return (user and not user == 'anonymous')
 
-# principal.
 
-realm.kinit(realm.user_princ,
 
-            flags=['-X', 'X509_user_identity=%s' % p12_upn_identity])
+    @property
 
+    def login_available(self):
 
+        """May a user proceed to log in?
 
-# Test an id-pkinit-san match to a post-canonical principal.
 
-realm.kinit('user@krbtest.com',
 
-            flags=['-E', '-X', 'X509_user_identity=%s' % p12_identity])
+        This returns True if login capability is available, irrespective of
 
+        whether the user is already logged in or not.
 
 
-# Test a UPN match to a post-canonical principal.  (This only works
 
-# for the cert with the UPN containing just "user", as we don't allow
+        """
 
-# UPN reparsing when comparing to the canonicalized client principal.)
+        return bool(self.settings.get('password', ''))
 
-realm.kinit('user@krbtest.com',
 
-            flags=['-E', '-X', 'X509_user_identity=%s' % p12_upn2_identity])
 
 
 
-# Test a mismatch.
+class IPythonHandler(AuthenticatedHandler):
 
-msg = 'kinit: Client name mismatch while getting initial credentials'
+    """IPython-specific extensions to authenticated handling
 
-realm.run([kinit, '-X', 'X509_user_identity=%s' % p12_upn2_identity, 'user2'],
+    
 
-          expected_code=1, expected_msg=msg)
+    Mostly property shortcuts to IPython-specific settings.
 
-realm.stop()
+    """
 
+    
 
+    @property
 
-realm = K5Realm(krb5_conf=pkinit_krb5_conf, kdc_conf=pkinit_kdc_conf,
+    def config(self):
 
-                get_creds=False)
+        return self.settings.get('config', None)
 
+    
 
+    @property
 
-# Sanity check - password-based preauth should still work.
+    def log(self):
 
-realm.run(['./responder', '-r', 'password=%s' % password('user'),
+        """use the IPython log by default, falling back on tornado's logger"""
 
-           realm.user_princ])
+        if Application.initialized():
 
-realm.kinit(realm.user_princ, password=password('user'))
+            return Application.instance().log
 
-realm.klist(realm.user_princ)
+        else:
 
-realm.run([kvno, realm.host_princ])
+            return app_log
 
+    
 
+    #---------------------------------------------------------------
 
-# Test anonymous PKINIT.
+    # URLs
 
-realm.kinit('@%s' % realm.realm, flags=['-n'], expected_code=1,
+    #---------------------------------------------------------------
 
-            expected_msg='not found in Kerberos database')
+    
 
-realm.addprinc('WELLKNOWN/ANONYMOUS')
+    @property
 
-realm.kinit('@%s' % realm.realm, flags=['-n'])
+    def mathjax_url(self):
 
-realm.klist('WELLKNOWN/ANONYMOUS@WELLKNOWN:ANONYMOUS')
+        return self.settings.get('mathjax_url', '')
 
-realm.run([kvno, realm.host_princ])
+    
 
-out = realm.run(['./adata', realm.host_princ])
+    @property
 
-if '97:' in out:
+    def base_url(self):
 
-    fail('auth indicators seen in anonymous PKINIT ticket')
+        return self.settings.get('base_url', '/')
 
+    
 
+    #---------------------------------------------------------------
 
-# Test anonymous kadmin.
+    # Manager objects
 
-f = open(os.path.join(realm.testdir, 'acl'), 'a')
+    #---------------------------------------------------------------
 
-f.write('WELLKNOWN/ANONYMOUS@WELLKNOWN:ANONYMOUS a *')
+    
 
-f.close()
+    @property
 
-realm.start_kadmind()
+    def kernel_manager(self):
 
-realm.run([kadmin, '-n', 'addprinc', '-pw', 'test', 'testadd'])
+        return self.settings['kernel_manager']
 
-realm.run([kadmin, '-n', 'getprinc', 'testadd'], expected_code=1,
 
-          expected_msg="Operation requires ``get'' privilege")
 
-realm.stop_kadmind()
+    @property
 
+    def notebook_manager(self):
 
+        return self.settings['notebook_manager']
 
-# Test with anonymous restricted; FAST should work but kvno should fail.
+    
 
-r_env = realm.special_env('restrict', True, kdc_conf=restrictive_kdc_conf)
+    @property
 
-realm.stop_kdc()
+    def cluster_manager(self):
 
-realm.start_kdc(env=r_env)
+        return self.settings['cluster_manager']
 
-realm.kinit('@%s' % realm.realm, flags=['-n'])
+    
 
-realm.kinit('@%s' % realm.realm, flags=['-n', '-T', realm.ccache])
+    @property
 
-realm.run([kvno, realm.host_princ], expected_code=1,
+    def session_manager(self):
 
-          expected_msg='KDC policy rejects request')
+        return self.settings['session_manager']
 
+    
 
+    @property
 
-# Regression test for #8458: S4U2Self requests crash the KDC if
+    def project_dir(self):
 
-# anonymous is restricted.
+        return self.notebook_manager.notebook_dir
 
-realm.kinit(realm.host_princ, flags=['-k'])
+    
 
-realm.run([kvno, '-U', 'user', realm.host_princ])
+    #---------------------------------------------------------------
 
+    # CORS
 
+    #---------------------------------------------------------------
 
-# Go back to a normal KDC and disable anonymous PKINIT.
 
-realm.stop_kdc()
 
-realm.start_kdc()
+    @property
 
-realm.run([kadminl, 'delprinc', 'WELLKNOWN/ANONYMOUS'])
+    def allow_origin(self):
 
+        """Normal Access-Control-Allow-Origin"""
 
+        return self.settings.get('allow_origin', '')
 
-# Run the basic test - PKINIT with FILE: identity, with no password on the key.
 
-realm.run(['./responder', '-x', 'pkinit=',
 
-           '-X', 'X509_user_identity=%s' % file_identity, realm.user_princ])
+    @property
 
-realm.kinit(realm.user_princ,
+    def allow_origin_pat(self):
 
-            flags=['-X', 'X509_user_identity=%s' % file_identity])
+        """Regular expression version of allow_origin"""
 
-realm.klist(realm.user_princ)
+        return self.settings.get('allow_origin_pat', None)
 
-realm.run([kvno, realm.host_princ])
 
 
+    @property
 
-# Try again using RSA instead of DH.
+    def allow_credentials(self):
 
-realm.kinit(realm.user_princ,
+        """Whether to set Access-Control-Allow-Credentials"""
 
-            flags=['-X', 'X509_user_identity=%s' % file_identity,
+        return self.settings.get('allow_credentials', False)
 
-                   '-X', 'flag_RSA_PROTOCOL=yes'])
 
-realm.klist(realm.user_princ)
 
+    def set_default_headers(self):
 
+        """Add CORS headers, if defined"""
 
-# Test a DH parameter renegotiation by temporarily setting a 4096-bit
+        super(IPythonHandler, self).set_default_headers()
 
-# minimum on the KDC.  (Preauth type 16 is PKINIT PA_PK_AS_REQ;
+        if self.allow_origin:
 
-# 109 is PKINIT TD_DH_PARAMETERS; 133 is FAST PA-FX-COOKIE.)
+            self.set_header("Access-Control-Allow-Origin", self.allow_origin)
 
-minbits_kdc_conf = {'realms': {'$realm': {'pkinit_dh_min_bits': '4096'}}}
+        elif self.allow_origin_pat:
 
-minbits_env = realm.special_env('restrict', True, kdc_conf=minbits_kdc_conf)
+            origin = self.get_origin()
 
-realm.stop_kdc()
+            if origin and self.allow_origin_pat.match(origin):
 
-realm.start_kdc(env=minbits_env)
+                self.set_header("Access-Control-Allow-Origin", origin)
 
-expected_trace = ('Sending unauthenticated request',
+        if self.allow_credentials:
 
-                  '/Additional pre-authentication required',
+            self.set_header("Access-Control-Allow-Credentials", 'true')
 
-                  'Preauthenticating using KDC method data',
 
-                  'Preauth module pkinit (16) (real) returned: 0/Success',
 
-                  'Produced preauth for next request: 133, 16',
+    def get_origin(self):
 
-                  '/Key parameters not accepted',
+        # Handle WebSocket Origin naming convention differences
 
-                  'Preauth tryagain input types (16): 109, 133',
+        # The difference between version 8 and 13 is that in 8 the
 
-                  'trying again with KDC-provided parameters',
+        # client sends a "Sec-Websocket-Origin" header and in 13 it's
 
-                  'Preauth module pkinit (16) tryagain returned: 0/Success',
+        # simply "Origin".
 
-                  'Followup preauth for next request: 16, 133')
+        if "Origin" in self.request.headers:
 
-realm.kinit(realm.user_princ,
+            origin = self.request.headers.get("Origin")
 
-            flags=['-X', 'X509_user_identity=%s' % file_identity],
+        else:
 
-            expected_trace=expected_trace)
+            origin = self.request.headers.get("Sec-Websocket-Origin", None)
 
-realm.stop_kdc()
+        return origin
 
-realm.start_kdc()
 
 
+    def check_origin_api(self):
 
-# Run the basic test - PKINIT with FILE: identity, with a password on the key,
+        """Check Origin for cross-site API requests.
 
-# supplied by the prompter.
+        
 
-# Expect failure if the responder does nothing, and we have no prompter.
+        Copied from WebSocket with changes:
 
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % file_enc_identity,
+        
 
-          '-X', 'X509_user_identity=%s' % file_enc_identity, realm.user_princ],
+        - allow unspecified host/origin (e.g. scripts)
 
-          expected_code=2)
+        """
 
-realm.kinit(realm.user_princ,
+        if self.allow_origin == '*':
 
-            flags=['-X', 'X509_user_identity=%s' % file_enc_identity],
+            return True
 
-            password='encrypted')
 
-realm.klist(realm.user_princ)
 
-realm.run([kvno, realm.host_princ])
+        host = self.request.headers.get("Host")
 
-realm.run(['./adata', realm.host_princ],
+        origin = self.request.headers.get("Origin")
 
-          expected_msg='+97: [indpkinit1, indpkinit2]')
 
 
+        # If no header is provided, assume it comes from a script/curl.
 
-# Run the basic test - PKINIT with FILE: identity, with a password on the key,
+        # We are only concerned with cross-site browser stuff here.
 
-# supplied by the responder.
+        if origin is None or host is None:
 
-# Supply the response in raw form.
+            return True
 
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % file_enc_identity,
+        
 
-           '-r', 'pkinit={"%s": "encrypted"}' % file_enc_identity,
+        origin = origin.lower()
 
-           '-X', 'X509_user_identity=%s' % file_enc_identity,
+        origin_host = urlparse(origin).netloc
 
-           realm.user_princ])
+        
 
-# Supply the response through the convenience API.
+        # OK if origin matches host
 
-realm.run(['./responder', '-X', 'X509_user_identity=%s' % file_enc_identity,
+        if origin_host == host:
 
-           '-p', '%s=%s' % (file_enc_identity, 'encrypted'), realm.user_princ])
+            return True
 
-realm.klist(realm.user_princ)
+        
 
-realm.run([kvno, realm.host_princ])
+        # Check CORS headers
 
+        if self.allow_origin:
 
+            allow = self.allow_origin == origin
 
-# PKINIT with DIR: identity, with no password on the key.
+        elif self.allow_origin_pat:
 
-os.mkdir(path)
+            allow = bool(self.allow_origin_pat.match(origin))
 
-os.mkdir(path_enc)
+        else:
 
-shutil.copy(privkey_pem, os.path.join(path, 'user.key'))
+            # No CORS headers deny the request
 
-shutil.copy(privkey_enc_pem, os.path.join(path_enc, 'user.key'))
+            allow = False
 
-shutil.copy(user_pem, os.path.join(path, 'user.crt'))
+        if not allow:
 
-shutil.copy(user_pem, os.path.join(path_enc, 'user.crt'))
+            self.log.warn("Blocking Cross Origin API request.  Origin: %s, Host: %s",
 
-realm.run(['./responder', '-x', 'pkinit=', '-X',
+                origin, host,
 
-           'X509_user_identity=%s' % dir_identity, realm.user_princ])
+            )
 
-realm.kinit(realm.user_princ,
+        return allow
 
-            flags=['-X', 'X509_user_identity=%s' % dir_identity])
 
-realm.klist(realm.user_princ)
 
-realm.run([kvno, realm.host_princ])
+    def prepare(self):
 
+        if not self.check_origin_api():
 
+            raise web.HTTPError(404)
 
-# PKINIT with DIR: identity, with a password on the key, supplied by the
+        return super(IPythonHandler, self).prepare()
 
-# prompter.
 
-# Expect failure if the responder does nothing, and we have no prompter.
 
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % dir_file_enc_identity,
+    #---------------------------------------------------------------
 
-           '-X', 'X509_user_identity=%s' % dir_enc_identity, realm.user_princ],
+    # template rendering
 
-           expected_code=2)
+    #---------------------------------------------------------------
 
-realm.kinit(realm.user_princ,
+    
 
-            flags=['-X', 'X509_user_identity=%s' % dir_enc_identity],
+    def get_template(self, name):
 
-            password='encrypted')
+        """Return the jinja template object for a given name"""
 
-realm.klist(realm.user_princ)
+        return self.settings['jinja2_env'].get_template(name)
 
-realm.run([kvno, realm.host_princ])
+    
 
+    def render_template(self, name, **ns):
 
+        ns.update(self.template_namespace)
 
-# PKINIT with DIR: identity, with a password on the key, supplied by the
+        template = self.get_template(name)
 
-# responder.
+        return template.render(**ns)
 
-# Supply the response in raw form.
+    
 
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % dir_file_enc_identity,
+    @property
 
-           '-r', 'pkinit={"%s": "encrypted"}' % dir_file_enc_identity,
+    def template_namespace(self):
 
-           '-X', 'X509_user_identity=%s' % dir_enc_identity, realm.user_princ])
+        return dict(
 
-# Supply the response through the convenience API.
+            base_url=self.base_url,
 
-realm.run(['./responder', '-X', 'X509_user_identity=%s' % dir_enc_identity,
+            logged_in=self.logged_in,
 
-           '-p', '%s=%s' % (dir_file_enc_identity, 'encrypted'),
+            login_available=self.login_available,
 
-           realm.user_princ])
+            static_url=self.static_url,
 
-realm.klist(realm.user_princ)
+        )
 
-realm.run([kvno, realm.host_princ])
+    
 
+    def get_json_body(self):
 
+        """Return the body of the request as JSON data."""
 
-# PKINIT with PKCS12: identity, with no password on the bundle.
+        if not self.request.body:
 
-realm.run(['./responder', '-x', 'pkinit=',
+            return None
 
-           '-X', 'X509_user_identity=%s' % p12_identity, realm.user_princ])
+        # Do we need to call body.decode('utf-8') here?
 
-realm.kinit(realm.user_princ,
+        body = self.request.body.strip().decode(u'utf-8')
 
-            flags=['-X', 'X509_user_identity=%s' % p12_identity])
+        try:
 
-realm.klist(realm.user_princ)
+            model = json.loads(body)
 
-realm.run([kvno, realm.host_princ])
+        except Exception:
 
+            self.log.debug("Bad JSON: %r", body)
 
+            self.log.error("Couldn't parse JSON", exc_info=True)
 
-# PKINIT with PKCS12: identity, with a password on the bundle, supplied by the
+            raise web.HTTPError(400, u'Invalid JSON in body of request')
 
-# prompter.
+        return model
 
-# Expect failure if the responder does nothing, and we have no prompter.
 
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % p12_enc_identity,
 
-           '-X', 'X509_user_identity=%s' % p12_enc_identity, realm.user_princ],
+    def write_error(self, status_code, **kwargs):
 
-           expected_code=2)
+        """render custom error pages"""
 
-realm.kinit(realm.user_princ,
+        exc_info = kwargs.get('exc_info')
 
-            flags=['-X', 'X509_user_identity=%s' % p12_enc_identity],
+        message = ''
 
-            password='encrypted')
+        status_message = responses.get(status_code, 'Unknown HTTP Error')
 
-realm.klist(realm.user_princ)
+        if exc_info:
 
-realm.run([kvno, realm.host_princ])
+            exception = exc_info[1]
 
+            # get the custom message, if defined
 
+            try:
 
-# PKINIT with PKCS12: identity, with a password on the bundle, supplied by the
+                message = exception.log_message % exception.args
 
-# responder.
+            except Exception:
 
-# Supply the response in raw form.
+                pass
 
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % p12_enc_identity,
+            
 
-           '-r', 'pkinit={"%s": "encrypted"}' % p12_enc_identity,
+            # construct the custom reason, if defined
 
-           '-X', 'X509_user_identity=%s' % p12_enc_identity, realm.user_princ])
+            reason = getattr(exception, 'reason', '')
 
-# Supply the response through the convenience API.
+            if reason:
 
-realm.run(['./responder', '-X', 'X509_user_identity=%s' % p12_enc_identity,
+                status_message = reason
 
-           '-p', '%s=%s' % (p12_enc_identity, 'encrypted'),
+        
 
-           realm.user_princ])
+        # build template namespace
 
-realm.klist(realm.user_princ)
+        ns = dict(
 
-realm.run([kvno, realm.host_princ])
+            status_code=status_code,
 
+            status_message=status_message,
 
+            message=message,
 
-# Match a single rule.
+            exception=exception,
 
-rule = '<SAN>^user@KRBTEST.COM$'
+        )
 
-realm.run([kadminl, 'setstr', realm.user_princ, 'pkinit_cert_match', rule])
+        
 
-realm.kinit(realm.user_princ,
+        self.set_header('Content-Type', 'text/html')
 
-            flags=['-X', 'X509_user_identity=%s' % p12_identity])
+        # render the template
 
-realm.klist(realm.user_princ)
+        try:
 
+            html = self.render_template('%s.html' % status_code, **ns)
 
+        except TemplateNotFound:
 
-# Match a combined rule (default prefix is &&).
+            self.log.debug("No template for %d", status_code)
 
-rule = '<SUBJECT>CN=user$<KU>digitalSignature,keyEncipherment'
+            html = self.render_template('error.html', **ns)
 
-realm.run([kadminl, 'setstr', realm.user_princ, 'pkinit_cert_match', rule])
+        
 
-realm.kinit(realm.user_princ,
+        self.write(html)
 
-            flags=['-X', 'X509_user_identity=%s' % p12_identity])
+        
 
-realm.klist(realm.user_princ)
 
 
 
-# Fail an && rule.
 
-rule = '&&<SUBJECT>O=OTHER.COM<SAN>^user@KRBTEST.COM$'
+class Template404(IPythonHandler):
 
-realm.run([kadminl, 'setstr', realm.user_princ, 'pkinit_cert_match', rule])
+    """Render our 404 template"""
 
-msg = 'kinit: Certificate mismatch while getting initial credentials'
+    def prepare(self):
 
-realm.kinit(realm.user_princ,
+        raise web.HTTPError(404)
 
-            flags=['-X', 'X509_user_identity=%s' % p12_identity],
 
-            expected_code=1, expected_msg=msg)
 
 
 
-# Pass an || rule.
+class AuthenticatedFileHandler(IPythonHandler, web.StaticFileHandler):
 
-rule = '||<SUBJECT>O=KRBTEST.COM<SAN>^otheruser@KRBTEST.COM$'
+    """static files should only be accessible when logged in"""
 
-realm.run([kadminl, 'setstr', realm.user_princ, 'pkinit_cert_match', rule])
 
-realm.kinit(realm.user_princ,
 
-            flags=['-X', 'X509_user_identity=%s' % p12_identity])
+    @web.authenticated
 
-realm.klist(realm.user_princ)
+    def get(self, path):
 
+        if os.path.splitext(path)[1] == '.ipynb':
 
+            name = os.path.basename(path)
 
-# Fail an || rule.
+            self.set_header('Content-Type', 'application/json')
 
-rule = '||<SUBJECT>O=OTHER.COM<SAN>^otheruser@KRBTEST.COM$'
+            self.set_header('Content-Disposition','attachment; filename="%s"' % name)
 
-realm.run([kadminl, 'setstr', realm.user_princ, 'pkinit_cert_match', rule])
+        
 
-msg = 'kinit: Certificate mismatch while getting initial credentials'
+        return web.StaticFileHandler.get(self, path)
 
-realm.kinit(realm.user_princ,
+    
 
-            flags=['-X', 'X509_user_identity=%s' % p12_identity],
+    def compute_etag(self):
 
-            expected_code=1, expected_msg=msg)
+        return None
 
+    
 
+    def validate_absolute_path(self, root, absolute_path):
 
-# Authorize a client cert with no PKINIT extensions using subject and
+        """Validate and return the absolute path.
 
-# issuer.  (Relies on EKU checking being turned off.)
+        
 
-rule = '&&<SUBJECT>CN=user$<ISSUER>O=MIT,'
+        Requires tornado 3.1
 
-realm.run([kadminl, 'setstr', realm.user_princ, 'pkinit_cert_match', rule])
+        
 
-realm.kinit(realm.user_princ,
+        Adding to tornado's own handling, forbids the serving of hidden files.
 
-            flags=['-X', 'X509_user_identity=%s' % p12_generic_identity])
+        """
 
-realm.klist(realm.user_princ)
+        abs_path = super(AuthenticatedFileHandler, self).validate_absolute_path(root, absolute_path)
 
+        abs_root = os.path.abspath(root)
 
+        if is_hidden(abs_path, abs_root):
 
-if not have_soft_pkcs11:
+            self.log.info("Refusing to serve hidden file, via 404 Error")
 
-    skip_rest('PKINIT PKCS11 tests', 'soft-pkcs11.so not found')
+            raise web.HTTPError(404)
 
+        return abs_path
 
 
-softpkcs11rc = os.path.join(os.getcwd(), 'testdir', 'soft-pkcs11.rc')
 
-realm.env['SOFTPKCS11RC'] = softpkcs11rc
 
 
+def json_errors(method):
 
-# PKINIT with PKCS11: identity, with no need for a PIN.
+    """Decorate methods with this to return GitHub style JSON errors.
 
-conf = open(softpkcs11rc, 'w')
+    
 
-conf.write("%s\t%s\t%s\t%s\n" % ('user', 'user token', user_pem, privkey_pem))
+    This should be used on any JSON API on any handler method that can raise HTTPErrors.
 
-conf.close()
+    
 
-# Expect to succeed without having to supply any more information.
+    This will grab the latest HTTPError exception using sys.exc_info
 
-realm.run(['./responder', '-x', 'pkinit=',
+    and then:
 
-           '-X', 'X509_user_identity=%s' % p11_identity, realm.user_princ])
+    
 
-realm.kinit(realm.user_princ,
+    1. Set the HTTP status code based on the HTTPError
 
-            flags=['-X', 'X509_user_identity=%s' % p11_identity])
+    2. Create and return a JSON body with a message field describing
 
-realm.klist(realm.user_princ)
+       the error in a human readable form.
 
-realm.run([kvno, realm.host_princ])
+    """
 
+    @functools.wraps(method)
 
+    def wrapper(self, *args, **kwargs):
 
-# PKINIT with PKCS11: identity, with a PIN supplied by the prompter.
+        try:
 
-os.remove(softpkcs11rc)
+            result = method(self, *args, **kwargs)
 
-conf = open(softpkcs11rc, 'w')
+        except web.HTTPError as e:
 
-conf.write("%s\t%s\t%s\t%s\n" % ('user', 'user token', user_pem,
+            status = e.status_code
 
-                                 privkey_enc_pem))
+            message = e.log_message
 
-conf.close()
+            self.log.warn(message)
 
-# Expect failure if the responder does nothing, and there's no prompter
+            self.set_status(e.status_code)
 
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % p11_token_identity,
+            self.set_header('Content-Type', 'application/json')
 
-           '-X', 'X509_user_identity=%s' % p11_identity, realm.user_princ],
+            self.finish(json.dumps(dict(message=message)))
 
-          expected_code=2)
+        except Exception:
 
-realm.kinit(realm.user_princ,
+            self.log.error("Unhandled error in API request", exc_info=True)
 
-            flags=['-X', 'X509_user_identity=%s' % p11_identity],
+            status = 500
 
-            password='encrypted')
+            message = "Unknown server error"
 
-realm.klist(realm.user_princ)
+            t, value, tb = sys.exc_info()
 
-realm.run([kvno, realm.host_princ])
+            self.set_status(status)
 
+            tb_text = ''.join(traceback.format_exception(t, value, tb))
 
+            reply = dict(message=message, traceback=tb_text)
 
-# Supply the wrong PIN, and verify that we ignore the draft9 padata offer
+            self.set_header('Content-Type', 'application/json')
 
-# in the KDC method data after RFC 4556 PKINIT fails.
+            self.finish(json.dumps(reply))
 
-expected_trace = ('PKINIT client has no configured identity; giving up',
+        else:
 
-                  'PKINIT client ignoring draft 9 offer from RFC 4556 KDC')
+            return result
 
-realm.kinit(realm.user_princ,
+    return wrapper
 
-            flags=['-X', 'X509_user_identity=%s' % p11_identity],
 
-            password='wrong', expected_code=1, expected_trace=expected_trace)
 
 
 
-# PKINIT with PKCS11: identity, with a PIN supplied by the responder.
 
-# Supply the response in raw form.
 
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % p11_token_identity,
+#-----------------------------------------------------------------------------
 
-           '-r', 'pkinit={"%s": "encrypted"}' % p11_token_identity,
+# File handler
 
-           '-X', 'X509_user_identity=%s' % p11_identity, realm.user_princ])
+#-----------------------------------------------------------------------------
 
-# Supply the response through the convenience API.
 
-realm.run(['./responder', '-X', 'X509_user_identity=%s' % p11_identity,
 
-           '-p', '%s=%s' % (p11_token_identity, 'encrypted'),
+# to minimize subclass changes:
 
-           realm.user_princ])
+HTTPError = web.HTTPError
 
-realm.klist(realm.user_princ)
 
-realm.run([kvno, realm.host_princ])
 
+class FileFindHandler(web.StaticFileHandler):
 
+    """subclass of StaticFileHandler for serving files from a search path"""
 
-success('PKINIT tests')
+    
+
+    # cache search results, don't search for files more than once
+
+    _static_paths = {}
+
+    
+
+    def initialize(self, path, default_filename=None):
+
+        if isinstance(path, string_types):
+
+            path = [path]
+
+        
+
+        self.root = tuple(
+
+            os.path.abspath(os.path.expanduser(p)) + os.sep for p in path
+
+        )
+
+        self.default_filename = default_filename
+
+    
+
+    def compute_etag(self):
+
+        return None
+
+    
+
+    @classmethod
+
+    def get_absolute_path(cls, roots, path):
+
+        """locate a file to serve on our static file search path"""
+
+        with cls._lock:
+
+            if path in cls._static_paths:
+
+                return cls._static_paths[path]
+
+            try:
+
+                abspath = os.path.abspath(filefind(path, roots))
+
+            except IOError:
+
+                # IOError means not found
+
+                return ''
+
+            
+
+            cls._static_paths[path] = abspath
+
+            return abspath
+
+    
+
+    def validate_absolute_path(self, root, absolute_path):
+
+        """check if the file should be served (raises 404, 403, etc.)"""
+
+        if absolute_path == '':
+
+            raise web.HTTPError(404)
+
+        
+
+        for root in self.root:
+
+            if (absolute_path + os.sep).startswith(root):
+
+                break
+
+        
+
+        return super(FileFindHandler, self).validate_absolute_path(root, absolute_path)
+
+
+
+
+
+class TrailingSlashHandler(web.RequestHandler):
+
+    """Simple redirect handler that strips trailing slashes
+
+    
+
+    This should be the first, highest priority handler.
+
+    """
+
+    
+
+    SUPPORTED_METHODS = ['GET']
+
+    
+
+    def get(self):
+
+        self.redirect(self.request.uri.rstrip('/'))
+
+
+
+#-----------------------------------------------------------------------------
+
+# URL pattern fragments for re-use
+
+#-----------------------------------------------------------------------------
+
+
+
+path_regex = r"(?P<path>(?:/.*)*)"
+
+notebook_name_regex = r"(?P<name>[^/]+\.ipynb)"
+
+notebook_path_regex = "%s/%s" % (path_regex, notebook_name_regex)
+
+
+
+#-----------------------------------------------------------------------------
+
+# URL to handler mappings
+
+#-----------------------------------------------------------------------------
+
+
+
+
+
+default_handlers = [
+
+    (r".*/", TrailingSlashHandler)
+
+]

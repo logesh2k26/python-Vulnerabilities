@@ -2,23 +2,49 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+
+
+
+# Copyright 2010 United States Government as represented by the
+
+# Administrator of the National Aeronautics and Space Administration.
+
+# All Rights Reserved.
+
+#
+
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+
+#    not use this file except in compliance with the License. You may obtain
+
+#    a copy of the License at
+
+#
+
+#         http://www.apache.org/licenses/LICENSE-2.0
+
+#
+
+#    Unless required by applicable law or agreed to in writing, software
+
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+
+#    License for the specific language governing permissions and limitations
+
+#    under the License.
+
+
 
 """
 
-    test_common
+Cloud Controller: Implementation of EC2 REST API calls, which are
 
-    ~~~~~~~~~~~
+dispatched to other nodes via AMQP RPC. State is via distributed
 
-
-
-    Test common functionality
-
-
-
-    :copyright: (c) 2019 by J. Christopher Wagner (jwag).
-
-    :license: MIT, see LICENSE for more details.
+datastore.
 
 """
 
@@ -26,1480 +52,3296 @@
 
 import base64
 
-import json
+import re
 
-import pytest
+import time
 
-
-
-from flask import Blueprint
+import urllib
 
 
 
-from utils import (
+from nova.api.ec2 import ec2utils
 
-    authenticate,
+from nova.api.ec2 import inst_state
 
-    json_authenticate,
+from nova.api import validator
 
-    get_num_queries,
+from nova import block_device
 
-    logout,
+from nova import compute
 
-    populate_data,
+from nova.compute import instance_types
 
-    verify_token,
+from nova.compute import vm_states
 
-)
+from nova import crypto
 
+from nova import db
 
+from nova import exception
 
-try:
+from nova import flags
 
-    from cookielib import Cookie
+from nova.image import s3
 
-except ImportError:
+from nova import log as logging
 
-    from http.cookiejar import Cookie
+from nova import network
 
+from nova.rpc import common as rpc_common
 
+from nova import utils
 
-
-
-def test_login_view(client):
-
-    response = client.get("/login")
-
-    assert b"<h1>Login</h1>" in response.data
+from nova import volume
 
 
 
 
 
-def test_authenticate(client):
+FLAGS = flags.FLAGS
 
-    response = authenticate(client)
+flags.DECLARE('dhcp_domain', 'nova.network.manager')
 
-    assert response.status_code == 302
 
-    response = authenticate(client, follow_redirects=True)
 
-    assert b"Welcome matt@lp.com" in response.data
+LOG = logging.getLogger(__name__)
 
 
 
 
 
-def test_authenticate_with_next(client):
+def validate_ec2_id(val):
 
-    data = dict(email="matt@lp.com", password="password")
+    if not validator.validate_str()(val):
 
-    response = client.post("/login?next=/page1", data=data, follow_redirects=True)
+        raise exception.InvalidInstanceIDMalformed(val)
 
-    assert b"Page 1" in response.data
+    try:
 
+        ec2utils.ec2_id_to_id(val)
 
+    except exception.InvalidEc2Id:
 
-
-
-def test_authenticate_with_next_bp(app, client):
-
-    api = Blueprint("api", __name__)
+        raise exception.InvalidInstanceIDMalformed(val)
 
 
 
-    @api.route("/info")
 
-    def info():
+
+def _gen_key(context, user_id, key_name):
+
+    """Generate a key
+
+
+
+    This is a module level method because it is slow and we need to defer
+
+    it into a process pool."""
+
+    # NOTE(vish): generating key pair is slow so check for legal
+
+    #             creation before creating key_pair
+
+    try:
+
+        db.key_pair_get(context, user_id, key_name)
+
+        raise exception.KeyPairExists(key_name=key_name)
+
+    except exception.NotFound:
 
         pass
 
+    private_key, public_key, fingerprint = crypto.generate_key_pair()
 
+    key = {}
 
-    app.register_blueprint(api, url_prefix="/api")
+    key['user_id'] = user_id
 
-    data = dict(email="matt@lp.com", password="password")
+    key['name'] = key_name
 
-    response = client.post("/login?next=api.info", data=data, follow_redirects=False)
+    key['public_key'] = public_key
 
-    assert response.status_code == 302
+    key['fingerprint'] = fingerprint
 
-    assert "api/info" in response.location
+    db.key_pair_create(context, key)
 
+    return {'private_key': private_key, 'fingerprint': fingerprint}
 
 
 
 
-def test_authenticate_with_invalid_next(client, get_message):
 
-    data = dict(email="matt@lp.com", password="password")
+# EC2 API can return the following values as documented in the EC2 API
 
-    response = client.post("/login?next=http://google.com", data=data)
+# http://docs.amazonwebservices.com/AWSEC2/latest/APIReference/
 
-    assert get_message("INVALID_REDIRECT") in response.data
+#    ApiReference-ItemType-InstanceStateType.html
 
+# pending 0 | running 16 | shutting-down 32 | terminated 48 | stopping 64 |
 
+# stopped 80
 
+_STATE_DESCRIPTION_MAP = {
 
+    None: inst_state.PENDING,
 
-def test_authenticate_with_invalid_malformed_next(client, get_message):
+    vm_states.ACTIVE: inst_state.RUNNING,
 
-    data = dict(email="matt@lp.com", password="password")
+    vm_states.BUILDING: inst_state.PENDING,
 
-    response = client.post("/login?next=http:///google.com", data=data)
+    vm_states.REBUILDING: inst_state.PENDING,
 
-    assert get_message("INVALID_REDIRECT") in response.data
+    vm_states.DELETED: inst_state.TERMINATED,
 
+    vm_states.SOFT_DELETE: inst_state.TERMINATED,
 
+    vm_states.STOPPED: inst_state.STOPPED,
 
+    vm_states.SHUTOFF: inst_state.SHUTOFF,
 
+    vm_states.MIGRATING: inst_state.MIGRATE,
 
-def test_authenticate_case_insensitive_email(app, client):
+    vm_states.RESIZING: inst_state.RESIZE,
 
-    response = authenticate(client, "MATT@lp.com", follow_redirects=True)
+    vm_states.PAUSED: inst_state.PAUSE,
 
-    assert b"Welcome matt@lp.com" in response.data
+    vm_states.SUSPENDED: inst_state.SUSPEND,
 
+    vm_states.RESCUED: inst_state.RESCUE,
 
+}
 
 
 
-def test_authenticate_with_invalid_input(client, get_message):
 
-    response = client.post(
 
-        "/login", data="{}", headers={"Content-Type": "application/json"}
+def _state_description(vm_state, shutdown_terminate):
 
-    )
+    """Map the vm state to the server status string"""
 
-    assert get_message("EMAIL_NOT_PROVIDED") in response.data
+    if (vm_state == vm_states.SHUTOFF and
 
+        not shutdown_terminate):
 
+            name = inst_state.STOPPED
 
+    else:
 
+        name = _STATE_DESCRIPTION_MAP.get(vm_state, vm_state)
 
-@pytest.mark.settings(post_login_view="/post_login")
 
-def test_get_already_authenticated(client):
 
-    response = authenticate(client, follow_redirects=True)
+    return {'code': inst_state.name_to_code(name),
 
-    assert b"Welcome matt@lp.com" in response.data
+            'name': name}
 
-    response = client.get("/login", follow_redirects=True)
 
-    assert b"Post Login" in response.data
 
 
 
+def _parse_block_device_mapping(bdm):
 
+    """Parse BlockDeviceMappingItemType into flat hash
 
-@pytest.mark.settings(post_login_view="/post_login")
+    BlockDevicedMapping.<N>.DeviceName
 
-def test_get_already_authenticated_next(client):
+    BlockDevicedMapping.<N>.Ebs.SnapshotId
 
-    response = authenticate(client, follow_redirects=True)
+    BlockDevicedMapping.<N>.Ebs.VolumeSize
 
-    assert b"Welcome matt@lp.com" in response.data
+    BlockDevicedMapping.<N>.Ebs.DeleteOnTermination
 
-    # This should NOT override post_login_view due to potential redirect loops.
+    BlockDevicedMapping.<N>.Ebs.NoDevice
 
-    response = client.get("/login?next=/page1", follow_redirects=True)
+    BlockDevicedMapping.<N>.VirtualName
 
-    assert b"Post Login" in response.data
-
-
-
-
-
-@pytest.mark.settings(post_login_view="/post_login")
-
-def test_post_already_authenticated(client):
-
-    response = authenticate(client, follow_redirects=True)
-
-    assert b"Welcome matt@lp.com" in response.data
-
-    data = dict(email="matt@lp.com", password="password")
-
-    response = client.post("/login", data=data, follow_redirects=True)
-
-    assert b"Post Login" in response.data
-
-    # This should NOT override post_login_view due to potential redirect loops.
-
-    response = client.post("/login?next=/page1", data=data, follow_redirects=True)
-
-    assert b"Post Login" in response.data
-
-
-
-
-
-def test_login_form(client):
-
-    response = client.post("/login", data={"email": "matt@lp.com"})
-
-    assert b"matt@lp.com" in response.data
-
-
-
-
-
-def test_unprovided_username(client, get_message):
-
-    response = authenticate(client, "")
-
-    assert get_message("EMAIL_NOT_PROVIDED") in response.data
-
-
-
-
-
-def test_unprovided_password(client, get_message):
-
-    response = authenticate(client, password="")
-
-    assert get_message("PASSWORD_NOT_PROVIDED") in response.data
-
-
-
-
-
-def test_invalid_user(client, get_message):
-
-    response = authenticate(client, email="bogus@bogus.com")
-
-    assert get_message("USER_DOES_NOT_EXIST") in response.data
-
-
-
-
-
-def test_bad_password(client, get_message):
-
-    response = authenticate(client, password="bogus")
-
-    assert get_message("INVALID_PASSWORD") in response.data
-
-
-
-
-
-def test_inactive_user(client, get_message):
-
-    response = authenticate(client, "tiya@lp.com", "password")
-
-    assert get_message("DISABLED_ACCOUNT") in response.data
-
-
-
-
-
-def test_inactive_forbids(app, client, get_message):
-
-    """ Make sure that existing session doesn't work after
-
-    user marked inactive
+    => remove .Ebs and allow volume id in SnapshotId
 
     """
 
-    response = authenticate(client, follow_redirects=True)
+    ebs = bdm.pop('ebs', None)
 
-    assert response.status_code == 200
+    if ebs:
 
-    # make sure can access restricted page
+        ec2_id = ebs.pop('snapshot_id', None)
 
-    response = client.get("/profile", follow_redirects=True)
+        if ec2_id:
 
-    assert b"Profile Page" in response.data
+            id = ec2utils.ec2_id_to_id(ec2_id)
 
+            if ec2_id.startswith('snap-'):
 
+                bdm['snapshot_id'] = id
 
-    # deactivate matt
+            elif ec2_id.startswith('vol-'):
 
-    with app.test_request_context("/"):
+                bdm['volume_id'] = id
 
-        user = app.security.datastore.find_user(email="matt@lp.com")
+            ebs.setdefault('delete_on_termination', True)
 
-        app.security.datastore.deactivate_user(user)
+        bdm.update(ebs)
 
-        app.security.datastore.commit()
-
-
-
-    response = client.get("/profile", follow_redirects=True)
-
-    # should be thrown back to login page.
-
-    assert response.status_code == 200
-
-    assert b"Please log in to access this page" in response.data
+    return bdm
 
 
 
 
 
-@pytest.mark.settings(unauthorized_view=None)
+def _properties_get_mappings(properties):
 
-def test_inactive_forbids_token(app, client_nc, get_message):
+    return block_device.mappings_prepend_dev(properties.get('mappings', []))
 
-    """ Make sure that existing token doesn't work after
 
-    user marked inactive
+
+
+
+def _format_block_device_mapping(bdm):
+
+    """Contruct BlockDeviceMappingItemType
+
+    {'device_name': '...', 'snapshot_id': , ...}
+
+    => BlockDeviceMappingItemType
 
     """
 
-    response = json_authenticate(client_nc)
+    keys = (('deviceName', 'device_name'),
 
-    assert response.status_code == 200
+             ('virtualName', 'virtual_name'))
 
-    token = response.json["response"]["user"]["authentication_token"]
+    item = {}
 
-    headers = {"Authentication-Token": token}
+    for name, k in keys:
 
-    # make sure can access restricted page
+        if k in bdm:
 
-    response = client_nc.get("/token", headers=headers)
+            item[name] = bdm[k]
 
-    assert b"Token Authentication" in response.data
+    if bdm.get('no_device'):
 
+        item['noDevice'] = True
 
+    if ('snapshot_id' in bdm) or ('volume_id' in bdm):
 
-    # deactivate matt
+        ebs_keys = (('snapshotId', 'snapshot_id'),
 
-    with app.test_request_context("/"):
+                    ('snapshotId', 'volume_id'),        # snapshotId is abused
 
-        user = app.security.datastore.find_user(email="matt@lp.com")
+                    ('volumeSize', 'volume_size'),
 
-        app.security.datastore.deactivate_user(user)
+                    ('deleteOnTermination', 'delete_on_termination'))
 
-        app.security.datastore.commit()
+        ebs = {}
 
+        for name, k in ebs_keys:
 
+            if k in bdm:
 
-    response = client_nc.get("/token", content_type="application/json", headers=headers)
+                if k == 'snapshot_id':
 
-    assert response.status_code == 401
+                    ebs[name] = ec2utils.id_to_ec2_snap_id(bdm[k])
 
+                elif k == 'volume_id':
 
+                    ebs[name] = ec2utils.id_to_ec2_vol_id(bdm[k])
 
+                else:
 
+                    ebs[name] = bdm[k]
 
-def test_unset_password(client, get_message):
+        assert 'snapshotId' in ebs
 
-    response = authenticate(client, "jess@lp.com", "password")
+        item['ebs'] = ebs
 
-    assert get_message("PASSWORD_NOT_SET") in response.data
+    return item
 
 
 
 
 
-def test_logout(client):
+def _format_mappings(properties, result):
 
-    authenticate(client)
+    """Format multiple BlockDeviceMappingItemType"""
 
-    response = logout(client, follow_redirects=True)
+    mappings = [{'virtualName': m['virtual'], 'deviceName': m['device']}
 
-    assert b"Home Page" in response.data
+                for m in _properties_get_mappings(properties)
 
+                if block_device.is_swap_or_ephemeral(m['virtual'])]
 
 
 
+    block_device_mapping = [_format_block_device_mapping(bdm) for bdm in
 
-def test_logout_post(client):
+                            properties.get('block_device_mapping', [])]
 
-    authenticate(client)
 
-    response = client.post("/logout", content_type="application/json")
 
-    assert response.status_code == 200
+    # NOTE(yamahata): overwrite mappings with block_device_mapping
 
-    assert response.json["meta"]["code"] == 200
+    for bdm in block_device_mapping:
 
+        for i in range(len(mappings)):
 
+            if bdm['deviceName'] == mappings[i]['deviceName']:
 
+                del mappings[i]
 
+                break
 
-def test_logout_with_next_invalid(client, get_message):
+        mappings.append(bdm)
 
-    authenticate(client)
 
-    response = client.get("/logout?next=http://google.com")
 
-    assert "google.com" not in response.location
+    # NOTE(yamahata): trim ebs.no_device == true. Is this necessary?
 
+    mappings = [bdm for bdm in mappings if not (bdm.get('noDevice', False))]
 
 
 
+    if mappings:
 
-def test_logout_with_next(client):
+        result['blockDeviceMapping'] = mappings
 
-    authenticate(client)
 
-    response = client.get("/logout?next=/page1", follow_redirects=True)
 
-    assert b"Page 1" in response.data
 
 
+class CloudController(object):
 
+    """ CloudController provides the critical dispatch between
 
+ inbound API calls through the endpoint and messages
 
-def test_missing_session_access(client, get_message):
+ sent to the other nodes.
 
-    response = client.get("/profile", follow_redirects=True)
+"""
 
-    assert get_message("LOGIN") in response.data
+    def __init__(self):
 
+        self.image_service = s3.S3ImageService()
 
+        self.network_api = network.API()
 
+        self.volume_api = volume.API()
 
+        self.compute_api = compute.API(network_api=self.network_api,
 
-def test_has_session_access(client):
+                                       volume_api=self.volume_api)
 
-    authenticate(client)
+        self.sgh = utils.import_object(FLAGS.security_group_handler)
 
-    response = client.get("/profile", follow_redirects=True)
 
-    assert b"profile" in response.data
 
+    def __str__(self):
 
+        return 'CloudController'
 
 
 
-def test_authorized_access(client):
+    def _get_image_state(self, image):
 
-    authenticate(client)
+        # NOTE(vish): fallback status if image_state isn't set
 
-    response = client.get("/admin")
+        state = image.get('status')
 
-    assert b"Admin Page" in response.data
+        if state == 'active':
 
+            state = 'available'
 
+        return image['properties'].get('image_state', state)
 
 
 
-def test_unauthorized_access(client, get_message):
+    def describe_availability_zones(self, context, **kwargs):
 
-    authenticate(client, "joe@lp.com")
+        if ('zone_name' in kwargs and
 
-    response = client.get("/admin", follow_redirects=True)
+            'verbose' in kwargs['zone_name'] and
 
-    assert response.status_code == 403
+            context.is_admin):
 
+            return self._describe_availability_zones_verbose(context,
 
+                                                             **kwargs)
 
+        else:
 
+            return self._describe_availability_zones(context, **kwargs)
 
-@pytest.mark.settings(unauthorized_view=lambda: None)
 
-def test_unauthorized_access_with_referrer(client, get_message):
 
-    authenticate(client, "joe@lp.com")
+    def _describe_availability_zones(self, context, **kwargs):
 
-    response = client.get("/admin", headers={"referer": "/admin"})
+        ctxt = context.elevated()
 
-    assert response.headers["Location"] != "/admin"
+        enabled_services = db.service_get_all(ctxt, False)
 
-    client.get(response.headers["Location"])
+        disabled_services = db.service_get_all(ctxt, True)
 
+        available_zones = []
 
+        for zone in [service.availability_zone for service
 
-    response = client.get(
+                     in enabled_services]:
 
-        "/admin?a=b", headers={"referer": "http://localhost/admin?x=y"}
+            if not zone in available_zones:
 
-    )
+                available_zones.append(zone)
 
-    assert response.headers["Location"] == "http://localhost/"
+        not_available_zones = []
 
-    client.get(response.headers["Location"])
+        for zone in [service.availability_zone for service in disabled_services
 
+                     if not service['availability_zone'] in available_zones]:
 
+            if not zone in not_available_zones:
 
-    response = client.get(
+                not_available_zones.append(zone)
 
-        "/admin", headers={"referer": "/admin"}, follow_redirects=True
+        result = []
 
-    )
+        for zone in available_zones:
 
-    assert response.data.count(get_message("UNAUTHORIZED")) == 1
+            result.append({'zoneName': zone,
 
+                           'zoneState': "available"})
 
+        for zone in not_available_zones:
 
-    # When referrer is from another path and unauthorized,
+            result.append({'zoneName': zone,
 
-    # we expect a temp redirect (302) to the referer
+                           'zoneState': "not available"})
 
-    response = client.get("/admin?w=s", headers={"referer": "/profile"})
+        return {'availabilityZoneInfo': result}
 
-    assert response.status_code == 302
 
-    assert response.headers["Location"] == "http://localhost/profile"
 
+    def _describe_availability_zones_verbose(self, context, **kwargs):
 
+        rv = {'availabilityZoneInfo': [{'zoneName': 'nova',
 
+                                        'zoneState': 'available'}]}
 
 
-@pytest.mark.settings(unauthorized_view="/unauthz")
 
-def test_roles_accepted(clients):
+        services = db.service_get_all(context, False)
 
-    # This specificaly tests that we can pass a URL for unauthorized_view.
+        hosts = []
 
-    for user in ("matt@lp.com", "joe@lp.com"):
+        for host in [service['host'] for service in services]:
 
-        authenticate(clients, user)
+            if not host in hosts:
 
-        response = clients.get("/admin_or_editor")
+                hosts.append(host)
 
-        assert b"Admin or Editor Page" in response.data
+        for host in hosts:
 
-        logout(clients)
+            rv['availabilityZoneInfo'].append({'zoneName': '|- %s' % host,
 
+                                               'zoneState': ''})
 
+            hsvcs = [service for service in services
 
-    authenticate(clients, "jill@lp.com")
+                     if service['host'] == host]
 
-    response = clients.get("/admin_or_editor", follow_redirects=True)
+            for svc in hsvcs:
 
-    assert b"Unauthorized" in response.data
+                alive = utils.service_is_up(svc)
 
+                art = (alive and ":-)") or "XXX"
 
+                active = 'enabled'
 
+                if svc['disabled']:
 
+                    active = 'disabled'
 
-@pytest.mark.settings(unauthorized_view="unauthz")
+                rv['availabilityZoneInfo'].append({
 
-def test_permissions_accepted(clients):
+                        'zoneName': '| |- %s' % svc['binary'],
 
-    for user in ("matt@lp.com", "joe@lp.com"):
+                        'zoneState': '%s %s %s' % (active, art,
 
-        authenticate(clients, user)
+                                                   svc['updated_at'])})
 
-        response = clients.get("/admin_perm")
+        return rv
 
-        assert b"Admin Page with full-write or super" in response.data
 
-        logout(clients)
 
+    def describe_regions(self, context, region_name=None, **kwargs):
 
+        if FLAGS.region_list:
 
-    authenticate(clients, "jill@lp.com")
+            regions = []
 
-    response = clients.get("/admin_perm", follow_redirects=True)
+            for region in FLAGS.region_list:
 
-    assert b"Unauthorized" in response.data
+                name, _sep, host = region.partition('=')
 
+                endpoint = '%s://%s:%s%s' % (FLAGS.ec2_scheme,
 
+                                             host,
 
+                                             FLAGS.ec2_port,
 
+                                             FLAGS.ec2_path)
 
-@pytest.mark.settings(unauthorized_view="unauthz")
+                regions.append({'regionName': name,
 
-def test_permissions_required(clients):
+                                'regionEndpoint': endpoint})
 
-    for user in ["matt@lp.com"]:
+        else:
 
-        authenticate(clients, user)
+            regions = [{'regionName': 'nova',
 
-        response = clients.get("/admin_perm_required")
+                        'regionEndpoint': '%s://%s:%s%s' % (FLAGS.ec2_scheme,
 
-        assert b"Admin Page required" in response.data
+                                                            FLAGS.ec2_host,
 
-        logout(clients)
+                                                            FLAGS.ec2_port,
 
+                                                            FLAGS.ec2_path)}]
 
+        return {'regionInfo': regions}
 
-    authenticate(clients, "joe@lp.com")
 
-    response = clients.get("/admin_perm_required", follow_redirects=True)
 
-    assert b"Unauthorized" in response.data
+    def describe_snapshots(self,
 
+                           context,
 
+                           snapshot_id=None,
 
+                           owner=None,
 
+                           restorable_by=None,
 
-@pytest.mark.settings(unauthorized_view="unauthz")
+                           **kwargs):
 
-def test_unauthenticated_role_required(client, get_message):
+        if snapshot_id:
 
-    response = client.get("/admin", follow_redirects=True)
+            snapshots = []
 
-    assert get_message("UNAUTHORIZED") in response.data
+            for ec2_id in snapshot_id:
 
+                internal_id = ec2utils.ec2_id_to_id(ec2_id)
 
+                snapshot = self.volume_api.get_snapshot(
 
+                    context,
 
+                    snapshot_id=internal_id)
 
-@pytest.mark.settings(unauthorized_view="unauthz")
+                snapshots.append(snapshot)
 
-def test_multiple_role_required(clients):
+        else:
 
-    for user in ("matt@lp.com", "joe@lp.com"):
+            snapshots = self.volume_api.get_all_snapshots(context)
 
-        authenticate(clients, user)
+        snapshots = [self._format_snapshot(context, s) for s in snapshots]
 
-        response = clients.get("/admin_and_editor", follow_redirects=True)
+        return {'snapshotSet': snapshots}
 
-        assert b"Unauthorized" in response.data
 
-        clients.get("/logout")
 
+    def _format_snapshot(self, context, snapshot):
 
+        s = {}
 
-    authenticate(clients, "dave@lp.com")
+        s['snapshotId'] = ec2utils.id_to_ec2_snap_id(snapshot['id'])
 
-    response = clients.get("/admin_and_editor", follow_redirects=True)
+        s['volumeId'] = ec2utils.id_to_ec2_vol_id(snapshot['volume_id'])
 
-    assert b"Admin and Editor Page" in response.data
+        s['status'] = snapshot['status']
 
+        s['startTime'] = snapshot['created_at']
 
+        s['progress'] = snapshot['progress']
 
+        s['ownerId'] = snapshot['project_id']
 
+        s['volumeSize'] = snapshot['volume_size']
 
-def test_ok_json_auth(client):
+        s['description'] = snapshot['display_description']
 
-    response = json_authenticate(client)
+        return s
 
-    assert response.json["meta"]["code"] == 200
 
-    assert "authentication_token" in response.json["response"]["user"]
 
+    def create_snapshot(self, context, volume_id, **kwargs):
 
+        validate_ec2_id(volume_id)
 
+        LOG.audit(_("Create snapshot of volume %s"), volume_id,
 
+                  context=context)
 
-def test_invalid_json_auth(client):
+        volume_id = ec2utils.ec2_id_to_id(volume_id)
 
-    response = json_authenticate(client, password="junk")
+        volume = self.volume_api.get(context, volume_id)
 
-    assert b'"code": 400' in response.data
+        snapshot = self.volume_api.create_snapshot(
 
+                context,
 
+                volume,
 
+                None,
 
+                kwargs.get('description'))
 
-def test_token_auth_via_querystring_valid_token(client):
+        return self._format_snapshot(context, snapshot)
 
-    response = json_authenticate(client)
 
-    token = response.json["response"]["user"]["authentication_token"]
 
-    response = client.get("/token?auth_token=" + token)
+    def delete_snapshot(self, context, snapshot_id, **kwargs):
 
-    assert b"Token Authentication" in response.data
+        snapshot_id = ec2utils.ec2_id_to_id(snapshot_id)
 
+        snapshot = self.volume_api.get_snapshot(context, snapshot_id)
 
+        self.volume_api.delete_snapshot(context, snapshot)
 
+        return True
 
 
-def test_token_auth_via_header_valid_token(client):
 
-    response = json_authenticate(client)
+    def describe_key_pairs(self, context, key_name=None, **kwargs):
 
-    token = response.json["response"]["user"]["authentication_token"]
+        key_pairs = db.key_pair_get_all_by_user(context, context.user_id)
 
-    headers = {"Authentication-Token": token}
+        if not key_name is None:
 
-    response = client.get("/token", headers=headers)
+            key_pairs = [x for x in key_pairs if x['name'] in key_name]
 
-    assert b"Token Authentication" in response.data
 
 
+        result = []
 
+        for key_pair in key_pairs:
 
+            # filter out the vpn keys
 
-def test_token_auth_via_querystring_invalid_token(client):
+            suffix = FLAGS.vpn_key_suffix
 
-    response = client.get("/token?auth_token=X", headers={"Accept": "application/json"})
+            if context.is_admin or not key_pair['name'].endswith(suffix):
 
-    assert response.status_code == 401
+                result.append({
 
+                    'keyName': key_pair['name'],
 
+                    'keyFingerprint': key_pair['fingerprint'],
 
+                })
 
 
-def test_token_auth_via_header_invalid_token(client):
 
-    response = client.get(
+        return {'keySet': result}
 
-        "/token", headers={"Authentication-Token": "X", "Accept": "application/json"}
 
-    )
 
-    assert response.status_code == 401
+    def create_key_pair(self, context, key_name, **kwargs):
 
+        if not re.match('^[a-zA-Z0-9_\- ]+$', str(key_name)):
 
+            err = _("Value (%s) for KeyName is invalid."
 
+                    " Content limited to Alphanumeric character, "
 
+                    "spaces, dashes, and underscore.") % key_name
 
-def test_http_auth(client):
+            raise exception.EC2APIError(err)
 
-    # browsers expect 401 response with WWW-Authenticate header - which will prompt
 
-    # them to pop up a login form.
 
-    response = client.get("/http", headers={})
+        if len(str(key_name)) > 255:
 
-    assert response.status_code == 401
+            err = _("Value (%s) for Keyname is invalid."
 
-    assert b"You are not authenticated" in response.data
+                    " Length exceeds maximum of 255.") % key_name
 
-    assert "WWW-Authenticate" in response.headers
+            raise exception.EC2APIError(err)
 
-    assert 'Basic realm="Login Required"' == response.headers["WWW-Authenticate"]
 
 
+        LOG.audit(_("Create key pair %s"), key_name, context=context)
 
-    # Now provide correct credentials
+        data = _gen_key(context, context.user_id, key_name)
 
-    response = client.get(
+        return {'keyName': key_name,
 
-        "/http",
+                'keyFingerprint': data['fingerprint'],
 
-        headers={
+                'keyMaterial': data['private_key']}
 
-            "Authorization": "Basic %s"
+        # TODO(vish): when context is no longer an object, pass it here
 
-            % base64.b64encode(b"joe@lp.com:password").decode("utf-8")
 
-        },
 
-    )
+    def import_key_pair(self, context, key_name, public_key_material,
 
-    assert b"HTTP Authentication" in response.data
+                        **kwargs):
 
+        LOG.audit(_("Import key %s"), key_name, context=context)
 
+        try:
 
+            db.key_pair_get(context, context.user_id, key_name)
 
+            raise exception.KeyPairExists(key_name=key_name)
 
-@pytest.mark.settings(USER_IDENTITY_ATTRIBUTES=("email", "username"))
+        except exception.NotFound:
 
-def test_http_auth_username(client):
+            pass
 
-    response = client.get(
+        public_key = base64.b64decode(public_key_material)
 
-        "/http",
+        fingerprint = crypto.generate_fingerprint(public_key)
 
-        headers={
+        key = {}
 
-            "Authorization": "Basic %s"
+        key['user_id'] = context.user_id
 
-            % base64.b64encode(b"jill:password").decode("utf-8")
+        key['name'] = key_name
 
-        },
+        key['public_key'] = public_key
 
-    )
+        key['fingerprint'] = fingerprint
 
-    assert b"HTTP Authentication" in response.data
+        db.key_pair_create(context, key)
 
+        return {'keyName': key_name,
 
+                'keyFingerprint': fingerprint}
 
 
 
-def test_http_auth_no_authorization(client):
+    def delete_key_pair(self, context, key_name, **kwargs):
 
-    response = client.get(
+        LOG.audit(_("Delete key pair %s"), key_name, context=context)
 
-        "/http_admin_required",
+        try:
 
-        headers={
+            db.key_pair_destroy(context, context.user_id, key_name)
 
-            "Authorization": "Basic %s"
+        except exception.NotFound:
 
-            % base64.b64encode(b"joe@lp.com:password").decode("utf-8")
+            # aws returns true even if the key doesn't exist
 
-        },
+            pass
 
-    )
+        return True
 
-    assert response.status_code == 403
 
 
+    def describe_security_groups(self, context, group_name=None, group_id=None,
 
+                                 **kwargs):
 
+        self.compute_api.ensure_default_security_group(context)
 
-def test_http_auth_no_authorization_json(client, get_message):
+        if group_name or group_id:
 
-    response = client.get(
+            groups = []
 
-        "/http_admin_required",
+            if group_name:
 
-        headers={
+                for name in group_name:
 
-            "accept": "application/json",
+                    group = db.security_group_get_by_name(context,
 
-            "Authorization": "Basic %s"
+                                                          context.project_id,
 
-            % base64.b64encode(b"joe@lp.com:password").decode("utf-8"),
+                                                          name)
 
-        },
+                    groups.append(group)
 
-    )
+            if group_id:
 
-    assert response.status_code == 403
+                for gid in group_id:
 
-    assert response.headers["Content-Type"] == "application/json"
+                    group = db.security_group_get(context, gid)
 
+                    groups.append(group)
 
+        elif context.is_admin:
 
+            groups = db.security_group_get_all(context)
 
+        else:
 
-@pytest.mark.settings(backwards_compat_unauthn=True)
+            groups = db.security_group_get_by_project(context,
 
-def test_http_auth_no_authentication(client, get_message):
+                                                      context.project_id)
 
-    response = client.get("/http", headers={})
+        groups = [self._format_security_group(context, g) for g in groups]
 
-    assert response.status_code == 401
 
-    assert b"<h1>Unauthorized</h1>" in response.data
 
-    assert "WWW-Authenticate" in response.headers
+        return {'securityGroupInfo':
 
-    assert 'Basic realm="Login Required"' == response.headers["WWW-Authenticate"]
+                list(sorted(groups,
 
+                            key=lambda k: (k['ownerId'], k['groupName'])))}
 
 
 
+    def _format_security_group(self, context, group):
 
-@pytest.mark.settings(backwards_compat_unauthn=False)
+        g = {}
 
-def test_http_auth_no_authentication_json(client, get_message):
+        g['groupDescription'] = group.description
 
-    response = client.get("/http", headers={"accept": "application/json"})
+        g['groupName'] = group.name
 
-    assert response.status_code == 401
+        g['ownerId'] = group.project_id
 
-    assert response.json["response"]["error"].encode("utf-8") == get_message(
+        g['ipPermissions'] = []
 
-        "UNAUTHENTICATED"
+        for rule in group.rules:
 
-    )
+            r = {}
 
-    assert response.headers["Content-Type"] == "application/json"
+            r['groups'] = []
 
-    assert "WWW-Authenticate" not in response.headers
+            r['ipRanges'] = []
 
+            if rule.group_id:
 
+                source_group = db.security_group_get(context, rule.group_id)
 
+                r['groups'] += [{'groupName': source_group.name,
 
+                                 'userId': source_group.project_id}]
 
-@pytest.mark.settings(backwards_compat_unauthn=True)
+                if rule.protocol:
 
-def test_invalid_http_auth_invalid_username(client):
+                    r['ipProtocol'] = rule.protocol
 
-    response = client.get(
+                    r['fromPort'] = rule.from_port
 
-        "/http",
+                    r['toPort'] = rule.to_port
 
-        headers={
+                    g['ipPermissions'] += [dict(r)]
 
-            "Authorization": "Basic %s"
+                else:
 
-            % base64.b64encode(b"bogus:bogus").decode("utf-8")
+                    for protocol, min_port, max_port in (('icmp', -1, -1),
 
-        },
+                                                         ('tcp', 1, 65535),
 
-    )
+                                                         ('udp', 1, 65535)):
 
-    assert b"<h1>Unauthorized</h1>" in response.data
+                        r['ipProtocol'] = protocol
 
-    assert "WWW-Authenticate" in response.headers
+                        r['fromPort'] = min_port
 
-    assert 'Basic realm="Login Required"' == response.headers["WWW-Authenticate"]
+                        r['toPort'] = max_port
 
+                        g['ipPermissions'] += [dict(r)]
 
+            else:
 
+                r['ipProtocol'] = rule.protocol
 
+                r['fromPort'] = rule.from_port
 
-@pytest.mark.settings(backwards_compat_unauthn=False)
+                r['toPort'] = rule.to_port
 
-def test_invalid_http_auth_invalid_username_json(client, get_message):
+                r['ipRanges'] += [{'cidrIp': rule.cidr}]
 
-    # While Basic auth is allowed with JSON - we never expect a WWW-Authenticate
+                g['ipPermissions'] += [r]
 
-    # header - since that is captured by most browsers and they pop up a
+        return g
 
-    # login form.
 
-    response = client.get(
 
-        "/http",
+    def _rule_args_to_dict(self, context, kwargs):
 
-        headers={
+        rules = []
 
-            "accept": "application/json",
+        if not 'groups' in kwargs and not 'ip_ranges' in kwargs:
 
-            "Authorization": "Basic %s"
+            rule = self._rule_dict_last_step(context, **kwargs)
 
-            % base64.b64encode(b"bogus:bogus").decode("utf-8"),
+            if rule:
 
-        },
+                rules.append(rule)
 
-    )
+            return rules
 
-    assert response.status_code == 401
+        if 'ip_ranges' in kwargs:
 
-    assert response.json["response"]["error"].encode("utf-8") == get_message(
+            rules = self._cidr_args_split(kwargs)
 
-        "UNAUTHENTICATED"
+        else:
 
-    )
+            rules = [kwargs]
 
-    assert response.headers["Content-Type"] == "application/json"
+        finalset = []
 
-    assert "WWW-Authenticate" not in response.headers
+        for rule in rules:
 
+            if 'groups' in rule:
 
+                groups_values = self._groups_args_split(rule)
 
+                for groups_value in groups_values:
 
+                    final = self._rule_dict_last_step(context, **groups_value)
 
-@pytest.mark.settings(backwards_compat_unauthn=True)
+                    finalset.append(final)
 
-def test_invalid_http_auth_bad_password(client):
+            else:
 
-    response = client.get(
+                final = self._rule_dict_last_step(context, **rule)
 
-        "/http",
+                finalset.append(final)
 
-        headers={
+        return finalset
 
-            "Authorization": "Basic %s"
 
-            % base64.b64encode(b"joe@lp.com:bogus").decode("utf-8")
 
-        },
+    def _cidr_args_split(self, kwargs):
 
-    )
+        cidr_args_split = []
 
-    assert b"<h1>Unauthorized</h1>" in response.data
+        cidrs = kwargs['ip_ranges']
 
-    assert "WWW-Authenticate" in response.headers
+        for key, cidr in cidrs.iteritems():
 
-    assert 'Basic realm="Login Required"' == response.headers["WWW-Authenticate"]
+            mykwargs = kwargs.copy()
 
+            del mykwargs['ip_ranges']
 
+            mykwargs['cidr_ip'] = cidr['cidr_ip']
 
+            cidr_args_split.append(mykwargs)
 
+        return cidr_args_split
 
-@pytest.mark.settings(backwards_compat_unauthn=True)
 
-def test_custom_http_auth_realm(client):
 
-    response = client.get(
+    def _groups_args_split(self, kwargs):
 
-        "/http_custom_realm",
+        groups_args_split = []
 
-        headers={
+        groups = kwargs['groups']
 
-            "Authorization": "Basic %s"
+        for key, group in groups.iteritems():
 
-            % base64.b64encode(b"joe@lp.com:bogus").decode("utf-8")
+            mykwargs = kwargs.copy()
 
-        },
+            del mykwargs['groups']
 
-    )
+            if 'group_name' in group:
 
-    assert b"<h1>Unauthorized</h1>" in response.data
+                mykwargs['source_security_group_name'] = group['group_name']
 
-    assert "WWW-Authenticate" in response.headers
+            if 'user_id' in group:
 
-    assert 'Basic realm="My Realm"' == response.headers["WWW-Authenticate"]
+                mykwargs['source_security_group_owner_id'] = group['user_id']
 
+            if 'group_id' in group:
 
+                mykwargs['source_security_group_id'] = group['group_id']
 
+            groups_args_split.append(mykwargs)
 
+        return groups_args_split
 
-def test_multi_auth_basic(client):
 
-    response = client.get(
 
-        "/multi_auth",
+    def _rule_dict_last_step(self, context, to_port=None, from_port=None,
 
-        headers={
+                                  ip_protocol=None, cidr_ip=None, user_id=None,
 
-            "Authorization": "Basic %s"
+                                  source_security_group_name=None,
 
-            % base64.b64encode(b"joe@lp.com:password").decode("utf-8")
+                                  source_security_group_owner_id=None):
 
-        },
 
-    )
 
-    assert b"Basic" in response.data
+        values = {}
 
 
 
-    response = client.get("/multi_auth")
+        if source_security_group_name:
 
-    # Default unauthn with basic is to return 401 with WWW-Authenticate Header
+            source_project_id = self._get_source_project_id(context,
 
-    # so that browser pops up a username/password dialog
+                source_security_group_owner_id)
 
-    assert response.status_code == 401
 
-    assert "WWW-Authenticate" in response.headers
 
+            source_security_group = db.security_group_get_by_name(
 
+                    context.elevated(),
 
+                    source_project_id,
 
+                    source_security_group_name)
 
-@pytest.mark.settings(backwards_compat_unauthn=True)
+            notfound = exception.SecurityGroupNotFound
 
-def test_multi_auth_basic_invalid(client):
+            if not source_security_group:
 
-    response = client.get(
+                raise notfound(security_group_id=source_security_group_name)
 
-        "/multi_auth",
+            values['group_id'] = source_security_group['id']
 
-        headers={
+        elif cidr_ip:
 
-            "Authorization": "Basic %s"
+            # If this fails, it throws an exception. This is what we want.
 
-            % base64.b64encode(b"bogus:bogus").decode("utf-8")
+            cidr_ip = urllib.unquote(cidr_ip).decode()
 
-        },
 
-    )
 
-    assert b"<h1>Unauthorized</h1>" in response.data
+            if not utils.is_valid_cidr(cidr_ip):
 
-    assert "WWW-Authenticate" in response.headers
+                # Raise exception for non-valid address
 
-    assert 'Basic realm="Login Required"' == response.headers["WWW-Authenticate"]
+                raise exception.EC2APIError(_("Invalid CIDR"))
 
 
 
-    response = client.get("/multi_auth")
+            values['cidr'] = cidr_ip
 
-    assert response.status_code == 401
+        else:
 
+            values['cidr'] = '0.0.0.0/0'
 
 
 
+        if source_security_group_name:
 
-def test_multi_auth_token(client):
+            # Open everything if an explicit port range or type/code are not
 
-    response = json_authenticate(client)
+            # specified, but only if a source group was specified.
 
-    token = response.json["response"]["user"]["authentication_token"]
+            ip_proto_upper = ip_protocol.upper() if ip_protocol else ''
 
-    response = client.get("/multi_auth?auth_token=" + token)
+            if (ip_proto_upper == 'ICMP' and
 
-    assert b"Token" in response.data
+                from_port is None and to_port is None):
 
+                from_port = -1
 
+                to_port = -1
 
+            elif (ip_proto_upper in ['TCP', 'UDP'] and from_port is None
 
+                  and to_port is None):
 
-def test_multi_auth_session(client):
+                from_port = 1
 
-    authenticate(client)
+                to_port = 65535
 
-    response = client.get("/multi_auth")
 
-    assert b"Session" in response.data
 
+        if ip_protocol and from_port is not None and to_port is not None:
 
 
 
+            ip_protocol = str(ip_protocol)
 
-def test_authenticated_loop(client):
+            try:
 
-    # If user is already authenticated say via session, and then hits an endpoint
+                # Verify integer conversions
 
-    # protected with @auth_token_required() - then they will be redirected to the login
+                from_port = int(from_port)
 
-    # page which will simply note the current user is already logged in and redirect
+                to_port = int(to_port)
 
-    # to POST_LOGIN_VIEW. Between 3.3.0 and 3.4.4 - this redirect would honor the 'next'
+            except ValueError:
 
-    # parameter - thus redirecting back to the endpoint that caused the redirect in the
+                if ip_protocol.upper() == 'ICMP':
 
-    # first place - thus an infinite loop.
+                    raise exception.InvalidInput(reason="Type and"
 
-    authenticate(client)
+                         " Code must be integers for ICMP protocol type")
 
+                else:
 
+                    raise exception.InvalidInput(reason="To and From ports "
 
-    response = client.get("/token", follow_redirects=True)
+                          "must be integers")
 
-    assert response.status_code == 200
 
-    assert b"Home Page" in response.data
 
+            if ip_protocol.upper() not in ['TCP', 'UDP', 'ICMP']:
 
+                raise exception.InvalidIpProtocol(protocol=ip_protocol)
 
 
 
-def test_user_deleted_during_session_reverts_to_anonymous_user(app, client):
+            # Verify that from_port must always be less than
 
-    authenticate(client)
+            # or equal to to_port
 
+            if (ip_protocol.upper() in ['TCP', 'UDP'] and
 
+                (from_port > to_port)):
 
-    with app.test_request_context("/"):
+                raise exception.InvalidPortRange(from_port=from_port,
 
-        user = app.security.datastore.find_user(email="matt@lp.com")
+                      to_port=to_port, msg="Former value cannot"
 
-        app.security.datastore.delete_user(user)
+                                            " be greater than the later")
 
-        app.security.datastore.commit()
 
 
+            # Verify valid TCP, UDP port ranges
 
-    response = client.get("/")
+            if (ip_protocol.upper() in ['TCP', 'UDP'] and
 
-    assert b"Hello matt@lp.com" not in response.data
+                (from_port < 1 or to_port > 65535)):
 
+                raise exception.InvalidPortRange(from_port=from_port,
 
+                      to_port=to_port, msg="Valid TCP ports should"
 
+                                           " be between 1-65535")
 
 
-def test_remember_token(client):
 
-    response = authenticate(client, follow_redirects=False)
+            # Verify ICMP type and code
 
-    client.cookie_jar.clear_session_cookies()
+            if (ip_protocol.upper() == "ICMP" and
 
-    response = client.get("/profile")
+                (from_port < -1 or from_port > 255 or
 
-    assert b"profile" in response.data
+                to_port < -1 or to_port > 255)):
 
+                raise exception.InvalidPortRange(from_port=from_port,
 
+                      to_port=to_port, msg="For ICMP, the"
 
+                                           " type:code must be valid")
 
 
-def test_request_loader_does_not_fail_with_invalid_token(client):
 
-    c = Cookie(
+            values['protocol'] = ip_protocol
 
-        version=0,
+            values['from_port'] = from_port
 
-        name="remember_token",
+            values['to_port'] = to_port
 
-        value="None",
+        else:
 
-        port=None,
+            # If cidr based filtering, protocol and ports are mandatory
 
-        port_specified=False,
+            if 'cidr' in values:
 
-        domain="www.example.com",
+                return None
 
-        domain_specified=False,
 
-        domain_initial_dot=False,
 
-        path="/",
+        return values
 
-        path_specified=True,
 
-        secure=False,
 
-        expires=None,
+    def _security_group_rule_exists(self, security_group, values):
 
-        discard=True,
+        """Indicates whether the specified rule values are already
 
-        comment=None,
+           defined in the given security group.
 
-        comment_url=None,
+        """
 
-        rest={"HttpOnly": None},
+        for rule in security_group.rules:
 
-        rfc2109=False,
+            is_duplicate = True
 
-    )
+            keys = ('group_id', 'cidr', 'from_port', 'to_port', 'protocol')
 
+            for key in keys:
 
+                if rule.get(key) != values.get(key):
 
-    client.cookie_jar.set_cookie(c)
+                    is_duplicate = False
 
-    response = client.get("/")
+                    break
 
-    assert b"BadSignature" not in response.data
+            if is_duplicate:
 
+                return rule['id']
 
+        return False
 
 
 
-def test_sending_auth_token_with_json(client):
+    def revoke_security_group_ingress(self, context, group_name=None,
 
-    response = json_authenticate(client)
+                                      group_id=None, **kwargs):
 
-    token = response.json["response"]["user"]["authentication_token"]
+        if not group_name and not group_id:
 
-    data = '{"auth_token": "%s"}' % token
+            err = _("Not enough parameters, need group_name or group_id")
 
-    response = client.post(
+            raise exception.EC2APIError(err)
 
-        "/token", data=data, headers={"Content-Type": "application/json"}
+        self.compute_api.ensure_default_security_group(context)
 
-    )
+        notfound = exception.SecurityGroupNotFound
 
-    assert b"Token Authentication" in response.data
+        if group_name:
 
+            security_group = db.security_group_get_by_name(context,
 
+                                                           context.project_id,
 
+                                                           group_name)
 
+            if not security_group:
 
-def test_json_not_dict(client):
+                raise notfound(security_group_id=group_name)
 
-    response = client.post(
+        if group_id:
 
-        "/json",
+            security_group = db.security_group_get(context, group_id)
 
-        data=json.dumps(["thing1", "thing2"]),
+            if not security_group:
 
-        headers={"Content-Type": "application/json"},
+                raise notfound(security_group_id=group_id)
 
-    )
 
-    assert response.status_code == 200
 
+        msg = _("Revoke security group ingress %s")
 
+        LOG.audit(msg, security_group['name'], context=context)
 
+        prevalues = []
 
+        try:
 
-def test_login_info(client):
+            prevalues = kwargs['ip_permissions']
 
-    # Make sure we can get user info when logged in already.
+        except KeyError:
 
+            prevalues.append(kwargs)
 
+        rule_id = None
 
-    json_authenticate(client)
+        rule_ids = []
 
-    response = client.get("/login", headers={"Content-Type": "application/json"})
+        for values in prevalues:
 
-    assert response.status_code == 200
+            rulesvalues = self._rule_args_to_dict(context, values)
 
-    assert response.json["response"]["user"]["id"] == "1"
+            if not rulesvalues:
 
-    assert "last_update" in response.json["response"]["user"]
+                err = _("%s Not enough parameters to build a valid rule")
 
+                raise exception.EC2APIError(err % rulesvalues)
 
 
-    response = client.get("/login", headers={"Accept": "application/json"})
 
-    assert response.status_code == 200
+            for values_for_rule in rulesvalues:
 
-    assert response.json["response"]["user"]["id"] == "1"
+                values_for_rule['parent_group_id'] = security_group.id
 
-    assert "last_update" in response.json["response"]["user"]
+                rule_id = self._security_group_rule_exists(security_group,
 
+                                                           values_for_rule)
 
+                if rule_id:
 
+                    db.security_group_rule_destroy(context, rule_id)
 
+                    rule_ids.append(rule_id)
 
-@pytest.mark.registerable()
+        if rule_id:
 
-@pytest.mark.settings(post_login_view="/anon_required")
+            # NOTE(vish): we removed a rule, so refresh
 
-def test_anon_required(client, get_message):
+            self.compute_api.trigger_security_group_rules_refresh(
 
-    """ If logged in, should get 'anonymous_user_required' redirect """
+                    context,
 
-    response = authenticate(client, follow_redirects=False)
+                    security_group_id=security_group['id'])
 
-    response = client.get("/register")
+            self.sgh.trigger_security_group_rule_destroy_refresh(
 
-    assert "location" in response.headers
+                    context, rule_ids)
 
-    assert "/anon_required" in response.location
+            return True
 
+        raise exception.EC2APIError(_("No rule for the specified parameters."))
 
 
 
+    # TODO(soren): This has only been tested with Boto as the client.
 
-@pytest.mark.registerable()
+    #              Unfortunately, it seems Boto is using an old API
 
-@pytest.mark.settings(post_login_view="/anon_required")
+    #              for these operations, so support for newer API versions
 
-def test_anon_required_json(client, get_message):
+    #              is sketchy.
 
-    """ If logged in, should get 'anonymous_user_required' response """
+    def authorize_security_group_ingress(self, context, group_name=None,
 
-    authenticate(client, follow_redirects=False)
+                                         group_id=None, **kwargs):
 
-    response = client.get("/register", headers={"Accept": "application/json"})
+        if not group_name and not group_id:
 
-    assert response.status_code == 400
+            err = _("Not enough parameters, need group_name or group_id")
 
-    assert response.json["response"]["error"].encode("utf-8") == get_message(
+            raise exception.EC2APIError(err)
 
-        "ANONYMOUS_USER_REQUIRED"
+        self.compute_api.ensure_default_security_group(context)
 
-    )
+        notfound = exception.SecurityGroupNotFound
 
+        if group_name:
 
+            security_group = db.security_group_get_by_name(context,
 
+                                                           context.project_id,
 
+                                                           group_name)
 
-@pytest.mark.settings(security_hashing_schemes=["sha256_crypt"])
+            if not security_group:
 
-@pytest.mark.skip
+                raise notfound(security_group_id=group_name)
 
-def test_auth_token_speed(app, client_nc):
+        if group_id:
 
-    # To run with old algorithm you have to comment out fs_uniquifier check in UserMixin
+            security_group = db.security_group_get(context, group_id)
 
-    import timeit
+            if not security_group:
 
+                raise notfound(security_group_id=group_id)
 
 
-    response = json_authenticate(client_nc)
 
-    token = response.json["response"]["user"]["authentication_token"]
+        msg = _("Authorize security group ingress %s")
 
+        LOG.audit(msg, security_group['name'], context=context)
 
+        prevalues = []
 
-    def time_get():
+        try:
 
-        rp = client_nc.get(
+            prevalues = kwargs['ip_permissions']
 
-            "/login",
+        except KeyError:
 
-            data={},
+            prevalues.append(kwargs)
 
-            headers={"Content-Type": "application/json", "Authentication-Token": token},
+        postvalues = []
 
-        )
+        for values in prevalues:
 
-        assert rp.status_code == 200
+            rulesvalues = self._rule_args_to_dict(context, values)
 
+            if not rulesvalues:
 
+                err = _("%s Not enough parameters to build a valid rule")
 
-    t = timeit.timeit(time_get, number=50)
+                raise exception.EC2APIError(err % rulesvalues)
 
-    print("Time for 50 iterations: ", t)
+            for values_for_rule in rulesvalues:
 
+                values_for_rule['parent_group_id'] = security_group.id
 
+                if self._security_group_rule_exists(security_group,
 
+                                                    values_for_rule):
 
+                    err = _('%s - This rule already exists in group')
 
-def test_change_uniquifier(app, client_nc):
+                    raise exception.EC2APIError(err % values_for_rule)
 
-    # make sure that existing token no longer works once we change the uniquifier
+                postvalues.append(values_for_rule)
 
 
 
-    response = json_authenticate(client_nc)
+        rule_ids = []
 
-    token = response.json["response"]["user"]["authentication_token"]
+        for values_for_rule in postvalues:
 
-    verify_token(client_nc, token)
+            security_group_rule = db.security_group_rule_create(
 
+                    context,
 
+                    values_for_rule)
 
-    # now change uniquifier
+            rule_ids.append(security_group_rule['id'])
 
-    with app.test_request_context("/"):
 
-        user = app.security.datastore.find_user(email="matt@lp.com")
 
-        app.security.datastore.reset_user_access(user)
+        if postvalues:
 
-        app.security.datastore.commit()
+            self.compute_api.trigger_security_group_rules_refresh(
 
+                    context,
 
+                    security_group_id=security_group['id'])
 
-    verify_token(client_nc, token, status=401)
+            self.sgh.trigger_security_group_rule_create_refresh(
 
+                    context, rule_ids)
 
+            return True
 
-    # get new token and verify it works
 
-    response = json_authenticate(client_nc)
 
-    token = response.json["response"]["user"]["authentication_token"]
+        raise exception.EC2APIError(_("No rule for the specified parameters."))
 
-    verify_token(client_nc, token)
 
 
+    def _get_source_project_id(self, context, source_security_group_owner_id):
 
+        if source_security_group_owner_id:
 
+        # Parse user:project for source group.
 
-def test_token_query(in_app_context):
+            source_parts = source_security_group_owner_id.split(':')
 
-    # Verify that when authenticating with auth token (and not session)
 
-    # that there is just one DB query to get user.
 
-    app = in_app_context
+            # If no project name specified, assume it's same as user name.
 
-    populate_data(app)
+            # Since we're looking up by project name, the user name is not
 
-    client_nc = app.test_client(use_cookies=False)
+            # used here.  It's only read for EC2 API compatibility.
 
+            if len(source_parts) == 2:
 
+                source_project_id = source_parts[1]
 
-    response = json_authenticate(client_nc)
+            else:
 
-    token = response.json["response"]["user"]["authentication_token"]
+                source_project_id = source_parts[0]
 
-    current_nqueries = get_num_queries(app.security.datastore)
+        else:
 
+            source_project_id = context.project_id
 
 
-    response = client_nc.get(
 
-        "/token",
+        return source_project_id
 
-        headers={"Content-Type": "application/json", "Authentication-Token": token},
 
-    )
 
-    assert response.status_code == 200
+    def create_security_group(self, context, group_name, group_description):
 
-    end_nqueries = get_num_queries(app.security.datastore)
+        if not re.match('^[a-zA-Z0-9_\- ]+$', str(group_name)):
 
-    assert current_nqueries is None or end_nqueries == (current_nqueries + 1)
+            # Some validation to ensure that values match API spec.
 
+            # - Alphanumeric characters, spaces, dashes, and underscores.
 
+            # TODO(Daviey): LP: #813685 extend beyond group_name checking, and
 
+            #  probably create a param validator that can be used elsewhere.
 
+            err = _("Value (%s) for parameter GroupName is invalid."
 
-def test_session_query(in_app_context):
+                    " Content limited to Alphanumeric characters, "
 
-    # Verify that when authenticating with auth token (but also sending session)
+                    "spaces, dashes, and underscores.") % group_name
 
-    # that there are 2 DB queries to get user.
+            # err not that of master ec2 implementation, as they fail to raise.
 
-    # This is since the session will load one - but auth_token_required needs to
+            raise exception.InvalidParameterValue(err=err)
 
-    # verify that the TOKEN is valid (and it is possible that the user_id in the
 
-    # session is different that the one in the token (huh?)
 
-    app = in_app_context
+        if len(str(group_name)) > 255:
 
-    populate_data(app)
+            err = _("Value (%s) for parameter GroupName is invalid."
 
-    client = app.test_client()
+                    " Length exceeds maximum of 255.") % group_name
 
+            raise exception.InvalidParameterValue(err=err)
 
 
-    response = json_authenticate(client)
 
-    token = response.json["response"]["user"]["authentication_token"]
+        LOG.audit(_("Create Security Group %s"), group_name, context=context)
 
-    current_nqueries = get_num_queries(app.security.datastore)
+        self.compute_api.ensure_default_security_group(context)
 
+        if db.security_group_exists(context, context.project_id, group_name):
 
+            msg = _('group %s already exists')
 
-    response = client.get(
+            raise exception.EC2APIError(msg % group_name)
 
-        "/token",
 
-        headers={"Content-Type": "application/json", "Authentication-Token": token},
 
-    )
+        group = {'user_id': context.user_id,
 
-    assert response.status_code == 200
+                 'project_id': context.project_id,
 
-    end_nqueries = get_num_queries(app.security.datastore)
+                 'name': group_name,
 
-    assert current_nqueries is None or end_nqueries == (current_nqueries + 2)
+                 'description': group_description}
+
+        group_ref = db.security_group_create(context, group)
+
+
+
+        self.sgh.trigger_security_group_create_refresh(context, group)
+
+
+
+        return {'securityGroupSet': [self._format_security_group(context,
+
+                                                                 group_ref)]}
+
+
+
+    def delete_security_group(self, context, group_name=None, group_id=None,
+
+                              **kwargs):
+
+        if not group_name and not group_id:
+
+            err = _("Not enough parameters, need group_name or group_id")
+
+            raise exception.EC2APIError(err)
+
+        notfound = exception.SecurityGroupNotFound
+
+        if group_name:
+
+            security_group = db.security_group_get_by_name(context,
+
+                                                           context.project_id,
+
+                                                           group_name)
+
+            if not security_group:
+
+                raise notfound(security_group_id=group_name)
+
+        elif group_id:
+
+            security_group = db.security_group_get(context, group_id)
+
+            if not security_group:
+
+                raise notfound(security_group_id=group_id)
+
+        if db.security_group_in_use(context, security_group.id):
+
+            raise exception.InvalidGroup(reason="In Use")
+
+        LOG.audit(_("Delete security group %s"), group_name, context=context)
+
+        db.security_group_destroy(context, security_group.id)
+
+
+
+        self.sgh.trigger_security_group_destroy_refresh(context,
+
+                                                        security_group.id)
+
+        return True
+
+
+
+    def get_console_output(self, context, instance_id, **kwargs):
+
+        LOG.audit(_("Get console output for instance %s"), instance_id,
+
+                  context=context)
+
+        # instance_id may be passed in as a list of instances
+
+        if isinstance(instance_id, list):
+
+            ec2_id = instance_id[0]
+
+        else:
+
+            ec2_id = instance_id
+
+        validate_ec2_id(ec2_id)
+
+        instance_id = ec2utils.ec2_id_to_id(ec2_id)
+
+        instance = self.compute_api.get(context, instance_id)
+
+        output = self.compute_api.get_console_output(context, instance)
+
+        now = utils.utcnow()
+
+        return {"InstanceId": ec2_id,
+
+                "Timestamp": now,
+
+                "output": base64.b64encode(output)}
+
+
+
+    def describe_volumes(self, context, volume_id=None, **kwargs):
+
+        if volume_id:
+
+            volumes = []
+
+            for ec2_id in volume_id:
+
+                validate_ec2_id(ec2_id)
+
+                internal_id = ec2utils.ec2_id_to_id(ec2_id)
+
+                volume = self.volume_api.get(context, internal_id)
+
+                volumes.append(volume)
+
+        else:
+
+            volumes = self.volume_api.get_all(context)
+
+        volumes = [self._format_volume(context, v) for v in volumes]
+
+        return {'volumeSet': volumes}
+
+
+
+    def _format_volume(self, context, volume):
+
+        instance_ec2_id = None
+
+        instance_data = None
+
+        if volume.get('instance', None):
+
+            instance_id = volume['instance']['id']
+
+            instance_ec2_id = ec2utils.id_to_ec2_id(instance_id)
+
+            instance_data = '%s[%s]' % (instance_ec2_id,
+
+                                        volume['instance']['host'])
+
+        v = {}
+
+        v['volumeId'] = ec2utils.id_to_ec2_vol_id(volume['id'])
+
+        v['status'] = volume['status']
+
+        v['size'] = volume['size']
+
+        v['availabilityZone'] = volume['availability_zone']
+
+        v['createTime'] = volume['created_at']
+
+        if context.is_admin:
+
+            v['status'] = '%s (%s, %s, %s, %s)' % (
+
+                volume['status'],
+
+                volume['project_id'],
+
+                volume['host'],
+
+                instance_data,
+
+                volume['mountpoint'])
+
+        if volume['attach_status'] == 'attached':
+
+            v['attachmentSet'] = [{'attachTime': volume['attach_time'],
+
+                                   'deleteOnTermination': False,
+
+                                   'device': volume['mountpoint'],
+
+                                   'instanceId': instance_ec2_id,
+
+                                   'status': 'attached',
+
+                                   'volumeId': v['volumeId']}]
+
+        else:
+
+            v['attachmentSet'] = [{}]
+
+        if volume.get('snapshot_id') is not None:
+
+            v['snapshotId'] = ec2utils.id_to_ec2_snap_id(volume['snapshot_id'])
+
+        else:
+
+            v['snapshotId'] = None
+
+
+
+        return v
+
+
+
+    def create_volume(self, context, **kwargs):
+
+        size = kwargs.get('size')
+
+        if kwargs.get('snapshot_id') is not None:
+
+            snapshot_id = ec2utils.ec2_id_to_id(kwargs['snapshot_id'])
+
+            snapshot = self.volume_api.get_snapshot(context, snapshot_id)
+
+            LOG.audit(_("Create volume from snapshot %s"), snapshot_id,
+
+                      context=context)
+
+        else:
+
+            snapshot = None
+
+            LOG.audit(_("Create volume of %s GB"), size, context=context)
+
+
+
+        availability_zone = kwargs.get('availability_zone', None)
+
+
+
+        volume = self.volume_api.create(context,
+
+                                        size,
+
+                                        None,
+
+                                        None,
+
+                                        snapshot,
+
+                                        availability_zone=availability_zone)
+
+        # TODO(vish): Instance should be None at db layer instead of
+
+        #             trying to lazy load, but for now we turn it into
+
+        #             a dict to avoid an error.
+
+        return self._format_volume(context, dict(volume))
+
+
+
+    def delete_volume(self, context, volume_id, **kwargs):
+
+        validate_ec2_id(volume_id)
+
+        volume_id = ec2utils.ec2_id_to_id(volume_id)
+
+
+
+        try:
+
+            volume = self.volume_api.get(context, volume_id)
+
+            self.volume_api.delete(context, volume)
+
+        except exception.InvalidVolume:
+
+            raise exception.EC2APIError(_('Delete Failed'))
+
+
+
+        return True
+
+
+
+    def attach_volume(self, context, volume_id, instance_id, device, **kwargs):
+
+        validate_ec2_id(instance_id)
+
+        validate_ec2_id(volume_id)
+
+        volume_id = ec2utils.ec2_id_to_id(volume_id)
+
+        instance_id = ec2utils.ec2_id_to_id(instance_id)
+
+        instance = self.compute_api.get(context, instance_id)
+
+        msg = _("Attach volume %(volume_id)s to instance %(instance_id)s"
+
+                " at %(device)s") % locals()
+
+        LOG.audit(msg, context=context)
+
+
+
+        try:
+
+            self.compute_api.attach_volume(context, instance,
+
+                                           volume_id, device)
+
+        except exception.InvalidVolume:
+
+            raise exception.EC2APIError(_('Attach Failed.'))
+
+
+
+        volume = self.volume_api.get(context, volume_id)
+
+        return {'attachTime': volume['attach_time'],
+
+                'device': volume['mountpoint'],
+
+                'instanceId': ec2utils.id_to_ec2_id(instance_id),
+
+                'requestId': context.request_id,
+
+                'status': volume['attach_status'],
+
+                'volumeId': ec2utils.id_to_ec2_vol_id(volume_id)}
+
+
+
+    def detach_volume(self, context, volume_id, **kwargs):
+
+        validate_ec2_id(volume_id)
+
+        volume_id = ec2utils.ec2_id_to_id(volume_id)
+
+        LOG.audit(_("Detach volume %s"), volume_id, context=context)
+
+        volume = self.volume_api.get(context, volume_id)
+
+
+
+        try:
+
+            instance = self.compute_api.detach_volume(context,
+
+                                                      volume_id=volume_id)
+
+        except exception.InvalidVolume:
+
+            raise exception.EC2APIError(_('Detach Volume Failed.'))
+
+
+
+        return {'attachTime': volume['attach_time'],
+
+                'device': volume['mountpoint'],
+
+                'instanceId': ec2utils.id_to_ec2_id(instance['id']),
+
+                'requestId': context.request_id,
+
+                'status': volume['attach_status'],
+
+                'volumeId': ec2utils.id_to_ec2_vol_id(volume_id)}
+
+
+
+    def _format_kernel_id(self, context, instance_ref, result, key):
+
+        kernel_uuid = instance_ref['kernel_id']
+
+        if kernel_uuid is None or kernel_uuid == '':
+
+            return
+
+        result[key] = ec2utils.glance_id_to_ec2_id(context, kernel_uuid, 'aki')
+
+
+
+    def _format_ramdisk_id(self, context, instance_ref, result, key):
+
+        ramdisk_uuid = instance_ref['ramdisk_id']
+
+        if ramdisk_uuid is None or ramdisk_uuid == '':
+
+            return
+
+        result[key] = ec2utils.glance_id_to_ec2_id(context, ramdisk_uuid,
+
+                                                   'ari')
+
+
+
+    def describe_instance_attribute(self, context, instance_id, attribute,
+
+                                    **kwargs):
+
+        def _unsupported_attribute(instance, result):
+
+            raise exception.EC2APIError(_('attribute not supported: %s') %
+
+                                     attribute)
+
+
+
+        def _format_attr_block_device_mapping(instance, result):
+
+            tmp = {}
+
+            self._format_instance_root_device_name(instance, tmp)
+
+            self._format_instance_bdm(context, instance_id,
+
+                                      tmp['rootDeviceName'], result)
+
+
+
+        def _format_attr_disable_api_termination(instance, result):
+
+            result['disableApiTermination'] = instance['disable_terminate']
+
+
+
+        def _format_attr_group_set(instance, result):
+
+            CloudController._format_group_set(instance, result)
+
+
+
+        def _format_attr_instance_initiated_shutdown_behavior(instance,
+
+                                                               result):
+
+            if instance['shutdown_terminate']:
+
+                result['instanceInitiatedShutdownBehavior'] = 'terminate'
+
+            else:
+
+                result['instanceInitiatedShutdownBehavior'] = 'stop'
+
+
+
+        def _format_attr_instance_type(instance, result):
+
+            self._format_instance_type(instance, result)
+
+
+
+        def _format_attr_kernel(instance, result):
+
+            self._format_kernel_id(context, instance, result, 'kernel')
+
+
+
+        def _format_attr_ramdisk(instance, result):
+
+            self._format_ramdisk_id(context, instance, result, 'ramdisk')
+
+
+
+        def _format_attr_root_device_name(instance, result):
+
+            self._format_instance_root_device_name(instance, result)
+
+
+
+        def _format_attr_source_dest_check(instance, result):
+
+            _unsupported_attribute(instance, result)
+
+
+
+        def _format_attr_user_data(instance, result):
+
+            result['userData'] = base64.b64decode(instance['user_data'])
+
+
+
+        attribute_formatter = {
+
+            'blockDeviceMapping': _format_attr_block_device_mapping,
+
+            'disableApiTermination': _format_attr_disable_api_termination,
+
+            'groupSet': _format_attr_group_set,
+
+            'instanceInitiatedShutdownBehavior':
+
+            _format_attr_instance_initiated_shutdown_behavior,
+
+            'instanceType': _format_attr_instance_type,
+
+            'kernel': _format_attr_kernel,
+
+            'ramdisk': _format_attr_ramdisk,
+
+            'rootDeviceName': _format_attr_root_device_name,
+
+            'sourceDestCheck': _format_attr_source_dest_check,
+
+            'userData': _format_attr_user_data,
+
+            }
+
+
+
+        fn = attribute_formatter.get(attribute)
+
+        if fn is None:
+
+            raise exception.EC2APIError(
+
+                _('attribute not supported: %s') % attribute)
+
+
+
+        ec2_instance_id = instance_id
+
+        validate_ec2_id(instance_id)
+
+        instance_id = ec2utils.ec2_id_to_id(ec2_instance_id)
+
+        instance = self.compute_api.get(context, instance_id)
+
+        result = {'instance_id': ec2_instance_id}
+
+        fn(instance, result)
+
+        return result
+
+
+
+    def describe_instances(self, context, **kwargs):
+
+        # Optional DescribeInstances argument
+
+        instance_id = kwargs.get('instance_id', None)
+
+        return self._format_describe_instances(context,
+
+                instance_id=instance_id)
+
+
+
+    def describe_instances_v6(self, context, **kwargs):
+
+        # Optional DescribeInstancesV6 argument
+
+        instance_id = kwargs.get('instance_id', None)
+
+        return self._format_describe_instances(context,
+
+                instance_id=instance_id, use_v6=True)
+
+
+
+    def _format_describe_instances(self, context, **kwargs):
+
+        return {'reservationSet': self._format_instances(context, **kwargs)}
+
+
+
+    def _format_run_instances(self, context, reservation_id):
+
+        i = self._format_instances(context, reservation_id=reservation_id)
+
+        assert len(i) == 1
+
+        return i[0]
+
+
+
+    def _format_terminate_instances(self, context, instance_id,
+
+                                    previous_states):
+
+        instances_set = []
+
+        for (ec2_id, previous_state) in zip(instance_id, previous_states):
+
+            i = {}
+
+            i['instanceId'] = ec2_id
+
+            i['previousState'] = _state_description(previous_state['vm_state'],
+
+                                        previous_state['shutdown_terminate'])
+
+            try:
+
+                internal_id = ec2utils.ec2_id_to_id(ec2_id)
+
+                instance = self.compute_api.get(context, internal_id)
+
+                i['shutdownState'] = _state_description(instance['vm_state'],
+
+                                            instance['shutdown_terminate'])
+
+            except exception.NotFound:
+
+                i['shutdownState'] = _state_description(vm_states.DELETED,
+
+                                                        True)
+
+            instances_set.append(i)
+
+        return {'instancesSet': instances_set}
+
+
+
+    def _format_instance_bdm(self, context, instance_id, root_device_name,
+
+                             result):
+
+        """Format InstanceBlockDeviceMappingResponseItemType"""
+
+        root_device_type = 'instance-store'
+
+        mapping = []
+
+        for bdm in db.block_device_mapping_get_all_by_instance(context,
+
+                                                               instance_id):
+
+            volume_id = bdm['volume_id']
+
+            if (volume_id is None or bdm['no_device']):
+
+                continue
+
+
+
+            if (bdm['device_name'] == root_device_name and
+
+                (bdm['snapshot_id'] or bdm['volume_id'])):
+
+                assert not bdm['virtual_name']
+
+                root_device_type = 'ebs'
+
+
+
+            vol = self.volume_api.get(context, volume_id)
+
+            LOG.debug(_("vol = %s\n"), vol)
+
+            # TODO(yamahata): volume attach time
+
+            ebs = {'volumeId': volume_id,
+
+                   'deleteOnTermination': bdm['delete_on_termination'],
+
+                   'attachTime': vol['attach_time'] or '-',
+
+                   'status': vol['status'], }
+
+            res = {'deviceName': bdm['device_name'],
+
+                   'ebs': ebs, }
+
+            mapping.append(res)
+
+
+
+        if mapping:
+
+            result['blockDeviceMapping'] = mapping
+
+        result['rootDeviceType'] = root_device_type
+
+
+
+    @staticmethod
+
+    def _format_instance_root_device_name(instance, result):
+
+        result['rootDeviceName'] = (instance.get('root_device_name') or
+
+                                    block_device.DEFAULT_ROOT_DEV_NAME)
+
+
+
+    @staticmethod
+
+    def _format_instance_type(instance, result):
+
+        if instance['instance_type']:
+
+            result['instanceType'] = instance['instance_type'].get('name')
+
+        else:
+
+            result['instanceType'] = None
+
+
+
+    @staticmethod
+
+    def _format_group_set(instance, result):
+
+        security_group_names = []
+
+        if instance.get('security_groups'):
+
+            for security_group in instance['security_groups']:
+
+                security_group_names.append(security_group['name'])
+
+        result['groupSet'] = utils.convert_to_list_dict(
+
+            security_group_names, 'groupId')
+
+
+
+    def _format_instances(self, context, instance_id=None, use_v6=False,
+
+            **search_opts):
+
+        # TODO(termie): this method is poorly named as its name does not imply
+
+        #               that it will be making a variety of database calls
+
+        #               rather than simply formatting a bunch of instances that
+
+        #               were handed to it
+
+        reservations = {}
+
+        # NOTE(vish): instance_id is an optional list of ids to filter by
+
+        if instance_id:
+
+            instances = []
+
+            for ec2_id in instance_id:
+
+                internal_id = ec2utils.ec2_id_to_id(ec2_id)
+
+                try:
+
+                    instance = self.compute_api.get(context, internal_id)
+
+                except exception.NotFound:
+
+                    continue
+
+                instances.append(instance)
+
+        else:
+
+            try:
+
+                # always filter out deleted instances
+
+                search_opts['deleted'] = False
+
+                instances = self.compute_api.get_all(context,
+
+                                                     search_opts=search_opts,
+
+                                                     sort_dir='asc')
+
+            except exception.NotFound:
+
+                instances = []
+
+        for instance in instances:
+
+            if not context.is_admin:
+
+                if instance['image_ref'] == str(FLAGS.vpn_image_id):
+
+                    continue
+
+            i = {}
+
+            instance_id = instance['id']
+
+            ec2_id = ec2utils.id_to_ec2_id(instance_id)
+
+            i['instanceId'] = ec2_id
+
+            image_uuid = instance['image_ref']
+
+            i['imageId'] = ec2utils.glance_id_to_ec2_id(context, image_uuid)
+
+            self._format_kernel_id(context, instance, i, 'kernelId')
+
+            self._format_ramdisk_id(context, instance, i, 'ramdiskId')
+
+            i['instanceState'] = _state_description(
+
+                instance['vm_state'], instance['shutdown_terminate'])
+
+
+
+            fixed_ip = None
+
+            floating_ip = None
+
+            ip_info = ec2utils.get_ip_info_for_instance(context, instance)
+
+            if ip_info['fixed_ips']:
+
+                fixed_ip = ip_info['fixed_ips'][0]
+
+            if ip_info['floating_ips']:
+
+                floating_ip = ip_info['floating_ips'][0]
+
+            if ip_info['fixed_ip6s']:
+
+                i['dnsNameV6'] = ip_info['fixed_ip6s'][0]
+
+            if FLAGS.ec2_private_dns_show_ip:
+
+                i['privateDnsName'] = fixed_ip
+
+            else:
+
+                i['privateDnsName'] = instance['hostname']
+
+            i['privateIpAddress'] = fixed_ip
+
+            i['publicDnsName'] = floating_ip
+
+            i['ipAddress'] = floating_ip or fixed_ip
+
+            i['dnsName'] = i['publicDnsName'] or i['privateDnsName']
+
+            i['keyName'] = instance['key_name']
+
+
+
+            if context.is_admin:
+
+                i['keyName'] = '%s (%s, %s)' % (i['keyName'],
+
+                    instance['project_id'],
+
+                    instance['host'])
+
+            i['productCodesSet'] = utils.convert_to_list_dict([],
+
+                                                              'product_codes')
+
+            self._format_instance_type(instance, i)
+
+            i['launchTime'] = instance['created_at']
+
+            i['amiLaunchIndex'] = instance['launch_index']
+
+            self._format_instance_root_device_name(instance, i)
+
+            self._format_instance_bdm(context, instance_id,
+
+                                      i['rootDeviceName'], i)
+
+            host = instance['host']
+
+            services = db.service_get_all_by_host(context.elevated(), host)
+
+            zone = ec2utils.get_availability_zone_by_host(services, host)
+
+            i['placement'] = {'availabilityZone': zone}
+
+            if instance['reservation_id'] not in reservations:
+
+                r = {}
+
+                r['reservationId'] = instance['reservation_id']
+
+                r['ownerId'] = instance['project_id']
+
+                self._format_group_set(instance, r)
+
+                r['instancesSet'] = []
+
+                reservations[instance['reservation_id']] = r
+
+            reservations[instance['reservation_id']]['instancesSet'].append(i)
+
+
+
+        return list(reservations.values())
+
+
+
+    def describe_addresses(self, context, **kwargs):
+
+        return self.format_addresses(context)
+
+
+
+    def format_addresses(self, context):
+
+        addresses = []
+
+        floaters = self.network_api.get_floating_ips_by_project(context)
+
+        for floating_ip_ref in floaters:
+
+            if floating_ip_ref['project_id'] is None:
+
+                continue
+
+            address = floating_ip_ref['address']
+
+            ec2_id = None
+
+            if floating_ip_ref['fixed_ip_id']:
+
+                fixed_id = floating_ip_ref['fixed_ip_id']
+
+                fixed = self.network_api.get_fixed_ip(context, fixed_id)
+
+                if fixed['instance_id'] is not None:
+
+                    ec2_id = ec2utils.id_to_ec2_id(fixed['instance_id'])
+
+            address_rv = {'public_ip': address,
+
+                          'instance_id': ec2_id}
+
+            if context.is_admin:
+
+                details = "%s (%s)" % (address_rv['instance_id'],
+
+                                       floating_ip_ref['project_id'])
+
+                address_rv['instance_id'] = details
+
+            addresses.append(address_rv)
+
+        return {'addressesSet': addresses}
+
+
+
+    def allocate_address(self, context, **kwargs):
+
+        LOG.audit(_("Allocate address"), context=context)
+
+        try:
+
+            public_ip = self.network_api.allocate_floating_ip(context)
+
+            return {'publicIp': public_ip}
+
+        except rpc_common.RemoteError as ex:
+
+            # NOTE(tr3buchet) - why does this block exist?
+
+            if ex.exc_type == 'NoMoreFloatingIps':
+
+                raise exception.NoMoreFloatingIps()
+
+            else:
+
+                raise
+
+
+
+    def release_address(self, context, public_ip, **kwargs):
+
+        LOG.audit(_("Release address %s"), public_ip, context=context)
+
+        self.network_api.release_floating_ip(context, address=public_ip)
+
+        return {'return': "true"}
+
+
+
+    def associate_address(self, context, instance_id, public_ip, **kwargs):
+
+        LOG.audit(_("Associate address %(public_ip)s to"
+
+                " instance %(instance_id)s") % locals(), context=context)
+
+        instance_id = ec2utils.ec2_id_to_id(instance_id)
+
+        instance = self.compute_api.get(context, instance_id)
+
+        self.compute_api.associate_floating_ip(context,
+
+                                               instance,
+
+                                               address=public_ip)
+
+        return {'return': "true"}
+
+
+
+    def disassociate_address(self, context, public_ip, **kwargs):
+
+        LOG.audit(_("Disassociate address %s"), public_ip, context=context)
+
+        self.network_api.disassociate_floating_ip(context, address=public_ip)
+
+        return {'return': "true"}
+
+
+
+    def run_instances(self, context, **kwargs):
+
+        max_count = int(kwargs.get('max_count', 1))
+
+        if kwargs.get('kernel_id'):
+
+            kernel = self._get_image(context, kwargs['kernel_id'])
+
+            kwargs['kernel_id'] = ec2utils.id_to_glance_id(context,
+
+                                                           kernel['id'])
+
+        if kwargs.get('ramdisk_id'):
+
+            ramdisk = self._get_image(context, kwargs['ramdisk_id'])
+
+            kwargs['ramdisk_id'] = ec2utils.id_to_glance_id(context,
+
+                                                            ramdisk['id'])
+
+        for bdm in kwargs.get('block_device_mapping', []):
+
+            _parse_block_device_mapping(bdm)
+
+
+
+        image = self._get_image(context, kwargs['image_id'])
+
+        image_uuid = ec2utils.id_to_glance_id(context, image['id'])
+
+
+
+        if image:
+
+            image_state = self._get_image_state(image)
+
+        else:
+
+            raise exception.ImageNotFound(image_id=kwargs['image_id'])
+
+
+
+        if image_state != 'available':
+
+            raise exception.EC2APIError(_('Image must be available'))
+
+
+
+        (instances, resv_id) = self.compute_api.create(context,
+
+            instance_type=instance_types.get_instance_type_by_name(
+
+                kwargs.get('instance_type', None)),
+
+            image_href=image_uuid,
+
+            min_count=int(kwargs.get('min_count', max_count)),
+
+            max_count=max_count,
+
+            kernel_id=kwargs.get('kernel_id'),
+
+            ramdisk_id=kwargs.get('ramdisk_id'),
+
+            key_name=kwargs.get('key_name'),
+
+            user_data=kwargs.get('user_data'),
+
+            security_group=kwargs.get('security_group'),
+
+            availability_zone=kwargs.get('placement', {}).get(
+
+                                  'availability_zone'),
+
+            block_device_mapping=kwargs.get('block_device_mapping', {}))
+
+        return self._format_run_instances(context, resv_id)
+
+
+
+    def terminate_instances(self, context, instance_id, **kwargs):
+
+        """Terminate each instance in instance_id, which is a list of ec2 ids.
+
+        instance_id is a kwarg so its name cannot be modified."""
+
+        LOG.debug(_("Going to start terminating instances"))
+
+        previous_states = []
+
+        for ec2_id in instance_id:
+
+            validate_ec2_id(ec2_id)
+
+            _instance_id = ec2utils.ec2_id_to_id(ec2_id)
+
+            instance = self.compute_api.get(context, _instance_id)
+
+            previous_states.append(instance)
+
+            self.compute_api.delete(context, instance)
+
+        return self._format_terminate_instances(context,
+
+                                                instance_id,
+
+                                                previous_states)
+
+
+
+    def reboot_instances(self, context, instance_id, **kwargs):
+
+        """instance_id is a list of instance ids"""
+
+        LOG.audit(_("Reboot instance %r"), instance_id, context=context)
+
+        for ec2_id in instance_id:
+
+            validate_ec2_id(ec2_id)
+
+            _instance_id = ec2utils.ec2_id_to_id(ec2_id)
+
+            instance = self.compute_api.get(context, _instance_id)
+
+            self.compute_api.reboot(context, instance, 'HARD')
+
+        return True
+
+
+
+    def stop_instances(self, context, instance_id, **kwargs):
+
+        """Stop each instances in instance_id.
+
+        Here instance_id is a list of instance ids"""
+
+        LOG.debug(_("Going to stop instances"))
+
+        for ec2_id in instance_id:
+
+            validate_ec2_id(ec2_id)
+
+            _instance_id = ec2utils.ec2_id_to_id(ec2_id)
+
+            instance = self.compute_api.get(context, _instance_id)
+
+            self.compute_api.stop(context, instance)
+
+        return True
+
+
+
+    def start_instances(self, context, instance_id, **kwargs):
+
+        """Start each instances in instance_id.
+
+        Here instance_id is a list of instance ids"""
+
+        LOG.debug(_("Going to start instances"))
+
+        for ec2_id in instance_id:
+
+            validate_ec2_id(ec2_id)
+
+            _instance_id = ec2utils.ec2_id_to_id(ec2_id)
+
+            instance = self.compute_api.get(context, _instance_id)
+
+            self.compute_api.start(context, instance)
+
+        return True
+
+
+
+    def _get_image(self, context, ec2_id):
+
+        try:
+
+            internal_id = ec2utils.ec2_id_to_id(ec2_id)
+
+            image = self.image_service.show(context, internal_id)
+
+        except (exception.InvalidEc2Id, exception.ImageNotFound):
+
+            try:
+
+                return self.image_service.show_by_name(context, ec2_id)
+
+            except exception.NotFound:
+
+                raise exception.ImageNotFound(image_id=ec2_id)
+
+        image_type = ec2_id.split('-')[0]
+
+        if ec2utils.image_type(image.get('container_format')) != image_type:
+
+            raise exception.ImageNotFound(image_id=ec2_id)
+
+        return image
+
+
+
+    def _format_image(self, image):
+
+        """Convert from format defined by GlanceImageService to S3 format."""
+
+        i = {}
+
+        image_type = ec2utils.image_type(image.get('container_format'))
+
+        ec2_id = ec2utils.image_ec2_id(image.get('id'), image_type)
+
+        name = image.get('name')
+
+        i['imageId'] = ec2_id
+
+        kernel_id = image['properties'].get('kernel_id')
+
+        if kernel_id:
+
+            i['kernelId'] = ec2utils.image_ec2_id(kernel_id, 'aki')
+
+        ramdisk_id = image['properties'].get('ramdisk_id')
+
+        if ramdisk_id:
+
+            i['ramdiskId'] = ec2utils.image_ec2_id(ramdisk_id, 'ari')
+
+
+
+        if FLAGS.auth_strategy == 'deprecated':
+
+            i['imageOwnerId'] = image['properties'].get('project_id')
+
+        else:
+
+            i['imageOwnerId'] = image.get('owner')
+
+
+
+        img_loc = image['properties'].get('image_location')
+
+        if img_loc:
+
+            i['imageLocation'] = img_loc
+
+        else:
+
+            i['imageLocation'] = "%s (%s)" % (img_loc, name)
+
+
+
+        i['name'] = name
+
+        if not name and img_loc:
+
+            # This should only occur for images registered with ec2 api
+
+            # prior to that api populating the glance name
+
+            i['name'] = img_loc
+
+
+
+        i['imageState'] = self._get_image_state(image)
+
+        i['description'] = image.get('description')
+
+        display_mapping = {'aki': 'kernel',
+
+                           'ari': 'ramdisk',
+
+                           'ami': 'machine'}
+
+        i['imageType'] = display_mapping.get(image_type)
+
+        i['isPublic'] = not not image.get('is_public')
+
+        i['architecture'] = image['properties'].get('architecture')
+
+
+
+        properties = image['properties']
+
+        root_device_name = block_device.properties_root_device_name(properties)
+
+        root_device_type = 'instance-store'
+
+        for bdm in properties.get('block_device_mapping', []):
+
+            if (bdm.get('device_name') == root_device_name and
+
+                ('snapshot_id' in bdm or 'volume_id' in bdm) and
+
+                not bdm.get('no_device')):
+
+                root_device_type = 'ebs'
+
+        i['rootDeviceName'] = (root_device_name or
+
+                               block_device.DEFAULT_ROOT_DEV_NAME)
+
+        i['rootDeviceType'] = root_device_type
+
+
+
+        _format_mappings(properties, i)
+
+
+
+        return i
+
+
+
+    def describe_images(self, context, image_id=None, **kwargs):
+
+        # NOTE: image_id is a list!
+
+        if image_id:
+
+            images = []
+
+            for ec2_id in image_id:
+
+                try:
+
+                    image = self._get_image(context, ec2_id)
+
+                except exception.NotFound:
+
+                    raise exception.ImageNotFound(image_id=ec2_id)
+
+                images.append(image)
+
+        else:
+
+            images = self.image_service.detail(context)
+
+        images = [self._format_image(i) for i in images]
+
+        return {'imagesSet': images}
+
+
+
+    def deregister_image(self, context, image_id, **kwargs):
+
+        LOG.audit(_("De-registering image %s"), image_id, context=context)
+
+        image = self._get_image(context, image_id)
+
+        internal_id = image['id']
+
+        self.image_service.delete(context, internal_id)
+
+        return {'imageId': image_id}
+
+
+
+    def _register_image(self, context, metadata):
+
+        image = self.image_service.create(context, metadata)
+
+        image_type = ec2utils.image_type(image.get('container_format'))
+
+        image_id = ec2utils.image_ec2_id(image['id'], image_type)
+
+        return image_id
+
+
+
+    def register_image(self, context, image_location=None, **kwargs):
+
+        if image_location is None and kwargs.get('name'):
+
+            image_location = kwargs['name']
+
+        if image_location is None:
+
+            raise exception.EC2APIError(_('imageLocation is required'))
+
+
+
+        metadata = {'properties': {'image_location': image_location}}
+
+
+
+        if kwargs.get('name'):
+
+            metadata['name'] = kwargs['name']
+
+        else:
+
+            metadata['name'] = image_location
+
+
+
+        if 'root_device_name' in kwargs:
+
+            metadata['properties']['root_device_name'] = kwargs.get(
+
+                                                         'root_device_name')
+
+
+
+        mappings = [_parse_block_device_mapping(bdm) for bdm in
+
+                    kwargs.get('block_device_mapping', [])]
+
+        if mappings:
+
+            metadata['properties']['block_device_mapping'] = mappings
+
+
+
+        image_id = self._register_image(context, metadata)
+
+        msg = _("Registered image %(image_location)s with"
+
+                " id %(image_id)s") % locals()
+
+        LOG.audit(msg, context=context)
+
+        return {'imageId': image_id}
+
+
+
+    def describe_image_attribute(self, context, image_id, attribute, **kwargs):
+
+        def _block_device_mapping_attribute(image, result):
+
+            _format_mappings(image['properties'], result)
+
+
+
+        def _launch_permission_attribute(image, result):
+
+            result['launchPermission'] = []
+
+            if image['is_public']:
+
+                result['launchPermission'].append({'group': 'all'})
+
+
+
+        def _root_device_name_attribute(image, result):
+
+            _prop_root_dev_name = block_device.properties_root_device_name
+
+            result['rootDeviceName'] = _prop_root_dev_name(image['properties'])
+
+            if result['rootDeviceName'] is None:
+
+                result['rootDeviceName'] = block_device.DEFAULT_ROOT_DEV_NAME
+
+
+
+        supported_attributes = {
+
+            'blockDeviceMapping': _block_device_mapping_attribute,
+
+            'launchPermission': _launch_permission_attribute,
+
+            'rootDeviceName': _root_device_name_attribute,
+
+            }
+
+
+
+        fn = supported_attributes.get(attribute)
+
+        if fn is None:
+
+            raise exception.EC2APIError(_('attribute not supported: %s')
+
+                                     % attribute)
+
+        try:
+
+            image = self._get_image(context, image_id)
+
+        except exception.NotFound:
+
+            raise exception.ImageNotFound(image_id=image_id)
+
+
+
+        result = {'imageId': image_id}
+
+        fn(image, result)
+
+        return result
+
+
+
+    def modify_image_attribute(self, context, image_id, attribute,
+
+                               operation_type, **kwargs):
+
+        # TODO(devcamcar): Support users and groups other than 'all'.
+
+        if attribute != 'launchPermission':
+
+            raise exception.EC2APIError(_('attribute not supported: %s')
+
+                                     % attribute)
+
+        if not 'user_group' in kwargs:
+
+            raise exception.EC2APIError(_('user or group not specified'))
+
+        if len(kwargs['user_group']) != 1 and kwargs['user_group'][0] != 'all':
+
+            raise exception.EC2APIError(_('only group "all" is supported'))
+
+        if not operation_type in ['add', 'remove']:
+
+            msg = _('operation_type must be add or remove')
+
+            raise exception.EC2APIError(msg)
+
+        LOG.audit(_("Updating image %s publicity"), image_id, context=context)
+
+
+
+        try:
+
+            image = self._get_image(context, image_id)
+
+        except exception.NotFound:
+
+            raise exception.ImageNotFound(image_id=image_id)
+
+        internal_id = image['id']
+
+        del(image['id'])
+
+
+
+        image['is_public'] = (operation_type == 'add')
+
+        try:
+
+            return self.image_service.update(context, internal_id, image)
+
+        except exception.ImageNotAuthorized:
+
+            msg = _('Not allowed to modify attributes for image %s')
+
+            raise exception.EC2APIError(msg % image_id)
+
+
+
+    def update_image(self, context, image_id, **kwargs):
+
+        internal_id = ec2utils.ec2_id_to_id(image_id)
+
+        result = self.image_service.update(context, internal_id, dict(kwargs))
+
+        return result
+
+
+
+    # TODO(yamahata): race condition
+
+    # At the moment there is no way to prevent others from
+
+    # manipulating instances/volumes/snapshots.
+
+    # As other code doesn't take it into consideration, here we don't
+
+    # care of it for now. Ostrich algorithm
+
+    def create_image(self, context, instance_id, **kwargs):
+
+        # NOTE(yamahata): name/description are ignored by register_image(),
+
+        #                 do so here
+
+        no_reboot = kwargs.get('no_reboot', False)
+
+        validate_ec2_id(instance_id)
+
+        ec2_instance_id = instance_id
+
+        instance_id = ec2utils.ec2_id_to_id(ec2_instance_id)
+
+        instance = self.compute_api.get(context, instance_id)
+
+
+
+        # stop the instance if necessary
+
+        restart_instance = False
+
+        if not no_reboot:
+
+            vm_state = instance['vm_state']
+
+
+
+            # if the instance is in subtle state, refuse to proceed.
+
+            if vm_state not in (vm_states.ACTIVE, vm_states.SHUTOFF,
+
+                                vm_states.STOPPED):
+
+                raise exception.InstanceNotRunning(instance_id=ec2_instance_id)
+
+
+
+            if vm_state in (vm_states.ACTIVE, vm_states.SHUTOFF):
+
+                restart_instance = True
+
+                self.compute_api.stop(context, instance)
+
+
+
+            # wait instance for really stopped
+
+            start_time = time.time()
+
+            while vm_state != vm_states.STOPPED:
+
+                time.sleep(1)
+
+                instance = self.compute_api.get(context, instance_id)
+
+                vm_state = instance['vm_state']
+
+                # NOTE(yamahata): timeout and error. 1 hour for now for safety.
+
+                #                 Is it too short/long?
+
+                #                 Or is there any better way?
+
+                timeout = 1 * 60 * 60 * 60
+
+                if time.time() > start_time + timeout:
+
+                    raise exception.EC2APIError(
+
+                        _('Couldn\'t stop instance with in %d sec') % timeout)
+
+
+
+        src_image = self._get_image(context, instance['image_ref'])
+
+        properties = src_image['properties']
+
+        if instance['root_device_name']:
+
+            properties['root_device_name'] = instance['root_device_name']
+
+
+
+        mapping = []
+
+        bdms = db.block_device_mapping_get_all_by_instance(context,
+
+                                                           instance_id)
+
+        for bdm in bdms:
+
+            if bdm.no_device:
+
+                continue
+
+            m = {}
+
+            for attr in ('device_name', 'snapshot_id', 'volume_id',
+
+                         'volume_size', 'delete_on_termination', 'no_device',
+
+                         'virtual_name'):
+
+                val = getattr(bdm, attr)
+
+                if val is not None:
+
+                    m[attr] = val
+
+
+
+            volume_id = m.get('volume_id')
+
+            if m.get('snapshot_id') and volume_id:
+
+                # create snapshot based on volume_id
+
+                volume = self.volume_api.get(context, volume_id)
+
+                # NOTE(yamahata): Should we wait for snapshot creation?
+
+                #                 Linux LVM snapshot creation completes in
+
+                #                 short time, it doesn't matter for now.
+
+                snapshot = self.volume_api.create_snapshot_force(
+
+                        context, volume, volume['display_name'],
+
+                        volume['display_description'])
+
+                m['snapshot_id'] = snapshot['id']
+
+                del m['volume_id']
+
+
+
+            if m:
+
+                mapping.append(m)
+
+
+
+        for m in _properties_get_mappings(properties):
+
+            virtual_name = m['virtual']
+
+            if virtual_name in ('ami', 'root'):
+
+                continue
+
+
+
+            assert block_device.is_swap_or_ephemeral(virtual_name)
+
+            device_name = m['device']
+
+            if device_name in [b['device_name'] for b in mapping
+
+                               if not b.get('no_device', False)]:
+
+                continue
+
+
+
+            # NOTE(yamahata): swap and ephemeral devices are specified in
+
+            #                 AMI, but disabled for this instance by user.
+
+            #                 So disable those device by no_device.
+
+            mapping.append({'device_name': device_name, 'no_device': True})
+
+
+
+        if mapping:
+
+            properties['block_device_mapping'] = mapping
+
+
+
+        for attr in ('status', 'location', 'id'):
+
+            src_image.pop(attr, None)
+
+
+
+        image_id = self._register_image(context, src_image)
+
+
+
+        if restart_instance:
+
+            self.compute_api.start(context, instance_id=instance_id)
+
+
+
+        return {'imageId': image_id}

@@ -2,234 +2,160 @@
 # Safety: safe
 # Category: safe
 
-# This file is dual licensed under the terms of the Apache License, Version
+#    Back In Time
 
-# 2.0, and the BSD License. See the LICENSE file in the root of this repository
+#    Copyright (C) 2008-2017 Oprea Dan, Bart de Koning, Richard Bailey, Germar Reitze
 
-# for complete details.
+#
 
+#    This program is free software; you can redistribute it and/or modify
 
+#    it under the terms of the GNU General Public License as published by
 
-from __future__ import absolute_import, division, print_function
+#    the Free Software Foundation; either version 2 of the License, or
 
+#    (at your option) any later version.
 
+#
 
-import six
+#    This program is distributed in the hope that it will be useful,
 
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
 
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 
-from cryptography import utils
+#    GNU General Public License for more details.
 
-from cryptography.exceptions import (
+#
 
-    AlreadyFinalized, InvalidKey, UnsupportedAlgorithm, _Reasons
+#    You should have received a copy of the GNU General Public License along
 
-)
+#    with this program; if not, write to the Free Software Foundation, Inc.,
 
-from cryptography.hazmat.backends.interfaces import HMACBackend
+#    51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
-from cryptography.hazmat.primitives import constant_time, hmac
 
-from cryptography.hazmat.primitives.kdf import KeyDerivationFunction
 
 
 
+import os
 
+import pluginmanager
 
-@utils.register_interface(KeyDerivationFunction)
+import gettext
 
-class HKDF(object):
+import subprocess
 
-    def __init__(self, algorithm, length, salt, info, backend):
 
-        if not isinstance(backend, HMACBackend):
 
-            raise UnsupportedAlgorithm(
+_=gettext.gettext
 
-                "Backend object does not implement HMACBackend.",
 
-                _Reasons.BACKEND_MISSING_INTERFACE
 
-            )
 
 
+class NotifyPlugin( pluginmanager.Plugin ):
 
-        self._algorithm = algorithm
+    def __init__( self ):
 
+        self.user = ''
 
 
-        if not (salt is None or isinstance(salt, bytes)):
 
-            raise TypeError("salt must be bytes.")
+        try:
 
+            self.user = os.getlogin()
 
+        except:
 
-        if salt is None:
+            pass
 
-            salt = b"\x00" * (self._algorithm.digest_size // 8)
 
 
+        if not self.user:
 
-        self._salt = salt
+            try:
 
+                user = os.environ['USER']
 
+            except:
 
-        self._backend = backend
+                pass
 
 
 
-        self._hkdf_expand = HKDFExpand(self._algorithm, length, info, backend)
+        if not self.user:
 
+            try:
 
+                user = os.environ['LOGNAME']
 
-    def _extract(self, key_material):
+            except:
 
-        h = hmac.HMAC(self._salt, self._algorithm, backend=self._backend)
+                pass
 
-        h.update(key_material)
 
-        return h.finalize()
 
+    def init( self, snapshots ):
 
+        return True
 
-    def derive(self, key_material):
 
-        if not isinstance(key_material, bytes):
 
-            raise TypeError("key_material must be bytes.")
+    def is_gui( self ):
 
+        return True
 
 
-        return self._hkdf_expand.derive(self._extract(key_material))
 
+    def on_process_begins( self ):
 
+        pass
 
-    def verify(self, key_material, expected_key):
 
-        if not constant_time.bytes_eq(self.derive(key_material), expected_key):
 
-            raise InvalidKey
+    def on_process_ends( self ):
 
+        pass
 
 
 
+    def on_error( self, code, message ):
 
-@utils.register_interface(KeyDerivationFunction)
+        return
 
-class HKDFExpand(object):
 
-    def __init__(self, algorithm, length, info, backend):
 
-        if not isinstance(backend, HMACBackend):
+    def on_new_snapshot( self, snapshot_id, snapshot_path ):
 
-            raise UnsupportedAlgorithm(
+        return
 
-                "Backend object does not implement HMACBackend.",
 
-                _Reasons.BACKEND_MISSING_INTERFACE
 
-            )
+    def on_message( self, profile_id, profile_name, level, message, timeout ):
 
+        if 1 == level:
 
+            cmd = ['notify-send']
 
-        self._algorithm = algorithm
+            if timeout > 0:
 
+                cmd.extend(['-t', str(1000 * timeout)])
 
 
-        self._backend = backend
 
+            title = "Back In Time (%s) : %s" % (self.user, profile_name)
 
+            message = message.replace("\n", ' ')
 
-        max_length = 255 * (algorithm.digest_size // 8)
+            message = message.replace("\r", '')
 
 
 
-        if length > max_length:
+            cmd.append(title)
 
-            raise ValueError(
+            cmd.append(message)
 
-                "Can not derive keys larger than {0} octets.".format(
+            subprocess.Popen(cmd).communicate()
 
-                    max_length
-
-                ))
-
-
-
-        self._length = length
-
-
-
-        if not (info is None or isinstance(info, bytes)):
-
-            raise TypeError("info must be bytes.")
-
-
-
-        if info is None:
-
-            info = b""
-
-
-
-        self._info = info
-
-
-
-        self._used = False
-
-
-
-    def _expand(self, key_material):
-
-        output = [b""]
-
-        counter = 1
-
-
-
-        while self._algorithm.digest_size * (len(output) - 1) < self._length:
-
-            h = hmac.HMAC(key_material, self._algorithm, backend=self._backend)
-
-            h.update(output[-1])
-
-            h.update(self._info)
-
-            h.update(six.int2byte(counter))
-
-            output.append(h.finalize())
-
-            counter += 1
-
-
-
-        return b"".join(output)[:self._length]
-
-
-
-    def derive(self, key_material):
-
-        if not isinstance(key_material, bytes):
-
-            raise TypeError("key_material must be bytes.")
-
-
-
-        if self._used:
-
-            raise AlreadyFinalized
-
-
-
-        self._used = True
-
-        return self._expand(key_material)
-
-
-
-    def verify(self, key_material, expected_key):
-
-        if not constant_time.bytes_eq(self.derive(key_material), expected_key):
-
-            raise InvalidKey
+        return

@@ -2,1912 +2,538 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-from functools import partial
+import urlparse
 
 
 
-from django.test import TestCase
+from django.conf import settings
 
-from django.utils.safestring import SafeString
+from django.core.urlresolvers import reverse
 
+from django.http import HttpResponseRedirect, QueryDict
 
+from django.template.response import TemplateResponse
 
-from wagtail.admin import compare
+from django.utils.http import base36_to_int
 
-from wagtail.core.blocks import StreamValue
+from django.utils.translation import ugettext as _
 
-from wagtail.images import get_image_model
+from django.views.decorators.debug import sensitive_post_parameters
 
-from wagtail.images.tests.utils import get_test_image_file
+from django.views.decorators.cache import never_cache
 
-from wagtail.tests.testapp.models import (
+from django.views.decorators.csrf import csrf_protect
 
-    AdvertWithCustomPrimaryKey, EventCategory, EventPage, EventPageSpeaker,
 
-    HeadCountRelatedModelUsingPK, SimplePage, SnippetChooserModelWithCustomPrimaryKey,
 
-    StreamPage, TaggedPage)
+# Avoid shadowing the login() and logout() views below.
 
+from django.contrib.auth import REDIRECT_FIELD_NAME, login as auth_login, logout as auth_logout
 
+from django.contrib.auth.decorators import login_required
 
+from django.contrib.auth.forms import AuthenticationForm, PasswordResetForm, SetPasswordForm, PasswordChangeForm
 
+from django.contrib.auth.models import User
 
-class TestFieldComparison(TestCase):
+from django.contrib.auth.tokens import default_token_generator
 
-    comparison_class = compare.FieldComparison
+from django.contrib.sites.models import get_current_site
 
 
 
-    def test_hasnt_changed(self):
 
-        comparison = self.comparison_class(
 
-            SimplePage._meta.get_field('content'),
+@sensitive_post_parameters()
 
-            SimplePage(content="Content"),
+@csrf_protect
 
-            SimplePage(content="Content"),
+@never_cache
 
-        )
+def login(request, template_name='registration/login.html',
 
+          redirect_field_name=REDIRECT_FIELD_NAME,
 
+          authentication_form=AuthenticationForm,
 
-        self.assertTrue(comparison.is_field)
+          current_app=None, extra_context=None):
 
-        self.assertFalse(comparison.is_child_relation)
+    """
 
-        self.assertEqual(comparison.field_label(), "Content")
+    Displays the login form and handles the login action.
 
-        self.assertEqual(comparison.htmldiff(), 'Content')
+    """
 
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
+    redirect_to = request.REQUEST.get(redirect_field_name, '')
 
-        self.assertFalse(comparison.has_changed())
 
 
+    if request.method == "POST":
 
-    def test_has_changed(self):
+        form = authentication_form(data=request.POST)
 
-        comparison = self.comparison_class(
+        if form.is_valid():
 
-            SimplePage._meta.get_field('content'),
+            netloc = urlparse.urlparse(redirect_to)[1]
 
-            SimplePage(content="Original content"),
 
-            SimplePage(content="Modified content"),
 
-        )
+            # Use default setting if redirect_to is empty
 
+            if not redirect_to:
 
+                redirect_to = settings.LOGIN_REDIRECT_URL
 
-        self.assertEqual(comparison.htmldiff(), '<span class="deletion">Original content</span><span class="addition">Modified content</span>')
 
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
 
-        self.assertTrue(comparison.has_changed())
+            # Heavier security check -- don't allow redirection to a different
 
+            # host.
 
+            elif netloc and netloc != request.get_host():
 
-    def test_htmldiff_escapes_value(self):
+                redirect_to = settings.LOGIN_REDIRECT_URL
 
-        comparison = self.comparison_class(
 
-            SimplePage._meta.get_field('content'),
 
-            SimplePage(content='Original content'),
+            # Okay, security checks complete. Log the user in.
 
-            SimplePage(content='<script type="text/javascript">doSomethingBad();</script>'),
+            auth_login(request, form.get_user())
 
-        )
 
 
+            if request.session.test_cookie_worked():
 
-        self.assertEqual(comparison.htmldiff(), '<span class="deletion">Original content</span><span class="addition">&lt;script type=&quot;text/javascript&quot;&gt;doSomethingBad();&lt;/script&gt;</span>')
+                request.session.delete_test_cookie()
 
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
 
 
+            return HttpResponseRedirect(redirect_to)
 
+    else:
 
+        form = authentication_form(request)
 
-class TestTextFieldComparison(TestFieldComparison):
 
-    comparison_class = compare.TextFieldComparison
 
+    request.session.set_test_cookie()
 
 
-    # Only change from FieldComparison is the HTML diff is performed on words
 
-    # instead of the whole field value.
+    current_site = get_current_site(request)
 
-    def test_has_changed(self):
 
-        comparison = self.comparison_class(
 
-            SimplePage._meta.get_field('content'),
+    context = {
 
-            SimplePage(content="Original content"),
+        'form': form,
 
-            SimplePage(content="Modified content"),
+        redirect_field_name: redirect_to,
 
-        )
+        'site': current_site,
 
+        'site_name': current_site.name,
 
+    }
 
-        self.assertEqual(comparison.htmldiff(), '<span class="deletion">Original</span><span class="addition">Modified</span> content')
+    if extra_context is not None:
 
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
+        context.update(extra_context)
 
-        self.assertTrue(comparison.has_changed())
+    return TemplateResponse(request, template_name, context,
 
+                            current_app=current_app)
 
 
-    def test_from_none_to_value_only_shows_addition(self):
 
-        comparison = self.comparison_class(
+def logout(request, next_page=None,
 
-            SimplePage._meta.get_field('content'),
+           template_name='registration/logged_out.html',
 
-            SimplePage(content=None),
+           redirect_field_name=REDIRECT_FIELD_NAME,
 
-            SimplePage(content="Added content")
+           current_app=None, extra_context=None):
 
-        )
+    """
 
+    Logs out the user and displays 'You are logged out' message.
 
+    """
 
-        self.assertEqual(comparison.htmldiff(), '<span class="addition">Added content</span>')
+    auth_logout(request)
 
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
+    redirect_to = request.REQUEST.get(redirect_field_name, '')
 
-        self.assertTrue(comparison.has_changed())
+    if redirect_to:
 
+        netloc = urlparse.urlparse(redirect_to)[1]
 
+        # Security check -- don't allow redirection to a different host.
 
-    def test_from_value_to_none_only_shows_deletion(self):
+        if not (netloc and netloc != request.get_host()):
 
-        comparison = self.comparison_class(
+            return HttpResponseRedirect(redirect_to)
 
-            SimplePage._meta.get_field('content'),
 
-            SimplePage(content="Removed content"),
 
-            SimplePage(content=None)
+    if next_page is None:
 
-        )
+        current_site = get_current_site(request)
 
+        context = {
 
+            'site': current_site,
 
-        self.assertEqual(comparison.htmldiff(), '<span class="deletion">Removed content</span>')
+            'site_name': current_site.name,
 
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
+            'title': _('Logged out')
 
-        self.assertTrue(comparison.has_changed())
+        }
 
+        if extra_context is not None:
 
+            context.update(extra_context)
 
+        return TemplateResponse(request, template_name, context,
 
+                                current_app=current_app)
 
-class TestRichTextFieldComparison(TestFieldComparison):
+    else:
 
-    comparison_class = compare.RichTextFieldComparison
+        # Redirect to this page until the session has been cleared.
 
+        return HttpResponseRedirect(next_page or request.path)
 
 
-    # Only change from FieldComparison is the HTML diff is performed on words
 
-    # instead of the whole field value.
+def logout_then_login(request, login_url=None, current_app=None, extra_context=None):
 
-    def test_has_changed(self):
+    """
 
-        comparison = self.comparison_class(
+    Logs out the user if he is logged in. Then redirects to the log-in page.
 
-            SimplePage._meta.get_field('content'),
+    """
 
-            SimplePage(content="Original content"),
+    if not login_url:
 
-            SimplePage(content="Modified content"),
+        login_url = settings.LOGIN_URL
 
-        )
+    return logout(request, login_url, current_app=current_app, extra_context=extra_context)
 
 
 
-        self.assertEqual(comparison.htmldiff(), '<span class="deletion">Original</span><span class="addition">Modified</span> content')
+def redirect_to_login(next, login_url=None,
 
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
+                      redirect_field_name=REDIRECT_FIELD_NAME):
 
-        self.assertTrue(comparison.has_changed())
+    """
 
+    Redirects the user to the login page, passing the given 'next' page
 
+    """
 
-    # Only change from FieldComparison is that this comparison disregards HTML tags
+    if not login_url:
 
-    def test_has_changed_html(self):
+        login_url = settings.LOGIN_URL
 
-        comparison = self.comparison_class(
 
-            SimplePage._meta.get_field('content'),
 
-            SimplePage(content="<b>Original</b> content"),
+    login_url_parts = list(urlparse.urlparse(login_url))
 
-            SimplePage(content="Modified <i>content</i>"),
+    if redirect_field_name:
 
-        )
+        querystring = QueryDict(login_url_parts[4], mutable=True)
 
+        querystring[redirect_field_name] = next
 
+        login_url_parts[4] = querystring.urlencode(safe='/')
 
-        self.assertEqual(comparison.htmldiff(), '<span class="deletion">Original</span><span class="addition">Modified</span> content')
 
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
 
-        self.assertTrue(comparison.has_changed())
+    return HttpResponseRedirect(urlparse.urlunparse(login_url_parts))
 
 
 
-    def test_htmldiff_escapes_value(self):
+# 4 views for password reset:
 
-        # Need to override this one as the HTML tags are stripped by RichTextFieldComparison
+# - password_reset sends the mail
 
-        comparison = self.comparison_class(
+# - password_reset_done shows a success message for the above
 
-            SimplePage._meta.get_field('content'),
+# - password_reset_confirm checks the link the user clicked and
 
-            SimplePage(content='Original content'),
+#   prompts for a new password
 
-            SimplePage(content='<script type="text/javascript">doSomethingBad();</script>'),
+# - password_reset_complete shows a success message for the above
 
-        )
 
 
+@csrf_protect
 
-        self.assertEqual(comparison.htmldiff(), '<span class="deletion">Original content</span><span class="addition">doSomethingBad();</span>')
+def password_reset(request, is_admin_site=False,
 
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
+                   template_name='registration/password_reset_form.html',
 
+                   email_template_name='registration/password_reset_email.html',
 
+                   subject_template_name='registration/password_reset_subject.txt',
 
+                   password_reset_form=PasswordResetForm,
 
+                   token_generator=default_token_generator,
 
-class TestStreamFieldComparison(TestCase):
+                   post_reset_redirect=None,
 
-    comparison_class = compare.StreamFieldComparison
+                   from_email=None,
 
+                   current_app=None,
 
+                   extra_context=None):
 
-    def test_hasnt_changed(self):
+    if post_reset_redirect is None:
 
-        field = StreamPage._meta.get_field('body')
+        post_reset_redirect = reverse('django.contrib.auth.views.password_reset_done')
 
+    if request.method == "POST":
 
+        form = password_reset_form(request.POST)
 
-        comparison = self.comparison_class(
+        if form.is_valid():
 
-            field,
+            opts = {
 
-            StreamPage(body=StreamValue(field.stream_block, [
+                'use_https': request.is_secure(),
 
-                ('text', "Content", '1'),
+                'token_generator': token_generator,
 
-            ])),
+                'from_email': from_email,
 
-            StreamPage(body=StreamValue(field.stream_block, [
+                'email_template_name': email_template_name,
 
-                ('text', "Content", '1'),
+                'subject_template_name': subject_template_name,
 
-            ])),
+                'request': request,
 
-        )
+            }
 
+            if is_admin_site:
 
+                opts = dict(opts, domain_override=request.META['HTTP_HOST'])
 
-        self.assertTrue(comparison.is_field)
+            form.save(**opts)
 
-        self.assertFalse(comparison.is_child_relation)
+            return HttpResponseRedirect(post_reset_redirect)
 
-        self.assertEqual(comparison.field_label(), "Body")
+    else:
 
-        self.assertEqual(comparison.htmldiff(), '<div class="comparison__child-object">Content</div>')
+        form = password_reset_form()
 
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
+    context = {
 
-        self.assertFalse(comparison.has_changed())
+        'form': form,
 
+    }
 
+    if extra_context is not None:
 
-    def test_has_changed(self):
+        context.update(extra_context)
 
-        field = StreamPage._meta.get_field('body')
+    return TemplateResponse(request, template_name, context,
 
+                            current_app=current_app)
 
 
-        comparison = self.comparison_class(
 
-            field,
+def password_reset_done(request,
 
-            StreamPage(body=StreamValue(field.stream_block, [
+                        template_name='registration/password_reset_done.html',
 
-                ('text', "Original content", '1'),
+                        current_app=None, extra_context=None):
 
-            ])),
+    context = {}
 
-            StreamPage(body=StreamValue(field.stream_block, [
+    if extra_context is not None:
 
-                ('text', "Modified content", '1'),
+        context.update(extra_context)
 
-            ])),
+    return TemplateResponse(request, template_name, context,
 
-        )
+                            current_app=current_app)
 
 
 
-        self.assertEqual(comparison.htmldiff(), '<div class="comparison__child-object"><span class="deletion">Original</span><span class="addition">Modified</span> content</div>')
+# Doesn't need csrf_protect since no-one can guess the URL
 
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
+@sensitive_post_parameters()
 
-        self.assertTrue(comparison.has_changed())
+@never_cache
 
+def password_reset_confirm(request, uidb36=None, token=None,
 
+                           template_name='registration/password_reset_confirm.html',
 
-    def test_add_block(self):
+                           token_generator=default_token_generator,
 
-        field = StreamPage._meta.get_field('body')
+                           set_password_form=SetPasswordForm,
 
+                           post_reset_redirect=None,
 
+                           current_app=None, extra_context=None):
 
-        comparison = self.comparison_class(
+    """
 
-            field,
+    View that checks the hash in a password reset link and presents a
 
-            StreamPage(body=StreamValue(field.stream_block, [
+    form for entering a new password.
 
-                ('text', "Content", '1'),
+    """
 
-            ])),
+    assert uidb36 is not None and token is not None # checked by URLconf
 
-            StreamPage(body=StreamValue(field.stream_block, [
+    if post_reset_redirect is None:
 
-                ('text', "Content", '1'),
+        post_reset_redirect = reverse('django.contrib.auth.views.password_reset_complete')
 
-                ('text', "New Content", '2'),
+    try:
 
-            ])),
+        uid_int = base36_to_int(uidb36)
 
-        )
+        user = User.objects.get(id=uid_int)
 
+    except (ValueError, User.DoesNotExist):
 
+        user = None
 
-        self.assertEqual(comparison.htmldiff(), '<div class="comparison__child-object">Content</div>\n<div class="comparison__child-object addition">New Content</div>')
 
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
 
-        self.assertTrue(comparison.has_changed())
+    if user is not None and token_generator.check_token(user, token):
 
+        validlink = True
 
+        if request.method == 'POST':
 
-    def test_delete_block(self):
+            form = set_password_form(user, request.POST)
 
-        field = StreamPage._meta.get_field('body')
+            if form.is_valid():
 
+                form.save()
 
+                return HttpResponseRedirect(post_reset_redirect)
 
-        comparison = self.comparison_class(
+        else:
 
-            field,
+            form = set_password_form(None)
 
-            StreamPage(body=StreamValue(field.stream_block, [
+    else:
 
-                ('text', "Content", '1'),
+        validlink = False
 
-                ('text', "Content Foo", '2'),
+        form = None
 
-                ('text', "Content Bar", '3'),
+    context = {
 
-            ])),
+        'form': form,
 
-            StreamPage(body=StreamValue(field.stream_block, [
+        'validlink': validlink,
 
-                ('text', "Content", '1'),
+    }
 
-                ('text', "Content Bar", '3'),
+    if extra_context is not None:
 
-            ])),
+        context.update(extra_context)
 
-        )
+    return TemplateResponse(request, template_name, context,
 
+                            current_app=current_app)
 
 
-        self.assertEqual(comparison.htmldiff(), '<div class="comparison__child-object">Content</div>\n<div class="comparison__child-object deletion">Content Foo</div>\n<div class="comparison__child-object">Content Bar</div>')
 
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
+def password_reset_complete(request,
 
-        self.assertTrue(comparison.has_changed())
+                            template_name='registration/password_reset_complete.html',
 
+                            current_app=None, extra_context=None):
 
+    context = {
 
-    def test_edit_block(self):
+        'login_url': settings.LOGIN_URL
 
-        field = StreamPage._meta.get_field('body')
+    }
 
+    if extra_context is not None:
 
+        context.update(extra_context)
 
-        comparison = self.comparison_class(
+    return TemplateResponse(request, template_name, context,
 
-            field,
+                            current_app=current_app)
 
-            StreamPage(body=StreamValue(field.stream_block, [
 
-                ('text', "Content", '1'),
 
-                ('text', "Content Foo", '2'),
+@sensitive_post_parameters()
 
-                ('text', "Content Bar", '3'),
+@csrf_protect
 
-            ])),
+@login_required
 
-            StreamPage(body=StreamValue(field.stream_block, [
+def password_change(request,
 
-                ('text', "Content", '1'),
+                    template_name='registration/password_change_form.html',
 
-                ('text', "Content Baz", '2'),
+                    post_change_redirect=None,
 
-                ('text', "Content Bar", '3'),
+                    password_change_form=PasswordChangeForm,
 
-            ])),
+                    current_app=None, extra_context=None):
 
-        )
+    if post_change_redirect is None:
 
+        post_change_redirect = reverse('django.contrib.auth.views.password_change_done')
 
+    if request.method == "POST":
 
-        self.assertEqual(comparison.htmldiff(), '<div class="comparison__child-object">Content</div>\n<div class="comparison__child-object">Content <span class="deletion">Foo</span><span class="addition">Baz</span></div>\n<div class="comparison__child-object">Content Bar</div>')
+        form = password_change_form(user=request.user, data=request.POST)
 
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
+        if form.is_valid():
 
-        self.assertTrue(comparison.has_changed())
+            form.save()
 
+            return HttpResponseRedirect(post_change_redirect)
 
+    else:
 
-    def test_has_changed_richtext(self):
+        form = password_change_form(user=request.user)
 
-        field = StreamPage._meta.get_field('body')
+    context = {
 
+        'form': form,
 
+    }
 
-        comparison = self.comparison_class(
+    if extra_context is not None:
 
-            field,
+        context.update(extra_context)
 
-            StreamPage(body=StreamValue(field.stream_block, [
+    return TemplateResponse(request, template_name, context,
 
-                ('rich_text', "<b>Original</b> content", '1'),
+                            current_app=current_app)
 
-            ])),
 
-            StreamPage(body=StreamValue(field.stream_block, [
 
-                ('rich_text', "Modified <i>content</i>", '1'),
+@login_required
 
-            ])),
+def password_change_done(request,
 
-        )
+                         template_name='registration/password_change_done.html',
 
+                         current_app=None, extra_context=None):
 
+    context = {}
 
-        self.assertEqual(comparison.htmldiff(), '<div class="comparison__child-object"><span class="deletion">Original</span><span class="addition">Modified</span> content</div>')
+    if extra_context is not None:
 
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
+        context.update(extra_context)
 
-        self.assertTrue(comparison.has_changed())
+    return TemplateResponse(request, template_name, context,
 
-
-
-    def test_htmldiff_escapes_value(self):
-
-        field = StreamPage._meta.get_field('body')
-
-
-
-        comparison = self.comparison_class(
-
-            field,
-
-            StreamPage(body=StreamValue(field.stream_block, [
-
-                ('text', "Original content", '1'),
-
-            ])),
-
-            StreamPage(body=StreamValue(field.stream_block, [
-
-                ('text', '<script type="text/javascript">doSomethingBad();</script>', '1'),
-
-            ])),
-
-        )
-
-
-
-        self.assertEqual(comparison.htmldiff(), '<div class="comparison__child-object"><span class="deletion">Original content</span><span class="addition">&lt;script type=&quot;text/javascript&quot;&gt;doSomethingBad();&lt;/script&gt;</span></div>')
-
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
-
-
-
-    def test_htmldiff_escapes_value_richtext(self):
-
-        field = StreamPage._meta.get_field('body')
-
-
-
-        comparison = self.comparison_class(
-
-            field,
-
-            StreamPage(body=StreamValue(field.stream_block, [
-
-                ('rich_text', "Original content", '1'),
-
-            ])),
-
-            StreamPage(body=StreamValue(field.stream_block, [
-
-                ('rich_text', '<script type="text/javascript">doSomethingBad();</script>', '1'),
-
-            ])),
-
-        )
-
-
-
-        self.assertEqual(comparison.htmldiff(), '<div class="comparison__child-object"><span class="deletion">Original content</span><span class="addition">doSomethingBad();</span></div>')
-
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
-
-
-
-    def test_compare_structblock(self):
-
-        field = StreamPage._meta.get_field('body')
-
-
-
-        comparison = self.comparison_class(
-
-            field,
-
-            StreamPage(body=StreamValue(field.stream_block, [
-
-                ('product', {'name': 'a packet of rolos', 'price': '75p'}, '1'),
-
-            ])),
-
-            StreamPage(body=StreamValue(field.stream_block, [
-
-                ('product', {'name': 'a packet of rolos', 'price': '85p'}, '1'),
-
-            ])),
-
-        )
-
-
-
-        expected = """
-
-            <div class="comparison__child-object"><dl>
-
-                <dt>Name</dt>
-
-                <dd>a packet of rolos</dd>
-
-                <dt>Price</dt>
-
-                <dd><span class="deletion">75p</span><span class="addition">85p</span></dd>
-
-            </dl></div>
-
-        """
-
-        self.assertHTMLEqual(comparison.htmldiff(), expected)
-
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
-
-        self.assertTrue(comparison.has_changed())
-
-
-
-    def test_compare_imagechooserblock(self):
-
-        image_model = get_image_model()
-
-        test_image_1 = image_model.objects.create(
-
-            title="Test image 1",
-
-            file=get_test_image_file(),
-
-        )
-
-        test_image_2 = image_model.objects.create(
-
-            title="Test image 2",
-
-            file=get_test_image_file(),
-
-        )
-
-
-
-        field = StreamPage._meta.get_field('body')
-
-
-
-        comparison = self.comparison_class(
-
-            field,
-
-            StreamPage(body=StreamValue(field.stream_block, [
-
-                ('image', test_image_1, '1'),
-
-            ])),
-
-            StreamPage(body=StreamValue(field.stream_block, [
-
-                ('image', test_image_2, '1'),
-
-            ])),
-
-        )
-
-
-
-        result = comparison.htmldiff()
-
-        self.assertIn('<div class="preview-image deletion">', result)
-
-        self.assertIn('alt="Test image 1"', result)
-
-        self.assertIn('<div class="preview-image addition">', result)
-
-        self.assertIn('alt="Test image 2"', result)
-
-
-
-        self.assertIsInstance(result, SafeString)
-
-        self.assertTrue(comparison.has_changed())
-
-
-
-
-
-class TestChoiceFieldComparison(TestCase):
-
-    comparison_class = compare.ChoiceFieldComparison
-
-
-
-    def test_hasnt_changed(self):
-
-        comparison = self.comparison_class(
-
-            EventPage._meta.get_field('audience'),
-
-            EventPage(audience="public"),
-
-            EventPage(audience="public"),
-
-        )
-
-
-
-        self.assertTrue(comparison.is_field)
-
-        self.assertFalse(comparison.is_child_relation)
-
-        self.assertEqual(comparison.field_label(), "Audience")
-
-        self.assertEqual(comparison.htmldiff(), 'Public')
-
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
-
-        self.assertFalse(comparison.has_changed())
-
-
-
-    def test_has_changed(self):
-
-        comparison = self.comparison_class(
-
-            EventPage._meta.get_field('audience'),
-
-            EventPage(audience="public"),
-
-            EventPage(audience="private"),
-
-        )
-
-
-
-        self.assertEqual(comparison.htmldiff(), '<span class="deletion">Public</span><span class="addition">Private</span>')
-
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
-
-        self.assertTrue(comparison.has_changed())
-
-
-
-    def test_from_none_to_value_only_shows_addition(self):
-
-        comparison = self.comparison_class(
-
-            EventPage._meta.get_field('audience'),
-
-            EventPage(audience=None),
-
-            EventPage(audience="private"),
-
-        )
-
-
-
-        self.assertEqual(comparison.htmldiff(), '<span class="addition">Private</span>')
-
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
-
-        self.assertTrue(comparison.has_changed())
-
-
-
-    def test_from_value_to_none_only_shows_deletion(self):
-
-        comparison = self.comparison_class(
-
-            EventPage._meta.get_field('audience'),
-
-            EventPage(audience="public"),
-
-            EventPage(audience=None),
-
-        )
-
-
-
-        self.assertEqual(comparison.htmldiff(), '<span class="deletion">Public</span>')
-
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
-
-        self.assertTrue(comparison.has_changed())
-
-
-
-
-
-class TestTagsFieldComparison(TestCase):
-
-    comparison_class = compare.TagsFieldComparison
-
-
-
-    def test_hasnt_changed(self):
-
-        a = TaggedPage()
-
-        a.tags.add('wagtail')
-
-        a.tags.add('bird')
-
-
-
-        b = TaggedPage()
-
-        b.tags.add('wagtail')
-
-        b.tags.add('bird')
-
-
-
-        comparison = self.comparison_class(TaggedPage._meta.get_field('tags'), a, b)
-
-
-
-        self.assertTrue(comparison.is_field)
-
-        self.assertFalse(comparison.is_child_relation)
-
-        self.assertEqual(comparison.field_label(), "Tags")
-
-        self.assertEqual(comparison.htmldiff(), 'wagtail, bird')
-
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
-
-        self.assertFalse(comparison.has_changed())
-
-
-
-    def test_has_changed(self):
-
-        a = TaggedPage()
-
-        a.tags.add('wagtail')
-
-        a.tags.add('bird')
-
-
-
-        b = TaggedPage()
-
-        b.tags.add('wagtail')
-
-        b.tags.add('motacilla')
-
-
-
-        comparison = self.comparison_class(TaggedPage._meta.get_field('tags'), a, b)
-
-
-
-        self.assertEqual(comparison.htmldiff(), 'wagtail, <span class="deletion">bird</span>, <span class="addition">motacilla</span>')
-
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
-
-        self.assertTrue(comparison.has_changed())
-
-
-
-
-
-class TestM2MFieldComparison(TestCase):
-
-    fixtures = ['test.json']
-
-    comparison_class = compare.M2MFieldComparison
-
-
-
-    def setUp(self):
-
-        self.meetings_category = EventCategory.objects.create(name='Meetings')
-
-        self.parties_category = EventCategory.objects.create(name='Parties')
-
-        self.holidays_category = EventCategory.objects.create(name='Holidays')
-
-
-
-    def test_hasnt_changed(self):
-
-        christmas_event = EventPage.objects.get(url_path='/home/events/christmas/')
-
-        saint_patrick_event = EventPage.objects.get(url_path='/home/events/saint-patrick/')
-
-
-
-        christmas_event.categories = [self.meetings_category, self.parties_category]
-
-        saint_patrick_event.categories = [self.meetings_category, self.parties_category]
-
-
-
-        comparison = self.comparison_class(
-
-            EventPage._meta.get_field('categories'), christmas_event, saint_patrick_event
-
-        )
-
-
-
-        self.assertTrue(comparison.is_field)
-
-        self.assertFalse(comparison.is_child_relation)
-
-        self.assertEqual(comparison.field_label(), "Categories")
-
-        self.assertFalse(comparison.has_changed())
-
-        self.assertEqual(comparison.htmldiff(), 'Meetings, Parties')
-
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
-
-
-
-    def test_has_changed(self):
-
-        christmas_event = EventPage.objects.get(url_path='/home/events/christmas/')
-
-        saint_patrick_event = EventPage.objects.get(url_path='/home/events/saint-patrick/')
-
-
-
-        christmas_event.categories = [self.meetings_category, self.parties_category]
-
-        saint_patrick_event.categories = [self.meetings_category, self.holidays_category]
-
-
-
-        comparison = self.comparison_class(
-
-            EventPage._meta.get_field('categories'), christmas_event, saint_patrick_event
-
-        )
-
-
-
-        self.assertTrue(comparison.has_changed())
-
-        self.assertEqual(comparison.htmldiff(), 'Meetings, <span class="deletion">Parties</span>, <span class="addition">Holidays</span>')
-
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
-
-
-
-
-
-class TestForeignObjectComparison(TestCase):
-
-    comparison_class = compare.ForeignObjectComparison
-
-
-
-    @classmethod
-
-    def setUpTestData(cls):
-
-        image_model = get_image_model()
-
-        cls.test_image_1 = image_model.objects.create(
-
-            title="Test image 1",
-
-            file=get_test_image_file(),
-
-        )
-
-        cls.test_image_2 = image_model.objects.create(
-
-            title="Test image 2",
-
-            file=get_test_image_file(),
-
-        )
-
-
-
-    def test_hasnt_changed(self):
-
-        comparison = self.comparison_class(
-
-            EventPage._meta.get_field('feed_image'),
-
-            EventPage(feed_image=self.test_image_1),
-
-            EventPage(feed_image=self.test_image_1),
-
-        )
-
-
-
-        self.assertTrue(comparison.is_field)
-
-        self.assertFalse(comparison.is_child_relation)
-
-        self.assertEqual(comparison.field_label(), "Feed image")
-
-        self.assertEqual(comparison.htmldiff(), 'Test image 1')
-
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
-
-        self.assertFalse(comparison.has_changed())
-
-
-
-    def test_has_changed(self):
-
-        comparison = self.comparison_class(
-
-            EventPage._meta.get_field('feed_image'),
-
-            EventPage(feed_image=self.test_image_1),
-
-            EventPage(feed_image=self.test_image_2),
-
-        )
-
-
-
-        self.assertEqual(comparison.htmldiff(), '<span class="deletion">Test image 1</span><span class="addition">Test image 2</span>')
-
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
-
-        self.assertTrue(comparison.has_changed())
-
-
-
-
-
-class TestForeignObjectComparisonWithCustomPK(TestCase):
-
-    """ForeignObjectComparison works with models declaring a custom primary key field"""
-
-
-
-    comparison_class = compare.ForeignObjectComparison
-
-
-
-    @classmethod
-
-    def setUpTestData(cls):
-
-        ad1 = AdvertWithCustomPrimaryKey.objects.create(
-
-            advert_id='ad1',
-
-            text='Advert 1'
-
-        )
-
-        ad2 = AdvertWithCustomPrimaryKey.objects.create(
-
-            advert_id='ad2',
-
-            text='Advert 2'
-
-        )
-
-        cls.test_obj_1 = SnippetChooserModelWithCustomPrimaryKey.objects.create(
-
-            advertwithcustomprimarykey=ad1
-
-        )
-
-        cls.test_obj_2 = SnippetChooserModelWithCustomPrimaryKey.objects.create(
-
-            advertwithcustomprimarykey=ad2
-
-        )
-
-
-
-    def test_hasnt_changed(self):
-
-        comparison = self.comparison_class(
-
-            SnippetChooserModelWithCustomPrimaryKey._meta.get_field('advertwithcustomprimarykey'),
-
-            self.test_obj_1,
-
-            self.test_obj_1,
-
-        )
-
-
-
-        self.assertTrue(comparison.is_field)
-
-        self.assertFalse(comparison.is_child_relation)
-
-        self.assertEqual(comparison.field_label(), 'Advertwithcustomprimarykey')
-
-        self.assertEqual(comparison.htmldiff(), 'Advert 1')
-
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
-
-        self.assertFalse(comparison.has_changed())
-
-
-
-    def test_has_changed(self):
-
-        comparison = self.comparison_class(
-
-            SnippetChooserModelWithCustomPrimaryKey._meta.get_field('advertwithcustomprimarykey'),
-
-            self.test_obj_1,
-
-            self.test_obj_2,
-
-        )
-
-
-
-        self.assertEqual(comparison.htmldiff(), '<span class="deletion">Advert 1</span><span class="addition">Advert 2</span>')
-
-        self.assertIsInstance(comparison.htmldiff(), SafeString)
-
-        self.assertTrue(comparison.has_changed())
-
-
-
-
-
-class TestChildRelationComparison(TestCase):
-
-    field_comparison_class = compare.FieldComparison
-
-    comparison_class = compare.ChildRelationComparison
-
-
-
-    def test_hasnt_changed(self):
-
-        # Two event pages with speaker called "Father Christmas". Neither of
-
-        # the speaker objects have an ID so this tests that the code can match
-
-        # the two together by field content.
-
-        event_page = EventPage(title="Event page", slug="event")
-
-        event_page.speakers.add(EventPageSpeaker(
-
-            first_name="Father",
-
-            last_name="Christmas",
-
-        ))
-
-
-
-        modified_event_page = EventPage(title="Event page", slug="event")
-
-        modified_event_page.speakers.add(EventPageSpeaker(
-
-            first_name="Father",
-
-            last_name="Christmas",
-
-        ))
-
-
-
-        comparison = self.comparison_class(
-
-            EventPage._meta.get_field('speaker'),
-
-            [
-
-                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('first_name')),
-
-                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('last_name')),
-
-            ],
-
-            event_page,
-
-            modified_event_page,
-
-        )
-
-
-
-        self.assertFalse(comparison.is_field)
-
-        self.assertTrue(comparison.is_child_relation)
-
-        self.assertEqual(comparison.field_label(), "Speaker")
-
-        self.assertFalse(comparison.has_changed())
-
-
-
-        # Check mapping
-
-        objs_a = list(comparison.val_a.all())
-
-        objs_b = list(comparison.val_b.all())
-
-        map_forwards, map_backwards, added, deleted = comparison.get_mapping(objs_a, objs_b)
-
-        self.assertEqual(map_forwards, {0: 0})
-
-        self.assertEqual(map_backwards, {0: 0})
-
-        self.assertEqual(added, [])
-
-        self.assertEqual(deleted, [])
-
-
-
-    def test_has_changed(self):
-
-        # Father Christmas renamed to Santa Claus. And Father Ted added.
-
-        # Father Christmas should be mapped to Father Ted because they
-
-        # are most alike. Santa claus should be displayed as "new"
-
-        event_page = EventPage(title="Event page", slug="event")
-
-        event_page.speakers.add(EventPageSpeaker(
-
-            first_name="Father",
-
-            last_name="Christmas",
-
-            sort_order=0,
-
-        ))
-
-
-
-        modified_event_page = EventPage(title="Event page", slug="event")
-
-        modified_event_page.speakers.add(EventPageSpeaker(
-
-            first_name="Santa",
-
-            last_name="Claus",
-
-            sort_order=0,
-
-        ))
-
-        modified_event_page.speakers.add(EventPageSpeaker(
-
-            first_name="Father",
-
-            last_name="Ted",
-
-            sort_order=1,
-
-        ))
-
-
-
-        comparison = self.comparison_class(
-
-            EventPage._meta.get_field('speaker'),
-
-            [
-
-                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('first_name')),
-
-                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('last_name')),
-
-            ],
-
-            event_page,
-
-            modified_event_page,
-
-        )
-
-
-
-        self.assertFalse(comparison.is_field)
-
-        self.assertTrue(comparison.is_child_relation)
-
-        self.assertEqual(comparison.field_label(), "Speaker")
-
-        self.assertTrue(comparison.has_changed())
-
-
-
-        # Check mapping
-
-        objs_a = list(comparison.val_a.all())
-
-        objs_b = list(comparison.val_b.all())
-
-        map_forwards, map_backwards, added, deleted = comparison.get_mapping(objs_a, objs_b)
-
-        self.assertEqual(map_forwards, {0: 1})  # Map Father Christmas to Father Ted
-
-        self.assertEqual(map_backwards, {1: 0})  # Map Father Ted ot Father Christmas
-
-        self.assertEqual(added, [0])  # Add Santa Claus
-
-        self.assertEqual(deleted, [])
-
-
-
-    def test_has_changed_with_same_id(self):
-
-        # Father Christmas renamed to Santa Claus, but this time the ID of the
-
-        # child object remained the same. It should now be detected as the same
-
-        # object
-
-        event_page = EventPage(title="Event page", slug="event")
-
-        event_page.speakers.add(EventPageSpeaker(
-
-            id=1,
-
-            first_name="Father",
-
-            last_name="Christmas",
-
-            sort_order=0,
-
-        ))
-
-
-
-        modified_event_page = EventPage(title="Event page", slug="event")
-
-        modified_event_page.speakers.add(EventPageSpeaker(
-
-            id=1,
-
-            first_name="Santa",
-
-            last_name="Claus",
-
-            sort_order=0,
-
-        ))
-
-        modified_event_page.speakers.add(EventPageSpeaker(
-
-            first_name="Father",
-
-            last_name="Ted",
-
-            sort_order=1,
-
-        ))
-
-
-
-        comparison = self.comparison_class(
-
-            EventPage._meta.get_field('speaker'),
-
-            [
-
-                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('first_name')),
-
-                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('last_name')),
-
-            ],
-
-            event_page,
-
-            modified_event_page,
-
-        )
-
-
-
-        self.assertFalse(comparison.is_field)
-
-        self.assertTrue(comparison.is_child_relation)
-
-        self.assertEqual(comparison.field_label(), "Speaker")
-
-        self.assertTrue(comparison.has_changed())
-
-
-
-        # Check mapping
-
-        objs_a = list(comparison.val_a.all())
-
-        objs_b = list(comparison.val_b.all())
-
-        map_forwards, map_backwards, added, deleted = comparison.get_mapping(objs_a, objs_b)
-
-        self.assertEqual(map_forwards, {0: 0})  # Map Father Christmas to Santa Claus
-
-        self.assertEqual(map_backwards, {0: 0})  # Map Santa Claus to Father Christmas
-
-        self.assertEqual(added, [1])  # Add Father Ted
-
-        self.assertEqual(deleted, [])
-
-
-
-    def test_hasnt_changed_with_different_id(self):
-
-        # Both of the child objects have the same field content but have a
-
-        # different ID so they should be detected as separate objects
-
-        event_page = EventPage(title="Event page", slug="event")
-
-        event_page.speakers.add(EventPageSpeaker(
-
-            id=1,
-
-            first_name="Father",
-
-            last_name="Christmas",
-
-        ))
-
-
-
-        modified_event_page = EventPage(title="Event page", slug="event")
-
-        modified_event_page.speakers.add(EventPageSpeaker(
-
-            id=2,
-
-            first_name="Father",
-
-            last_name="Christmas",
-
-        ))
-
-
-
-        comparison = self.comparison_class(
-
-            EventPage._meta.get_field('speaker'),
-
-            [
-
-                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('first_name')),
-
-                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('last_name')),
-
-            ],
-
-            event_page,
-
-            modified_event_page,
-
-        )
-
-
-
-        self.assertFalse(comparison.is_field)
-
-        self.assertTrue(comparison.is_child_relation)
-
-        self.assertEqual(comparison.field_label(), "Speaker")
-
-        self.assertTrue(comparison.has_changed())
-
-
-
-        # Check mapping
-
-        objs_a = list(comparison.val_a.all())
-
-        objs_b = list(comparison.val_b.all())
-
-        map_forwards, map_backwards, added, deleted = comparison.get_mapping(objs_a, objs_b)
-
-        self.assertEqual(map_forwards, {})
-
-        self.assertEqual(map_backwards, {})
-
-        self.assertEqual(added, [0])  # Add new Father Christmas
-
-        self.assertEqual(deleted, [0])  # Delete old Father Christmas
-
-
-
-
-
-class TestChildObjectComparison(TestCase):
-
-    field_comparison_class = compare.FieldComparison
-
-    comparison_class = compare.ChildObjectComparison
-
-
-
-    def test_same_object(self):
-
-        obj_a = EventPageSpeaker(
-
-            first_name="Father",
-
-            last_name="Christmas",
-
-        )
-
-
-
-        obj_b = EventPageSpeaker(
-
-            first_name="Father",
-
-            last_name="Christmas",
-
-        )
-
-
-
-        comparison = self.comparison_class(
-
-            EventPageSpeaker,
-
-            [
-
-                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('first_name')),
-
-                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('last_name')),
-
-            ],
-
-            obj_a,
-
-            obj_b,
-
-        )
-
-
-
-        self.assertFalse(comparison.is_addition())
-
-        self.assertFalse(comparison.is_deletion())
-
-        self.assertFalse(comparison.has_changed())
-
-        self.assertEqual(comparison.get_position_change(), 0)
-
-        self.assertEqual(comparison.get_num_differences(), 0)
-
-
-
-    def test_different_object(self):
-
-        obj_a = EventPageSpeaker(
-
-            first_name="Father",
-
-            last_name="Christmas",
-
-        )
-
-
-
-        obj_b = EventPageSpeaker(
-
-            first_name="Santa",
-
-            last_name="Claus",
-
-        )
-
-
-
-        comparison = self.comparison_class(
-
-            EventPageSpeaker,
-
-            [
-
-                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('first_name')),
-
-                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('last_name')),
-
-            ],
-
-            obj_a,
-
-            obj_b,
-
-        )
-
-
-
-        self.assertFalse(comparison.is_addition())
-
-        self.assertFalse(comparison.is_deletion())
-
-        self.assertTrue(comparison.has_changed())
-
-        self.assertEqual(comparison.get_position_change(), 0)
-
-        self.assertEqual(comparison.get_num_differences(), 2)
-
-
-
-    def test_moved_object(self):
-
-        obj_a = EventPageSpeaker(
-
-            first_name="Father",
-
-            last_name="Christmas",
-
-            sort_order=1,
-
-        )
-
-
-
-        obj_b = EventPageSpeaker(
-
-            first_name="Father",
-
-            last_name="Christmas",
-
-            sort_order=5,
-
-        )
-
-
-
-        comparison = self.comparison_class(
-
-            EventPageSpeaker,
-
-            [
-
-                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('first_name')),
-
-                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('last_name')),
-
-            ],
-
-            obj_a,
-
-            obj_b,
-
-        )
-
-
-
-        self.assertFalse(comparison.is_addition())
-
-        self.assertFalse(comparison.is_deletion())
-
-        self.assertFalse(comparison.has_changed())
-
-        self.assertEqual(comparison.get_position_change(), 4)
-
-        self.assertEqual(comparison.get_num_differences(), 0)
-
-
-
-    def test_addition(self):
-
-        obj = EventPageSpeaker(
-
-            first_name="Father",
-
-            last_name="Christmas",
-
-        )
-
-
-
-        comparison = self.comparison_class(
-
-            EventPageSpeaker,
-
-            [
-
-                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('first_name')),
-
-                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('last_name')),
-
-            ],
-
-            None,
-
-            obj,
-
-        )
-
-
-
-        self.assertTrue(comparison.is_addition())
-
-        self.assertFalse(comparison.is_deletion())
-
-        self.assertFalse(comparison.has_changed())
-
-        self.assertIsNone(comparison.get_position_change(), 0)
-
-        self.assertEqual(comparison.get_num_differences(), 0)
-
-
-
-    def test_deletion(self):
-
-        obj = EventPageSpeaker(
-
-            first_name="Father",
-
-            last_name="Christmas",
-
-        )
-
-
-
-        comparison = self.comparison_class(
-
-            EventPageSpeaker,
-
-            [
-
-                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('first_name')),
-
-                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('last_name')),
-
-            ],
-
-            obj,
-
-            None,
-
-        )
-
-
-
-        self.assertFalse(comparison.is_addition())
-
-        self.assertTrue(comparison.is_deletion())
-
-        self.assertFalse(comparison.has_changed())
-
-        self.assertIsNone(comparison.get_position_change())
-
-        self.assertEqual(comparison.get_num_differences(), 0)
-
-
-
-
-
-class TestChildRelationComparisonUsingPK(TestCase):
-
-    """Test related objects can be compred if they do not use id for primary key"""
-
-
-
-    field_comparison_class = compare.FieldComparison
-
-    comparison_class = compare.ChildRelationComparison
-
-
-
-    def test_has_changed_with_same_id(self):
-
-        # Head Count was changed but the PK of the child object remained the same.
-
-        # It should be detected as the same object
-
-
-
-        event_page = EventPage(title="Semi Finals", slug="semi-finals-2018")
-
-        event_page.head_counts.add(HeadCountRelatedModelUsingPK(
-
-            custom_id=1,
-
-            head_count=22,
-
-        ))
-
-
-
-        modified_event_page = EventPage(title="Semi Finals", slug="semi-finals-2018")
-
-        modified_event_page.head_counts.add(HeadCountRelatedModelUsingPK(
-
-            custom_id=1,
-
-            head_count=23,
-
-        ))
-
-        modified_event_page.head_counts.add(HeadCountRelatedModelUsingPK(
-
-            head_count=25,
-
-        ))
-
-
-
-        comparison = self.comparison_class(
-
-            EventPage._meta.get_field('head_counts'),
-
-            [partial(self.field_comparison_class, HeadCountRelatedModelUsingPK._meta.get_field('head_count'))],
-
-            event_page,
-
-            modified_event_page,
-
-        )
-
-
-
-        self.assertFalse(comparison.is_field)
-
-        self.assertTrue(comparison.is_child_relation)
-
-        self.assertEqual(comparison.field_label(), 'Head counts')
-
-        self.assertTrue(comparison.has_changed())
-
-
-
-        # Check mapping
-
-        objs_a = list(comparison.val_a.all())
-
-        objs_b = list(comparison.val_b.all())
-
-        map_forwards, map_backwards, added, deleted = comparison.get_mapping(objs_a, objs_b)
-
-        self.assertEqual(map_forwards, {0: 0})  # map head count 22 to 23
-
-        self.assertEqual(map_backwards, {0: 0})  # map head count 23 to 22
-
-        self.assertEqual(added, [1])  # add second head count
-
-        self.assertEqual(deleted, [])
-
-
-
-
-
-    def test_hasnt_changed_with_different_id(self):
-
-        # Both of the child objects have the same field content but have a
-
-        # different PK (ID) so they should be detected as separate objects
-
-        event_page = EventPage(title="Finals", slug="finals-event-abc")
-
-        event_page.head_counts.add(HeadCountRelatedModelUsingPK(
-
-            custom_id=1,
-
-            head_count=220
-
-        ))
-
-
-
-        modified_event_page = EventPage(title="Finals", slug="finals-event-abc")
-
-        modified_event_page.head_counts.add(HeadCountRelatedModelUsingPK(
-
-            custom_id=2,
-
-            head_count=220
-
-        ))
-
-
-
-        comparison = self.comparison_class(
-
-            EventPage._meta.get_field('head_counts'),
-
-            [partial(self.field_comparison_class, HeadCountRelatedModelUsingPK._meta.get_field('head_count'))],
-
-            event_page,
-
-            modified_event_page,
-
-        )
-
-
-
-        self.assertFalse(comparison.is_field)
-
-        self.assertTrue(comparison.is_child_relation)
-
-        self.assertEqual(comparison.field_label(), "Head counts")
-
-        self.assertTrue(comparison.has_changed())
-
-
-
-        # Check mapping
-
-        objs_a = list(comparison.val_a.all())
-
-        objs_b = list(comparison.val_b.all())
-
-        map_forwards, map_backwards, added, deleted = comparison.get_mapping(objs_a, objs_b)
-
-        self.assertEqual(map_forwards, {})
-
-        self.assertEqual(map_backwards, {})
-
-        self.assertEqual(added, [0])  # Add new head count
-
-        self.assertEqual(deleted, [0])  # Delete old head count
+                            current_app=current_app)

@@ -2,662 +2,366 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# tests.paths_tests
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Testing the paths descriptor
 
-#
 
-# Author:   Benjamin Bengfort <benjamin@bengfort.com>
+# Copyright 2010 United States Government as represented by the
 
-# Created:  Thu Jun 11 08:09:40 2015 -0400
+# Administrator of the National Aeronautics and Space Administration.
 
-#
-
-# Copyright (C) 2014 Bengfort.com
-
-# For license information, see LICENSE.txt
+# All Rights Reserved.
 
 #
 
-# ID: paths_tests.py [] benjamin@bengfort.com $
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
 
+#    not use this file except in compliance with the License. You may obtain
 
+#    a copy of the License at
 
-"""
+#
 
-Testing the paths descriptor
+#         http://www.apache.org/licenses/LICENSE-2.0
 
-"""
+#
 
+#    Unless required by applicable law or agreed to in writing, software
 
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-##########################################################################
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
-## Imports
+#    License for the specific language governing permissions and limitations
 
-##########################################################################
+#    under the License.
 
 
 
-import os
+"""Quotas for instances, volumes, and floating ips."""
 
-import pytest
 
-import shutil
 
-import tempfile
+from nova import db
 
+from nova.openstack.common import cfg
 
+from nova import flags
 
-from confire.paths import Path
 
-from confire import path_setting
 
-from six import with_metaclass, string_types
 
-from confire.descriptors import SettingsMeta
 
-from confire.exceptions import ImproperlyConfigured, PathNotFound
+quota_opts = [
 
+    cfg.IntOpt('quota_instances',
 
+               default=10,
 
-##########################################################################
+               help='number of instances allowed per project'),
 
-## Temporary Paths
+    cfg.IntOpt('quota_cores',
 
-##########################################################################
+               default=20,
 
+               help='number of instance cores allowed per project'),
 
+    cfg.IntOpt('quota_ram',
 
-TEMPDIR  = tempfile.mkdtemp('_paths', 'confire_')    # The base temporary directory
+               default=50 * 1024,
 
-MDROOT   = os.path.join(TEMPDIR, "missing")          # The root of the missing directory, for unlinking
+               help='megabytes of instance ram allowed per project'),
 
-MISSDIR  = os.path.join(MDROOT, "path", "to", "dir") # A temporary directory that does not exist
+    cfg.IntOpt('quota_volumes',
 
-VARSDIR  = tempfile.mkdtemp("subdir", dir=TEMPDIR)   # A temporary directory referenced by environment
+               default=10,
 
-TESTDIR  = tempfile.mkdtemp("testdir", dir=TEMPDIR)  # Another temporary directory for testing
+               help='number of volumes allowed per project'),
 
-_, TESTFILE = tempfile.mkstemp("test.txt", dir=TEMPDIR) # A temporary file for testing
+    cfg.IntOpt('quota_gigabytes',
 
+               default=1000,
 
+               help='number of volume gigabytes allowed per project'),
 
-ENVVAR  = "VARDIR"  # environment variable to test expansion
+    cfg.IntOpt('quota_floating_ips',
 
+               default=10,
 
+               help='number of floating ips allowed per project'),
 
-##########################################################################
+    cfg.IntOpt('quota_metadata_items',
 
-## Setup and tear down module
+               default=128,
 
-##########################################################################
+               help='number of metadata items allowed per instance'),
 
+    cfg.IntOpt('quota_max_injected_files',
 
+               default=5,
 
-@pytest.fixture(scope='module', autouse=True)
+               help='number of injected files allowed'),
 
-def environ():
+    cfg.IntOpt('quota_max_injected_file_content_bytes',
 
-    os.environ[ENVVAR] = VARSDIR
+               default=10 * 1024,
 
-    yield
+               help='number of bytes allowed per injected file'),
 
-    os.environ.pop(ENVVAR)
+    cfg.IntOpt('quota_max_injected_file_path_bytes',
 
+               default=255,
 
+               help='number of bytes allowed per injected file path'),
 
+    ]
 
 
-@pytest.fixture(scope='module', autouse=True)
 
-def paths():
+FLAGS = flags.FLAGS
 
-    for path in (TEMPDIR, VARSDIR):
+FLAGS.register_opts(quota_opts)
 
-        assert os.path.exists(path)
 
-    yield
 
-    shutil.rmtree(TEMPDIR)
 
-    for path in (TEMPDIR, MISSDIR, VARSDIR, TESTDIR, TESTFILE):
 
-        assert not os.path.exists(path)
+def _get_default_quotas():
 
+    defaults = {
 
+        'instances': FLAGS.quota_instances,
 
+        'cores': FLAGS.quota_cores,
 
+        'ram': FLAGS.quota_ram,
 
-@pytest.fixture(scope='function', autouse=True)
+        'volumes': FLAGS.quota_volumes,
 
-def destroy_paths():
+        'gigabytes': FLAGS.quota_gigabytes,
 
-    yield
+        'floating_ips': FLAGS.quota_floating_ips,
 
-    if os.path.exists(MDROOT):
+        'metadata_items': FLAGS.quota_metadata_items,
 
-        shutil.rmtree(MDROOT)
+        'injected_files': FLAGS.quota_max_injected_files,
 
+        'injected_file_content_bytes':
 
+            FLAGS.quota_max_injected_file_content_bytes,
 
-    # Delete contents of the test file
+    }
 
-    with open(TESTFILE, 'w') as f:
+    # -1 in the quota flags means unlimited
 
-        f.write("")
+    for key in defaults.keys():
 
+        if defaults[key] == -1:
 
+            defaults[key] = None
 
+    return defaults
 
 
-@pytest.fixture(scope='function')
 
-def mockobj():
 
-    obj = MockObject()
 
-    path_attrs = (
+def get_project_quotas(context, project_id):
 
-        'standard_path',
+    rval = _get_default_quotas()
 
-        'default_path',
+    quota = db.quota_get_all_by_project(context, project_id)
 
-        'not_required_path',
+    for key in rval.keys():
 
-        'mkdirs_path',
+        if key in quota:
 
-        'mk_no_raise_path',
+            rval[key] = quota[key]
 
-        'dont_raise_path',
+    return rval
 
-        'not_absolute',
 
-        'silent_path',
 
-    )
 
-    return obj, path_attrs
 
+def _get_request_allotment(requested, used, quota):
 
+    if quota is None:
 
+        return requested
 
+    return quota - used
 
-##########################################################################
 
-## Mock configuration object
 
-##########################################################################
 
 
+def allowed_instances(context, requested_instances, instance_type):
 
-class MockObject(with_metaclass(SettingsMeta, object)):
+    """Check quota and return min(requested_instances, allowed_instances)."""
 
-    """
+    project_id = context.project_id
 
-    Tests an object that has Path descriptors set on the class.
+    context = context.elevated()
 
-    """
+    requested_cores = requested_instances * instance_type['vcpus']
 
+    requested_ram = requested_instances * instance_type['memory_mb']
 
+    usage = db.instance_data_get_for_project(context, project_id)
 
-    __metaclass__ = SettingsMeta
+    used_instances, used_cores, used_ram = usage
 
+    quota = get_project_quotas(context, project_id)
 
+    allowed_instances = _get_request_allotment(requested_instances,
 
-    standard_path     = path_setting()
+                                               used_instances,
 
-    default_path      = path_setting(default=TESTDIR)
+                                               quota['instances'])
 
-    not_required_path = path_setting(required=False)
+    allowed_cores = _get_request_allotment(requested_cores, used_cores,
 
-    mkdirs_path       = path_setting(mkdirs=True)
+                                           quota['cores'])
 
-    mk_no_raise_path  = path_setting(mkdirs=True, raises=False)
+    allowed_ram = _get_request_allotment(requested_ram, used_ram, quota['ram'])
 
-    dont_raise_path   = path_setting(raises=False)
+    if instance_type['vcpus']:
 
-    not_absolute      = path_setting(absolute=False, raises=False)
+        allowed_instances = min(allowed_instances,
 
-    silent_path       = path_setting(raises=False, required=False)
+                                allowed_cores // instance_type['vcpus'])
 
+    if instance_type['memory_mb']:
 
+        allowed_instances = min(allowed_instances,
 
+                                allowed_ram // instance_type['memory_mb'])
 
 
-##########################################################################
 
-## Test case
+    return min(requested_instances, allowed_instances)
 
-##########################################################################
 
 
 
-class TestPaths():
 
+def allowed_volumes(context, requested_volumes, size):
 
+    """Check quota and return min(requested_volumes, allowed_volumes)."""
 
-    def test_label(self, mockobj):
+    project_id = context.project_id
 
-        """
+    context = context.elevated()
 
-        Check that path settings get labeled
+    size = int(size)
 
-        """
+    requested_gigabytes = requested_volumes * size
 
-        _, path_attrs = mockobj
+    used_volumes, used_gigabytes = db.volume_data_get_for_project(context,
 
-        for name in path_attrs:
+                                                                  project_id)
 
-            setting = getattr(MockObject, name)
+    quota = get_project_quotas(context, project_id)
 
-            assert setting.label == name
+    allowed_volumes = _get_request_allotment(requested_volumes, used_volumes,
 
+                                             quota['volumes'])
 
+    allowed_gigabytes = _get_request_allotment(requested_gigabytes,
 
-    def test_get_path_descriptor(self, mockobj):
+                                               used_gigabytes,
 
-        """
+                                               quota['gigabytes'])
 
-        Check that the path descriptor can be fetched from the class
+    if size != 0:
 
-        """
+        allowed_volumes = min(allowed_volumes,
 
-        obj,_ = mockobj
+                              int(allowed_gigabytes // size))
 
-        assert isinstance(MockObject.default_path, Path)
+    return min(requested_volumes, allowed_volumes)
 
-        assert isinstance(obj.default_path, string_types)
 
 
 
-    def test_set_and_get_paths(self, mockobj):
 
-        """
+def allowed_floating_ips(context, requested_floating_ips):
 
-        Assert that paths can be set and fetched
+    """Check quota and return min(requested, allowed) floating ips."""
 
-        """
+    project_id = context.project_id
 
-        obj, path_attrs = mockobj
+    context = context.elevated()
 
-        for name in path_attrs:
+    used_floating_ips = db.floating_ip_count_by_project(context, project_id)
 
-            setattr(obj, name, TESTDIR)
+    quota = get_project_quotas(context, project_id)
 
-            attr = getattr(obj, name)
+    allowed_floating_ips = _get_request_allotment(requested_floating_ips,
 
+                                                  used_floating_ips,
 
+                                                  quota['floating_ips'])
 
-            assert attr == TESTDIR
+    return min(requested_floating_ips, allowed_floating_ips)
 
 
 
-    def test_delete_not_required_path(self, mockobj):
 
-        """
 
-        Assert that paths can be deleted
+def _calculate_simple_quota(context, resource, requested):
 
-        """
+    """Check quota for resource; return min(requested, allowed)."""
 
-        obj, _ = mockobj
+    quota = get_project_quotas(context, context.project_id)
 
+    allowed = _get_request_allotment(requested, 0, quota[resource])
 
+    return min(requested, allowed)
 
-        # Must use the not required path, otherwise exceptions!
 
-        obj.not_required_path = TESTDIR
 
-        assert obj.not_required_path == TESTDIR
 
 
+def allowed_metadata_items(context, requested_metadata_items):
 
-        del obj.not_required_path
+    """Return the number of metadata items allowed."""
 
-        assert obj.not_required_path is None
+    return _calculate_simple_quota(context, 'metadata_items',
 
+                                   requested_metadata_items)
 
 
-    def test_delete_required_path(self, mockobj):
 
-        """
 
-        Test that required paths on delete raise error
 
-        """
+def allowed_injected_files(context, requested_injected_files):
 
-        obj, _ = mockobj
+    """Return the number of injected files allowed."""
 
+    return _calculate_simple_quota(context, 'injected_files',
 
+                                   requested_injected_files)
 
-        with pytest.raises(ImproperlyConfigured):
 
-            # Path is required on access
 
-            path = obj.standard_path
 
 
+def allowed_injected_file_content_bytes(context, requested_bytes):
 
-        # Set to a file, and we're good to go
+    """Return the number of bytes allowed per injected file content."""
 
-        obj.standard_path = TESTFILE
+    resource = 'injected_file_content_bytes'
 
-        path = obj.standard_path
+    return _calculate_simple_quota(context, resource, requested_bytes)
 
-        assert path == TESTFILE
 
 
 
-        # Now try to delete it
 
-        del obj.standard_path
+def allowed_injected_file_path_bytes(context):
 
-        with pytest.raises(ImproperlyConfigured):
+    """Return the number of bytes allowed in an injected file path."""
 
-            path = obj.standard_path
-
-
-
-    def test_default_path(self, mockobj):
-
-        """
-
-        Check that a default path is returned when not set
-
-        """
-
-        obj, _ = mockobj
-
-
-
-        # Make sure the default is available
-
-        assert obj.default_path is not None
-
-        assert obj.default_path == TESTDIR
-
-
-
-        # Change the default to the test file
-
-        obj.default_path = TESTFILE
-
-        assert obj.default_path == TESTFILE
-
-
-
-        # Now delete the test file and check default again
-
-        del obj.default_path
-
-        assert obj.default_path is not None
-
-        assert obj.default_path == TESTDIR
-
-
-
-    def test_required_path(self, mockobj):
-
-        """
-
-        Assert that paths are required
-
-        """
-
-        obj, _ = mockobj
-
-        with pytest.raises(ImproperlyConfigured):
-
-            obj.standard_path
-
-
-
-    def test_not_required_path(self, mockobj):
-
-        """
-
-        Assert not required paths don't raise an error
-
-        """
-
-        obj, _ = mockobj
-
-
-
-        try:
-
-            path = obj.not_required_path
-
-            assert path is None
-
-        except ImproperlyConfigured:
-
-            pytest.fail("a non-required path raised a configuration error")
-
-
-
-    def test_path_not_found_warning(self, mockobj):
-
-        """
-
-        Test that PathNotFound is warned on not raises
-
-        """
-
-        obj, _ = mockobj
-
-
-
-        with pytest.warns(PathNotFound):
-
-            assert not MockObject.dont_raise_path.mkdirs
-
-            assert not os.path.exists(MISSDIR)
-
-
-
-            # Trigger a warning.
-
-            obj.dont_raise_path = MISSDIR
-
-
-
-    @pytest.mark.filterwarnings("ignore")
-
-    def test_user_expansion(self, mockobj):
-
-        """
-
-        Test that on set, user is expanded.
-
-        """
-
-        obj, _ = mockobj
-
-
-
-        testpath = "~/path/to/test"
-
-        obj.dont_raise_path = "~/path/to/test"
-
-        assert obj.dont_raise_path == os.path.expanduser(testpath)
-
-
-
-    @pytest.mark.filterwarnings("ignore")
-
-    def test_vars_expansion(self, mockobj):
-
-        """
-
-        Test that on set, vars are expanded.
-
-        """
-
-        obj, _ = mockobj
-
-        obj.standard_path = "${}".format(ENVVAR)
-
-        assert obj.standard_path == VARSDIR
-
-
-
-    @pytest.mark.filterwarnings("ignore")
-
-    def test_normpath_path(self, mockobj):
-
-        """
-
-        Test that on set the path is normed
-
-        """
-
-        obj, _ = mockobj
-
-
-
-        # Use the not raises so that we don't have to create the user path
-
-        path = os.path.join(VARSDIR, "..")
-
-        obj.standard_path = path
-
-        assert obj.standard_path == TEMPDIR
-
-
-
-    @pytest.mark.filterwarnings("ignore")
-
-    def test_absolute_path(self, mockobj):
-
-        """
-
-        Test that the path is transformed into an absolute path
-
-        """
-
-        obj, _ = mockobj
-
-
-
-        # Use the not raises so that we don't have to create the user path
-
-        relative_path = "path/to/test.txt"
-
-        obj.dont_raise_path = relative_path
-
-        assert obj.dont_raise_path == os.path.abspath(relative_path)
-
-
-
-    @pytest.mark.filterwarnings("ignore")
-
-    def test_not_absolute_path(self, mockobj):
-
-        """
-
-        Test that the path is not transformed into an absolute path
-
-        """
-
-        obj, _ = mockobj
-
-        # Use the not raises so that we don't have to create the user path
-
-        relative_path = "path/to/test.txt"
-
-        obj.not_absolute = relative_path
-
-        assert obj.not_absolute == relative_path
-
-
-
-    def test_mkdirs_path(self, mockobj):
-
-        """
-
-        Test that a directory is created on mkdirs = True
-
-        """
-
-        obj, _ = mockobj
-
-        assert not os.path.exists(MISSDIR)
-
-        obj.mkdirs_path = MISSDIR
-
-        assert os.path.exists(MISSDIR)
-
-
-
-    @pytest.mark.filterwarnings("ignore")
-
-    def test_no_mkdirs_path(self, mockobj):
-
-        """
-
-        Test that no directory is created by default
-
-        """
-
-        obj, _ = mockobj
-
-
-
-        assert not os.path.exists(MISSDIR)
-
-        obj.silent_path = MISSDIR
-
-        assert not os.path.exists(MISSDIR)
-
-
-
-    def test_raises_path(self, mockobj):
-
-        """
-
-        Test that if raises is True, an exception happens
-
-        """
-
-        obj, _ = mockobj
-
-        for path in ('standard_path', 'default_path', 'not_required_path'):
-
-            with pytest.raises(ImproperlyConfigured):
-
-                assert not os.path.exists(MISSDIR)
-
-                setattr(obj, path, MISSDIR)
-
-
-
-    @pytest.mark.filterwarnings("ignore")
-
-    def test_not_raises_path(self, mockobj):
-
-        """
-
-        Assert other paths don't raise an exception
-
-        """
-
-        obj, _ = mockobj
-
-        for path in ('mk_no_raise_path', 'dont_raise_path', 'not_absolute', 'silent_path'):
-
-            try:
-
-                if os.path.exists(MISSDIR):
-
-                    shutil.rmtree(MISSDIR)
-
-
-
-                setattr(obj, path, MISSDIR)
-
-            except ImproperlyConfigured:
-
-                self.fail("Improperly configured raised on %s" % path)
+    return FLAGS.quota_max_injected_file_path_bytes

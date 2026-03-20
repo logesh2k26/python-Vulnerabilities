@@ -2,646 +2,654 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-#!/usr/bin/python
-
-# -*- coding: utf-8 -*-
-
-
-
-# Copyright: (c) 2019, Patrick Pichler <ppichler+ansible@mgit.at>
-
-# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
-
-
-
-from __future__ import absolute_import, division, print_function
-
-__metaclass__ = type
-
-
-
-
-
-DOCUMENTATION = r'''
-
----
-
-module: openssl_signature
-
-version_added: 1.1.0
-
-short_description: Sign data with openssl
-
-description:
-
-    - This module allows one to sign data using a private key.
-
-    - The module can use the cryptography Python library, or the pyOpenSSL Python
-
-      library. By default, it tries to detect which one is available. This can be
-
-      overridden with the I(select_crypto_backend) option. Please note that the PyOpenSSL backend
-
-      was deprecated in Ansible 2.9 and will be removed in community.crypto 2.0.0.
-
-requirements:
-
-    - Either cryptography >= 1.4 (some key types require newer versions)
-
-    - Or pyOpenSSL >= 0.11 (Ed25519 and Ed448 keys are not supported with this backend)
-
-author:
-
-    - Patrick Pichler (@aveexy)
-
-    - Markus Teufelberger (@MarkusTeufelberger)
-
-options:
-
-    privatekey_path:
-
-        description:
-
-            - The path to the private key to use when signing.
-
-            - Either I(privatekey_path) or I(privatekey_content) must be specified, but not both.
-
-        type: path
-
-    privatekey_content:
-
-        description:
-
-            - The content of the private key to use when signing the certificate signing request.
-
-            - Either I(privatekey_path) or I(privatekey_content) must be specified, but not both.
-
-        type: str
-
-    privatekey_passphrase:
-
-        description:
-
-            - The passphrase for the private key.
-
-            - This is required if the private key is password protected.
-
-        type: str
-
-    path:
-
-        description:
-
-            - The file to sign.
-
-            - This file will only be read and not modified.
-
-        type: path
-
-        required: true
-
-    select_crypto_backend:
-
-        description:
-
-            - Determines which crypto backend to use.
-
-            - The default choice is C(auto), which tries to use C(cryptography) if available, and falls back to C(pyopenssl).
-
-            - If set to C(pyopenssl), will try to use the L(pyOpenSSL,https://pypi.org/project/pyOpenSSL/) library.
-
-            - If set to C(cryptography), will try to use the L(cryptography,https://cryptography.io/) library.
-
-        type: str
-
-        default: auto
-
-        choices: [ auto, cryptography, pyopenssl ]
-
-notes:
-
-    - |
-
-      When using the C(cryptography) backend, the following key types require at least the following C(cryptography) version:
-
-      RSA keys: C(cryptography) >= 1.4
-
-      DSA and ECDSA keys: C(cryptography) >= 1.5
-
-      ed448 and ed25519 keys: C(cryptography) >= 2.6
-
-seealso:
-
-    - module: community.crypto.openssl_signature_info
-
-    - module: community.crypto.openssl_privatekey
-
-'''
-
-
-
-EXAMPLES = r'''
-
-- name: Sign example file
-
-  community.crypto.openssl_signature:
-
-    privatekey_path: private.key
-
-    path: /tmp/example_file
-
-  register: sig
-
-
-
-- name: Verify signature of example file
-
-  community.crypto.openssl_signature_info:
-
-    certificate_path: cert.pem
-
-    path: /tmp/example_file
-
-    signature: "{{ sig.signature }}"
-
-  register: verify
-
-
-
-- name: Make sure the signature is valid
-
-  assert:
-
-    that:
-
-      - verify.valid
-
-'''
-
-
-
-RETURN = r'''
-
-signature:
-
-    description: Base64 encoded signature.
-
-    returned: success
-
-    type: str
-
-'''
-
-
-
-import os
-
-import traceback
-
-from distutils.version import LooseVersion
-
 import base64
 
+import hashlib
+
+import hmac
+
+import struct
+
+import six
+
+import sys
 
 
-MINIMAL_PYOPENSSL_VERSION = '0.11'
 
-MINIMAL_CRYPTOGRAPHY_VERSION = '1.4'
+import Crypto.Hash.SHA256
+
+import Crypto.Hash.SHA384
+
+import Crypto.Hash.SHA512
 
 
 
-PYOPENSSL_IMP_ERR = None
+from Crypto.PublicKey import RSA
 
-try:
+from Crypto.Signature import PKCS1_v1_5
 
-    import OpenSSL
+from Crypto.Util.asn1 import DerSequence
 
-    from OpenSSL import crypto
 
-    PYOPENSSL_VERSION = LooseVersion(OpenSSL.__version__)
 
-except ImportError:
+import ecdsa
 
-    PYOPENSSL_IMP_ERR = traceback.format_exc()
 
-    PYOPENSSL_FOUND = False
+
+from jose.constants import ALGORITHMS
+
+from jose.exceptions import JWKError
+
+from jose.utils import base64url_decode
+
+
+
+# PyCryptodome's RSA module doesn't have PyCrypto's _RSAobj class
+
+# Instead it has a class named RsaKey, which serves the same purpose.
+
+if hasattr(RSA, '_RSAobj'):
+
+    _RSAKey = RSA._RSAobj
 
 else:
 
-    PYOPENSSL_FOUND = True
+    _RSAKey = RSA.RsaKey
 
 
 
-CRYPTOGRAPHY_IMP_ERR = None
+# Deal with integer compatibilities between Python 2 and 3.
 
-try:
+# Using `from builtins import int` is not supported on AppEngine.
 
-    import cryptography
+if sys.version_info > (3,):
 
-    import cryptography.hazmat.primitives.asymmetric.padding
+    long = int
 
-    import cryptography.hazmat.primitives.hashes
 
-    CRYPTOGRAPHY_VERSION = LooseVersion(cryptography.__version__)
 
-except ImportError:
 
-    CRYPTOGRAPHY_IMP_ERR = traceback.format_exc()
 
-    CRYPTOGRAPHY_FOUND = False
+def int_arr_to_long(arr):
 
-else:
+    return long(''.join(["%02x" % byte for byte in arr]), 16)
 
-    CRYPTOGRAPHY_FOUND = True
 
 
 
-from ansible_collections.community.crypto.plugins.module_utils.crypto.basic import (
 
-    CRYPTOGRAPHY_HAS_DSA_SIGN,
+def base64_to_long(data):
 
-    CRYPTOGRAPHY_HAS_EC_SIGN,
+    if isinstance(data, six.text_type):
 
-    CRYPTOGRAPHY_HAS_ED25519_SIGN,
+        data = data.encode("ascii")
 
-    CRYPTOGRAPHY_HAS_ED448_SIGN,
 
-    CRYPTOGRAPHY_HAS_RSA_SIGN,
 
-    OpenSSLObjectError,
+    # urlsafe_b64decode will happily convert b64encoded data
 
-)
+    _d = base64.urlsafe_b64decode(bytes(data) + b'==')
 
+    return int_arr_to_long(struct.unpack('%sB' % len(_d), _d))
 
 
-from ansible_collections.community.crypto.plugins.module_utils.crypto.support import (
 
-    OpenSSLObject,
 
-    load_privatekey,
 
-)
+def construct(key_data, algorithm=None):
 
+    """
 
+    Construct a Key object for the given algorithm with the given
 
-from ansible.module_utils._text import to_native, to_bytes
+    key_data.
 
-from ansible.module_utils.basic import AnsibleModule, missing_required_lib
+    """
 
 
 
+    # Allow for pulling the algorithm off of the passed in jwk.
 
+    if not algorithm and isinstance(key_data, dict):
 
-class SignatureBase(OpenSSLObject):
+        algorithm = key_data.get('alg', None)
 
 
 
-    def __init__(self, module, backend):
+    if not algorithm:
 
-        super(SignatureBase, self).__init__(
+        raise JWKError('Unable to find a algorithm for key: %s' % key_data)
 
-            path=module.params['path'],
 
-            state='present',
 
-            force=False,
+    if algorithm in ALGORITHMS.HMAC:
 
-            check_mode=module.check_mode
+        return HMACKey(key_data, algorithm)
 
-        )
 
 
+    if algorithm in ALGORITHMS.RSA:
 
-        self.backend = backend
+        return RSAKey(key_data, algorithm)
 
 
 
-        self.privatekey_path = module.params['privatekey_path']
+    if algorithm in ALGORITHMS.EC:
 
-        self.privatekey_content = module.params['privatekey_content']
+        return ECKey(key_data, algorithm)
 
-        if self.privatekey_content is not None:
 
-            self.privatekey_content = self.privatekey_content.encode('utf-8')
 
-        self.privatekey_passphrase = module.params['privatekey_passphrase']
 
 
+def get_algorithm_object(algorithm):
 
-    def generate(self):
 
-        # Empty method because OpenSSLObject wants this
 
-        pass
+    algorithms = {
 
+        ALGORITHMS.HS256: HMACKey.SHA256,
 
+        ALGORITHMS.HS384: HMACKey.SHA384,
 
-    def dump(self):
+        ALGORITHMS.HS512: HMACKey.SHA512,
 
-        # Empty method because OpenSSLObject wants this
+        ALGORITHMS.RS256: RSAKey.SHA256,
 
-        pass
+        ALGORITHMS.RS384: RSAKey.SHA384,
 
+        ALGORITHMS.RS512: RSAKey.SHA512,
 
+        ALGORITHMS.ES256: ECKey.SHA256,
 
+        ALGORITHMS.ES384: ECKey.SHA384,
 
+        ALGORITHMS.ES512: ECKey.SHA512,
 
-# Implementation with using pyOpenSSL
+    }
 
-class SignaturePyOpenSSL(SignatureBase):
 
 
+    return algorithms.get(algorithm, None)
 
-    def __init__(self, module, backend):
 
-        super(SignaturePyOpenSSL, self).__init__(module, backend)
 
 
 
-    def run(self):
+class Key(object):
 
+    """
 
+    A simple interface for implementing JWK keys.
 
-        result = dict()
+    """
 
+    prepared_key = None
 
+    hash_alg = None
+
+
+
+    def _process_jwk(self, jwk_dict):
+
+        raise NotImplementedError()
+
+
+
+    def sign(self, msg):
+
+        raise NotImplementedError()
+
+
+
+    def verify(self, msg, sig):
+
+        raise NotImplementedError()
+
+
+
+
+
+class HMACKey(Key):
+
+    """
+
+    Performs signing and verification operations using HMAC
+
+    and the specified hash function.
+
+    """
+
+    SHA256 = hashlib.sha256
+
+    SHA384 = hashlib.sha384
+
+    SHA512 = hashlib.sha512
+
+    valid_hash_algs = ALGORITHMS.HMAC
+
+
+
+    prepared_key = None
+
+    hash_alg = None
+
+
+
+    def __init__(self, key, algorithm):
+
+        if algorithm not in self.valid_hash_algs:
+
+            raise JWKError('hash_alg: %s is not a valid hash algorithm' % algorithm)
+
+        self.hash_alg = get_algorithm_object(algorithm)
+
+
+
+        if isinstance(key, dict):
+
+            self.prepared_key = self._process_jwk(key)
+
+            return
+
+
+
+        if not isinstance(key, six.string_types) and not isinstance(key, bytes):
+
+            raise JWKError('Expecting a string- or bytes-formatted key.')
+
+
+
+        if isinstance(key, six.text_type):
+
+            key = key.encode('utf-8')
+
+
+
+        invalid_strings = [
+
+            b'-----BEGIN PUBLIC KEY-----',
+
+            b'-----BEGIN CERTIFICATE-----',
+
+            b'ssh-rsa'
+
+        ]
+
+
+
+        if any([string_value in key for string_value in invalid_strings]):
+
+            raise JWKError(
+
+                'The specified key is an asymmetric key or x509 certificate and'
+
+                ' should not be used as an HMAC secret.')
+
+
+
+        self.prepared_key = key
+
+
+
+    def _process_jwk(self, jwk_dict):
+
+        if not jwk_dict.get('kty') == 'oct':
+
+            raise JWKError("Incorrect key type.  Expected: 'oct', Recieved: %s" % jwk_dict.get('kty'))
+
+
+
+        k = jwk_dict.get('k')
+
+        k = k.encode('utf-8')
+
+        k = bytes(k)
+
+        k = base64url_decode(k)
+
+
+
+        return k
+
+
+
+    def sign(self, msg):
+
+        return hmac.new(self.prepared_key, msg, self.hash_alg).digest()
+
+
+
+    def verify(self, msg, sig):
+
+        return sig == self.sign(msg)
+
+
+
+
+
+class RSAKey(Key):
+
+    """
+
+    Performs signing and verification operations using
+
+    RSASSA-PKCS-v1_5 and the specified hash function.
+
+    This class requires PyCrypto package to be installed.
+
+    This is based off of the implementation in PyJWT 0.3.2
+
+    """
+
+
+
+    SHA256 = Crypto.Hash.SHA256
+
+    SHA384 = Crypto.Hash.SHA384
+
+    SHA512 = Crypto.Hash.SHA512
+
+    valid_hash_algs = ALGORITHMS.RSA
+
+
+
+    prepared_key = None
+
+    hash_alg = None
+
+
+
+    def __init__(self, key, algorithm):
+
+
+
+        if algorithm not in self.valid_hash_algs:
+
+            raise JWKError('hash_alg: %s is not a valid hash algorithm' % algorithm)
+
+        self.hash_alg = get_algorithm_object(algorithm)
+
+
+
+        if isinstance(key, _RSAKey):
+
+            self.prepared_key = key
+
+            return
+
+
+
+        if isinstance(key, dict):
+
+            self._process_jwk(key)
+
+            return
+
+
+
+        if isinstance(key, six.string_types):
+
+            if isinstance(key, six.text_type):
+
+                key = key.encode('utf-8')
+
+
+
+            if key.startswith(b'-----BEGIN CERTIFICATE-----'):
+
+                try:
+
+                    self._process_cert(key)
+
+                except Exception as e:
+
+                    raise JWKError(e)
+
+                return
+
+
+
+            try:
+
+                self.prepared_key = RSA.importKey(key)
+
+            except Exception as e:
+
+                raise JWKError(e)
+
+            return
+
+
+
+        raise JWKError('Unable to parse an RSA_JWK from key: %s' % key)
+
+
+
+    def _process_jwk(self, jwk_dict):
+
+        if not jwk_dict.get('kty') == 'RSA':
+
+            raise JWKError("Incorrect key type.  Expected: 'RSA', Recieved: %s" % jwk_dict.get('kty'))
+
+
+
+        e = base64_to_long(jwk_dict.get('e', 256))
+
+        n = base64_to_long(jwk_dict.get('n'))
+
+
+
+        self.prepared_key = RSA.construct((n, e))
+
+        return self.prepared_key
+
+
+
+    def _process_cert(self, key):
+
+        pemLines = key.replace(b' ', b'').split()
+
+        certDer = base64url_decode(b''.join(pemLines[1:-1]))
+
+        certSeq = DerSequence()
+
+        certSeq.decode(certDer)
+
+        tbsSeq = DerSequence()
+
+        tbsSeq.decode(certSeq[0])
+
+        self.prepared_key = RSA.importKey(tbsSeq[6])
+
+        return
+
+
+
+    def sign(self, msg):
 
         try:
 
-            with open(self.path, "rb") as f:
-
-                _in = f.read()
-
-
-
-            private_key = load_privatekey(
-
-                path=self.privatekey_path,
-
-                content=self.privatekey_content,
-
-                passphrase=self.privatekey_passphrase,
-
-                backend=self.backend,
-
-            )
-
-
-
-            signature = OpenSSL.crypto.sign(private_key, _in, "sha256")
-
-            result['signature'] = base64.b64encode(signature)
-
-            return result
+            return PKCS1_v1_5.new(self.prepared_key).sign(self.hash_alg.new(msg))
 
         except Exception as e:
 
-            raise OpenSSLObjectError(e)
+            raise JWKError(e)
 
 
 
-
-
-# Implementation with using cryptography
-
-class SignatureCryptography(SignatureBase):
-
-
-
-    def __init__(self, module, backend):
-
-        super(SignatureCryptography, self).__init__(module, backend)
-
-
-
-    def run(self):
-
-        _padding = cryptography.hazmat.primitives.asymmetric.padding.PKCS1v15()
-
-        _hash = cryptography.hazmat.primitives.hashes.SHA256()
-
-
-
-        result = dict()
-
-
+    def verify(self, msg, sig):
 
         try:
 
-            with open(self.path, "rb") as f:
-
-                _in = f.read()
-
-
-
-            private_key = load_privatekey(
-
-                path=self.privatekey_path,
-
-                content=self.privatekey_content,
-
-                passphrase=self.privatekey_passphrase,
-
-                backend=self.backend,
-
-            )
-
-
-
-            signature = None
-
-
-
-            if CRYPTOGRAPHY_HAS_DSA_SIGN:
-
-                if isinstance(private_key, cryptography.hazmat.primitives.asymmetric.dsa.DSAPrivateKey):
-
-                    signature = private_key.sign(_in, _hash)
-
-
-
-            if CRYPTOGRAPHY_HAS_EC_SIGN:
-
-                if isinstance(private_key, cryptography.hazmat.primitives.asymmetric.ec.EllipticCurvePrivateKey):
-
-                    signature = private_key.sign(_in, cryptography.hazmat.primitives.asymmetric.ec.ECDSA(_hash))
-
-
-
-            if CRYPTOGRAPHY_HAS_ED25519_SIGN:
-
-                if isinstance(private_key, cryptography.hazmat.primitives.asymmetric.ed25519.Ed25519PrivateKey):
-
-                    signature = private_key.sign(_in)
-
-
-
-            if CRYPTOGRAPHY_HAS_ED448_SIGN:
-
-                if isinstance(private_key, cryptography.hazmat.primitives.asymmetric.ed448.Ed448PrivateKey):
-
-                    signature = private_key.sign(_in)
-
-
-
-            if CRYPTOGRAPHY_HAS_RSA_SIGN:
-
-                if isinstance(private_key, cryptography.hazmat.primitives.asymmetric.rsa.RSAPrivateKey):
-
-                    signature = private_key.sign(_in, _padding, _hash)
-
-
-
-            if signature is None:
-
-                self.module.fail_json(
-
-                    msg="Unsupported key type. Your cryptography version is {0}".format(CRYPTOGRAPHY_VERSION)
-
-                )
-
-
-
-            result['signature'] = base64.b64encode(signature)
-
-            return result
-
-
+            return PKCS1_v1_5.new(self.prepared_key).verify(self.hash_alg.new(msg), sig)
 
         except Exception as e:
 
-            raise OpenSSLObjectError(e)
+            raise JWKError(e)
 
 
 
 
 
-def main():
+class ECKey(Key):
 
-    module = AnsibleModule(
+    """
 
-        argument_spec=dict(
+    Performs signing and verification operations using
 
-            privatekey_path=dict(type='path'),
+    ECDSA and the specified hash function
 
-            privatekey_content=dict(type='str'),
 
-            privatekey_passphrase=dict(type='str', no_log=True),
 
-            path=dict(type='path', required=True),
+    This class requires the ecdsa package to be installed.
 
-            select_crypto_backend=dict(type='str', choices=['auto', 'pyopenssl', 'cryptography'], default='auto'),
 
-        ),
 
-        mutually_exclusive=(
+    This is based off of the implementation in PyJWT 0.3.2
 
-            ['privatekey_path', 'privatekey_content'],
+    """
 
-        ),
+    SHA256 = hashlib.sha256
 
-        required_one_of=(
+    SHA384 = hashlib.sha384
 
-            ['privatekey_path', 'privatekey_content'],
+    SHA512 = hashlib.sha512
 
-        ),
+    valid_hash_algs = ALGORITHMS.EC
 
-        supports_check_mode=True,
 
-    )
 
+    curve_map = {
 
+        SHA256: ecdsa.curves.NIST256p,
 
-    if not os.path.isfile(module.params['path']):
+        SHA384: ecdsa.curves.NIST384p,
 
-        module.fail_json(
+        SHA512: ecdsa.curves.NIST521p,
 
-            name=module.params['path'],
+    }
 
-            msg='The file {0} does not exist'.format(module.params['path'])
 
-        )
 
+    prepared_key = None
 
+    hash_alg = None
 
-    backend = module.params['select_crypto_backend']
+    curve = None
 
-    if backend == 'auto':
 
-        # Detection what is possible
 
-        can_use_cryptography = CRYPTOGRAPHY_FOUND and CRYPTOGRAPHY_VERSION >= LooseVersion(MINIMAL_CRYPTOGRAPHY_VERSION)
+    def __init__(self, key, algorithm):
 
-        can_use_pyopenssl = PYOPENSSL_FOUND and PYOPENSSL_VERSION >= LooseVersion(MINIMAL_PYOPENSSL_VERSION)
+        if algorithm not in self.valid_hash_algs:
 
+            raise JWKError('hash_alg: %s is not a valid hash algorithm' % algorithm)
 
+        self.hash_alg = get_algorithm_object(algorithm)
 
-        # Decision
 
-        if can_use_cryptography:
 
-            backend = 'cryptography'
+        self.curve = self.curve_map.get(self.hash_alg)
 
-        elif can_use_pyopenssl:
 
-            backend = 'pyopenssl'
 
+        if isinstance(key, (ecdsa.SigningKey, ecdsa.VerifyingKey)):
 
+            self.prepared_key = key
 
-        # Success?
+            return
 
-        if backend == 'auto':
 
-            module.fail_json(msg=("Can't detect any of the required Python libraries "
 
-                                  "cryptography (>= {0}) or PyOpenSSL (>= {1})").format(
+        if isinstance(key, dict):
 
-                MINIMAL_CRYPTOGRAPHY_VERSION,
+            self.prepared_key = self._process_jwk(key)
 
-                MINIMAL_PYOPENSSL_VERSION))
+            return
 
-    try:
 
-        if backend == 'pyopenssl':
 
-            if not PYOPENSSL_FOUND:
+        if isinstance(key, six.string_types):
 
-                module.fail_json(msg=missing_required_lib('pyOpenSSL >= {0}'.format(MINIMAL_PYOPENSSL_VERSION)),
+            if isinstance(key, six.text_type):
 
-                                 exception=PYOPENSSL_IMP_ERR)
+                key = key.encode('utf-8')
 
-            module.deprecate('The module is using the PyOpenSSL backend. This backend has been deprecated',
 
-                             version='2.0.0', collection_name='community.crypto')
 
-            _sign = SignaturePyOpenSSL(module, backend)
+            # Attempt to load key. We don't know if it's
 
-        elif backend == 'cryptography':
+            # a Signing Key or a Verifying Key, so we try
 
-            if not CRYPTOGRAPHY_FOUND:
+            # the Verifying Key first.
 
-                module.fail_json(msg=missing_required_lib('cryptography >= {0}'.format(MINIMAL_CRYPTOGRAPHY_VERSION)),
+            try:
 
-                                 exception=CRYPTOGRAPHY_IMP_ERR)
+                key = ecdsa.VerifyingKey.from_pem(key)
 
-            _sign = SignatureCryptography(module, backend)
+            except ecdsa.der.UnexpectedDER:
 
+                key = ecdsa.SigningKey.from_pem(key)
 
+            except Exception as e:
 
-        result = _sign.run()
+                raise JWKError(e)
 
 
 
-        module.exit_json(**result)
+            self.prepared_key = key
 
-    except OpenSSLObjectError as exc:
+            return
 
-        module.fail_json(msg=to_native(exc))
 
 
+        raise JWKError('Unable to parse an ECKey from key: %s' % key)
 
 
 
-if __name__ == '__main__':
+    def _process_jwk(self, jwk_dict):
 
-    main()
+        if not jwk_dict.get('kty') == 'EC':
+
+            raise JWKError("Incorrect key type.  Expected: 'EC', Recieved: %s" % jwk_dict.get('kty'))
+
+
+
+        x = base64_to_long(jwk_dict.get('x'))
+
+        y = base64_to_long(jwk_dict.get('y'))
+
+
+
+        if not ecdsa.ecdsa.point_is_valid(self.curve.generator, x, y):
+
+            raise JWKError("Point: %s, %s is not a valid point" % (x, y))
+
+
+
+        point = ecdsa.ellipticcurve.Point(self.curve.curve, x, y, self.curve.order)
+
+        verifying_key = ecdsa.keys.VerifyingKey.from_public_point(point, self.curve)
+
+
+
+        return verifying_key
+
+
+
+    def sign(self, msg):
+
+        return self.prepared_key.sign(msg, hashfunc=self.hash_alg, sigencode=ecdsa.util.sigencode_string)
+
+
+
+    def verify(self, msg, sig):
+
+        try:
+
+            return self.prepared_key.verify(sig, msg, hashfunc=self.hash_alg, sigdecode=ecdsa.util.sigdecode_string)
+
+        except:
+
+            return False

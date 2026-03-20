@@ -2,1222 +2,1754 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
+# vim: ft=python fileencoding=utf-8 sts=4 sw=4 et:
 
 
 
-# Copyright 2012 OpenStack LLC
-
-#
-
-# Licensed under the Apache License, Version 2.0 (the "License"); you may
-
-# not use this file except in compliance with the License. You may obtain
-
-# a copy of the License at
+# Copyright 2016-2019 Florian Bruhin (The Compiler) <mail@qutebrowser.org>
 
 #
 
-#      http://www.apache.org/licenses/LICENSE-2.0
+# This file is part of qutebrowser.
 
 #
 
-# Unless required by applicable law or agreed to in writing, software
+# qutebrowser is free software: you can redistribute it and/or modify
 
-# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# it under the terms of the GNU General Public License as published by
 
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# the Free Software Foundation, either version 3 of the License, or
 
-# License for the specific language governing permissions and limitations
+# (at your option) any later version.
 
-# under the License.
+#
 
+# qutebrowser is distributed in the hope that it will be useful,
 
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
 
-"""Main entry point into the Identity service."""
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 
+# GNU General Public License for more details.
 
+#
 
-import uuid
+# You should have received a copy of the GNU General Public License
 
-import urllib
-
-import urlparse
-
-
-
-from keystone import config
-
-from keystone import exception
-
-from keystone import policy
-
-from keystone import token
-
-from keystone.common import manager
-
-from keystone.common import wsgi
+# along with qutebrowser.  If not, see <http://www.gnu.org/licenses/>.
 
 
 
-
-
-CONF = config.CONF
-
+"""Wrapper over our (QtWebKit) WebView."""
 
 
 
+import re
 
-class Manager(manager.Manager):
+import functools
 
-    """Default pivot point for the Identity backend.
-
-
-
-    See :mod:`keystone.common.manager.Manager` for more details on how this
-
-    dynamically calls the backend.
+import xml.etree.ElementTree
 
 
 
-    """
+from PyQt5.QtCore import pyqtSlot, Qt, QUrl, QPoint, QTimer, QSizeF, QSize
+
+from PyQt5.QtGui import QIcon
+
+from PyQt5.QtWebKitWidgets import QWebPage, QWebFrame
+
+from PyQt5.QtWebKit import QWebSettings
+
+from PyQt5.QtPrintSupport import QPrinter
 
 
 
-    def __init__(self):
+from qutebrowser.browser import browsertab, shared
 
-        super(Manager, self).__init__(CONF.identity.driver)
+from qutebrowser.browser.webkit import (webview, tabhistory, webkitelem,
+
+                                        webkitsettings)
+
+from qutebrowser.utils import qtutils, usertypes, utils, log, debug
+
+from qutebrowser.qt import sip
 
 
 
 
 
-class Driver(object):
-
-    """Interface description for an Identity driver."""
+class WebKitAction(browsertab.AbstractAction):
 
 
 
-    def authenticate(self, user_id=None, tenant_id=None, password=None):
-
-        """Authenticate a given user, tenant and password.
+    """QtWebKit implementations related to web actions."""
 
 
 
-        Returns: (user, tenant, metadata).
+    action_class = QWebPage
+
+    action_base = QWebPage.WebAction
 
 
+
+    def exit_fullscreen(self):
+
+        raise browsertab.UnsupportedOperationError
+
+
+
+    def save_page(self):
+
+        """Save the current page."""
+
+        raise browsertab.UnsupportedOperationError
+
+
+
+    def show_source(self, pygments=False):
+
+        self._show_source_pygments()
+
+
+
+
+
+class WebKitPrinting(browsertab.AbstractPrinting):
+
+
+
+    """QtWebKit implementations related to printing."""
+
+
+
+    def check_pdf_support(self):
+
+        pass
+
+
+
+    def check_printer_support(self):
+
+        pass
+
+
+
+    def check_preview_support(self):
+
+        pass
+
+
+
+    def to_pdf(self, filename):
+
+        printer = QPrinter()
+
+        printer.setOutputFileName(filename)
+
+        self.to_printer(printer)
+
+
+
+    def to_printer(self, printer, callback=None):
+
+        self._widget.print(printer)
+
+        # Can't find out whether there was an error...
+
+        if callback is not None:
+
+            callback(True)
+
+
+
+
+
+class WebKitSearch(browsertab.AbstractSearch):
+
+
+
+    """QtWebKit implementations related to searching on the page."""
+
+
+
+    def __init__(self, tab, parent=None):
+
+        super().__init__(tab, parent)
+
+        self._flags = QWebPage.FindFlags(0)
+
+
+
+    def _call_cb(self, callback, found, text, flags, caller):
+
+        """Call the given callback if it's non-None.
+
+
+
+        Delays the call via a QTimer so the website is re-rendered in between.
+
+
+
+        Args:
+
+            callback: What to call
+
+            found: If the text was found
+
+            text: The text searched for
+
+            flags: The flags searched with
+
+            caller: Name of the caller.
 
         """
 
-        raise exception.NotImplemented()
+        found_text = 'found' if found else "didn't find"
 
+        # Removing FindWrapsAroundDocument to get the same logging as with
 
+        # QtWebEngine
 
-    def get_tenant(self, tenant_id):
+        debug_flags = debug.qflags_key(
 
-        """Get a tenant by id.
+            QWebPage, flags & ~QWebPage.FindWrapsAroundDocument,
 
+            klass=QWebPage.FindFlag)
 
+        if debug_flags != '0x0000':
 
-        Returns: tenant_ref or None.
+            flag_text = 'with flags {}'.format(debug_flags)
 
+        else:
 
+            flag_text = ''
 
-        """
+        log.webview.debug(' '.join([caller, found_text, text, flag_text])
 
-        raise exception.NotImplemented()
+                          .strip())
 
+        if callback is not None:
 
+            QTimer.singleShot(0, functools.partial(callback, found))
 
-    def get_tenant_by_name(self, tenant_name):
 
-        """Get a tenant by name.
 
+        self.finished.emit(found)
 
 
-        Returns: tenant_ref or None.
 
+    def clear(self):
 
+        if self.search_displayed:
 
-        """
+            self.cleared.emit()
 
-        raise exception.NotImplemented()
+        self.search_displayed = False
 
+        # We first clear the marked text, then the highlights
 
+        self._widget.findText('')
 
-    def get_user(self, user_id):
+        self._widget.findText('', QWebPage.HighlightAllOccurrences)
 
-        """Get a user by id.
 
 
+    def search(self, text, *, ignore_case=usertypes.IgnoreCase.never,
 
-        Returns: user_ref or None.
+               reverse=False, result_cb=None):
 
+        # Don't go to next entry on duplicate search
 
+        if self.text == text and self.search_displayed:
 
-        """
+            log.webview.debug("Ignoring duplicate search request"
 
-        raise exception.NotImplemented()
+                              " for {}".format(text))
 
+            return
 
 
-    def get_user_by_name(self, user_name):
 
-        """Get a user by name.
+        # Clear old search results, this is done automatically on QtWebEngine.
 
+        self.clear()
 
 
-        Returns: user_ref or None.
 
+        self.text = text
 
+        self.search_displayed = True
 
-        """
+        self._flags = QWebPage.FindWrapsAroundDocument
 
-        raise exception.NotImplemented()
+        if self._is_case_sensitive(ignore_case):
 
+            self._flags |= QWebPage.FindCaseSensitively
 
+        if reverse:
 
-    def get_role(self, role_id):
+            self._flags |= QWebPage.FindBackward
 
-        """Get a role by id.
+        # We actually search *twice* - once to highlight everything, then again
 
+        # to get a mark so we can navigate.
 
+        found = self._widget.findText(text, self._flags)
 
-        Returns: role_ref or None.
+        self._widget.findText(text,
 
+                              self._flags | QWebPage.HighlightAllOccurrences)
 
+        self._call_cb(result_cb, found, text, self._flags, 'search')
 
-        """
 
-        raise exception.NotImplemented()
 
+    def next_result(self, *, result_cb=None):
 
+        self.search_displayed = True
 
-    def list_users(self):
+        found = self._widget.findText(self.text, self._flags)
 
-        """List all users in the system.
+        self._call_cb(result_cb, found, self.text, self._flags, 'next_result')
 
 
 
-        NOTE(termie): I'd prefer if this listed only the users for a given
+    def prev_result(self, *, result_cb=None):
 
-                      tenant.
+        self.search_displayed = True
 
+        # The int() here makes sure we get a copy of the flags.
 
+        flags = QWebPage.FindFlags(int(self._flags))
 
-        Returns: a list of user_refs or an empty list.
+        if flags & QWebPage.FindBackward:
 
+            flags &= ~QWebPage.FindBackward
 
+        else:
 
-        """
+            flags |= QWebPage.FindBackward
 
-        raise exception.NotImplemented()
+        found = self._widget.findText(self.text, flags)
 
+        self._call_cb(result_cb, found, self.text, flags, 'prev_result')
 
 
-    def list_roles(self):
 
-        """List all roles in the system.
 
 
+class WebKitCaret(browsertab.AbstractCaret):
 
-        Returns: a list of role_refs or an empty list.
 
 
+    """QtWebKit implementations related to moving the cursor/selection."""
 
-        """
 
-        raise exception.NotImplemented()
 
+    @pyqtSlot(usertypes.KeyMode)
 
+    def _on_mode_entered(self, mode):
 
-    # NOTE(termie): seven calls below should probably be exposed by the api
+        if mode != usertypes.KeyMode.caret:
 
-    #               more clearly when the api redesign happens
+            return
 
-    def add_user_to_tenant(self, tenant_id, user_id):
 
-        raise exception.NotImplemented()
 
+        self.selection_enabled = self._widget.hasSelection()
 
+        self.selection_toggled.emit(self.selection_enabled)
 
-    def remove_user_from_tenant(self, tenant_id, user_id):
+        settings = self._widget.settings()
 
-        raise exception.NotImplemented()
+        settings.setAttribute(QWebSettings.CaretBrowsingEnabled, True)
 
 
 
-    def get_all_tenants(self):
+        if self._widget.isVisible():
 
-        raise exception.NotImplemented()
+            # Sometimes the caret isn't immediately visible, but unfocusing
 
+            # and refocusing it fixes that.
 
+            self._widget.clearFocus()
 
-    def get_tenants_for_user(self, user_id):
+            self._widget.setFocus(Qt.OtherFocusReason)
 
-        """Get the tenants associated with a given user.
 
 
+            # Move the caret to the first element in the viewport if there
 
-        Returns: a list of tenant ids.
+            # isn't any text which is already selected.
 
+            #
 
+            # Note: We can't use hasSelection() here, as that's always
 
-        """
+            # true in caret mode.
 
-        raise exception.NotImplemented()
+            if not self.selection_enabled:
 
+                self._widget.page().currentFrame().evaluateJavaScript(
 
+                    utils.read_file('javascript/position_caret.js'))
 
-    def get_roles_for_user_and_tenant(self, user_id, tenant_id):
 
-        """Get the roles associated with a user within given tenant.
 
+    @pyqtSlot(usertypes.KeyMode)
 
+    def _on_mode_left(self, _mode):
 
-        Returns: a list of role ids.
+        settings = self._widget.settings()
 
+        if settings.testAttribute(QWebSettings.CaretBrowsingEnabled):
 
+            if self.selection_enabled and self._widget.hasSelection():
 
-        """
+                # Remove selection if it exists
 
-        raise exception.NotImplemented()
+                self._widget.triggerPageAction(QWebPage.MoveToNextChar)
 
+            settings.setAttribute(QWebSettings.CaretBrowsingEnabled, False)
 
+            self.selection_enabled = False
 
-    def add_role_to_user_and_tenant(self, user_id, tenant_id, role_id):
 
-        """Add a role to a user within given tenant."""
 
-        raise exception.NotImplemented()
+    def move_to_next_line(self, count=1):
 
+        if not self.selection_enabled:
 
+            act = QWebPage.MoveToNextLine
 
-    def remove_role_from_user_and_tenant(self, user_id, tenant_id, role_id):
+        else:
 
-        """Remove a role from a user within given tenant."""
+            act = QWebPage.SelectNextLine
 
-        raise exception.NotImplemented()
+        for _ in range(count):
 
+            self._widget.triggerPageAction(act)
 
 
-    # user crud
 
-    def create_user(self, user_id, user):
+    def move_to_prev_line(self, count=1):
 
-        raise exception.NotImplemented()
+        if not self.selection_enabled:
 
+            act = QWebPage.MoveToPreviousLine
 
+        else:
 
-    def update_user(self, user_id, user):
+            act = QWebPage.SelectPreviousLine
 
-        raise exception.NotImplemented()
+        for _ in range(count):
 
+            self._widget.triggerPageAction(act)
 
 
-    def delete_user(self, user_id):
 
-        raise exception.NotImplemented()
+    def move_to_next_char(self, count=1):
 
+        if not self.selection_enabled:
 
+            act = QWebPage.MoveToNextChar
 
-    # tenant crud
+        else:
 
-    def create_tenant(self, tenant_id, tenant):
+            act = QWebPage.SelectNextChar
 
-        raise exception.NotImplemented()
+        for _ in range(count):
 
+            self._widget.triggerPageAction(act)
 
 
-    def update_tenant(self, tenant_id, tenant):
 
-        raise exception.NotImplemented()
+    def move_to_prev_char(self, count=1):
 
+        if not self.selection_enabled:
 
+            act = QWebPage.MoveToPreviousChar
 
-    def delete_tenant(self, tenant_id, tenant):
+        else:
 
-        raise exception.NotImplemented()
+            act = QWebPage.SelectPreviousChar
 
+        for _ in range(count):
 
+            self._widget.triggerPageAction(act)
 
-    # metadata crud
 
 
+    def move_to_end_of_word(self, count=1):
 
-    def get_metadata(self, user_id, tenant_id):
+        if not self.selection_enabled:
 
-        raise exception.NotImplemented()
+            act = [QWebPage.MoveToNextWord]
 
+            if utils.is_windows:  # pragma: no cover
 
+                act.append(QWebPage.MoveToPreviousChar)
 
-    def create_metadata(self, user_id, tenant_id, metadata):
+        else:
 
-        raise exception.NotImplemented()
+            act = [QWebPage.SelectNextWord]
 
+            if utils.is_windows:  # pragma: no cover
 
+                act.append(QWebPage.SelectPreviousChar)
 
-    def update_metadata(self, user_id, tenant_id, metadata):
+        for _ in range(count):
 
-        raise exception.NotImplemented()
+            for a in act:
 
+                self._widget.triggerPageAction(a)
 
 
-    def delete_metadata(self, user_id, tenant_id, metadata):
 
-        raise exception.NotImplemented()
+    def move_to_next_word(self, count=1):
 
+        if not self.selection_enabled:
 
+            act = [QWebPage.MoveToNextWord]
 
-    # role crud
+            if not utils.is_windows:  # pragma: no branch
 
-    def create_role(self, role_id, role):
+                act.append(QWebPage.MoveToNextChar)
 
-        raise exception.NotImplemented()
+        else:
 
+            act = [QWebPage.SelectNextWord]
 
+            if not utils.is_windows:  # pragma: no branch
 
-    def update_role(self, role_id, role):
+                act.append(QWebPage.SelectNextChar)
 
-        raise exception.NotImplemented()
+        for _ in range(count):
 
+            for a in act:
 
+                self._widget.triggerPageAction(a)
 
-    def delete_role(self, role_id):
 
-        raise exception.NotImplemented()
 
+    def move_to_prev_word(self, count=1):
 
+        if not self.selection_enabled:
 
+            act = QWebPage.MoveToPreviousWord
 
+        else:
 
-class PublicRouter(wsgi.ComposableRouter):
+            act = QWebPage.SelectPreviousWord
 
-    def add_routes(self, mapper):
+        for _ in range(count):
 
-        tenant_controller = TenantController()
+            self._widget.triggerPageAction(act)
 
-        mapper.connect('/tenants',
 
-                       controller=tenant_controller,
 
-                       action='get_tenants_for_token',
+    def move_to_start_of_line(self):
 
-                       conditions=dict(methods=['GET']))
+        if not self.selection_enabled:
 
+            act = QWebPage.MoveToStartOfLine
 
+        else:
 
+            act = QWebPage.SelectStartOfLine
 
+        self._widget.triggerPageAction(act)
 
-class AdminRouter(wsgi.ComposableRouter):
 
-    def add_routes(self, mapper):
 
-        # Tenant Operations
+    def move_to_end_of_line(self):
 
-        tenant_controller = TenantController()
+        if not self.selection_enabled:
 
-        mapper.connect('/tenants',
+            act = QWebPage.MoveToEndOfLine
 
-                       controller=tenant_controller,
+        else:
 
-                       action='get_all_tenants',
+            act = QWebPage.SelectEndOfLine
 
-                       conditions=dict(method=['GET']))
+        self._widget.triggerPageAction(act)
 
-        mapper.connect('/tenants/{tenant_id}',
 
-                       controller=tenant_controller,
 
-                       action='get_tenant',
+    def move_to_start_of_next_block(self, count=1):
 
-                       conditions=dict(method=['GET']))
+        if not self.selection_enabled:
 
+            act = [QWebPage.MoveToNextLine,
 
+                   QWebPage.MoveToStartOfBlock]
 
-        # User Operations
+        else:
 
-        user_controller = UserController()
+            act = [QWebPage.SelectNextLine,
 
-        mapper.connect('/users/{user_id}',
+                   QWebPage.SelectStartOfBlock]
 
-                       controller=user_controller,
+        for _ in range(count):
 
-                       action='get_user',
+            for a in act:
 
-                       conditions=dict(method=['GET']))
+                self._widget.triggerPageAction(a)
 
 
 
-        # Role Operations
+    def move_to_start_of_prev_block(self, count=1):
 
-        roles_controller = RoleController()
+        if not self.selection_enabled:
 
-        mapper.connect('/tenants/{tenant_id}/users/{user_id}/roles',
+            act = [QWebPage.MoveToPreviousLine,
 
-                       controller=roles_controller,
+                   QWebPage.MoveToStartOfBlock]
 
-                       action='get_user_roles',
+        else:
 
-                       conditions=dict(method=['GET']))
+            act = [QWebPage.SelectPreviousLine,
 
-        mapper.connect('/users/{user_id}/roles',
+                   QWebPage.SelectStartOfBlock]
 
-                       controller=user_controller,
+        for _ in range(count):
 
-                       action='get_user_roles',
+            for a in act:
 
-                       conditions=dict(method=['GET']))
+                self._widget.triggerPageAction(a)
 
 
 
+    def move_to_end_of_next_block(self, count=1):
 
+        if not self.selection_enabled:
 
-class TenantController(wsgi.Application):
+            act = [QWebPage.MoveToNextLine,
 
-    def __init__(self):
+                   QWebPage.MoveToEndOfBlock]
 
-        self.identity_api = Manager()
+        else:
 
-        self.policy_api = policy.Manager()
+            act = [QWebPage.SelectNextLine,
 
-        self.token_api = token.Manager()
+                   QWebPage.SelectEndOfBlock]
 
-        super(TenantController, self).__init__()
+        for _ in range(count):
 
+            for a in act:
 
+                self._widget.triggerPageAction(a)
 
-    def get_all_tenants(self, context, **kw):
 
-        """Gets a list of all tenants for an admin user."""
 
-        self.assert_admin(context)
+    def move_to_end_of_prev_block(self, count=1):
 
-        tenant_refs = self.identity_api.get_tenants(context)
+        if not self.selection_enabled:
 
-        params = {
+            act = [QWebPage.MoveToPreviousLine, QWebPage.MoveToEndOfBlock]
 
-            'limit': context['query_string'].get('limit'),
+        else:
 
-            'marker': context['query_string'].get('marker'),
+            act = [QWebPage.SelectPreviousLine, QWebPage.SelectEndOfBlock]
 
-        }
+        for _ in range(count):
 
-        return self._format_tenant_list(tenant_refs, **params)
+            for a in act:
 
+                self._widget.triggerPageAction(a)
 
 
-    def get_tenants_for_token(self, context, **kw):
 
-        """Get valid tenants for token based on token used to authenticate.
+    def move_to_start_of_document(self):
 
+        if not self.selection_enabled:
 
+            act = QWebPage.MoveToStartOfDocument
 
-        Pulls the token from the context, validates it and gets the valid
+        else:
 
-        tenants for the user in the token.
+            act = QWebPage.SelectStartOfDocument
 
+        self._widget.triggerPageAction(act)
 
 
-        Doesn't care about token scopedness.
 
+    def move_to_end_of_document(self):
 
+        if not self.selection_enabled:
 
-        """
+            act = QWebPage.MoveToEndOfDocument
 
-        try:
+        else:
 
-            token_ref = self.token_api.get_token(context=context,
+            act = QWebPage.SelectEndOfDocument
 
-                                                 token_id=context['token_id'])
+        self._widget.triggerPageAction(act)
 
-        except exception.NotFound:
 
-            raise exception.Unauthorized()
 
+    def toggle_selection(self):
 
+        self.selection_enabled = not self.selection_enabled
 
-        user_ref = token_ref['user']
+        self.selection_toggled.emit(self.selection_enabled)
 
-        tenant_ids = self.identity_api.get_tenants_for_user(
 
-                context, user_ref['id'])
 
-        tenant_refs = []
+    def drop_selection(self):
 
-        for tenant_id in tenant_ids:
+        self._widget.triggerPageAction(QWebPage.MoveToNextChar)
 
-            tenant_refs.append(self.identity_api.get_tenant(
 
-                    context=context,
 
-                    tenant_id=tenant_id))
+    def selection(self, callback):
 
-        params = {
+        callback(self._widget.selectedText())
 
-            'limit': context['query_string'].get('limit'),
 
-            'marker': context['query_string'].get('marker'),
 
-        }
+    def reverse_selection(self):
 
-        return self._format_tenant_list(tenant_refs, **params)
+        self._tab.run_js_async("""{
 
+            const sel = window.getSelection();
 
+            sel.setBaseAndExtent(
 
-    def get_tenant(self, context, tenant_id):
+                sel.extentNode, sel.extentOffset, sel.baseNode,
 
-        # TODO(termie): this stuff should probably be moved to middleware
+                sel.baseOffset
 
-        self.assert_admin(context)
+            );
 
-        tenant = self.identity_api.get_tenant(context, tenant_id)
+        }""")
 
-        if tenant is None:
 
-            raise exception.TenantNotFound(tenant_id=tenant_id)
 
+    def _follow_selected(self, *, tab=False):
 
+        if QWebSettings.globalSettings().testAttribute(
 
-        return {'tenant': tenant}
+                QWebSettings.JavascriptEnabled):
 
+            if tab:
 
+                self._tab.data.override_target = usertypes.ClickTarget.tab
 
-    # CRUD Extension
+            self._tab.run_js_async("""
 
-    def create_tenant(self, context, tenant):
+                const aElm = document.activeElement;
 
-        tenant_ref = self._normalize_dict(tenant)
+                if (window.getSelection().anchorNode) {
 
-        self.assert_admin(context)
+                    window.getSelection().anchorNode.parentNode.click();
 
-        tenant_id = (tenant_ref.get('id')
+                } else if (aElm && aElm !== document.body) {
 
-                     and tenant_ref.get('id')
+                    aElm.click();
 
-                     or uuid.uuid4().hex)
+                }
 
-        tenant_ref['id'] = tenant_id
+            """)
 
+        else:
 
+            selection = self._widget.selectedHtml()
 
-        tenant = self.identity_api.create_tenant(
+            if not selection:
 
-                context, tenant_id, tenant_ref)
+                # Getting here may mean we crashed, but we can't do anything
 
-        return {'tenant': tenant}
+                # about that until this commit is released:
 
+                # https://github.com/annulen/webkit/commit/0e75f3272d149bc64899c161f150eb341a2417af
 
+                # TODO find a way to check if something is focused
 
-    def update_tenant(self, context, tenant_id, tenant):
+                self._follow_enter(tab)
 
-        self.assert_admin(context)
-
-        if self.identity_api.get_tenant(context, tenant_id) is None:
-
-            raise exception.TenantNotFound(tenant_id=tenant_id)
-
-
-
-        tenant_ref = self.identity_api.update_tenant(
-
-                context, tenant_id, tenant)
-
-        return {'tenant': tenant_ref}
-
-
-
-    def delete_tenant(self, context, tenant_id, **kw):
-
-        self.assert_admin(context)
-
-        if self.identity_api.get_tenant(context, tenant_id) is None:
-
-            raise exception.TenantNotFound(tenant_id=tenant_id)
-
-
-
-        self.identity_api.delete_tenant(context, tenant_id)
-
-
-
-    def get_tenant_users(self, context, tenant_id, **kw):
-
-        self.assert_admin(context)
-
-        if self.identity_api.get_tenant(context, tenant_id) is None:
-
-            raise exception.TenantNotFound(tenant_id=tenant_id)
-
-
-
-        user_refs = self.identity_api.get_tenant_users(context, tenant_id)
-
-        return {'users': user_refs}
-
-
-
-    def _format_tenant_list(self, tenant_refs, **kwargs):
-
-        marker = kwargs.get('marker')
-
-        page_idx = 0
-
-        if marker is not None:
-
-            for (marker_idx, tenant) in enumerate(tenant_refs):
-
-                if tenant['id'] == marker:
-
-                    # we start pagination after the marker
-
-                    page_idx = marker_idx + 1
-
-                    break
-
-            else:
-
-                msg = 'Marker could not be found'
-
-                raise exception.ValidationError(message=msg)
-
-
-
-        limit = kwargs.get('limit')
-
-        if limit is not None:
+                return
 
             try:
 
-                limit = int(limit)
+                selected_element = xml.etree.ElementTree.fromstring(
 
-                if limit < 0:
+                    '<html>{}</html>'.format(selection)).find('a')
 
-                    raise AssertionError()
+            except xml.etree.ElementTree.ParseError:
 
-            except (ValueError, AssertionError):
+                raise browsertab.WebTabError('Could not parse selected '
 
-                msg = 'Invalid limit value'
+                                             'element!')
 
-                raise exception.ValidationError(message=msg)
 
 
+            if selected_element is not None:
 
-        tenant_refs = tenant_refs[page_idx:limit]
+                try:
 
+                    url = selected_element.attrib['href']
 
+                except KeyError:
 
-        for x in tenant_refs:
+                    raise browsertab.WebTabError('Anchor element without '
 
-            if 'enabled' not in x:
+                                                 'href!')
 
-                x['enabled'] = True
+                url = self._tab.url().resolved(QUrl(url))
 
-        o = {'tenants': tenant_refs,
+                if tab:
 
-             'tenants_links': []}
+                    self._tab.new_tab_requested.emit(url)
 
-        return o
+                else:
 
+                    self._tab.load_url(url)
 
 
 
+    def follow_selected(self, *, tab=False):
 
-class UserController(wsgi.Application):
+        try:
 
-    def __init__(self):
+            self._follow_selected(tab=tab)
 
-        self.identity_api = Manager()
+        finally:
 
-        self.policy_api = policy.Manager()
+            self.follow_selected_done.emit()
 
-        self.token_api = token.Manager()
 
-        super(UserController, self).__init__()
 
 
 
-    def get_user(self, context, user_id):
+class WebKitZoom(browsertab.AbstractZoom):
 
-        self.assert_admin(context)
 
-        user_ref = self.identity_api.get_user(context, user_id)
 
-        if not user_ref:
+    """QtWebKit implementations related to zooming."""
 
-            raise exception.UserNotFound(user_id=user_id)
 
 
+    def _set_factor_internal(self, factor):
 
-        return {'user': user_ref}
+        self._widget.setZoomFactor(factor)
 
 
 
-    def get_users(self, context):
 
-        # NOTE(termie): i can't imagine that this really wants all the data
 
-        #               about every single user in the system...
+class WebKitScroller(browsertab.AbstractScroller):
 
-        self.assert_admin(context)
 
-        user_refs = self.identity_api.list_users(context)
 
-        return {'users': user_refs}
+    """QtWebKit implementations related to scrolling."""
 
 
 
-    # CRUD extension
+    # FIXME:qtwebengine When to use the main frame, when the current one?
 
-    def create_user(self, context, user):
 
-        user = self._normalize_dict(user)
 
-        self.assert_admin(context)
+    def pos_px(self):
 
-        tenant_id = user.get('tenantId', None)
+        return self._widget.page().mainFrame().scrollPosition()
 
-        if (tenant_id is not None
 
-                and self.identity_api.get_tenant(context, tenant_id) is None):
 
-            raise exception.TenantNotFound(tenant_id=tenant_id)
+    def pos_perc(self):
 
-        user_id = uuid.uuid4().hex
+        return self._widget.scroll_pos
 
-        user_ref = user.copy()
 
-        user_ref['id'] = user_id
 
-        new_user_ref = self.identity_api.create_user(
+    def to_point(self, point):
 
-                context, user_id, user_ref)
+        self._widget.page().mainFrame().setScrollPosition(point)
 
-        if tenant_id:
 
-            self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
 
-        return {'user': new_user_ref}
+    def to_anchor(self, name):
 
+        self._widget.page().mainFrame().scrollToAnchor(name)
 
 
-    def update_user(self, context, user_id, user):
 
-        # NOTE(termie): this is really more of a patch than a put
+    def delta(self, x=0, y=0):
 
-        self.assert_admin(context)
+        qtutils.check_overflow(x, 'int')
 
-        if self.identity_api.get_user(context, user_id) is None:
+        qtutils.check_overflow(y, 'int')
 
-            raise exception.UserNotFound(user_id=user_id)
+        self._widget.page().mainFrame().scroll(x, y)
 
 
 
-        user_ref = self.identity_api.update_user(context, user_id, user)
+    def delta_page(self, x=0.0, y=0.0):
 
-        return {'user': user_ref}
+        if y.is_integer():
 
+            y = int(y)
 
+            if y == 0:
 
-    def delete_user(self, context, user_id):
+                pass
 
-        self.assert_admin(context)
+            elif y < 0:
 
-        if self.identity_api.get_user(context, user_id) is None:
+                self.page_up(count=-y)
 
-            raise exception.UserNotFound(user_id=user_id)
+            elif y > 0:
 
+                self.page_down(count=y)
 
+            y = 0
 
-        self.identity_api.delete_user(context, user_id)
+        if x == 0 and y == 0:
 
+            return
 
+        size = self._widget.page().mainFrame().geometry()
 
-    def set_user_enabled(self, context, user_id, user):
+        self.delta(x * size.width(), y * size.height())
 
-        return self.update_user(context, user_id, user)
 
 
+    def to_perc(self, x=None, y=None):
 
-    def set_user_password(self, context, user_id, user):
+        if x is None and y == 0:
 
-        return self.update_user(context, user_id, user)
+            self.top()
 
+        elif x is None and y == 100:
 
+            self.bottom()
 
-    def update_user_tenant(self, context, user_id, user):
+        else:
 
-        """Update the default tenant."""
+            for val, orientation in [(x, Qt.Horizontal), (y, Qt.Vertical)]:
 
-        # ensure that we're a member of that tenant
+                if val is not None:
 
-        tenant_id = user.get('tenantId')
+                    frame = self._widget.page().mainFrame()
 
-        self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
+                    maximum = frame.scrollBarMaximum(orientation)
 
-        return self.update_user(context, user_id, user)
+                    if maximum == 0:
 
+                        continue
 
+                    pos = int(maximum * val / 100)
 
+                    pos = qtutils.check_overflow(pos, 'int', fatal=False)
 
+                    frame.setScrollBarValue(orientation, pos)
 
-class RoleController(wsgi.Application):
 
-    def __init__(self):
 
-        self.identity_api = Manager()
+    def _key_press(self, key, count=1, getter_name=None, direction=None):
 
-        self.token_api = token.Manager()
+        frame = self._widget.page().mainFrame()
 
-        self.policy_api = policy.Manager()
+        getter = None if getter_name is None else getattr(frame, getter_name)
 
-        super(RoleController, self).__init__()
 
 
+        # FIXME:qtwebengine needed?
 
-    # COMPAT(essex-3)
+        # self._widget.setFocus()
 
-    def get_user_roles(self, context, user_id, tenant_id=None):
 
-        """Get the roles for a user and tenant pair.
 
+        for _ in range(min(count, 5000)):
 
+            # Abort scrolling if the minimum/maximum was reached.
 
-        Since we're trying to ignore the idea of user-only roles we're
+            if (getter is not None and
 
-        not implementing them in hopes that the idea will die off.
+                    frame.scrollBarValue(direction) == getter(direction)):
 
+                return
 
+            self._tab.fake_key_press(key)
+
+
+
+    def up(self, count=1):
+
+        self._key_press(Qt.Key_Up, count, 'scrollBarMinimum', Qt.Vertical)
+
+
+
+    def down(self, count=1):
+
+        self._key_press(Qt.Key_Down, count, 'scrollBarMaximum', Qt.Vertical)
+
+
+
+    def left(self, count=1):
+
+        self._key_press(Qt.Key_Left, count, 'scrollBarMinimum', Qt.Horizontal)
+
+
+
+    def right(self, count=1):
+
+        self._key_press(Qt.Key_Right, count, 'scrollBarMaximum', Qt.Horizontal)
+
+
+
+    def top(self):
+
+        self._key_press(Qt.Key_Home)
+
+
+
+    def bottom(self):
+
+        self._key_press(Qt.Key_End)
+
+
+
+    def page_up(self, count=1):
+
+        self._key_press(Qt.Key_PageUp, count, 'scrollBarMinimum', Qt.Vertical)
+
+
+
+    def page_down(self, count=1):
+
+        self._key_press(Qt.Key_PageDown, count, 'scrollBarMaximum',
+
+                        Qt.Vertical)
+
+
+
+    def at_top(self):
+
+        return self.pos_px().y() == 0
+
+
+
+    def at_bottom(self):
+
+        frame = self._widget.page().currentFrame()
+
+        return self.pos_px().y() >= frame.scrollBarMaximum(Qt.Vertical)
+
+
+
+
+
+class WebKitHistoryPrivate(browsertab.AbstractHistoryPrivate):
+
+
+
+    """History-related methods which are not part of the extension API."""
+
+
+
+    def serialize(self):
+
+        return qtutils.serialize(self._history)
+
+
+
+    def deserialize(self, data):
+
+        qtutils.deserialize(data, self._history)
+
+
+
+    def load_items(self, items):
+
+        if items:
+
+            self._tab.before_load_started.emit(items[-1].url)
+
+
+
+        stream, _data, user_data = tabhistory.serialize(items)
+
+        qtutils.deserialize_stream(stream, self._history)
+
+        for i, data in enumerate(user_data):
+
+            self._history.itemAt(i).setUserData(data)
+
+        cur_data = self._history.currentItem().userData()
+
+        if cur_data is not None:
+
+            if 'zoom' in cur_data:
+
+                self._tab.zoom.set_factor(cur_data['zoom'])
+
+            if ('scroll-pos' in cur_data and
+
+                    self._tab.scroller.pos_px() == QPoint(0, 0)):
+
+                QTimer.singleShot(0, functools.partial(
+
+                    self._tab.scroller.to_point, cur_data['scroll-pos']))
+
+
+
+
+
+class WebKitHistory(browsertab.AbstractHistory):
+
+
+
+    """QtWebKit implementations related to page history."""
+
+
+
+    def __init__(self, tab):
+
+        super().__init__(tab)
+
+        self.private_api = WebKitHistoryPrivate(tab)
+
+
+
+    def __len__(self):
+
+        return len(self._history)
+
+
+
+    def __iter__(self):
+
+        return iter(self._history.items())
+
+
+
+    def current_idx(self):
+
+        return self._history.currentItemIndex()
+
+
+
+    def can_go_back(self):
+
+        return self._history.canGoBack()
+
+
+
+    def can_go_forward(self):
+
+        return self._history.canGoForward()
+
+
+
+    def _item_at(self, i):
+
+        return self._history.itemAt(i)
+
+
+
+    def _go_to_item(self, item):
+
+        self._tab.before_load_started.emit(item.url())
+
+        self._history.goToItem(item)
+
+
+
+
+
+class WebKitElements(browsertab.AbstractElements):
+
+
+
+    """QtWebKit implemementations related to elements on the page."""
+
+
+
+    def find_css(self, selector, callback, error_cb, *, only_visible=False):
+
+        utils.unused(error_cb)
+
+        mainframe = self._widget.page().mainFrame()
+
+        if mainframe is None:
+
+            raise browsertab.WebTabError("No frame focused!")
+
+
+
+        elems = []
+
+        frames = webkitelem.get_child_frames(mainframe)
+
+        for f in frames:
+
+            for elem in f.findAllElements(selector):
+
+                elems.append(webkitelem.WebKitElement(elem, tab=self._tab))
+
+
+
+        if only_visible:
+
+            # pylint: disable=protected-access
+
+            elems = [e for e in elems if e._is_visible(mainframe)]
+
+            # pylint: enable=protected-access
+
+
+
+        callback(elems)
+
+
+
+    def find_id(self, elem_id, callback):
+
+        def find_id_cb(elems):
+
+            """Call the real callback with the found elements."""
+
+            if not elems:
+
+                callback(None)
+
+            else:
+
+                callback(elems[0])
+
+
+
+        # Escape non-alphanumeric characters in the selector
+
+        # https://www.w3.org/TR/CSS2/syndata.html#value-def-identifier
+
+        elem_id = re.sub(r'[^a-zA-Z0-9_-]', r'\\\g<0>', elem_id)
+
+        self.find_css('#' + elem_id, find_id_cb, error_cb=lambda exc: None)
+
+
+
+    def find_focused(self, callback):
+
+        frame = self._widget.page().currentFrame()
+
+        if frame is None:
+
+            callback(None)
+
+            return
+
+
+
+        elem = frame.findFirstElement('*:focus')
+
+        if elem.isNull():
+
+            callback(None)
+
+        else:
+
+            callback(webkitelem.WebKitElement(elem, tab=self._tab))
+
+
+
+    def find_at_pos(self, pos, callback):
+
+        assert pos.x() >= 0
+
+        assert pos.y() >= 0
+
+        frame = self._widget.page().frameAt(pos)
+
+        if frame is None:
+
+            # This happens when we click inside the webview, but not actually
+
+            # on the QWebPage - for example when clicking the scrollbar
+
+            # sometimes.
+
+            log.webview.debug("Hit test at {} but frame is None!".format(pos))
+
+            callback(None)
+
+            return
+
+
+
+        # You'd think we have to subtract frame.geometry().topLeft() from the
+
+        # position, but it seems QWebFrame::hitTestContent wants a position
+
+        # relative to the QWebView, not to the frame. This makes no sense to
+
+        # me, but it works this way.
+
+        hitresult = frame.hitTestContent(pos)
+
+        if hitresult.isNull():
+
+            # For some reason, the whole hit result can be null sometimes (e.g.
+
+            # on doodle menu links).
+
+            log.webview.debug("Hit test result is null!")
+
+            callback(None)
+
+            return
+
+
+
+        try:
+
+            elem = webkitelem.WebKitElement(hitresult.element(), tab=self._tab)
+
+        except webkitelem.IsNullError:
+
+            # For some reason, the hit result element can be a null element
+
+            # sometimes (e.g. when clicking the timetable fields on
+
+            # http://www.sbb.ch/ ).
+
+            log.webview.debug("Hit test result element is null!")
+
+            callback(None)
+
+            return
+
+
+
+        callback(elem)
+
+
+
+
+
+class WebKitAudio(browsertab.AbstractAudio):
+
+
+
+    """Dummy handling of audio status for QtWebKit."""
+
+
+
+    def set_muted(self, muted: bool, override: bool = False) -> None:
+
+        raise browsertab.WebTabError('Muting is not supported on QtWebKit!')
+
+
+
+    def is_muted(self):
+
+        return False
+
+
+
+    def is_recently_audible(self):
+
+        return False
+
+
+
+
+
+class WebKitTabPrivate(browsertab.AbstractTabPrivate):
+
+
+
+    """QtWebKit-related methods which aren't part of the public API."""
+
+
+
+    def networkaccessmanager(self):
+
+        return self._widget.page().networkAccessManager()
+
+
+
+    def user_agent(self):
+
+        page = self._widget.page()
+
+        return page.userAgentForUrl(self._tab.url())
+
+
+
+    def clear_ssl_errors(self):
+
+        self.networkaccessmanager().clear_all_ssl_errors()
+
+
+
+    def event_target(self):
+
+        return self._widget
+
+
+
+    def shutdown(self):
+
+        self._widget.shutdown()
+
+
+
+
+
+class WebKitTab(browsertab.AbstractTab):
+
+
+
+    """A QtWebKit tab in the browser."""
+
+
+
+    def __init__(self, *, win_id, mode_manager, private, parent=None):
+
+        super().__init__(win_id=win_id, private=private, parent=parent)
+
+        widget = webview.WebView(win_id=win_id, tab_id=self.tab_id,
+
+                                 private=private, tab=self)
+
+        if private:
+
+            self._make_private(widget)
+
+        self.history = WebKitHistory(tab=self)
+
+        self.scroller = WebKitScroller(tab=self, parent=self)
+
+        self.caret = WebKitCaret(mode_manager=mode_manager,
+
+                                 tab=self, parent=self)
+
+        self.zoom = WebKitZoom(tab=self, parent=self)
+
+        self.search = WebKitSearch(tab=self, parent=self)
+
+        self.printing = WebKitPrinting(tab=self)
+
+        self.elements = WebKitElements(tab=self)
+
+        self.action = WebKitAction(tab=self)
+
+        self.audio = WebKitAudio(tab=self, parent=self)
+
+        self.private_api = WebKitTabPrivate(mode_manager=mode_manager,
+
+                                            tab=self)
+
+        # We're assigning settings in _set_widget
+
+        self.settings = webkitsettings.WebKitSettings(settings=None)
+
+        self._set_widget(widget)
+
+        self._connect_signals()
+
+        self.backend = usertypes.Backend.QtWebKit
+
+
+
+    def _install_event_filter(self):
+
+        self._widget.installEventFilter(self._mouse_event_filter)
+
+
+
+    def _make_private(self, widget):
+
+        settings = widget.settings()
+
+        settings.setAttribute(QWebSettings.PrivateBrowsingEnabled, True)
+
+
+
+    def load_url(self, url, *, emit_before_load_started=True):
+
+        self._load_url_prepare(
+
+            url, emit_before_load_started=emit_before_load_started)
+
+        self._widget.load(url)
+
+
+
+    def url(self, *, requested=False):
+
+        frame = self._widget.page().mainFrame()
+
+        if requested:
+
+            return frame.requestedUrl()
+
+        else:
+
+            return frame.url()
+
+
+
+    def dump_async(self, callback, *, plain=False):
+
+        frame = self._widget.page().mainFrame()
+
+        if plain:
+
+            callback(frame.toPlainText())
+
+        else:
+
+            callback(frame.toHtml())
+
+
+
+    def run_js_async(self, code, callback=None, *, world=None):
+
+        if world is not None and world != usertypes.JsWorld.jseval:
+
+            log.webview.warning("Ignoring world ID {}".format(world))
+
+        document_element = self._widget.page().mainFrame().documentElement()
+
+        result = document_element.evaluateJavaScript(code)
+
+        if callback is not None:
+
+            callback(result)
+
+
+
+    def icon(self):
+
+        return self._widget.icon()
+
+
+
+    def reload(self, *, force=False):
+
+        if force:
+
+            action = QWebPage.ReloadAndBypassCache
+
+        else:
+
+            action = QWebPage.Reload
+
+        self._widget.triggerPageAction(action)
+
+
+
+    def stop(self):
+
+        self._widget.stop()
+
+
+
+    def title(self):
+
+        return self._widget.title()
+
+
+
+    @pyqtSlot()
+
+    def _on_history_trigger(self):
+
+        url = self.url()
+
+        requested_url = self.url(requested=True)
+
+        self.history_item_triggered.emit(url, requested_url, self.title())
+
+
+
+    def set_html(self, html, base_url=QUrl()):
+
+        self._widget.setHtml(html, base_url)
+
+
+
+    @pyqtSlot()
+
+    def _on_load_started(self):
+
+        super()._on_load_started()
+
+        nam = self._widget.page().networkAccessManager()
+
+        nam.netrc_used = False
+
+        # Make sure the icon is cleared when navigating to a page without one.
+
+        self.icon_changed.emit(QIcon())
+
+
+
+    @pyqtSlot(bool)
+
+    def _on_load_finished(self, ok: bool) -> None:
+
+        super()._on_load_finished(ok)
+
+        self._update_load_status(ok)
+
+
+
+    @pyqtSlot()
+
+    def _on_frame_load_finished(self):
+
+        """Make sure we emit an appropriate status when loading finished.
+
+
+
+        While Qt has a bool "ok" attribute for loadFinished, it always is True
+
+        when using error pages... See
+
+        https://github.com/qutebrowser/qutebrowser/issues/84
 
         """
 
-        if tenant_id is None:
+        self._on_load_finished(not self._widget.page().error_occurred)
 
-            raise exception.NotImplemented(message='User roles not supported: '
 
-                                                   'tenant ID required')
 
+    @pyqtSlot()
 
+    def _on_webkit_icon_changed(self):
 
-        user = self.identity_api.get_user(context, user_id)
+        """Emit iconChanged with a QIcon like QWebEngineView does."""
 
-        if user is None:
+        if sip.isdeleted(self._widget):
 
-            raise exception.UserNotFound(user_id=user_id)
+            log.webview.debug("Got _on_webkit_icon_changed for deleted view!")
 
-        tenant = self.identity_api.get_tenant(context, tenant_id)
+            return
 
-        if tenant is None:
+        self.icon_changed.emit(self._widget.icon())
 
-            raise exception.TenantNotFound(tenant_id=tenant_id)
 
 
+    @pyqtSlot(QWebFrame)
 
-        roles = self.identity_api.get_roles_for_user_and_tenant(
+    def _on_frame_created(self, frame):
 
-                context, user_id, tenant_id)
+        """Connect the contentsSizeChanged signal of each frame."""
 
-        return {'roles': [self.identity_api.get_role(context, x)
+        # FIXME:qtwebengine those could theoretically regress:
 
-                          for x in roles]}
+        # https://github.com/qutebrowser/qutebrowser/issues/152
 
+        # https://github.com/qutebrowser/qutebrowser/issues/263
 
+        frame.contentsSizeChanged.connect(self._on_contents_size_changed)
 
-    # CRUD extension
 
-    def get_role(self, context, role_id):
 
-        self.assert_admin(context)
+    @pyqtSlot(QSize)
 
-        role_ref = self.identity_api.get_role(context, role_id)
+    def _on_contents_size_changed(self, size):
 
-        if not role_ref:
+        self.contents_size_changed.emit(QSizeF(size))
 
-            raise exception.RoleNotFound(role_id=role_id)
 
-        return {'role': role_ref}
 
+    @pyqtSlot(usertypes.NavigationRequest)
 
+    def _on_navigation_request(self, navigation):
 
-    def create_role(self, context, role):
+        super()._on_navigation_request(navigation)
 
-        role = self._normalize_dict(role)
+        if not navigation.accepted:
 
-        self.assert_admin(context)
+            return
 
-        role_id = uuid.uuid4().hex
 
-        role['id'] = role_id
 
-        role_ref = self.identity_api.create_role(context, role_id, role)
+        log.webview.debug("target {} override {}".format(
 
-        return {'role': role_ref}
+            self.data.open_target, self.data.override_target))
 
 
 
-    def delete_role(self, context, role_id):
+        if self.data.override_target is not None:
 
-        self.assert_admin(context)
+            target = self.data.override_target
 
-        self.get_role(context, role_id)
+            self.data.override_target = None
 
-        self.identity_api.delete_role(context, role_id)
+        else:
 
+            target = self.data.open_target
 
 
-    def get_roles(self, context):
 
-        self.assert_admin(context)
+        if (navigation.navigation_type == navigation.Type.link_clicked and
 
-        roles = self.identity_api.list_roles(context)
+                target != usertypes.ClickTarget.normal):
 
-        # TODO(termie): probably inefficient at some point
+            tab = shared.get_tab(self.win_id, target)
 
-        return {'roles': roles}
+            tab.load_url(navigation.url)
 
+            self.data.open_target = usertypes.ClickTarget.normal
 
+            navigation.accepted = False
 
-    def add_role_to_user(self, context, user_id, role_id, tenant_id=None):
 
-        """Add a role to a user and tenant pair.
 
+        if navigation.is_main_frame:
 
+            self.settings.update_for_url(navigation.url)
 
-        Since we're trying to ignore the idea of user-only roles we're
 
-        not implementing them in hopes that the idea will die off.
 
+    @pyqtSlot()
 
+    def _on_ssl_errors(self):
 
-        """
+        self._has_ssl_errors = True
 
-        self.assert_admin(context)
 
-        if tenant_id is None:
 
-            raise exception.NotImplemented(message='User roles not supported: '
+    def _connect_signals(self):
 
-                                                   'tenant_id required')
+        view = self._widget
 
-        if self.identity_api.get_user(context, user_id) is None:
+        page = view.page()
 
-            raise exception.UserNotFound(user_id=user_id)
+        frame = page.mainFrame()
 
-        if self.identity_api.get_tenant(context, tenant_id) is None:
+        page.windowCloseRequested.connect(self.window_close_requested)
 
-            raise exception.TenantNotFound(tenant_id=tenant_id)
+        page.linkHovered.connect(self.link_hovered)
 
-        if self.identity_api.get_role(context, role_id) is None:
+        page.loadProgress.connect(self._on_load_progress)
 
-            raise exception.RoleNotFound(role_id=role_id)
+        frame.loadStarted.connect(self._on_load_started)
 
+        view.scroll_pos_changed.connect(self.scroller.perc_changed)
 
+        view.titleChanged.connect(self.title_changed)
 
-        # This still has the weird legacy semantics that adding a role to
+        view.urlChanged.connect(self._on_url_changed)
 
-        # a user also adds them to a tenant
+        view.shutting_down.connect(self.shutting_down)
 
-        self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
+        page.networkAccessManager().sslErrors.connect(self._on_ssl_errors)
 
-        self.identity_api.add_role_to_user_and_tenant(
+        frame.loadFinished.connect(self._on_frame_load_finished)
 
-                context, user_id, tenant_id, role_id)
+        view.iconChanged.connect(self._on_webkit_icon_changed)
 
-        role_ref = self.identity_api.get_role(context, role_id)
+        page.frameCreated.connect(self._on_frame_created)
 
-        return {'role': role_ref}
+        frame.contentsSizeChanged.connect(self._on_contents_size_changed)
 
+        frame.initialLayoutCompleted.connect(self._on_history_trigger)
 
-
-    def remove_role_from_user(self, context, user_id, role_id, tenant_id=None):
-
-        """Remove a role from a user and tenant pair.
-
-
-
-        Since we're trying to ignore the idea of user-only roles we're
-
-        not implementing them in hopes that the idea will die off.
-
-
-
-        """
-
-        self.assert_admin(context)
-
-        if tenant_id is None:
-
-            raise exception.NotImplemented(message='User roles not supported: '
-
-                                                   'tenant_id required')
-
-        if self.identity_api.get_user(context, user_id) is None:
-
-            raise exception.UserNotFound(user_id=user_id)
-
-        if self.identity_api.get_tenant(context, tenant_id) is None:
-
-            raise exception.TenantNotFound(tenant_id=tenant_id)
-
-        if self.identity_api.get_role(context, role_id) is None:
-
-            raise exception.RoleNotFound(role_id=role_id)
-
-
-
-        # This still has the weird legacy semantics that adding a role to
-
-        # a user also adds them to a tenant, so we must follow up on that
-
-        self.identity_api.remove_role_from_user_and_tenant(
-
-                context, user_id, tenant_id, role_id)
-
-        roles = self.identity_api.get_roles_for_user_and_tenant(
-
-                context, user_id, tenant_id)
-
-        if not roles:
-
-            self.identity_api.remove_user_from_tenant(
-
-                    context, tenant_id, user_id)
-
-        return
-
-
-
-    # COMPAT(diablo): CRUD extension
-
-    def get_role_refs(self, context, user_id):
-
-        """Ultimate hack to get around having to make role_refs first-class.
-
-
-
-        This will basically iterate over the various roles the user has in
-
-        all tenants the user is a member of and create fake role_refs where
-
-        the id encodes the user-tenant-role information so we can look
-
-        up the appropriate data when we need to delete them.
-
-
-
-        """
-
-        self.assert_admin(context)
-
-        user_ref = self.identity_api.get_user(context, user_id)
-
-        tenant_ids = self.identity_api.get_tenants_for_user(context, user_id)
-
-        o = []
-
-        for tenant_id in tenant_ids:
-
-            role_ids = self.identity_api.get_roles_for_user_and_tenant(
-
-                    context, user_id, tenant_id)
-
-            for role_id in role_ids:
-
-                ref = {'roleId': role_id,
-
-                       'tenantId': tenant_id,
-
-                       'userId': user_id}
-
-                ref['id'] = urllib.urlencode(ref)
-
-                o.append(ref)
-
-        return {'roles': o}
-
-
-
-    # COMPAT(diablo): CRUD extension
-
-    def create_role_ref(self, context, user_id, role):
-
-        """This is actually used for adding a user to a tenant.
-
-
-
-        In the legacy data model adding a user to a tenant required setting
-
-        a role.
-
-
-
-        """
-
-        self.assert_admin(context)
-
-        # TODO(termie): for now we're ignoring the actual role
-
-        tenant_id = role.get('tenantId')
-
-        role_id = role.get('roleId')
-
-        self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
-
-        self.identity_api.add_role_to_user_and_tenant(
-
-                context, user_id, tenant_id, role_id)
-
-        role_ref = self.identity_api.get_role(context, role_id)
-
-        return {'role': role_ref}
-
-
-
-    # COMPAT(diablo): CRUD extension
-
-    def delete_role_ref(self, context, user_id, role_ref_id):
-
-        """This is actually used for deleting a user from a tenant.
-
-
-
-        In the legacy data model removing a user from a tenant required
-
-        deleting a role.
-
-
-
-        To emulate this, we encode the tenant and role in the role_ref_id,
-
-        and if this happens to be the last role for the user-tenant pair,
-
-        we remove the user from the tenant.
-
-
-
-        """
-
-        self.assert_admin(context)
-
-        # TODO(termie): for now we're ignoring the actual role
-
-        role_ref_ref = urlparse.parse_qs(role_ref_id)
-
-        tenant_id = role_ref_ref.get('tenantId')[0]
-
-        role_id = role_ref_ref.get('roleId')[0]
-
-        self.identity_api.remove_role_from_user_and_tenant(
-
-                context, user_id, tenant_id, role_id)
-
-        roles = self.identity_api.get_roles_for_user_and_tenant(
-
-                context, user_id, tenant_id)
-
-        if not roles:
-
-            self.identity_api.remove_user_from_tenant(
-
-                    context, tenant_id, user_id)
+        page.navigation_request.connect(self._on_navigation_request)

@@ -6,61 +6,53 @@
 
 
 
-# Copyright 2012 OpenStack LLC
+# Copyright 2011 United States Government as represented by the
+
+# Administrator of the National Aeronautics and Space Administration.
+
+# All Rights Reserved.
+
+# Copyright (c) 2011 Citrix Systems, Inc.
 
 #
 
-# Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
 
-# not use this file except in compliance with the License. You may obtain
+#    not use this file except in compliance with the License. You may obtain
 
-# a copy of the License at
-
-#
-
-#      http://www.apache.org/licenses/LICENSE-2.0
+#    a copy of the License at
 
 #
 
-# Unless required by applicable law or agreed to in writing, software
+#         http://www.apache.org/licenses/LICENSE-2.0
 
-# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#
 
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    Unless required by applicable law or agreed to in writing, software
 
-# License for the specific language governing permissions and limitations
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-# under the License.
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
+#    License for the specific language governing permissions and limitations
 
-
-import uuid
-
-import routes
-
-import json
+#    under the License.
 
 
 
-from keystone import config
+from nova import context
 
-from keystone import catalog
+from nova import db
 
-from keystone.common import cms
+from nova import flags
 
-from keystone.common import logging
+from nova import log as logging
 
-from keystone.common import wsgi
+from nova.openstack.common import cfg
 
-from keystone import exception
+from nova import utils
 
-from keystone import identity
-
-from keystone.openstack.common import timeutils
-
-from keystone import policy
-
-from keystone import token
+from nova.virt import netutils
 
 
 
@@ -70,1998 +62,920 @@ LOG = logging.getLogger(__name__)
 
 
 
+allow_same_net_traffic_opt = cfg.BoolOpt('allow_same_net_traffic',
 
+        default=True,
 
-class V3Router(wsgi.ComposingRouter):
+        help='Whether to allow network traffic from same network')
 
-    def crud_routes(self, mapper, controller, collection_key, key):
 
-        collection_path = '/%(collection_key)s' % {
 
-            'collection_key': collection_key}
+FLAGS = flags.FLAGS
 
-        entity_path = '/%(collection_key)s/{%(key)s_id}' % {
+FLAGS.register_opt(allow_same_net_traffic_opt)
 
-            'collection_key': collection_key,
 
-            'key': key}
 
 
 
-        mapper.connect(
+class FirewallDriver(object):
 
-            collection_path,
+    """ Firewall Driver base class.
 
-            controller=controller,
 
-            action='create_%s' % key,
 
-            conditions=dict(method=['POST']))
+        Defines methods that any driver providing security groups
 
-        mapper.connect(
+        and provider fireall functionality should implement.
 
-            collection_path,
+    """
 
-            controller=controller,
+    def prepare_instance_filter(self, instance, network_info):
 
-            action='list_%s' % collection_key,
+        """Prepare filters for the instance.
 
-            conditions=dict(method=['GET']))
+        At this point, the instance isn't running yet."""
 
-        mapper.connect(
+        raise NotImplementedError()
 
-            entity_path,
 
-            controller=controller,
 
-            action='get_%s' % key,
+    def unfilter_instance(self, instance, network_info):
 
-            conditions=dict(method=['GET']))
+        """Stop filtering instance"""
 
-        mapper.connect(
+        raise NotImplementedError()
 
-            entity_path,
 
-            controller=controller,
 
-            action='update_%s' % key,
+    def apply_instance_filter(self, instance, network_info):
 
-            conditions=dict(method=['PATCH']))
+        """Apply instance filter.
 
-        mapper.connect(
 
-            entity_path,
 
-            controller=controller,
+        Once this method returns, the instance should be firewalled
 
-            action='delete_%s' % key,
+        appropriately. This method should as far as possible be a
 
-            conditions=dict(method=['DELETE']))
+        no-op. It's vastly preferred to get everything set up in
 
+        prepare_instance_filter.
 
+        """
 
-    def __init__(self):
+        raise NotImplementedError()
 
-        mapper = routes.Mapper()
 
 
+    def refresh_security_group_rules(self, security_group_id):
 
-        apis = dict(
+        """Refresh security group rules from data store
 
-            catalog_api=catalog.Manager(),
 
-            identity_api=identity.Manager(),
 
-            policy_api=policy.Manager(),
+        Gets called when a rule has been added to or removed from
 
-            token_api=token.Manager())
+        the security group."""
 
+        raise NotImplementedError()
 
 
-        # Catalog
 
+    def refresh_security_group_members(self, security_group_id):
 
+        """Refresh security group members from data store
 
-        self.crud_routes(
 
-            mapper,
 
-            catalog.ServiceControllerV3(**apis),
+        Gets called when an instance gets added to or removed from
 
-            'services',
+        the security group."""
 
-            'service')
+        raise NotImplementedError()
 
 
 
-        self.crud_routes(
+    def refresh_provider_fw_rules(self):
 
-            mapper,
+        """Refresh common rules for all hosts/instances from data store.
 
-            catalog.EndpointControllerV3(**apis),
 
-            'endpoints',
 
-            'endpoint')
+        Gets called when a rule has been added to or removed from
 
-
-
-        # Identity
-
-
-
-        self.crud_routes(
-
-            mapper,
-
-            identity.DomainControllerV3(**apis),
-
-            'domains',
-
-            'domain')
-
-
-
-        project_controller = identity.ProjectControllerV3(**apis)
-
-        self.crud_routes(
-
-            mapper,
-
-            project_controller,
-
-            'projects',
-
-            'project')
-
-        mapper.connect(
-
-            '/users/{user_id}/projects',
-
-            controller=project_controller,
-
-            action='list_user_projects',
-
-            conditions=dict(method=['GET']))
-
-
-
-        self.crud_routes(
-
-            mapper,
-
-            identity.UserControllerV3(**apis),
-
-            'users',
-
-            'user')
-
-
-
-        self.crud_routes(
-
-            mapper,
-
-            identity.CredentialControllerV3(**apis),
-
-            'credentials',
-
-            'credential')
-
-
-
-        role_controller = identity.RoleControllerV3(**apis)
-
-        self.crud_routes(
-
-            mapper,
-
-            role_controller,
-
-            'roles',
-
-            'role')
-
-        mapper.connect(
-
-            '/projects/{project_id}/users/{user_id}/roles/{role_id}',
-
-            controller=role_controller,
-
-            action='create_grant',
-
-            conditions=dict(method=['PUT']))
-
-        mapper.connect(
-
-            '/projects/{project_id}/users/{user_id}/roles/{role_id}',
-
-            controller=role_controller,
-
-            action='check_grant',
-
-            conditions=dict(method=['HEAD']))
-
-        mapper.connect(
-
-            '/projects/{project_id}/users/{user_id}/roles',
-
-            controller=role_controller,
-
-            action='list_grants',
-
-            conditions=dict(method=['GET']))
-
-        mapper.connect(
-
-            '/projects/{project_id}/users/{user_id}/roles/{role_id}',
-
-            controller=role_controller,
-
-            action='revoke_grant',
-
-            conditions=dict(method=['DELETE']))
-
-        mapper.connect(
-
-            '/domains/{domain_id}/users/{user_id}/roles/{role_id}',
-
-            controller=role_controller,
-
-            action='create_grant',
-
-            conditions=dict(method=['PUT']))
-
-        mapper.connect(
-
-            '/domains/{domain_id}/users/{user_id}/roles/{role_id}',
-
-            controller=role_controller,
-
-            action='check_grant',
-
-            conditions=dict(method=['HEAD']))
-
-        mapper.connect(
-
-            '/domains/{domain_id}/users/{user_id}/roles',
-
-            controller=role_controller,
-
-            action='list_grants',
-
-            conditions=dict(method=['GET']))
-
-        mapper.connect(
-
-            '/domains/{domain_id}/users/{user_id}/roles/{role_id}',
-
-            controller=role_controller,
-
-            action='revoke_grant',
-
-            conditions=dict(method=['DELETE']))
-
-
-
-        # Policy
-
-
-
-        policy_controller = policy.PolicyControllerV3(**apis)
-
-        self.crud_routes(
-
-            mapper,
-
-            policy_controller,
-
-            'policies',
-
-            'policy')
-
-
-
-        # Token
+        the list of rules (via admin api).
 
 
 
         """
 
-        # v2.0 LEGACY
+        raise NotImplementedError()
 
-        mapper.connect('/tokens/{token_id}',
 
-                       controller=auth_controller,
 
-                       action='validate_token',
+    def setup_basic_filtering(self, instance, network_info):
 
-                       conditions=dict(method=['GET']))
+        """Create rules to block spoofing and allow dhcp.
 
-        mapper.connect('/tokens/{token_id}',
 
-                       controller=auth_controller,
 
-                       action='validate_token_head',
+        This gets called when spawning an instance, before
 
-                       conditions=dict(method=['HEAD']))
+        :py:meth:`prepare_instance_filter`.
 
-        mapper.connect('/tokens/{token_id}',
 
-                       controller=auth_controller,
-
-                       action='delete_token',
-
-                       conditions=dict(method=['DELETE']))
-
-        mapper.connect('/tokens/{token_id}/endpoints',
-
-                       controller=auth_controller,
-
-                       action='endpoints',
-
-                       conditions=dict(method=['GET']))
 
         """
 
+        raise NotImplementedError()
 
 
-        super(V3Router, self).__init__(mapper, [])
 
+    def instance_filter_exists(self, instance, network_info):
 
+        """Check nova-instance-instance-xxx exists"""
 
+        raise NotImplementedError()
 
 
-class AdminRouter(wsgi.ComposingRouter):
 
-    def __init__(self):
+    def _handle_network_info_model(self, network_info):
 
-        mapper = routes.Mapper()
-
-
-
-        version_controller = VersionController('admin')
-
-        mapper.connect('/',
-
-                       controller=version_controller,
-
-                       action='get_version')
-
-
-
-        # Token Operations
-
-        auth_controller = TokenController()
-
-        mapper.connect('/tokens',
-
-                       controller=auth_controller,
-
-                       action='authenticate',
-
-                       conditions=dict(method=['POST']))
-
-        mapper.connect('/tokens/revoked',
-
-                       controller=auth_controller,
-
-                       action='revocation_list',
-
-                       conditions=dict(method=['GET']))
-
-        mapper.connect('/tokens/{token_id}',
-
-                       controller=auth_controller,
-
-                       action='validate_token',
-
-                       conditions=dict(method=['GET']))
-
-        mapper.connect('/tokens/{token_id}',
-
-                       controller=auth_controller,
-
-                       action='validate_token_head',
-
-                       conditions=dict(method=['HEAD']))
-
-        mapper.connect('/tokens/{token_id}',
-
-                       controller=auth_controller,
-
-                       action='delete_token',
-
-                       conditions=dict(method=['DELETE']))
-
-        mapper.connect('/tokens/{token_id}/endpoints',
-
-                       controller=auth_controller,
-
-                       action='endpoints',
-
-                       conditions=dict(method=['GET']))
-
-
-
-        # Certificates used to verify auth tokens
-
-        mapper.connect('/certificates/ca',
-
-                       controller=auth_controller,
-
-                       action='ca_cert',
-
-                       conditions=dict(method=['GET']))
-
-
-
-        mapper.connect('/certificates/signing',
-
-                       controller=auth_controller,
-
-                       action='signing_cert',
-
-                       conditions=dict(method=['GET']))
-
-
-
-        # Miscellaneous Operations
-
-        extensions_controller = AdminExtensionsController()
-
-        mapper.connect('/extensions',
-
-                       controller=extensions_controller,
-
-                       action='get_extensions_info',
-
-                       conditions=dict(method=['GET']))
-
-        mapper.connect('/extensions/{extension_alias}',
-
-                       controller=extensions_controller,
-
-                       action='get_extension_info',
-
-                       conditions=dict(method=['GET']))
-
-        identity_router = identity.AdminRouter()
-
-        routers = [identity_router]
-
-        super(AdminRouter, self).__init__(mapper, routers)
-
-
-
-
-
-class PublicRouter(wsgi.ComposingRouter):
-
-    def __init__(self):
-
-        mapper = routes.Mapper()
-
-
-
-        version_controller = VersionController('public')
-
-        mapper.connect('/',
-
-                       controller=version_controller,
-
-                       action='get_version')
-
-
-
-        # Token Operations
-
-        auth_controller = TokenController()
-
-        mapper.connect('/tokens',
-
-                       controller=auth_controller,
-
-                       action='authenticate',
-
-                       conditions=dict(method=['POST']))
-
-
-
-        mapper.connect('/certificates/ca',
-
-                       controller=auth_controller,
-
-                       action='ca_cert',
-
-                       conditions=dict(method=['GET']))
-
-
-
-        mapper.connect('/certificates/signing',
-
-                       controller=auth_controller,
-
-                       action='signing_cert',
-
-                       conditions=dict(method=['GET']))
-
-
-
-        # Miscellaneous
-
-        extensions_controller = PublicExtensionsController()
-
-        mapper.connect('/extensions',
-
-                       controller=extensions_controller,
-
-                       action='get_extensions_info',
-
-                       conditions=dict(method=['GET']))
-
-        mapper.connect('/extensions/{extension_alias}',
-
-                       controller=extensions_controller,
-
-                       action='get_extension_info',
-
-                       conditions=dict(method=['GET']))
-
-
-
-        identity_router = identity.PublicRouter()
-
-        routers = [identity_router]
-
-
-
-        super(PublicRouter, self).__init__(mapper, routers)
-
-
-
-
-
-class PublicVersionRouter(wsgi.ComposingRouter):
-
-    def __init__(self):
-
-        mapper = routes.Mapper()
-
-        version_controller = VersionController('public')
-
-        mapper.connect('/',
-
-                       controller=version_controller,
-
-                       action='get_versions')
-
-        routers = []
-
-        super(PublicVersionRouter, self).__init__(mapper, routers)
-
-
-
-
-
-class AdminVersionRouter(wsgi.ComposingRouter):
-
-    def __init__(self):
-
-        mapper = routes.Mapper()
-
-        version_controller = VersionController('admin')
-
-        mapper.connect('/',
-
-                       controller=version_controller,
-
-                       action='get_versions')
-
-        routers = []
-
-        super(AdminVersionRouter, self).__init__(mapper, routers)
-
-
-
-
-
-class VersionController(wsgi.Application):
-
-    def __init__(self, version_type):
-
-        self.catalog_api = catalog.Manager()
-
-        self.url_key = '%sURL' % version_type
-
-
-
-        super(VersionController, self).__init__()
-
-
-
-    def _get_identity_url(self, context):
-
-        catalog_ref = self.catalog_api.get_catalog(context=context,
-
-                                                   user_id=None,
-
-                                                   tenant_id=None)
-
-        for region, region_ref in catalog_ref.iteritems():
-
-            for service, service_ref in region_ref.iteritems():
-
-                if service == 'identity':
-
-                    return service_ref[self.url_key]
-
-
-
-        raise exception.NotImplemented()
-
-
-
-    def _get_versions_list(self, context):
-
-        """The list of versions is dependent on the context."""
-
-        identity_url = self._get_identity_url(context)
-
-        if not identity_url.endswith('/'):
-
-            identity_url = identity_url + '/'
-
-
-
-        versions = {}
-
-        versions['v2.0'] = {
-
-            'id': 'v2.0',
-
-            'status': 'beta',
-
-            'updated': '2011-11-19T00:00:00Z',
-
-            'links': [
-
-                {
-
-                    'rel': 'self',
-
-                    'href': identity_url,
-
-                }, {
-
-                    'rel': 'describedby',
-
-                    'type': 'text/html',
-
-                    'href': 'http://docs.openstack.org/api/openstack-'
-
-                            'identity-service/2.0/content/'
-
-                }, {
-
-                    'rel': 'describedby',
-
-                    'type': 'application/pdf',
-
-                    'href': 'http://docs.openstack.org/api/openstack-'
-
-                            'identity-service/2.0/identity-dev-guide-'
-
-                            '2.0.pdf'
-
-                }
-
-            ],
-
-            'media-types': [
-
-                {
-
-                    'base': 'application/json',
-
-                    'type': 'application/vnd.openstack.identity-v2.0'
-
-                            '+json'
-
-                }, {
-
-                    'base': 'application/xml',
-
-                    'type': 'application/vnd.openstack.identity-v2.0'
-
-                            '+xml'
-
-                }
-
-            ]
-
-        }
-
-
-
-        return versions
-
-
-
-    def get_versions(self, context):
-
-        versions = self._get_versions_list(context)
-
-        return wsgi.render_response(status=(300, 'Multiple Choices'), body={
-
-            'versions': {
-
-                'values': versions.values()
-
-            }
-
-        })
-
-
-
-    def get_version(self, context):
-
-        versions = self._get_versions_list(context)
-
-        return wsgi.render_response(body={
-
-            'version': versions['v2.0']
-
-        })
-
-
-
-
-
-class NoopController(wsgi.Application):
-
-    def __init__(self):
-
-        super(NoopController, self).__init__()
-
-
-
-    def noop(self, context):
-
-        return {}
-
-
-
-
-
-class ExternalAuthNotApplicable(Exception):
-
-    """External authentication is not applicable"""
-
-
-
-
-
-class TokenController(wsgi.Application):
-
-    def __init__(self):
-
-        self.catalog_api = catalog.Manager()
-
-        self.identity_api = identity.Manager()
-
-        self.token_api = token.Manager()
-
-        self.policy_api = policy.Manager()
-
-        super(TokenController, self).__init__()
-
-
-
-    def ca_cert(self, context, auth=None):
-
-        ca_file = open(config.CONF.signing.ca_certs, 'r')
-
-        data = ca_file.read()
-
-        ca_file.close()
-
-        return data
-
-
-
-    def signing_cert(self, context, auth=None):
-
-        cert_file = open(config.CONF.signing.certfile, 'r')
-
-        data = cert_file.read()
-
-        cert_file.close()
-
-        return data
-
-
-
-    def authenticate(self, context, auth=None):
-
-        """Authenticate credentials and return a token.
-
-
-
-        Accept auth as a dict that looks like::
-
-
-
-            {
-
-                "auth":{
-
-                    "passwordCredentials":{
-
-                        "username":"test_user",
-
-                        "password":"mypass"
-
-                    },
-
-                    "tenantName":"customer-x"
-
-                }
-
-            }
-
-
-
-        In this case, tenant is optional, if not provided the token will be
-
-        considered "unscoped" and can later be used to get a scoped token.
-
-
-
-        Alternatively, this call accepts auth with only a token and tenant
-
-        that will return a token that is scoped to that tenant.
-
-        """
-
-
-
-        if auth is None:
-
-            raise exception.ValidationError(attribute='auth',
-
-                                            target='request body')
-
-
-
-        auth_token_data = None
-
-
-
-        if "token" in auth:
-
-            # Try to authenticate using a token
-
-            auth_token_data, auth_info = self._authenticate_token(
-
-                context, auth)
-
-        else:
-
-            # Try external authentication
-
-            try:
-
-                auth_token_data, auth_info = self._authenticate_external(
-
-                    context, auth)
-
-            except ExternalAuthNotApplicable:
-
-                # Try local authentication
-
-                auth_token_data, auth_info = self._authenticate_local(
-
-                    context, auth)
-
-
-
-        user_ref, tenant_ref, metadata_ref = auth_info
-
-
-
-        # If the user is disabled don't allow them to authenticate
-
-        if not user_ref.get('enabled', True):
-
-            msg = 'User is disabled: %s' % user_ref['id']
-
-            LOG.warning(msg)
-
-            raise exception.Unauthorized(msg)
-
-
-
-        # If the tenant is disabled don't allow them to authenticate
-
-        if tenant_ref and not tenant_ref.get('enabled', True):
-
-            msg = 'Tenant is disabled: %s' % tenant_ref['id']
-
-            LOG.warning(msg)
-
-            raise exception.Unauthorized(msg)
-
-
-
-        if tenant_ref:
-
-            catalog_ref = self.catalog_api.get_catalog(
-
-                context=context,
-
-                user_id=user_ref['id'],
-
-                tenant_id=tenant_ref['id'],
-
-                metadata=metadata_ref)
-
-        else:
-
-            catalog_ref = {}
-
-
-
-        auth_token_data['id'] = 'placeholder'
-
-
-
-        roles_ref = []
-
-        for role_id in metadata_ref.get('roles', []):
-
-            role_ref = self.identity_api.get_role(context, role_id)
-
-            roles_ref.append(dict(name=role_ref['name']))
-
-
-
-        token_data = self._format_token(auth_token_data, roles_ref)
-
-
-
-        service_catalog = self._format_catalog(catalog_ref)
-
-        token_data['access']['serviceCatalog'] = service_catalog
-
-
-
-        if config.CONF.signing.token_format == 'UUID':
-
-            token_id = uuid.uuid4().hex
-
-        elif config.CONF.signing.token_format == 'PKI':
-
-            token_id = cms.cms_sign_token(json.dumps(token_data),
-
-                                          config.CONF.signing.certfile,
-
-                                          config.CONF.signing.keyfile)
-
-        else:
-
-            raise exception.UnexpectedError(
-
-                'Invalid value for token_format: %s.'
-
-                '  Allowed values are PKI or UUID.' %
-
-                config.CONF.signing.token_format)
+        # make sure this is legacy network_info
 
         try:
 
-            self.token_api.create_token(
+            return network_info.legacy()
 
-                context, token_id, dict(key=token_id,
+        except AttributeError:
 
-                                        id=token_id,
+            # no "legacy" function means network_info is legacy
 
-                                        user=user_ref,
+            return network_info
 
-                                        tenant=tenant_ref,
 
-                                        metadata=metadata_ref))
 
-        except Exception as e:
 
-            # an identical token may have been created already.
 
-            # if so, return the token_data as it is also identical
+class IptablesFirewallDriver(FirewallDriver):
 
-            try:
+    """Driver which enforces security groups through iptables rules."""
 
-                self.token_api.get_token(context=context,
 
-                                         token_id=token_id)
 
-            except exception.TokenNotFound:
+    def __init__(self, **kwargs):
 
-                raise e
+        from nova.network import linux_net
 
+        self.iptables = linux_net.iptables_manager
 
+        self.instances = {}
 
-        token_data['access']['token']['id'] = token_id
+        self.network_infos = {}
 
+        self.basicly_filtered = False
 
 
-        return token_data
 
+        self.iptables.ipv4['filter'].add_chain('sg-fallback')
 
+        self.iptables.ipv4['filter'].add_rule('sg-fallback', '-j DROP')
 
-    def _authenticate_token(self, context, auth):
+        self.iptables.ipv6['filter'].add_chain('sg-fallback')
 
-        """Try to authenticate using an already existing token.
+        self.iptables.ipv6['filter'].add_rule('sg-fallback', '-j DROP')
 
 
 
-        Returns auth_token_data, (user_ref, tenant_ref, metadata_ref)
+    def setup_basic_filtering(self, instance, network_info):
 
-        """
+        pass
 
-        if 'token' not in auth:
 
-            raise exception.ValidationError(
 
-                attribute='token', target='auth')
+    def apply_instance_filter(self, instance, network_info):
 
+        """No-op. Everything is done in prepare_instance_filter."""
 
+        pass
 
-        if "id" not in auth['token']:
 
-            raise exception.ValidationError(
 
-                attribute="id", target="token")
+    def unfilter_instance(self, instance, network_info):
 
+        # make sure this is legacy nw_info
 
+        network_info = self._handle_network_info_model(network_info)
 
-        old_token = auth['token']['id']
 
 
+        if self.instances.pop(instance['id'], None):
 
-        try:
+            # NOTE(vish): use the passed info instead of the stored info
 
-            old_token_ref = self.token_api.get_token(context=context,
+            self.network_infos.pop(instance['id'])
 
-                                                     token_id=old_token)
+            self.remove_filters_for_instance(instance)
 
-        except exception.NotFound as e:
-
-            raise exception.Unauthorized(e)
-
-
-
-        user_ref = old_token_ref['user']
-
-        user_id = user_ref['id']
-
-
-
-        current_user_ref = self.identity_api.get_user(context=context,
-
-                                                      user_id=user_id)
-
-
-
-        tenant_id = self._get_tenant_id_from_auth(context, auth)
-
-
-
-        tenant_ref = self._get_tenant_ref(context, user_id, tenant_id)
-
-        metadata_ref = self._get_metadata_ref(context, user_id, tenant_id)
-
-
-
-        expiry = old_token_ref['expires']
-
-        auth_token_data = self._get_auth_token_data(current_user_ref,
-
-                                                    tenant_ref,
-
-                                                    metadata_ref,
-
-                                                    expiry)
-
-
-
-        return auth_token_data, (current_user_ref, tenant_ref, metadata_ref)
-
-
-
-    def _authenticate_local(self, context, auth):
-
-        """Try to authenticate against the identity backend.
-
-
-
-        Returns auth_token_data, (user_ref, tenant_ref, metadata_ref)
-
-        """
-
-        if 'passwordCredentials' not in auth:
-
-            raise exception.ValidationError(
-
-                attribute='passwordCredentials', target='auth')
-
-
-
-        if "password" not in auth['passwordCredentials']:
-
-            raise exception.ValidationError(
-
-                attribute='password', target='passwordCredentials')
-
-
-
-        password = auth['passwordCredentials']['password']
-
-
-
-        if ("userId" not in auth['passwordCredentials'] and
-
-                "username" not in auth['passwordCredentials']):
-
-            raise exception.ValidationError(
-
-                attribute='username or userId',
-
-                target='passwordCredentials')
-
-
-
-        user_id = auth['passwordCredentials'].get('userId', None)
-
-        username = auth['passwordCredentials'].get('username', '')
-
-
-
-        if username:
-
-            try:
-
-                user_ref = self.identity_api.get_user_by_name(
-
-                    context=context, user_name=username)
-
-                user_id = user_ref['id']
-
-            except exception.UserNotFound as e:
-
-                raise exception.Unauthorized(e)
-
-
-
-        tenant_id = self._get_tenant_id_from_auth(context, auth)
-
-
-
-        try:
-
-            auth_info = self.identity_api.authenticate(
-
-                context=context,
-
-                user_id=user_id,
-
-                password=password,
-
-                tenant_id=tenant_id)
-
-        except AssertionError as e:
-
-            raise exception.Unauthorized(e)
-
-        (user_ref, tenant_ref, metadata_ref) = auth_info
-
-
-
-        expiry = self.token_api._get_default_expire_time(context=context)
-
-        auth_token_data = self._get_auth_token_data(user_ref,
-
-                                                    tenant_ref,
-
-                                                    metadata_ref,
-
-                                                    expiry)
-
-
-
-        return auth_token_data, (user_ref, tenant_ref, metadata_ref)
-
-
-
-    def _authenticate_external(self, context, auth):
-
-        """Try to authenticate an external user via REMOTE_USER variable.
-
-
-
-        Returns auth_token_data, (user_ref, tenant_ref, metadata_ref)
-
-        """
-
-        if 'REMOTE_USER' not in context:
-
-            raise ExternalAuthNotApplicable()
-
-
-
-        username = context['REMOTE_USER']
-
-        try:
-
-            user_ref = self.identity_api.get_user_by_name(
-
-                context=context, user_name=username)
-
-            user_id = user_ref['id']
-
-        except exception.UserNotFound as e:
-
-            raise exception.Unauthorized(e)
-
-
-
-        tenant_id = self._get_tenant_id_from_auth(context, auth)
-
-
-
-        tenant_ref = self._get_tenant_ref(context, user_id, tenant_id)
-
-        metadata_ref = self._get_metadata_ref(context, user_id, tenant_id)
-
-
-
-        expiry = self.token_api._get_default_expire_time(context=context)
-
-        auth_token_data = self._get_auth_token_data(user_ref,
-
-                                                    tenant_ref,
-
-                                                    metadata_ref,
-
-                                                    expiry)
-
-
-
-        return auth_token_data, (user_ref, tenant_ref, metadata_ref)
-
-
-
-    def _get_auth_token_data(self, user, tenant, metadata, expiry):
-
-        return dict(dict(user=user,
-
-                         tenant=tenant,
-
-                         metadata=metadata,
-
-                         expires=expiry))
-
-
-
-    def _get_tenant_id_from_auth(self, context, auth):
-
-        """Extract tenant information from auth dict.
-
-
-
-        Returns a valid tenant_id if it exists, or None if not specified.
-
-        """
-
-        tenant_id = auth.get('tenantId', None)
-
-        tenant_name = auth.get('tenantName', None)
-
-        if tenant_name:
-
-            try:
-
-                tenant_ref = self.identity_api.get_tenant_by_name(
-
-                    context=context, tenant_name=tenant_name)
-
-                tenant_id = tenant_ref['id']
-
-            except exception.TenantNotFound as e:
-
-                raise exception.Unauthorized(e)
-
-        return tenant_id
-
-
-
-    def _get_tenant_ref(self, context, user_id, tenant_id):
-
-        """Returns the tenant_ref for the user's tenant"""
-
-        tenant_ref = None
-
-        if tenant_id:
-
-            tenants = self.identity_api.get_tenants_for_user(context, user_id)
-
-            if tenant_id not in tenants:
-
-                msg = 'User %s is unauthorized for tenant %s' % (
-
-                    user_id, tenant_id)
-
-                LOG.warning(msg)
-
-                raise exception.Unauthorized(msg)
-
-
-
-            try:
-
-                tenant_ref = self.identity_api.get_tenant(context=context,
-
-                                                          tenant_id=tenant_id)
-
-            except exception.TenantNotFound as e:
-
-                exception.Unauthorized(e)
-
-        return tenant_ref
-
-
-
-    def _get_metadata_ref(self, context, user_id, tenant_id):
-
-        """Returns the metadata_ref for a user in a tenant"""
-
-        metadata_ref = {}
-
-        if tenant_id:
-
-            try:
-
-                metadata_ref = self.identity_api.get_metadata(
-
-                    context=context,
-
-                    user_id=user_id,
-
-                    tenant_id=tenant_id)
-
-            except exception.MetadataNotFound:
-
-                metadata_ref = {}
-
-
-
-        return metadata_ref
-
-
-
-    def _get_token_ref(self, context, token_id, belongs_to=None):
-
-        """Returns a token if a valid one exists.
-
-
-
-        Optionally, limited to a token owned by a specific tenant.
-
-
-
-        """
-
-        # TODO(termie): this stuff should probably be moved to middleware
-
-        self.assert_admin(context)
-
-
-
-        if cms.is_ans1_token(token_id):
-
-            data = json.loads(cms.cms_verify(cms.token_to_cms(token_id),
-
-                                             config.CONF.signing.certfile,
-
-                                             config.CONF.signing.ca_certs))
-
-            data['access']['token']['user'] = data['access']['user']
-
-            data['access']['token']['metadata'] = data['access']['metadata']
-
-            if belongs_to:
-
-                assert data['access']['token']['tenant']['id'] == belongs_to
-
-            token_ref = data['access']['token']
+            self.iptables.apply()
 
         else:
 
-            token_ref = self.token_api.get_token(context=context,
+            LOG.info(_('Attempted to unfilter instance which is not '
 
-                                                 token_id=token_id)
+                     'filtered'), instance=instance)
 
-        return token_ref
 
 
+    def prepare_instance_filter(self, instance, network_info):
 
-    # admin only
+        # make sure this is legacy nw_info
 
-    def validate_token_head(self, context, token_id):
+        network_info = self._handle_network_info_model(network_info)
 
-        """Check that a token is valid.
 
 
+        self.instances[instance['id']] = instance
 
-        Optionally, also ensure that it is owned by a specific tenant.
+        self.network_infos[instance['id']] = network_info
 
+        self.add_filters_for_instance(instance)
 
+        LOG.debug(_('Filters added to instance'), instance=instance)
 
-        Identical to ``validate_token``, except does not return a response.
+        self.refresh_provider_fw_rules()
 
+        LOG.debug(_('Provider Firewall Rules refreshed'), instance=instance)
 
+        self.iptables.apply()
 
-        """
 
-        belongs_to = context['query_string'].get('belongsTo')
 
-        assert self._get_token_ref(context, token_id, belongs_to)
+    def _create_filter(self, ips, chain_name):
 
+        return ['-d %s -j $%s' % (ip, chain_name) for ip in ips]
 
 
-    # admin only
 
-    def validate_token(self, context, token_id):
+    def _filters_for_instance(self, chain_name, network_info):
 
-        """Check that a token is valid.
+        """Creates a rule corresponding to each ip that defines a
 
+             jump to the corresponding instance - chain for all the traffic
 
+             destined to that ip."""
 
-        Optionally, also ensure that it is owned by a specific tenant.
+        # make sure this is legacy nw_info
 
+        network_info = self._handle_network_info_model(network_info)
 
 
-        Returns metadata about the token along any associated roles.
 
+        ips_v4 = [ip['ip'] for (_n, mapping) in network_info
 
+                 for ip in mapping['ips']]
 
-        """
+        ipv4_rules = self._create_filter(ips_v4, chain_name)
 
-        belongs_to = context['query_string'].get('belongsTo')
 
-        token_ref = self._get_token_ref(context, token_id, belongs_to)
 
+        ipv6_rules = []
 
+        if FLAGS.use_ipv6:
 
-        # TODO(termie): optimize this call at some point and put it into the
+            ips_v6 = [ip['ip'] for (_n, mapping) in network_info
 
-        #               the return for metadata
+                     for ip in mapping['ip6s']]
 
-        # fill out the roles in the metadata
+            ipv6_rules = self._create_filter(ips_v6, chain_name)
 
-        metadata_ref = token_ref['metadata']
 
-        roles_ref = []
 
-        for role_id in metadata_ref.get('roles', []):
+        return ipv4_rules, ipv6_rules
 
-            roles_ref.append(self.identity_api.get_role(context, role_id))
 
 
+    def _add_filters(self, chain_name, ipv4_rules, ipv6_rules):
 
-        # Get a service catalog if possible
+        for rule in ipv4_rules:
 
-        # This is needed for on-behalf-of requests
+            self.iptables.ipv4['filter'].add_rule(chain_name, rule)
 
-        catalog_ref = None
 
-        if token_ref.get('tenant'):
 
-            catalog_ref = self.catalog_api.get_catalog(
+        if FLAGS.use_ipv6:
 
-                context=context,
+            for rule in ipv6_rules:
 
-                user_id=token_ref['user']['id'],
+                self.iptables.ipv6['filter'].add_rule(chain_name, rule)
 
-                tenant_id=token_ref['tenant']['id'],
 
-                metadata=metadata_ref)
 
-        return self._format_token(token_ref, roles_ref, catalog_ref)
+    def add_filters_for_instance(self, instance):
 
+        network_info = self.network_infos[instance['id']]
 
+        chain_name = self._instance_chain_name(instance)
 
-    def delete_token(self, context, token_id):
+        if FLAGS.use_ipv6:
 
-        """Delete a token, effectively invalidating it for authz."""
+            self.iptables.ipv6['filter'].add_chain(chain_name)
 
-        # TODO(termie): this stuff should probably be moved to middleware
+        self.iptables.ipv4['filter'].add_chain(chain_name)
 
-        self.assert_admin(context)
+        ipv4_rules, ipv6_rules = self._filters_for_instance(chain_name,
 
-        self.token_api.delete_token(context=context, token_id=token_id)
+                                                            network_info)
 
+        self._add_filters('local', ipv4_rules, ipv6_rules)
 
+        ipv4_rules, ipv6_rules = self.instance_rules(instance, network_info)
 
-    def revocation_list(self, context, auth=None):
+        self._add_filters(chain_name, ipv4_rules, ipv6_rules)
 
-        self.assert_admin(context)
 
-        tokens = self.token_api.list_revoked_tokens(context)
 
+    def remove_filters_for_instance(self, instance):
 
+        chain_name = self._instance_chain_name(instance)
 
-        for t in tokens:
 
-            expires = t['expires']
 
-            if not (expires and isinstance(expires, unicode)):
+        self.iptables.ipv4['filter'].remove_chain(chain_name)
 
-                    t['expires'] = timeutils.isotime(expires)
+        if FLAGS.use_ipv6:
 
-        data = {'revoked': tokens}
+            self.iptables.ipv6['filter'].remove_chain(chain_name)
 
-        json_data = json.dumps(data)
 
-        signed_text = cms.cms_sign_text(json_data,
 
-                                        config.CONF.signing.certfile,
+    @staticmethod
 
-                                        config.CONF.signing.keyfile)
+    def _security_group_chain_name(security_group_id):
 
+        return 'nova-sg-%s' % (security_group_id,)
 
 
-        return {'signed': signed_text}
 
+    def _instance_chain_name(self, instance):
 
+        return 'inst-%s' % (instance['id'],)
 
-    def endpoints(self, context, token_id):
 
-        """Return a list of endpoints available to the token."""
 
-        self.assert_admin(context)
+    def _do_basic_rules(self, ipv4_rules, ipv6_rules, network_info):
 
+        # Always drop invalid packets
 
+        ipv4_rules += ['-m state --state ' 'INVALID -j DROP']
 
-        token_ref = self._get_token_ref(context, token_id)
+        ipv6_rules += ['-m state --state ' 'INVALID -j DROP']
 
 
 
-        catalog_ref = None
+        # Allow established connections
 
-        if token_ref.get('tenant'):
+        ipv4_rules += ['-m state --state ESTABLISHED,RELATED -j ACCEPT']
 
-            catalog_ref = self.catalog_api.get_catalog(
+        ipv6_rules += ['-m state --state ESTABLISHED,RELATED -j ACCEPT']
 
-                context=context,
 
-                user_id=token_ref['user']['id'],
 
-                tenant_id=token_ref['tenant']['id'],
+        # Pass through provider-wide drops
 
-                metadata=token_ref['metadata'])
+        ipv4_rules += ['-j $provider']
 
+        ipv6_rules += ['-j $provider']
 
 
-        return self._format_endpoint_list(catalog_ref)
 
+    def _do_dhcp_rules(self, ipv4_rules, network_info):
 
+        # make sure this is legacy nw_info
 
-    def _format_authenticate(self, token_ref, roles_ref, catalog_ref):
+        network_info = self._handle_network_info_model(network_info)
 
-        o = self._format_token(token_ref, roles_ref)
 
-        o['access']['serviceCatalog'] = self._format_catalog(catalog_ref)
 
-        return o
+        dhcp_servers = [info['dhcp_server'] for (_n, info) in network_info]
 
 
 
-    def _format_token(self, token_ref, roles_ref, catalog_ref=None):
+        for dhcp_server in dhcp_servers:
 
-        user_ref = token_ref['user']
+            if dhcp_server:
 
-        metadata_ref = token_ref['metadata']
+                ipv4_rules.append('-s %s -p udp --sport 67 --dport 68 '
 
-        expires = token_ref['expires']
+                                  '-j ACCEPT' % (dhcp_server,))
 
-        if expires is not None:
 
-            if not isinstance(expires, unicode):
 
-                expires = timeutils.isotime(expires)
+    def _do_project_network_rules(self, ipv4_rules, ipv6_rules, network_info):
 
-        o = {'access': {'token': {'id': token_ref['id'],
+        # make sure this is legacy nw_info
 
-                                  'expires': expires,
+        network_info = self._handle_network_info_model(network_info)
 
-                                  'issued_at': timeutils.strtime()
 
-                                  },
 
-                        'user': {'id': user_ref['id'],
+        cidrs = [network['cidr'] for (network, _i) in network_info]
 
-                                 'name': user_ref['name'],
+        for cidr in cidrs:
 
-                                 'username': user_ref['name'],
+            ipv4_rules.append('-s %s -j ACCEPT' % (cidr,))
 
-                                 'roles': roles_ref,
+        if FLAGS.use_ipv6:
 
-                                 'roles_links': metadata_ref.get('roles_links',
+            cidrv6s = [network['cidr_v6'] for (network, _i) in
 
-                                                                 [])
+                       network_info]
 
-                                 }
 
-                        }
 
-             }
+            for cidrv6 in cidrv6s:
 
-        if 'tenant' in token_ref and token_ref['tenant']:
+                ipv6_rules.append('-s %s -j ACCEPT' % (cidrv6,))
 
-            token_ref['tenant']['enabled'] = True
 
-            o['access']['token']['tenant'] = token_ref['tenant']
 
-        if catalog_ref is not None:
+    def _do_ra_rules(self, ipv6_rules, network_info):
 
-            o['access']['serviceCatalog'] = self._format_catalog(catalog_ref)
+        # make sure this is legacy nw_info
 
-        if metadata_ref:
+        network_info = self._handle_network_info_model(network_info)
 
-            if 'is_admin' in metadata_ref:
 
-                o['access']['metadata'] = {'is_admin':
 
-                                           metadata_ref['is_admin']}
+        gateways_v6 = [mapping['gateway_v6'] for (_n, mapping) in
+
+                       network_info]
+
+        for gateway_v6 in gateways_v6:
+
+            ipv6_rules.append(
+
+                    '-s %s/128 -p icmpv6 -j ACCEPT' % (gateway_v6,))
+
+
+
+    def _build_icmp_rule(self, rule, version):
+
+        icmp_type = rule.from_port
+
+        icmp_code = rule.to_port
+
+
+
+        if icmp_type == -1:
+
+            icmp_type_arg = None
+
+        else:
+
+            icmp_type_arg = '%s' % icmp_type
+
+            if not icmp_code == -1:
+
+                icmp_type_arg += '/%s' % icmp_code
+
+
+
+        if icmp_type_arg:
+
+            if version == 4:
+
+                return ['-m', 'icmp', '--icmp-type', icmp_type_arg]
+
+            elif version == 6:
+
+                return ['-m', 'icmp6', '--icmpv6-type', icmp_type_arg]
+
+        # return empty list if icmp_type == -1
+
+        return []
+
+
+
+    def _build_tcp_udp_rule(self, rule, version):
+
+        if rule.from_port == rule.to_port:
+
+            return ['--dport', '%s' % (rule.from_port,)]
+
+        else:
+
+            return ['-m', 'multiport',
+
+                    '--dports', '%s:%s' % (rule.from_port,
+
+                                           rule.to_port)]
+
+
+
+    def instance_rules(self, instance, network_info):
+
+        # make sure this is legacy nw_info
+
+        network_info = self._handle_network_info_model(network_info)
+
+
+
+        ctxt = context.get_admin_context()
+
+
+
+        ipv4_rules = []
+
+        ipv6_rules = []
+
+
+
+        # Initialize with basic rules
+
+        self._do_basic_rules(ipv4_rules, ipv6_rules, network_info)
+
+        # Set up rules to allow traffic to/from DHCP server
+
+        self._do_dhcp_rules(ipv4_rules, network_info)
+
+
+
+        #Allow project network traffic
+
+        if FLAGS.allow_same_net_traffic:
+
+            self._do_project_network_rules(ipv4_rules, ipv6_rules,
+
+                                           network_info)
+
+        # We wrap these in FLAGS.use_ipv6 because they might cause
+
+        # a DB lookup. The other ones are just list operations, so
+
+        # they're not worth the clutter.
+
+        if FLAGS.use_ipv6:
+
+            # Allow RA responses
+
+            self._do_ra_rules(ipv6_rules, network_info)
+
+
+
+        security_groups = db.security_group_get_by_instance(ctxt,
+
+                                                            instance['id'])
+
+
+
+        # then, security group chains and rules
+
+        for security_group in security_groups:
+
+            rules = db.security_group_rule_get_by_security_group(ctxt,
+
+                                                          security_group['id'])
+
+
+
+            for rule in rules:
+
+                LOG.debug(_('Adding security group rule: %r'), rule,
+
+                          instance=instance)
+
+
+
+                if not rule.cidr:
+
+                    version = 4
+
+                else:
+
+                    version = netutils.get_ip_version(rule.cidr)
+
+
+
+                if version == 4:
+
+                    fw_rules = ipv4_rules
+
+                else:
+
+                    fw_rules = ipv6_rules
+
+
+
+                protocol = rule.protocol
+
+                if version == 6 and rule.protocol == 'icmp':
+
+                    protocol = 'icmpv6'
+
+
+
+                args = ['-j ACCEPT']
+
+                if protocol:
+
+                    args += ['-p', protocol]
+
+
+
+                if protocol in ['udp', 'tcp']:
+
+                    args += self._build_tcp_udp_rule(rule, version)
+
+                elif protocol == 'icmp':
+
+                    args += self._build_icmp_rule(rule, version)
+
+                if rule.cidr:
+
+                    LOG.debug('Using cidr %r', rule.cidr, instance=instance)
+
+                    args += ['-s', rule.cidr]
+
+                    fw_rules += [' '.join(args)]
+
+                else:
+
+                    if rule['grantee_group']:
+
+                        # FIXME(jkoelker) This needs to be ported up into
+
+                        #                 the compute manager which already
+
+                        #                 has access to a nw_api handle,
+
+                        #                 and should be the only one making
+
+                        #                 making rpc calls.
+
+                        import nova.network
+
+                        nw_api = nova.network.API()
+
+                        for instance in rule['grantee_group']['instances']:
+
+                            nw_info = nw_api.get_instance_nw_info(ctxt,
+
+                                                                  instance)
+
+
+
+                            ips = [ip['address']
+
+                                for ip in nw_info.fixed_ips()
+
+                                    if ip['version'] == version]
+
+
+
+                            LOG.debug('ips: %r', ips, instance=instance)
+
+                            for ip in ips:
+
+                                subrule = args + ['-s %s' % ip]
+
+                                fw_rules += [' '.join(subrule)]
+
+
+
+                LOG.debug('Using fw_rules: %r', fw_rules, instance=instance)
+
+
+
+        ipv4_rules += ['-j $sg-fallback']
+
+        ipv6_rules += ['-j $sg-fallback']
+
+
+
+        return ipv4_rules, ipv6_rules
+
+
+
+    def instance_filter_exists(self, instance, network_info):
+
+        pass
+
+
+
+    def refresh_security_group_members(self, security_group):
+
+        self.do_refresh_security_group_rules(security_group)
+
+        self.iptables.apply()
+
+
+
+    def refresh_security_group_rules(self, security_group):
+
+        self.do_refresh_security_group_rules(security_group)
+
+        self.iptables.apply()
+
+
+
+    @utils.synchronized('iptables', external=True)
+
+    def do_refresh_security_group_rules(self, security_group):
+
+        for instance in self.instances.values():
+
+            self.remove_filters_for_instance(instance)
+
+            self.add_filters_for_instance(instance)
+
+
+
+    def refresh_provider_fw_rules(self):
+
+        """See :class:`FirewallDriver` docs."""
+
+        self._do_refresh_provider_fw_rules()
+
+        self.iptables.apply()
+
+
+
+    @utils.synchronized('iptables', external=True)
+
+    def _do_refresh_provider_fw_rules(self):
+
+        """Internal, synchronized version of refresh_provider_fw_rules."""
+
+        self._purge_provider_fw_rules()
+
+        self._build_provider_fw_rules()
+
+
+
+    def _purge_provider_fw_rules(self):
+
+        """Remove all rules from the provider chains."""
+
+        self.iptables.ipv4['filter'].empty_chain('provider')
+
+        if FLAGS.use_ipv6:
+
+            self.iptables.ipv6['filter'].empty_chain('provider')
+
+
+
+    def _build_provider_fw_rules(self):
+
+        """Create all rules for the provider IP DROPs."""
+
+        self.iptables.ipv4['filter'].add_chain('provider')
+
+        if FLAGS.use_ipv6:
+
+            self.iptables.ipv6['filter'].add_chain('provider')
+
+        ipv4_rules, ipv6_rules = self._provider_rules()
+
+        for rule in ipv4_rules:
+
+            self.iptables.ipv4['filter'].add_rule('provider', rule)
+
+
+
+        if FLAGS.use_ipv6:
+
+            for rule in ipv6_rules:
+
+                self.iptables.ipv6['filter'].add_rule('provider', rule)
+
+
+
+    @staticmethod
+
+    def _provider_rules():
+
+        """Generate a list of rules from provider for IP4 & IP6."""
+
+        ctxt = context.get_admin_context()
+
+        ipv4_rules = []
+
+        ipv6_rules = []
+
+        rules = db.provider_fw_rule_get_all(ctxt)
+
+        for rule in rules:
+
+            LOG.debug(_('Adding provider rule: %s'), rule['cidr'])
+
+            version = netutils.get_ip_version(rule['cidr'])
+
+            if version == 4:
+
+                fw_rules = ipv4_rules
 
             else:
 
-                o['access']['metadata'] = {'is_admin': 0}
+                fw_rules = ipv6_rules
 
-        if 'roles' in metadata_ref:
 
-                o['access']['metadata']['roles'] = metadata_ref['roles']
 
-        return o
+            protocol = rule['protocol']
 
+            if version == 6 and protocol == 'icmp':
 
+                protocol = 'icmpv6'
 
-    def _format_catalog(self, catalog_ref):
 
-        """Munge catalogs from internal to output format
 
-        Internal catalogs look like:
+            args = ['-p', protocol, '-s', rule['cidr']]
 
 
 
-        {$REGION: {
+            if protocol in ['udp', 'tcp']:
 
-            {$SERVICE: {
+                if rule['from_port'] == rule['to_port']:
 
-                $key1: $value1,
+                    args += ['--dport', '%s' % (rule['from_port'],)]
 
-                ...
+                else:
 
-                }
+                    args += ['-m', 'multiport',
 
-            }
+                             '--dports', '%s:%s' % (rule['from_port'],
 
-        }
+                                                    rule['to_port'])]
 
+            elif protocol == 'icmp':
 
+                icmp_type = rule['from_port']
 
-        The legacy api wants them to look like
+                icmp_code = rule['to_port']
 
 
 
-        [{'name': $SERVICE[name],
+                if icmp_type == -1:
 
-          'type': $SERVICE,
+                    icmp_type_arg = None
 
-          'endpoints': [{
+                else:
 
-              'tenantId': $tenant_id,
+                    icmp_type_arg = '%s' % icmp_type
 
-              ...
+                    if not icmp_code == -1:
 
-              'region': $REGION,
+                        icmp_type_arg += '/%s' % icmp_code
 
-              }],
 
-          'endpoints_links': [],
 
-         }]
+                if icmp_type_arg:
 
+                    if version == 4:
 
+                        args += ['-m', 'icmp', '--icmp-type',
 
-        """
+                                 icmp_type_arg]
 
-        if not catalog_ref:
+                    elif version == 6:
 
-            return {}
+                        args += ['-m', 'icmp6', '--icmpv6-type',
 
+                                 icmp_type_arg]
 
+            args += ['-j DROP']
 
-        services = {}
+            fw_rules += [' '.join(args)]
 
-        for region, region_ref in catalog_ref.iteritems():
+        return ipv4_rules, ipv6_rules
 
-            for service, service_ref in region_ref.iteritems():
 
-                new_service_ref = services.get(service, {})
 
-                new_service_ref['name'] = service_ref.pop('name')
 
-                new_service_ref['type'] = service
 
-                new_service_ref['endpoints_links'] = []
+class NoopFirewallDriver(object):
 
-                service_ref['region'] = region
+    """Firewall driver which just provides No-op methods."""
 
+    def __init__(*args, **kwargs):
 
+        pass
 
-                endpoints_ref = new_service_ref.get('endpoints', [])
 
-                endpoints_ref.append(service_ref)
 
+    def _noop(*args, **kwargs):
 
+        pass
 
-                new_service_ref['endpoints'] = endpoints_ref
 
-                services[service] = new_service_ref
 
+    def __getattr__(self, key):
 
+        return self._noop
 
-        return services.values()
 
 
+    def instance_filter_exists(self, instance, network_info):
 
-    def _format_endpoint_list(self, catalog_ref):
-
-        """Formats a list of endpoints according to Identity API v2.
-
-
-
-        The v2.0 API wants an endpoint list to look like::
-
-
-
-            {
-
-                'endpoints': [
-
-                    {
-
-                        'id': $endpoint_id,
-
-                        'name': $SERVICE[name],
-
-                        'type': $SERVICE,
-
-                        'tenantId': $tenant_id,
-
-                        'region': $REGION,
-
-                    }
-
-                ],
-
-                'endpoints_links': [],
-
-            }
-
-
-
-        """
-
-        if not catalog_ref:
-
-            return {}
-
-
-
-        endpoints = []
-
-        for region_name, region_ref in catalog_ref.iteritems():
-
-            for service_type, service_ref in region_ref.iteritems():
-
-                endpoints.append({
-
-                    'id': service_ref.get('id'),
-
-                    'name': service_ref.get('name'),
-
-                    'type': service_type,
-
-                    'region': region_name,
-
-                    'publicURL': service_ref.get('publicURL'),
-
-                    'internalURL': service_ref.get('internalURL'),
-
-                    'adminURL': service_ref.get('adminURL'),
-
-                })
-
-
-
-        return {'endpoints': endpoints, 'endpoints_links': []}
-
-
-
-
-
-class ExtensionsController(wsgi.Application):
-
-    """Base extensions controller to be extended by public and admin API's."""
-
-
-
-    def __init__(self, extensions=None):
-
-        super(ExtensionsController, self).__init__()
-
-
-
-        self.extensions = extensions or {}
-
-
-
-    def get_extensions_info(self, context):
-
-        return {'extensions': {'values': self.extensions.values()}}
-
-
-
-    def get_extension_info(self, context, extension_alias):
-
-        try:
-
-            return {'extension': self.extensions[extension_alias]}
-
-        except KeyError:
-
-            raise exception.NotFound(target=extension_alias)
-
-
-
-
-
-class PublicExtensionsController(ExtensionsController):
-
-    pass
-
-
-
-
-
-class AdminExtensionsController(ExtensionsController):
-
-    def __init__(self, *args, **kwargs):
-
-        super(AdminExtensionsController, self).__init__(*args, **kwargs)
-
-
-
-        # TODO(dolph): Extensions should obviously provide this information
-
-        #               themselves, but hardcoding it here allows us to match
-
-        #               the API spec in the short term with minimal complexity.
-
-        self.extensions['OS-KSADM'] = {
-
-            'name': 'Openstack Keystone Admin',
-
-            'namespace': 'http://docs.openstack.org/identity/api/ext/'
-
-                         'OS-KSADM/v1.0',
-
-            'alias': 'OS-KSADM',
-
-            'updated': '2011-08-19T13:25:27-06:00',
-
-            'description': 'Openstack extensions to Keystone v2.0 API '
-
-                           'enabling Admin Operations.',
-
-            'links': [
-
-                {
-
-                    'rel': 'describedby',
-
-                    # TODO(dolph): link needs to be revised after
-
-                    #              bug 928059 merges
-
-                    'type': 'text/html',
-
-                    'href': 'https://github.com/openstack/identity-api',
-
-                }
-
-            ]
-
-        }
-
-
-
-
-
-@logging.fail_gracefully
-
-def public_app_factory(global_conf, **local_conf):
-
-    conf = global_conf.copy()
-
-    conf.update(local_conf)
-
-    return PublicRouter()
-
-
-
-
-
-@logging.fail_gracefully
-
-def admin_app_factory(global_conf, **local_conf):
-
-    conf = global_conf.copy()
-
-    conf.update(local_conf)
-
-    return AdminRouter()
-
-
-
-
-
-@logging.fail_gracefully
-
-def public_version_app_factory(global_conf, **local_conf):
-
-    conf = global_conf.copy()
-
-    conf.update(local_conf)
-
-    return PublicVersionRouter()
-
-
-
-
-
-@logging.fail_gracefully
-
-def admin_version_app_factory(global_conf, **local_conf):
-
-    conf = global_conf.copy()
-
-    conf.update(local_conf)
-
-    return AdminVersionRouter()
-
-
-
-
-
-@logging.fail_gracefully
-
-def v3_app_factory(global_conf, **local_conf):
-
-    conf = global_conf.copy()
-
-    conf.update(local_conf)
-
-    return V3Router()
+        return True

@@ -1,6 +1,10 @@
+import React, { useState } from 'react';
 import TraceVisualizer from './TraceVisualizer'
+import ChatBot from './ChatBot';
 
 function ResultsPanel({ result, isLoading, onLineClick }) {
+    const [chatVuln, setChatVuln] = useState(null);
+
     if (isLoading) {
         return (
             <div className="results-panel">
@@ -86,10 +90,22 @@ function ResultsPanel({ result, isLoading, onLineClick }) {
                     </h3>
                     <div className="vulnerabilities-list">
                         {vulnerabilities.map((vuln, idx) => (
-                            <VulnerabilityCard key={idx} vulnerability={vuln} onLineClick={onLineClick} />
+                            <VulnerabilityCard 
+                                key={idx} 
+                                vulnerability={vuln} 
+                                onLineClick={onLineClick} 
+                                onExplainClick={() => setChatVuln(vuln)} 
+                            />
                         ))}
                     </div>
                 </div>
+            )}
+            {/* Chatbot Overlay */}
+            {chatVuln && (
+                <ChatBot 
+                    vulnerability={chatVuln} 
+                    onClose={() => setChatVuln(null)} 
+                />
             )}
         </div>
     )
@@ -105,13 +121,16 @@ const TYPE_LABELS = {
     ssrf: 'SSRF Attack'
 }
 
-function VulnerabilityCard({ vulnerability, onLineClick }) {
+function VulnerabilityCard({ vulnerability, onLineClick, onExplainClick }) {
     const {
         type, confidence, severity, description, remediation,
         affected_lines, status, mitigations, taint_path, metadata
     } = vulnerability
 
-    const handleCardClick = () => {
+    const handleCardClick = (e) => {
+        // Prevent generic card click if interacting with inner elements
+        if (e.target.closest('button') || e.target.closest('.clickable-line')) return;
+        
         if (onLineClick && affected_lines?.length > 0) {
             onLineClick(affected_lines[0])
         }
@@ -134,8 +153,27 @@ function VulnerabilityCard({ vulnerability, onLineClick }) {
                         </span>
                     )}
                 </div>
-                <div className="vuln-meta" style={{ textAlign: 'right' }}>
+                <div className="vuln-meta" style={{ textAlign: 'right', display: 'flex', alignItems: 'center', gap: '12px' }}>
                     <div className="vuln-confidence">{Math.round(confidence * 100)}% Conf.</div>
+                    <button 
+                        className="explain-btn" 
+                        onClick={onExplainClick}
+                        style={{
+                            background: 'rgba(0, 240, 255, 0.1)',
+                            border: '1px solid var(--neon-blue)',
+                            color: 'var(--neon-blue)',
+                            padding: '4px 10px',
+                            borderRadius: '4px',
+                            cursor: 'pointer',
+                            fontSize: '0.8rem',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '6px',
+                            transition: 'all 0.2s'
+                        }}
+                    >
+                        🤖 Explain
+                    </button>
                 </div>
             </div>
 

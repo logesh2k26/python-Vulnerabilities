@@ -2,158 +2,262 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-##############################################################################
+"""
 
-#
+Systemd service utilities.
 
-# Copyright (c) 2006 Zope Foundation and Contributors.
 
-# All Rights Reserved.
 
-#
+Contains functions to start, stop & poll systemd services.
 
-# This software is subject to the provisions of the Zope Public License,
+Probably not very useful outside this spawner.
 
-# Version 2.1 (ZPL).  A copy of the ZPL should accompany this distribution.
+"""
 
-# THIS SOFTWARE IS PROVIDED "AS IS" AND ANY AND ALL EXPRESS OR IMPLIED
+import asyncio
 
-# WARRANTIES ARE DISCLAIMED, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+import shlex
 
-# WARRANTIES OF TITLE, MERCHANTABILITY, AGAINST INFRINGEMENT, AND FITNESS
 
-# FOR A PARTICULAR PURPOSE.
 
-#
 
-##############################################################################
 
-import os
+async def start_transient_service(
 
-from setuptools import setup, find_packages
+    unit_name,
 
+    cmd,
 
+    args,
 
-here = os.path.abspath(os.path.dirname(__file__))
+    working_dir,
 
-try:
+    environment_variables=None,
 
-    README = open(os.path.join(here, "README.rst")).read()
+    properties=None,
 
-    CHANGES = open(os.path.join(here, "CHANGES.txt")).read()
+    uid=None,
 
-except IOError:
+    gid=None,
 
-    README = CHANGES = ""
+    slice=None,
 
+):
 
+    """
 
-docs_extras = [
+    Start a systemd transient service with given paramters
 
-    "Sphinx>=1.8.1",
+    """
 
-    "docutils",
 
-    "pylons-sphinx-themes>=1.0.9",
 
-]
+    run_cmd = [
 
+        'systemd-run',
 
+        '--unit', unit_name,
 
-testing_extras = [
+    ]
 
-    "nose",
 
-    "coverage>=5.0",
 
-]
+    if properties:
 
+        for key, value in properties.items():
 
+            if isinstance(value, list):
 
-setup(
+                run_cmd += ['--property={}={}'.format(key, v) for v in value]
 
-    name="waitress",
+            else:
 
-    version="1.3.1",
+                # A string!
 
-    author="Zope Foundation and Contributors",
+                run_cmd.append('--property={}={}'.format(key, value))
 
-    author_email="zope-dev@zope.org",
 
-    maintainer="Pylons Project",
 
-    maintainer_email="pylons-discuss@googlegroups.com",
+    if environment_variables:
 
-    description="Waitress WSGI server",
+        run_cmd += [
 
-    long_description=README + "\n\n" + CHANGES,
+            '--setenv={}={}'.format(key, value)
 
-    license="ZPL 2.1",
+            for key, value in environment_variables.items()
 
-    keywords="waitress wsgi server http",
+        ]
 
-    classifiers=[
 
-        "Development Status :: 5 - Production/Stable",
 
-        "Environment :: Web Environment",
+    # Explicitly check if uid / gid are not None, since 0 is valid value for both
 
-        "Intended Audience :: Developers",
+    if uid is not None:
 
-        "License :: OSI Approved :: Zope Public License",
+        run_cmd += ['--uid', str(uid)]
 
-        "Programming Language :: Python",
 
-        "Programming Language :: Python :: 2",
 
-        "Programming Language :: Python :: 2.7",
+    if gid is not None:
 
-        "Programming Language :: Python :: 3",
+        run_cmd += ['--gid', str(gid)]
 
-        "Programming Language :: Python :: 3.4",
 
-        "Programming Language :: Python :: 3.5",
 
-        "Programming Language :: Python :: 3.6",
+    if slice is not None:
 
-        "Programming Language :: Python :: 3.7",
+        run_cmd += ['--slice={}'.format(slice)]
 
-        "Programming Language :: Python :: Implementation :: CPython",
+    
 
-        "Programming Language :: Python :: Implementation :: PyPy",
+    # We unfortunately have to resort to doing cd with bash, since WorkingDirectory property
 
-        "Natural Language :: English",
+    # of systemd units can't be set for transient units via systemd-run until systemd v227.
 
-        "Operating System :: OS Independent",
+    # Centos 7 has systemd 219, and will probably never upgrade - so we need to support them.
 
-        "Topic :: Internet :: WWW/HTTP",
+    run_cmd += [
 
-        "Topic :: Internet :: WWW/HTTP :: WSGI",
+        '/bin/bash',
 
-    ],
+        '-c',
 
-    url="https://github.com/Pylons/waitress",
+        "cd {wd} && exec {cmd} {args}".format(
 
-    packages=find_packages(),
+            wd=shlex.quote(working_dir),
 
-    extras_require={"testing": testing_extras, "docs": docs_extras,},
+            cmd=' '.join([shlex.quote(c) for c in cmd]),
 
-    include_package_data=True,
+            args=' '.join([shlex.quote(a) for a in args])
 
-    test_suite="waitress",
+        )
 
-    zip_safe=False,
+    ]
 
-    entry_points="""
 
-    [paste.server_runner]
 
-    main = waitress:serve_paste
+    proc = await asyncio.create_subprocess_exec(*run_cmd)
 
-    [console_scripts]
 
-    waitress-serve = waitress.runner:run
 
-    """,
+    return await proc.wait()
 
-)
+
+
+
+
+async def service_running(unit_name):
+
+    """
+
+    Return true if service with given name is running (active).
+
+    """
+
+    proc = await asyncio.create_subprocess_exec(
+
+        'systemctl',
+
+        'is-active',
+
+        unit_name,
+
+        # hide stdout, but don't capture stderr at all
+
+        stdout=asyncio.subprocess.DEVNULL
+
+    )
+
+    ret = await proc.wait()
+
+
+
+    return ret == 0
+
+
+
+
+
+async def service_failed(unit_name):
+
+    """
+
+    Return true if service with given name is in a failed state.
+
+    """
+
+    proc = await asyncio.create_subprocess_exec(
+
+        'systemctl',
+
+        'is-failed',
+
+        unit_name,
+
+        # hide stdout, but don't capture stderr at all
+
+        stdout=asyncio.subprocess.DEVNULL
+
+    )
+
+    ret = await proc.wait()
+
+
+
+    return ret == 0
+
+
+
+
+
+async def stop_service(unit_name):
+
+    """
+
+    Stop service with given name.
+
+
+
+    Throws CalledProcessError if stopping fails
+
+    """
+
+    proc = await asyncio.create_subprocess_exec(
+
+        'systemctl',
+
+        'stop',
+
+        unit_name
+
+    )
+
+    await proc.wait()
+
+
+
+
+
+async def reset_service(unit_name):
+
+    """
+
+    Reset service with given name.
+
+
+
+    Throws CalledProcessError if resetting fails
+
+    """
+
+    proc = await asyncio.create_subprocess_exec(
+
+        'systemctl',
+
+        'reset-failed',
+
+        unit_name
+
+    )
+
+    await proc.wait()

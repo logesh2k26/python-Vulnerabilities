@@ -2,2396 +2,2876 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-# -*- coding: utf-8 -*-
+#!/usr/bin/env  python2
 
-#    Copyright (C) 2017-2018 CIRCL Computer Incident Response Center Luxembourg (smile gie)
+__license__   = 'GPL v3'
 
-#    Copyright (C) 2017-2018 Christian Studer
+__copyright__ = '2008, Kovid Goyal kovid@kovidgoyal.net'
 
-#
+__docformat__ = 'restructuredtext en'
 
-#    This program is free software: you can redistribute it and/or modify
 
-#    it under the terms of the GNU Affero General Public License as
 
-#    published by the Free Software Foundation, either version 3 of the
+# Imports {{{
 
-#    License, or (at your option) any later version.
+import os, math, json
 
-#
+from base64 import b64encode
 
-#    This program is distributed in the hope that it will be useful,
+from functools import partial
 
-#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+from future_builtins import map
 
-#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 
-#    GNU Affero General Public License for more details.
 
-#
+from PyQt5.Qt import (
 
-#    You should have received a copy of the GNU Affero General Public License
+    QSize, QSizePolicy, QUrl, Qt, pyqtProperty, QPainter, QPalette, QBrush,
 
-#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    QDialog, QColor, QPoint, QImage, QRegion, QIcon, QAction, QMenu,
 
+    pyqtSignal, QApplication, pyqtSlot, QKeySequence, QMimeData)
 
+from PyQt5.QtWebKitWidgets import QWebPage, QWebView
 
-import sys
+from PyQt5.QtWebKit import QWebSettings, QWebElement
 
-import json
 
-import os
 
-import time
+from calibre.gui2.viewer.flip import SlideFlip
 
-import uuid
+from calibre.gui2.shortcuts import Shortcuts
 
-import base64
+from calibre.gui2 import open_url
 
-import stix2misp_mapping
+from calibre import prints
 
-import stix.extensions.marking.ais
+from calibre.customize.ui import all_viewer_plugins
 
-from operator import attrgetter
+from calibre.gui2.viewer.keys import SHORTCUTS
 
-from pymisp import MISPEvent, MISPObject, MISPAttribute, __path__
+from calibre.gui2.viewer.javascript import JavaScriptLoader
 
-from stix.core import STIXPackage
+from calibre.gui2.viewer.position import PagePosition
 
-from collections import defaultdict
+from calibre.gui2.viewer.config import config, ConfigDialog, load_themes
 
+from calibre.gui2.viewer.image_popup import ImagePopup
 
+from calibre.gui2.viewer.table_popup import TablePopup
 
-cybox_to_misp_object = {"Account": "credential", "AutonomousSystem": "asn",
+from calibre.gui2.viewer.inspector import WebInspector
 
-                        "EmailMessage": "email", "NetworkConnection": "network-connection",
+from calibre.gui2.viewer.gestures import GestureHandler
 
-                        "NetworkSocket": "network-socket", "Process": "process",
+from calibre.gui2.viewer.footnote import Footnotes
 
-                        "x509Certificate": "x509", "Whois": "whois"}
+from calibre.ebooks.oeb.display.webview import load_html
 
+from calibre.constants import isxp, iswindows, DEBUG, __version__
 
+# }}}
 
-threat_level_mapping = {'High': '1', 'Medium': '2', 'Low': '3', 'Undefined': '4'}
 
 
 
-descFilename = os.path.join(__path__[0], 'data/describeTypes.json')
 
-with open(descFilename, 'r') as f:
+def apply_settings(settings, opts):
 
-    categories = json.loads(f.read())['result'].get('categories')
+    settings.setFontSize(QWebSettings.DefaultFontSize, opts.default_font_size)
 
+    settings.setFontSize(QWebSettings.DefaultFixedFontSize, opts.mono_font_size)
 
+    settings.setFontSize(QWebSettings.MinimumLogicalFontSize, opts.minimum_font_size)
 
-class StixParser():
+    settings.setFontSize(QWebSettings.MinimumFontSize, opts.minimum_font_size)
 
-    def __init__(self):
+    settings.setFontFamily(QWebSettings.StandardFont, {'serif':opts.serif_family, 'sans':opts.sans_family, 'mono':opts.mono_family}[opts.standard_font])
 
-        super(StixParser, self).__init__()
+    settings.setFontFamily(QWebSettings.SerifFont, opts.serif_family)
 
-        self.misp_event = MISPEvent()
+    settings.setFontFamily(QWebSettings.SansSerifFont, opts.sans_family)
 
-        self.misp_event['Galaxy'] = []
+    settings.setFontFamily(QWebSettings.FixedFont, opts.mono_family)
 
-        self.references = defaultdict(list)
+    settings.setAttribute(QWebSettings.ZoomTextOnly, True)
 
 
 
-    ################################################################################
 
-    ##            LOADING & UTILITY FUNCTIONS USED BY BOTH SUBCLASSES.            ##
 
-    ################################################################################
+def apply_basic_settings(settings):
 
+    # Security
 
+    settings.setAttribute(QWebSettings.JavaEnabled, False)
 
-    # Load data from STIX document, and other usefull data
+    settings.setAttribute(QWebSettings.PluginsEnabled, False)
 
-    def load_event(self, args, filename, from_misp, stix_version):
+    settings.setAttribute(QWebSettings.JavascriptCanOpenWindows, False)
 
-        self.outputname = '{}.json'.format(filename)
+    settings.setAttribute(QWebSettings.JavascriptCanAccessClipboard, False)
 
-        if len(args) > 0 and args[0]:
+    # PrivateBrowsing disables console messages
 
-            self.add_original_file(filename, args[0], stix_version)
+    # settings.setAttribute(QWebSettings.PrivateBrowsingEnabled, True)
 
-        try:
+    settings.setAttribute(QWebSettings.NotificationsEnabled, False)
 
-            event_distribution = args[1]
+    settings.setThirdPartyCookiePolicy(QWebSettings.AlwaysBlockThirdPartyCookies)
 
-            if not isinstance(event_distribution, int):
 
-                event_distribution = int(event_distribution) if event_distribution.isdigit() else 5
 
-        except IndexError:
+    # Miscellaneous
 
-            event_distribution = 5
+    settings.setAttribute(QWebSettings.LinksIncludedInFocusChain, True)
 
-        try:
+    settings.setAttribute(QWebSettings.DeveloperExtrasEnabled, True)
 
-            attribute_distribution = args[2]
 
-            if attribute_distribution == 'event':
 
-                attribute_distribution = event_distribution
 
-            elif not isinstance(attribute_distribution, int):
 
-                attribute_distribution = int(attribute_distribution) if attribute_distribution.isdigit() else event_distribution
+class Document(QWebPage):  # {{{
 
-        except IndexError:
 
-            attribute_distribution = event_distribution
 
-        self.misp_event.distribution = event_distribution
+    page_turn = pyqtSignal(object)
 
-        self.__attribute_distribution = attribute_distribution
+    mark_element = pyqtSignal(QWebElement)
 
-        self.from_misp = from_misp
+    settings_changed = pyqtSignal()
 
-        self.load_mapping()
+    animated_scroll_done_signal = pyqtSignal()
 
 
 
-    # Convert the MISP event we create from the STIX document into json format
+    def set_font_settings(self, opts):
 
-    # and write it in the output file
+        settings = self.settings()
 
-    def saveFile(self):
+        apply_settings(settings, opts)
 
-        eventDict = self.misp_event.to_json()
 
-        with open(self.outputname, 'wt', encoding='utf-8') as f:
 
-            f.write(eventDict)
+    def do_config(self, parent=None):
 
+        d = ConfigDialog(self.shortcuts, parent)
 
+        if d.exec_() == QDialog.Accepted:
 
-    def add_original_file(self, filename, original_filename, version):
+            opts = config().parse()
 
-        with open(filename, 'rb') as f:
+            self.apply_settings(opts)
 
-            sample = base64.b64encode(f.read()).decode('utf-8')
 
-        original_file = MISPObject('original-imported-file')
 
-        original_file.add_attribute(**{'type': 'attachment', 'value': original_filename,
+    def apply_settings(self, opts):
 
-                                       'object_relation': 'imported-sample', 'data': sample})
+        with self.page_position:
 
-        original_file.add_attribute(**{'type': 'text', 'object_relation': 'format',
+            self.set_font_settings(opts)
 
-                                       'value': 'STIX {}'.format(version)})
+            self.set_user_stylesheet(opts)
 
-        self.misp_event.add_object(**original_file)
+            self.misc_config(opts)
 
+            self.settings_changed.emit()
 
+            self.after_load()
 
-    # Load the mapping dictionary for STIX object types
 
-    def load_mapping(self):
 
-        self.attribute_types_mapping = {
+    def __init__(self, shortcuts, parent=None, debug_javascript=False):
 
-            "AccountObjectType": self.handle_credential,
+        QWebPage.__init__(self, parent)
 
-            'AddressObjectType': self.handle_address,
+        self.setObjectName("py_bridge")
 
-            "ArtifactObjectType": self.handle_attachment,
+        self.in_paged_mode = False
 
-            "ASObjectType": self.handle_as,
+        # Use this to pass arbitrary JSON encodable objects between python and
 
-            "CustomObjectType": self.handle_custom,
+        # javascript. In python get/set the value as: self.bridge_value. In
 
-            "DNSRecordObjectType": self.handle_dns,
+        # javascript, get/set the value as: py_bridge.value
 
-            'DomainNameObjectType': self.handle_domain_or_url,
+        self.bridge_value = None
 
-            'EmailMessageObjectType': self.handle_email_attribute,
+        self.first_load = True
 
-            'FileObjectType': self.handle_file,
+        self.jump_to_cfi_listeners = set()
 
-            'HostnameObjectType': self.handle_hostname,
 
-            'HTTPSessionObjectType': self.handle_http,
 
-            'MutexObjectType': self.handle_mutex,
+        self.debug_javascript = debug_javascript
 
-            'NetworkConnectionObjectType': self.handle_network_connection,
+        self.anchor_positions = {}
 
-            'NetworkSocketObjectType': self.handle_network_socket,
+        self.index_anchors = set()
 
-            'PDFFileObjectType': self.handle_file,
+        self.current_language = None
 
-            'PortObjectType': self.handle_port,
+        self.loaded_javascript = False
 
-            'ProcessObjectType': self.handle_process,
+        self.js_loader = JavaScriptLoader(
 
-            'SocketAddressObjectType': self.handle_socket_address,
+                    dynamic_coffeescript=self.debug_javascript)
 
-            'SystemObjectType': self.handle_system,
+        self.in_fullscreen_mode = False
 
-            'URIObjectType': self.handle_domain_or_url,
+        self.math_present = False
 
-            "WhoisObjectType": self.handle_whois,
 
-            "WindowsFileObjectType": self.handle_file,
 
-            'WindowsRegistryKeyObjectType': self.handle_regkey,
+        self.setLinkDelegationPolicy(self.DelegateAllLinks)
 
-            "WindowsExecutableFileObjectType": self.handle_pe,
+        self.scroll_marks = []
 
-            "WindowsServiceObjectType": self.handle_windows_service,
+        self.shortcuts = shortcuts
 
-            "X509CertificateObjectType": self.handle_x509
+        pal = self.palette()
 
-        }
+        pal.setBrush(QPalette.Background, QColor(0xee, 0xee, 0xee))
 
+        self.setPalette(pal)
 
+        self.page_position = PagePosition(self)
 
-        self.marking_mapping = {
 
-            'AIS:AISMarkingStructure': self.parse_AIS_marking,
 
-            'tlpMarking:TLPMarkingStructureType': self.parse_TLP_marking
+        settings = self.settings()
 
-        }
 
 
+        # Fonts
 
-    def parse_marking(self, handling):
+        self.all_viewer_plugins = tuple(all_viewer_plugins())
 
-        tags = []
+        for pl in self.all_viewer_plugins:
 
-        if hasattr(handling, 'marking_structures') and handling.marking_structures:
+            pl.load_fonts()
 
-            for marking in handling.marking_structures:
+        opts = config().parse()
 
-                try:
+        self.set_font_settings(opts)
 
-                    tags.extend(self.marking_mapping[marking._XSI_TYPE](marking))
 
-                except KeyError:
 
-                    print(marking._XSI_TYPE, file=sys.stderr)
+        apply_basic_settings(settings)
 
-                    continue
+        self.set_user_stylesheet(opts)
 
-        return tags
+        self.misc_config(opts)
 
 
 
-    def set_distribution(self):
+        # Load javascript
 
-        for attribute in self.misp_event.attributes:
+        self.mainFrame().javaScriptWindowObjectCleared.connect(
 
-            attribute.distribution = self.__attribute_distribution
+                self.add_window_objects)
 
-        for misp_object in self.misp_event.objects:
 
-            misp_object.distribution = self.__attribute_distribution
 
-            for attribute in misp_object.attributes:
+        self.turn_off_internal_scrollbars()
 
-                attribute.distribution = self.__attribute_distribution
 
 
+    def turn_off_internal_scrollbars(self):
 
-    # Make references between objects
+        mf = self.mainFrame()
 
-    def build_references(self):
+        mf.setScrollBarPolicy(Qt.Vertical, Qt.ScrollBarAlwaysOff)
 
-        for misp_object in self.misp_event.objects:
+        mf.setScrollBarPolicy(Qt.Horizontal, Qt.ScrollBarAlwaysOff)
 
-            object_uuid = misp_object.uuid
 
-            if object_uuid in self.references:
 
-                for reference in self.references[object_uuid]:
+    def set_user_stylesheet(self, opts):
 
-                    misp_object.add_reference(reference['idref'], reference['relationship'])
+        brules = ['background-color: %s !important'%opts.background_color] if opts.background_color else ['background-color: white']
 
+        prefix = '''
 
+            body { %s  }
 
-    # Set info & title values in the new MISP event
+        '''%('; '.join(brules))
 
-    def get_event_info(self):
+        if opts.text_color:
 
-        info = "Imported from external STIX event"
+            prefix += '\n\nbody, p, div { color: %s !important }'%opts.text_color
 
-        try:
+        raw = prefix + opts.user_css
 
-            try:
+        raw = '::selection {background:#ffff00; color:#000;}\n'+raw
 
-                title = self.event.stix_header.title
+        data = 'data:text/css;charset=utf-8;base64,'
 
-            except AttributeError:
+        data += b64encode(raw.encode('utf-8'))
 
-                title = self.event.title
+        self.settings().setUserStyleSheetUrl(QUrl(data))
 
-            if title:
 
-                info = title
 
-        except AttributeError:
+    def findText(self, q, flags):
 
-            pass
+        if self.hyphenatable:
 
-        return info
+            q = unicode(q)
 
+            hyphenated_q = self.javascript(
 
+                'hyphenate_text(%s, "%s")' % (json.dumps(q, ensure_ascii=False), self.loaded_lang), typ='string')
 
-    # Get timestamp & date values in the new MISP event
+            if hyphenated_q and QWebPage.findText(self, hyphenated_q, flags):
 
-    def get_timestamp_and_date(self):
+                return True
 
-        stix_date = self.event.timestamp
+        return QWebPage.findText(self, q, flags)
 
-        try:
 
-            date = stix_date.split("T")[0]
 
-        except AttributeError:
+    def misc_config(self, opts):
 
-            date = stix_date
+        self.hyphenate = opts.hyphenate
 
-        return date, self.getTimestampfromDate(stix_date)
+        self.hyphenate_default_lang = opts.hyphenate_default_lang
 
+        self.do_fit_images = opts.fit_images
 
+        self.page_flip_duration = opts.page_flip_duration
 
-    # Translate date into timestamp
+        self.enable_page_flip = self.page_flip_duration > 0.1
 
-    @staticmethod
+        self.font_magnification_step = opts.font_magnification_step
 
-    def getTimestampfromDate(date):
+        self.wheel_flips_pages = opts.wheel_flips_pages
 
-        try:
+        self.wheel_scroll_fraction = opts.wheel_scroll_fraction
 
-            try:
+        self.line_scroll_fraction = opts.line_scroll_fraction
 
-                dt = date.split('+')[0]
+        self.tap_flips_pages = opts.tap_flips_pages
 
-                d = int(time.mktime(time.strptime(dt, "%Y-%m-%d %H:%M:%S")))
+        self.line_scrolling_stops_on_pagebreaks = opts.line_scrolling_stops_on_pagebreaks
 
-            except ValueError:
+        screen_width = QApplication.desktop().screenGeometry().width()
 
-                dt = date.split('.')[0]
+        # Leave some space for the scrollbar and some border
 
-                d = int(time.mktime(time.strptime(dt, "%Y-%m-%d %H:%M:%S")))
+        self.max_fs_width = min(opts.max_fs_width, screen_width-50)
 
-        except AttributeError:
+        self.max_fs_height = opts.max_fs_height
 
-            d = int(time.mktime(date.timetuple()))
+        self.fullscreen_clock = opts.fullscreen_clock
 
-        return d
+        self.fullscreen_scrollbar = opts.fullscreen_scrollbar
 
+        self.fullscreen_pos = opts.fullscreen_pos
 
+        self.start_in_fullscreen = opts.start_in_fullscreen
 
-    ################################################################################
+        self.show_fullscreen_help = opts.show_fullscreen_help
 
-    ##           STIX OBJECTS PARSING FUNCTIONS USED BY BOTH SUBCLASSES           ##
+        self.use_book_margins = opts.use_book_margins
 
-    ################################################################################
+        self.cols_per_screen_portrait = opts.cols_per_screen_portrait
 
+        self.cols_per_screen_landscape = opts.cols_per_screen_landscape
 
+        self.side_margin = opts.side_margin
 
-    # Define type & value of an attribute or object in MISP
+        self.top_margin, self.bottom_margin = opts.top_margin, opts.bottom_margin
 
-    def handle_attribute_type(self, properties, is_object=False, title=None, observable_id=None):
+        self.show_controls = opts.show_controls
 
-        xsi_type = properties._XSI_TYPE
+        self.remember_current_page = opts.remember_current_page
 
-        # try:
+        self.copy_bookmarks_to_file = opts.copy_bookmarks_to_file
 
-        args = [properties]
+        self.search_online_url = opts.search_online_url or 'https://www.google.com/search?q={text}'
 
-        if xsi_type in ("FileObjectType", "PDFFileObjectType", "WindowsFileObjectType"):
 
-            args.append(is_object)
 
-        elif xsi_type == "ArtifactObjectType":
+    def fit_images(self):
 
-            args.append(title)
+        if self.do_fit_images and not self.in_paged_mode:
 
-        return self.attribute_types_mapping[xsi_type](*args)
+            self.javascript('setup_image_scaling_handlers()')
 
-        # except AttributeError:
 
-        #     # ATM USED TO TEST TYPES
 
-        #     print("Unparsed type: {}".format(xsi_type))
+    def add_window_objects(self):
 
-        #     sys.exit(1)
+        self.mainFrame().addToJavaScriptWindowObject("py_bridge", self)
 
+        self.javascript('''
 
+        Object.defineProperty(py_bridge, 'value', {
 
-    # Return type & value of an ip address attribute
+               get : function() { return JSON.parse(this._pass_json_value); },
 
-    @staticmethod
+               set : function(val) { this._pass_json_value = JSON.stringify(val); }
 
-    def handle_address(properties):
+        });
 
-        if properties.is_source:
+        ''')
 
-            ip_type = "ip-src"
+        self.loaded_javascript = False
 
-        else:
 
-            ip_type = "ip-dst"
 
-        return ip_type, properties.address_value.value, "ip"
+    def load_javascript_libraries(self):
 
-
-
-    def handle_as(self, properties):
-
-        attributes = self.fetch_attributes_with_partial_key_parsing(properties, stix2misp_mapping._as_mapping)
-
-        return attributes[0] if len(attributes) == 1 else ('asn', self.return_attributes(attributes), '')
-
-
-
-    # Return type & value of an attachment attribute
-
-    @staticmethod
-
-    def handle_attachment(properties, title):
-
-        if properties.hashes:
-
-            return "malware-sample", "{}|{}".format(title, properties.hashes[0], properties.raw_artifact.value)
-
-        return stix2misp_mapping.eventTypes[properties._XSI_TYPE]['type'], title, properties.raw_artifact.value
-
-
-
-    # Return type & attributes of a credential object
-
-    def handle_credential(self, properties):
-
-        attributes = []
-
-        if properties.description:
-
-            attributes.append(["text", properties.description.value, "text"])
-
-        if properties.authentication:
-
-            for authentication in properties.authentication:
-
-                attributes += self.fetch_attributes_with_key_parsing(authentication, stix2misp_mapping._credential_authentication_mapping)
-
-        if properties.custom_properties:
-
-            for prop in properties.custom_properties:
-
-                if prop.name in stix2misp_mapping._credential_custom_types:
-
-                    attributes.append(['text', prop.value, prop.name])
-
-        return attributes[0] if len(attributes) == 1 else ("credential", self.return_attributes(attributes), "")
-
-
-
-    # Return type & attributes of a dns object
-
-    def handle_dns(self, properties):
-
-        relation = []
-
-        if properties.domain_name:
-
-            relation.append(["domain", str(properties.domain_name.value), ""])
-
-        if properties.ip_address:
-
-            relation.append(["ip-dst", str(properties.ip_address.value), ""])
-
-        if relation:
-
-            if len(relation) == '2':
-
-                domain = relation[0][1]
-
-                ip = relattion[1][1]
-
-                attributes = [["text", domain, "rrname"], ["text", ip, "rdata"]]
-
-                rrtype = "AAAA" if ":" in ip else "A"
-
-                attributes.append(["text", rrtype, "rrtype"])
-
-                return "passive-dns", self.return_attributes(attributes), ""
-
-            return relation[0]
-
-
-
-    # Return type & value of a domain or url attribute
-
-    @staticmethod
-
-    def handle_domain_or_url(properties):
-
-        event_types = stix2misp_mapping.eventTypes[properties._XSI_TYPE]
-
-        return event_types['type'], properties.value.value, event_types['relation']
-
-
-
-    # Return type & value of an email attribute
-
-    def handle_email_attribute(self, properties):
-
-        if properties.header:
-
-            header = properties.header
-
-            attributes = self.fetch_attributes_with_key_parsing(header, stix2misp_mapping._email_mapping)
-
-            if header.to:
-
-                for to in header.to:
-
-                    attributes.append(["email-dst", to.address_value.value, "to"])
-
-            if header.cc:
-
-                for cc in header.cc:
-
-                    attributes.append(["email-dst", cc.address_value.value, "cc"])
-
-        else:
-
-            attributes = []
-
-        if properties.attachments:
-
-            attributes.append(self.handle_email_attachment(properties.parent))
-
-        return attributes[0] if len(attributes) == 1 else ("email", self.return_attributes(attributes), "")
-
-
-
-    # Return type & value of an email attachment
-
-    @staticmethod
-
-    def handle_email_attachment(indicator_object):
-
-        properties = indicator_object.related_objects[0].properties
-
-        return ["email-attachment", properties.file_name.value, "attachment"]
-
-
-
-    # Return type & attributes of a file object
-
-    def handle_file(self, properties, is_object):
-
-        b_hash, b_file = False, False
-
-        attributes = []
-
-        if properties.hashes:
-
-            b_hash = True
-
-            for h in properties.hashes:
-
-                attributes.append(self.handle_hashes_attribute(h))
-
-        if properties.file_name:
-
-            value = properties.file_name.value
-
-            if value:
-
-                b_file = True
-
-                attribute_type, relation = stix2misp_mapping.eventTypes[properties._XSI_TYPE]
-
-                attributes.append([attribute_type, value, relation])
-
-        attributes.extend(self.fetch_attributes_with_keys(properties, stix2misp_mapping._file_mapping))
-
-        if len(attributes) == 1:
-
-            attribute = attributes[0]
-
-            return attribute[0] if attribute[2] != "fullpath" else "filename", attribute[1], ""
-
-        if len(attributes) == 2:
-
-            if b_hash and b_file:
-
-                return self.handle_filename_object(attributes, is_object)
-
-            path, filename = self.handle_filename_path_case(attributes)
-
-            if path and filename:
-
-                attribute_value = "{}\\{}".format(path, filename)
-
-                if '\\' in filename and path == filename:
-
-                    attribute_value = filename
-
-                return "filename", attribute_value, ""
-
-        return "file", self.return_attributes(attributes), ""
-
-
-
-    # Determine path & filename from a complete path or filename attribute
-
-    @staticmethod
-
-    def handle_filename_path_case(attributes):
-
-        path, filename = [""] * 2
-
-        if attributes[0][2] == 'filename' and attributes[1][2] == 'path':
-
-            path = attributes[1][1]
-
-            filename = attributes[0][1]
-
-        elif attributes[0][2] == 'path' and attributes[1][2] == 'filename':
-
-            path = attributes[0][1]
-
-            filename = attributes[1][1]
-
-        return path, filename
-
-
-
-    # Return the appropriate type & value when we have 1 filename & 1 hash value
-
-    @staticmethod
-
-    def handle_filename_object(attributes, is_object):
-
-        for attribute in attributes:
-
-            attribute_type, attribute_value, _ = attribute
-
-            if attribute_type == "filename":
-
-                filename_value = attribute_value
-
-            else:
-
-                hash_type, hash_value = attribute_type, attribute_value
-
-        value = "{}|{}".format(filename_value,  hash_value)
-
-        if is_object:
-
-            # file object attributes cannot be filename|hash, so it is malware-sample
-
-            attr_type = "malware-sample"
-
-            return attr_type, value, attr_type
-
-        # it could be malware-sample as well, but STIX is losing this information
-
-        return "filename|{}".format(hash_type), value, ""
-
-
-
-    # Return type & value of a hash attribute
-
-    @staticmethod
-
-    def handle_hashes_attribute(properties):
-
-        hash_type = properties.type_.value.lower()
-
-        try:
-
-            hash_value = properties.simple_hash_value.value
-
-        except AttributeError:
-
-            hash_value = properties.fuzzy_hash_value.value
-
-        return hash_type, hash_value, hash_type
-
-
-
-    # Return type & value of a hostname attribute
-
-    @staticmethod
-
-    def handle_hostname(properties):
-
-        event_types = stix2misp_mapping.eventTypes[properties._XSI_TYPE]
-
-        return event_types['type'], properties.hostname_value.value, event_types['relation']
-
-
-
-    # Return type & value of a http request attribute
-
-    @staticmethod
-
-    def handle_http(properties):
-
-        client_request = properties.http_request_response[0].http_client_request
-
-        if client_request.http_request_header:
-
-            request_header = client_request.http_request_header
-
-            if request_header.parsed_header:
-
-                value = request_header.parsed_header.user_agent.value
-
-                return "user-agent", value, "user-agent"
-
-            elif request_header.raw_header:
-
-                value = request_header.raw_header.value
-
-                return "http-method", value, "method"
-
-        elif client_request.http_request_line:
-
-            value = client_request.http_request_line.http_method.value
-
-            return "http-method", value, "method"
-
-
-
-    # Return type & value of a mutex attribute
-
-    @staticmethod
-
-    def handle_mutex(properties):
-
-        event_types = stix2misp_mapping.eventTypes[properties._XSI_TYPE]
-
-        return event_types['type'], properties.name.value, event_types['relation']
-
-
-
-    # Return type & attributes of a network connection object
-
-    def handle_network_connection(self, properties):
-
-        attributes = self.fetch_attributes_from_sockets(properties, stix2misp_mapping._network_connection_addresses)
-
-        for prop in ('layer3_protocol', 'layer4_protocol', 'layer7_protocol'):
-
-            if getattr(properties, prop):
-
-                attributes.append(['text', attrgetter("{}.value".format(prop))(properties), prop.replace('_', '-')])
-
-        if attributes:
-
-            return "network-connection", self.return_attributes(attributes), ""
-
-
-
-    # Return type & attributes of a network socket objet
-
-    def handle_network_socket(self, properties):
-
-        attributes = self.fetch_attributes_from_sockets(properties, stix2misp_mapping._network_socket_addresses)
-
-        attributes.extend(self.fetch_attributes_with_keys(properties, stix2misp_mapping._network_socket_mapping))
-
-        for prop in ('is_listening', 'is_blocking'):
-
-            if getattr(properties, prop):
-
-                attributes.append(["text", prop.split('_')[1], "state"])
-
-        if attributes:
-
-            return "network-socket", self.return_attributes(attributes), ""
-
-
-
-    # Return type & value of a port attribute
-
-    @staticmethod
-
-    def handle_port(*kwargs):
-
-        properties = kwargs[0]
-
-        event_types = stix2misp_mapping.eventTypes[properties._XSI_TYPE]
-
-        relation = event_types['relation']
-
-        if len(kwargs) > 1:
-
-            observable_id = kwargs[1]
-
-            if "srcPort" in observable_id:
-
-                relation = "src-{}".format(relation)
-
-            elif "dstPort" in observable_id:
-
-                relation = "dst-{}".format(relation)
-
-        return event_types['type'], properties.port_value.value, relation
-
-
-
-    # Return type & attributes of a process object
-
-    def handle_process(self, properties):
-
-        attributes = self.fetch_attributes_with_partial_key_parsing(properties, stix2misp_mapping._process_mapping)
-
-        if properties.child_pid_list:
-
-            for child in properties.child_pid_list:
-
-                attributes.append(["text", child.value, "child-pid"])
-
-        # if properties.port_list:
-
-        #     for port in properties.port_list:
-
-        #         attributes.append(["src-port", port.port_value.value, "port"])
-
-        if properties.network_connection_list:
-
-            references = []
-
-            for connection in properties.network_connection_list:
-
-                object_name, object_attributes, _ = self.handle_network_connection(connection)
-
-                object_uuid = str(uuid.uuid4())
-
-                misp_object = MISPObject(object_name)
-
-                misp_object.uuid = object_uuid
-
-                for attribute in object_attributes:
-
-                    misp_object.add_attribute(**attribute)
-
-                references.append(object_uuid)
-
-            return "process", self.return_attributes(attributes), {"process_uuid": references}
-
-        return "process", self.return_attributes(attributes), ""
-
-
-
-    # Return type & value of a regkey attribute
-
-    def handle_regkey(self, properties):
-
-        attributes = self.fetch_attributes_with_partial_key_parsing(properties, stix2misp_mapping._regkey_mapping)
-
-        if properties.values:
-
-            values = properties.values
-
-            value = values[0]
-
-            attributes += self.fetch_attributes_with_partial_key_parsing(value, stix2misp_mapping._regkey_value_mapping)
-
-        if len(attributes) in (2,3):
-
-            d_regkey = {key: value for (_, value, key) in attributes}
-
-            if 'hive' in d_regkey and 'key' in d_regkey:
-
-                regkey = "{}\\{}".format(d_regkey['hive'], d_regkey['key'])
-
-                if 'data' in d_regkey:
-
-                    return "regkey|value", "{} | {}".format(regkey, d_regkey['data']), ""
-
-                return "regkey", regkey, ""
-
-        return "registry-key", self.return_attributes(attributes), ""
-
-
-
-    @staticmethod
-
-    def handle_socket(attributes, socket, s_type):
-
-        for prop, mapping in stix2misp_mapping._socket_mapping.items():
-
-            if getattr(socket, prop):
-
-                attribute_type, properties_key, relation = mapping
-
-                attribute_type, relation = [elem.format(s_type) for elem in (attribute_type, relation)]
-
-                attributes.append([attribute_type, attrgetter('{}.{}.value'.format(prop, properties_key))(socket), relation])
-
-
-
-    # Parse a socket address object in order to return type & value
-
-    # of a composite attribute ip|port or hostname|port
-
-    def handle_socket_address(self, properties):
-
-        if properties.ip_address:
-
-            type1, value1, _ = self.handle_address(properties.ip_address)
-
-        elif properties.hostname:
-
-            type1 = "hostname"
-
-            value1 = properties.hostname.hostname_value.value
-
-        return "{}|port".format(type1), "{}|{}".format(value1, properties.port.port_value.value), ""
-
-
-
-    # Parse a system object to extract a mac-address attribute
-
-    @staticmethod
-
-    def handle_system(properties):
-
-        if properties.network_interface_list:
-
-            return "mac-address", str(properties.network_interface_list[0].mac), ""
-
-
-
-    # Parse a whois object:
-
-    # Return type & attributes of a whois object if we have the required fields
-
-    # Otherwise create attributes and return type & value of the last attribute to avoid crashing the parent function
-
-    def handle_whois(self, properties):
-
-        attributes = self.fetch_attributes_with_key_parsing(properties, stix2misp_mapping._whois_mapping)
-
-        required_one_of = True if attributes else False
-
-        if properties.registrants:
-
-            registrant = properties.registrants[0]
-
-            attributes += self.fetch_attributes_with_key_parsing(registrant, stix2misp_mapping._whois_registrant_mapping)
-
-        if properties.creation_date:
-
-            attributes.append(["datetime", properties.creation_date.value.strftime('%Y-%m-%d'), "creation-date"])
-
-            required_one_of = True
-
-        if properties.updated_date:
-
-            attributes.append(["datetime", properties.updated_date.value.strftime('%Y-%m-%d'), "modification-date"])
-
-        if properties.expiration_date:
-
-            attributes.append(["datetime", properties.expiration_date.value.strftime('%Y-%m-%d'), "expiration-date"])
-
-        if properties.nameservers:
-
-            for nameserver in properties.nameservers:
-
-                attributes.append(["hostname", nameserver.value.value, "nameserver"])
-
-        if properties.remarks:
-
-            attribute_type = "text"
-
-            relation = "comment" if attributes else attribute_type
-
-            attributes.append([attribute_type, properties.remarks.value, relation])
-
-            required_one_of = True
-
-        # Testing if we have the required attribute types for Object whois
-
-        if required_one_of:
-
-            # if yes, we return the object type and the attributes
-
-            return "whois", self.return_attributes(attributes), ""
-
-        # otherwise, attributes are added in the event, and one attribute is returned to not make the function crash
-
-        if len(attributes) == 1:
-
-            return attributes[0]
-
-        last_attribute = attributes.pop(-1)
-
-        for attribute in attributes:
-
-            attribute_type, attribute_value, attribute_relation = attribute
-
-            misp_attributes = {"comment": "Whois {}".format(attribute_relation)}
-
-            self.misp_event.add_attribute(attribute_type, attribute_value, **misp_attributes)
-
-        return last_attribute
-
-
-
-    # Return type & value of a windows service object
-
-    @staticmethod
-
-    def handle_windows_service(properties):
-
-        if properties.name:
-
-            return "windows-service-name", properties.name.value, ""
-
-
-
-    def handle_x509(self, properties):
-
-        attributes = self.handle_x509_certificate(properties.certificate) if properties.certificate else []
-
-        if properties.raw_certificate:
-
-            raw = properties.raw_certificate.value
-
-            try:
-
-                relation = "raw-base64" if raw == base64.b64encode(base64.b64decode(raw)).strip() else "pem"
-
-            except Exception:
-
-                relation = "pem"
-
-            attributes.append(["text", raw, relation])
-
-        if properties.certificate_signature:
-
-            signature = properties.certificate_signature
-
-            attribute_type = "x509-fingerprint-{}".format(signature.signature_algorithm.value.lower())
-
-            attributes.append([attribute_type, signature.signature.value, attribute_type])
-
-        return "x509", self.return_attributes(attributes), ""
-
-
-
-    @staticmethod
-
-    def handle_x509_certificate(certificate):
-
-        attributes = []
-
-        if certificate.validity:
-
-            validity = certificate.validity
-
-            for prop in stix2misp_mapping._x509_datetime_types:
-
-                if getattr(validity, prop):
-
-                    attributes.append(['datetime', attrgetter('{}.value'.format(prop))(validity), 'validity-{}'.format(prop.replace('_', '-'))])
-
-        if certificate.subject_public_key:
-
-            subject_pubkey = certificate.subject_public_key
-
-            if subject_pubkey.rsa_public_key:
-
-                rsa_pubkey = subject_pubkey.rsa_public_key
-
-                for prop in stix2misp_mapping._x509__x509_pubkey_types:
-
-                    if getattr(rsa_pubkey, prop):
-
-                        attributes.append(['text', attrgetter('{}.value'.format(prop))(rsa_pubkey), 'pubkey-info-{}'.format(prop)])
-
-            if subject_pubkey.public_key_algorithm:
-
-                attributes.append(["text", subject_pubkey.public_key_algorithm.value, "pubkey-info-algorithm"])
-
-        for prop in stix2misp_mapping._x509_certificate_types:
-
-            if getattr(certificate, prop):
-
-                attributes.append(['text', attrgetter('{}.value'.format(prop))(certificate), prop.replace('_', '-')])
-
-        return attributes
-
-
-
-    # Return type & attributes of the file defining a portable executable object
-
-    def handle_pe(self, properties):
-
-        pe_uuid = self.parse_pe(properties)
-
-        file_type, file_value, _ = self.handle_file(properties, False)
-
-        return file_type, file_value, pe_uuid
-
-
-
-    # Parse attributes of a portable executable, create the corresponding object,
-
-    # and return its uuid to build the reference for the file object generated at the same time
-
-    def parse_pe(self, properties):
-
-        misp_object = MISPObject('pe')
-
-        filename = properties.file_name.value
-
-        for attr in ('internal-filename', 'original-filename'):
-
-            misp_object.add_attribute(**dict(zip(('type', 'value', 'object_relation'),('filename', filename, attr))))
-
-        if properties.headers:
-
-            headers = properties.headers
-
-            header_object = MISPObject('pe-section')
-
-            if headers.entropy:
-
-                header_object.add_attribute(**{"type": "float", "object_relation": "entropy",
-
-                                               "value": headers.entropy.value.value})
-
-            file_header = headers.file_header
-
-            misp_object.add_attribute(**{"type": "counter", "object_relation": "number-sections",
-
-                                         "value": file_header.number_of_sections.value})
-
-            for h in file_header.hashes:
-
-                hash_type, hash_value, hash_relation = self.handle_hashes_attribute(h)
-
-                header_object.add_attribute(**{"type": hash_type, "value": hash_value, "object_relation": hash_relation})
-
-            if file_header.size_of_optional_header:
-
-                header_object.add_attribute(**{"type": "size-in-bytes", "object_relation": "size-in-bytes",
-
-                                               "value": file_header.size_of_optional_header.value})
-
-            self.misp_event.add_object(**header_object)
-
-            misp_object.add_reference(header_object.uuid, 'header-of')
-
-        if properties.sections:
-
-            for section in properties.sections:
-
-                section_uuid = self.parse_pe_section(section)
-
-                misp_object.add_reference(section_uuid, 'included-in')
-
-        self.misp_event.add_object(**misp_object)
-
-        return {"pe_uuid": misp_object.uuid}
-
-
-
-    # Parse attributes of a portable executable section, create the corresponding object,
-
-    # and return its uuid to build the reference for the pe object generated at the same time
-
-    def parse_pe_section(self, section):
-
-        section_object = MISPObject('pe-section')
-
-        header_hashes = section.header_hashes
-
-        for h in header_hashes:
-
-            hash_type, hash_value, hash_relation = self.handle_hashes_attribute(h)
-
-            section_object.add_attribute(**{"type": hash_type, "value": hash_value, "object_relation": hash_relation})
-
-        if section.entropy:
-
-            section_object.add_attribute(**{"type": "float", "object_relation": "entropy",
-
-                                            "value": section.entropy.value.value})
-
-        if section.section_header:
-
-            section_header = section.section_header
-
-            section_object.add_attribute(**{"type": "text", "object_relation": "name",
-
-                                            "value": section_header.name.value})
-
-            section_object.add_attribute(**{"type": "size-in-bytes", "object_relation": "size-in-bytes",
-
-                                            "value": section_header.size_of_raw_data.value})
-
-        self.misp_event.add_object(**section_object)
-
-        return section_object.uuid
-
-
-
-    ################################################################################
-
-    ##             MARKINGS PARSING FUNCTIONS USED BY BOTH SUBCLASSES             ##
-
-    ################################################################################
-
-
-
-    def parse_AIS_marking(self, marking):
-
-        tags = []
-
-        if hasattr(marking, 'is_proprietary') and marking.is_proprietary:
-
-            proprietary = "Is"
-
-            marking = marking.is_proprietary
-
-        elif hasattr(marking, 'not_proprietary') and marking.not_proprietary:
-
-            proprietary = "Not"
-
-            marking = marking.not_proprietary
-
-        else:
+        if self.loaded_javascript:
 
             return
 
-        mapping = stix2misp_mapping._AIS_marking_mapping
+        self.loaded_javascript = True
 
-        prefix = mapping['prefix']
+        evaljs = self.mainFrame().evaluateJavaScript
 
-        tags.append('{}{}'.format(prefix, mapping['proprietary'].format(proprietary)))
+        self.loaded_lang = self.js_loader(evaljs, self.current_language,
 
-        if hasattr(marking, 'cisa_proprietary'):
+                self.hyphenate_default_lang)
+
+        evaljs('window.calibre_utils.setup_epub_reading_system(%s, %s, %s, %s)' % tuple(map(json.dumps, (
+
+            'calibre-desktop', __version__, 'paginated' if self.in_paged_mode else 'scrolling',
+
+            'dom-manipulation layout-changes mouse-events keyboard-events'.split()))))
+
+        mjpath = P(u'viewer/mathjax').replace(os.sep, '/')
+
+        if iswindows:
+
+            mjpath = u'/' + mjpath
+
+        self.javascript(u'window.mathjax.base = %s'%(json.dumps(mjpath,
+
+            ensure_ascii=False)))
+
+        for pl in self.all_viewer_plugins:
+
+            pl.load_javascript(evaljs)
+
+        evaljs('py_bridge.mark_element.connect(window.calibre_extract.mark)')
+
+
+
+    @pyqtSlot()
+
+    def animated_scroll_done(self):
+
+        self.animated_scroll_done_signal.emit()
+
+
+
+    @property
+
+    def hyphenatable(self):
+
+        # Qt fails to render soft hyphens correctly on windows xp
+
+        return not isxp and self.hyphenate and getattr(self, 'loaded_lang', '') and not self.math_present
+
+
+
+    @pyqtSlot()
+
+    def init_hyphenate(self):
+
+        if self.hyphenatable:
+
+            self.javascript('do_hyphenation("%s")'%self.loaded_lang)
+
+
+
+    @pyqtSlot(int)
+
+    def page_turn_requested(self, backwards):
+
+        self.page_turn.emit(bool(backwards))
+
+
+
+    def _pass_json_value_getter(self):
+
+        val = json.dumps(self.bridge_value)
+
+        return val
+
+
+
+    def _pass_json_value_setter(self, value):
+
+        self.bridge_value = json.loads(unicode(value))
+
+
+
+    _pass_json_value = pyqtProperty(str, fget=_pass_json_value_getter,
+
+            fset=_pass_json_value_setter)
+
+
+
+    def after_load(self, last_loaded_path=None):
+
+        self.javascript('window.paged_display.read_document_margins()')
+
+        self.set_bottom_padding(0)
+
+        self.fit_images()
+
+        w = 1 if iswindows else 0
+
+        self.math_present = self.javascript('window.mathjax.check_for_math(%d)' % w, bool)
+
+        self.init_hyphenate()
+
+        self.javascript('full_screen.save_margins()')
+
+        if self.in_fullscreen_mode:
+
+            self.switch_to_fullscreen_mode()
+
+        if self.in_paged_mode:
+
+            self.switch_to_paged_mode(last_loaded_path=last_loaded_path)
+
+        self.read_anchor_positions(use_cache=False)
+
+        evaljs = self.mainFrame().evaluateJavaScript
+
+        for pl in self.all_viewer_plugins:
+
+            pl.run_javascript(evaljs)
+
+        self.first_load = False
+
+
+
+    def colors(self):
+
+        self.javascript('''
+
+            bs = getComputedStyle(document.body);
+
+            py_bridge.value = [bs.backgroundColor, bs.color]
+
+            ''')
+
+        ans = self.bridge_value
+
+        return (ans if isinstance(ans, list) else ['white', 'black'])
+
+
+
+    def read_anchor_positions(self, use_cache=True):
+
+        self.bridge_value = tuple(self.index_anchors)
+
+        self.javascript(u'''
+
+            py_bridge.value = book_indexing.anchor_positions(py_bridge.value, %s);
+
+            '''%('true' if use_cache else 'false'))
+
+        self.anchor_positions = self.bridge_value
+
+        if not isinstance(self.anchor_positions, dict):
+
+            # Some weird javascript error happened
+
+            self.anchor_positions = {}
+
+        return {k:tuple(v) for k, v in self.anchor_positions.iteritems()}
+
+
+
+    def switch_to_paged_mode(self, onresize=False, last_loaded_path=None):
+
+        if onresize and not self.loaded_javascript:
+
+            return
+
+        cols_per_screen = self.cols_per_screen_portrait if self.is_portrait else self.cols_per_screen_landscape
+
+        cols_per_screen = max(1, min(5, cols_per_screen))
+
+        self.javascript('''
+
+            window.paged_display.use_document_margins = %s;
+
+            window.paged_display.set_geometry(%d, %d, %d, %d);
+
+            '''%(
+
+            ('true' if self.use_book_margins else 'false'),
+
+            cols_per_screen, self.top_margin, self.side_margin,
+
+            self.bottom_margin
+
+            ))
+
+        force_fullscreen_layout = bool(getattr(last_loaded_path,
+
+                                               'is_single_page', False))
+
+        self.update_contents_size_for_paged_mode(force_fullscreen_layout)
+
+
+
+    def update_contents_size_for_paged_mode(self, force_fullscreen_layout=None):
+
+        # Setup the contents size to ensure that there is a right most margin.
+
+        # Without this WebKit renders the final column with no margin, as the
+
+        # columns extend beyond the boundaries (and margin) of body
+
+        if force_fullscreen_layout is None:
+
+            force_fullscreen_layout = self.javascript('window.paged_display.is_full_screen_layout', typ=bool)
+
+        f = 'true' if force_fullscreen_layout else 'false'
+
+        side_margin = self.javascript('window.paged_display.layout(%s)'%f, typ=int)
+
+        mf = self.mainFrame()
+
+        sz = mf.contentsSize()
+
+        scroll_width = self.javascript('document.body.scrollWidth', int)
+
+        # At this point sz.width() is not reliable, presumably because Qt
+
+        # has not yet been updated
+
+        if scroll_width > self.window_width:
+
+            sz.setWidth(scroll_width+side_margin)
+
+            self.setPreferredContentsSize(sz)
+
+        self.javascript('window.paged_display.fit_images()')
+
+
+
+    @property
+
+    def column_boundaries(self):
+
+        if not self.loaded_javascript:
+
+            return (0, 1)
+
+        self.javascript(u'py_bridge.value = paged_display.column_boundaries()')
+
+        return tuple(self.bridge_value)
+
+
+
+    def after_resize(self):
+
+        if self.in_paged_mode:
+
+            self.setPreferredContentsSize(QSize())
+
+            self.switch_to_paged_mode(onresize=True)
+
+        self.javascript('if (window.mathjax) window.mathjax.after_resize();')
+
+
+
+    def switch_to_fullscreen_mode(self):
+
+        self.in_fullscreen_mode = True
+
+        self.javascript('full_screen.on(%d, %d, %s)'%(self.max_fs_width, self.max_fs_height,
+
+            'true' if self.in_paged_mode else 'false'))
+
+
+
+    def switch_to_window_mode(self):
+
+        self.in_fullscreen_mode = False
+
+        self.javascript('full_screen.off(%s)'%('true' if self.in_paged_mode
+
+            else 'false'))
+
+
+
+    @pyqtSlot(str)
+
+    def debug(self, msg):
+
+        prints(unicode(msg))
+
+
+
+    @pyqtSlot(int)
+
+    def jump_to_cfi_finished(self, job_id):
+
+        for l in self.jump_to_cfi_listeners:
+
+            l(job_id)
+
+
+
+    def reference_mode(self, enable):
+
+        self.javascript(('enter' if enable else 'leave')+'_reference_mode()')
+
+
+
+    def set_reference_prefix(self, prefix):
+
+        self.javascript('reference_prefix = "%s"'%prefix)
+
+
+
+    def goto(self, ref):
+
+        self.javascript('goto_reference("%s")'%ref)
+
+
+
+    def goto_bookmark(self, bm):
+
+        if bm['type'] == 'legacy':
+
+            bm = bm['pos']
+
+            bm = bm.strip()
+
+            if bm.startswith('>'):
+
+                bm = bm[1:].strip()
+
+            self.javascript('scroll_to_bookmark("%s")'%bm)
+
+        elif bm['type'] == 'cfi':
+
+            self.page_position.to_pos(bm['pos'])
+
+
+
+    def javascript(self, string, typ=None):
+
+        ans = self.mainFrame().evaluateJavaScript(string)
+
+        if typ in {'int', int}:
 
             try:
 
-                cisa_proprietary = marking.cisa_proprietary.numerator
+                return int(ans)
 
-                cisa_proprietary = 'true' if cisa_proprietary == 1 else 'false'
+            except (TypeError, ValueError):
 
-                tags.append('{}{}'.format(prefix, mapping['cisa_proprietary'].format(cisa_proprietary)))
+                return 0
 
-            except AttributeError:
+        if typ in {'float', float}:
 
-                pass
+            try:
 
-        for ais_field in ('ais_consent', 'tlp_marking'):
+                return float(ans)
 
-            if hasattr(marking, ais_field) and getattr(marking, ais_field):
+            except (TypeError, ValueError):
 
-                key, tag = mapping[ais_field]
+                return 0.0
 
-                tags.append('{}{}'.format(prefix, tag.format(getattr(getattr(marking, ais_field), key))))
+        if typ == 'string':
 
-        return tags
+            return ans or u''
 
+        if typ in {bool, 'bool'}:
 
+            return bool(ans)
 
-    def parse_TLP_marking(self, marking):
+        return ans
 
-        return ['tlp:{}'.format(marking.color.lower())]
 
 
+    def javaScriptConsoleMessage(self, msg, lineno, msgid):
 
-    ################################################################################
+        if DEBUG or self.debug_javascript:
 
-    ##          FUNCTIONS HANDLING PARSED DATA, USED BY BOTH SUBCLASSES.          ##
+            prints(msg)
 
-    ################################################################################
 
 
+    def javaScriptAlert(self, frame, msg):
 
-    # The value returned by the indicators or observables parser is of type str or int
+        if DEBUG:
 
-    # Thus we can add an attribute in the MISP event with the type & value
+            prints(msg)
 
-    def handle_attribute_case(self, attribute_type, attribute_value, data, attribute):
+        else:
 
-        if attribute_type == 'attachment':
+            return QWebPage.javaScriptAlert(self, frame, msg)
 
-            attribute['data'] = data
 
-        elif attribute_type == 'text':
 
-            attribute['comment'] = data
+    def scroll_by(self, dx=0, dy=0):
 
-        self.misp_event.add_attribute(attribute_type, attribute_value, **attribute)
+        self.mainFrame().scroll(dx, dy)
 
 
 
-    # The value returned by the indicators or observables parser is a list of dictionaries
+    def scroll_to(self, x=0, y=0):
 
-    # These dictionaries are the attributes we add in an object, itself added in the MISP event
+        self.mainFrame().setScrollPosition(QPoint(x, y))
 
-    def handle_object_case(self, attribute_type, attribute_value, compl_data, to_ids=False, object_uuid=None):
 
-        misp_object = MISPObject(attribute_type)
 
-        if object_uuid:
+    def jump_to_anchor(self, anchor):
 
-            misp_object.uuid = object_uuid
+        if not self.loaded_javascript:
 
-        for attribute in attribute_value:
+            return
 
-            attribute['to_ids'] = to_ids
+        self.javascript('window.paged_display.jump_to_anchor("%s")'%anchor)
 
-            misp_object.add_attribute(**attribute)
 
-        if isinstance(compl_data, dict):
 
-            # if some complementary data is a dictionary containing an uuid,
-
-            # it means we are using it to add an object reference
-
-            if "pe_uuid" in compl_data:
-
-                misp_object.add_reference(compl_data['pe_uuid'], 'included-in')
-
-            if "process_uuid" in compl_data:
-
-                for uuid in compl_data["process_uuid"]:
-
-                    misp_object.add_reference(uuid, 'connected-to')
-
-        self.misp_event.add_object(**misp_object)
-
-
-
-    ################################################################################
-
-    ##              UTILITY FUNCTIONS USED BY PARSING FUNCTION ABOVE              ##
-
-    ################################################################################
-
-
-
-    def fetch_attributes_from_sockets(self, properties, mapping_dict):
-
-        attributes = []
-
-        for prop, s_type in zip(mapping_dict, stix2misp_mapping._s_types):
-
-            address_property = getattr(properties, prop)
-
-            if address_property:
-
-                self.handle_socket(attributes, address_property, s_type)
-
-        return attributes
-
-
-
-    @staticmethod
-
-    def fetch_attributes_with_keys(properties, mapping_dict):
-
-        attributes = []
-
-        for prop, mapping in mapping_dict.items():
-
-            if getattr(properties,prop):
-
-                attribute_type, properties_key, relation = mapping
-
-                attributes.append([attribute_type, attrgetter(properties_key)(properties), relation])
-
-        return attributes
-
-
-
-    @staticmethod
-
-    def fetch_attributes_with_key_parsing(properties, mapping_dict):
-
-        attributes = []
-
-        for prop, mapping in mapping_dict.items():
-
-            if getattr(properties, prop):
-
-                attribute_type, properties_key, relation = mapping
-
-                attributes.append([attribute_type, attrgetter('{}.{}'.format(prop, properties_key))(properties), relation])
-
-        return attributes
-
-
-
-    @staticmethod
-
-    def fetch_attributes_with_partial_key_parsing(properties, mapping_dict):
-
-        attributes = []
-
-        for prop, mapping in mapping_dict.items():
-
-            if getattr(properties, prop):
-
-                attribute_type, relation = mapping
-
-                attributes.append([attribute_type, attrgetter('{}.value'.format(prop))(properties), relation])
-
-        return attributes
-
-
-
-    # Extract the uuid from a stix id
-
-    @staticmethod
-
-    def fetch_uuid(object_id):
+    def element_ypos(self, elem):
 
         try:
 
-            return "-".join(object_id.split("-")[-5:])
+            ans = int(elem.evaluateJavaScript('$(this).offset().top'))
 
-        except Exception:
+        except (TypeError, ValueError):
 
-            return str(uuid.uuid4())
+            raise ValueError('No ypos found')
 
+        return ans
 
 
-    # Return the attributes that will be added in a MISP object as a list of dictionaries
 
-    @staticmethod
+    def elem_outer_xml(self, elem):
 
-    def return_attributes(attributes):
+        return unicode(elem.toOuterXml())
 
-        return_attributes = []
 
-        for attribute in attributes:
 
-            return_attributes.append(dict(zip(('type', 'value', 'object_relation'), attribute)))
+    def bookmark(self):
 
-        return return_attributes
+        pos = self.page_position.current_pos
 
+        return {'type':'cfi', 'pos':pos}
 
 
 
+    @property
 
-class StixFromMISPParser(StixParser):
+    def at_bottom(self):
 
-    def __init__(self):
+        return self.height - self.ypos <= self.window_height
 
-        super(StixFromMISPParser, self).__init__()
 
-        self.dates = []
 
-        self.timestamps = []
+    @property
 
-        self.titles = []
+    def at_top(self):
 
+        return self.ypos <=0
 
 
-    def build_misp_dict(self, event):
 
-        for item in event.related_packages.related_package:
+    def test(self):
 
-            package = item.item
+        pass
 
-            self.event = package.incidents[0]
 
-            self.set_timestamp_and_date()
 
-            self.set_event_info()
+    @property
 
-            if self.event.related_indicators:
+    def ypos(self):
 
-                for indicator in self.event.related_indicators.indicator:
+        return self.mainFrame().scrollPosition().y()
 
-                    self.parse_misp_indicator(indicator)
 
-            if self.event.related_observables:
 
-                for observable in self.event.related_observables.observable:
+    @property
 
-                    self.parse_misp_observable(observable)
+    def window_height(self):
 
-            if self.event.history:
+        return self.javascript('window.innerHeight', 'int')
 
-                self.parse_journal_entries()
 
-            if self.event.information_source and self.event.information_source.references:
 
-                for reference in self.event.information_source.references:
+    @property
 
-                    self.misp_event.add_attribute(**{'type': 'link', 'value': reference})
+    def window_width(self):
 
-            if package.ttps:
+        return self.javascript('window.innerWidth', 'int')
 
-                for ttp in package.ttps.ttps:
 
-                    if ttp.exploit_targets:
 
-                        self.parse_vulnerability(ttp.exploit_targets.exploit_target)
+    @property
 
-                    # if ttp.handling:
+    def is_portrait(self):
 
-                    #     self.parse_tlp_marking(ttp.handling)
+        return self.window_width < self.window_height
 
-        self.set_distribution()
 
 
+    @property
 
-    # Return type & attributes (or value) of a Custom Object
+    def xpos(self):
 
-    def handle_custom(self, properties):
+        return self.mainFrame().scrollPosition().x()
 
-        custom_properties = properties.custom_properties
 
-        attributes = []
 
-        for prop in custom_properties:
+    @dynamic_property
 
-            attribute_type, relation = prop.name.split(': ')
+    def scroll_fraction(self):
 
-            attribute_type = attribute_type.split(' ')[1]
+        def fget(self):
 
-            attributes.append([attribute_type, prop.value, relation])
+            if self.in_paged_mode:
 
-        if len(attributes) > 1:
+                return self.javascript('''
 
-            name = custom_properties[0].name.split(' ')[0]
+                ans = 0.0;
 
-            return name, self.return_attributes(attributes), ""
+                if (window.paged_display) {
 
-        return attributes[0]
+                    ans = window.paged_display.current_pos();
 
+                }
 
+                ans;''',  typ='float')
 
-    def parse_journal_entries(self):
+            else:
 
-        for entry in self.event.history.history_items:
+                try:
 
-            journal_entry = entry.journal_entry.value
+                    return abs(float(self.ypos)/(self.height-self.window_height))
+
+                except ZeroDivisionError:
+
+                    return 0.
+
+
+
+        def fset(self, val):
+
+            if self.in_paged_mode and self.loaded_javascript:
+
+                self.javascript('paged_display.scroll_to_pos(%f)'%val)
+
+            else:
+
+                npos = val * (self.height - self.window_height)
+
+                if npos < 0:
+
+                    npos = 0
+
+                self.scroll_to(x=self.xpos, y=npos)
+
+        return property(fget=fget, fset=fset)
+
+
+
+    @dynamic_property
+
+    def page_number(self):
+
+        ' The page number is the number of the page at the left most edge of the screen (starting from 0) '
+
+
+
+        def fget(self):
+
+            if self.in_paged_mode:
+
+                return self.javascript(
+
+                    'ans = 0; if (window.paged_display) ans = window.paged_display.column_boundaries()[0]; ans;', typ='int')
+
+
+
+        def fset(self, val):
+
+            if self.in_paged_mode and self.loaded_javascript:
+
+                self.javascript('if (window.paged_display) window.paged_display.scroll_to_column(%d)' % int(val))
+
+                return True
+
+        return property(fget=fget, fset=fset)
+
+
+
+    @property
+
+    def page_dimensions(self):
+
+        if self.in_paged_mode:
+
+            return self.javascript(
+
+                '''
+
+                ans = ''
+
+                if (window.paged_display)
+
+                    ans = window.paged_display.col_width + ':' + window.paged_display.current_page_height;
+
+                ans;''', typ='string')
+
+
+
+    @property
+
+    def hscroll_fraction(self):
+
+        try:
+
+            return float(self.xpos)/self.width
+
+        except ZeroDivisionError:
+
+            return 0.
+
+
+
+    @property
+
+    def height(self):
+
+        # Note that document.body.offsetHeight does not include top and bottom
+
+        # margins on body and in some cases does not include the top margin on
+
+        # the first element inside body either. See ticket #8791 for an example
+
+        # of the latter.
+
+        q = self.mainFrame().contentsSize().height()
+
+        if q < 0:
+
+            # Don't know if this is still needed, but it can't hurt
+
+            j = self.javascript('document.body.offsetHeight', 'int')
+
+            if j >= 0:
+
+                q = j
+
+        return q
+
+
+
+    @property
+
+    def width(self):
+
+        return self.mainFrame().contentsSize().width()  # offsetWidth gives inaccurate results
+
+
+
+    def set_bottom_padding(self, amount):
+
+        s = QSize(-1, -1) if amount == 0 else QSize(self.viewportSize().width(),
+
+                self.height+amount)
+
+        self.setPreferredContentsSize(s)
+
+
+
+    def extract_node(self):
+
+        return unicode(self.mainFrame().evaluateJavaScript(
+
+            'window.calibre_extract.extract()'))
+
+
+
+# }}}
+
+
+
+
+
+class DocumentView(QWebView):  # {{{
+
+
+
+    magnification_changed = pyqtSignal(object)
+
+    DISABLED_BRUSH = QBrush(Qt.lightGray, Qt.Dense5Pattern)
+
+    gesture_handler = lambda s, e: False
+
+    last_loaded_path = None
+
+
+
+    def initialize_view(self, debug_javascript=False):
+
+        self.setRenderHints(QPainter.Antialiasing|QPainter.TextAntialiasing|QPainter.SmoothPixmapTransform)
+
+        self.flipper = SlideFlip(self)
+
+        self.gesture_handler = GestureHandler(self)
+
+        self.is_auto_repeat_event = False
+
+        self.debug_javascript = debug_javascript
+
+        self.shortcuts =  Shortcuts(SHORTCUTS, 'shortcuts/viewer')
+
+        self.setSizePolicy(QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding))
+
+        self._size_hint = QSize(510, 680)
+
+        self.initial_pos = 0.0
+
+        self.to_bottom = False
+
+        self.document = Document(self.shortcuts, parent=self,
+
+                debug_javascript=debug_javascript)
+
+        self.footnotes = Footnotes(self)
+
+        self.document.settings_changed.connect(self.footnotes.clone_settings)
+
+        self.setPage(self.document)
+
+        self.inspector = WebInspector(self, self.document)
+
+        self.manager = None
+
+        self._reference_mode = False
+
+        self._ignore_scrollbar_signals = False
+
+        self.loading_url = None
+
+        self.loadFinished.connect(self.load_finished)
+
+        self.document.linkClicked.connect(self.link_clicked)
+
+        self.document.linkHovered.connect(self.link_hovered)
+
+        self.document.selectionChanged[()].connect(self.selection_changed)
+
+        self.document.animated_scroll_done_signal.connect(self.animated_scroll_done, type=Qt.QueuedConnection)
+
+        self.document.page_turn.connect(self.page_turn_requested)
+
+        copy_action = self.copy_action
+
+        copy_action.setIcon(QIcon(I('edit-copy.png')))
+
+        copy_action.triggered.connect(self.copy, Qt.QueuedConnection)
+
+        d = self.document
+
+        self.unimplemented_actions = list(map(self.pageAction,
+
+            [d.DownloadImageToDisk, d.OpenLinkInNewWindow, d.DownloadLinkToDisk,
+
+                d.OpenImageInNewWindow, d.OpenLink, d.Reload, d.InspectElement]))
+
+
+
+        self.search_online_action = QAction(QIcon(I('search.png')), '', self)
+
+        self.search_online_action.triggered.connect(self.search_online)
+
+        self.addAction(self.search_online_action)
+
+        self.dictionary_action = QAction(QIcon(I('dictionary.png')),
+
+                _('&Lookup in dictionary'), self)
+
+        self.dictionary_action.triggered.connect(self.lookup)
+
+        self.addAction(self.dictionary_action)
+
+        self.image_popup = ImagePopup(self)
+
+        self.table_popup = TablePopup(self)
+
+        self.view_image_action = QAction(QIcon(I('view-image.png')), _('View &image...'), self)
+
+        self.view_image_action.triggered.connect(self.image_popup)
+
+        self.view_table_action = QAction(QIcon(I('view.png')), _('View &table...'), self)
+
+        self.view_table_action.triggered.connect(self.popup_table)
+
+        self.search_action = QAction(QIcon(I('dictionary.png')),
+
+                _('&Search for next occurrence'), self)
+
+        self.search_action.triggered.connect(self.search_next)
+
+        self.addAction(self.search_action)
+
+
+
+        self.goto_location_action = QAction(_('Go to...'), self)
+
+        self.goto_location_menu = m = QMenu(self)
+
+        self.goto_location_actions = a = {
+
+                'Next Page': self.next_page,
+
+                'Previous Page': self.previous_page,
+
+                'Section Top' : partial(self.scroll_to, 0),
+
+                'Document Top': self.goto_document_start,
+
+                'Section Bottom':partial(self.scroll_to, 1),
+
+                'Document Bottom': self.goto_document_end,
+
+                'Next Section': self.goto_next_section,
+
+                'Previous Section': self.goto_previous_section,
+
+        }
+
+        for name, key in [(_('Next Section'), 'Next Section'),
+
+                (_('Previous Section'), 'Previous Section'),
+
+                (None, None),
+
+                (_('Document Start'), 'Document Top'),
+
+                (_('Document End'), 'Document Bottom'),
+
+                (None, None),
+
+                (_('Section Start'), 'Section Top'),
+
+                (_('Section End'), 'Section Bottom'),
+
+                (None, None),
+
+                (_('Next Page'), 'Next Page'),
+
+                (_('Previous Page'), 'Previous Page')]:
+
+            if key is None:
+
+                m.addSeparator()
+
+            else:
+
+                m.addAction(name, a[key], self.shortcuts.get_sequences(key)[0])
+
+        self.goto_location_action.setMenu(self.goto_location_menu)
+
+
+
+        self.restore_fonts_action = QAction(_('Default font size'), self)
+
+        self.restore_fonts_action.setCheckable(True)
+
+        self.restore_fonts_action.triggered.connect(self.restore_font_size)
+
+
+
+    def goto_next_section(self, *args):
+
+        if self.manager is not None:
+
+            self.manager.goto_next_section()
+
+
+
+    def goto_previous_section(self, *args):
+
+        if self.manager is not None:
+
+            self.manager.goto_previous_section()
+
+
+
+    def goto_document_start(self, *args):
+
+        if self.manager is not None:
+
+            self.manager.goto_start()
+
+
+
+    def goto_document_end(self, *args):
+
+        if self.manager is not None:
+
+            self.manager.goto_end()
+
+
+
+    @property
+
+    def copy_action(self):
+
+        return self.pageAction(self.document.Copy)
+
+
+
+    def animated_scroll_done(self):
+
+        if self.manager is not None:
+
+            self.manager.scrolled(self.document.scroll_fraction)
+
+
+
+    def reference_mode(self, enable):
+
+        self._reference_mode = enable
+
+        self.document.reference_mode(enable)
+
+
+
+    def goto(self, ref):
+
+        self.document.goto(ref)
+
+
+
+    def goto_bookmark(self, bm):
+
+        self.document.goto_bookmark(bm)
+
+
+
+    def config(self, parent=None):
+
+        self.document.do_config(parent)
+
+        if self.document.in_fullscreen_mode:
+
+            self.document.switch_to_fullscreen_mode()
+
+        self.setFocus(Qt.OtherFocusReason)
+
+
+
+    def load_theme(self, theme_id):
+
+        themes = load_themes()
+
+        theme = themes[theme_id]
+
+        opts = config(theme).parse()
+
+        self.document.apply_settings(opts)
+
+        if self.document.in_fullscreen_mode:
+
+            self.document.switch_to_fullscreen_mode()
+
+        self.setFocus(Qt.OtherFocusReason)
+
+
+
+    def bookmark(self):
+
+        return self.document.bookmark()
+
+
+
+    @property
+
+    def selected_text(self):
+
+        return self.document.selectedText().replace(u'\u00ad', u'').strip()
+
+
+
+    def copy(self):
+
+        self.document.triggerAction(self.document.Copy)
+
+        c = QApplication.clipboard()
+
+        md = c.mimeData()
+
+        if iswindows:
+
+            nmd = QMimeData()
+
+            nmd.setHtml(md.html().replace(u'\u00ad', ''))
+
+            md = nmd
+
+        md.setText(self.selected_text)
+
+        QApplication.clipboard().setMimeData(md)
+
+
+
+    def selection_changed(self):
+
+        if self.manager is not None:
+
+            self.manager.selection_changed(self.selected_text)
+
+
+
+    def _selectedText(self):
+
+        t = unicode(self.selectedText()).strip()
+
+        if not t:
+
+            return u''
+
+        if len(t) > 40:
+
+            t = t[:40] + u'...'
+
+        t = t.replace(u'&', u'&&')
+
+        return _("S&earch online for '%s'")%t
+
+
+
+    def popup_table(self):
+
+        html = self.document.extract_node()
+
+        self.table_popup(html, QUrl.fromLocalFile(self.last_loaded_path),
+
+                         self.document.font_magnification_step)
+
+
+
+    def contextMenuEvent(self, ev):
+
+        from_touch = ev.reason() == ev.Other
+
+        mf = self.document.mainFrame()
+
+        r = mf.hitTestContent(ev.pos())
+
+        img = r.pixmap()
+
+        elem = r.element()
+
+        if elem.isNull():
+
+            elem = r.enclosingBlockElement()
+
+        table = None
+
+        parent = elem
+
+        while not parent.isNull():
+
+            if (unicode(parent.tagName()) == u'table' or
+
+                unicode(parent.localName()) == u'table'):
+
+                table = parent
+
+                break
+
+            parent = parent.parent()
+
+        self.image_popup.current_img = img
+
+        self.image_popup.current_url = r.imageUrl()
+
+        menu = self.document.createStandardContextMenu()
+
+        for action in self.unimplemented_actions:
+
+            menu.removeAction(action)
+
+
+
+        if not img.isNull():
+
+            menu.addAction(self.view_image_action)
+
+        if table is not None:
+
+            self.document.mark_element.emit(table)
+
+            menu.addAction(self.view_table_action)
+
+
+
+        text = self._selectedText()
+
+        if text and img.isNull():
+
+            self.search_online_action.setText(text)
+
+            for x, sc in (('search_online', 'Search online'), ('dictionary', 'Lookup word'), ('search', 'Next occurrence')):
+
+                ac = getattr(self, '%s_action' % x)
+
+                menu.addAction(ac.icon(), '%s [%s]' % (unicode(ac.text()), ','.join(self.shortcuts.get_shortcuts(sc))), ac.trigger)
+
+
+
+        if from_touch and self.manager is not None:
+
+            word = unicode(mf.evaluateJavaScript('window.calibre_utils.word_at_point(%f, %f)' % (ev.pos().x(), ev.pos().y())) or '')
+
+            if word:
+
+                menu.addAction(self.dictionary_action.icon(), _('Lookup %s in the dictionary') % word, partial(self.manager.lookup, word))
+
+                menu.addAction(self.search_online_action.icon(), _('Search for %s online') % word, partial(self.do_search_online, word))
+
+
+
+        if not text and img.isNull():
+
+            menu.addSeparator()
+
+            if self.manager.action_back.isEnabled():
+
+                menu.addAction(self.manager.action_back)
+
+            if self.manager.action_forward.isEnabled():
+
+                menu.addAction(self.manager.action_forward)
+
+            menu.addAction(self.goto_location_action)
+
+
+
+            if self.manager is not None:
+
+                menu.addSeparator()
+
+                menu.addAction(self.manager.action_table_of_contents)
+
+
+
+                menu.addSeparator()
+
+                menu.addAction(self.manager.action_font_size_larger)
+
+                self.restore_fonts_action.setChecked(self.multiplier == 1)
+
+                menu.addAction(self.restore_fonts_action)
+
+                menu.addAction(self.manager.action_font_size_smaller)
+
+
+
+        menu.addSeparator()
+
+        menu.addAction(_('Inspect'), self.inspect)
+
+
+
+        if not text and img.isNull() and self.manager is not None:
+
+            menu.addSeparator()
+
+            if (not self.document.show_controls or self.document.in_fullscreen_mode) and self.manager is not None:
+
+                menu.addAction(self.manager.toggle_toolbar_action)
+
+            menu.addAction(self.manager.action_full_screen)
+
+
+
+            menu.addSeparator()
+
+            menu.addAction(self.manager.action_reload)
+
+            menu.addAction(self.manager.action_quit)
+
+
+
+        for plugin in self.document.all_viewer_plugins:
+
+            plugin.customize_context_menu(menu, ev, r)
+
+
+
+        if from_touch:
+
+            from calibre.constants import plugins
+
+            pi = plugins['progress_indicator'][0]
+
+            for x in (menu, self.goto_location_menu):
+
+                if hasattr(pi, 'set_touch_menu_style'):
+
+                    pi.set_touch_menu_style(x)
+
+            helpt = QAction(QIcon(I('help.png')), _('Show supported touch screen gestures'), menu)
+
+            helpt.triggered.connect(self.gesture_handler.show_help)
+
+            menu.insertAction(menu.actions()[0], helpt)
+
+        else:
+
+            self.goto_location_menu.setStyle(self.style())
+
+        self.context_menu = menu
+
+        menu.exec_(ev.globalPos())
+
+
+
+    def inspect(self):
+
+        self.inspector.show()
+
+        self.inspector.raise_()
+
+        self.pageAction(self.document.InspectElement).trigger()
+
+
+
+    def lookup(self, *args):
+
+        if self.manager is not None:
+
+            t = unicode(self.selectedText()).strip()
+
+            if t:
+
+                self.manager.lookup(t.split()[0])
+
+
+
+    def search_next(self):
+
+        if self.manager is not None:
+
+            t = unicode(self.selectedText()).strip()
+
+            if t:
+
+                self.manager.search.set_search_string(t)
+
+
+
+    def search_online(self):
+
+        t = unicode(self.selectedText()).strip()
+
+        if t:
+
+            self.do_search_online(t)
+
+
+
+    def do_search_online(self, text):
+
+        url = self.document.search_online_url.replace('{text}', QUrl().toPercentEncoding(text))
+
+        if not isinstance(url, bytes):
+
+            url = url.encode('utf-8')
+
+        open_url(QUrl.fromEncoded(url))
+
+
+
+    def set_manager(self, manager):
+
+        self.manager = manager
+
+        self.scrollbar = manager.horizontal_scrollbar
+
+        self.scrollbar.valueChanged[(int)].connect(self.scroll_horizontally)
+
+
+
+    def scroll_horizontally(self, amount):
+
+        self.document.scroll_to(y=self.document.ypos, x=amount)
+
+
+
+    @property
+
+    def scroll_pos(self):
+
+        return (self.document.ypos, self.document.ypos +
+
+                self.document.window_height)
+
+
+
+    @property
+
+    def viewport_rect(self):
+
+        # (left, top, right, bottom) of the viewport in document co-ordinates
+
+        # When in paged mode, left and right are the numbers of the columns
+
+        # at the left edge and *after* the right edge of the viewport
+
+        d = self.document
+
+        if d.in_paged_mode:
 
             try:
 
-                entry_type, entry_value = journal_entry.split(': ')
-
-                if entry_type == "MISP Tag":
-
-                    self.parse_tag(entry_value)
-
-                elif entry_type.startswith('attribute['):
-
-                    _, category, attribute_type = entry_type.split('[')
-
-                    self.misp_event.add_attribute(**{'type': attribute_type[:-1], 'category': category[:-1], 'value': entry_value})
-
-                elif entry_type == "Event Threat Level":
-
-                    self.misp_event.threat_level_id = threat_level_mapping[entry_value]
+                l, r = d.column_boundaries
 
             except ValueError:
 
-                continue
-
-
-
-    # Parse indicators of a STIX document coming from our exporter
-
-    def parse_misp_indicator(self, indicator):
-
-        # define is an indicator will be imported as attribute or object
-
-        if indicator.relationship in categories:
-
-            self.parse_misp_attribute_indicator(indicator)
+                l, r = (0, 1)
 
         else:
 
-            self.parse_misp_object_indicator(indicator)
+            l, r = d.xpos, d.xpos + d.window_width
+
+        return (l, d.ypos, r, d.ypos + d.window_height)
 
 
 
-    def parse_misp_observable(self, observable):
+    def link_hovered(self, link, text, context):
 
-        if observable.relationship in categories:
+        link, text = unicode(link), unicode(text)
 
-            self.parse_misp_attribute_observable(observable)
+        if link:
+
+            self.setCursor(Qt.PointingHandCursor)
 
         else:
 
-            self.parse_misp_object_observable(observable)
+            self.unsetCursor()
 
 
 
-    # Parse STIX objects that we know will give MISP attributes
+    def link_clicked(self, url):
 
-    def parse_misp_attribute_indicator(self, indicator):
+        if self.manager is not None:
 
-        misp_attribute = {'to_ids': True, 'category': str(indicator.relationship),
-
-                          'uuid': self.fetch_uuid(indicator.id_)}
-
-        item = indicator.item
-
-        misp_attribute['timestamp'] = self.getTimestampfromDate(item.timestamp)
-
-        if item.observable:
-
-            observable = item.observable
-
-            self.parse_misp_attribute(observable, misp_attribute, to_ids=True)
+            self.manager.link_clicked(url)
 
 
 
-    def parse_misp_attribute_observable(self, observable):
+    def sizeHint(self):
 
-        misp_attribute = {'to_ids': False, 'category': str(observable.relationship),
-
-                          'uuid': self.fetch_uuid(observable.id_)}
-
-        if observable.item:
-
-            self.parse_misp_attribute(observable.item, misp_attribute)
+        return self._size_hint
 
 
 
-    def parse_misp_attribute(self, observable, misp_attribute, to_ids=False):
+    @dynamic_property
 
-        try:
+    def scroll_fraction(self):
 
-            properties = observable.object_.properties
+        def fget(self):
 
-            if properties:
+            return self.document.scroll_fraction
 
-                attribute_type, attribute_value, compl_data = self.handle_attribute_type(properties)
 
-                if isinstance(attribute_value, (str, int)):
 
-                    self.handle_attribute_case(attribute_type, attribute_value, compl_data, misp_attribute)
+        def fset(self, val):
+
+            self.document.scroll_fraction = float(val)
+
+        return property(fget=fget, fset=fset)
+
+
+
+    @property
+
+    def hscroll_fraction(self):
+
+        return self.document.hscroll_fraction
+
+
+
+    @property
+
+    def content_size(self):
+
+        return self.document.width, self.document.height
+
+
+
+    @dynamic_property
+
+    def current_language(self):
+
+        def fget(self):
+
+            return self.document.current_language
+
+
+
+        def fset(self, val):
+
+            self.document.current_language = val
+
+        return property(fget=fget, fset=fset)
+
+
+
+    def search(self, text, backwards=False):
+
+        flags = self.document.FindBackward if backwards else self.document.FindFlags(0)
+
+        found = self.document.findText(text, flags)
+
+        if found and self.document.in_paged_mode:
+
+            self.document.javascript('paged_display.snap_to_selection()')
+
+        return found
+
+
+
+    def path(self):
+
+        return os.path.abspath(unicode(self.url().toLocalFile()))
+
+
+
+    def load_path(self, path, pos=0.0):
+
+        self.initial_pos = pos
+
+        self.last_loaded_path = path
+
+        # This is needed otherwise percentage margins on body are not correctly
+
+        # evaluated in read_document_margins() in paged mode.
+
+        self.document.setPreferredContentsSize(QSize())
+
+
+
+        def callback(lu):
+
+            self.loading_url = lu
+
+            if self.manager is not None:
+
+                self.manager.load_started()
+
+
+
+        load_html(path, self, codec=getattr(path, 'encoding', 'utf-8'), mime_type=getattr(path,
+
+            'mime_type', 'text/html'), pre_load_callback=callback)
+
+        entries = set()
+
+        for ie in getattr(path, 'index_entries', []):
+
+            if ie.start_anchor:
+
+                entries.add(ie.start_anchor)
+
+            if ie.end_anchor:
+
+                entries.add(ie.end_anchor)
+
+        self.document.index_anchors = entries
+
+
+
+    def initialize_scrollbar(self):
+
+        if getattr(self, 'scrollbar', None) is not None:
+
+            if self.document.in_paged_mode:
+
+                self.scrollbar.setVisible(False)
+
+                return
+
+            delta = self.document.width - self.size().width()
+
+            if delta > 0:
+
+                self._ignore_scrollbar_signals = True
+
+                self.scrollbar.blockSignals(True)
+
+                self.scrollbar.setRange(0, delta)
+
+                self.scrollbar.setValue(0)
+
+                self.scrollbar.setSingleStep(1)
+
+                self.scrollbar.setPageStep(int(delta/10.))
+
+            self.scrollbar.setVisible(delta > 0)
+
+            self.scrollbar.blockSignals(False)
+
+            self._ignore_scrollbar_signals = False
+
+
+
+    def load_finished(self, ok):
+
+        if self.loading_url is None:
+
+            # An <iframe> finished loading
+
+            return
+
+        self.loading_url = None
+
+        self.document.load_javascript_libraries()
+
+        self.document.after_load(self.last_loaded_path)
+
+        self._size_hint = self.document.mainFrame().contentsSize()
+
+        scrolled = False
+
+        if self.to_bottom:
+
+            self.to_bottom = False
+
+            self.initial_pos = 1.0
+
+        if self.initial_pos > 0.0:
+
+            scrolled = True
+
+        self.scroll_to(self.initial_pos, notify=False)
+
+        self.initial_pos = 0.0
+
+        self.update()
+
+        self.initialize_scrollbar()
+
+        self.document.reference_mode(self._reference_mode)
+
+        if self.manager is not None:
+
+            spine_index = self.manager.load_finished(bool(ok))
+
+            if spine_index > -1:
+
+                self.document.set_reference_prefix('%d.'%(spine_index+1))
+
+            if scrolled:
+
+                self.manager.scrolled(self.document.scroll_fraction,
+
+                        onload=True)
+
+
+
+        if self.flipper.isVisible():
+
+            if self.flipper.running:
+
+                self.flipper.setVisible(False)
+
+            else:
+
+                self.flipper(self.current_page_image(),
+
+                        duration=self.document.page_flip_duration)
+
+
+
+    @classmethod
+
+    def test_line(cls, img, y):
+
+        'Test if line contains pixels of exactly the same color'
+
+        start = img.pixel(0, y)
+
+        for i in range(1, img.width()):
+
+            if img.pixel(i, y) != start:
+
+                return False
+
+        return True
+
+
+
+    def current_page_image(self, overlap=-1):
+
+        if overlap < 0:
+
+            overlap = self.height()
+
+        img = QImage(self.width(), overlap, QImage.Format_ARGB32_Premultiplied)
+
+        painter = QPainter(img)
+
+        painter.setRenderHints(self.renderHints())
+
+        self.document.mainFrame().render(painter, QRegion(0, 0, self.width(), overlap))
+
+        painter.end()
+
+        return img
+
+
+
+    def find_next_blank_line(self, overlap):
+
+        img = self.current_page_image(overlap)
+
+        for i in range(overlap-1, -1, -1):
+
+            if self.test_line(img, i):
+
+                self.scroll_by(y=i, notify=False)
+
+                return
+
+        self.scroll_by(y=overlap)
+
+
+
+    def previous_page(self):
+
+        if self.flipper.running and not self.is_auto_repeat_event:
+
+            return
+
+        if self.loading_url is not None:
+
+            return
+
+        epf = self.document.enable_page_flip and not self.is_auto_repeat_event
+
+
+
+        if self.document.in_paged_mode:
+
+            loc = self.document.javascript(
+
+                    'paged_display.previous_screen_location()', typ='int')
+
+            if loc < 0:
+
+                if self.manager is not None:
+
+                    if epf:
+
+                        self.flipper.initialize(self.current_page_image(),
+
+                                forwards=False)
+
+                    self.manager.previous_document()
+
+            else:
+
+                if epf:
+
+                    self.flipper.initialize(self.current_page_image(),
+
+                            forwards=False)
+
+                self.document.scroll_to(x=loc, y=0)
+
+                if epf:
+
+                    self.flipper(self.current_page_image(),
+
+                            duration=self.document.page_flip_duration)
+
+                if self.manager is not None:
+
+                    self.manager.scrolled(self.scroll_fraction)
+
+
+
+            return
+
+
+
+        delta_y = self.document.window_height - 25
+
+        if self.document.at_top:
+
+            if self.manager is not None:
+
+                self.to_bottom = True
+
+                if epf:
+
+                    self.flipper.initialize(self.current_page_image(), False)
+
+                self.manager.previous_document()
+
+        else:
+
+            opos = self.document.ypos
+
+            upper_limit = opos - delta_y
+
+            if upper_limit < 0:
+
+                upper_limit = 0
+
+            if upper_limit < opos:
+
+                if epf:
+
+                    self.flipper.initialize(self.current_page_image(),
+
+                            forwards=False)
+
+                self.document.scroll_to(self.document.xpos, upper_limit)
+
+                if epf:
+
+                    self.flipper(self.current_page_image(),
+
+                            duration=self.document.page_flip_duration)
+
+                if self.manager is not None:
+
+                    self.manager.scrolled(self.scroll_fraction)
+
+
+
+    def next_page(self):
+
+        if self.flipper.running and not self.is_auto_repeat_event:
+
+            return
+
+        if self.loading_url is not None:
+
+            return
+
+        epf = self.document.enable_page_flip and not self.is_auto_repeat_event
+
+
+
+        if self.document.in_paged_mode:
+
+            loc = self.document.javascript(
+
+                    'paged_display.next_screen_location()', typ='int')
+
+            if loc < 0:
+
+                if self.manager is not None:
+
+                    if epf:
+
+                        self.flipper.initialize(self.current_page_image())
+
+                    self.manager.next_document()
+
+            else:
+
+                if epf:
+
+                    self.flipper.initialize(self.current_page_image())
+
+                self.document.scroll_to(x=loc, y=0)
+
+                if epf:
+
+                    self.flipper(self.current_page_image(),
+
+                            duration=self.document.page_flip_duration)
+
+                if self.manager is not None:
+
+                    self.manager.scrolled(self.scroll_fraction)
+
+
+
+            return
+
+
+
+        window_height = self.document.window_height
+
+        document_height = self.document.height
+
+        ddelta = document_height - window_height
+
+        # print '\nWindow height:', window_height
+
+        # print 'Document height:', self.document.height
+
+
+
+        delta_y = window_height - 25
+
+        if self.document.at_bottom or ddelta <= 0:
+
+            if self.manager is not None:
+
+                if epf:
+
+                    self.flipper.initialize(self.current_page_image())
+
+                self.manager.next_document()
+
+        elif ddelta < 25:
+
+            self.scroll_by(y=ddelta)
+
+            return
+
+        else:
+
+            oopos = self.document.ypos
+
+            # print 'Original position:', oopos
+
+            self.document.set_bottom_padding(0)
+
+            opos = self.document.ypos
+
+            # print 'After set padding=0:', self.document.ypos
+
+            if opos < oopos:
+
+                if self.manager is not None:
+
+                    if epf:
+
+                        self.flipper.initialize(self.current_page_image())
+
+                    self.manager.next_document()
+
+                return
+
+            # oheight = self.document.height
+
+            lower_limit = opos + delta_y  # Max value of top y co-ord after scrolling
+
+            max_y = self.document.height - window_height  # The maximum possible top y co-ord
+
+            if max_y < lower_limit:
+
+                padding = lower_limit - max_y
+
+                if padding == window_height:
+
+                    if self.manager is not None:
+
+                        if epf:
+
+                            self.flipper.initialize(self.current_page_image())
+
+                        self.manager.next_document()
+
+                    return
+
+                # print 'Setting padding to:', lower_limit - max_y
+
+                self.document.set_bottom_padding(lower_limit - max_y)
+
+            if epf:
+
+                self.flipper.initialize(self.current_page_image())
+
+            # print 'Document height:', self.document.height
+
+            # print 'Height change:', (self.document.height - oheight)
+
+            max_y = self.document.height - window_height
+
+            lower_limit = min(max_y, lower_limit)
+
+            # print 'Scroll to:', lower_limit
+
+            if lower_limit > opos:
+
+                self.document.scroll_to(self.document.xpos, lower_limit)
+
+            actually_scrolled = self.document.ypos - opos
+
+            # print 'After scroll pos:', self.document.ypos
+
+            # print 'Scrolled by:', self.document.ypos - opos
+
+            self.find_next_blank_line(window_height - actually_scrolled)
+
+            # print 'After blank line pos:', self.document.ypos
+
+            if epf:
+
+                self.flipper(self.current_page_image(),
+
+                        duration=self.document.page_flip_duration)
+
+            if self.manager is not None:
+
+                self.manager.scrolled(self.scroll_fraction)
+
+            # print 'After all:', self.document.ypos
+
+
+
+    def page_turn_requested(self, backwards):
+
+        if backwards:
+
+            self.previous_page()
+
+        else:
+
+            self.next_page()
+
+
+
+    def scroll_by(self, x=0, y=0, notify=True):
+
+        old_pos = (self.document.xpos if self.document.in_paged_mode else
+
+                self.document.ypos)
+
+        self.document.scroll_by(x, y)
+
+        new_pos = (self.document.xpos if self.document.in_paged_mode else
+
+                self.document.ypos)
+
+        if notify and self.manager is not None and new_pos != old_pos:
+
+            self.manager.scrolled(self.scroll_fraction)
+
+
+
+    def scroll_to(self, pos, notify=True):
+
+        if self._ignore_scrollbar_signals:
+
+            return
+
+        old_pos = (self.document.xpos if self.document.in_paged_mode else
+
+                self.document.ypos)
+
+        if self.document.in_paged_mode:
+
+            if isinstance(pos, basestring):
+
+                self.document.jump_to_anchor(pos)
+
+            else:
+
+                self.document.scroll_fraction = pos
+
+        else:
+
+            if isinstance(pos, basestring):
+
+                self.document.jump_to_anchor(pos)
+
+            else:
+
+                if pos >= 1:
+
+                    self.document.scroll_to(0, self.document.height)
 
                 else:
 
-                    self.handle_object_case(attribute_type, attribute_value, compl_data, to_ids=to_ids)
+                    y = int(math.ceil(
 
-        except AttributeError:
+                            pos*(self.document.height-self.document.window_height)))
 
-            attribute_dict = {}
+                    self.document.scroll_to(0, y)
 
-            for observables in observable.observable_composition.observables:
 
-                properties = observables.object_.properties
 
-                attribute_type, attribute_value, _ = self.handle_attribute_type(properties, observable_id=observable.id_)
+        new_pos = (self.document.xpos if self.document.in_paged_mode else
 
-                attribute_dict[attribute_type] = attribute_value
+                self.document.ypos)
 
-            attribute_type, attribute_value = self.composite_type(attribute_dict)
+        if notify and self.manager is not None and new_pos != old_pos:
 
-            self.misp_event.add_attribute(attribute_type, attribute_value, **misp_attribute)
+            self.manager.scrolled(self.scroll_fraction)
 
 
 
-    # Return type & value of a composite attribute in MISP
+    @dynamic_property
 
-    @staticmethod
+    def multiplier(self):
 
-    def composite_type(attributes):
+        def fget(self):
 
-        if "port" in attributes:
+            return self.zoomFactor()
 
-            if "ip-src" in attributes:
 
-                return "ip-src|port", "{}|{}".format(attributes["ip-src"], attributes["port"])
 
-            elif "ip-dst" in attributes:
+        def fset(self, val):
 
-                return "ip-dst|port", "{}|{}".format(attributes["ip-dst"], attributes["port"])
+            oval = self.zoomFactor()
 
-            elif "hostname" in attributes:
+            self.setZoomFactor(val)
 
-                return "hostname|port", "{}|{}".format(attributes["hostname"], attributes["port"])
+            if val != oval:
 
-        elif "domain" in attributes:
+                if self.document.in_paged_mode:
 
-            if "ip-src" in attributes:
+                    self.document.update_contents_size_for_paged_mode()
 
-                ip_value = attributes["ip-src"]
+                self.magnification_changed.emit(val)
 
-            elif "ip-dst" in attributes:
+        return property(fget=fget, fset=fset)
 
-                ip_value = attributes["ip-dst"]
 
-            return "domain|ip", "{}|{}".format(attributes["domain"], ip_value)
 
+    def magnify_fonts(self, amount=None):
 
+        if amount is None:
 
-    # Parse STIX object that we know will give MISP objects
+            amount = self.document.font_magnification_step
 
-    def parse_misp_object_indicator(self, indicator):
+        with self.document.page_position:
 
-        object_type = str(indicator.relationship)
+            self.multiplier += amount
 
-        item = indicator.item
+        return self.document.scroll_fraction
 
-        name = item.title.split(' ')[0]
 
-        if name not in ('passive-dns'):
 
-            self.fill_misp_object(item, name, to_ids=True)
+    def shrink_fonts(self, amount=None):
 
-        else:
+        if amount is None:
 
-            if object_type != "misc":
+            amount = self.document.font_magnification_step
 
-                print("Unparsed Object type: {}".format(name), file=sys.stderr)
+        if self.multiplier >= amount:
 
+            with self.document.page_position:
 
+                self.multiplier -= amount
 
-    def parse_misp_object_observable(self, observable):
+        return self.document.scroll_fraction
 
-        object_type = str(observable.relationship)
 
-        observable = observable.item
 
-        observable_id = observable.id_
+    def restore_font_size(self):
 
-        if object_type == "file":
+        with self.document.page_position:
 
-            name = "registry-key" if "WinRegistryKey" in observable_id else "file"
+            self.multiplier = 1
 
-        elif object_type == "network":
+        return self.document.scroll_fraction
 
-            if "Custom" in observable_id:
 
-                name = observable_id.split("Custom")[0].split(":")[1]
 
-            elif "ObservableComposition" in observable_id:
+    def changeEvent(self, event):
 
-                name = observable_id.split("_")[0].split(":")[1]
+        if event.type() == event.EnabledChange:
 
-            else:
+            self.update()
 
-                name = cybox_to_misp_object[observable_id.split('-')[0].split(':')[1]]
+        return QWebView.changeEvent(self, event)
 
-        else:
 
-            name = cybox_to_misp_object[observable_id.split('-')[0].split(':')[1]]
 
-        try:
+    def paintEvent(self, event):
 
-            self.fill_misp_object(observable, name)
+        painter = QPainter(self)
 
-        except Exception:
+        painter.setRenderHints(self.renderHints())
 
-            print("Unparsed Object type: {}".format(observable.to_json()), file=sys.stderr)
+        self.document.mainFrame().render(painter, event.region())
 
+        if not self.isEnabled():
 
+            painter.fillRect(event.region().boundingRect(), self.DISABLED_BRUSH)
 
-    # Create a MISP object, its attributes, and add it in the MISP event
+        painter.end()
 
-    def fill_misp_object(self, item, name, to_ids=False):
 
-        uuid = self.fetch_uuid(item.id_)
 
-        try:
+    def wheelEvent(self, event):
 
-            misp_object = MISPObject(name)
+        if event.phase() not in (Qt.ScrollUpdate, 0):
 
-            misp_object.uuid = uuid
+            # 0 is Qt.NoScrollPhase which is not yet available in PyQt
 
-            if to_ids:
+            return
 
-                observables = item.observable.observable_composition.observables
+        mods = event.modifiers()
 
-                misp_object.timestamp = self.getTimestampfromDate(item.timestamp)
+        num_degrees = event.angleDelta().y() // 8
 
-            else:
+        if mods & Qt.CTRL:
 
-                observables = item.observable_composition.observables
+            if self.manager is not None and num_degrees != 0:
 
-            for observable in observables:
+                (self.manager.font_size_larger if num_degrees > 0 else
 
-                properties = observable.object_.properties
+                        self.manager.font_size_smaller)()
 
-                misp_attribute = MISPAttribute()
+                return
 
-                misp_attribute.type, misp_attribute.value, misp_attribute.object_relation = self.handle_attribute_type(properties, is_object=True, observable_id=observable.id_)
 
-                misp_attribute.to_ids = to_ids
 
-                misp_object.add_attribute(**misp_attribute)
+        if self.document.in_paged_mode:
 
-            self.misp_event.add_object(**misp_object)
+            if abs(num_degrees) < 15:
 
-        except AttributeError:
+                return
 
-            properties = item.observable.object_.properties if to_ids else item.object_.properties
+            typ = 'screen' if self.document.wheel_flips_pages else 'col'
 
-            self.parse_observable(properties, to_ids, uuid)
+            direction = 'next' if num_degrees < 0 else 'previous'
 
+            loc = self.document.javascript('paged_display.%s_%s_location()'%(
 
+                direction, typ), typ='int')
 
-    # Create a MISP attribute and add it in its MISP object
+            if loc > -1:
 
-    def parse_observable(self, properties, to_ids, uuid):
+                self.document.scroll_to(x=loc, y=0)
 
-        attribute_type, attribute_value, compl_data = self.handle_attribute_type(properties)
+                if self.manager is not None:
 
-        if isinstance(attribute_value, (str, int)):
+                    self.manager.scrolled(self.scroll_fraction)
 
-            attribute = {'to_ids': to_ids, 'uuid': uuid}
+                event.accept()
 
-            self.handle_attribute_case(attribute_type, attribute_value, compl_data, attribute)
+            elif self.manager is not None:
 
-        else:
+                if direction == 'next':
 
-            self.handle_object_case(attribute_type, attribute_value, compl_data, to_ids=to_ids, object_uuid=uuid)
+                    self.manager.next_document()
 
+                else:
 
+                    self.manager.previous_document()
 
-    def parse_tag(self, entry):
+                event.accept()
 
-        if entry.startswith('misp-galaxy:'):
+            return
 
-            tag_type, value = entry.split('=')
 
-            galaxy_type = tag_type.split(':')[1]
 
-            cluster = {'type': galaxy_type, 'value': value[1:-1], 'tag_name': entry}
+        if num_degrees < -14:
 
-            self.misp_event['Galaxy'].append({'type': galaxy_type, 'GalaxyCluster': [cluster]})
+            if self.document.wheel_flips_pages:
 
-        self.misp_event.add_tag(entry)
+                self.next_page()
 
+                event.accept()
 
+                return
 
-    def parse_vulnerability(self, exploit_targets):
+            if self.document.at_bottom:
 
-        for exploit_target in exploit_targets:
+                self.scroll_by(y=15)  # at_bottom can lie on windows
 
-            if exploit_target.item:
+                if self.manager is not None:
 
-                for vulnerability in exploit_target.item.vulnerabilities:
+                    self.manager.next_document()
 
-                    self.misp_event.add_attribute(**{'type': 'vulnerability', 'value': vulnerability.cve_id})
+                    event.accept()
 
+                    return
 
+        elif num_degrees > 14:
 
-    def set_event_info(self):
+            if self.document.wheel_flips_pages:
 
-        info = self.get_event_info()
+                self.previous_page()
 
-        self.titles.append(info)
+                event.accept()
 
+                return
 
 
-    def set_timestamp_and_date(self):
 
-        if self.event.timestamp:
+            if self.document.at_top:
 
-            date, timestamp = self.get_timestamp_and_date()
+                if self.manager is not None:
 
-            self.dates.append(date)
+                    self.manager.previous_document()
 
-            self.timestamps.append(timestamp)
+                    event.accept()
 
+                    return
 
 
 
+        ret = QWebView.wheelEvent(self, event)
 
-class ExternalStixParser(StixParser):
 
-    def __init__(self):
 
-        super(ExternalStixParser, self).__init__()
+        num_degrees_h = event.angleDelta().x() // 8
 
-        self.dns_objects = defaultdict(dict)
+        vertical = abs(num_degrees) > abs(num_degrees_h)
 
-        self.dns_ips = []
+        scroll_amount = ((num_degrees if vertical else num_degrees_h)/ 120.0) * .2 * -1 * 8
 
+        dim = self.document.viewportSize().height() if vertical else self.document.viewportSize().width()
 
+        amt =  dim * scroll_amount
 
-    def build_misp_dict(self, event):
+        mult = -1 if amt < 0 else 1
 
-        self.event = event
+        if self.document.wheel_scroll_fraction != 100:
 
-        self.set_timestamp_and_date()
+            amt = mult * max(1, abs(int(amt * self.document.wheel_scroll_fraction / 100.)))
 
-        self.set_event_info()
+        self.scroll_by(0, amt) if vertical else self.scroll_by(amt, 0)
 
-        header = self.event.stix_header
 
-        if hasattr(header, 'description') and hasattr(header.description, 'value'):
 
-            self.misp_event.add_attribute(**{'type': 'comment', 'value': header.description.value,
+        if self.manager is not None:
 
-                                             'comment': 'Imported from STIX header description'})
+            self.manager.scrolled(self.scroll_fraction)
 
-        if hasattr(header, 'handling') and header.handling:
+        return ret
 
-            for handling in header.handling:
 
-                tags = self.parse_marking(handling)
 
-                for tag in  tags:
+    def keyPressEvent(self, event):
 
-                    self.misp_event.add_tag(tag)
+        if not self.handle_key_press(event):
 
-        if self.event.indicators:
+            return QWebView.keyPressEvent(self, event)
 
-            self.parse_external_indicators(self.event.indicators)
 
-        if self.event.observables:
 
-            self.parse_external_observable(self.event.observables.observables)
+    def paged_col_scroll(self, forward=True, scroll_past_end=True):
 
-        if self.event.ttps:
+        dir = 'next' if forward else 'previous'
 
-            self.parse_ttps(self.event.ttps.ttps)
+        loc = self.document.javascript(
 
-        if self.event.courses_of_action:
+                'paged_display.%s_col_location()'%dir, typ='int')
 
-            self.parse_coa(self.event.courses_of_action)
+        if loc > -1:
 
-        if self.dns_objects:
+            self.document.scroll_to(x=loc, y=0)
 
-            self.resolve_dns_objects()
+            self.manager.scrolled(self.document.scroll_fraction)
 
-        self.set_distribution()
+        elif scroll_past_end:
 
-        if self.references:
+            (self.manager.next_document() if forward else
 
-            self.build_references()
+                    self.manager.previous_document())
 
 
 
-    def set_event_info(self):
+    def handle_key_press(self, event):
 
-        info =  self.get_event_info()
+        handled = True
 
-        self.misp_event.info = str(info)
+        key = self.shortcuts.get_match(event)
 
+        func = self.goto_location_actions.get(key, None)
 
+        if func is not None:
 
-    def set_timestamp_and_date(self):
-
-        if self.event.timestamp:
-
-            date, timestamp = self.get_timestamp_and_date()
-
-            self.misp_event.date = date
-
-            self.misp_event.timestamp = timestamp
-
-
-
-    # Return type & attributes (or value) of a Custom Object
-
-    def handle_custom(self, properties):
-
-        custom_properties = properties.custom_properties
-
-        if len(custom_properties) > 1:
-
-            for prop in custom_properties[:-1]:
-
-                misp_attribute = {'type': 'text', 'value': prop.value, 'comment': prop.name}
-
-                self.misp_event.add_attribute(**misp_attribute)
-
-        to_return = custom_properties[-1]
-
-        return 'text', to_return.value, to_return.name
-
-
-
-    # Parse the courses of action field of an external STIX document
-
-    def parse_coa(self, courses_of_action):
-
-        for coa in courses_of_action:
-
-            misp_object = MISPObject('course-of-action')
-
-            if coa.title:
-
-                attribute = {'type': 'text', 'object_relation': 'name',
-
-                             'value': coa.title}
-
-                misp_object.add_attribute(**attribute)
-
-            for prop, properties_key in stix2misp_mapping._coa_mapping.items():
-
-                if getattr(coa, prop):
-
-                    attribute = {'type': 'text', 'object_relation': prop.replace('_', ''),
-
-                                 'value': attrgetter('{}.{}'.format(prop, properties_key))(coa)}
-
-                    misp_object.add_attribute(**attribute)
-
-            if coa.parameter_observables:
-
-                for observable in coa.parameter_observables.observables:
-
-                    properties = observable.object_.properties
-
-                    attribute = MISPAttribute()
-
-                    attribute.type, attribute.value, _ = self.handle_attribute_type(properties)
-
-                    referenced_uuid = str(uuid.uuid4())
-
-                    attribute.uuid = referenced_uuid
-
-                    self.misp_event.add_attribute(**attribute)
-
-                    misp_object.add_reference(referenced_uuid, 'observable', None, **attribute)
-
-            self.misp_event.add_object(**misp_object)
-
-
-
-    # Parse description of an external indicator or observable and add it in the MISP event as an attribute
-
-    def parse_description(self, stix_object):
-
-        if stix_object.description:
-
-            misp_attribute = {}
-
-            if stix_object.timestamp:
-
-                misp_attribute['timestamp'] = self.getTimestampfromDate(stix_object.timestamp)
-
-            self.misp_event.add_attribute("text", stix_object.description.value, **misp_attribute)
-
-
-
-    # Parse indicators of an external STIX document
-
-    def parse_external_indicators(self, indicators):
-
-        for indicator in indicators:
-
-            self.parse_external_single_indicator(indicator)
-
-
-
-    def parse_external_single_indicator(self, indicator):
-
-        if hasattr(indicator, 'observable') and indicator.observable:
-
-            observable = indicator.observable
-
-            if hasattr(observable, 'object_') and observable.object_:
-
-                uuid = self.fetch_uuid(observable.object_.id_)
-
-                try:
-
-                    properties = observable.object_.properties
-
-                    if properties:
-
-                        attribute_type, attribute_value, compl_data = self.handle_attribute_type(properties)
-
-                        if isinstance(attribute_value, (str, int)):
-
-                            # if the returned value is a simple value, we build an attribute
-
-                            attribute = {'to_ids': True, 'uuid': uuid}
-
-                            if indicator.timestamp:
-
-                                attribute['timestamp'] = self.getTimestampfromDate(indicator.timestamp)
-
-                            if hasattr(observable, 'handling') and observable.handling:
-
-                                attribute['Tag'] = []
-
-                                for handling in observable.handling:
-
-                                    attribute['Tag'].extend(self.parse_marking(handling))
-
-                            parsed = self.special_parsing(observable.object_, attribute_type, attribute_value, attribute, uuid)
-
-                            if parsed is not None:
-
-                                return
-
-                            self.handle_attribute_case(attribute_type, attribute_value, compl_data, attribute)
-
-                        else:
-
-                            # otherwise, it is a dictionary of attributes, so we build an object
-
-                            self.handle_object_case(attribute_type, attribute_value, compl_data, to_ids=True, object_uuid=uuid)
-
-                except AttributeError:
-
-                    self.parse_description(indicator)
-
-        if hasattr(indicator, 'related_indicators') and indicator.related_indicators:
-
-            for related_indicator in indicator.related_indicators:
-
-                self.parse_external_single_indicator(related_indicator.item)
-
-
-
-    # Parse observables of an external STIX document
-
-    def parse_external_observable(self, observables):
-
-        for observable in observables:
-
-            title = observable.title
-
-            observable_object = observable.object_
+            self.is_auto_repeat_event = event.isAutoRepeat()
 
             try:
 
-                properties = observable_object.properties
+                func()
 
-            except AttributeError:
+            finally:
 
-                self.parse_description(observable)
+                self.is_auto_repeat_event = False
 
-                continue
+        elif key == 'Down':
 
-            if properties:
+            if self.document.in_paged_mode:
 
-                try:
+                self.paged_col_scroll(scroll_past_end=not
 
-                    attribute_type, attribute_value, compl_data = self.handle_attribute_type(properties, title=title)
-
-                except KeyError:
-
-                    # print("Error with an object of type: {}\n{}".format(properties._XSI_TYPE, observable.to_json()))
-
-                    continue
-
-                object_uuid = self.fetch_uuid(observable_object.id_)
-
-                if isinstance(attribute_value, (str, int)):
-
-                    # if the returned value is a simple value, we build an attribute
-
-                    attribute = {'to_ids': False, 'uuid': object_uuid}
-
-                    if hasattr(observable, 'handling') and observable.handling:
-
-                        attribute['Tag'] = []
-
-                        for handling in observable.handling:
-
-                            attribute['Tag'].extend(self.parse_marking(handling))
-
-                    parsed = self.special_parsing(observable_object, attribute_type, attribute_value, attribute, object_uuid)
-
-                    if parsed is not None:
-
-                        continue
-
-                    self.handle_attribute_case(attribute_type, attribute_value, compl_data, attribute)
-
-                else:
-
-                    # otherwise, it is a dictionary of attributes, so we build an object
-
-                    if attribute_value:
-
-                        self.handle_object_case(attribute_type, attribute_value, compl_data, object_uuid=object_uuid)
-
-                    if observable_object.related_objects:
-
-                        for related_object in observable_object.related_objects:
-
-                            relationship = related_object.relationship.value.lower().replace('_', '-')
-
-                            self.references[object_uuid].append({"idref": self.fetch_uuid(related_object.idref),
-
-                                                                 "relationship": relationship})
-
-
-
-    # Parse the ttps field of an external STIX document
-
-    def parse_ttps(self, ttps):
-
-        for ttp in ttps:
-
-            if ttp.behavior and ttp.behavior.malware_instances:
-
-                mi = ttp.behavior.malware_instances[0]
-
-                if mi.types:
-
-                    mi_type = mi.types[0].value
-
-                    galaxy = {'type': mi_type}
-
-                    cluster = defaultdict(dict)
-
-                    cluster['type'] = mi_type
-
-                    if mi.description:
-
-                        cluster['description'] = mi.description.value
-
-                    cluster['value'] = ttp.title
-
-                    if mi.names:
-
-                        synonyms = []
-
-                        for name in mi.names:
-
-                            synonyms.append(name.value)
-
-                        cluster['meta']['synonyms'] = synonyms
-
-                    galaxy['GalaxyCluster'] = [cluster]
-
-                    self.misp_event['Galaxy'].append(galaxy)
-
-
-
-    # Parse a DNS object
-
-    def resolve_dns_objects(self):
-
-        for domain, domain_dict in self.dns_objects['domain'].items():
-
-            ip_reference = domain_dict['related']
-
-            domain_attribute = domain_dict['data']
-
-            if ip_reference in self.dns_objects['ip']:
-
-                misp_object = MISPObject('passive-dns')
-
-                domain_attribute['object_relation'] = "rrname"
-
-                misp_object.add_attribute(**domain_attribute)
-
-                ip = self.dns_objects['ip'][ip_reference]['value']
-
-                ip_attribute = {"type": "text", "value": ip, "object_relation": "rdata"}
-
-                misp_object.add_attribute(**ip_attribute)
-
-                rrtype = "AAAA" if ":" in ip else "A"
-
-                rrtype_attribute = {"type": "text", "value": rrtype, "object_relation": "rrtype"}
-
-                misp_object.add_attribute(**rrtype_attribute)
-
-                self.misp_event.add_object(**misp_object)
+                        self.document.line_scrolling_stops_on_pagebreaks)
 
             else:
 
-                self.misp_event.add_attribute(**domain_attribute)
+                if (not self.document.line_scrolling_stops_on_pagebreaks and
 
-        for ip, ip_dict in self.dns_objects['ip'].items():
+                        self.document.at_bottom):
 
-            if ip not in self.dns_ips:
+                    self.manager.next_document()
 
-                self.misp_event.add_attribute(**ip_dict)
+                else:
 
+                    amt = int((self.document.line_scroll_fraction / 100.) * 15)
 
+                    self.scroll_by(y=amt)
 
-    def special_parsing(self, observable_object, attribute_type, attribute_value, attribute, uuid):
+        elif key == 'Up':
 
-        if observable_object.related_objects:
+            if self.document.in_paged_mode:
 
-            related_objects = observable_object.related_objects
+                self.paged_col_scroll(forward=False, scroll_past_end=not
 
-            if attribute_type == "url" and len(related_objects) == 1 and related_objects[0].relationship.value == "Resolved_To":
+                        self.document.line_scrolling_stops_on_pagebreaks)
 
-                related_ip = self.fetch_uuid(related_objects[0].idref)
+            else:
 
-                self.dns_objects['domain'][uuid] = {"related": related_ip,
+                if (not self.document.line_scrolling_stops_on_pagebreaks and
 
-                                                    "data": {"type": "text", "value": attribute_value}}
+                        self.document.at_top):
 
-                if related_ip not in self.dns_ips:
+                    self.manager.previous_document()
 
-                    self.dns_ips.append(related_ip)
+                else:
 
-                return 1
+                    amt = int((self.document.line_scroll_fraction / 100.) * 15)
 
-        if attribute_type in ('ip-src', 'ip-dst'):
+                    self.scroll_by(y=-amt)
 
-            attribute['type'] = attribute_type
+        elif key == 'Left':
 
-            attribute['value'] = attribute_value
+            if self.document.in_paged_mode:
 
-            self.dns_objects['ip'][uuid] = attribute
+                self.paged_col_scroll(forward=False)
 
-            return 2
+            else:
 
+                amt = int((self.document.line_scroll_fraction / 100.) * 15)
 
+                self.scroll_by(x=-amt)
 
+        elif key == 'Right':
 
+            if self.document.in_paged_mode:
 
-def generate_event(filename):
+                self.paged_col_scroll()
 
-    try:
+            else:
 
-        return STIXPackage.from_xml(filename)
+                amt = int((self.document.line_scroll_fraction / 100.) * 15)
 
-    except Exception:
+                self.scroll_by(x=amt)
 
-        try:
+        elif key == 'Back':
 
-            import maec
+            if self.manager is not None:
 
-            print(2)
+                self.manager.back(None)
 
-        except ImportError:
+        elif key == 'Forward':
 
-            print(3)
+            if self.manager is not None:
 
-        sys.exit(0)
+                self.manager.forward(None)
 
+        elif event.matches(QKeySequence.Copy):
 
+            self.copy()
 
-def main(args):
+        else:
 
-    filename = '{}/tmp/{}'.format(os.path.dirname(args[0]), args[1])
+            handled = False
 
-    event = generate_event(filename)
-
-    title = event.stix_header.title
-
-    from_misp = (title is not None and "Export from " in title and "MISP" in title)
-
-    stix_parser = StixFromMISPParser() if from_misp else ExternalStixParser()
-
-    stix_parser.load_event(args[2:], filename, from_misp, event.version)
-
-    stix_parser.build_misp_dict(event)
-
-    stix_parser.saveFile()
-
-    print(1)
+        return handled
 
 
 
-if __name__ == "__main__":
+    def resizeEvent(self, event):
 
-    main(sys.argv)
+        if self.manager is not None:
+
+            self.manager.viewport_resize_started(event)
+
+        return QWebView.resizeEvent(self, event)
+
+
+
+    def event(self, ev):
+
+        if self.gesture_handler(ev):
+
+            return True
+
+        return QWebView.event(self, ev)
+
+
+
+    def mouseMoveEvent(self, ev):
+
+        if self.document.in_paged_mode and ev.buttons() & Qt.LeftButton and not self.rect().contains(ev.pos(), True):
+
+            # Prevent this event from causing WebKit to scroll the viewport
+
+            # See https://bugs.launchpad.net/bugs/1464862
+
+            return
+
+        return QWebView.mouseMoveEvent(self, ev)
+
+
+
+    def mouseReleaseEvent(self, ev):
+
+        r = self.document.mainFrame().hitTestContent(ev.pos())
+
+        a, url = r.linkElement(), r.linkUrl()
+
+        if url.isValid() and not a.isNull() and self.manager is not None:
+
+            fd = self.footnotes.get_footnote_data(a, url)
+
+            if fd:
+
+                self.footnotes.show_footnote(fd)
+
+                self.manager.show_footnote_view()
+
+                ev.accept()
+
+                return
+
+        opos = self.document.ypos
+
+        if self.manager is not None:
+
+            prev_pos = self.manager.update_page_number()
+
+        ret = QWebView.mouseReleaseEvent(self, ev)
+
+        if self.manager is not None and opos != self.document.ypos:
+
+            self.manager.scrolled(self.scroll_fraction)
+
+            self.manager.internal_link_clicked(prev_pos)
+
+        return ret
+
+
+
+    def follow_footnote_link(self):
+
+        qurl =  self.footnotes.showing_url
+
+        if qurl and qurl.isValid():
+
+            self.link_clicked(qurl)
+
+
+
+# }}}

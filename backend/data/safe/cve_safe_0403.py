@@ -2,1070 +2,308 @@
 # Safety: safe
 # Category: safe
 
-# vim: ft=python fileencoding=utf-8 sts=4 sw=4 et:
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
 
 
 
-# Copyright 2016-2018 Florian Bruhin (The Compiler) <mail@qutebrowser.org>
+# Copyright 2011 OpenStack LLC.
 
-#
-
-# This file is part of qutebrowser.
+# All Rights Reserved.
 
 #
 
-# qutebrowser is free software: you can redistribute it and/or modify
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
 
-# it under the terms of the GNU General Public License as published by
+#    not use this file except in compliance with the License. You may obtain
 
-# the Free Software Foundation, either version 3 of the License, or
-
-# (at your option) any later version.
+#    a copy of the License at
 
 #
 
-# qutebrowser is distributed in the hope that it will be useful,
-
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-
-# GNU General Public License for more details.
+#         http://www.apache.org/licenses/LICENSE-2.0
 
 #
 
-# You should have received a copy of the GNU General Public License
+#    Unless required by applicable law or agreed to in writing, software
 
-# along with qutebrowser.  If not, see <http://www.gnu.org/licenses/>.
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
+#    License for the specific language governing permissions and limitations
 
-"""Backend-independent qute://* code.
-
-
-
-Module attributes:
-
-    pyeval_output: The output of the last :pyeval command.
-
-    _HANDLERS: The handlers registered via decorators.
-
-"""
+#    under the License.
 
 
-
-import html
 
 import json
 
-import os
+import webob
 
-import time
 
-import textwrap
 
-import mimetypes
+from nova import context
 
-import urllib
+from nova import test
 
-import collections
+from nova.tests.api.openstack import fakes
 
-import base64
 
 
+from nova.api.openstack.contrib.quotas import QuotaSetsController
 
-try:
 
-    import secrets
 
-except ImportError:
 
-    # New in Python 3.6
 
-    secrets = None
+def quota_set(id):
 
+    return {'quota_set': {'id': id, 'metadata_items': 128, 'volumes': 10,
 
+            'gigabytes': 1000, 'ram': 51200, 'floating_ips': 10,
 
-import pkg_resources
+            'instances': 10, 'injected_files': 5, 'cores': 20,
 
-from PyQt5.QtCore import QUrlQuery, QUrl
+            'injected_file_content_bytes': 10240}}
 
-from PyQt5.QtNetwork import QNetworkReply
 
 
 
-import qutebrowser
 
-from qutebrowser.config import config, configdata, configexc, configdiff
+def quota_set_list():
 
-from qutebrowser.utils import (version, utils, jinja, log, message, docutils,
+    return {'quota_set_list': [quota_set('1234'), quota_set('5678'),
 
-                               objreg, urlutils)
+                               quota_set('update_me')]}
 
-from qutebrowser.misc import objects
 
-from qutebrowser.qt import sip
 
 
 
+class QuotaSetsTest(test.TestCase):
 
 
-pyeval_output = ":pyeval was never called"
 
-spawn_output = ":spawn was never called"
+    def setUp(self):
 
-csrf_token = None
+        super(QuotaSetsTest, self).setUp()
 
+        self.controller = QuotaSetsController()
 
+        self.user_id = 'fake'
 
+        self.project_id = 'fake'
 
+        self.user_context = context.RequestContext(self.user_id,
 
-_HANDLERS = {}
+                                                   self.project_id)
 
+        self.admin_context = context.RequestContext(self.user_id,
 
+                                                    self.project_id,
 
+                                                    is_admin=True)
 
 
-class NoHandlerFound(Exception):
 
+    def test_format_quota_set(self):
 
+        raw_quota_set = {
 
-    """Raised when no handler was found for the given URL."""
+            'instances': 10,
 
+            'cores': 20,
 
+            'ram': 51200,
 
-    pass
+            'volumes': 10,
 
+            'floating_ips': 10,
 
+            'metadata_items': 128,
 
+            'gigabytes': 1000,
 
+            'injected_files': 5,
 
-class QuteSchemeOSError(Exception):
+            'injected_file_content_bytes': 10240}
 
 
 
-    """Called when there was an OSError inside a handler."""
+        quota_set = QuotaSetsController()._format_quota_set('1234',
 
+                                                            raw_quota_set)
 
+        qs = quota_set['quota_set']
 
-    pass
 
 
+        self.assertEqual(qs['id'], '1234')
 
+        self.assertEqual(qs['instances'], 10)
 
+        self.assertEqual(qs['cores'], 20)
 
-class QuteSchemeError(Exception):
+        self.assertEqual(qs['ram'], 51200)
 
+        self.assertEqual(qs['volumes'], 10)
 
+        self.assertEqual(qs['gigabytes'], 1000)
 
-    """Exception to signal that a handler should return an ErrorReply.
+        self.assertEqual(qs['floating_ips'], 10)
 
+        self.assertEqual(qs['metadata_items'], 128)
 
+        self.assertEqual(qs['injected_files'], 5)
 
-    Attributes correspond to the arguments in
+        self.assertEqual(qs['injected_file_content_bytes'], 10240)
 
-    networkreply.ErrorNetworkReply.
 
 
+    def test_quotas_defaults(self):
 
-    Attributes:
+        uri = '/v1.1/fake/os-quota-sets/fake_tenant/defaults'
 
-        errorstring: Error string to print.
+        req = webob.Request.blank(uri)
 
-        error: Numerical error value.
+        req.method = 'GET'
 
-    """
+        req.headers['Content-Type'] = 'application/json'
 
+        res = req.get_response(fakes.wsgi_app())
 
 
-    def __init__(self, errorstring, error):
 
-        self.errorstring = errorstring
+        self.assertEqual(res.status_int, 200)
 
-        self.error = error
+        expected = {'quota_set': {
 
-        super().__init__(errorstring)
+                    'id': 'fake_tenant',
 
+                    'instances': 10,
 
+                    'cores': 20,
 
+                    'ram': 51200,
 
+                    'volumes': 10,
 
-class Redirect(Exception):
+                    'gigabytes': 1000,
 
+                    'floating_ips': 10,
 
+                    'metadata_items': 128,
 
-    """Exception to signal a redirect should happen.
+                    'injected_files': 5,
 
+                    'injected_file_content_bytes': 10240}}
 
 
-    Attributes:
 
-        url: The URL to redirect to, as a QUrl.
+        self.assertEqual(json.loads(res.body), expected)
 
-    """
 
 
+    def test_quotas_show_as_admin(self):
 
-    def __init__(self, url):
+        req = webob.Request.blank('/v1.1/fake/os-quota-sets/1234')
 
-        super().__init__(url.toDisplayString())
+        req.method = 'GET'
 
-        self.url = url
+        req.headers['Content-Type'] = 'application/json'
 
+        res = req.get_response(fakes.wsgi_app(
 
+                               fake_auth_context=self.admin_context))
 
 
 
-class add_handler:  # noqa: N801,N806 pylint: disable=invalid-name
+        self.assertEqual(res.status_int, 200)
 
+        self.assertEqual(json.loads(res.body), quota_set('1234'))
 
 
-    """Decorator to register a qute://* URL handler.
 
+    def test_quotas_show_as_unauthorized_user(self):
 
+        req = webob.Request.blank('/v1.1/fake/os-quota-sets/1234')
 
-    Attributes:
+        req.method = 'GET'
 
-        _name: The 'foo' part of qute://foo
+        req.headers['Content-Type'] = 'application/json'
 
-        backend: Limit which backends the handler can run with.
+        res = req.get_response(fakes.wsgi_app(
 
-    """
+                               fake_auth_context=self.user_context))
 
 
 
-    def __init__(self, name, backend=None):
+        self.assertEqual(res.status_int, 403)
 
-        self._name = name
 
-        self._backend = backend
 
-        self._function = None
+    def test_quotas_update_as_admin(self):
 
+        updated_quota_set = {'quota_set': {'instances': 50,
 
+                             'cores': 50, 'ram': 51200, 'volumes': 10,
 
-    def __call__(self, function):
+                             'gigabytes': 1000, 'floating_ips': 10,
 
-        self._function = function
+                             'metadata_items': 128, 'injected_files': 5,
 
-        _HANDLERS[self._name] = self.wrapper
+                             'injected_file_content_bytes': 10240}}
 
-        return function
 
 
+        req = webob.Request.blank('/v1.1/fake/os-quota-sets/update_me')
 
-    def wrapper(self, *args, **kwargs):
+        req.method = 'PUT'
 
-        """Call the underlying function."""
+        req.body = json.dumps(updated_quota_set)
 
-        if self._backend is not None and objects.backend != self._backend:
+        req.headers['Content-Type'] = 'application/json'
 
-            return self.wrong_backend_handler(*args, **kwargs)
 
-        else:
 
-            return self._function(*args, **kwargs)
+        res = req.get_response(fakes.wsgi_app(
 
+                               fake_auth_context=self.admin_context))
 
 
-    def wrong_backend_handler(self, url):
 
-        """Show an error page about using the invalid backend."""
+        self.assertEqual(json.loads(res.body), updated_quota_set)
 
-        src = jinja.render('error.html',
 
-                           title="Error while opening qute://url",
 
-                           url=url.toDisplayString(),
+    def test_quotas_update_as_user(self):
 
-                           error='{} is not available with this '
+        updated_quota_set = {'quota_set': {'instances': 50,
 
-                                 'backend'.format(url.toDisplayString()))
+                             'cores': 50, 'ram': 51200, 'volumes': 10,
 
-        return 'text/html', src
+                             'gigabytes': 1000, 'floating_ips': 10,
 
+                             'metadata_items': 128, 'injected_files': 5,
 
+                             'injected_file_content_bytes': 10240}}
 
 
 
-def data_for_url(url):
+        req = webob.Request.blank('/v1.1/fake/os-quota-sets/update_me')
 
-    """Get the data to show for the given URL.
+        req.method = 'PUT'
 
+        req.body = json.dumps(updated_quota_set)
 
+        req.headers['Content-Type'] = 'application/json'
 
-    Args:
 
-        url: The QUrl to show.
 
+        res = req.get_response(fakes.wsgi_app(
 
+                               fake_auth_context=self.user_context))
 
-    Return:
 
-        A (mimetype, data) tuple.
 
-    """
-
-    norm_url = url.adjusted(QUrl.NormalizePathSegments |
-
-                            QUrl.StripTrailingSlash)
-
-    if norm_url != url:
-
-        raise Redirect(norm_url)
-
-
-
-    path = url.path()
-
-    host = url.host()
-
-    query = urlutils.query_string(url)
-
-    # A url like "qute:foo" is split as "scheme:path", not "scheme:host".
-
-    log.misc.debug("url: {}, path: {}, host {}".format(
-
-        url.toDisplayString(), path, host))
-
-    if not path or not host:
-
-        new_url = QUrl()
-
-        new_url.setScheme('qute')
-
-        # When path is absent, e.g. qute://help (with no trailing slash)
-
-        if host:
-
-            new_url.setHost(host)
-
-        # When host is absent, e.g. qute:help
-
-        else:
-
-            new_url.setHost(path)
-
-
-
-        new_url.setPath('/')
-
-        if query:
-
-            new_url.setQuery(query)
-
-        if new_url.host():  # path was a valid host
-
-            raise Redirect(new_url)
-
-
-
-    try:
-
-        handler = _HANDLERS[host]
-
-    except KeyError:
-
-        raise NoHandlerFound(url)
-
-
-
-    try:
-
-        mimetype, data = handler(url)
-
-    except OSError as e:
-
-        # FIXME:qtwebengine how to handle this?
-
-        raise QuteSchemeOSError(e)
-
-    except QuteSchemeError:
-
-        raise
-
-
-
-    assert mimetype is not None, url
-
-    if mimetype == 'text/html' and isinstance(data, str):
-
-        # We let handlers return HTML as text
-
-        data = data.encode('utf-8', errors='xmlcharrefreplace')
-
-
-
-    return mimetype, data
-
-
-
-
-
-@add_handler('bookmarks')
-
-def qute_bookmarks(_url):
-
-    """Handler for qute://bookmarks. Display all quickmarks / bookmarks."""
-
-    bookmarks = sorted(objreg.get('bookmark-manager').marks.items(),
-
-                       key=lambda x: x[1])  # Sort by title
-
-    quickmarks = sorted(objreg.get('quickmark-manager').marks.items(),
-
-                        key=lambda x: x[0])  # Sort by name
-
-
-
-    src = jinja.render('bookmarks.html',
-
-                       title='Bookmarks',
-
-                       bookmarks=bookmarks,
-
-                       quickmarks=quickmarks)
-
-    return 'text/html', src
-
-
-
-
-
-@add_handler('tabs')
-
-def qute_tabs(_url):
-
-    """Handler for qute://tabs. Display information about all open tabs."""
-
-    tabs = collections.defaultdict(list)
-
-    for win_id, window in objreg.window_registry.items():
-
-        if sip.isdeleted(window):
-
-            continue
-
-        tabbed_browser = objreg.get('tabbed-browser',
-
-                                    scope='window',
-
-                                    window=win_id)
-
-        for tab in tabbed_browser.widgets():
-
-            if tab.url() not in [QUrl("qute://tabs/"), QUrl("qute://tabs")]:
-
-                urlstr = tab.url().toDisplayString()
-
-                tabs[str(win_id)].append((tab.title(), urlstr))
-
-
-
-    src = jinja.render('tabs.html',
-
-                       title='Tabs',
-
-                       tab_list_by_window=tabs)
-
-    return 'text/html', src
-
-
-
-
-
-def history_data(start_time, offset=None):
-
-    """Return history data.
-
-
-
-    Arguments:
-
-        start_time: select history starting from this timestamp.
-
-        offset: number of items to skip
-
-    """
-
-    # history atimes are stored as ints, ensure start_time is not a float
-
-    start_time = int(start_time)
-
-    hist = objreg.get('web-history')
-
-    if offset is not None:
-
-        entries = hist.entries_before(start_time, limit=1000, offset=offset)
-
-    else:
-
-        # end is 24hrs earlier than start
-
-        end_time = start_time - 24*60*60
-
-        entries = hist.entries_between(end_time, start_time)
-
-
-
-    return [{"url": e.url,
-
-             "title": html.escape(e.title) or html.escape(e.url),
-
-             "time": e.atime} for e in entries]
-
-
-
-
-
-@add_handler('history')
-
-def qute_history(url):
-
-    """Handler for qute://history. Display and serve history."""
-
-    if url.path() == '/data':
-
-        try:
-
-            offset = QUrlQuery(url).queryItemValue("offset")
-
-            offset = int(offset) if offset else None
-
-        except ValueError as e:
-
-            raise QuteSchemeError("Query parameter offset is invalid", e)
-
-        # Use start_time in query or current time.
-
-        try:
-
-            start_time = QUrlQuery(url).queryItemValue("start_time")
-
-            start_time = float(start_time) if start_time else time.time()
-
-        except ValueError as e:
-
-            raise QuteSchemeError("Query parameter start_time is invalid", e)
-
-
-
-        return 'text/html', json.dumps(history_data(start_time, offset))
-
-    else:
-
-        return 'text/html', jinja.render(
-
-            'history.html',
-
-            title='History',
-
-            gap_interval=config.val.history_gap_interval
-
-        )
-
-
-
-
-
-@add_handler('javascript')
-
-def qute_javascript(url):
-
-    """Handler for qute://javascript.
-
-
-
-    Return content of file given as query parameter.
-
-    """
-
-    path = url.path()
-
-    if path:
-
-        path = "javascript" + os.sep.join(path.split('/'))
-
-        return 'text/html', utils.read_file(path, binary=False)
-
-    else:
-
-        raise QuteSchemeError("No file specified", ValueError())
-
-
-
-
-
-@add_handler('pyeval')
-
-def qute_pyeval(_url):
-
-    """Handler for qute://pyeval."""
-
-    src = jinja.render('pre.html', title='pyeval', content=pyeval_output)
-
-    return 'text/html', src
-
-
-
-
-
-@add_handler('spawn-output')
-
-def qute_spawn_output(_url):
-
-    """Handler for qute://spawn-output."""
-
-    src = jinja.render('pre.html', title='spawn output', content=spawn_output)
-
-    return 'text/html', src
-
-
-
-
-
-@add_handler('version')
-
-@add_handler('verizon')
-
-def qute_version(_url):
-
-    """Handler for qute://version."""
-
-    src = jinja.render('version.html', title='Version info',
-
-                       version=version.version(),
-
-                       copyright=qutebrowser.__copyright__)
-
-    return 'text/html', src
-
-
-
-
-
-@add_handler('plainlog')
-
-def qute_plainlog(url):
-
-    """Handler for qute://plainlog.
-
-
-
-    An optional query parameter specifies the minimum log level to print.
-
-    For example, qute://log?level=warning prints warnings and errors.
-
-    Level can be one of: vdebug, debug, info, warning, error, critical.
-
-    """
-
-    if log.ram_handler is None:
-
-        text = "Log output was disabled."
-
-    else:
-
-        level = QUrlQuery(url).queryItemValue('level')
-
-        if not level:
-
-            level = 'vdebug'
-
-        text = log.ram_handler.dump_log(html=False, level=level)
-
-    src = jinja.render('pre.html', title='log', content=text)
-
-    return 'text/html', src
-
-
-
-
-
-@add_handler('log')
-
-def qute_log(url):
-
-    """Handler for qute://log.
-
-
-
-    An optional query parameter specifies the minimum log level to print.
-
-    For example, qute://log?level=warning prints warnings and errors.
-
-    Level can be one of: vdebug, debug, info, warning, error, critical.
-
-    """
-
-    if log.ram_handler is None:
-
-        html_log = None
-
-    else:
-
-        level = QUrlQuery(url).queryItemValue('level')
-
-        if not level:
-
-            level = 'vdebug'
-
-        html_log = log.ram_handler.dump_log(html=True, level=level)
-
-
-
-    src = jinja.render('log.html', title='log', content=html_log)
-
-    return 'text/html', src
-
-
-
-
-
-@add_handler('gpl')
-
-def qute_gpl(_url):
-
-    """Handler for qute://gpl. Return HTML content as string."""
-
-    return 'text/html', utils.read_file('html/license.html')
-
-
-
-
-
-@add_handler('help')
-
-def qute_help(url):
-
-    """Handler for qute://help."""
-
-    urlpath = url.path()
-
-    if not urlpath or urlpath == '/':
-
-        urlpath = 'index.html'
-
-    else:
-
-        urlpath = urlpath.lstrip('/')
-
-    if not docutils.docs_up_to_date(urlpath):
-
-        message.error("Your documentation is outdated! Please re-run "
-
-                      "scripts/asciidoc2html.py.")
-
-
-
-    path = 'html/doc/{}'.format(urlpath)
-
-    if not urlpath.endswith('.html'):
-
-        try:
-
-            bdata = utils.read_file(path, binary=True)
-
-        except OSError as e:
-
-            raise QuteSchemeOSError(e)
-
-        mimetype, _encoding = mimetypes.guess_type(urlpath)
-
-        assert mimetype is not None, url
-
-        return mimetype, bdata
-
-
-
-    try:
-
-        data = utils.read_file(path)
-
-    except OSError:
-
-        # No .html around, let's see if we find the asciidoc
-
-        asciidoc_path = path.replace('.html', '.asciidoc')
-
-        if asciidoc_path.startswith('html/doc/'):
-
-            asciidoc_path = asciidoc_path.replace('html/doc/', '../doc/help/')
-
-
-
-        try:
-
-            asciidoc = utils.read_file(asciidoc_path)
-
-        except OSError:
-
-            asciidoc = None
-
-
-
-        if asciidoc is None:
-
-            raise
-
-
-
-        preamble = textwrap.dedent("""
-
-            There was an error loading the documentation!
-
-
-
-            This most likely means the documentation was not generated
-
-            properly. If you are running qutebrowser from the git repository,
-
-            please (re)run scripts/asciidoc2html.py and reload this page.
-
-
-
-            If you're running a released version this is a bug, please use
-
-            :report to report it.
-
-
-
-            Falling back to the plaintext version.
-
-
-
-            ---------------------------------------------------------------
-
-
-
-
-
-        """)
-
-        return 'text/plain', (preamble + asciidoc).encode('utf-8')
-
-    else:
-
-        return 'text/html', data
-
-
-
-
-
-@add_handler('backend-warning')
-
-def qute_backend_warning(_url):
-
-    """Handler for qute://backend-warning."""
-
-    src = jinja.render('backend-warning.html',
-
-                       distribution=version.distribution(),
-
-                       Distribution=version.Distribution,
-
-                       version=pkg_resources.parse_version,
-
-                       title="Legacy backend warning")
-
-    return 'text/html', src
-
-
-
-
-
-def _qute_settings_set(url):
-
-    """Handler for qute://settings/set."""
-
-    query = QUrlQuery(url)
-
-    option = query.queryItemValue('option', QUrl.FullyDecoded)
-
-    value = query.queryItemValue('value', QUrl.FullyDecoded)
-
-
-
-    # https://github.com/qutebrowser/qutebrowser/issues/727
-
-    if option == 'content.javascript.enabled' and value == 'false':
-
-        msg = ("Refusing to disable javascript via qute://settings "
-
-               "as it needs javascript support.")
-
-        message.error(msg)
-
-        return 'text/html', b'error: ' + msg.encode('utf-8')
-
-
-
-    try:
-
-        config.instance.set_str(option, value, save_yaml=True)
-
-        return 'text/html', b'ok'
-
-    except configexc.Error as e:
-
-        message.error(str(e))
-
-        return 'text/html', b'error: ' + str(e).encode('utf-8')
-
-
-
-
-
-@add_handler('settings')
-
-def qute_settings(url):
-
-    """Handler for qute://settings. View/change qute configuration."""
-
-    global csrf_token
-
-
-
-    if url.path() == '/set':
-
-        if url.password() != csrf_token:
-
-            message.error("Invalid CSRF token for qute://settings!")
-
-            raise QuteSchemeError("Invalid CSRF token!",
-
-                                  QNetworkReply.ContentAccessDenied)
-
-        return _qute_settings_set(url)
-
-
-
-    # Requests to qute://settings/set should only be allowed from
-
-    # qute://settings. As an additional security precaution, we generate a CSRF
-
-    # token to use here.
-
-    if secrets:
-
-        csrf_token = secrets.token_urlsafe()
-
-    else:
-
-        # On Python < 3.6, from secrets.py
-
-        token = base64.urlsafe_b64encode(os.urandom(32))
-
-        csrf_token = token.rstrip(b'=').decode('ascii')
-
-
-
-    src = jinja.render('settings.html', title='settings',
-
-                       configdata=configdata,
-
-                       confget=config.instance.get_str,
-
-                       csrf_token=csrf_token)
-
-    return 'text/html', src
-
-
-
-
-
-@add_handler('bindings')
-
-def qute_bindings(_url):
-
-    """Handler for qute://bindings. View keybindings."""
-
-    bindings = {}
-
-    defaults = config.val.bindings.default
-
-    modes = set(defaults.keys()).union(config.val.bindings.commands)
-
-    modes.remove('normal')
-
-    modes = ['normal'] + sorted(list(modes))
-
-    for mode in modes:
-
-        bindings[mode] = config.key_instance.get_bindings_for(mode)
-
-
-
-    src = jinja.render('bindings.html', title='Bindings',
-
-                       bindings=bindings)
-
-    return 'text/html', src
-
-
-
-
-
-@add_handler('back')
-
-def qute_back(url):
-
-    """Handler for qute://back.
-
-
-
-    Simple page to free ram / lazy load a site, goes back on focusing the tab.
-
-    """
-
-    src = jinja.render(
-
-        'back.html',
-
-        title='Suspended: ' + urllib.parse.unquote(url.fragment()))
-
-    return 'text/html', src
-
-
-
-
-
-@add_handler('configdiff')
-
-def qute_configdiff(url):
-
-    """Handler for qute://configdiff."""
-
-    if url.path() == '/old':
-
-        try:
-
-            return 'text/html', configdiff.get_diff()
-
-        except OSError as e:
-
-            error = (b'Failed to read old config: ' +
-
-                     str(e.strerror).encode('utf-8'))
-
-            return 'text/plain', error
-
-    else:
-
-        data = config.instance.dump_userconfig().encode('utf-8')
-
-        return 'text/plain', data
-
-
-
-
-
-@add_handler('pastebin-version')
-
-def qute_pastebin_version(_url):
-
-    """Handler that pastebins the version string."""
-
-    version.pastebin_version()
-
-    return 'text/plain', b'Paste called.'
+        self.assertEqual(res.status_int, 403)

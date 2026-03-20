@@ -2,4124 +2,1414 @@
 # Safety: safe
 # Category: safe
 
-"""
-
-JupyterHub Spawner to spawn user notebooks on a Kubernetes cluster.
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
 
 
 
-This module exports `KubeSpawner` class, which is the actual spawner
+# Copyright 2012 OpenStack, LLC
 
-implementation that should be used by JupyterHub.
+# All Rights Reserved.
 
-"""
+#
+
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+
+#    not use this file except in compliance with the License. You may obtain
+
+#    a copy of the License at
+
+#
+
+#         http://www.apache.org/licenses/LICENSE-2.0
+
+#
+
+#    Unless required by applicable law or agreed to in writing, software
+
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+
+#    License for the specific language governing permissions and limitations
+
+#    under the License.
 
 
-
-from functools import partial  # noqa
-
-from datetime import datetime
 
 import json
 
-import os
 
-import sys
 
-import string
+import requests
 
-import multiprocessing
 
-from concurrent.futures import ThreadPoolExecutor
 
-import warnings
+from glance.common import utils
 
+from glance.tests import functional
 
 
-from tornado import gen
 
-from tornado.ioloop import IOLoop
 
-from tornado.concurrent import run_on_executor
 
-from tornado import web
+TENANT1 = utils.generate_uuid()
 
-from traitlets import (
+TENANT2 = utils.generate_uuid()
 
-    Bool,
+TENANT3 = utils.generate_uuid()
 
-    Dict,
+TENANT4 = utils.generate_uuid()
 
-    Integer,
 
-    List,
 
-    Unicode,
 
-    Union,
 
-    default,
+class TestImages(functional.FunctionalTest):
 
-    observe,
 
-    validate,
 
-)
+    def setUp(self):
 
-from jupyterhub.spawner import Spawner
+        super(TestImages, self).setUp()
 
-from jupyterhub.utils import exponential_backoff
+        self.cleanup()
 
-from jupyterhub.traitlets import Command
+        self.api_server.deployment_flavor = 'noauth'
 
-from kubernetes.client.rest import ApiException
+        self.start_servers(**self.__dict__.copy())
 
-from kubernetes import client
 
-import escapism
 
-from jinja2 import Environment, BaseLoader
+    def _url(self, path):
 
+        return 'http://127.0.0.1:%d%s' % (self.api_port, path)
 
 
-from .clients import shared_client
 
-from kubespawner.traitlets import Callable
+    def _headers(self, custom_headers=None):
 
-from kubespawner.objects import make_pod, make_pvc
+        base_headers = {
 
-from kubespawner.reflector import NamespacedResourceReflector
+            'X-Identity-Status': 'Confirmed',
 
-from asyncio import sleep
+            'X-Auth-Token': '932c5c84-02ac-4fe5-a9ba-620af0e2bb96',
 
-from async_generator import async_generator, yield_
+            'X-User-Id': 'f9a41d13-0c13-47e9-bee2-ce4e8bfe958e',
 
-from slugify import slugify
+            'X-Tenant-Id': TENANT1,
 
-
-
-class PodReflector(NamespacedResourceReflector):
-
-    """
-
-    PodReflector is merely a configured NamespacedResourceReflector. It exposes
-
-    the pods property, which is simply mapping to self.resources where the
-
-    NamespacedResourceReflector keeps an updated list of the resource defined by
-
-    the `kind` field and the `list_method_name` field.
-
-    """
-
-    kind = 'pods'
-
-    list_method_name = 'list_namespaced_pod'
-
-    # FUTURE: These labels are the selection labels for the PodReflector. We
-
-    # might want to support multiple deployments in the same namespace, so we
-
-    # would need to select based on additional labels such as `app` and
-
-    # `release`.
-
-    labels = {
-
-        'component': 'singleuser-server',
-
-    }
-
-
-
-    @property
-
-    def pods(self):
-
-        """
-
-        A dictionary of the python kubernetes client's representation of pods
-
-        for the namespace. The dictionary keys are the pod ids and the values
-
-        are the actual pod resource representations.
-
-
-
-        ref: https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.16/#pod-v1-core
-
-        """
-
-        return self.resources
-
-
-
-
-
-class EventReflector(NamespacedResourceReflector):
-
-    """
-
-    EventsReflector is merely a configured NamespacedResourceReflector. It
-
-    exposes the events property, which is simply mapping to self.resources where
-
-    the NamespacedResourceReflector keeps an updated list of the resource
-
-    defined by the `kind` field and the `list_method_name` field.
-
-    """
-
-    kind = 'events'
-
-    list_method_name = 'list_namespaced_event'
-
-
-
-    @property
-
-    def events(self):
-
-        """
-
-        Returns list of the python kubernetes client's representation of k8s
-
-        events within the namespace, sorted by the latest event.
-
-
-
-        ref: https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.16/#event-v1-core
-
-        """
-
-
-
-        # NOTE:
-
-        # - self.resources is a dictionary with keys mapping unique ids of
-
-        #   Kubernetes Event resources, updated by NamespacedResourceReflector.
-
-        #   self.resources will builds up with incoming k8s events, but can also
-
-        #   suddenly refreshes itself entirely. We should not assume a call to
-
-        #   this dictionary's values will result in a consistently ordered list,
-
-        #   so we sort it to get it somewhat more structured.
-
-        # - We either seem to get only event.last_timestamp or event.event_time,
-
-        #   both fields serve the same role but the former is a low resolution
-
-        #   timestamp without and the other is a higher resolution timestamp.
-
-        return sorted(
-
-            self.resources.values(),
-
-            key=lambda event: event.last_timestamp or event.event_time,
-
-        )
-
-
-
-
-
-class MockObject(object):
-
-    pass
-
-
-
-class KubeSpawner(Spawner):
-
-    """
-
-    A JupyterHub spawner that spawn pods in a Kubernetes Cluster. Each server
-
-    spawned by a user will have its own KubeSpawner instance.
-
-    """
-
-
-
-    # We want to have one single threadpool executor that is shared across all
-
-    # KubeSpawner instances, so we apply a Singleton pattern. We initialize this
-
-    # class variable from the first KubeSpawner instance that is created and
-
-    # then reference it from all instances. The same goes for the PodReflector
-
-    # and EventReflector.
-
-    executor = None
-
-    reflectors = {
-
-        "pods": None,
-
-        "events": None,
-
-    }
-
-
-
-    @property
-
-    def pod_reflector(self):
-
-        """
-
-        A convinience alias to the class variable reflectors['pods'].
-
-        """
-
-        return self.__class__.reflectors['pods']
-
-
-
-    @property
-
-    def event_reflector(self):
-
-        """
-
-        A convninience alias to the class variable reflectors['events'] if the
-
-        spawner instance has events_enabled.
-
-        """
-
-        if self.events_enabled:
-
-            return self.__class__.reflectors['events']
-
-
-
-    def __init__(self, *args, **kwargs):
-
-        _mock = kwargs.pop('_mock', False)
-
-        super().__init__(*args, **kwargs)
-
-
-
-        if _mock:
-
-            # runs during test execution only
-
-            if 'user' not in kwargs:
-
-                user = MockObject()
-
-                user.name = 'mock_name'
-
-                user.id = 'mock_id'
-
-                user.url = 'mock_url'
-
-                self.user = user
-
-
-
-            if 'hub' not in kwargs:
-
-                hub = MockObject()
-
-                hub.public_host = 'mock_public_host'
-
-                hub.url = 'mock_url'
-
-                hub.base_url = 'mock_base_url'
-
-                hub.api_url = 'mock_api_url'
-
-                self.hub = hub
-
-        else:
-
-            # runs during normal execution only
-
-
-
-            # By now, all the traitlets have been set, so we can use them to compute
-
-            # other attributes
-
-            if self.__class__.executor is None:
-
-                self.__class__.executor = ThreadPoolExecutor(
-
-                    max_workers=self.k8s_api_threadpool_workers
-
-                )
-
-
-
-            # This will start watching in __init__, so it'll start the first
-
-            # time any spawner object is created. Not ideal but works!
-
-            self._start_watching_pods()
-
-            if self.events_enabled:
-
-                self._start_watching_events()
-
-
-
-            self.api = shared_client('CoreV1Api')
-
-
-
-        # runs during both test and normal execution
-
-        self.pod_name = self._expand_user_properties(self.pod_name_template)
-
-        self.pvc_name = self._expand_user_properties(self.pvc_name_template)
-
-        if self.working_dir:
-
-            self.working_dir = self._expand_user_properties(self.working_dir)
-
-        if self.port == 0:
-
-            # Our default port is 8888
-
-            self.port = 8888
-
-
-
-    k8s_api_threadpool_workers = Integer(
-
-        # Set this explicitly, since this is the default in Python 3.5+
-
-        # but not in 3.4
-
-        5 * multiprocessing.cpu_count(),
-
-        config=True,
-
-        help="""
-
-        Number of threads in thread pool used to talk to the k8s API.
-
-
-
-        Increase this if you are dealing with a very large number of users.
-
-
-
-        Defaults to `5 * cpu_cores`, which is the default for `ThreadPoolExecutor`.
-
-        """
-
-    )
-
-
-
-    events_enabled = Bool(
-
-        True,
-
-        config=True,
-
-        help="""
-
-        Enable event-watching for progress-reports to the user spawn page.
-
-
-
-        Disable if these events are not desirable
-
-        or to save some performance cost.
-
-        """
-
-    )
-
-
-
-    namespace = Unicode(
-
-        config=True,
-
-        help="""
-
-        Kubernetes namespace to spawn user pods in.
-
-
-
-        If running inside a kubernetes cluster with service accounts enabled,
-
-        defaults to the current namespace. If not, defaults to `default`
-
-        """
-
-    )
-
-
-
-    @default('namespace')
-
-    def _namespace_default(self):
-
-        """
-
-        Set namespace default to current namespace if running in a k8s cluster
-
-
-
-        If not in a k8s cluster with service accounts enabled, default to
-
-        `default`
-
-        """
-
-        ns_path = '/var/run/secrets/kubernetes.io/serviceaccount/namespace'
-
-        if os.path.exists(ns_path):
-
-            with open(ns_path) as f:
-
-                return f.read().strip()
-
-        return 'default'
-
-
-
-    ip = Unicode(
-
-        '0.0.0.0',
-
-        config=True,
-
-        help="""
-
-        The IP address (or hostname) the single-user server should listen on.
-
-
-
-        We override this from the parent so we can set a more sane default for
-
-        the Kubernetes setup.
-
-        """
-
-    )
-
-
-
-    cmd = Command(
-
-        None,
-
-        allow_none=True,
-
-        minlen=0,
-
-        config=True,
-
-        help="""
-
-        The command used for starting the single-user server.
-
-
-
-        Provide either a string or a list containing the path to the startup script command. Extra arguments,
-
-        other than this path, should be provided via `args`.
-
-
-
-        This is usually set if you want to start the single-user server in a different python
-
-        environment (with virtualenv/conda) than JupyterHub itself.
-
-
-
-        Some spawners allow shell-style expansion here, allowing you to use environment variables.
-
-        Most, including the default, do not. Consult the documentation for your spawner to verify!
-
-
-
-        If set to `None`, Kubernetes will start the `CMD` that is specified in the Docker image being started.
-
-        """
-
-    )
-
-
-
-    # FIXME: Don't override 'default_value' ("") or 'allow_none' (False) (Breaking change)
-
-    working_dir = Unicode(
-
-        None,
-
-        allow_none=True,
-
-        config=True,
-
-        help="""
-
-        The working directory where the Notebook server will be started inside the container.
-
-        Defaults to `None` so the working directory will be the one defined in the Dockerfile.
-
-
-
-        `{username}` is expanded to the escaped, dns-label safe username.
-
-        """
-
-    )
-
-
-
-    # FIXME: Don't override 'default_value' ("") or 'allow_none' (False) (Breaking change)
-
-    service_account = Unicode(
-
-        None,
-
-        allow_none=True,
-
-        config=True,
-
-        help="""
-
-        The service account to be mounted in the spawned user pod.
-
-
-
-        When set to `None` (the default), no service account is mounted, and the default service account
-
-        is explicitly disabled.
-
-
-
-        This `serviceaccount` must already exist in the namespace the user pod is being spawned in.
-
-
-
-        WARNING: Be careful with this configuration! Make sure the service account being mounted
-
-        has the minimal permissions needed, and nothing more. When misconfigured, this can easily
-
-        give arbitrary users root over your entire cluster.
-
-        """
-
-    )
-
-
-
-    pod_name_template = Unicode(
-
-        'jupyter-{username}--{servername}',
-
-        config=True,
-
-        help="""
-
-        Template to use to form the name of user's pods.
-
-
-
-        `{username}` is expanded to the escaped, dns-label-safe username.
-
-        `{servername}` is expanded to the escaped, dns-label-safe server name, if any.
-
-
-
-        Trailing `-` characters are stripped for safe handling of empty server names (user default servers).
-
-
-
-        This must be unique within the namespace the pods are being spawned
-
-        in, so if you are running multiple jupyterhubs spawning in the
-
-        same namespace, consider setting this to be something more unique.
-
-
-
-        .. versionchanged:: 0.12
-
-            `--` delimiter added to the template,
-
-            where it was implicitly added to the `servername` field before.
-
-            Additionally, `username--servername` delimiter was `-` instead of `--`,
-
-            allowing collisions in certain circumstances.
-
-        """
-
-    )
-
-
-
-    storage_pvc_ensure = Bool(
-
-        False,
-
-        config=True,
-
-        help="""
-
-        Ensure that a PVC exists for each user before spawning.
-
-
-
-        Set to true to create a PVC named with `pvc_name_template` if it does
-
-        not exist for the user when their pod is spawning.
-
-        """
-
-    )
-
-
-
-    pvc_name_template = Unicode(
-
-        'claim-{username}--{servername}',
-
-        config=True,
-
-        help="""
-
-        Template to use to form the name of user's pvc.
-
-
-
-        `{username}` is expanded to the escaped, dns-label safe username.
-
-        `{servername}` is expanded to the escaped, dns-label-safe server name, if any.
-
-
-
-        Trailing `-` characters are stripped for safe handling of empty server names (user default servers).
-
-
-
-        This must be unique within the namespace the pvc are being spawned
-
-        in, so if you are running multiple jupyterhubs spawning in the
-
-        same namespace, consider setting this to be something more unique.
-
-
-
-        .. versionchanged:: 0.12
-
-            `--` delimiter added to the template,
-
-            where it was implicitly added to the `servername` field before.
-
-            Additionally, `username--servername` delimiter was `-` instead of `--`,
-
-            allowing collisions in certain circumstances.
-
-        """
-
-    )
-
-
-
-    # FIXME: Don't override 'default_value' ("") or 'allow_none' (False) (Breaking change)
-
-    hub_connect_ip = Unicode(
-
-        allow_none=True,
-
-        config=True,
-
-        help="""DEPRECATED. Use c.JupyterHub.hub_connect_ip"""
-
-    )
-
-
-
-    hub_connect_port = Integer(
-
-        config=True,
-
-        help="""DEPRECATED. Use c.JupyterHub.hub_connect_url"""
-
-    )
-
-
-
-    @observe('hub_connect_ip', 'hub_connect_port')
-
-    def _deprecated_changed(self, change):
-
-        warnings.warn("""
-
-            KubeSpawner.{0} is deprecated with JupyterHub >= 0.8.
-
-            Use JupyterHub.{0}
-
-            """.format(change.name),
-
-            DeprecationWarning)
-
-        setattr(self.hub, change.name.split('_', 1)[1], change.new)
-
-
-
-    common_labels = Dict(
-
-        {
-
-            'app': 'jupyterhub',
-
-            'heritage': 'jupyterhub',
-
-        },
-
-        config=True,
-
-        help="""
-
-        Kubernetes labels that both spawned singleuser server pods and created
-
-        user PVCs will get.
-
-
-
-        Note that these are only set when the Pods and PVCs are created, not
-
-        later when this setting is updated.
-
-        """
-
-    )
-
-
-
-    extra_labels = Dict(
-
-        config=True,
-
-        help="""
-
-        Extra kubernetes labels to set on the spawned single-user pods.
-
-
-
-        The keys and values specified here would be set as labels on the spawned single-user
-
-        kubernetes pods. The keys and values must both be strings that match the kubernetes
-
-        label key / value constraints.
-
-
-
-        See `the Kubernetes documentation <https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/>`__
-
-        for more info on what labels are and why you might want to use them!
-
-
-
-        `{username}` is expanded to the escaped, dns-label safe username.
-
-        """
-
-    )
-
-
-
-    extra_annotations = Dict(
-
-        config=True,
-
-        help="""
-
-        Extra Kubernetes annotations to set on the spawned single-user pods.
-
-
-
-        The keys and values specified here are added as annotations on the spawned single-user
-
-        kubernetes pods. The keys and values must both be strings.
-
-
-
-        See `the Kubernetes documentation <https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations/>`__
-
-        for more info on what annotations are and why you might want to use them!
-
-
-
-        `{username}` is expanded to the escaped, dns-label safe username.
-
-        """
-
-    )
-
-
-
-    image = Unicode(
-
-        'jupyterhub/singleuser:latest',
-
-        config=True,
-
-        help="""
-
-        Docker image to use for spawning user's containers.
-
-
-
-        Defaults to `jupyterhub/singleuser:latest`
-
-
-
-        Name of the container + a tag, same as would be used with
-
-        a `docker pull` command. If tag is set to `latest`, kubernetes will
-
-        check the registry each time a new user is spawned to see if there
-
-        is a newer image available. If available, new image will be pulled.
-
-        Note that this could cause long delays when spawning, especially
-
-        if the image is large. If you do not specify a tag, whatever version
-
-        of the image is first pulled on the node will be used, thus possibly
-
-        leading to inconsistent images on different nodes. For all these
-
-        reasons, it is recommended to specify a specific immutable tag
-
-        for the image.
-
-
-
-        If your image is very large, you might need to increase the timeout
-
-        for starting the single user container from the default. You can
-
-        set this with::
-
-
-
-           c.KubeSpawner.start_timeout = 60 * 5  # Up to 5 minutes
-
-
-
-        """
-
-    )
-
-
-
-    image_pull_policy = Unicode(
-
-        'IfNotPresent',
-
-        config=True,
-
-        help="""
-
-        The image pull policy of the docker container specified in
-
-        `image`.
-
-
-
-        Defaults to `IfNotPresent` which causes the Kubelet to NOT pull the image
-
-        specified in KubeSpawner.image if it already exists, except if the tag
-
-        is `:latest`. For more information on image pull policy,
-
-        refer to `the Kubernetes documentation <https://kubernetes.io/docs/concepts/containers/images/>`__.
-
-
-
-
-
-        This configuration is primarily used in development if you are
-
-        actively changing the `image_spec` and would like to pull the image
-
-        whenever a user container is spawned.
-
-        """
-
-    )
-
-
-
-    # FIXME: Don't override 'default_value' ("") or 'allow_none' (False) (Breaking change)
-
-    image_pull_secrets = Unicode(
-
-        None,
-
-        allow_none=True,
-
-        config=True,
-
-        help="""
-
-        The kubernetes secret to use for pulling images from private repository.
-
-
-
-        Set this to the name of a Kubernetes secret containing the docker configuration
-
-        required to pull the image.
-
-
-
-        See `the Kubernetes documentation <https://kubernetes.io/docs/concepts/containers/images/#specifying-imagepullsecrets-on-a-pod>`__
-
-        for more information on when and why this might need to be set, and what
-
-        it should be set to.
-
-        """
-
-    )
-
-
-
-    node_selector = Dict(
-
-        config=True,
-
-        help="""
-
-        The dictionary Selector labels used to match the Nodes where Pods will be launched.
-
-
-
-        Default is None and means it will be launched in any available Node.
-
-
-
-        For example to match the Nodes that have a label of `disktype: ssd` use::
-
-
-
-           c.KubeSpawner.node_selector = {'disktype': 'ssd'}
-
-        """
-
-    )
-
-
-
-    uid = Union(
-
-        trait_types=[
-
-            Integer(),
-
-            Callable(),
-
-        ],
-
-        allow_none=True,
-
-        config=True,
-
-        help="""
-
-        The UID to run the single-user server containers as.
-
-
-
-        This UID should ideally map to a user that already exists in the container
-
-        image being used. Running as root is discouraged.
-
-
-
-        Instead of an integer, this could also be a callable that takes as one
-
-        parameter the current spawner instance and returns an integer. The callable
-
-        will be called asynchronously if it returns a future. Note that
-
-        the interface of the spawner class is not deemed stable across versions,
-
-        so using this functionality might cause your JupyterHub or kubespawner
-
-        upgrades to break.
-
-
-
-        If set to `None`, the user specified with the `USER` directive in the
-
-        container metadata is used.
-
-        """
-
-    )
-
-
-
-    gid = Union(
-
-        trait_types=[
-
-            Integer(),
-
-            Callable(),
-
-        ],
-
-        allow_none=True,
-
-        config=True,
-
-        help="""
-
-        The GID to run the single-user server containers as.
-
-
-
-        This GID should ideally map to a group that already exists in the container
-
-        image being used. Running as root is discouraged.
-
-
-
-        Instead of an integer, this could also be a callable that takes as one
-
-        parameter the current spawner instance and returns an integer. The callable
-
-        will be called asynchronously if it returns a future. Note that
-
-        the interface of the spawner class is not deemed stable across versions,
-
-        so using this functionality might cause your JupyterHub or kubespawner
-
-        upgrades to break.
-
-
-
-        If set to `None`, the group of the user specified with the `USER` directive
-
-        in the container metadata is used.
-
-        """
-
-    )
-
-
-
-    fs_gid = Union(
-
-        trait_types=[
-
-            Integer(),
-
-            Callable(),
-
-        ],
-
-        allow_none=True,
-
-        config=True,
-
-        help="""
-
-        The GID of the group that should own any volumes that are created & mounted.
-
-
-
-        A special supplemental group that applies primarily to the volumes mounted
-
-        in the single-user server. In volumes from supported providers, the following
-
-        things happen:
-
-
-
-          1. The owning GID will be the this GID
-
-          2. The setgid bit is set (new files created in the volume will be owned by
-
-             this GID)
-
-          3. The permission bits are OR’d with rw-rw
-
-
-
-        The single-user server will also be run with this gid as part of its supplemental
-
-        groups.
-
-
-
-        Instead of an integer, this could also be a callable that takes as one
-
-        parameter the current spawner instance and returns an integer. The callable will
-
-        be called asynchronously if it returns a future, rather than an int. Note that
-
-        the interface of the spawner class is not deemed stable across versions,
-
-        so using this functionality might cause your JupyterHub or kubespawner
-
-        upgrades to break.
-
-
-
-        You'll *have* to set this if you are using auto-provisioned volumes with most
-
-        cloud providers. See `fsGroup <https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.11/#podsecuritycontext-v1-core>`_
-
-        for more details.
-
-        """
-
-    )
-
-
-
-    supplemental_gids = Union(
-
-        trait_types=[
-
-            List(),
-
-            Callable(),
-
-        ],
-
-        config=True,
-
-        help="""
-
-        A list of GIDs that should be set as additional supplemental groups to the
-
-        user that the container runs as.
-
-
-
-        Instead of a list of integers, this could also be a callable that takes as one
-
-        parameter the current spawner instance and returns a list of integers. The
-
-        callable will be called asynchronously if it returns a future, rather than
-
-        a list. Note that the interface of the spawner class is not deemed stable
-
-        across versions, so using this functionality might cause your JupyterHub
-
-        or kubespawner upgrades to break.
-
-
-
-        You may have to set this if you are deploying to an environment with RBAC/SCC
-
-        enforced and pods run with a 'restricted' SCC which results in the image being
-
-        run as an assigned user ID. The supplemental group IDs would need to include
-
-        the corresponding group ID of the user ID the image normally would run as. The
-
-        image must setup all directories/files any application needs access to, as group
-
-        writable.
-
-        """
-
-    )
-
-
-
-    privileged = Bool(
-
-        False,
-
-        config=True,
-
-        help="""
-
-        Whether to run the pod with a privileged security context.
-
-        """
-
-    )
-
-
-
-    modify_pod_hook = Callable(
-
-        None,
-
-        allow_none=True,
-
-        config=True,
-
-        help="""
-
-        Callable to augment the Pod object before launching.
-
-
-
-        Expects a callable that takes two parameters:
-
-
-
-           1. The spawner object that is doing the spawning
-
-           2. The Pod object that is to be launched
-
-
-
-        You should modify the Pod object and return it.
-
-
-
-        This can be a coroutine if necessary. When set to none, no augmenting is done.
-
-
-
-        This is very useful if you want to modify the pod being launched dynamically.
-
-        Note that the spawner object can change between versions of KubeSpawner and JupyterHub,
-
-        so be careful relying on this!
-
-        """
-
-    )
-
-
-
-    volumes = List(
-
-        config=True,
-
-        help="""
-
-        List of Kubernetes Volume specifications that will be mounted in the user pod.
-
-
-
-        This list will be directly added under `volumes` in the kubernetes pod spec,
-
-        so you should use the same structure. Each item in the list must have the
-
-        following two keys:
-
-
-
-          - `name`
-
-            Name that'll be later used in the `volume_mounts` config to mount this
-
-            volume at a specific path.
-
-          - `<name-of-a-supported-volume-type>` (such as `hostPath`, `persistentVolumeClaim`,
-
-            etc)
-
-            The key name determines the type of volume to mount, and the value should
-
-            be an object specifying the various options available for that kind of
-
-            volume.
-
-
-
-        See `the Kubernetes documentation <https://kubernetes.io/docs/concepts/storage/volumes>`__
-
-        for more information on the various kinds of volumes available and their options.
-
-        Your kubernetes cluster must already be configured to support the volume types you want to use.
-
-
-
-        `{username}` is expanded to the escaped, dns-label safe username.
-
-        """
-
-    )
-
-
-
-    volume_mounts = List(
-
-        config=True,
-
-        help="""
-
-        List of paths on which to mount volumes in the user notebook's pod.
-
-
-
-        This list will be added to the values of the `volumeMounts` key under the user's
-
-        container in the kubernetes pod spec, so you should use the same structure as that.
-
-        Each item in the list should be a dictionary with at least these two keys:
-
-
-
-           - `mountPath` The path on the container in which we want to mount the volume.
-
-           - `name` The name of the volume we want to mount, as specified in the `volumes` config.
-
-
-
-        See `the Kubernetes documentation <https://kubernetes.io/docs/concepts/storage/volumes>`__
-
-        for more information on how the `volumeMount` item works.
-
-
-
-        `{username}` is expanded to the escaped, dns-label safe username.
-
-        """
-
-    )
-
-
-
-    # FIXME: Don't override 'default_value' ("") or 'allow_none' (False) (Breaking change)
-
-    storage_capacity = Unicode(
-
-        None,
-
-        config=True,
-
-        allow_none=True,
-
-        help="""
-
-        The amount of storage space to request from the volume that the pvc will
-
-        mount to. This amount will be the amount of storage space the user has
-
-        to work with on their notebook. If left blank, the kubespawner will not
-
-        create a pvc for the pod.
-
-
-
-        This will be added to the `resources: requests: storage:` in the k8s pod spec.
-
-
-
-        See `the Kubernetes documentation <https://kubernetes.io/docs/concepts/storage/persistent-volumes/#persistentvolumeclaims>`__
-
-        for more information on how storage works.
-
-
-
-        Quantities can be represented externally as unadorned integers, or as fixed-point
-
-        integers with one of these SI suffices (`E, P, T, G, M, K, m`) or their power-of-two
-
-        equivalents (`Ei, Pi, Ti, Gi, Mi, Ki`). For example, the following represent roughly
-
-        the same value: `128974848`, `129e6`, `129M`, `123Mi`.
-
-        """
-
-    )
-
-
-
-    storage_extra_labels = Dict(
-
-        config=True,
-
-        help="""
-
-        Extra kubernetes labels to set on the user PVCs.
-
-
-
-        The keys and values specified here would be set as labels on the PVCs
-
-        created by kubespawner for the user. Note that these are only set
-
-        when the PVC is created, not later when this setting is updated.
-
-
-
-        See `the Kubernetes documentation <https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/>`__
-
-        for more info on what labels are and why you might want to use them!
-
-
-
-        `{username}` is expanded to the escaped, dns-label safe username.
-
-        """
-
-    )
-
-
-
-    # FIXME: Don't override 'default_value' ("") or 'allow_none' (False) (Breaking change)
-
-    storage_class = Unicode(
-
-        None,
-
-        config=True,
-
-        allow_none=True,
-
-        help="""
-
-        The storage class that the pvc will use.
-
-
-
-        This will be added to the `annotations: volume.beta.kubernetes.io/storage-class:`
-
-        in the pvc metadata.
-
-
-
-        This will determine what type of volume the pvc will request to use. If one exists
-
-        that matches the criteria of the StorageClass, the pvc will mount to that. Otherwise,
-
-        b/c it has a storage class, k8s will dynamically spawn a pv for the pvc to bind to
-
-        and a machine in the cluster for the pv to bind to.
-
-
-
-        Note that an empty string is a valid value and is always interpreted to be
-
-        requesting a pv with no class.
-
-
-
-        See `the Kubernetes documentation <https://kubernetes.io/docs/concepts/storage/storage-classes/>`__
-
-        for more information on how StorageClasses work.
-
-
-
-        """
-
-    )
-
-
-
-    storage_access_modes = List(
-
-        ["ReadWriteOnce"],
-
-        config=True,
-
-        help="""
-
-        List of access modes the user has for the pvc.
-
-
-
-        The access modes are:
-
-
-
-            - `ReadWriteOnce` – the volume can be mounted as read-write by a single node
-
-            - `ReadOnlyMany` – the volume can be mounted read-only by many nodes
-
-            - `ReadWriteMany` – the volume can be mounted as read-write by many nodes
-
-
-
-        See `the Kubernetes documentation <https://kubernetes.io/docs/concepts/storage/persistent-volumes/#access-modes>`__
-
-        for more information on how access modes work.
-
-        """
-
-    )
-
-
-
-    storage_selector = Dict(
-
-        config=True,
-
-        help="""
-
-        The dictionary Selector labels used to match a PersistentVolumeClaim to
-
-        a PersistentVolume.
-
-
-
-        Default is None and means it will match based only on other storage criteria.
-
-
-
-        For example to match the Nodes that have a label of `content: jupyter` use::
-
-
-
-           c.KubeSpawner.storage_selector = {'matchLabels':{'content': 'jupyter'}}
-
-        """
-
-    )
-
-
-
-    lifecycle_hooks = Dict(
-
-        config=True,
-
-        help="""
-
-        Kubernetes lifecycle hooks to set on the spawned single-user pods.
-
-
-
-        The keys is name of hooks and there are only two hooks, postStart and preStop.
-
-        The values are handler of hook which executes by Kubernetes management system when hook is called.
-
-
-
-        Below is an sample copied from
-
-        `the Kubernetes documentation <https://kubernetes.io/docs/tasks/configure-pod-container/attach-handler-lifecycle-event/>`__::
-
-
-
-
-
-            c.KubeSpawner.lifecycle_hooks = {
-
-                "postStart": {
-
-                    "exec": {
-
-                        "command": ["/bin/sh", "-c", "echo Hello from the postStart handler > /usr/share/message"]
-
-                    }
-
-                },
-
-                "preStop": {
-
-                    "exec": {
-
-                        "command": ["/usr/sbin/nginx", "-s", "quit"]
-
-                    }
-
-                }
-
-            }
-
-
-
-        See `the Kubernetes documentation <https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/>`__
-
-        for more info on what lifecycle hooks are and why you might want to use them!
-
-        """
-
-    )
-
-
-
-    init_containers = List(
-
-        config=True,
-
-        help="""
-
-        List of initialization containers belonging to the pod.
-
-
-
-        This list will be directly added under `initContainers` in the kubernetes pod spec,
-
-        so you should use the same structure. Each item in the dict must a field
-
-        of the `V1Container specification <https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.11/#container-v1-core>`_.
-
-
-
-        One usage is disabling access to metadata service from single-user
-
-        notebook server with configuration below::
-
-
-
-            c.KubeSpawner.init_containers = [{
-
-                "name": "init-iptables",
-
-                "image": "<image with iptables installed>",
-
-                "command": ["iptables", "-A", "OUTPUT", "-p", "tcp", "--dport", "80", "-d", "169.254.169.254", "-j", "DROP"],
-
-                "securityContext": {
-
-                    "capabilities": {
-
-                        "add": ["NET_ADMIN"]
-
-                    }
-
-                }
-
-            }]
-
-
-
-
-
-        See `the Kubernetes documentation <https://kubernetes.io/docs/concepts/workloads/pods/init-containers/>`__
-
-        for more info on what init containers are and why you might want to use them!
-
-
-
-        To user this feature, Kubernetes version must greater than 1.6.
-
-        """
-
-    )
-
-
-
-    extra_container_config = Dict(
-
-        config=True,
-
-        help="""
-
-        Extra configuration (e.g. ``envFrom``) for notebook container which is not covered by other attributes.
-
-
-
-        This dict will be directly merge into `container` of notebook server,
-
-        so you should use the same structure. Each item in the dict must a field
-
-        of the `V1Container specification <https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.11/#container-v1-core>`_.
-
-
-
-        One usage is set ``envFrom`` on notebook container with configuration below::
-
-
-
-            c.KubeSpawner.extra_container_config = {
-
-                "envFrom": [{
-
-                    "configMapRef": {
-
-                        "name": "special-config"
-
-                    }
-
-                }]
-
-            }
-
-
-
-        The key could be either a camelCase word (used by Kubernetes yaml, e.g.
-
-        ``envFrom``) or a snake_case word (used by Kubernetes Python client,
-
-        e.g. ``env_from``).
-
-        """
-
-    )
-
-
-
-    extra_pod_config = Dict(
-
-        config=True,
-
-        help="""
-
-        Extra configuration for the pod which is not covered by other attributes.
-
-
-
-        This dict will be directly merge into pod,so you should use the same structure.
-
-        Each item in the dict is field of pod configuration
-
-        which follows spec at https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.11/#podspec-v1-core.
-
-
-
-        One usage is set restartPolicy and dnsPolicy with configuration below::
-
-
-
-            c.KubeSpawner.extra_pod_config = {
-
-                "restartPolicy": "OnFailure",
-
-                "dns_policy": "ClusterFirstWithHostNet"
-
-            }
-
-
-
-        The `key` could be either a camelCase word (used by Kubernetes yaml,
-
-        e.g. `restartPolicy`) or a snake_case word (used by Kubernetes Python
-
-        client, e.g. `dns_policy`).
-
-        """
-
-    )
-
-
-
-    extra_containers = List(
-
-        config=True,
-
-        help="""
-
-        List of containers belonging to the pod which besides to the container generated for notebook server.
-
-
-
-        This list will be directly appended under `containers` in the kubernetes pod spec,
-
-        so you should use the same structure. Each item in the list is container configuration
-
-        which follows spec at https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.11/#container-v1-core.
-
-
-
-        One usage is setting crontab in a container to clean sensitive data with configuration below::
-
-
-
-            c.KubeSpawner.extra_containers = [{
-
-                "name": "crontab",
-
-                "image": "supercronic",
-
-                "command": ["/usr/local/bin/supercronic", "/etc/crontab"]
-
-            }]
-
-
-
-        `{username}` is expanded to the escaped, dns-label safe username.
-
-        """
-
-    )
-
-
-
-    # FIXME: Don't override 'default_value' ("") or 'allow_none' (False) (Breaking change)
-
-    scheduler_name = Unicode(
-
-        None,
-
-        allow_none=True,
-
-        config=True,
-
-        help="""
-
-        Set the pod's scheduler explicitly by name. See `the Kubernetes documentation <https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.11/#podspec-v1-core>`__
-
-        for more information.
-
-        """
-
-    )
-
-
-
-    tolerations = List(
-
-        config=True,
-
-        help="""
-
-        List of tolerations that are to be assigned to the pod in order to be able to schedule the pod
-
-        on a node with the corresponding taints. See the official Kubernetes documentation for additional details
-
-        https://kubernetes.io/docs/concepts/configuration/taint-and-toleration/
-
-
-
-        Pass this field an array of `"Toleration" objects
-
-        <https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.11/#nodeselectorterm-v1-core>`__
-
-
-
-        Example::
-
-
-
-            [
-
-                {
-
-                    'key': 'key',
-
-                    'operator': 'Equal',
-
-                    'value': 'value',
-
-                    'effect': 'NoSchedule'
-
-                },
-
-                {
-
-                    'key': 'key',
-
-                    'operator': 'Exists',
-
-                    'effect': 'NoSchedule'
-
-                }
-
-            ]
-
-
-
-        """
-
-    )
-
-
-
-    node_affinity_preferred = List(
-
-        config=True,
-
-        help="""
-
-        Affinities describe where pods prefer or require to be scheduled, they
-
-        may prefer or require a node to have a certain label or be in proximity
-
-        / remoteness to another pod. To learn more visit
-
-        https://kubernetes.io/docs/concepts/configuration/assign-pod-node/
-
-
-
-        Pass this field an array of "PreferredSchedulingTerm" objects.*
-
-        * https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.11/#preferredschedulingterm-v1-core
-
-        """
-
-    )
-
-    node_affinity_required = List(
-
-        config=True,
-
-        help="""
-
-        Affinities describe where pods prefer or require to be scheduled, they
-
-        may prefer or require a node to have a certain label or be in proximity
-
-        / remoteness to another pod. To learn more visit
-
-        https://kubernetes.io/docs/concepts/configuration/assign-pod-node/
-
-
-
-        Pass this field an array of "NodeSelectorTerm" objects.*
-
-        * https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.11/#nodeselectorterm-v1-core
-
-        """
-
-    )
-
-    pod_affinity_preferred = List(
-
-        config=True,
-
-        help="""
-
-        Affinities describe where pods prefer or require to be scheduled, they
-
-        may prefer or require a node to have a certain label or be in proximity
-
-        / remoteness to another pod. To learn more visit
-
-        https://kubernetes.io/docs/concepts/configuration/assign-pod-node/
-
-
-
-        Pass this field an array of "WeightedPodAffinityTerm" objects.*
-
-        * https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.11/#weightedpodaffinityterm-v1-core
-
-        """
-
-    )
-
-    pod_affinity_required = List(
-
-        config=True,
-
-        help="""
-
-        Affinities describe where pods prefer or require to be scheduled, they
-
-        may prefer or require a node to have a certain label or be in proximity
-
-        / remoteness to another pod. To learn more visit
-
-        https://kubernetes.io/docs/concepts/configuration/assign-pod-node/
-
-
-
-        Pass this field an array of "PodAffinityTerm" objects.*
-
-        * https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.11/#podaffinityterm-v1-core
-
-        """
-
-    )
-
-    pod_anti_affinity_preferred = List(
-
-        config=True,
-
-        help="""
-
-        Affinities describe where pods prefer or require to be scheduled, they
-
-        may prefer or require a node to have a certain label or be in proximity
-
-        / remoteness to another pod. To learn more visit
-
-        https://kubernetes.io/docs/concepts/configuration/assign-pod-node/
-
-
-
-        Pass this field an array of "WeightedPodAffinityTerm" objects.*
-
-        * https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.11/#weightedpodaffinityterm-v1-core
-
-        """
-
-    )
-
-    pod_anti_affinity_required = List(
-
-        config=True,
-
-        help="""
-
-        Affinities describe where pods prefer or require to be scheduled, they
-
-        may prefer or require a node to have a certain label or be in proximity
-
-        / remoteness to another pod. To learn more visit
-
-        https://kubernetes.io/docs/concepts/configuration/assign-pod-node/
-
-
-
-        Pass this field an array of "PodAffinityTerm" objects.*
-
-        * https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.11/#podaffinityterm-v1-core
-
-        """
-
-    )
-
-
-
-    extra_resource_guarantees = Dict(
-
-        config=True,
-
-        help="""
-
-        The dictionary used to request arbitrary resources.
-
-        Default is None and means no additional resources are requested.
-
-        For example, to request 1 Nvidia GPUs::
-
-
-
-            c.KubeSpawner.extra_resource_guarantees = {"nvidia.com/gpu": "1"}
-
-        """
-
-    )
-
-
-
-    extra_resource_limits = Dict(
-
-        config=True,
-
-        help="""
-
-        The dictionary used to limit arbitrary resources.
-
-        Default is None and means no additional resources are limited.
-
-        For example, to add a limit of 3 Nvidia GPUs::
-
-
-
-            c.KubeSpawner.extra_resource_limits = {"nvidia.com/gpu": "3"}
-
-        """
-
-    )
-
-
-
-    delete_stopped_pods = Bool(
-
-        True,
-
-        config=True,
-
-        help="""
-
-        Whether to delete pods that have stopped themselves.
-
-        Set to False to leave stopped pods in the completed state,
-
-        allowing for easier debugging of why they may have stopped.
-
-        """
-
-    )
-
-
-
-    profile_form_template = Unicode(
-
-        """
-
-        <script>
-
-        // JupyterHub 0.8 applied form-control indisciminately to all form elements.
-
-        // Can be removed once we stop supporting JupyterHub 0.8
-
-        $(document).ready(function() {
-
-            $('#kubespawner-profiles-list input[type="radio"]').removeClass('form-control');
-
-        });
-
-        </script>
-
-        <style>
-
-        /* The profile description should not be bold, even though it is inside the <label> tag */
-
-        #kubespawner-profiles-list label p {
-
-            font-weight: normal;
+            'X-Roles': 'member',
 
         }
 
-        </style>
+        base_headers.update(custom_headers or {})
 
+        return base_headers
 
 
-        <div class='form-group' id='kubespawner-profiles-list'>
 
-        {% for profile in profile_list %}
+    def test_image_lifecycle(self):
 
-        <label for='profile-item-{{ profile.slug }}' class='form-control input-group'>
+        # Image list should be empty
 
-            <div class='col-md-1'>
+        path = self._url('/v2/images')
 
-                <input type='radio' name='profile' id='profile-item-{{ profile.slug }}' value='{{ profile.slug }}' {% if profile.default %}checked{% endif %} />
+        response = requests.get(path, headers=self._headers())
 
-            </div>
+        self.assertEqual(200, response.status_code)
 
-            <div class='col-md-11'>
+        images = json.loads(response.text)['images']
 
-                <strong>{{ profile.display_name }}</strong>
+        self.assertEqual(0, len(images))
 
-                {% if profile.description %}
 
-                <p>{{ profile.description }}</p>
 
-                {% endif %}
+        # Create an image (with a deployer-defined property)
 
-            </div>
+        path = self._url('/v2/images')
 
-        </label>
+        headers = self._headers({'content-type': 'application/json'})
 
-        {% endfor %}
+        data = json.dumps({'name': 'image-1', 'type': 'kernel', 'foo': 'bar'})
 
-        </div>
+        response = requests.post(path, headers=headers, data=data)
 
-        """,
+        self.assertEqual(201, response.status_code)
 
-        config=True,
+        image_location_header = response.headers['Location']
 
-        help="""
 
-        Jinja2 template for constructing profile list shown to user.
 
+        # Returned image entity should have a generated id and status
 
+        image = json.loads(response.text)
 
-        Used when `profile_list` is set.
+        image_id = image['id']
 
+        self.assertEqual(image['status'], 'queued')
 
 
-        The contents of `profile_list` are passed in to the template.
 
-        This should be used to construct the contents of a HTML form. When
+        # Image list should now have one entry
 
-        posted, this form is expected to have an item with name `profile` and
+        path = self._url('/v2/images')
 
-        the value the index of the profile in `profile_list`.
+        response = requests.get(path, headers=self._headers())
 
-        """
+        self.assertEqual(200, response.status_code)
 
-    )
+        images = json.loads(response.text)['images']
 
+        self.assertEqual(1, len(images))
 
+        self.assertEqual(images[0]['id'], image_id)
 
-    profile_list = Union(
 
-        trait_types=[
 
-            List(trait=Dict()),
+        # Get the image using the returned Location header
 
-            Callable()
+        response = requests.get(image_location_header, headers=self._headers())
 
-        ],
+        self.assertEqual(200, response.status_code)
 
-        config=True,
+        image = json.loads(response.text)
 
-        help="""
+        self.assertEqual(image_id, image['id'])
 
-        List of profiles to offer for selection by the user.
+        self.assertFalse('checksum' in image)
 
+        self.assertFalse('size' in image)
 
+        self.assertEqual('bar', image['foo'])
 
-        Signature is: `List(Dict())`, where each item is a dictionary that has two keys:
+        self.assertEqual(False, image['protected'])
 
+        self.assertEqual('kernel', image['type'])
 
+        self.assertTrue(image['created_at'])
 
-        - `display_name`: the human readable display name (should be HTML safe)
+        self.assertTrue(image['updated_at'])
 
-        - `slug`: the machine readable slug to identify the profile
+        self.assertEqual(image['updated_at'], image['created_at'])
 
-          (missing slugs are generated from display_name)
 
-        - `description`: Optional description of this profile displayed to the user.
 
-        - `kubespawner_override`: a dictionary with overrides to apply to the KubeSpawner
+        # The image should be mutable, including adding and removing properties
 
-          settings. Each value can be either the final value to change or a callable that
+        path = self._url('/v2/images/%s' % image_id)
 
-          take the `KubeSpawner` instance as parameter and return the final value.
+        media_type = 'application/openstack-images-v2.0-json-patch'
 
-        - `default`: (optional Bool) True if this is the default selected option
+        headers = self._headers({'content-type': media_type})
 
+        data = json.dumps([
 
+            {'replace': '/name', 'value': 'image-2'},
 
-        Example::
+            {'replace': '/disk_format', 'value': 'vhd'},
 
+            {'replace': '/foo', 'value': 'baz'},
 
+            {'add': '/ping', 'value': 'pong'},
 
-            c.KubeSpawner.profile_list = [
+            {'replace': '/protected', 'value': True},
 
-                {
+            {'remove': '/type'},
 
-                    'display_name': 'Training Env - Python',
+        ])
 
-                    'slug': 'training-python',
+        response = requests.patch(path, headers=headers, data=data)
 
-                    'default': True,
+        self.assertEqual(200, response.status_code, response.text)
 
-                    'kubespawner_override': {
 
-                        'image': 'training/python:label',
 
-                        'cpu_limit': 1,
+        # Returned image entity should reflect the changes
 
-                        'mem_limit': '512M',
+        image = json.loads(response.text)
 
-                    }
+        self.assertEqual('image-2', image['name'])
 
-                }, {
+        self.assertEqual('vhd', image['disk_format'])
 
-                    'display_name': 'Training Env - Datascience',
+        self.assertEqual('baz', image['foo'])
 
-                    'slug': 'training-datascience',
+        self.assertEqual('pong', image['ping'])
 
-                    'kubespawner_override': {
+        self.assertEqual(True, image['protected'])
 
-                        'image': 'training/datascience:label',
+        self.assertFalse('type' in image, response.text)
 
-                        'cpu_limit': 4,
 
-                        'mem_limit': '8G',
 
-                    }
+        # Updates should persist across requests
 
-                }, {
+        path = self._url('/v2/images/%s' % image_id)
 
-                    'display_name': 'DataScience - Small instance',
+        response = requests.get(path, headers=self._headers())
 
-                    'slug': 'datascience-small',
+        self.assertEqual(200, response.status_code)
 
-                    'kubespawner_override': {
+        image = json.loads(response.text)
 
-                        'image': 'datascience/small:label',
+        self.assertEqual(image_id, image['id'])
 
-                        'cpu_limit': 10,
+        self.assertEqual('image-2', image['name'])
 
-                        'mem_limit': '16G',
+        self.assertEqual('baz', image['foo'])
 
-                    }
+        self.assertEqual('pong', image['ping'])
 
-                }, {
+        self.assertEqual(True, image['protected'])
 
-                    'display_name': 'DataScience - Medium instance',
+        self.assertFalse('type' in image, response.text)
 
-                    'slug': 'datascience-medium',
 
-                    'kubespawner_override': {
 
-                        'image': 'datascience/medium:label',
+        # Try to download data before its uploaded
 
-                        'cpu_limit': 48,
+        path = self._url('/v2/images/%s/file' % image_id)
 
-                        'mem_limit': '96G',
+        headers = self._headers()
 
-                    }
+        response = requests.get(path, headers=headers)
 
-                }, {
+        self.assertEqual(404, response.status_code)
 
-                    'display_name': 'DataScience - Medium instance (GPUx2)',
 
-                    'slug': 'datascience-gpu2x',
 
-                    'kubespawner_override': {
+        # Upload some image data
 
-                        'image': 'datascience/medium:label',
+        path = self._url('/v2/images/%s/file' % image_id)
 
-                        'cpu_limit': 48,
+        headers = self._headers({'Content-Type': 'application/octet-stream'})
 
-                        'mem_limit': '96G',
+        response = requests.put(path, headers=headers, data='ZZZZZ')
 
-                        'extra_resource_guarantees': {"nvidia.com/gpu": "2"},
+        self.assertEqual(201, response.status_code)
 
-                    }
 
-                }
 
-            ]
+        # Checksum should be populated automatically
 
+        path = self._url('/v2/images/%s' % image_id)
 
+        response = requests.get(path, headers=self._headers())
 
-        Instead of a list of dictionaries, this could also be a callable that takes as one
+        self.assertEqual(200, response.status_code)
 
-        parameter the current spawner instance and returns a list of dictionaries. The
+        image = json.loads(response.text)
 
-        callable will be called asynchronously if it returns a future, rather than
+        self.assertEqual('8f113e38d28a79a5a451b16048cc2b72', image['checksum'])
 
-        a list. Note that the interface of the spawner class is not deemed stable
 
-        across versions, so using this functionality might cause your JupyterHub
 
-        or kubespawner upgrades to break.
+        # Try to download the data that was just uploaded
 
-        """
+        path = self._url('/v2/images/%s/file' % image_id)
 
-    )
+        headers = self._headers()
 
+        response = requests.get(path, headers=headers)
 
+        self.assertEqual(200, response.status_code)
 
-    priority_class_name = Unicode(
+        self.assertEqual('8f113e38d28a79a5a451b16048cc2b72',
 
-        config=True,
+                         response.headers['Content-MD5'])
 
-        help="""
+        self.assertEqual(response.text, 'ZZZZZ')
 
-        The priority class that the pods will use.
 
 
+        # Uploading duplicate data should be rejected with a 409
 
-        See https://kubernetes.io/docs/concepts/configuration/pod-priority-preemption for
+        path = self._url('/v2/images/%s/file' % image_id)
 
-        more information on how pod priority works.
+        headers = self._headers({'Content-Type': 'application/octet-stream'})
 
-        """
+        response = requests.put(path, headers=headers, data='XXX')
 
-    )
+        self.assertEqual(409, response.status_code)
 
 
 
-    delete_grace_period = Integer(
+        # Ensure the size is updated to reflect the data uploaded
 
-        1,
+        path = self._url('/v2/images/%s' % image_id)
 
-        config=True,
+        headers = self._headers()
 
-        help="""
+        response = requests.get(path, headers=headers)
 
-        Time in seconds for the pod to be in `terminating` state before is forcefully killed.
+        self.assertEqual(200, response.status_code)
 
-        
+        self.assertEqual(5, json.loads(response.text)['size'])
 
-        Increase this if you need more time to execute a `preStop` lifecycle hook.
 
 
+        # Deletion should not work on protected images
 
-        See https://kubernetes.io/docs/concepts/workloads/pods/pod/#termination-of-pods for
+        path = self._url('/v2/images/%s' % image_id)
 
-        more information on how pod termination works.
+        response = requests.delete(path, headers=self._headers())
 
+        self.assertEqual(403, response.status_code)
 
 
-        Defaults to `1`.
 
-        """
+        # Unprotect image for deletion
 
-    )
+        path = self._url('/v2/images/%s' % image_id)
 
+        media_type = 'application/openstack-images-v2.0-json-patch'
 
+        headers = self._headers({'content-type': media_type})
 
-    # deprecate redundant and inconsistent singleuser_ and user_ prefixes:
+        data = json.dumps([{'replace': '/protected', 'value': False}])
 
-    _deprecated_traits_09 = [
+        response = requests.patch(path, headers=headers, data=data)
 
-        "singleuser_working_dir",
+        self.assertEqual(200, response.status_code, response.text)
 
-        "singleuser_service_account",
 
-        "singleuser_extra_labels",
 
-        "singleuser_extra_annotations",
+        # Deletion should work
 
-        "singleuser_image_spec",
+        path = self._url('/v2/images/%s' % image_id)
 
-        "singleuser_image_pull_policy",
+        response = requests.delete(path, headers=self._headers())
 
-        "singleuser_image_pull_secrets",
+        self.assertEqual(204, response.status_code)
 
-        "singleuser_node_selector",
 
-        "singleuser_uid",
 
-        "singleuser_fs_gid",
+        # This image should be no longer be directly accessible
 
-        "singleuser_supplemental_gids",
+        path = self._url('/v2/images/%s' % image_id)
 
-        "singleuser_privileged",
+        response = requests.get(path, headers=self._headers())
 
-        "singleuser_lifecycle_hooks",
+        self.assertEqual(404, response.status_code)
 
-        "singleuser_extra_pod_config",
 
-        "singleuser_init_containers",
 
-        "singleuser_extra_container_config",
+        # And neither should its data
 
-        "singleuser_extra_containers",
+        path = self._url('/v2/images/%s/file' % image_id)
 
-        "user_storage_class",
+        headers = self._headers()
 
-        "user_storage_pvc_ensure",
+        response = requests.get(path, headers=headers)
 
-        "user_storage_capacity",
+        self.assertEqual(404, response.status_code)
 
-        "user_storage_extra_labels",
 
-        "user_storage_access_modes",
 
-    ]
+        # Image list should now be empty
 
-    # other general deprecations:
+        path = self._url('/v2/images')
 
-    _deprecated_traits = {
+        response = requests.get(path, headers=self._headers())
 
-        'image_spec': ('image', '0.10'),
+        self.assertEqual(200, response.status_code)
 
-    }
+        images = json.loads(response.text)['images']
 
-    # add the bulk deprecations from 0.9
+        self.assertEqual(0, len(images))
 
-    for _deprecated_name in _deprecated_traits_09:
 
-        _new_name = _deprecated_name.split('_', 1)[1]
 
-        _deprecated_traits[_deprecated_name] = (_new_name, '0.9')
+        self.stop_servers()
 
 
 
-    @validate('config')
+    def test_permissions(self):
 
-    def _handle_deprecated_config(self, proposal):
+        # Create an image that belongs to TENANT1
 
-        config = proposal.value
+        path = self._url('/v2/images')
 
-        if 'KubeSpawner' not in config:
+        headers = self._headers({'Content-Type': 'application/json'})
 
-            # nothing to check
+        data = json.dumps({'name': 'image-1'})
 
-            return config
+        response = requests.post(path, headers=headers, data=data)
 
-        for _deprecated_name, (_new_name, version) in self._deprecated_traits.items():
+        self.assertEqual(201, response.status_code)
 
-            # for any `singleuser_name` deprecate in favor of `name`
+        image_id = json.loads(response.text)['id']
 
-            if _deprecated_name not in config.KubeSpawner:
 
-                # nothing to do
 
-                continue
+        # Upload some image data
 
+        path = self._url('/v2/images/%s/file' % image_id)
 
+        headers = self._headers({'Content-Type': 'application/octet-stream'})
 
-            # remove deprecated value from config
+        response = requests.put(path, headers=headers, data='ZZZZZ')
 
-            _deprecated_value = config.KubeSpawner.pop(_deprecated_name)
+        self.assertEqual(201, response.status_code)
 
-            self.log.warning(
 
-                "KubeSpawner.%s is deprecated in %s. Use KubeSpawner.%s instead",
 
-                _deprecated_name,
+        # TENANT1 should see the image in their list
 
-                version,
+        path = self._url('/v2/images')
 
-                _new_name,
+        response = requests.get(path, headers=self._headers())
 
-            )
+        self.assertEqual(200, response.status_code)
 
-            if _new_name in config.KubeSpawner:
+        images = json.loads(response.text)['images']
 
-                # *both* config values found,
+        self.assertEqual(image_id, images[0]['id'])
 
-                # ignore deprecated config and warn about the collision
 
-                _new_value = config.KubeSpawner[_new_name]
 
-                # ignore deprecated config in favor of non-deprecated config
+        # TENANT1 should be able to access the image directly
 
-                self.log.warning(
+        path = self._url('/v2/images/%s' % image_id)
 
-                    "Ignoring deprecated config KubeSpawner.%s = %r "
+        response = requests.get(path, headers=self._headers())
 
-                    " in favor of KubeSpawner.%s = %r",
+        self.assertEqual(200, response.status_code)
 
-                    _deprecated_name,
 
-                    _deprecated_value,
 
-                    _new_name,
+        # TENANT2 should not see the image in their list
 
-                    _new_value,
+        path = self._url('/v2/images')
 
-                )
+        headers = self._headers({'X-Tenant-Id': TENANT2})
 
-            else:
+        response = requests.get(path, headers=headers)
 
-                # move deprecated config to its new home
+        self.assertEqual(200, response.status_code)
 
-                config.KubeSpawner[_new_name] = _deprecated_value
+        images = json.loads(response.text)['images']
 
+        self.assertEqual(0, len(images))
 
 
-        return config
 
+        # TENANT2 should not be able to access the image directly
 
+        path = self._url('/v2/images/%s' % image_id)
 
-    # define properties for deprecated names
+        headers = self._headers({'X-Tenant-Id': TENANT2})
 
-    # so we can propagate their values to the new traits.
+        response = requests.get(path, headers=headers)
 
-    # most deprecations should be handled via config above,
+        self.assertEqual(404, response.status_code)
 
-    # but in case these are set at runtime, e.g. by subclasses
 
-    # or hooks, hook this up.
 
-    # The signature-order of these is funny
+        # TENANT2 should not be able to modify the image, either
 
-    # because the property methods are created with
+        path = self._url('/v2/images/%s' % image_id)
 
-    # functools.partial(f, name) so name is passed as the first arg
+        headers = self._headers({
 
-    # before self.
+            'Content-Type': 'application/openstack-images-v2.0-json-patch',
 
-
-
-    def _get_deprecated(name, new_name, version, self):
-
-        # warn about the deprecated name
-
-        self.log.warning(
-
-            "KubeSpawner.%s is deprecated in %s. Use KubeSpawner.%s",
-
-            name,
-
-            version,
-
-            new_name,
-
-        )
-
-        return getattr(self, new_name)
-
-
-
-    def _set_deprecated(name, new_name, version, self, value):
-
-        # warn about the deprecated name
-
-        self.log.warning(
-
-            "KubeSpawner.%s is deprecated in %s. Use KubeSpawner.%s",
-
-            name,
-
-            version,
-
-            new_name,
-
-        )
-
-        return setattr(self, new_name, value)
-
-
-
-    for _deprecated_name, (_new_name, _version) in _deprecated_traits.items():
-
-        exec(
-
-            """{0} = property(
-
-                partial(_get_deprecated, '{0}', '{1}', '{2}'),
-
-                partial(_set_deprecated, '{0}', '{1}', '{2}'),
-
-            )
-
-            """.format(
-
-                _deprecated_name,
-
-                _new_name,
-
-                _version,
-
-            )
-
-        )
-
-    del _deprecated_name
-
-
-
-    def _expand_user_properties(self, template):
-
-        # Make sure username and servername match the restrictions for DNS labels
-
-        # Note: '-' is not in safe_chars, as it is being used as escape character
-
-        safe_chars = set(string.ascii_lowercase + string.digits)
-
-
-
-        raw_servername = self.name or ''
-
-        safe_servername = escapism.escape(raw_servername, safe=safe_chars, escape_char='-').lower()
-
-
-
-        legacy_escaped_username = ''.join([s if s in safe_chars else '-' for s in self.user.name.lower()])
-
-        safe_username = escapism.escape(self.user.name, safe=safe_chars, escape_char='-').lower()
-
-        rendered = template.format(
-
-            userid=self.user.id,
-
-            username=safe_username,
-
-            unescaped_username=self.user.name,
-
-            legacy_escape_username=legacy_escaped_username,
-
-            servername=safe_servername,
-
-            unescaped_servername=raw_servername,
-
-        )
-
-        # strip trailing - delimiter in case of empty servername.
-
-        # k8s object names cannot have trailing -
-
-        return rendered.rstrip("-")
-
-
-
-    def _expand_all(self, src):
-
-        if isinstance(src, list):
-
-            return [self._expand_all(i) for i in src]
-
-        elif isinstance(src, dict):
-
-            return {k: self._expand_all(v) for k, v in src.items()}
-
-        elif isinstance(src, str):
-
-            return self._expand_user_properties(src)
-
-        else:
-
-            return src
-
-
-
-    def _build_common_labels(self, extra_labels):
-
-        # Default set of labels, picked up from
-
-        # https://github.com/kubernetes/helm/blob/master/docs/chart_best_practices/labels.md
-
-        labels = {}
-
-        labels.update(extra_labels)
-
-        labels.update(self.common_labels)
-
-        return labels
-
-
-
-    def _build_pod_labels(self, extra_labels):
-
-        labels = self._build_common_labels(extra_labels)
-
-        labels.update({
-
-            'component': 'singleuser-server'
+            'X-Tenant-Id': TENANT2,
 
         })
 
-        return labels
+        data = json.dumps([{'replace': '/name', 'value': 'image-2'}])
 
+        response = requests.patch(path, headers=headers, data=data)
 
+        self.assertEqual(404, response.status_code)
 
-    def _build_common_annotations(self, extra_annotations):
 
-        # Annotations don't need to be escaped
 
-        annotations = {
+        # TENANT2 should not be able to delete the image, either
 
-            'hub.jupyter.org/username': self.user.name
+        path = self._url('/v2/images/%s' % image_id)
 
-        }
+        headers = self._headers({'X-Tenant-Id': TENANT2})
 
-        if self.name:
+        response = requests.delete(path, headers=headers)
 
-            annotations['hub.jupyter.org/servername'] = self.name
+        self.assertEqual(404, response.status_code)
 
 
 
-        annotations.update(extra_annotations)
+        # Publicize the image as an admin of TENANT1
 
-        return annotations
+        path = self._url('/v2/images/%s' % image_id)
 
+        headers = self._headers({
 
+            'Content-Type': 'application/openstack-images-v2.0-json-patch',
 
-    @gen.coroutine
-
-    def get_pod_manifest(self):
-
-        """
-
-        Make a pod manifest that will spawn current user's notebook pod.
-
-        """
-
-        if callable(self.uid):
-
-            uid = yield gen.maybe_future(self.uid(self))
-
-        else:
-
-            uid = self.uid
-
-
-
-        if callable(self.gid):
-
-            gid = yield gen.maybe_future(self.gid(self))
-
-        else:
-
-            gid = self.gid
-
-
-
-        if callable(self.fs_gid):
-
-            fs_gid = yield gen.maybe_future(self.fs_gid(self))
-
-        else:
-
-            fs_gid = self.fs_gid
-
-
-
-        if callable(self.supplemental_gids):
-
-            supplemental_gids = yield gen.maybe_future(self.supplemental_gids(self))
-
-        else:
-
-            supplemental_gids = self.supplemental_gids
-
-
-
-        if self.cmd:
-
-            real_cmd = self.cmd + self.get_args()
-
-        else:
-
-            real_cmd = None
-
-
-
-        labels = self._build_pod_labels(self._expand_all(self.extra_labels))
-
-        annotations = self._build_common_annotations(self._expand_all(self.extra_annotations))
-
-
-
-        return make_pod(
-
-            name=self.pod_name,
-
-            cmd=real_cmd,
-
-            port=self.port,
-
-            image=self.image,
-
-            image_pull_policy=self.image_pull_policy,
-
-            image_pull_secret=self.image_pull_secrets,
-
-            node_selector=self.node_selector,
-
-            run_as_uid=uid,
-
-            run_as_gid=gid,
-
-            fs_gid=fs_gid,
-
-            supplemental_gids=supplemental_gids,
-
-            run_privileged=self.privileged,
-
-            env=self.get_env(),
-
-            volumes=self._expand_all(self.volumes),
-
-            volume_mounts=self._expand_all(self.volume_mounts),
-
-            working_dir=self.working_dir,
-
-            labels=labels,
-
-            annotations=annotations,
-
-            cpu_limit=self.cpu_limit,
-
-            cpu_guarantee=self.cpu_guarantee,
-
-            mem_limit=self.mem_limit,
-
-            mem_guarantee=self.mem_guarantee,
-
-            extra_resource_limits=self.extra_resource_limits,
-
-            extra_resource_guarantees=self.extra_resource_guarantees,
-
-            lifecycle_hooks=self.lifecycle_hooks,
-
-            init_containers=self._expand_all(self.init_containers),
-
-            service_account=self.service_account,
-
-            extra_container_config=self.extra_container_config,
-
-            extra_pod_config=self._expand_all(self.extra_pod_config),
-
-            extra_containers=self._expand_all(self.extra_containers),
-
-            scheduler_name=self.scheduler_name,
-
-            tolerations=self.tolerations,
-
-            node_affinity_preferred=self.node_affinity_preferred,
-
-            node_affinity_required=self.node_affinity_required,
-
-            pod_affinity_preferred=self.pod_affinity_preferred,
-
-            pod_affinity_required=self.pod_affinity_required,
-
-            pod_anti_affinity_preferred=self.pod_anti_affinity_preferred,
-
-            pod_anti_affinity_required=self.pod_anti_affinity_required,
-
-            priority_class_name=self.priority_class_name,
-
-            logger=self.log,
-
-        )
-
-
-
-    def get_pvc_manifest(self):
-
-        """
-
-        Make a pvc manifest that will spawn current user's pvc.
-
-        """
-
-        labels = self._build_common_labels(self._expand_all(self.storage_extra_labels))
-
-        labels.update({
-
-            'component': 'singleuser-storage'
+            'X-Roles': 'admin',
 
         })
 
+        data = json.dumps([{'replace': '/visibility', 'value': 'public'}])
 
+        response = requests.patch(path, headers=headers, data=data)
 
-        annotations = self._build_common_annotations({})
+        self.assertEqual(200, response.status_code)
 
 
 
-        return make_pvc(
+        # TENANT3 should now see the image in their list
 
-            name=self.pvc_name,
+        path = self._url('/v2/images')
 
-            storage_class=self.storage_class,
+        headers = self._headers({'X-Tenant-Id': TENANT3})
 
-            access_modes=self.storage_access_modes,
+        response = requests.get(path, headers=headers)
 
-            selector=self.storage_selector,
+        self.assertEqual(200, response.status_code)
 
-            storage=self.storage_capacity,
+        images = json.loads(response.text)['images']
 
-            labels=labels,
+        self.assertEqual(image_id, images[0]['id'])
 
-            annotations=annotations
 
-        )
 
+        # TENANT3 should also be able to access the image directly
 
+        path = self._url('/v2/images/%s' % image_id)
 
-    def is_pod_running(self, pod):
+        headers = self._headers({'X-Tenant-Id': TENANT3})
 
-        """
+        response = requests.get(path, headers=headers)
 
-        Check if the given pod is running
+        self.assertEqual(200, response.status_code)
 
 
 
-        pod must be a dictionary representing a Pod kubernetes API object.
+        # TENANT3 still should not be able to modify the image
 
-        """
+        path = self._url('/v2/images/%s' % image_id)
 
-        # FIXME: Validate if this is really the best way
+        headers = self._headers({
 
-        is_running = (
+            'Content-Type': 'application/openstack-images-v2.0-json-patch',
 
-            pod is not None and
+            'X-Tenant-Id': TENANT3,
 
-            pod.status.phase == 'Running' and
+        })
 
-            pod.status.pod_ip is not None and
+        data = json.dumps([{'replace': '/name', 'value': 'image-2'}])
 
-            pod.metadata.deletion_timestamp is None and
+        response = requests.patch(path, headers=headers, data=data)
 
-            all([cs.ready for cs in pod.status.container_statuses])
+        self.assertEqual(404, response.status_code)
 
-        )
 
-        return is_running
 
+        # TENANT3 should not be able to delete the image, either
 
+        path = self._url('/v2/images/%s' % image_id)
 
-    def get_state(self):
+        headers = self._headers({'X-Tenant-Id': TENANT3})
 
-        """
+        response = requests.delete(path, headers=headers)
 
-        Save state required to reinstate this user's pod from scratch
+        self.assertEqual(404, response.status_code)
 
 
 
-        We save the `pod_name`, even though we could easily compute it,
+        # Image data should still be present after the failed delete
 
-        because JupyterHub requires you save *some* state! Otherwise
+        path = self._url('/v2/images/%s/file' % image_id)
 
-        it assumes your server is dead. This works around that.
+        response = requests.get(path, headers=self._headers())
 
+        self.assertEqual(200, response.status_code)
 
+        self.assertEqual(response.text, 'ZZZZZ')
 
-        It's also useful for cases when the `pod_template` changes between
 
-        restarts - this keeps the old pods around.
 
-        """
+        self.stop_servers()
 
-        state = super().get_state()
 
-        state['pod_name'] = self.pod_name
 
-        return state
+    def test_tag_lifecycle(self):
 
+        # Create an image with a tag - duplicate should be ignored
 
+        path = self._url('/v2/images')
 
-    def get_env(self):
+        headers = self._headers({'Content-Type': 'application/json'})
 
-        """Return the environment dict to use for the Spawner.
+        data = json.dumps({'name': 'image-1', 'tags': ['sniff', 'sniff']})
 
+        response = requests.post(path, headers=headers, data=data)
 
+        self.assertEqual(201, response.status_code)
 
-        See also: jupyterhub.Spawner.get_env
+        image_id = json.loads(response.text)['id']
 
-        """
 
 
+        # Image should show a list with a single tag
 
-        env = super(KubeSpawner, self).get_env()
+        path = self._url('/v2/images/%s' % image_id)
 
-        # deprecate image
+        response = requests.get(path, headers=self._headers())
 
-        env['JUPYTER_IMAGE_SPEC'] = self.image
+        self.assertEqual(200, response.status_code)
 
-        env['JUPYTER_IMAGE'] = self.image
+        tags = json.loads(response.text)['tags']
 
+        self.assertEqual(['sniff'], tags)
 
 
-        return env
 
+        # Update image with duplicate tag - it should be ignored
 
+        path = self._url('/v2/images/%s' % image_id)
 
-    def load_state(self, state):
+        media_type = 'application/openstack-images-v2.0-json-patch'
 
-        """
+        headers = self._headers({'content-type': media_type})
 
-        Load state from storage required to reinstate this user's pod
+        data = json.dumps([{'replace': '/tags',
 
+                            'value': ['sniff', 'snozz', 'snozz']}])
 
+        response = requests.patch(path, headers=headers, data=data)
 
-        Since this runs after `__init__`, this will override the generated `pod_name`
+        self.assertEqual(200, response.status_code)
 
-        if there's one we have saved in state. These are the same in most cases,
+        tags = json.loads(response.text)['tags']
 
-        but if the `pod_template` has changed in between restarts, it will no longer
+        self.assertEqual(['snozz', 'sniff'], tags)
 
-        be the case. This allows us to continue serving from the old pods with
 
-        the old names.
 
-        """
+        # Image should show the appropriate tags
 
-        if 'pod_name' in state:
+        path = self._url('/v2/images/%s' % image_id)
 
-            self.pod_name = state['pod_name']
+        response = requests.get(path, headers=self._headers())
 
+        self.assertEqual(200, response.status_code)
 
+        tags = json.loads(response.text)['tags']
 
-    @gen.coroutine
+        self.assertEqual(['sniff', 'snozz'], tags)
 
-    def poll(self):
 
-        """
 
-        Check if the pod is still running.
+        # Attempt to tag the image with a duplicate should be ignored
 
+        path = self._url('/v2/images/%s/tags/snozz' % image_id)
 
+        response = requests.put(path, headers=self._headers())
 
-        Uses the same interface as subprocess.Popen.poll(): if the pod is
+        self.assertEqual(204, response.status_code)
 
-        still running, returns None.  If the pod has exited, return the
 
-        exit code if we can determine it, or 1 if it has exited but we
 
-        don't know how.  These are the return values JupyterHub expects.
+        # Create another more complex tag
 
+        path = self._url('/v2/images/%s/tags/gabe%%40example.com' % image_id)
 
+        response = requests.put(path, headers=self._headers())
 
-        Note that a clean exit will have an exit code of zero, so it is
+        self.assertEqual(204, response.status_code)
 
-        necessary to check that the returned value is None, rather than
 
-        just Falsy, to determine that the pod is still running.
 
-        """
+        # Double-check that the tags container on the image is populated
 
-        # have to wait for first load of data before we have a valid answer
+        path = self._url('/v2/images/%s' % image_id)
 
-        if not self.pod_reflector.first_load_future.done():
+        response = requests.get(path, headers=self._headers())
 
-            yield self.pod_reflector.first_load_future
+        self.assertEqual(200, response.status_code)
 
-        data = self.pod_reflector.pods.get(self.pod_name, None)
+        tags = json.loads(response.text)['tags']
 
-        if data is not None:
+        self.assertEqual(['sniff', 'snozz', 'gabe@example.com'], tags)
 
-            if data.status.phase == 'Pending':
 
-                return None
 
-            ctr_stat = data.status.container_statuses
+        # The tag should be deletable
 
-            if ctr_stat is None:  # No status, no container (we hope)
+        path = self._url('/v2/images/%s/tags/gabe%%40example.com' % image_id)
 
-                # This seems to happen when a pod is idle-culled.
+        response = requests.delete(path, headers=self._headers())
 
-                return 1
+        self.assertEqual(204, response.status_code)
 
-            for c in ctr_stat:
 
-                # return exit code if notebook container has terminated
 
-                if c.name == 'notebook':
+        # List of tags should reflect the deletion
 
-                    if c.state.terminated:
+        path = self._url('/v2/images/%s' % image_id)
 
-                        # call self.stop to delete the pod
+        response = requests.get(path, headers=self._headers())
 
-                        if self.delete_stopped_pods:
+        self.assertEqual(200, response.status_code)
 
-                            yield self.stop(now=True)
+        tags = json.loads(response.text)['tags']
 
-                        return c.state.terminated.exit_code
+        self.assertEqual(['sniff', 'snozz'], tags)
 
-                    break
 
-            # None means pod is running or starting up
 
-            return None
+        # Deleting the same tag should return a 404
 
-        # pod doesn't exist or has been deleted
+        path = self._url('/v2/images/%s/tags/gabe%%40example.com' % image_id)
 
-        return 1
+        response = requests.delete(path, headers=self._headers())
 
+        self.assertEqual(404, response.status_code)
 
 
-    @run_on_executor
 
-    def asynchronize(self, method, *args, **kwargs):
+        self.stop_servers()
 
-        return method(*args, **kwargs)
 
 
+    def test_images_container(self):
 
-    @property
+        # Image list should be empty and no next link should be present
 
-    def events(self):
+        path = self._url('/v2/images')
 
-        """Filter event-reflector to just this pods events
+        response = requests.get(path, headers=self._headers())
 
+        self.assertEqual(200, response.status_code)
 
+        images = json.loads(response.text)['images']
 
-        Returns list of all events that match our pod_name
+        first = json.loads(response.text)['first']
 
-        since our ._last_event (if defined).
+        self.assertEqual(0, len(images))
 
-        ._last_event is set at the beginning of .start().
+        self.assertTrue('next' not in json.loads(response.text))
 
-        """
+        self.assertEqual('/v2/images', first)
 
-        if not self.event_reflector:
 
-            return []
 
+        # Create 7 images
 
+        images = []
 
-        events = []
+        fixtures = [
 
-        for event in self.event_reflector.events:
+            {'name': 'image-3', 'type': 'kernel', 'ping': 'pong'},
 
-            if event.involved_object.name != self.pod_name:
+            {'name': 'image-4', 'type': 'kernel', 'ping': 'pong'},
 
-                # only consider events for my pod name
+            {'name': 'image-1', 'type': 'kernel', 'ping': 'pong'},
 
-                continue
+            {'name': 'image-3', 'type': 'ramdisk', 'ping': 'pong'},
 
+            {'name': 'image-2', 'type': 'kernel', 'ping': 'ding'},
 
+            {'name': 'image-3', 'type': 'kernel', 'ping': 'pong'},
 
-            if self._last_event and event.metadata.uid == self._last_event:
+            {'name': 'image-2', 'type': 'kernel', 'ping': 'pong'},
 
-                # saw last_event marker, ignore any previous events
+        ]
 
-                # and only consider future events
+        path = self._url('/v2/images')
 
-                # only include events *after* our _last_event marker
+        headers = self._headers({'content-type': 'application/json'})
 
-                events = []
+        for fixture in fixtures:
 
-            else:
+            data = json.dumps(fixture)
 
-                events.append(event)
+            response = requests.post(path, headers=headers, data=data)
 
-        return events
+            self.assertEqual(201, response.status_code)
 
+            images.append(json.loads(response.text))
 
 
-    @async_generator
 
-    async def progress(self):
+        # Image list should contain 7 images
 
-        """
+        path = self._url('/v2/images')
 
-        This function is reporting back the progress of spawning a pod until
+        response = requests.get(path, headers=self._headers())
 
-        self._start_future has fired.
+        self.assertEqual(200, response.status_code)
 
+        body = json.loads(response.text)
 
+        self.assertEqual(7, len(body['images']))
 
-        This is working with events parsed by the python kubernetes client,
+        self.assertEqual('/v2/images', body['first'])
 
-        and here is the specification of events that is relevant to understand:
+        self.assertFalse('next' in json.loads(response.text))
 
-        ref: https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.16/#event-v1-core
 
-        """
 
-        if not self.events_enabled:
+        # Begin pagination after the first image
 
-            return
+        template_url = ('/v2/images?limit=2&sort_dir=asc&sort_key=name'
 
+                        '&marker=%s&type=kernel&ping=pong')
 
+        path = self._url(template_url % images[2]['id'])
 
-        self.log.debug('progress generator: %s', self.pod_name)
+        response = requests.get(path, headers=self._headers())
 
-        start_future = self._start_future
+        self.assertEqual(200, response.status_code)
 
-        pod_id = None
+        body = json.loads(response.text)
 
-        progress = 0
+        self.assertEqual(2, len(body['images']))
 
-        next_event = 0
+        response_ids = [image['id'] for image in body['images']]
 
+        self.assertEqual([images[6]['id'], images[0]['id']], response_ids)
 
 
-        break_while_loop = False
 
-        while True:
+        # Continue pagination using next link from previous request
 
-            # Ensure we always capture events following the start_future
+        path = self._url(body['next'])
 
-            # signal has fired.
+        response = requests.get(path, headers=self._headers())
 
-            if start_future.done():
+        self.assertEqual(200, response.status_code)
 
-                break_while_loop = True
+        body = json.loads(response.text)
 
-            events = self.events
+        self.assertEqual(2, len(body['images']))
 
+        response_ids = [image['id'] for image in body['images']]
 
+        self.assertEqual([images[5]['id'], images[1]['id']], response_ids)
 
-            len_events = len(events)
 
-            if next_event < len_events:
 
-                # only show messages for the 'current' pod
+        # Continue pagination - expect no results
 
-                # pod_id may change if a previous pod is being stopped
+        path = self._url(body['next'])
 
-                # before starting a new one
+        response = requests.get(path, headers=self._headers())
 
-                # use the uid of the latest event to identify 'current'
+        self.assertEqual(200, response.status_code)
 
-                pod_id = events[-1].involved_object.uid
+        body = json.loads(response.text)
 
-                for i in range(next_event, len_events):
+        self.assertEqual(0, len(body['images']))
 
-                    event = events[i]
 
-                    # move the progress bar.
 
-                    # Since we don't know how many events we will get,
+        # Delete first image
 
-                    # asymptotically approach 90% completion with each event.
+        path = self._url('/v2/images/%s' % images[0]['id'])
 
-                    # each event gets 33% closer to 90%:
+        response = requests.delete(path, headers=self._headers())
 
-                    # 30 50 63 72 78 82 84 86 87 88 88 89
+        self.assertEqual(204, response.status_code)
 
-                    progress += (90 - progress) / 3
 
 
+        # Ensure bad request for using a deleted image as marker
 
-                    # V1Event isn't serializable, and neither is the datetime
+        path = self._url('/v2/images?marker=%s' % images[0]['id'])
 
-                    # objects within it, and we need what we pass back to be
+        response = requests.get(path, headers=self._headers())
 
-                    # serializable to it can be sent back from JupyterHub to
+        self.assertEqual(400, response.status_code)
 
-                    # a browser wanting to display progress.
 
-                    serializable_event = json.loads(
 
-                        json.dumps(event.to_dict(), default=datetime.isoformat)
+        self.stop_servers()
 
-                    )
 
-                    await yield_({
 
-                        'progress': int(progress),
+    def test_image_visibility_to_different_users(self):
 
-                        'raw_event': serializable_event,
+        self.cleanup()
 
-                        'message':  "%s [%s] %s" % (
+        self.api_server.deployment_flavor = 'fakeauth'
 
-                            event.last_timestamp or event.event_time,
+        self.registry_server.deployment_flavor = 'fakeauth'
 
-                            event.type,
+        self.start_servers(**self.__dict__.copy())
 
-                            event.message,
 
-                        )
 
-                    })
+        owners = ['admin', 'tenant1', 'tenant2', 'none']
 
-                next_event = len_events
+        visibilities = ['public', 'private']
 
 
 
-            if break_while_loop:
+        for owner in owners:
 
-                break
+            for visibility in visibilities:
 
-            await sleep(1)
+                path = self._url('/v2/images')
 
+                headers = self._headers({
 
+                    'content-type': 'application/json',
 
-    def _start_reflector(self, key, ReflectorClass, replace=False, **kwargs):
+                    'X-Auth-Token': 'createuser:%s:admin' % owner,
 
-        """Start a shared reflector on the KubeSpawner class
+                })
 
+                data = json.dumps({
 
+                    'name': '%s-%s' % (owner, visibility),
 
+                    'visibility': visibility,
 
+                })
 
-        key: key for the reflector (e.g. 'pod' or 'events')
+                response = requests.post(path, headers=headers, data=data)
 
-        Reflector: Reflector class to be instantiated
+                self.assertEqual(201, response.status_code)
 
-        kwargs: extra keyword-args to be relayed to ReflectorClass
 
 
+        def list_images(tenant, role='', visibility=None):
 
-        If replace=False and the pod reflector is already running,
+            auth_token = 'user:%s:%s' % (tenant, role)
 
-        do nothing.
+            headers = {'X-Auth-Token': auth_token}
 
+            path = self._url('/v2/images')
 
+            if visibility is not None:
 
-        If replace=True, a running pod reflector will be stopped
+                path += '?visibility=%s' % visibility
 
-        and a new one started (for recovering from possible errors).
+            response = requests.get(path, headers=headers)
 
-        """
+            self.assertEqual(response.status_code, 200)
 
-        main_loop = IOLoop.current()
+            return json.loads(response.text)['images']
 
-        def on_reflector_failure():
 
-            self.log.critical(
 
-                "%s reflector failed, halting Hub.",
+        # 1. Known user sees public and their own images
 
-                key.title(),
+        images = list_images('tenant1')
 
-            )
+        self.assertEquals(len(images), 5)
 
-            sys.exit(1)
+        for image in images:
 
+            self.assertTrue(image['visibility'] == 'public'
 
+                            or 'tenant1' in image['name'])
 
-        previous_reflector = self.__class__.reflectors.get(key)
 
 
+        # 2. Known user, visibility=public, sees all public images
 
-        if replace or not previous_reflector:
+        images = list_images('tenant1', visibility='public')
 
-            self.__class__.reflectors[key] = ReflectorClass(
+        self.assertEquals(len(images), 4)
 
-                parent=self,
+        for image in images:
 
-                namespace=self.namespace,
+            self.assertEquals(image['visibility'], 'public')
 
-                on_failure=on_reflector_failure,
 
-                **kwargs,
 
-            )
+        # 3. Known user, visibility=private, sees only their private image
 
+        images = list_images('tenant1', visibility='private')
 
+        self.assertEquals(len(images), 1)
 
-        if replace and previous_reflector:
+        image = images[0]
 
-            # we replaced the reflector, stop the old one
+        self.assertEquals(image['visibility'], 'private')
 
-            previous_reflector.stop()
+        self.assertTrue('tenant1' in image['name'])
 
 
 
-        # return the current reflector
+        # 4. Unknown user sees only public images
 
-        return self.__class__.reflectors[key]
+        images = list_images('none')
 
+        self.assertEquals(len(images), 4)
 
+        for image in images:
 
+            self.assertEquals(image['visibility'], 'public')
 
 
-    def _start_watching_events(self, replace=False):
 
-        """Start the events reflector
+        # 5. Unknown user, visibility=public, sees only public images
 
+        images = list_images('none', visibility='public')
 
+        self.assertEquals(len(images), 4)
 
-        If replace=False and the event reflector is already running,
+        for image in images:
 
-        do nothing.
+            self.assertEquals(image['visibility'], 'public')
 
 
 
-        If replace=True, a running pod reflector will be stopped
+        # 6. Unknown user, visibility=private, sees no images
 
-        and a new one started (for recovering from possible errors).
+        images = list_images('none', visibility='private')
 
-        """
+        self.assertEquals(len(images), 0)
 
-        return self._start_reflector(
 
-            "events",
 
-            EventReflector,
+        # 7. Unknown admin sees all images
 
-            fields={"involvedObject.kind": "Pod"},
+        images = list_images('none', role='admin')
 
-            replace=replace,
+        self.assertEquals(len(images), 8)
 
-        )
 
 
+        # 8. Unknown admin, visibility=public, shows only public images
 
-    def _start_watching_pods(self, replace=False):
+        images = list_images('none', role='admin', visibility='public')
 
-        """Start the pod reflector
+        self.assertEquals(len(images), 4)
 
+        for image in images:
 
+            self.assertEquals(image['visibility'], 'public')
 
-        If replace=False and the pod reflector is already running,
 
-        do nothing.
 
+        # 9. Unknown admin, visibility=private, sees only private images
 
+        images = list_images('none', role='admin', visibility='private')
 
-        If replace=True, a running pod reflector will be stopped
+        self.assertEquals(len(images), 4)
 
-        and a new one started (for recovering from possible errors).
+        for image in images:
 
-        """
+            self.assertEquals(image['visibility'], 'private')
 
-        return self._start_reflector("pods", PodReflector, replace=replace)
 
 
+        # 10. Known admin sees all images
 
-    # record a future for the call to .start()
+        images = list_images('admin', role='admin')
 
-    # so we can use it to terminate .progress()
+        self.assertEquals(len(images), 8)
 
-    def start(self):
 
-        """Thin wrapper around self._start
 
+        # 11. Known admin, visibility=public, sees all public images
 
+        images = list_images('admin', role='admin', visibility='public')
 
-        so we can hold onto a reference for the Future
+        self.assertEquals(len(images), 4)
 
-        start returns, which we can use to terminate
+        for image in images:
 
-        .progress()
+            self.assertEqual(image['visibility'], 'public')
 
-        """
 
-        self._start_future = self._start()
 
-        return self._start_future
+        # 12. Known admin, visibility=private, sees all private images
 
+        images = list_images('admin', role='admin', visibility='private')
 
+        self.assertEquals(len(images), 4)
 
-    _last_event = None
+        for image in images:
 
+            self.assertEquals(image['visibility'], 'private')
 
 
-    @gen.coroutine
 
-    def _start(self):
+        self.stop_servers()
 
-        """Start the user's pod"""
 
 
 
-        # load user options (including profile)
 
-        yield self.load_user_options()
+class TestImageDirectURLVisibility(functional.FunctionalTest):
 
 
 
-        # record latest event so we don't include old
+    def setUp(self):
 
-        # events from previous pods in self.events
+        super(TestImageDirectURLVisibility, self).setUp()
 
-        # track by order and name instead of uid
+        self.cleanup()
 
-        # so we get events like deletion of a previously stale
+        self.api_server.deployment_flavor = 'noauth'
 
-        # pod if it's part of this spawn process
 
-        events = self.events
 
-        if events:
+    def _url(self, path):
 
-            self._last_event = events[-1].metadata.uid
+        return 'http://127.0.0.1:%d%s' % (self.api_port, path)
 
 
 
-        if self.storage_pvc_ensure:
+    def _headers(self, custom_headers=None):
 
-            # Try and create the pvc. If it succeeds we are good. If
+        base_headers = {
 
-            # returns a 409 indicating it already exists we are good. If
+            'X-Identity-Status': 'Confirmed',
 
-            # it returns a 403, indicating potential quota issue we need
+            'X-Auth-Token': '932c5c84-02ac-4fe5-a9ba-620af0e2bb96',
 
-            # to see if pvc already exists before we decide to raise the
+            'X-User-Id': 'f9a41d13-0c13-47e9-bee2-ce4e8bfe958e',
 
-            # error for quota being exceeded. This is because quota is
+            'X-Tenant-Id': TENANT1,
 
-            # checked before determining if the PVC needed to be
-
-            # created.
-
-
-
-            pvc = self.get_pvc_manifest()
-
-
-
-            try:
-
-                yield self.asynchronize(
-
-                    self.api.create_namespaced_persistent_volume_claim,
-
-                    namespace=self.namespace,
-
-                    body=pvc
-
-                )
-
-            except ApiException as e:
-
-                if e.status == 409:
-
-                    self.log.info("PVC " + self.pvc_name + " already exists, so did not create new pvc.")
-
-
-
-                elif e.status == 403:
-
-                    t, v, tb = sys.exc_info()
-
-
-
-                    try:
-
-                        yield self.asynchronize(
-
-                            self.api.read_namespaced_persistent_volume_claim,
-
-                            name=self.pvc_name,
-
-                            namespace=self.namespace)
-
-
-
-                    except ApiException as e:
-
-                        raise v.with_traceback(tb)
-
-
-
-                    self.log.info("PVC " + self.pvc_name + " already exists, possibly have reached quota though.")
-
-
-
-                else:
-
-                    raise
-
-
-
-        # If we run into a 409 Conflict error, it means a pod with the
-
-        # same name already exists. We stop it, wait for it to stop, and
-
-        # try again. We try 4 times, and if it still fails we give up.
-
-        # FIXME: Have better / cleaner retry logic!
-
-        retry_times = 4
-
-        pod = yield self.get_pod_manifest()
-
-        if self.modify_pod_hook:
-
-            pod = yield gen.maybe_future(self.modify_pod_hook(self, pod))
-
-        for i in range(retry_times):
-
-            try:
-
-                yield self.asynchronize(
-
-                    self.api.create_namespaced_pod,
-
-                    self.namespace,
-
-                    pod,
-
-                )
-
-                break
-
-            except ApiException as e:
-
-                if e.status != 409:
-
-                    # We only want to handle 409 conflict errors
-
-                    self.log.exception("Failed for %s", pod.to_str())
-
-                    raise
-
-                self.log.info('Found existing pod %s, attempting to kill', self.pod_name)
-
-                # TODO: this should show up in events
-
-                yield self.stop(True)
-
-
-
-                self.log.info('Killed pod %s, will try starting singleuser pod again', self.pod_name)
-
-        else:
-
-            raise Exception(
-
-                'Can not create user pod %s already exists & could not be deleted' % self.pod_name)
-
-
-
-        # we need a timeout here even though start itself has a timeout
-
-        # in order for this coroutine to finish at some point.
-
-        # using the same start_timeout here
-
-        # essentially ensures that this timeout should never propagate up
-
-        # because the handler will have stopped waiting after
-
-        # start_timeout, starting from a slightly earlier point.
-
-        try:
-
-            yield exponential_backoff(
-
-                lambda: self.is_pod_running(self.pod_reflector.pods.get(self.pod_name, None)),
-
-                'pod/%s did not start in %s seconds!' % (self.pod_name, self.start_timeout),
-
-                timeout=self.start_timeout,
-
-            )
-
-        except TimeoutError:
-
-            if self.pod_name not in self.pod_reflector.pods:
-
-                # if pod never showed up at all,
-
-                # restart the pod reflector which may have become disconnected.
-
-                self.log.error(
-
-                    "Pod %s never showed up in reflector, restarting pod reflector",
-
-                    self.pod_name,
-
-                )
-
-                self._start_watching_pods(replace=True)
-
-            raise
-
-
-
-        pod = self.pod_reflector.pods[self.pod_name]
-
-        self.pod_id = pod.metadata.uid
-
-        if self.event_reflector:
-
-            self.log.debug(
-
-                'pod %s events before launch: %s',
-
-                self.pod_name,
-
-                "\n".join(
-
-                    [
-
-                        "%s [%s] %s" % (event.last_timestamp or event.event_time, event.type, event.message)
-
-                        for event in self.events
-
-                    ]
-
-                ),
-
-            )
-
-        return (pod.status.pod_ip, self.port)
-
-
-
-    @gen.coroutine
-
-    def stop(self, now=False):
-
-        delete_options = client.V1DeleteOptions()
-
-
-
-        if now:
-
-            grace_seconds = 0
-
-        else:
-
-            grace_seconds = self.delete_grace_period
-
-
-
-        delete_options.grace_period_seconds = grace_seconds
-
-        self.log.info("Deleting pod %s", self.pod_name)
-
-        try:
-
-            yield self.asynchronize(
-
-                self.api.delete_namespaced_pod,
-
-                name=self.pod_name,
-
-                namespace=self.namespace,
-
-                body=delete_options,
-
-                grace_period_seconds=grace_seconds,
-
-            )
-
-        except ApiException as e:
-
-            if e.status == 404:
-
-                self.log.warning(
-
-                    "No pod %s to delete. Assuming already deleted.",
-
-                    self.pod_name,
-
-                )
-
-            else:
-
-                raise
-
-        try:
-
-            yield exponential_backoff(
-
-                lambda: self.pod_reflector.pods.get(self.pod_name, None) is None,
-
-                'pod/%s did not disappear in %s seconds!' % (self.pod_name, self.start_timeout),
-
-                timeout=self.start_timeout,
-
-            )
-
-        except TimeoutError:
-
-            self.log.error("Pod %s did not disappear, restarting pod reflector", self.pod_name)
-
-            self._start_watching_pods(replace=True)
-
-            raise
-
-
-
-    @default('env_keep')
-
-    def _env_keep_default(self):
-
-        return []
-
-
-
-    _profile_list = None
-
-
-
-    def _render_options_form(self, profile_list):
-
-        self._profile_list = self._init_profile_list(profile_list)
-
-        profile_form_template = Environment(loader=BaseLoader).from_string(self.profile_form_template)
-
-        return profile_form_template.render(profile_list=self._profile_list)
-
-
-
-    @gen.coroutine
-
-    def _render_options_form_dynamically(self, current_spawner):
-
-        profile_list = yield gen.maybe_future(self.profile_list(current_spawner))
-
-        profile_list = self._init_profile_list(profile_list)
-
-        return self._render_options_form(profile_list)
-
-
-
-    @default('options_form')
-
-    def _options_form_default(self):
-
-        '''
-
-        Build the form template according to the `profile_list` setting.
-
-
-
-        Returns:
-
-            '' when no `profile_list` has been defined
-
-            The rendered template (using jinja2) when `profile_list` is defined.
-
-        '''
-
-        if not self.profile_list:
-
-            return ''
-
-        if callable(self.profile_list):
-
-            return self._render_options_form_dynamically
-
-        else:
-
-            return self._render_options_form(self.profile_list)
-
-
-
-    def options_from_form(self, formdata):
-
-        """get the option selected by the user on the form
-
-
-
-        This only constructs the user_options dict,
-
-        it should not actually load any options.
-
-        That is done later in `.load_user_options()`
-
-
-
-        Args:
-
-            formdata: user selection returned by the form
-
-
-
-        To access to the value, you can use the `get` accessor and the name of the html element,
-
-        for example::
-
-
-
-            formdata.get('profile',[0])
-
-
-
-        to get the value of the form named "profile", as defined in `form_template`::
-
-
-
-            <select class="form-control" name="profile"...>
-
-            </select>
-
-
-
-        Returns:
-
-            user_options (dict): the selected profile in the user_options form,
-
-                e.g. ``{"profile": "cpus-8"}``
-
-        """
-
-        return {
-
-            'profile': formdata.get('profile', [None])[0]
+            'X-Roles': 'member',
 
         }
 
+        base_headers.update(custom_headers or {})
 
+        return base_headers
 
-    @gen.coroutine
 
-    def _load_profile(self, slug):
 
-        """Load a profile by name
+    def test_v2_not_enabled(self):
 
+        self.api_server.enable_v2_api = False
 
+        self.start_servers(**self.__dict__.copy())
 
-        Called by load_user_options
+        path = self._url('/v2/images')
 
-        """
+        response = requests.get(path, headers=self._headers())
 
+        self.assertEqual(300, response.status_code)
 
+        self.stop_servers()
 
-        # find the profile
 
-        default_profile = self._profile_list[0]
 
-        for profile in self._profile_list:
+    def test_v2_enabled(self):
 
-            if profile.get('default', False):
+        self.api_server.enable_v2_api = True
 
-                # explicit default, not the first
+        self.start_servers(**self.__dict__.copy())
 
-                default_profile = profile
+        path = self._url('/v2/images')
 
+        response = requests.get(path, headers=self._headers())
 
+        self.assertEqual(200, response.status_code)
 
-            if profile['slug'] == slug:
+        self.stop_servers()
 
-                break
 
-        else:
 
-            if slug:
+    def test_image_direct_url_visible(self):
 
-                # name specified, but not found
 
-                raise ValueError("No such profile: %s. Options include: %s" % (
 
-                    slug, ', '.join(p['slug'] for p in self._profile_list)
+        self.api_server.show_image_direct_url = True
 
-                ))
+        self.start_servers(**self.__dict__.copy())
 
-            else:
 
-                # no name specified, use the default
 
-                profile = default_profile
+        # Image list should be empty
 
+        path = self._url('/v2/images')
 
+        response = requests.get(path, headers=self._headers())
 
-        self.log.debug("Applying KubeSpawner override for profile '%s'", profile['display_name'])
+        self.assertEqual(200, response.status_code)
 
-        kubespawner_override = profile.get('kubespawner_override', {})
+        images = json.loads(response.text)['images']
 
-        for k, v in kubespawner_override.items():
+        self.assertEqual(0, len(images))
 
-            if callable(v):
 
-                v = v(self)
 
-                self.log.debug(".. overriding KubeSpawner value %s=%s (callable result)", k, v)
+        # Create an image
 
-            else:
+        path = self._url('/v2/images')
 
-                self.log.debug(".. overriding KubeSpawner value %s=%s", k, v)
+        headers = self._headers({'content-type': 'application/json'})
 
-            setattr(self, k, v)
+        data = json.dumps({'name': 'image-1', 'type': 'kernel', 'foo': 'bar'})
 
+        response = requests.post(path, headers=headers, data=data)
 
+        self.assertEqual(201, response.status_code)
 
-    # set of recognised user option keys
 
-    # used for warning about ignoring unrecognised options
 
-    _user_option_keys = {'profile',}
+        # Get the image id
 
+        image = json.loads(response.text)
 
+        image_id = image['id']
 
-    def _init_profile_list(self, profile_list):
 
-        # generate missing slug fields from display_name
 
-        for profile in profile_list:
+        # Image direct_url should not be visible before location is set
 
-            if 'slug' not in profile:
+        path = self._url('/v2/images/%s' % image_id)
 
-                profile['slug'] = slugify(profile['display_name'])
+        headers = self._headers({'Content-Type': 'application/json'})
 
+        response = requests.get(path, headers=headers)
 
+        self.assertEqual(200, response.status_code)
 
-        return profile_list
+        image = json.loads(response.text)
 
+        self.assertFalse('direct_url' in image)
 
 
-    @gen.coroutine
 
-    def load_user_options(self):
+        # Upload some image data, setting the image location
 
-        """Load user options from self.user_options dict
+        path = self._url('/v2/images/%s/file' % image_id)
 
+        headers = self._headers({'Content-Type': 'application/octet-stream'})
 
+        response = requests.put(path, headers=headers, data='ZZZZZ')
 
-        This can be set via POST to the API or via options_from_form
+        self.assertEqual(201, response.status_code)
 
 
 
-        Only supported argument by default is 'profile'.
+        # Image direct_url should be visible
 
-        Override in subclasses to support other options.
+        path = self._url('/v2/images/%s' % image_id)
 
-        """
+        headers = self._headers({'Content-Type': 'application/json'})
 
+        response = requests.get(path, headers=headers)
 
+        self.assertEqual(200, response.status_code)
 
-        if self._profile_list is None:
+        image = json.loads(response.text)
 
-            if callable(self.profile_list):
+        self.assertTrue('direct_url' in image)
 
-                profile_list = yield gen.maybe_future(self.profile_list(self))
 
-            else:
 
-                profile_list = self.profile_list
+        # Image direct_url should be visible in a list
 
+        path = self._url('/v2/images')
 
+        headers = self._headers({'Content-Type': 'application/json'})
 
-            self._profile_list = self._init_profile_list(profile_list)
+        response = requests.get(path, headers=headers)
 
+        self.assertEqual(200, response.status_code)
 
+        image = json.loads(response.text)['images'][0]
 
-        selected_profile = self.user_options.get('profile', None)
+        self.assertTrue('direct_url' in image)
 
-        if self._profile_list:
 
-            yield self._load_profile(selected_profile)
 
-        elif selected_profile:
+        self.stop_servers()
 
-            self.log.warning("Profile %r requested, but profiles are not enabled", selected_profile)
 
 
+    def test_image_direct_url_not_visible(self):
 
-        # help debugging by logging any option fields that are not recognized
 
-        option_keys = set(self.user_options)
 
-        unrecognized_keys = option_keys.difference(self._user_option_keys)
+        self.api_server.show_image_direct_url = False
 
-        if unrecognized_keys:
+        self.start_servers(**self.__dict__.copy())
 
-            self.log.warning(
 
-                "Ignoring unrecognized KubeSpawner user_options: %s",
 
-                ", ".join(
+        # Image list should be empty
 
-                    map(
+        path = self._url('/v2/images')
 
-                        str,
+        response = requests.get(path, headers=self._headers())
 
-                        sorted(unrecognized_keys)
+        self.assertEqual(200, response.status_code)
 
-                    )
+        images = json.loads(response.text)['images']
 
-                )
+        self.assertEqual(0, len(images))
 
-            )
+
+
+        # Create an image
+
+        path = self._url('/v2/images')
+
+        headers = self._headers({'content-type': 'application/json'})
+
+        data = json.dumps({'name': 'image-1', 'type': 'kernel', 'foo': 'bar'})
+
+        response = requests.post(path, headers=headers, data=data)
+
+        self.assertEqual(201, response.status_code)
+
+
+
+        # Get the image id
+
+        image = json.loads(response.text)
+
+        image_id = image['id']
+
+
+
+        # Upload some image data, setting the image location
+
+        path = self._url('/v2/images/%s/file' % image_id)
+
+        headers = self._headers({'Content-Type': 'application/octet-stream'})
+
+        response = requests.put(path, headers=headers, data='ZZZZZ')
+
+        self.assertEqual(201, response.status_code)
+
+
+
+        # Image direct_url should not be visible
+
+        path = self._url('/v2/images/%s' % image_id)
+
+        headers = self._headers({'Content-Type': 'application/json'})
+
+        response = requests.get(path, headers=headers)
+
+        self.assertEqual(200, response.status_code)
+
+        image = json.loads(response.text)
+
+        self.assertFalse('direct_url' in image)
+
+
+
+        # Image direct_url should not be visible in a list
+
+        path = self._url('/v2/images')
+
+        headers = self._headers({'Content-Type': 'application/json'})
+
+        response = requests.get(path, headers=headers)
+
+        self.assertEqual(200, response.status_code)
+
+        image = json.loads(response.text)['images'][0]
+
+        self.assertFalse('direct_url' in image)
+
+
+
+        self.stop_servers()

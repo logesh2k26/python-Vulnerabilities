@@ -2,1104 +2,512 @@
 # Safety: safe
 # Category: safe
 
-from __future__ import unicode_literals
+"""Tornado handlers for logging into the notebook."""
 
 
 
-import base64
+# Copyright (c) Jupyter Development Team.
 
-import binascii
-
-import hashlib
-
-import importlib
-
-import warnings
-
-from collections import OrderedDict
+# Distributed under the terms of the Modified BSD License.
 
 
 
-from django.conf import settings
+import re
 
-from django.core.exceptions import ImproperlyConfigured
-
-from django.core.signals import setting_changed
-
-from django.dispatch import receiver
-
-from django.utils import lru_cache
-
-from django.utils.crypto import (
-
-    constant_time_compare, get_random_string, pbkdf2,
-
-)
-
-from django.utils.encoding import force_bytes, force_str, force_text
-
-from django.utils.module_loading import import_string
-
-from django.utils.translation import ugettext_noop as _
+import os
 
 
 
-UNUSABLE_PASSWORD_PREFIX = '!'  # This will never be a valid encoded hash
+try:
 
-UNUSABLE_PASSWORD_SUFFIX_LENGTH = 40  # number of random chars to add after UNUSABLE_PASSWORD_PREFIX
+    from urllib.parse import urlparse # Py 3
+
+except ImportError:
+
+    from urlparse import urlparse # Py 2
+
+import uuid
+
+
+
+from tornado.escape import url_escape
+
+
+
+from .security import passwd_check, set_password
+
+
+
+from ..base.handlers import IPythonHandler
 
 
 
 
 
-def is_password_usable(encoded):
+class LoginHandler(IPythonHandler):
 
-    if encoded is None or encoded.startswith(UNUSABLE_PASSWORD_PREFIX):
-
-        return False
-
-    try:
-
-        identify_hasher(encoded)
-
-    except ValueError:
-
-        return False
-
-    return True
+    """The basic tornado login handler
 
 
 
-
-
-def check_password(password, encoded, setter=None, preferred='default'):
+    authenticates with a hashed password from the configuration.
 
     """
 
-    Returns a boolean of whether the raw password matches the three
+    def _render(self, message=None):
 
-    part encoded digest.
+        self.write(self.render_template('login.html',
 
+                next=url_escape(self.get_argument('next', default=self.base_url)),
 
+                message=message,
 
-    If setter is specified, it'll be called when you need to
+        ))
 
-    regenerate the password.
 
-    """
 
-    if password is None or not is_password_usable(encoded):
+    def _redirect_safe(self, url, default=None):
 
-        return False
+        """Redirect if url is on our PATH
 
 
 
-    preferred = get_hasher(preferred)
+        Full-domain redirects are allowed if they pass our CORS origin checks.
 
-    hasher = identify_hasher(encoded)
 
 
-
-    hasher_changed = hasher.algorithm != preferred.algorithm
-
-    must_update = hasher_changed or preferred.must_update(encoded)
-
-    is_correct = hasher.verify(password, encoded)
-
-
-
-    # If the hasher didn't change (we don't protect against enumeration if it
-
-    # does) and the password should get updated, try to close the timing gap
-
-    # between the work factor of the current encoded password and the default
-
-    # work factor.
-
-    if not is_correct and not hasher_changed and must_update:
-
-        hasher.harden_runtime(password, encoded)
-
-
-
-    if setter and is_correct and must_update:
-
-        setter(password)
-
-    return is_correct
-
-
-
-
-
-def make_password(password, salt=None, hasher='default'):
-
-    """
-
-    Turn a plain-text password into a hash for database storage
-
-
-
-    Same as encode() but generates a new random salt.
-
-    If password is None then a concatenation of
-
-    UNUSABLE_PASSWORD_PREFIX and a random string will be returned
-
-    which disallows logins. Additional random string reduces chances
-
-    of gaining access to staff or superuser accounts.
-
-    See ticket #20079 for more info.
-
-    """
-
-    if password is None:
-
-        return UNUSABLE_PASSWORD_PREFIX + get_random_string(UNUSABLE_PASSWORD_SUFFIX_LENGTH)
-
-    hasher = get_hasher(hasher)
-
-
-
-    if not salt:
-
-        salt = hasher.salt()
-
-
-
-    return hasher.encode(password, salt)
-
-
-
-
-
-@lru_cache.lru_cache()
-
-def get_hashers():
-
-    hashers = []
-
-    for hasher_path in settings.PASSWORD_HASHERS:
-
-        hasher_cls = import_string(hasher_path)
-
-        hasher = hasher_cls()
-
-        if not getattr(hasher, 'algorithm'):
-
-            raise ImproperlyConfigured("hasher doesn't specify an "
-
-                                       "algorithm name: %s" % hasher_path)
-
-        hashers.append(hasher)
-
-    return hashers
-
-
-
-
-
-@lru_cache.lru_cache()
-
-def get_hashers_by_algorithm():
-
-    return {hasher.algorithm: hasher for hasher in get_hashers()}
-
-
-
-
-
-@receiver(setting_changed)
-
-def reset_hashers(**kwargs):
-
-    if kwargs['setting'] == 'PASSWORD_HASHERS':
-
-        get_hashers.cache_clear()
-
-        get_hashers_by_algorithm.cache_clear()
-
-
-
-
-
-def get_hasher(algorithm='default'):
-
-    """
-
-    Returns an instance of a loaded password hasher.
-
-
-
-    If algorithm is 'default', the default hasher will be returned.
-
-    This function will also lazy import hashers specified in your
-
-    settings file if needed.
-
-    """
-
-    if hasattr(algorithm, 'algorithm'):
-
-        return algorithm
-
-
-
-    elif algorithm == 'default':
-
-        return get_hashers()[0]
-
-
-
-    else:
-
-        hashers = get_hashers_by_algorithm()
-
-        try:
-
-            return hashers[algorithm]
-
-        except KeyError:
-
-            raise ValueError("Unknown password hashing algorithm '%s'. "
-
-                             "Did you specify it in the PASSWORD_HASHERS "
-
-                             "setting?" % algorithm)
-
-
-
-
-
-def identify_hasher(encoded):
-
-    """
-
-    Returns an instance of a loaded password hasher.
-
-
-
-    Identifies hasher algorithm by examining encoded hash, and calls
-
-    get_hasher() to return hasher. Raises ValueError if
-
-    algorithm cannot be identified, or if hasher is not loaded.
-
-    """
-
-    # Ancient versions of Django created plain MD5 passwords and accepted
-
-    # MD5 passwords with an empty salt.
-
-    if ((len(encoded) == 32 and '$' not in encoded) or
-
-            (len(encoded) == 37 and encoded.startswith('md5$$'))):
-
-        algorithm = 'unsalted_md5'
-
-    # Ancient versions of Django accepted SHA1 passwords with an empty salt.
-
-    elif len(encoded) == 46 and encoded.startswith('sha1$$'):
-
-        algorithm = 'unsalted_sha1'
-
-    else:
-
-        algorithm = encoded.split('$', 1)[0]
-
-    return get_hasher(algorithm)
-
-
-
-
-
-def mask_hash(hash, show=6, char="*"):
-
-    """
-
-    Returns the given hash, with only the first ``show`` number shown. The
-
-    rest are masked with ``char`` for security reasons.
-
-    """
-
-    masked = hash[:show]
-
-    masked += char * len(hash[show:])
-
-    return masked
-
-
-
-
-
-class BasePasswordHasher(object):
-
-    """
-
-    Abstract base class for password hashers
-
-
-
-    When creating your own hasher, you need to override algorithm,
-
-    verify(), encode() and safe_summary().
-
-
-
-    PasswordHasher objects are immutable.
-
-    """
-
-    algorithm = None
-
-    library = None
-
-
-
-    def _load_library(self):
-
-        if self.library is not None:
-
-            if isinstance(self.library, (tuple, list)):
-
-                name, mod_path = self.library
-
-            else:
-
-                mod_path = self.library
-
-            try:
-
-                module = importlib.import_module(mod_path)
-
-            except ImportError as e:
-
-                raise ValueError("Couldn't load %r algorithm library: %s" %
-
-                                 (self.__class__.__name__, e))
-
-            return module
-
-        raise ValueError("Hasher %r doesn't specify a library attribute" %
-
-                         self.__class__.__name__)
-
-
-
-    def salt(self):
+        Otherwise use default (self.base_url if unspecified).
 
         """
 
-        Generates a cryptographically secure nonce salt in ASCII
+        if default is None:
 
-        """
+            default = self.base_url
 
-        return get_random_string()
+        # protect chrome users from mishandling unescaped backslashes.
 
+        # \ is not valid in urls, but some browsers treat it as /
 
+        # instead of %5C, causing `\\` to behave as `//`
 
-    def verify(self, password, encoded):
+        url = url.replace("\\", "%5C")
 
-        """
+        parsed = urlparse(url)
 
-        Checks if the given password is correct
+        if parsed.netloc or not (parsed.path + '/').startswith(self.base_url):
 
-        """
+            # require that next_url be absolute path within our path
 
-        raise NotImplementedError('subclasses of BasePasswordHasher must provide a verify() method')
+            allow = False
 
+            # OR pass our cross-origin check
 
+            if parsed.netloc:
 
-    def encode(self, password, salt):
+                # if full URL, run our cross-origin check:
 
-        """
+                origin = '%s://%s' % (parsed.scheme, parsed.netloc)
 
-        Creates an encoded database value
+                origin = origin.lower()
 
+                if self.allow_origin:
 
+                    allow = self.allow_origin == origin
 
-        The result is normally formatted as "algorithm$salt$hash" and
+                elif self.allow_origin_pat:
 
-        must be fewer than 128 characters.
+                    allow = bool(self.allow_origin_pat.match(origin))
 
-        """
+            if not allow:
 
-        raise NotImplementedError('subclasses of BasePasswordHasher must provide an encode() method')
+                # not allowed, use default
 
+                self.log.warning("Not allowing login redirect to %r" % url)
 
+                url = default
 
-    def safe_summary(self, encoded):
+        self.redirect(url)
 
-        """
 
-        Returns a summary of safe values
 
+    def get(self):
 
+        if self.current_user:
 
-        The result is a dictionary and will be used where the password field
+            next_url = self.get_argument('next', default=self.base_url)
 
-        must be displayed to construct a safe representation of the password.
-
-        """
-
-        raise NotImplementedError('subclasses of BasePasswordHasher must provide a safe_summary() method')
-
-
-
-    def must_update(self, encoded):
-
-        return False
-
-
-
-    def harden_runtime(self, password, encoded):
-
-        """
-
-        Bridge the runtime gap between the work factor supplied in `encoded`
-
-        and the work factor suggested by this hasher.
-
-
-
-        Taking PBKDF2 as an example, if `encoded` contains 20000 iterations and
-
-        `self.iterations` is 30000, this method should run password through
-
-        another 10000 iterations of PBKDF2. Similar approaches should exist
-
-        for any hasher that has a work factor. If not, this method should be
-
-        defined as a no-op to silence the warning.
-
-        """
-
-        warnings.warn('subclasses of BasePasswordHasher should provide a harden_runtime() method')
-
-
-
-
-
-class PBKDF2PasswordHasher(BasePasswordHasher):
-
-    """
-
-    Secure password hashing using the PBKDF2 algorithm (recommended)
-
-
-
-    Configured to use PBKDF2 + HMAC + SHA256.
-
-    The result is a 64 byte binary string.  Iterations may be changed
-
-    safely but you must rename the algorithm if you change SHA256.
-
-    """
-
-    algorithm = "pbkdf2_sha256"
-
-    iterations = 30000
-
-    digest = hashlib.sha256
-
-
-
-    def encode(self, password, salt, iterations=None):
-
-        assert password is not None
-
-        assert salt and '$' not in salt
-
-        if not iterations:
-
-            iterations = self.iterations
-
-        hash = pbkdf2(password, salt, iterations, digest=self.digest)
-
-        hash = base64.b64encode(hash).decode('ascii').strip()
-
-        return "%s$%d$%s$%s" % (self.algorithm, iterations, salt, hash)
-
-
-
-    def verify(self, password, encoded):
-
-        algorithm, iterations, salt, hash = encoded.split('$', 3)
-
-        assert algorithm == self.algorithm
-
-        encoded_2 = self.encode(password, salt, int(iterations))
-
-        return constant_time_compare(encoded, encoded_2)
-
-
-
-    def safe_summary(self, encoded):
-
-        algorithm, iterations, salt, hash = encoded.split('$', 3)
-
-        assert algorithm == self.algorithm
-
-        return OrderedDict([
-
-            (_('algorithm'), algorithm),
-
-            (_('iterations'), iterations),
-
-            (_('salt'), mask_hash(salt)),
-
-            (_('hash'), mask_hash(hash)),
-
-        ])
-
-
-
-    def must_update(self, encoded):
-
-        algorithm, iterations, salt, hash = encoded.split('$', 3)
-
-        return int(iterations) != self.iterations
-
-
-
-    def harden_runtime(self, password, encoded):
-
-        algorithm, iterations, salt, hash = encoded.split('$', 3)
-
-        extra_iterations = self.iterations - int(iterations)
-
-        if extra_iterations > 0:
-
-            self.encode(password, salt, extra_iterations)
-
-
-
-
-
-class PBKDF2SHA1PasswordHasher(PBKDF2PasswordHasher):
-
-    """
-
-    Alternate PBKDF2 hasher which uses SHA1, the default PRF
-
-    recommended by PKCS #5. This is compatible with other
-
-    implementations of PBKDF2, such as openssl's
-
-    PKCS5_PBKDF2_HMAC_SHA1().
-
-    """
-
-    algorithm = "pbkdf2_sha1"
-
-    digest = hashlib.sha1
-
-
-
-
-
-class BCryptSHA256PasswordHasher(BasePasswordHasher):
-
-    """
-
-    Secure password hashing using the bcrypt algorithm (recommended)
-
-
-
-    This is considered by many to be the most secure algorithm but you
-
-    must first install the bcrypt library.  Please be warned that
-
-    this library depends on native C code and might cause portability
-
-    issues.
-
-    """
-
-    algorithm = "bcrypt_sha256"
-
-    digest = hashlib.sha256
-
-    library = ("bcrypt", "bcrypt")
-
-    rounds = 12
-
-
-
-    def salt(self):
-
-        bcrypt = self._load_library()
-
-        return bcrypt.gensalt(self.rounds)
-
-
-
-    def encode(self, password, salt):
-
-        bcrypt = self._load_library()
-
-        # Hash the password prior to using bcrypt to prevent password
-
-        # truncation as described in #20138.
-
-        if self.digest is not None:
-
-            # Use binascii.hexlify() because a hex encoded bytestring is
-
-            # Unicode on Python 3.
-
-            password = binascii.hexlify(self.digest(force_bytes(password)).digest())
+            self._redirect_safe(next_url)
 
         else:
 
-            password = force_bytes(password)
+            self._render()
 
 
 
-        data = bcrypt.hashpw(password, salt)
+    @property
 
-        return "%s$%s" % (self.algorithm, force_text(data))
+    def hashed_password(self):
 
+        return self.password_from_settings(self.settings)
 
 
-    def verify(self, password, encoded):
 
-        algorithm, data = encoded.split('$', 1)
+    def passwd_check(self, a, b):
 
-        assert algorithm == self.algorithm
+        return passwd_check(a, b)
 
-        encoded_2 = self.encode(password, force_bytes(data))
+    
 
-        return constant_time_compare(encoded, encoded_2)
+    def post(self):
 
+        typed_password = self.get_argument('password', default=u'')
 
+        new_password = self.get_argument('new_password', default=u'')
 
-    def safe_summary(self, encoded):
 
-        algorithm, empty, algostr, work_factor, data = encoded.split('$', 4)
 
-        assert algorithm == self.algorithm
 
-        salt, checksum = data[:22], data[22:]
 
-        return OrderedDict([
+        
 
-            (_('algorithm'), algorithm),
+        if self.get_login_available(self.settings):
 
-            (_('work factor'), work_factor),
+            if self.passwd_check(self.hashed_password, typed_password) and not new_password:
 
-            (_('salt'), mask_hash(salt)),
+                self.set_login_cookie(self, uuid.uuid4().hex)
 
-            (_('checksum'), mask_hash(checksum)),
+            elif self.token and self.token == typed_password:
 
-        ])
+                self.set_login_cookie(self, uuid.uuid4().hex)
 
+                if new_password and self.settings.get('allow_password_change'):
 
+                    config_dir = self.settings.get('config_dir')
 
-    def must_update(self, encoded):
+                    config_file = os.path.join(config_dir, 'jupyter_notebook_config.json')
 
-        algorithm, empty, algostr, rounds, data = encoded.split('$', 4)
+                    set_password(new_password, config_file=config_file)
 
-        return int(rounds) != self.rounds
+                    self.log.info("Wrote hashed password to %s" % config_file)
 
+            else:
 
+                self.set_status(401)
 
-    def harden_runtime(self, password, encoded):
+                self._render(message={'error': 'Invalid credentials'})
 
-        _, data = encoded.split('$', 1)
+                return
 
-        salt = data[:29]  # Length of the salt in bcrypt.
 
-        rounds = data.split('$')[2]
 
-        # work factor is logarithmic, adding one doubles the load.
 
-        diff = 2**(self.rounds - int(rounds)) - 1
 
-        while diff > 0:
+        next_url = self.get_argument('next', default=self.base_url)
 
-            self.encode(password, force_bytes(salt))
+        self._redirect_safe(next_url)
 
-            diff -= 1
 
 
+    @classmethod
 
+    def set_login_cookie(cls, handler, user_id=None):
 
+        """Call this on handlers to set the login cookie for success"""
 
-class BCryptPasswordHasher(BCryptSHA256PasswordHasher):
+        cookie_options = handler.settings.get('cookie_options', {})
 
-    """
+        cookie_options.setdefault('httponly', True)
 
-    Secure password hashing using the bcrypt algorithm
+        # tornado <4.2 has a bug that considers secure==True as soon as
 
+        # 'secure' kwarg is passed to set_secure_cookie
 
+        if handler.settings.get('secure_cookie', handler.request.protocol == 'https'):
 
-    This is considered by many to be the most secure algorithm but you
+            cookie_options.setdefault('secure', True)
 
-    must first install the bcrypt library.  Please be warned that
+        cookie_options.setdefault('path', handler.base_url)
 
-    this library depends on native C code and might cause portability
+        handler.set_secure_cookie(handler.cookie_name, user_id, **cookie_options)
 
-    issues.
+        return user_id
 
 
 
-    This hasher does not first hash the password which means it is subject to
+    auth_header_pat = re.compile('token\s+(.+)', re.IGNORECASE)
 
-    the 72 character bcrypt password truncation, most use cases should prefer
 
-    the BCryptSHA256PasswordHasher.
 
+    @classmethod
 
+    def get_token(cls, handler):
 
-    See: https://code.djangoproject.com/ticket/20138
+        """Get the user token from a request
 
-    """
 
-    algorithm = "bcrypt"
 
-    digest = None
+        Default:
 
 
 
+        - in URL parameters: ?token=<token>
 
+        - in header: Authorization: token <token>
 
-class SHA1PasswordHasher(BasePasswordHasher):
+        """
 
-    """
 
-    The SHA1 password hashing algorithm (not recommended)
 
-    """
+        user_token = handler.get_argument('token', '')
 
-    algorithm = "sha1"
+        if not user_token:
 
+            # get it from Authorization header
 
+            m = cls.auth_header_pat.match(handler.request.headers.get('Authorization', ''))
 
-    def encode(self, password, salt):
+            if m:
 
-        assert password is not None
+                user_token = m.group(1)
 
-        assert salt and '$' not in salt
+        return user_token
 
-        hash = hashlib.sha1(force_bytes(salt + password)).hexdigest()
 
-        return "%s$%s$%s" % (self.algorithm, salt, hash)
 
+    @classmethod
 
+    def should_check_origin(cls, handler):
 
-    def verify(self, password, encoded):
+        """Should the Handler check for CORS origin validation?
 
-        algorithm, salt, hash = encoded.split('$', 2)
 
-        assert algorithm == self.algorithm
 
-        encoded_2 = self.encode(password, salt)
+        Origin check should be skipped for token-authenticated requests.
 
-        return constant_time_compare(encoded, encoded_2)
 
 
+        Returns:
 
-    def safe_summary(self, encoded):
+        - True, if Handler must check for valid CORS origin.
 
-        algorithm, salt, hash = encoded.split('$', 2)
+        - False, if Handler should skip origin check since requests are token-authenticated.
 
-        assert algorithm == self.algorithm
+        """
 
-        return OrderedDict([
+        return not cls.is_token_authenticated(handler)
 
-            (_('algorithm'), algorithm),
 
-            (_('salt'), mask_hash(salt, show=2)),
 
-            (_('hash'), mask_hash(hash)),
+    @classmethod
 
-        ])
+    def is_token_authenticated(cls, handler):
 
+        """Returns True if handler has been token authenticated. Otherwise, False.
 
 
-    def harden_runtime(self, password, encoded):
 
-        pass
+        Login with a token is used to signal certain things, such as:
 
 
 
+        - permit access to REST API
 
+        - xsrf protection
 
-class MD5PasswordHasher(BasePasswordHasher):
+        - skip origin-checks for scripts
 
-    """
+        """
 
-    The Salted MD5 password hashing algorithm (not recommended)
+        if getattr(handler, '_user_id', None) is None:
 
-    """
+            # ensure get_user has been called, so we know if we're token-authenticated
 
-    algorithm = "md5"
+            handler.get_current_user()
 
+        return getattr(handler, '_token_authenticated', False)
 
 
-    def encode(self, password, salt):
 
-        assert password is not None
+    @classmethod
 
-        assert salt and '$' not in salt
+    def get_user(cls, handler):
 
-        hash = hashlib.md5(force_bytes(salt + password)).hexdigest()
+        """Called by handlers.get_current_user for identifying the current user.
 
-        return "%s$%s$%s" % (self.algorithm, salt, hash)
 
 
+        See tornado.web.RequestHandler.get_current_user for details.
 
-    def verify(self, password, encoded):
+        """
 
-        algorithm, salt, hash = encoded.split('$', 2)
+        # Can't call this get_current_user because it will collide when
 
-        assert algorithm == self.algorithm
+        # called on LoginHandler itself.
 
-        encoded_2 = self.encode(password, salt)
+        if getattr(handler, '_user_id', None):
 
-        return constant_time_compare(encoded, encoded_2)
+            return handler._user_id
 
+        user_id = cls.get_user_token(handler)
 
+        if user_id is None:
 
-    def safe_summary(self, encoded):
+            get_secure_cookie_kwargs  = handler.settings.get('get_secure_cookie_kwargs', {})
 
-        algorithm, salt, hash = encoded.split('$', 2)
+            user_id = handler.get_secure_cookie(handler.cookie_name, **get_secure_cookie_kwargs )
 
-        assert algorithm == self.algorithm
+        else:
 
-        return OrderedDict([
+            cls.set_login_cookie(handler, user_id)
 
-            (_('algorithm'), algorithm),
+            # Record that the current request has been authenticated with a token.
 
-            (_('salt'), mask_hash(salt, show=2)),
+            # Used in is_token_authenticated above.
 
-            (_('hash'), mask_hash(hash)),
+            handler._token_authenticated = True
 
-        ])
+        if user_id is None:
 
+            # If an invalid cookie was sent, clear it to prevent unnecessary
 
+            # extra warnings. But don't do this on a request with *no* cookie,
 
-    def harden_runtime(self, password, encoded):
+            # because that can erroneously log you out (see gh-3365)
 
-        pass
+            if handler.get_cookie(handler.cookie_name) is not None:
 
+                handler.log.warning("Clearing invalid/expired login cookie %s", handler.cookie_name)
 
+                handler.clear_login_cookie()
 
+            if not handler.login_available:
 
+                # Completely insecure! No authentication at all.
 
-class UnsaltedSHA1PasswordHasher(BasePasswordHasher):
+                # No need to warn here, though; validate_security will have already done that.
 
-    """
+                user_id = 'anonymous'
 
-    Very insecure algorithm that you should *never* use; stores SHA1 hashes
 
-    with an empty salt.
 
+        # cache value for future retrievals on the same request
 
+        handler._user_id = user_id
 
-    This class is implemented because Django used to accept such password
+        return user_id
 
-    hashes. Some older Django installs still have these values lingering
 
-    around so we need to handle and upgrade them properly.
 
-    """
+    @classmethod
 
-    algorithm = "unsalted_sha1"
+    def get_user_token(cls, handler):
 
+        """Identify the user based on a token in the URL or Authorization header
 
+        
 
-    def salt(self):
+        Returns:
 
-        return ''
+        - uuid if authenticated
 
+        - None if not
 
+        """
 
-    def encode(self, password, salt):
+        token = handler.token
 
-        assert salt == ''
+        if not token:
 
-        hash = hashlib.sha1(force_bytes(password)).hexdigest()
+            return
 
-        return 'sha1$$%s' % hash
+        # check login token from URL argument or Authorization header
 
+        user_token = cls.get_token(handler)
 
+        authenticated = False
 
-    def verify(self, password, encoded):
+        if user_token == token:
 
-        encoded_2 = self.encode(password, '')
+            # token-authenticated, set the login cookie
 
-        return constant_time_compare(encoded, encoded_2)
+            handler.log.debug("Accepting token-authenticated connection from %s", handler.request.remote_ip)
 
+            authenticated = True
 
 
-    def safe_summary(self, encoded):
 
-        assert encoded.startswith('sha1$$')
+        if authenticated:
 
-        hash = encoded[6:]
+            return uuid.uuid4().hex
 
-        return OrderedDict([
+        else:
 
-            (_('algorithm'), self.algorithm),
+            return None
 
-            (_('hash'), mask_hash(hash)),
 
-        ])
 
 
 
-    def harden_runtime(self, password, encoded):
+    @classmethod
 
-        pass
+    def validate_security(cls, app, ssl_options=None):
 
+        """Check the notebook application's security.
 
 
 
+        Show messages, or abort if necessary, based on the security configuration.
 
-class UnsaltedMD5PasswordHasher(BasePasswordHasher):
+        """
 
-    """
+        if not app.ip:
 
-    Incredibly insecure algorithm that you should *never* use; stores unsalted
+            warning = "WARNING: The notebook server is listening on all IP addresses"
 
-    MD5 hashes without the algorithm prefix, also accepts MD5 hashes with an
+            if ssl_options is None:
 
-    empty salt.
+                app.log.warning(warning + " and not using encryption. This "
 
+                    "is not recommended.")
 
+            if not app.password and not app.token:
 
-    This class is implemented because Django used to store passwords this way
+                app.log.warning(warning + " and not using authentication. "
 
-    and to accept such password hashes. Some older Django installs still have
+                    "This is highly insecure and not recommended.")
 
-    these values lingering around so we need to handle and upgrade them
+        else:
 
-    properly.
+            if not app.password and not app.token:
 
-    """
+                app.log.warning(
 
-    algorithm = "unsalted_md5"
+                    "All authentication is disabled."
 
+                    "  Anyone who can connect to this server will be able to run code.")
 
 
-    def salt(self):
 
-        return ''
+    @classmethod
 
+    def password_from_settings(cls, settings):
 
+        """Return the hashed password from the tornado settings.
 
-    def encode(self, password, salt):
 
-        assert salt == ''
 
-        return hashlib.md5(force_bytes(password)).hexdigest()
+        If there is no configured password, an empty string will be returned.
 
+        """
 
+        return settings.get('password', u'')
 
-    def verify(self, password, encoded):
 
-        if len(encoded) == 37 and encoded.startswith('md5$$'):
 
-            encoded = encoded[5:]
+    @classmethod
 
-        encoded_2 = self.encode(password, '')
+    def get_login_available(cls, settings):
 
-        return constant_time_compare(encoded, encoded_2)
+        """Whether this LoginHandler is needed - and therefore whether the login page should be displayed."""
 
-
-
-    def safe_summary(self, encoded):
-
-        return OrderedDict([
-
-            (_('algorithm'), self.algorithm),
-
-            (_('hash'), mask_hash(encoded, show=3)),
-
-        ])
-
-
-
-    def harden_runtime(self, password, encoded):
-
-        pass
-
-
-
-
-
-class CryptPasswordHasher(BasePasswordHasher):
-
-    """
-
-    Password hashing using UNIX crypt (not recommended)
-
-
-
-    The crypt module is not supported on all platforms.
-
-    """
-
-    algorithm = "crypt"
-
-    library = "crypt"
-
-
-
-    def salt(self):
-
-        return get_random_string(2)
-
-
-
-    def encode(self, password, salt):
-
-        crypt = self._load_library()
-
-        assert len(salt) == 2
-
-        data = crypt.crypt(force_str(password), salt)
-
-        # we don't need to store the salt, but Django used to do this
-
-        return "%s$%s$%s" % (self.algorithm, '', data)
-
-
-
-    def verify(self, password, encoded):
-
-        crypt = self._load_library()
-
-        algorithm, salt, data = encoded.split('$', 2)
-
-        assert algorithm == self.algorithm
-
-        return constant_time_compare(data, crypt.crypt(force_str(password), data))
-
-
-
-    def safe_summary(self, encoded):
-
-        algorithm, salt, data = encoded.split('$', 2)
-
-        assert algorithm == self.algorithm
-
-        return OrderedDict([
-
-            (_('algorithm'), algorithm),
-
-            (_('salt'), salt),
-
-            (_('hash'), mask_hash(data, show=3)),
-
-        ])
-
-
-
-    def harden_runtime(self, password, encoded):
-
-        pass
+        return bool(cls.password_from_settings(settings) or settings.get('token'))

@@ -2,280 +2,364 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-from django import forms
 
-from django.contrib.auth import authenticate, get_backends, get_user_model
 
-from django.contrib.sites.shortcuts import get_current_site
+# Copyright 2012 OpenStack LLC
 
-from django.core.exceptions import ImproperlyConfigured
+# Copyright 2012 Canonical Ltd.
 
-from django.shortcuts import resolve_url
+#
 
-from django.utils.translation import ugettext_lazy as _
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
 
+# not use this file except in compliance with the License. You may obtain
 
+# a copy of the License at
 
-from nopassword import models
+#
 
+#      http://www.apache.org/licenses/LICENSE-2.0
 
+#
 
+# Unless required by applicable law or agreed to in writing, software
 
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-class LoginForm(forms.Form):
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
-    error_messages = {
+# License for the specific language governing permissions and limitations
 
-        'invalid_username': _(
+# under the License.
 
-            "Please enter a correct %(username)s. "
 
-            "Note that it is case-sensitive."
 
-        ),
+"""Main entry point into the Catalog service."""
 
-        'inactive': _("This account is inactive."),
 
-    }
 
+import uuid
 
 
-    next = forms.CharField(max_length=200, required=False, widget=forms.HiddenInput)
 
+from keystone import config
 
+from keystone import exception
 
-    def __init__(self, *args, **kwargs):
+from keystone import identity
 
-        super(LoginForm, self).__init__(*args, **kwargs)
+from keystone import policy
 
+from keystone import token
 
+from keystone.common import manager
 
-        self.username_field = get_user_model()._meta.get_field(get_user_model().USERNAME_FIELD)
+from keystone.common import wsgi
 
-        self.fields['username'] = self.username_field.formfield()
 
 
 
-    def clean_username(self):
 
-        username = self.cleaned_data['username']
+CONF = config.CONF
 
 
 
-        try:
 
-            user = get_user_model()._default_manager.get_by_natural_key(username)
 
-        except get_user_model().DoesNotExist:
+class Manager(manager.Manager):
 
-            raise forms.ValidationError(
+    """Default pivot point for the Catalog backend.
 
-                self.error_messages['invalid_username'],
 
-                code='invalid_username',
 
-                params={'username': self.username_field.verbose_name},
+    See :mod:`keystone.common.manager.Manager` for more details on how this
 
-            )
+    dynamically calls the backend.
 
 
 
-        if not user.is_active:
+    """
 
-            raise forms.ValidationError(
 
-                self.error_messages['inactive'],
 
-                code='inactive',
+    def __init__(self):
 
-            )
+        super(Manager, self).__init__(CONF.catalog.driver)
 
 
 
-        self.cleaned_data['user'] = user
 
 
+class Driver(object):
 
-        return username
+    """Interface description for an Catalog driver."""
 
+    def list_services(self):
 
+        """List all service ids in catalog.
 
-    def save(self, request, login_code_url='login_code', domain_override=None, extra_context=None):
 
-        login_code = models.LoginCode.create_code_for_user(
 
-            user=self.cleaned_data['user'],
+        Returns: list of service_ids or an empty list.
 
-            next=self.cleaned_data['next'],
 
-        )
 
+        """
 
+        raise exception.NotImplemented()
 
-        if not domain_override:
 
-            current_site = get_current_site(request)
 
-            site_name = current_site.name
+    def get_service(self, service_id):
 
-            domain = current_site.domain
+        """Get service by id.
 
-        else:
 
-            site_name = domain = domain_override
 
+        Returns: service_ref dict or None.
 
 
-        url = '{}://{}{}?code={}'.format(
 
-            'https' if request.is_secure() else 'http',
+        """
 
-            domain,
+        raise exception.NotImplemented()
 
-            resolve_url(login_code_url),
 
-            login_code.code,
 
-        )
+    def delete_service(self, service_id):
 
+        raise exception.NotImplemented()
 
 
-        context = {
 
-            'domain': domain,
+    def create_service(self, service_id, service_ref):
 
-            'site_name': site_name,
+        raise exception.NotImplemented()
 
-            'code': login_code.code,
 
-            'url': url,
 
-        }
+    def create_endpoint(self, endpoint_id, endpoint_ref):
 
+        raise exception.NotImplemented()
 
 
-        if extra_context:
 
-            context.update(extra_context)
+    def delete_endpoint(self, endpoint_id):
 
+        raise exception.NotImplemented()
 
 
-        self.send_login_code(login_code, context)
 
+    def get_endpoint(self, endpoint_id):
 
+        """Get endpoint by id.
 
-        return login_code
 
 
+        Returns: endpoint_ref dict or None.
 
-    def send_login_code(self, login_code, context, **kwargs):
 
-        for backend in get_backends():
 
-            if hasattr(backend, 'send_login_code'):
+        """
 
-                backend.send_login_code(login_code, context, **kwargs)
+        raise exception.NotImplemented()
 
-                break
 
-        else:
 
-            raise ImproperlyConfigured(
+    def list_endpoints(self):
 
-                'Please add a nopassword authentication backend to settings, '
+        """List all endpoint ids in catalog.
 
-                'e.g. `nopassword.backends.EmailBackend`'
 
-            )
 
+        Returns: list of endpoint_ids or an empty list.
 
 
 
+        """
 
-class LoginCodeForm(forms.Form):
+        raise exception.NotImplemented()
 
-    code = forms.ModelChoiceField(
 
-        label=_('Login code'),
 
-        queryset=models.LoginCode.objects.select_related('user'),
+    def get_catalog(self, user_id, tenant_id, metadata=None):
 
-        to_field_name='code',
+        """Retreive and format the current service catalog.
 
-        widget=forms.TextInput,
 
-        error_messages={
 
-            'invalid_choice': _('Login code is invalid. It might have expired.'),
+        Returns: A nested dict representing the service catalog or an
 
-        },
+                 empty dict.
 
-    )
 
 
+        Example:
 
-    error_messages = {
 
-        'invalid_code': _("Unable to log in with provided login code."),
 
-    }
+            { 'RegionOne':
 
+                {'compute': {
 
+                    'adminURL': u'http://host:8774/v1.1/tenantid',
 
-    def __init__(self, request=None, *args, **kwargs):
+                    'internalURL': u'http://host:8774/v1.1/tenant_id',
 
-        super(LoginCodeForm, self).__init__(*args, **kwargs)
+                    'name': 'Compute Service',
 
+                    'publicURL': u'http://host:8774/v1.1/tenantid'},
 
+                 'ec2': {
 
-        self.request = request
+                    'adminURL': 'http://host:8773/services/Admin',
 
+                    'internalURL': 'http://host:8773/services/Cloud',
 
+                    'name': 'EC2 Service',
 
-    def clean_code(self):
+                    'publicURL': 'http://host:8773/services/Cloud'}}
 
-        code = self.cleaned_data['code']
 
-        username = code.user.get_username()
 
-        user = authenticate(self.request, **{
+        """
 
-            get_user_model().USERNAME_FIELD: username,
+        raise exception.NotImplemented()
 
-            'code': code.code,
 
-        })
 
 
 
-        if not user:
+class ServiceController(wsgi.Application):
 
-            raise forms.ValidationError(
+    def __init__(self):
 
-                self.error_messages['invalid_code'],
+        self.catalog_api = Manager()
 
-                code='invalid_code',
+        super(ServiceController, self).__init__()
 
-            )
 
 
+    # CRUD extensions
 
-        self.cleaned_data['user'] = user
+    # NOTE(termie): this OS-KSADM stuff is not very consistent
 
+    def get_services(self, context):
 
+        service_list = self.catalog_api.list_services(context)
 
-        return code
+        service_refs = [self.catalog_api.get_service(context, x)
 
+                        for x in service_list]
 
+        return {'OS-KSADM:services': service_refs}
 
-    def get_user(self):
 
-        return self.cleaned_data.get('user')
 
+    def get_service(self, context, service_id):
 
+        service_ref = self.catalog_api.get_service(context, service_id)
 
-    def save(self):
+        if not service_ref:
 
-        self.cleaned_data['code'].delete()
+            raise exception.ServiceNotFound(service_id=service_id)
+
+        return {'OS-KSADM:service': service_ref}
+
+
+
+    def delete_service(self, context, service_id):
+
+        service_ref = self.catalog_api.get_service(context, service_id)
+
+        if not service_ref:
+
+            raise exception.ServiceNotFound(service_id=service_id)
+
+        self.catalog_api.delete_service(context, service_id)
+
+
+
+    def create_service(self, context, OS_KSADM_service):
+
+        service_id = uuid.uuid4().hex
+
+        service_ref = OS_KSADM_service.copy()
+
+        service_ref['id'] = service_id
+
+        new_service_ref = self.catalog_api.create_service(
+
+                context, service_id, service_ref)
+
+        return {'OS-KSADM:service': new_service_ref}
+
+
+
+
+
+class EndpointController(wsgi.Application):
+
+    def __init__(self):
+
+        self.catalog_api = Manager()
+
+        self.identity_api = identity.Manager()
+
+        self.policy_api = policy.Manager()
+
+        self.token_api = token.Manager()
+
+        super(EndpointController, self).__init__()
+
+
+
+    def get_endpoints(self, context):
+
+        self.assert_admin(context)
+
+        endpoint_list = self.catalog_api.list_endpoints(context)
+
+        endpoint_refs = [self.catalog_api.get_endpoint(context, e)
+
+                         for e in endpoint_list]
+
+        return {'endpoints': endpoint_refs}
+
+
+
+    def create_endpoint(self, context, endpoint):
+
+        self.assert_admin(context)
+
+        endpoint_id = uuid.uuid4().hex
+
+        endpoint_ref = endpoint.copy()
+
+        endpoint_ref['id'] = endpoint_id
+
+
+
+        service_id = endpoint_ref['service_id']
+
+        if not self.catalog_api.get_service(context, service_id):
+
+            raise exception.ServiceNotFound(service_id=service_id)
+
+
+
+        new_endpoint_ref = self.catalog_api.create_endpoint(
+
+                                context, endpoint_id, endpoint_ref)
+
+        return {'endpoint': new_endpoint_ref}
+
+
+
+    def delete_endpoint(self, context, endpoint_id):
+
+        self.assert_admin(context)
+
+        endpoint_ref = self.catalog_api.delete_endpoint(context, endpoint_id)

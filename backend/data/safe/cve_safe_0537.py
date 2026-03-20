@@ -6,7 +6,7 @@
 
 
 
-# Copyright 2012 OpenStack, LLC
+# Copyright 2011 Isaku Yamahata
 
 # All Rights Reserved.
 
@@ -36,1380 +36,328 @@
 
 
 
-import json
+import os
 
 
 
-import requests
+from nova import exception
+
+from nova import flags
+
+from nova import test
+
+from nova import utils
+
+from nova.virt.disk import api as disk_api
+
+from nova.virt import driver
 
 
 
-from glance.common import utils
-
-from glance.tests import functional
-
-
-
-
-
-TENANT1 = utils.generate_uuid()
-
-TENANT2 = utils.generate_uuid()
-
-TENANT3 = utils.generate_uuid()
-
-TENANT4 = utils.generate_uuid()
+FLAGS = flags.FLAGS
 
 
 
 
 
-class TestImages(functional.FunctionalTest):
+class TestVirtDriver(test.TestCase):
+
+    def test_block_device(self):
+
+        swap = {'device_name': '/dev/sdb',
+
+                'swap_size': 1}
+
+        ephemerals = [{'num': 0,
+
+                       'virtual_name': 'ephemeral0',
+
+                       'device_name': '/dev/sdc1',
+
+                       'size': 1}]
+
+        block_device_mapping = [{'mount_device': '/dev/sde',
+
+                                 'device_path': 'fake_device'}]
+
+        block_device_info = {
+
+                'root_device_name': '/dev/sda',
+
+                'swap': swap,
+
+                'ephemerals': ephemerals,
+
+                'block_device_mapping': block_device_mapping}
 
 
+
+        empty_block_device_info = {}
+
+
+
+        self.assertEqual(
+
+            driver.block_device_info_get_root(block_device_info), '/dev/sda')
+
+        self.assertEqual(
+
+            driver.block_device_info_get_root(empty_block_device_info), None)
+
+        self.assertEqual(
+
+            driver.block_device_info_get_root(None), None)
+
+
+
+        self.assertEqual(
+
+            driver.block_device_info_get_swap(block_device_info), swap)
+
+        self.assertEqual(driver.block_device_info_get_swap(
+
+            empty_block_device_info)['device_name'], None)
+
+        self.assertEqual(driver.block_device_info_get_swap(
+
+            empty_block_device_info)['swap_size'], 0)
+
+        self.assertEqual(
+
+            driver.block_device_info_get_swap({'swap': None})['device_name'],
+
+            None)
+
+        self.assertEqual(
+
+            driver.block_device_info_get_swap({'swap': None})['swap_size'],
+
+            0)
+
+        self.assertEqual(
+
+            driver.block_device_info_get_swap(None)['device_name'], None)
+
+        self.assertEqual(
+
+            driver.block_device_info_get_swap(None)['swap_size'], 0)
+
+
+
+        self.assertEqual(
+
+            driver.block_device_info_get_ephemerals(block_device_info),
+
+            ephemerals)
+
+        self.assertEqual(
+
+            driver.block_device_info_get_ephemerals(empty_block_device_info),
+
+            [])
+
+        self.assertEqual(
+
+            driver.block_device_info_get_ephemerals(None),
+
+            [])
+
+
+
+    def test_swap_is_usable(self):
+
+        self.assertFalse(driver.swap_is_usable(None))
+
+        self.assertFalse(driver.swap_is_usable({'device_name': None}))
+
+        self.assertFalse(driver.swap_is_usable({'device_name': '/dev/sdb',
+
+                                                'swap_size': 0}))
+
+        self.assertTrue(driver.swap_is_usable({'device_name': '/dev/sdb',
+
+                                                'swap_size': 1}))
+
+
+
+
+
+class TestVirtDisk(test.TestCase):
 
     def setUp(self):
 
-        super(TestImages, self).setUp()
+        super(TestVirtDisk, self).setUp()
 
-        self.cleanup()
+        self.executes = []
 
-        self.api_server.deployment_flavor = 'noauth'
 
-        self.start_servers(**self.__dict__.copy())
 
+        def fake_execute(*cmd, **kwargs):
 
+            self.executes.append(cmd)
 
-    def _url(self, path):
+            return None, None
 
-        return 'http://127.0.0.1:%d%s' % (self.api_port, path)
 
 
+        self.stubs.Set(utils, 'execute', fake_execute)
 
-    def _headers(self, custom_headers=None):
 
-        base_headers = {
 
-            'X-Identity-Status': 'Confirmed',
+    def test_lxc_destroy_container(self):
 
-            'X-Auth-Token': '932c5c84-02ac-4fe5-a9ba-620af0e2bb96',
 
-            'X-User-Id': 'f9a41d13-0c13-47e9-bee2-ce4e8bfe958e',
 
-            'X-Tenant-Id': TENANT1,
+        def proc_mounts(self, mount_point):
 
-            'X-Roles': 'member',
+            mount_points = {
 
-        }
+                '/mnt/loop/nopart': '/dev/loop0',
 
-        base_headers.update(custom_headers or {})
+                '/mnt/loop/part': '/dev/mapper/loop0p1',
 
-        return base_headers
+                '/mnt/nbd/nopart': '/dev/nbd15',
 
+                '/mnt/nbd/part': '/dev/mapper/nbd15p1',
 
+                '/mnt/guestfs': 'guestmount',
 
-    def test_image_lifecycle(self):
+            }
 
-        # Image list should be empty
+            return mount_points[mount_point]
 
-        path = self._url('/v2/images')
 
-        response = requests.get(path, headers=self._headers())
 
-        self.assertEqual(200, response.status_code)
+        self.stubs.Set(os.path, 'exists', lambda _: True)
 
-        images = json.loads(response.text)['images']
+        self.stubs.Set(disk_api._DiskImage, '_device_for_path', proc_mounts)
 
-        self.assertEqual(0, len(images))
+        expected_commands = []
 
 
 
-        # Create an image (with a deployer-defined property)
+        disk_api.destroy_container('/mnt/loop/nopart')
 
-        path = self._url('/v2/images')
+        expected_commands += [
 
-        headers = self._headers({'content-type': 'application/json'})
+                              ('umount', '/dev/loop0'),
 
-        data = json.dumps({'name': 'image-1', 'type': 'kernel', 'foo': 'bar'})
+                              ('losetup', '--detach', '/dev/loop0'),
 
-        response = requests.post(path, headers=headers, data=data)
+                             ]
 
-        self.assertEqual(201, response.status_code)
 
-        image_location_header = response.headers['Location']
 
+        disk_api.destroy_container('/mnt/loop/part')
 
+        expected_commands += [
 
-        # Returned image entity should have a generated id and status
+                              ('umount', '/dev/mapper/loop0p1'),
 
-        image = json.loads(response.text)
+                              ('kpartx', '-d', '/dev/loop0'),
 
-        image_id = image['id']
+                              ('losetup', '--detach', '/dev/loop0'),
 
-        self.assertEqual(image['status'], 'queued')
+                             ]
 
 
 
-        # Image list should now have one entry
+        disk_api.destroy_container('/mnt/nbd/nopart')
 
-        path = self._url('/v2/images')
+        expected_commands += [
 
-        response = requests.get(path, headers=self._headers())
+                              ('umount', '/dev/nbd15'),
 
-        self.assertEqual(200, response.status_code)
+                              ('qemu-nbd', '-d', '/dev/nbd15'),
 
-        images = json.loads(response.text)['images']
+                             ]
 
-        self.assertEqual(1, len(images))
 
-        self.assertEqual(images[0]['id'], image_id)
 
+        disk_api.destroy_container('/mnt/nbd/part')
 
+        expected_commands += [
 
-        # Get the image using the returned Location header
+                              ('umount', '/dev/mapper/nbd15p1'),
 
-        response = requests.get(image_location_header, headers=self._headers())
+                              ('kpartx', '-d', '/dev/nbd15'),
 
-        self.assertEqual(200, response.status_code)
+                              ('qemu-nbd', '-d', '/dev/nbd15'),
 
-        image = json.loads(response.text)
+                             ]
 
-        self.assertEqual(image_id, image['id'])
 
-        self.assertFalse('checksum' in image)
 
-        self.assertFalse('size' in image)
+        disk_api.destroy_container('/mnt/guestfs')
 
-        self.assertEqual('bar', image['foo'])
+        expected_commands += [
 
-        self.assertEqual(False, image['protected'])
+                              ('fusermount', '-u', '/mnt/guestfs'),
 
-        self.assertEqual('kernel', image['type'])
+                             ]
 
-        self.assertTrue(image['created_at'])
+        # It's not worth trying to match the last timeout command
 
-        self.assertTrue(image['updated_at'])
+        self.executes.pop()
 
-        self.assertEqual(image['updated_at'], image['created_at'])
 
 
+        self.assertEqual(self.executes, expected_commands)
 
-        # The image should be mutable, including adding and removing properties
 
-        path = self._url('/v2/images/%s' % image_id)
 
-        media_type = 'application/openstack-images-v2.0-json-patch'
 
-        headers = self._headers({'content-type': media_type})
 
-        data = json.dumps([
-
-            {'replace': '/name', 'value': 'image-2'},
-
-            {'replace': '/disk_format', 'value': 'vhd'},
-
-            {'replace': '/foo', 'value': 'baz'},
-
-            {'add': '/ping', 'value': 'pong'},
-
-            {'replace': '/protected', 'value': True},
-
-            {'remove': '/type'},
-
-        ])
-
-        response = requests.patch(path, headers=headers, data=data)
-
-        self.assertEqual(200, response.status_code, response.text)
-
-
-
-        # Returned image entity should reflect the changes
-
-        image = json.loads(response.text)
-
-        self.assertEqual('image-2', image['name'])
-
-        self.assertEqual('vhd', image['disk_format'])
-
-        self.assertEqual('baz', image['foo'])
-
-        self.assertEqual('pong', image['ping'])
-
-        self.assertEqual(True, image['protected'])
-
-        self.assertFalse('type' in image, response.text)
-
-
-
-        # Updates should persist across requests
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        response = requests.get(path, headers=self._headers())
-
-        self.assertEqual(200, response.status_code)
-
-        image = json.loads(response.text)
-
-        self.assertEqual(image_id, image['id'])
-
-        self.assertEqual('image-2', image['name'])
-
-        self.assertEqual('baz', image['foo'])
-
-        self.assertEqual('pong', image['ping'])
-
-        self.assertEqual(True, image['protected'])
-
-        self.assertFalse('type' in image, response.text)
-
-
-
-        # Try to download data before its uploaded
-
-        path = self._url('/v2/images/%s/file' % image_id)
-
-        headers = self._headers()
-
-        response = requests.get(path, headers=headers)
-
-        self.assertEqual(404, response.status_code)
-
-
-
-        # Upload some image data
-
-        path = self._url('/v2/images/%s/file' % image_id)
-
-        headers = self._headers({'Content-Type': 'application/octet-stream'})
-
-        response = requests.put(path, headers=headers, data='ZZZZZ')
-
-        self.assertEqual(201, response.status_code)
-
-
-
-        # Checksum should be populated automatically
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        response = requests.get(path, headers=self._headers())
-
-        self.assertEqual(200, response.status_code)
-
-        image = json.loads(response.text)
-
-        self.assertEqual('8f113e38d28a79a5a451b16048cc2b72', image['checksum'])
-
-
-
-        # Try to download the data that was just uploaded
-
-        path = self._url('/v2/images/%s/file' % image_id)
-
-        headers = self._headers()
-
-        response = requests.get(path, headers=headers)
-
-        self.assertEqual(200, response.status_code)
-
-        self.assertEqual('8f113e38d28a79a5a451b16048cc2b72',
-
-                         response.headers['Content-MD5'])
-
-        self.assertEqual(response.text, 'ZZZZZ')
-
-
-
-        # Uploading duplicate data should be rejected with a 409
-
-        path = self._url('/v2/images/%s/file' % image_id)
-
-        headers = self._headers({'Content-Type': 'application/octet-stream'})
-
-        response = requests.put(path, headers=headers, data='XXX')
-
-        self.assertEqual(409, response.status_code)
-
-
-
-        # Ensure the size is updated to reflect the data uploaded
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        headers = self._headers()
-
-        response = requests.get(path, headers=headers)
-
-        self.assertEqual(200, response.status_code)
-
-        self.assertEqual(5, json.loads(response.text)['size'])
-
-
-
-        # Deletion should not work on protected images
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        response = requests.delete(path, headers=self._headers())
-
-        self.assertEqual(403, response.status_code)
-
-
-
-        # Unprotect image for deletion
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        media_type = 'application/openstack-images-v2.0-json-patch'
-
-        headers = self._headers({'content-type': media_type})
-
-        data = json.dumps([{'replace': '/protected', 'value': False}])
-
-        response = requests.patch(path, headers=headers, data=data)
-
-        self.assertEqual(200, response.status_code, response.text)
-
-
-
-        # Deletion should work
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        response = requests.delete(path, headers=self._headers())
-
-        self.assertEqual(204, response.status_code)
-
-
-
-        # This image should be no longer be directly accessible
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        response = requests.get(path, headers=self._headers())
-
-        self.assertEqual(404, response.status_code)
-
-
-
-        # And neither should its data
-
-        path = self._url('/v2/images/%s/file' % image_id)
-
-        headers = self._headers()
-
-        response = requests.get(path, headers=headers)
-
-        self.assertEqual(404, response.status_code)
-
-
-
-        # Image list should now be empty
-
-        path = self._url('/v2/images')
-
-        response = requests.get(path, headers=self._headers())
-
-        self.assertEqual(200, response.status_code)
-
-        images = json.loads(response.text)['images']
-
-        self.assertEqual(0, len(images))
-
-
-
-        self.stop_servers()
-
-
-
-    def test_permissions(self):
-
-        # Create an image that belongs to TENANT1
-
-        path = self._url('/v2/images')
-
-        headers = self._headers({'Content-Type': 'application/json'})
-
-        data = json.dumps({'name': 'image-1'})
-
-        response = requests.post(path, headers=headers, data=data)
-
-        self.assertEqual(201, response.status_code)
-
-        image_id = json.loads(response.text)['id']
-
-
-
-        # Upload some image data
-
-        path = self._url('/v2/images/%s/file' % image_id)
-
-        headers = self._headers({'Content-Type': 'application/octet-stream'})
-
-        response = requests.put(path, headers=headers, data='ZZZZZ')
-
-        self.assertEqual(201, response.status_code)
-
-
-
-        # TENANT1 should see the image in their list
-
-        path = self._url('/v2/images')
-
-        response = requests.get(path, headers=self._headers())
-
-        self.assertEqual(200, response.status_code)
-
-        images = json.loads(response.text)['images']
-
-        self.assertEqual(image_id, images[0]['id'])
-
-
-
-        # TENANT1 should be able to access the image directly
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        response = requests.get(path, headers=self._headers())
-
-        self.assertEqual(200, response.status_code)
-
-
-
-        # TENANT2 should not see the image in their list
-
-        path = self._url('/v2/images')
-
-        headers = self._headers({'X-Tenant-Id': TENANT2})
-
-        response = requests.get(path, headers=headers)
-
-        self.assertEqual(200, response.status_code)
-
-        images = json.loads(response.text)['images']
-
-        self.assertEqual(0, len(images))
-
-
-
-        # TENANT2 should not be able to access the image directly
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        headers = self._headers({'X-Tenant-Id': TENANT2})
-
-        response = requests.get(path, headers=headers)
-
-        self.assertEqual(404, response.status_code)
-
-
-
-        # TENANT2 should not be able to modify the image, either
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        headers = self._headers({
-
-            'Content-Type': 'application/openstack-images-v2.0-json-patch',
-
-            'X-Tenant-Id': TENANT2,
-
-        })
-
-        data = json.dumps([{'replace': '/name', 'value': 'image-2'}])
-
-        response = requests.patch(path, headers=headers, data=data)
-
-        self.assertEqual(404, response.status_code)
-
-
-
-        # TENANT2 should not be able to delete the image, either
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        headers = self._headers({'X-Tenant-Id': TENANT2})
-
-        response = requests.delete(path, headers=headers)
-
-        self.assertEqual(404, response.status_code)
-
-
-
-        # Publicize the image as an admin of TENANT1
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        headers = self._headers({
-
-            'Content-Type': 'application/openstack-images-v2.0-json-patch',
-
-            'X-Roles': 'admin',
-
-        })
-
-        data = json.dumps([{'replace': '/visibility', 'value': 'public'}])
-
-        response = requests.patch(path, headers=headers, data=data)
-
-        self.assertEqual(200, response.status_code)
-
-
-
-        # TENANT3 should now see the image in their list
-
-        path = self._url('/v2/images')
-
-        headers = self._headers({'X-Tenant-Id': TENANT3})
-
-        response = requests.get(path, headers=headers)
-
-        self.assertEqual(200, response.status_code)
-
-        images = json.loads(response.text)['images']
-
-        self.assertEqual(image_id, images[0]['id'])
-
-
-
-        # TENANT3 should also be able to access the image directly
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        headers = self._headers({'X-Tenant-Id': TENANT3})
-
-        response = requests.get(path, headers=headers)
-
-        self.assertEqual(200, response.status_code)
-
-
-
-        # TENANT3 still should not be able to modify the image
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        headers = self._headers({
-
-            'Content-Type': 'application/openstack-images-v2.0-json-patch',
-
-            'X-Tenant-Id': TENANT3,
-
-        })
-
-        data = json.dumps([{'replace': '/name', 'value': 'image-2'}])
-
-        response = requests.patch(path, headers=headers, data=data)
-
-        self.assertEqual(404, response.status_code)
-
-
-
-        # TENANT3 should not be able to delete the image, either
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        headers = self._headers({'X-Tenant-Id': TENANT3})
-
-        response = requests.delete(path, headers=headers)
-
-        self.assertEqual(404, response.status_code)
-
-
-
-        # Image data should still be present after the failed delete
-
-        path = self._url('/v2/images/%s/file' % image_id)
-
-        response = requests.get(path, headers=self._headers())
-
-        self.assertEqual(200, response.status_code)
-
-        self.assertEqual(response.text, 'ZZZZZ')
-
-
-
-        self.stop_servers()
-
-
-
-    def test_tag_lifecycle(self):
-
-        # Create an image with a tag - duplicate should be ignored
-
-        path = self._url('/v2/images')
-
-        headers = self._headers({'Content-Type': 'application/json'})
-
-        data = json.dumps({'name': 'image-1', 'tags': ['sniff', 'sniff']})
-
-        response = requests.post(path, headers=headers, data=data)
-
-        self.assertEqual(201, response.status_code)
-
-        image_id = json.loads(response.text)['id']
-
-
-
-        # Image should show a list with a single tag
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        response = requests.get(path, headers=self._headers())
-
-        self.assertEqual(200, response.status_code)
-
-        tags = json.loads(response.text)['tags']
-
-        self.assertEqual(['sniff'], tags)
-
-
-
-        # Update image with duplicate tag - it should be ignored
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        media_type = 'application/openstack-images-v2.0-json-patch'
-
-        headers = self._headers({'content-type': media_type})
-
-        data = json.dumps([{'replace': '/tags',
-
-                            'value': ['sniff', 'snozz', 'snozz']}])
-
-        response = requests.patch(path, headers=headers, data=data)
-
-        self.assertEqual(200, response.status_code)
-
-        tags = json.loads(response.text)['tags']
-
-        self.assertEqual(['snozz', 'sniff'], tags)
-
-
-
-        # Image should show the appropriate tags
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        response = requests.get(path, headers=self._headers())
-
-        self.assertEqual(200, response.status_code)
-
-        tags = json.loads(response.text)['tags']
-
-        self.assertEqual(['sniff', 'snozz'], tags)
-
-
-
-        # Attempt to tag the image with a duplicate should be ignored
-
-        path = self._url('/v2/images/%s/tags/snozz' % image_id)
-
-        response = requests.put(path, headers=self._headers())
-
-        self.assertEqual(204, response.status_code)
-
-
-
-        # Create another more complex tag
-
-        path = self._url('/v2/images/%s/tags/gabe%%40example.com' % image_id)
-
-        response = requests.put(path, headers=self._headers())
-
-        self.assertEqual(204, response.status_code)
-
-
-
-        # Double-check that the tags container on the image is populated
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        response = requests.get(path, headers=self._headers())
-
-        self.assertEqual(200, response.status_code)
-
-        tags = json.loads(response.text)['tags']
-
-        self.assertEqual(['sniff', 'snozz', 'gabe@example.com'], tags)
-
-
-
-        # The tag should be deletable
-
-        path = self._url('/v2/images/%s/tags/gabe%%40example.com' % image_id)
-
-        response = requests.delete(path, headers=self._headers())
-
-        self.assertEqual(204, response.status_code)
-
-
-
-        # List of tags should reflect the deletion
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        response = requests.get(path, headers=self._headers())
-
-        self.assertEqual(200, response.status_code)
-
-        tags = json.loads(response.text)['tags']
-
-        self.assertEqual(['sniff', 'snozz'], tags)
-
-
-
-        # Deleting the same tag should return a 404
-
-        path = self._url('/v2/images/%s/tags/gabe%%40example.com' % image_id)
-
-        response = requests.delete(path, headers=self._headers())
-
-        self.assertEqual(404, response.status_code)
-
-
-
-        self.stop_servers()
-
-
-
-    def test_images_container(self):
-
-        # Image list should be empty and no next link should be present
-
-        path = self._url('/v2/images')
-
-        response = requests.get(path, headers=self._headers())
-
-        self.assertEqual(200, response.status_code)
-
-        images = json.loads(response.text)['images']
-
-        first = json.loads(response.text)['first']
-
-        self.assertEqual(0, len(images))
-
-        self.assertTrue('next' not in json.loads(response.text))
-
-        self.assertEqual('/v2/images', first)
-
-
-
-        # Create 7 images
-
-        images = []
-
-        fixtures = [
-
-            {'name': 'image-3', 'type': 'kernel', 'ping': 'pong'},
-
-            {'name': 'image-4', 'type': 'kernel', 'ping': 'pong'},
-
-            {'name': 'image-1', 'type': 'kernel', 'ping': 'pong'},
-
-            {'name': 'image-3', 'type': 'ramdisk', 'ping': 'pong'},
-
-            {'name': 'image-2', 'type': 'kernel', 'ping': 'ding'},
-
-            {'name': 'image-3', 'type': 'kernel', 'ping': 'pong'},
-
-            {'name': 'image-2', 'type': 'kernel', 'ping': 'pong'},
-
-        ]
-
-        path = self._url('/v2/images')
-
-        headers = self._headers({'content-type': 'application/json'})
-
-        for fixture in fixtures:
-
-            data = json.dumps(fixture)
-
-            response = requests.post(path, headers=headers, data=data)
-
-            self.assertEqual(201, response.status_code)
-
-            images.append(json.loads(response.text))
-
-
-
-        # Image list should contain 7 images
-
-        path = self._url('/v2/images')
-
-        response = requests.get(path, headers=self._headers())
-
-        self.assertEqual(200, response.status_code)
-
-        body = json.loads(response.text)
-
-        self.assertEqual(7, len(body['images']))
-
-        self.assertEqual('/v2/images', body['first'])
-
-        self.assertFalse('next' in json.loads(response.text))
-
-
-
-        # Begin pagination after the first image
-
-        template_url = ('/v2/images?limit=2&sort_dir=asc&sort_key=name'
-
-                        '&marker=%s&type=kernel&ping=pong')
-
-        path = self._url(template_url % images[2]['id'])
-
-        response = requests.get(path, headers=self._headers())
-
-        self.assertEqual(200, response.status_code)
-
-        body = json.loads(response.text)
-
-        self.assertEqual(2, len(body['images']))
-
-        response_ids = [image['id'] for image in body['images']]
-
-        self.assertEqual([images[6]['id'], images[0]['id']], response_ids)
-
-
-
-        # Continue pagination using next link from previous request
-
-        path = self._url(body['next'])
-
-        response = requests.get(path, headers=self._headers())
-
-        self.assertEqual(200, response.status_code)
-
-        body = json.loads(response.text)
-
-        self.assertEqual(2, len(body['images']))
-
-        response_ids = [image['id'] for image in body['images']]
-
-        self.assertEqual([images[5]['id'], images[1]['id']], response_ids)
-
-
-
-        # Continue pagination - expect no results
-
-        path = self._url(body['next'])
-
-        response = requests.get(path, headers=self._headers())
-
-        self.assertEqual(200, response.status_code)
-
-        body = json.loads(response.text)
-
-        self.assertEqual(0, len(body['images']))
-
-
-
-        # Delete first image
-
-        path = self._url('/v2/images/%s' % images[0]['id'])
-
-        response = requests.delete(path, headers=self._headers())
-
-        self.assertEqual(204, response.status_code)
-
-
-
-        # Ensure bad request for using a deleted image as marker
-
-        path = self._url('/v2/images?marker=%s' % images[0]['id'])
-
-        response = requests.get(path, headers=self._headers())
-
-        self.assertEqual(400, response.status_code)
-
-
-
-        self.stop_servers()
-
-
-
-    def test_image_visibility_to_different_users(self):
-
-        self.cleanup()
-
-        self.api_server.deployment_flavor = 'fakeauth'
-
-        self.registry_server.deployment_flavor = 'fakeauth'
-
-        self.start_servers(**self.__dict__.copy())
-
-
-
-        owners = ['admin', 'tenant1', 'tenant2', 'none']
-
-        visibilities = ['public', 'private']
-
-
-
-        for owner in owners:
-
-            for visibility in visibilities:
-
-                path = self._url('/v2/images')
-
-                headers = self._headers({
-
-                    'content-type': 'application/json',
-
-                    'X-Auth-Token': 'createuser:%s:admin' % owner,
-
-                })
-
-                data = json.dumps({
-
-                    'name': '%s-%s' % (owner, visibility),
-
-                    'visibility': visibility,
-
-                })
-
-                response = requests.post(path, headers=headers, data=data)
-
-                self.assertEqual(201, response.status_code)
-
-
-
-        def list_images(tenant, role='', visibility=None):
-
-            auth_token = 'user:%s:%s' % (tenant, role)
-
-            headers = {'X-Auth-Token': auth_token}
-
-            path = self._url('/v2/images')
-
-            if visibility is not None:
-
-                path += '?visibility=%s' % visibility
-
-            response = requests.get(path, headers=headers)
-
-            self.assertEqual(response.status_code, 200)
-
-            return json.loads(response.text)['images']
-
-
-
-        # 1. Known user sees public and their own images
-
-        images = list_images('tenant1')
-
-        self.assertEquals(len(images), 5)
-
-        for image in images:
-
-            self.assertTrue(image['visibility'] == 'public'
-
-                            or 'tenant1' in image['name'])
-
-
-
-        # 2. Known user, visibility=public, sees all public images
-
-        images = list_images('tenant1', visibility='public')
-
-        self.assertEquals(len(images), 4)
-
-        for image in images:
-
-            self.assertEquals(image['visibility'], 'public')
-
-
-
-        # 3. Known user, visibility=private, sees only their private image
-
-        images = list_images('tenant1', visibility='private')
-
-        self.assertEquals(len(images), 1)
-
-        image = images[0]
-
-        self.assertEquals(image['visibility'], 'private')
-
-        self.assertTrue('tenant1' in image['name'])
-
-
-
-        # 4. Unknown user sees only public images
-
-        images = list_images('none')
-
-        self.assertEquals(len(images), 4)
-
-        for image in images:
-
-            self.assertEquals(image['visibility'], 'public')
-
-
-
-        # 5. Unknown user, visibility=public, sees only public images
-
-        images = list_images('none', visibility='public')
-
-        self.assertEquals(len(images), 4)
-
-        for image in images:
-
-            self.assertEquals(image['visibility'], 'public')
-
-
-
-        # 6. Unknown user, visibility=private, sees no images
-
-        images = list_images('none', visibility='private')
-
-        self.assertEquals(len(images), 0)
-
-
-
-        # 7. Unknown admin sees all images
-
-        images = list_images('none', role='admin')
-
-        self.assertEquals(len(images), 8)
-
-
-
-        # 8. Unknown admin, visibility=public, shows only public images
-
-        images = list_images('none', role='admin', visibility='public')
-
-        self.assertEquals(len(images), 4)
-
-        for image in images:
-
-            self.assertEquals(image['visibility'], 'public')
-
-
-
-        # 9. Unknown admin, visibility=private, sees only private images
-
-        images = list_images('none', role='admin', visibility='private')
-
-        self.assertEquals(len(images), 4)
-
-        for image in images:
-
-            self.assertEquals(image['visibility'], 'private')
-
-
-
-        # 10. Known admin sees all images
-
-        images = list_images('admin', role='admin')
-
-        self.assertEquals(len(images), 8)
-
-
-
-        # 11. Known admin, visibility=public, sees all public images
-
-        images = list_images('admin', role='admin', visibility='public')
-
-        self.assertEquals(len(images), 4)
-
-        for image in images:
-
-            self.assertEqual(image['visibility'], 'public')
-
-
-
-        # 12. Known admin, visibility=private, sees all private images
-
-        images = list_images('admin', role='admin', visibility='private')
-
-        self.assertEquals(len(images), 4)
-
-        for image in images:
-
-            self.assertEquals(image['visibility'], 'private')
-
-
-
-        self.stop_servers()
-
-
-
-
-
-class TestImageDirectURLVisibility(functional.FunctionalTest):
-
-
+class TestVirtDiskPaths(test.TestCase):
 
     def setUp(self):
 
-        super(TestImageDirectURLVisibility, self).setUp()
+        super(TestVirtDiskPaths, self).setUp()
 
-        self.cleanup()
 
-        self.api_server.deployment_flavor = 'noauth'
 
+        real_execute = utils.execute
 
 
-    def _url(self, path):
 
-        return 'http://127.0.0.1:%d%s' % (self.api_port, path)
+        def nonroot_execute(*cmd_parts, **kwargs):
 
+            kwargs.pop('run_as_root', None)
 
+            return real_execute(*cmd_parts, **kwargs)
 
-    def _headers(self, custom_headers=None):
 
-        base_headers = {
 
-            'X-Identity-Status': 'Confirmed',
+        self.stubs.Set(utils, 'execute', nonroot_execute)
 
-            'X-Auth-Token': '932c5c84-02ac-4fe5-a9ba-620af0e2bb96',
 
-            'X-User-Id': 'f9a41d13-0c13-47e9-bee2-ce4e8bfe958e',
 
-            'X-Tenant-Id': TENANT1,
+    def test_check_safe_path(self):
 
-            'X-Roles': 'member',
+        ret = disk_api._join_and_check_path_within_fs('/foo', 'etc',
 
-        }
+                                                      'something.conf')
 
-        base_headers.update(custom_headers or {})
+        self.assertEquals(ret, '/foo/etc/something.conf')
 
-        return base_headers
 
 
+    def test_check_unsafe_path(self):
 
-    def test_v2_not_enabled(self):
+        self.assertRaises(exception.Invalid,
 
-        self.api_server.enable_v2_api = False
+                          disk_api._join_and_check_path_within_fs,
 
-        self.start_servers(**self.__dict__.copy())
+                          '/foo', 'etc/../../../something.conf')
 
-        path = self._url('/v2/images')
 
-        response = requests.get(path, headers=self._headers())
 
-        self.assertEqual(300, response.status_code)
+    def test_inject_files_with_bad_path(self):
 
-        self.stop_servers()
+        self.assertRaises(exception.Invalid,
 
+                          disk_api._inject_file_into_fs,
 
+                          '/tmp', '/etc/../../../../etc/passwd',
 
-    def test_v2_enabled(self):
-
-        self.api_server.enable_v2_api = True
-
-        self.start_servers(**self.__dict__.copy())
-
-        path = self._url('/v2/images')
-
-        response = requests.get(path, headers=self._headers())
-
-        self.assertEqual(200, response.status_code)
-
-        self.stop_servers()
-
-
-
-    def test_image_direct_url_visible(self):
-
-
-
-        self.api_server.show_image_direct_url = True
-
-        self.start_servers(**self.__dict__.copy())
-
-
-
-        # Image list should be empty
-
-        path = self._url('/v2/images')
-
-        response = requests.get(path, headers=self._headers())
-
-        self.assertEqual(200, response.status_code)
-
-        images = json.loads(response.text)['images']
-
-        self.assertEqual(0, len(images))
-
-
-
-        # Create an image
-
-        path = self._url('/v2/images')
-
-        headers = self._headers({'content-type': 'application/json'})
-
-        data = json.dumps({'name': 'image-1', 'type': 'kernel', 'foo': 'bar'})
-
-        response = requests.post(path, headers=headers, data=data)
-
-        self.assertEqual(201, response.status_code)
-
-
-
-        # Get the image id
-
-        image = json.loads(response.text)
-
-        image_id = image['id']
-
-
-
-        # Image direct_url should not be visible before location is set
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        headers = self._headers({'Content-Type': 'application/json'})
-
-        response = requests.get(path, headers=headers)
-
-        self.assertEqual(200, response.status_code)
-
-        image = json.loads(response.text)
-
-        self.assertFalse('direct_url' in image)
-
-
-
-        # Upload some image data, setting the image location
-
-        path = self._url('/v2/images/%s/file' % image_id)
-
-        headers = self._headers({'Content-Type': 'application/octet-stream'})
-
-        response = requests.put(path, headers=headers, data='ZZZZZ')
-
-        self.assertEqual(201, response.status_code)
-
-
-
-        # Image direct_url should be visible
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        headers = self._headers({'Content-Type': 'application/json'})
-
-        response = requests.get(path, headers=headers)
-
-        self.assertEqual(200, response.status_code)
-
-        image = json.loads(response.text)
-
-        self.assertTrue('direct_url' in image)
-
-
-
-        # Image direct_url should be visible in a list
-
-        path = self._url('/v2/images')
-
-        headers = self._headers({'Content-Type': 'application/json'})
-
-        response = requests.get(path, headers=headers)
-
-        self.assertEqual(200, response.status_code)
-
-        image = json.loads(response.text)['images'][0]
-
-        self.assertTrue('direct_url' in image)
-
-
-
-        self.stop_servers()
-
-
-
-    def test_image_direct_url_not_visible(self):
-
-
-
-        self.api_server.show_image_direct_url = False
-
-        self.start_servers(**self.__dict__.copy())
-
-
-
-        # Image list should be empty
-
-        path = self._url('/v2/images')
-
-        response = requests.get(path, headers=self._headers())
-
-        self.assertEqual(200, response.status_code)
-
-        images = json.loads(response.text)['images']
-
-        self.assertEqual(0, len(images))
-
-
-
-        # Create an image
-
-        path = self._url('/v2/images')
-
-        headers = self._headers({'content-type': 'application/json'})
-
-        data = json.dumps({'name': 'image-1', 'type': 'kernel', 'foo': 'bar'})
-
-        response = requests.post(path, headers=headers, data=data)
-
-        self.assertEqual(201, response.status_code)
-
-
-
-        # Get the image id
-
-        image = json.loads(response.text)
-
-        image_id = image['id']
-
-
-
-        # Upload some image data, setting the image location
-
-        path = self._url('/v2/images/%s/file' % image_id)
-
-        headers = self._headers({'Content-Type': 'application/octet-stream'})
-
-        response = requests.put(path, headers=headers, data='ZZZZZ')
-
-        self.assertEqual(201, response.status_code)
-
-
-
-        # Image direct_url should not be visible
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        headers = self._headers({'Content-Type': 'application/json'})
-
-        response = requests.get(path, headers=headers)
-
-        self.assertEqual(200, response.status_code)
-
-        image = json.loads(response.text)
-
-        self.assertFalse('direct_url' in image)
-
-
-
-        # Image direct_url should not be visible in a list
-
-        path = self._url('/v2/images')
-
-        headers = self._headers({'Content-Type': 'application/json'})
-
-        response = requests.get(path, headers=headers)
-
-        self.assertEqual(200, response.status_code)
-
-        image = json.loads(response.text)['images'][0]
-
-        self.assertFalse('direct_url' in image)
-
-
-
-        self.stop_servers()
+                          'hax')

@@ -2,666 +2,284 @@
 # Safety: safe
 # Category: safe
 
-# (from BackInTime)
+"""Test the kernels service API."""
 
-# Copyright (C) 2015-2017 Germar Reitze
 
-#
 
-# This program is free software; you can redistribute it and/or modify
+import json
 
-# it under the terms of the GNU General Public License as published by
+import requests
 
-# the Free Software Foundation; either version 2 of the License, or
 
-# (at your option) any later version.
 
-#
+from IPython.html.utils import url_path_join
 
-# This program is distributed in the hope that it will be useful,
+from IPython.html.tests.launchnotebook import NotebookTestBase, assert_http_error
 
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
 
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 
-# GNU General Public License for more details.
+class KernelAPI(object):
 
-#
+    """Wrapper for kernel REST API requests"""
 
-# You should have received a copy of the GNU General Public License along
+    def __init__(self, base_url):
 
-# with this program; if not, write to the Free Software Foundation, Inc.,
+        self.base_url = base_url
 
-# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 
+    def _req(self, verb, path, body=None):
 
-# (from jockey)
+        response = requests.request(verb,
 
-# (c) 2008 Canonical Ltd.
+                url_path_join(self.base_url, 'api/kernels', path), data=body)
 
-#
 
-# This program is free software; you can redistribute it and/or modify
 
-# it under the terms of the GNU General Public License as published by
+        if 400 <= response.status_code < 600:
 
-# the Free Software Foundation; either version 2 of the License, or
+            try:
 
-# (at your option) any later version.
+                response.reason = response.json()['message']
 
-#
+            except:
 
-# This program is distributed in the hope that it will be useful,
+                pass
 
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
+        response.raise_for_status()
 
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 
-# GNU General Public License for more details.
 
-#
+        return response
 
-# You should have received a copy of the GNU General Public License along
 
-# with this program; if not, write to the Free Software Foundation, Inc.,
 
-# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+    def list(self):
 
+        return self._req('GET', '')
 
 
-# (from python-dbus-docs)
 
-# Copyright (C) 2004-2006 Red Hat Inc. <http://www.redhat.com/>
+    def get(self, id):
 
-# Copyright (C) 2005-2007 Collabora Ltd. <http://www.collabora.co.uk/>
+        return self._req('GET', id)
 
-#
 
-# Permission is hereby granted, free of charge, to any person
 
-# obtaining a copy of this software and associated documentation
+    def start(self, name='python'):
 
-# files (the "Software"), to deal in the Software without
+        body = json.dumps({'name': name})
 
-# restriction, including without limitation the rights to use, copy,
+        return self._req('POST', '', body)
 
-# modify, merge, publish, distribute, sublicense, and/or sell copies
 
-# of the Software, and to permit persons to whom the Software is
 
-# furnished to do so, subject to the following conditions:
+    def shutdown(self, id):
 
-#
+        return self._req('DELETE', id)
 
-# The above copyright notice and this permission notice shall be
 
-# included in all copies or substantial portions of the Software.
 
-#
+    def interrupt(self, id):
 
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+        return self._req('POST', url_path_join(id, 'interrupt'))
 
-# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
 
-# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
 
-# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+    def restart(self, id):
 
-# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+        return self._req('POST', url_path_join(id, 'restart'))
 
-# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 
-# DEALINGS IN THE SOFTWARE.
+class KernelAPITest(NotebookTestBase):
 
-#
+    """Test the kernels web service API"""
 
-# This file was modified by David D. Lowe in 2009.
+    def setUp(self):
 
-# To the extent possible under law, David D. Lowe has waived all
+        self.kern_api = KernelAPI(self.base_url())
 
-# copyright and related or neighboring rights to his modifications to
 
-# this file under this license: http://creativecommons.org/publicdomain/zero/1.0/
 
+    def tearDown(self):
 
+        for k in self.kern_api.list().json():
 
-import os
+            self.kern_api.shutdown(k['id'])
 
-import re
 
-from subprocess import Popen, PIPE
 
-try:
+    def test__no_kernels(self):
 
-    import pwd
+        """Make sure there are no kernels running at the start"""
 
-except ImportError:
+        kernels = self.kern_api.list().json()
 
-    pwd = None
+        self.assertEqual(kernels, [])
 
 
 
-import dbus
+    def test_default_kernel(self):
 
-import dbus.service
+        # POST request
 
-import dbus.mainloop.pyqt5
+        r = self.kern_api._req('POST', '')
 
-from PyQt5.QtCore import QCoreApplication
+        kern1 = r.json()
 
+        self.assertEqual(r.headers['location'], '/api/kernels/' + kern1['id'])
 
+        self.assertEqual(r.status_code, 201)
 
-UDEV_RULES_PATH = '/etc/udev/rules.d/99-backintime-%s.rules'
+        self.assertIsInstance(kern1, dict)
 
 
 
-class InvalidChar(dbus.DBusException):
+        self.assertEqual(r.headers['Content-Security-Policy'], (
 
-    _dbus_error_name = 'net.launchpad.backintime.InvalidChar'
+                            "frame-ancestors 'self'; "
 
+                            "report-uri /api/security/csp-report; "
 
+                            "default-src 'none'"
 
-class InvalidCmd(dbus.DBusException):
+        ))
 
-    _dbus_error_name = 'net.launchpad.backintime.InvalidCmd'
 
 
+    def test_main_kernel_handler(self):
 
-class LimitExceeded(dbus.DBusException):
+        # POST request
 
-    _dbus_error_name = 'net.launchpad.backintime.LimitExceeded'
+        r = self.kern_api.start()
 
+        kern1 = r.json()
 
+        self.assertEqual(r.headers['location'], '/api/kernels/' + kern1['id'])
 
-class PermissionDeniedByPolicy(dbus.DBusException):
+        self.assertEqual(r.status_code, 201)
 
-    _dbus_error_name = 'com.ubuntu.DeviceDriver.PermissionDeniedByPolicy'
+        self.assertIsInstance(kern1, dict)
 
 
 
-class UdevRules(dbus.service.Object):
+        self.assertEqual(r.headers['Content-Security-Policy'], (
 
-    def __init__(self, conn=None, object_path=None, bus_name=None):
+                            "frame-ancestors 'self'; "
 
-        super(UdevRules, self).__init__(conn, object_path, bus_name)
+                            "report-uri /api/security/csp-report; "
 
+                            "default-src 'none'"
 
+        ))
 
-        # the following variables are used by _checkPolkitPrivilege
 
-        self.polkit = None
 
-        self.enforce_polkit = True
+        # GET request
 
+        r = self.kern_api.list()
 
+        self.assertEqual(r.status_code, 200)
 
-        self.tmpDict = {}
+        assert isinstance(r.json(), list)
 
+        self.assertEqual(r.json()[0]['id'], kern1['id'])
 
+        self.assertEqual(r.json()[0]['name'], kern1['name'])
 
-        #find su path
 
-        self.su = self._which('su', '/bin/su')
 
-        self.backintime = self._which('backintime', '/usr/bin/backintime')
+        # create another kernel and check that they both are added to the
 
-        self.nice = self._which('nice', '/usr/bin/nice')
+        # list of kernels from a GET request
 
-        self.ionice = self._which('ionice', '/usr/bin/ionice')
+        kern2 = self.kern_api.start().json()
 
-        self.max_rules = 100
+        assert isinstance(kern2, dict)
 
-        self.max_users = 20
+        r = self.kern_api.list()
 
-        self.max_cmd_len = 100
+        kernels = r.json()
 
+        self.assertEqual(r.status_code, 200)
 
+        assert isinstance(kernels, list)
 
-    def _which(self, exe, fallback):
+        self.assertEqual(len(kernels), 2)
 
-        proc = Popen(['which', exe], stdout = PIPE)
 
-        ret = proc.communicate()[0].strip().decode()
 
-        if proc.returncode or not ret:
+        # Interrupt a kernel
 
-            return fallback
+        r = self.kern_api.interrupt(kern2['id'])
 
+        self.assertEqual(r.status_code, 204)
 
 
-        return ret
 
+        # Restart a kernel
 
+        r = self.kern_api.restart(kern2['id'])
 
-    def _validateCmd(self, cmd):
+        self.assertEqual(r.headers['Location'], '/api/kernels/'+kern2['id'])
 
+        rekern = r.json()
 
+        self.assertEqual(rekern['id'], kern2['id'])
 
-        if cmd.find("&&") != -1:
+        self.assertEqual(rekern['name'], kern2['name'])
 
-            raise InvalidCmd("Parameter 'cmd' contains '&&' concatenation")
 
-        # make sure it starts with an absolute path
 
-        elif not cmd.startswith(os.path.sep):
+    def test_kernel_handler(self):
 
-            raise InvalidCmd("Parameter 'cmd' does not start with '/'")
+        # GET kernel with given id
 
+        kid = self.kern_api.start().json()['id']
 
+        r = self.kern_api.get(kid)
 
-        parts = cmd.split()
+        kern1 = r.json()
 
+        self.assertEqual(r.status_code, 200)
 
+        assert isinstance(kern1, dict)
 
-        # make sure only well known commands and switches are used
+        self.assertIn('id', kern1)
 
-        whitelist = (
+        self.assertEqual(kern1['id'], kid)
 
-            (self.nice, ("-n")),
 
-            (self.ionice, ("-c", "-n")),
 
-        )
+        # Request a bad kernel id and check that a JSON
 
+        # message is returned!
 
+        bad_id = '111-111-111-111-111'
 
-        for c, switches in whitelist:
+        with assert_http_error(404, 'Kernel does not exist: ' + bad_id):
 
-            if parts and parts[0] == c:
+            self.kern_api.get(bad_id)
 
-                parts.pop(0)
 
-                for sw in switches:
 
-                    while parts and parts[0].startswith(sw):
+        # DELETE kernel with id
 
-                        parts.pop(0)
+        r = self.kern_api.shutdown(kid)
 
+        self.assertEqual(r.status_code, 204)
 
+        kernels = self.kern_api.list().json()
 
-        if not parts:
+        self.assertEqual(kernels, [])
 
-            raise InvalidCmd("Parameter 'cmd' does not contain the backintime command")
 
-        elif parts[0] != self.backintime:
 
-            raise InvalidCmd("Parameter 'cmd' contains non-whitelisted cmd/parameter (%s)" % parts[0])
+        # Request to delete a non-existent kernel id
 
+        bad_id = '111-111-111-111-111'
 
+        with assert_http_error(404, 'Kernel does not exist: ' + bad_id):
 
-    def _checkLimits(self, owner, cmd):
-
-
-
-        if len(self.tmpDict.get(owner, [])) >= self.max_rules:
-
-            raise LimitExceeded("Maximum number of cached rules reached (%d)"
-
-                            % self.max_rules)
-
-        elif len(self.tmpDict) >= self.max_users:
-
-            raise LimitExceeded("Maximum number of cached users reached (%d)"
-
-                            % self.max_users)
-
-        elif len(cmd) > self.max_cmd_len:
-
-            raise LimitExceeded("Maximum length of command line reached (%d)"
-
-                            % self.max_cmd_len)
-
-
-
-    @dbus.service.method("net.launchpad.backintime.serviceHelper.UdevRules",
-
-                         in_signature='ss', out_signature='',
-
-                         sender_keyword='sender', connection_keyword='conn')
-
-    def addRule(self, cmd, uuid, sender=None, conn=None):
-
-        """
-
-        Receive command and uuid and create an Udev rule out of this.
-
-        This is done on the service side to prevent malicious code to
-
-        run as root.
-
-        """
-
-        #prevent breaking out of su command
-
-        chars = re.findall(r'[^a-zA-Z0-9-/\.>& ]', cmd)
-
-        if chars:
-
-            raise InvalidChar("Parameter 'cmd' contains invalid character(s) %s"
-
-                              % '|'.join(set(chars)))
-
-        #only allow relevant chars in uuid
-
-        chars = re.findall(r'[^a-zA-Z0-9-]', uuid)
-
-        if chars:
-
-            raise InvalidChar("Parameter 'uuid' contains invalid character(s) %s"
-
-                              % '|'.join(set(chars)))
-
-
-
-        self._validateCmd(cmd)
-
-
-
-        info = SenderInfo(sender, conn)
-
-        user = info.connectionUnixUser()
-
-        owner = info.nameOwner()
-
-
-
-        self._checkLimits(owner, cmd)
-
-
-
-        #create su command
-
-        sucmd = "%s - '%s' -c '%s'" %(self.su, user, cmd)
-
-        #create Udev rule
-
-        rule = 'ACTION=="add|change", ENV{ID_FS_UUID}=="%s", RUN+="%s"\n' %(uuid, sucmd)
-
-
-
-        #store rule
-
-        if not owner in self.tmpDict:
-
-            self.tmpDict[owner] = []
-
-        self.tmpDict[owner].append(rule)
-
-
-
-    @dbus.service.method("net.launchpad.backintime.serviceHelper.UdevRules",
-
-                         in_signature='', out_signature='b',
-
-                         sender_keyword='sender', connection_keyword='conn')
-
-    def save(self, sender=None, conn=None):
-
-        """
-
-        Save rules to destiantion file after user authenticated as admin.
-
-        This will first check if there are any changes between
-
-        temporary added rules and current rules in destiantion file.
-
-        Returns False if files are identical or no rules to be installed.
-
-        """
-
-        info = SenderInfo(sender, conn)
-
-        user = info.connectionUnixUser()
-
-        owner = info.nameOwner()
-
-
-
-        #delete rule if no rules in tmp
-
-        if not owner in self.tmpDict or not self.tmpDict[owner]:
-
-            self.delete(sender, conn)
-
-            return False
-
-        #return False if rule already exist.
-
-        if os.path.exists(UDEV_RULES_PATH % user):
-
-            with open(UDEV_RULES_PATH % user, 'r') as f:
-
-                if self.tmpDict[owner] == f.readlines():
-
-                    self._clean(owner)
-
-                    return False
-
-        #auth to save changes
-
-        self._checkPolkitPrivilege(sender, conn, 'net.launchpad.backintime.UdevRuleSave')
-
-        with open(UDEV_RULES_PATH % user, 'w') as f:
-
-            f.writelines(self.tmpDict[owner])
-
-        self._clean(owner)
-
-        return True
-
-
-
-    @dbus.service.method("net.launchpad.backintime.serviceHelper.UdevRules",
-
-                         in_signature='', out_signature='',
-
-                         sender_keyword='sender', connection_keyword='conn')
-
-    def delete(self, sender=None, conn=None):
-
-        """
-
-        Delete existing Udev rule
-
-        """
-
-        info = SenderInfo(sender, conn)
-
-        user = info.connectionUnixUser()
-
-        owner = info.nameOwner()
-
-        self._clean(owner)
-
-        if os.path.exists(UDEV_RULES_PATH % user):
-
-            #auth to delete rule
-
-            self._checkPolkitPrivilege(sender, conn, 'net.launchpad.backintime.UdevRuleDelete')
-
-            os.remove(UDEV_RULES_PATH % user)
-
-
-
-    @dbus.service.method("net.launchpad.backintime.serviceHelper.UdevRules",
-
-                         in_signature='', out_signature='',
-
-                         sender_keyword='sender', connection_keyword='conn')
-
-    def clean(self, sender=None, conn=None):
-
-        """
-
-        clean up previous cached rules
-
-        """
-
-        info = SenderInfo(sender, conn)
-
-        self._clean(info.nameOwner())
-
-
-
-    def _clean(self, owner):
-
-        if owner in self.tmpDict:
-
-            del self.tmpDict[owner]
-
-
-
-    def _initPolkit(self):
-
-        if self.polkit is None:
-
-            self.polkit = dbus.Interface(dbus.SystemBus().get_object(
-
-                'org.freedesktop.PolicyKit1',
-
-                '/org/freedesktop/PolicyKit1/Authority', False),
-
-                'org.freedesktop.PolicyKit1.Authority')
-
-
-
-    def _checkPolkitPrivilege(self, sender, conn, privilege):
-
-        # from jockey
-
-        """
-
-        Verify that sender has a given PolicyKit privilege.
-
-
-
-        sender is the sender's (private) D-BUS name, such as ":1:42"
-
-        (sender_keyword in @dbus.service.methods). conn is
-
-        the dbus.Connection object (connection_keyword in
-
-        @dbus.service.methods). privilege is the PolicyKit privilege string.
-
-
-
-        This method returns if the caller is privileged, and otherwise throws a
-
-        PermissionDeniedByPolicy exception.
-
-        """
-
-        if sender is None and conn is None:
-
-            # called locally, not through D-BUS
-
-            return
-
-        if not self.enforce_polkit:
-
-            # that happens for testing purposes when running on the session
-
-            # bus, and it does not make sense to restrict operations here
-
-            return
-
-
-
-        # query PolicyKit
-
-        self._initPolkit()
-
-        try:
-
-            # we don't need is_challenge return here, since we call with AllowUserInteraction
-
-            (is_auth, _, details) = self.polkit.CheckAuthorization(
-
-                    ('system-bus-name', {'name': dbus.String(sender, variant_level=1)}),
-
-                    privilege, {'': ''}, dbus.UInt32(1), '', timeout=3000)
-
-        except dbus.DBusException as e:
-
-            if e._dbus_error_name == 'org.freedesktop.DBus.Error.ServiceUnknown':
-
-                # polkitd timed out, connect again
-
-                self.polkit = None
-
-                return self._checkPolkitPrivilege(sender, conn, privilege)
-
-            else:
-
-                raise
-
-
-
-        if not is_auth:
-
-            raise PermissionDeniedByPolicy(privilege)
-
-
-
-class SenderInfo(object):
-
-    def __init__(self, sender, conn):
-
-        self.sender = sender
-
-        self.dbus_info = dbus.Interface(conn.get_object('org.freedesktop.DBus',
-
-                '/org/freedesktop/DBus/Bus', False), 'org.freedesktop.DBus')
-
-
-
-    def connectionUnixUser(self):
-
-        uid = self.dbus_info.GetConnectionUnixUser(self.sender)
-
-        if pwd:
-
-            return pwd.getpwuid(uid).pw_name
-
-        else:
-
-            return uid
-
-
-
-    def nameOwner(self):
-
-        return self.dbus_info.GetNameOwner(self.sender)
-
-
-
-    def connectionPid(self):
-
-        return self.dbus_info.GetConnectionUnixProcessID(self.sender)
-
-
-
-if __name__ == '__main__':
-
-    dbus.mainloop.pyqt5.DBusQtMainLoop(set_as_default=True)
-
-
-
-    app = QCoreApplication([])
-
-
-
-    bus = dbus.SystemBus()
-
-    name = dbus.service.BusName("net.launchpad.backintime.serviceHelper", bus)
-
-    object = UdevRules(bus, '/UdevRules')
-
-
-
-    print("Running BIT service.")
-
-    app.exec_()
+            self.kern_api.shutdown(bad_id)

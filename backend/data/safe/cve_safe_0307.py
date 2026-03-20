@@ -2,52 +2,234 @@
 # Safety: safe
 # Category: safe
 
-from django.conf.urls.defaults import patterns
+# This file is dual licensed under the terms of the Apache License, Version
 
-from django.contrib.auth.urls import urlpatterns
+# 2.0, and the BSD License. See the LICENSE file in the root of this repository
 
-from django.contrib.auth.views import password_reset
-
-from django.contrib.auth.decorators import login_required
-
-from django.http import HttpResponse
-
-from django.template import Template, RequestContext
-
-from django.views.decorators.cache import never_cache
+# for complete details.
 
 
 
-@never_cache
-
-def remote_user_auth_view(request):
-
-    "Dummy view for remote user tests"
-
-    t = Template("Username is {{ user }}.")
-
-    c = RequestContext(request, {})
-
-    return HttpResponse(t.render(c))
+from __future__ import absolute_import, division, print_function
 
 
 
-# special urls for auth test cases
+import six
 
-urlpatterns = urlpatterns + patterns('',
 
-    (r'^logout/custom_query/$', 'django.contrib.auth.views.logout', dict(redirect_field_name='follow')),
 
-    (r'^logout/next_page/$', 'django.contrib.auth.views.logout', dict(next_page='/somewhere/')),
+from cryptography import utils
 
-    (r'^remote_user/$', remote_user_auth_view),
+from cryptography.exceptions import (
 
-    (r'^password_reset_from_email/$', 'django.contrib.auth.views.password_reset', dict(from_email='staffmember@example.com')),
-
-    (r'^admin_password_reset/$', 'django.contrib.auth.views.password_reset', dict(is_admin_site=True)),
-
-    (r'^login_required/$', login_required(password_reset)),
-
-    (r'^login_required_login_url/$', login_required(password_reset, login_url='/somewhere/')),
+    AlreadyFinalized, InvalidKey, UnsupportedAlgorithm, _Reasons
 
 )
+
+from cryptography.hazmat.backends.interfaces import HMACBackend
+
+from cryptography.hazmat.primitives import constant_time, hmac
+
+from cryptography.hazmat.primitives.kdf import KeyDerivationFunction
+
+
+
+
+
+@utils.register_interface(KeyDerivationFunction)
+
+class HKDF(object):
+
+    def __init__(self, algorithm, length, salt, info, backend):
+
+        if not isinstance(backend, HMACBackend):
+
+            raise UnsupportedAlgorithm(
+
+                "Backend object does not implement HMACBackend.",
+
+                _Reasons.BACKEND_MISSING_INTERFACE
+
+            )
+
+
+
+        self._algorithm = algorithm
+
+
+
+        if not (salt is None or isinstance(salt, bytes)):
+
+            raise TypeError("salt must be bytes.")
+
+
+
+        if salt is None:
+
+            salt = b"\x00" * (self._algorithm.digest_size // 8)
+
+
+
+        self._salt = salt
+
+
+
+        self._backend = backend
+
+
+
+        self._hkdf_expand = HKDFExpand(self._algorithm, length, info, backend)
+
+
+
+    def _extract(self, key_material):
+
+        h = hmac.HMAC(self._salt, self._algorithm, backend=self._backend)
+
+        h.update(key_material)
+
+        return h.finalize()
+
+
+
+    def derive(self, key_material):
+
+        if not isinstance(key_material, bytes):
+
+            raise TypeError("key_material must be bytes.")
+
+
+
+        return self._hkdf_expand.derive(self._extract(key_material))
+
+
+
+    def verify(self, key_material, expected_key):
+
+        if not constant_time.bytes_eq(self.derive(key_material), expected_key):
+
+            raise InvalidKey
+
+
+
+
+
+@utils.register_interface(KeyDerivationFunction)
+
+class HKDFExpand(object):
+
+    def __init__(self, algorithm, length, info, backend):
+
+        if not isinstance(backend, HMACBackend):
+
+            raise UnsupportedAlgorithm(
+
+                "Backend object does not implement HMACBackend.",
+
+                _Reasons.BACKEND_MISSING_INTERFACE
+
+            )
+
+
+
+        self._algorithm = algorithm
+
+
+
+        self._backend = backend
+
+
+
+        max_length = 255 * (algorithm.digest_size // 8)
+
+
+
+        if length > max_length:
+
+            raise ValueError(
+
+                "Can not derive keys larger than {0} octets.".format(
+
+                    max_length
+
+                ))
+
+
+
+        self._length = length
+
+
+
+        if not (info is None or isinstance(info, bytes)):
+
+            raise TypeError("info must be bytes.")
+
+
+
+        if info is None:
+
+            info = b""
+
+
+
+        self._info = info
+
+
+
+        self._used = False
+
+
+
+    def _expand(self, key_material):
+
+        output = [b""]
+
+        counter = 1
+
+
+
+        while self._algorithm.digest_size * (len(output) - 1) < self._length:
+
+            h = hmac.HMAC(key_material, self._algorithm, backend=self._backend)
+
+            h.update(output[-1])
+
+            h.update(self._info)
+
+            h.update(six.int2byte(counter))
+
+            output.append(h.finalize())
+
+            counter += 1
+
+
+
+        return b"".join(output)[:self._length]
+
+
+
+    def derive(self, key_material):
+
+        if not isinstance(key_material, bytes):
+
+            raise TypeError("key_material must be bytes.")
+
+
+
+        if self._used:
+
+            raise AlreadyFinalized
+
+
+
+        self._used = True
+
+        return self._expand(key_material)
+
+
+
+    def verify(self, key_material, expected_key):
+
+        if not constant_time.bytes_eq(self.derive(key_material), expected_key):
+
+            raise InvalidKey

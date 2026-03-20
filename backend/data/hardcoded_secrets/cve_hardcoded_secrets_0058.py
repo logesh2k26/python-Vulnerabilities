@@ -2,330 +2,224 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
-
-
-# Copyright 2012 United States Government as represented by the
-
-# Administrator of the National Aeronautics and Space Administration.
-
-# All Rights Reserved.
+# Copyright 2020 The TensorFlow Authors. All Rights Reserved.
 
 #
 
-# Copyright 2012 Nebula, Inc.
+# Licensed under the Apache License, Version 2.0 (the "License");
+
+# you may not use this file except in compliance with the License.
+
+# You may obtain a copy of the License at
 
 #
 
-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
-
-#    not use this file except in compliance with the License. You may obtain
-
-#    a copy of the License at
+#     http://www.apache.org/licenses/LICENSE-2.0
 
 #
 
-#         http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
 
-#
+# distributed under the License is distributed on an "AS IS" BASIS,
 
-#    Unless required by applicable law or agreed to in writing, software
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 
-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# See the License for the specific language governing permissions and
 
-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# limitations under the License.
 
-#    License for the specific language governing permissions and limitations
+# ==============================================================================
 
-#    under the License.
+"""Tests for DLPack functions."""
 
-"""
+from __future__ import absolute_import
 
-Classes and methods related to user handling in Horizon.
+from __future__ import division
 
-"""
+from __future__ import print_function
 
 
 
-import logging
+from absl.testing import parameterized
 
+import numpy as np
 
 
-from django.utils.translation import ugettext as _
 
+from tensorflow.python.dlpack import dlpack
 
+from tensorflow.python.framework import constant_op
 
-from horizon import api
+from tensorflow.python.framework import dtypes
 
-from horizon import exceptions
+from tensorflow.python.framework import ops
 
+from tensorflow.python.platform import test
 
+from tensorflow.python.ops import array_ops
 
 
 
-LOG = logging.getLogger(__name__)
+int_dtypes = [
 
+    np.int8, np.int16, np.int32, np.int64, np.uint8, np.uint16, np.uint32,
 
+    np.uint64
 
+]
 
+float_dtypes = [np.float16, np.float32, np.float64]
 
-def get_user_from_request(request):
+complex_dtypes = [np.complex64, np.complex128]
 
-    """ Checks the current session and returns a :class:`~horizon.users.User`.
+dlpack_dtypes = int_dtypes + float_dtypes + [dtypes.bfloat16]
 
 
 
-    If the session contains user data the User will be treated as
+testcase_shapes = [(), (1,), (2, 3), (2, 0), (0, 7), (4, 1, 2)]
 
-    authenticated and the :class:`~horizon.users.User` will have all
 
-    its attributes set.
 
 
 
-    If not, the :class:`~horizon.users.User` will have no attributes set.
+def FormatShapeAndDtype(shape, dtype):
 
+  return "_{}[{}]".format(str(dtype), ",".join(map(str, shape)))
 
 
-    If the session contains invalid data,
 
-    :exc:`~horizon.exceptions.NotAuthorized` will be raised.
 
-    """
 
-    if 'user_id' not in request.session:
+def GetNamedTestParameters():
 
-        return User()
+  result = []
 
-    try:
+  for dtype in dlpack_dtypes:
 
-        return User(id=request.session['user_id'],
+    for shape in testcase_shapes:
 
-                    token=request.session['token'],
+      result.append({
 
-                    user=request.session['user_name'],
+          "testcase_name": FormatShapeAndDtype(shape, dtype),
 
-                    tenant_id=request.session['tenant_id'],
+          "dtype": dtype,
 
-                    tenant_name=request.session['tenant'],
+          "shape": shape
 
-                    service_catalog=request.session['serviceCatalog'],
+      })
 
-                    roles=request.session['roles'],
+  return result
 
-                    request=request)
 
-    except KeyError:
 
-        # If any of those keys are missing from the session it is
 
-        # overwhelmingly likely that we're dealing with an outdated session.
 
-        LOG.exception("Error while creating User from session.")
+class DLPackTest(parameterized.TestCase, test.TestCase):
 
-        request.session.clear()
 
-        raise exceptions.NotAuthorized(_("Your session has expired. "
 
-                                         "Please log in again."))
+  @parameterized.named_parameters(GetNamedTestParameters())
 
+  def testRoundTrip(self, dtype, shape):
 
+    np.random.seed(42)
 
+    np_array = np.random.randint(0, 10, shape)
 
+    # copy to gpu if available
 
-class LazyUser(object):
+    tf_tensor = array_ops.identity(constant_op.constant(np_array, dtype=dtype))
 
-    def __get__(self, request, obj_type=None):
+    tf_tensor_device = tf_tensor.device
 
-        if not hasattr(request, '_cached_user'):
+    tf_tensor_dtype = tf_tensor.dtype
 
-            request._cached_user = get_user_from_request(request)
+    dlcapsule = dlpack.to_dlpack(tf_tensor)
 
-        return request._cached_user
+    del tf_tensor  # should still work
 
+    tf_tensor2 = dlpack.from_dlpack(dlcapsule)
 
+    self.assertAllClose(np_array, tf_tensor2)
 
+    if tf_tensor_dtype == dtypes.int32:
 
+      # int32 tensor is always on cpu for now
 
-class User(object):
+      self.assertEqual(tf_tensor2.device,
 
-    """ The main user class which Horizon expects.
+                       "/job:localhost/replica:0/task:0/device:CPU:0")
 
+    else:
 
+      self.assertEqual(tf_tensor_device, tf_tensor2.device)
 
-    .. attribute:: token
 
 
+  def testTensorsCanBeConsumedOnceOnly(self):
 
-        The id of the Keystone token associated with the current user/tenant.
+    np.random.seed(42)
 
+    np_array = np.random.randint(0, 10, (2, 3, 4))
 
+    tf_tensor = constant_op.constant(np_array, dtype=np.float32)
 
-    .. attribute:: username
+    dlcapsule = dlpack.to_dlpack(tf_tensor)
 
+    del tf_tensor  # should still work
 
+    _ = dlpack.from_dlpack(dlcapsule)
 
-        The name of the current user.
 
 
+    def ConsumeDLPackTensor():
 
-    .. attribute:: tenant_id
+      dlpack.from_dlpack(dlcapsule)  # Should can be consumed only once
 
 
 
-        The id of the Keystone tenant for the current user/token.
+    self.assertRaisesRegex(Exception,
 
+                           ".*a DLPack tensor may be consumed at most once.*",
 
+                           ConsumeDLPackTensor)
 
-    .. attribute:: tenant_name
 
 
+  def testUnsupportedTypeToDLPack(self):
 
-        The name of the Keystone tenant for the current user/token.
 
 
+    def UnsupportedQint16():
 
-    .. attribute:: service_catalog
+      tf_tensor = constant_op.constant([[1, 4], [5, 2]], dtype=dtypes.qint16)
 
+      _ = dlpack.to_dlpack(tf_tensor)
 
 
-        The ``ServiceCatalog`` data returned by Keystone.
 
+    def UnsupportedComplex64():
 
+      tf_tensor = constant_op.constant([[1, 4], [5, 2]], dtype=dtypes.complex64)
 
-    .. attribute:: roles
+      _ = dlpack.to_dlpack(tf_tensor)
 
 
 
-        A list of dictionaries containing role names and ids as returned
+    self.assertRaisesRegex(Exception, ".* is not supported by dlpack",
 
-        by Keystone.
+                           UnsupportedQint16)
 
+    self.assertRaisesRegex(Exception, ".* is not supported by dlpack",
 
+                           UnsupportedComplex64)
 
-    .. attribute:: admin
 
 
 
-        Boolean value indicating whether or not this user has admin
 
-        privileges. Internally mapped to :meth:`horizon.users.User.is_admin`.
+if __name__ == "__main__":
 
-    """
+  ops.enable_eager_execution()
 
-    def __init__(self, id=None, token=None, user=None, tenant_id=None,
-
-                    service_catalog=None, tenant_name=None, roles=None,
-
-                    authorized_tenants=None, request=None):
-
-        self.id = id
-
-        self.token = token
-
-        self.username = user
-
-        self.tenant_id = tenant_id
-
-        self.tenant_name = tenant_name
-
-        self.service_catalog = service_catalog
-
-        self.roles = roles or []
-
-        self._authorized_tenants = authorized_tenants
-
-        # Store the request for lazy fetching of auth'd tenants
-
-        self._request = request
-
-
-
-    def is_authenticated(self):
-
-        """
-
-        Evaluates whether this :class:`.User` instance has been authenticated.
-
-        Returns ``True`` or ``False``.
-
-        """
-
-        # TODO: deal with token expiration
-
-        return self.token
-
-
-
-    @property
-
-    def admin(self):
-
-        return self.is_admin()
-
-
-
-    def is_admin(self):
-
-        """
-
-        Evaluates whether this user has admin privileges. Returns
-
-        ``True`` or ``False``.
-
-        """
-
-        for role in self.roles:
-
-            if role['name'].lower() == 'admin':
-
-                return True
-
-        return False
-
-
-
-    def get_and_delete_messages(self):
-
-        """
-
-        Placeholder function for parity with
-
-        ``django.contrib.auth.models.User``.
-
-        """
-
-        return []
-
-
-
-    @property
-
-    def authorized_tenants(self):
-
-        if self.is_authenticated() and self._authorized_tenants is None:
-
-            try:
-
-                token = self._request.session.get("unscoped_token", self.token)
-
-                authd = api.tenant_list_for_token(self._request, token)
-
-            except:
-
-                authd = []
-
-                LOG.exception('Could not retrieve tenant list.')
-
-            self._authorized_tenants = authd
-
-        return self._authorized_tenants
-
-
-
-    @authorized_tenants.setter
-
-    def authorized_tenants(self, tenant_list):
-
-        self._authorized_tenants = tenant_list
+  test.main()

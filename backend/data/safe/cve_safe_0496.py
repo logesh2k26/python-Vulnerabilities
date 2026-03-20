@@ -2,2298 +2,906 @@
 # Safety: safe
 # Category: safe
 
-# vim: ft=python fileencoding=utf-8 sts=4 sw=4 et:
+import os
 
+import re
 
+import urllib
 
-# Copyright 2016-2020 Florian Bruhin (The Compiler) <mail@qutebrowser.org>
 
-#
 
-# This file is part of qutebrowser.
+from django.conf import settings
 
-#
+from django.contrib.auth import SESSION_KEY, REDIRECT_FIELD_NAME
 
-# qutebrowser is free software: you can redistribute it and/or modify
+from django.contrib.auth.forms import AuthenticationForm
 
-# it under the terms of the GNU General Public License as published by
+from django.contrib.sites.models import Site, RequestSite
 
-# the Free Software Foundation, either version 3 of the License, or
+from django.contrib.auth.models import User
 
-# (at your option) any later version.
+from django.test import TestCase
 
-#
+from django.core import mail
 
-# qutebrowser is distributed in the hope that it will be useful,
+from django.core.exceptions import SuspiciousOperation
 
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
+from django.core.urlresolvers import reverse
 
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+from django.http import QueryDict
 
-# GNU General Public License for more details.
 
-#
 
-# You should have received a copy of the GNU General Public License
-
-# along with qutebrowser.  If not, see <http://www.gnu.org/licenses/>.
-
-
-
-"""Base class for a wrapper over QWebView/QWebEngineView."""
-
-
-
-import enum
-
-import itertools
-
-import typing
-
-import functools
-
-
-
-import attr
-
-from PyQt5.QtCore import (pyqtSignal, pyqtSlot, QUrl, QObject, QSizeF, Qt,
-
-                          QEvent, QPoint)
-
-from PyQt5.QtGui import QKeyEvent, QIcon
-
-from PyQt5.QtWidgets import QWidget, QApplication, QDialog
-
-from PyQt5.QtPrintSupport import QPrintDialog, QPrinter
-
-from PyQt5.QtNetwork import QNetworkAccessManager
-
-
-
-if typing.TYPE_CHECKING:
-
-    from PyQt5.QtWebKit import QWebHistory
-
-    from PyQt5.QtWebEngineWidgets import QWebEngineHistory
-
-
-
-import pygments
-
-import pygments.lexers
-
-import pygments.formatters
-
-
-
-from qutebrowser.keyinput import modeman
-
-from qutebrowser.config import config
-
-from qutebrowser.utils import (utils, objreg, usertypes, log, qtutils,
-
-                               urlutils, message)
-
-from qutebrowser.misc import miscwidgets, objects, sessions
-
-from qutebrowser.browser import eventfilter
-
-from qutebrowser.qt import sip
-
-
-
-if typing.TYPE_CHECKING:
-
-    from qutebrowser.browser import webelem
-
-    from qutebrowser.browser.inspector import AbstractWebInspector
-
-
-
-
-
-tab_id_gen = itertools.count(0)
-
-
-
-
-
-def create(win_id: int,
-
-           private: bool,
-
-           parent: QWidget = None) -> 'AbstractTab':
-
-    """Get a QtWebKit/QtWebEngine tab object.
-
-
-
-    Args:
-
-        win_id: The window ID where the tab will be shown.
-
-        private: Whether the tab is a private/off the record tab.
-
-        parent: The Qt parent to set.
+class AuthViewsTestCase(TestCase):
 
     """
 
-    # Importing modules here so we don't depend on QtWebEngine without the
-
-    # argument and to avoid circular imports.
-
-    mode_manager = modeman.instance(win_id)
-
-    if objects.backend == usertypes.Backend.QtWebEngine:
-
-        from qutebrowser.browser.webengine import webenginetab
-
-        tab_class = webenginetab.WebEngineTab
-
-    else:
-
-        from qutebrowser.browser.webkit import webkittab
-
-        tab_class = webkittab.WebKitTab
-
-    return tab_class(win_id=win_id, mode_manager=mode_manager, private=private,
-
-                     parent=parent)
-
-
-
-
-
-def init() -> None:
-
-    """Initialize backend-specific modules."""
-
-    if objects.backend == usertypes.Backend.QtWebEngine:
-
-        from qutebrowser.browser.webengine import webenginetab
-
-        webenginetab.init()
-
-
-
-
-
-class WebTabError(Exception):
-
-
-
-    """Base class for various errors."""
-
-
-
-
-
-class UnsupportedOperationError(WebTabError):
-
-
-
-    """Raised when an operation is not supported with the given backend."""
-
-
-
-
-
-TerminationStatus = enum.Enum('TerminationStatus', [
-
-    'normal',
-
-    'abnormal',  # non-zero exit status
-
-    'crashed',   # e.g. segfault
-
-    'killed',
-
-    'unknown',
-
-])
-
-
-
-
-
-@attr.s
-
-class TabData:
-
-
-
-    """A simple namespace with a fixed set of attributes.
-
-
-
-    Attributes:
-
-        keep_icon: Whether the (e.g. cloned) icon should not be cleared on page
-
-                   load.
-
-        inspector: The QWebInspector used for this webview.
-
-        viewing_source: Set if we're currently showing a source view.
-
-                        Only used when sources are shown via pygments.
-
-        open_target: Where to open the next link.
-
-                     Only used for QtWebKit.
-
-        override_target: Override for open_target for fake clicks (like hints).
-
-                         Only used for QtWebKit.
-
-        pinned: Flag to pin the tab.
-
-        fullscreen: Whether the tab has a video shown fullscreen currently.
-
-        netrc_used: Whether netrc authentication was performed.
-
-        input_mode: current input mode for the tab.
+    Helper base class for all the follow test cases.
 
     """
 
+    fixtures = ['authtestdata.json']
 
+    urls = 'django.contrib.auth.tests.urls'
 
-    keep_icon = attr.ib(False)  # type: bool
 
-    viewing_source = attr.ib(False)  # type: bool
 
-    inspector = attr.ib(None)  # type: typing.Optional[AbstractWebInspector]
+    def setUp(self):
 
-    open_target = attr.ib(
+        self.old_LANGUAGES = settings.LANGUAGES
 
-        usertypes.ClickTarget.normal)  # type: usertypes.ClickTarget
+        self.old_LANGUAGE_CODE = settings.LANGUAGE_CODE
 
-    override_target = attr.ib(
+        settings.LANGUAGES = (('en', 'English'),)
 
-        None)  # type: typing.Optional[usertypes.ClickTarget]
+        settings.LANGUAGE_CODE = 'en'
 
-    pinned = attr.ib(False)  # type: bool
+        self.old_TEMPLATE_DIRS = settings.TEMPLATE_DIRS
 
-    fullscreen = attr.ib(False)  # type: bool
+        settings.TEMPLATE_DIRS = (
 
-    netrc_used = attr.ib(False)  # type: bool
+            os.path.join(os.path.dirname(__file__), 'templates'),
 
-    input_mode = attr.ib(usertypes.KeyMode.normal)  # type: usertypes.KeyMode
+        )
 
-    last_navigation = attr.ib(None)  # type: usertypes.NavigationRequest
 
 
+    def tearDown(self):
 
-    def should_show_icon(self) -> bool:
+        settings.LANGUAGES = self.old_LANGUAGES
 
-        return (config.val.tabs.favicons.show == 'always' or
+        settings.LANGUAGE_CODE = self.old_LANGUAGE_CODE
 
-                config.val.tabs.favicons.show == 'pinned' and self.pinned)
+        settings.TEMPLATE_DIRS = self.old_TEMPLATE_DIRS
 
 
 
+    def login(self, password='password'):
 
+        response = self.client.post('/login/', {
 
-class AbstractAction:
+            'username': 'testclient',
 
+            'password': password
 
+            }
 
-    """Attribute ``action`` of AbstractTab for Qt WebActions."""
+        )
 
+        self.assertEqual(response.status_code, 302)
 
+        self.assertTrue(response['Location'].endswith(settings.LOGIN_REDIRECT_URL))
 
-    # The class actions are defined on (QWeb{Engine,}Page)
+        self.assertTrue(SESSION_KEY in self.client.session)
 
-    action_class = None  # type: type
 
-    # The type of the actions (QWeb{Engine,}Page.WebAction)
 
-    action_base = None  # type: type
+class PasswordResetTest(AuthViewsTestCase):
 
 
 
-    def __init__(self, tab: 'AbstractTab') -> None:
+    def test_email_not_found(self):
 
-        self._widget = typing.cast(QWidget, None)
+        "Error is raised if the provided email address isn't currently registered"
 
-        self._tab = tab
+        response = self.client.get('/password_reset/')
 
+        self.assertEqual(response.status_code, 200)
 
+        response = self.client.post('/password_reset/', {'email': 'not_a_real_email@email.com'})
 
-    def exit_fullscreen(self) -> None:
+        self.assertContains(response, "That e-mail address doesn&#39;t have an associated user account")
 
-        """Exit the fullscreen mode."""
+        self.assertEqual(len(mail.outbox), 0)
 
-        raise NotImplementedError
 
 
+    def test_email_found(self):
 
-    def save_page(self) -> None:
+        "Email is sent if a valid email address is provided for password reset"
 
-        """Save the current page."""
+        response = self.client.post('/password_reset/', {'email': 'staffmember@example.com'})
 
-        raise NotImplementedError
+        self.assertEqual(response.status_code, 302)
 
+        self.assertEqual(len(mail.outbox), 1)
 
+        self.assertTrue("http://" in mail.outbox[0].body)
 
-    def run_string(self, name: str) -> None:
+        self.assertEqual(settings.DEFAULT_FROM_EMAIL, mail.outbox[0].from_email)
 
-        """Run a webaction based on its name."""
 
-        member = getattr(self.action_class, name, None)
 
-        if not isinstance(member, self.action_base):
+    def test_email_found_custom_from(self):
 
-            raise WebTabError("{} is not a valid web action!".format(name))
+        "Email is sent if a valid email address is provided for password reset when a custom from_email is provided."
 
-        self._widget.triggerPageAction(member)
+        response = self.client.post('/password_reset_from_email/', {'email': 'staffmember@example.com'})
 
+        self.assertEqual(response.status_code, 302)
 
+        self.assertEqual(len(mail.outbox), 1)
 
-    def show_source(
+        self.assertEqual("staffmember@example.com", mail.outbox[0].from_email)
 
-            self,
 
-            pygments: bool = False  # pylint: disable=redefined-outer-name
 
-    ) -> None:
+    def test_admin_reset(self):
 
-        """Show the source of the current page in a new tab."""
+        "If the reset view is marked as being for admin, the HTTP_HOST header is used for a domain override."
 
-        raise NotImplementedError
+        response = self.client.post('/admin_password_reset/',
 
+            {'email': 'staffmember@example.com'},
 
+            HTTP_HOST='adminsite.com'
 
-    def _show_source_pygments(self) -> None:
+        )
 
+        self.assertEqual(response.status_code, 302)
 
+        self.assertEqual(len(mail.outbox), 1)
 
-        def show_source_cb(source: str) -> None:
+        self.assertTrue("http://adminsite.com" in mail.outbox[0].body)
 
-            """Show source as soon as it's ready."""
+        self.assertEqual(settings.DEFAULT_FROM_EMAIL, mail.outbox[0].from_email)
 
-            # WORKAROUND for https://github.com/PyCQA/pylint/issues/491
 
-            # pylint: disable=no-member
 
-            lexer = pygments.lexers.HtmlLexer()
+    def test_poisoned_http_host(self):
 
-            formatter = pygments.formatters.HtmlFormatter(
+        "Poisoned HTTP_HOST headers can't be used for reset emails"
 
-                full=True, linenos='table')
+        # This attack is based on the way browsers handle URLs. The colon
 
-            # pylint: enable=no-member
+        # should be used to separate the port, but if the URL contains an @,
 
-            highlighted = pygments.highlight(source, lexer, formatter)
+        # the colon is interpreted as part of a username for login purposes,
 
+        # making 'evil.com' the request domain. Since HTTP_HOST is used to
 
+        # produce a meaningful reset URL, we need to be certain that the
 
-            tb = objreg.get('tabbed-browser', scope='window',
+        # HTTP_HOST header isn't poisoned. This is done as a check when get_host()
 
-                            window=self._tab.win_id)
+        # is invoked, but we check here as a practical consequence.
 
-            new_tab = tb.tabopen(background=False, related=True)
+        def test_host_poisoning():
 
-            new_tab.set_html(highlighted, self._tab.url())
+            self.client.post('/password_reset/',
 
-            new_tab.data.viewing_source = True
+                {'email': 'staffmember@example.com'},
 
+                HTTP_HOST='www.example:dr.frankenstein@evil.tld'
 
+            )
 
-        self._tab.dump_async(show_source_cb)
+        self.assertRaises(SuspiciousOperation, test_host_poisoning)
 
+        self.assertEqual(len(mail.outbox), 0)
 
 
 
+    def test_poisoned_http_host_admin_site(self):
 
-class AbstractPrinting:
+        "Poisoned HTTP_HOST headers can't be used for reset emails on admin views"
 
+        def test_host_poisoning():
 
+            self.client.post('/admin_password_reset/',
 
-    """Attribute ``printing`` of AbstractTab for printing the page."""
+                {'email': 'staffmember@example.com'},
 
+                HTTP_HOST='www.example:dr.frankenstein@evil.tld'
 
+            )
 
-    def __init__(self, tab: 'AbstractTab') -> None:
+        self.assertRaises(SuspiciousOperation, test_host_poisoning)
 
-        self._widget = typing.cast(QWidget, None)
+        self.assertEqual(len(mail.outbox), 0)
 
-        self._tab = tab
 
 
+    def _test_confirm_start(self):
 
-    def check_pdf_support(self) -> None:
+        # Start by creating the email
 
-        """Check whether writing to PDFs is supported.
+        response = self.client.post('/password_reset/', {'email': 'staffmember@example.com'})
 
+        self.assertEqual(response.status_code, 302)
 
+        self.assertEqual(len(mail.outbox), 1)
 
-        If it's not supported (by the current Qt version), a WebTabError is
+        return self._read_signup_email(mail.outbox[0])
 
-        raised.
 
-        """
 
-        raise NotImplementedError
+    def _read_signup_email(self, email):
 
+        urlmatch = re.search(r"https?://[^/]*(/.*reset/\S*)", email.body)
 
+        self.assertTrue(urlmatch is not None, "No URL found in sent email")
 
-    def check_printer_support(self) -> None:
+        return urlmatch.group(), urlmatch.groups()[0]
 
-        """Check whether writing to a printer is supported.
 
 
+    def test_confirm_valid(self):
 
-        If it's not supported (by the current Qt version), a WebTabError is
+        url, path = self._test_confirm_start()
 
-        raised.
+        response = self.client.get(path)
 
-        """
+        # redirect to a 'complete' page:
 
-        raise NotImplementedError
+        self.assertEqual(response.status_code, 200)
 
+        self.assertTrue("Please enter your new password" in response.content)
 
 
-    def check_preview_support(self) -> None:
 
-        """Check whether showing a print preview is supported.
+    def test_confirm_invalid(self):
 
+        url, path = self._test_confirm_start()
 
+        # Let's munge the token in the path, but keep the same length,
 
-        If it's not supported (by the current Qt version), a WebTabError is
+        # in case the URLconf will reject a different length.
 
-        raised.
+        path = path[:-5] + ("0"*4) + path[-1]
 
-        """
 
-        raise NotImplementedError
 
+        response = self.client.get(path)
 
+        self.assertEqual(response.status_code, 200)
 
-    def to_pdf(self, filename: str) -> bool:
+        self.assertTrue("The password reset link was invalid" in response.content)
 
-        """Print the tab to a PDF with the given filename."""
 
-        raise NotImplementedError
 
+    def test_confirm_invalid_user(self):
 
+        # Ensure that we get a 200 response for a non-existant user, not a 404
 
-    def to_printer(self, printer: QPrinter,
+        response = self.client.get('/reset/123456-1-1/')
 
-                   callback: typing.Callable[[bool], None] = None) -> None:
+        self.assertEqual(response.status_code, 200)
 
-        """Print the tab.
+        self.assertTrue("The password reset link was invalid" in response.content)
 
 
 
-        Args:
+    def test_confirm_overflow_user(self):
 
-            printer: The QPrinter to print to.
+        # Ensure that we get a 200 response for a base36 user id that overflows int
 
-            callback: Called with a boolean
+        response = self.client.get('/reset/zzzzzzzzzzzzz-1-1/')
 
-                      (True if printing succeeded, False otherwise)
+        self.assertEqual(response.status_code, 200)
 
-        """
+        self.assertTrue("The password reset link was invalid" in response.content)
 
-        raise NotImplementedError
 
 
+    def test_confirm_invalid_post(self):
 
-    def show_dialog(self) -> None:
+        # Same as test_confirm_invalid, but trying
 
-        """Print with a QPrintDialog."""
+        # to do a POST instead.
 
-        self.check_printer_support()
+        url, path = self._test_confirm_start()
 
+        path = path[:-5] + ("0"*4) + path[-1]
 
 
-        def print_callback(ok: bool) -> None:
 
-            """Called when printing finished."""
+        response = self.client.post(path, {'new_password1': 'anewpassword',
 
-            if not ok:
+                                           'new_password2':' anewpassword'})
 
-                message.error("Printing failed!")
+        # Check the password has not been changed
 
-            diag.deleteLater()
+        u = User.objects.get(email='staffmember@example.com')
 
+        self.assertTrue(not u.check_password("anewpassword"))
 
 
-        def do_print() -> None:
 
-            """Called when the dialog was closed."""
+    def test_confirm_complete(self):
 
-            self.to_printer(diag.printer(), print_callback)
+        url, path = self._test_confirm_start()
 
+        response = self.client.post(path, {'new_password1': 'anewpassword',
 
+                                           'new_password2': 'anewpassword'})
 
-        diag = QPrintDialog(self._tab)
+        # It redirects us to a 'complete' page:
 
-        if utils.is_mac:
+        self.assertEqual(response.status_code, 302)
 
-            # For some reason we get a segfault when using open() on macOS
+        # Check the password has been changed
 
-            ret = diag.exec_()
+        u = User.objects.get(email='staffmember@example.com')
 
-            if ret == QDialog.Accepted:
+        self.assertTrue(u.check_password("anewpassword"))
 
-                do_print()
+
+
+        # Check we can't use the link again
+
+        response = self.client.get(path)
+
+        self.assertEqual(response.status_code, 200)
+
+        self.assertTrue("The password reset link was invalid" in response.content)
+
+
+
+    def test_confirm_different_passwords(self):
+
+        url, path = self._test_confirm_start()
+
+        response = self.client.post(path, {'new_password1': 'anewpassword',
+
+                                           'new_password2':' x'})
+
+        self.assertEqual(response.status_code, 200)
+
+        self.assertTrue("The two password fields didn&#39;t match" in response.content)
+
+
+
+class ChangePasswordTest(AuthViewsTestCase):
+
+
+
+    def fail_login(self, password='password'):
+
+        response = self.client.post('/login/', {
+
+            'username': 'testclient',
+
+            'password': password
+
+            }
+
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        self.assertTrue("Please enter a correct username and password. Note that both fields are case-sensitive." in response.content)
+
+
+
+    def logout(self):
+
+        response = self.client.get('/logout/')
+
+
+
+    def test_password_change_fails_with_invalid_old_password(self):
+
+        self.login()
+
+        response = self.client.post('/password_change/', {
+
+            'old_password': 'donuts',
+
+            'new_password1': 'password1',
+
+            'new_password2': 'password1',
+
+            }
+
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        self.assertTrue("Your old password was entered incorrectly. Please enter it again." in response.content)
+
+
+
+    def test_password_change_fails_with_mismatched_passwords(self):
+
+        self.login()
+
+        response = self.client.post('/password_change/', {
+
+            'old_password': 'password',
+
+            'new_password1': 'password1',
+
+            'new_password2': 'donuts',
+
+            }
+
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        self.assertTrue("The two password fields didn&#39;t match." in response.content)
+
+
+
+    def test_password_change_succeeds(self):
+
+        self.login()
+
+        response = self.client.post('/password_change/', {
+
+            'old_password': 'password',
+
+            'new_password1': 'password1',
+
+            'new_password2': 'password1',
+
+            }
+
+        )
+
+        self.assertEqual(response.status_code, 302)
+
+        self.assertTrue(response['Location'].endswith('/password_change/done/'))
+
+        self.fail_login()
+
+        self.login(password='password1')
+
+
+
+class LoginTest(AuthViewsTestCase):
+
+
+
+    def test_current_site_in_context_after_login(self):
+
+        response = self.client.get(reverse('django.contrib.auth.views.login'))
+
+        self.assertEqual(response.status_code, 200)
+
+        if Site._meta.installed:
+
+            site = Site.objects.get_current()
+
+            self.assertEqual(response.context['site'], site)
+
+            self.assertEqual(response.context['site_name'], site.name)
 
         else:
 
-            diag.open(do_print)
+            self.assertIsInstance(response.context['site'], RequestSite)
 
+        self.assertTrue(isinstance(response.context['form'], AuthenticationForm),
 
+                     'Login form is not an AuthenticationForm')
 
 
 
-class AbstractSearch(QObject):
+    def test_security_check(self, password='password'):
 
+        login_url = reverse('django.contrib.auth.views.login')
 
 
-    """Attribute ``search`` of AbstractTab for doing searches.
 
+        # Those URLs should not pass the security check
 
+        for bad_url in ('http://example.com',
 
-    Attributes:
+                        'https://example.com',
 
-        text: The last thing this view was searched for.
+                        'ftp://exampel.com',
 
-        search_displayed: Whether we're currently displaying search results in
+                        '//example.com'):
 
-                          this view.
 
-        _flags: The flags of the last search (needs to be set by subclasses).
 
-        _widget: The underlying WebView widget.
+            nasty_url = '%(url)s?%(next)s=%(bad_url)s' % {
 
-    """
+                'url': login_url,
 
+                'next': REDIRECT_FIELD_NAME,
 
+                'bad_url': urllib.quote(bad_url)
 
-    #: Signal emitted when a search was finished
+            }
 
-    #: (True if the text was found, False otherwise)
+            response = self.client.post(nasty_url, {
 
-    finished = pyqtSignal(bool)
+                'username': 'testclient',
 
-    #: Signal emitted when an existing search was cleared.
+                'password': password,
 
-    cleared = pyqtSignal()
+                }
 
+            )
 
+            self.assertEqual(response.status_code, 302)
 
-    _Callback = typing.Callable[[bool], None]
+            self.assertFalse(bad_url in response['Location'],
 
+                             "%s should be blocked" % bad_url)
 
 
-    def __init__(self, tab: 'AbstractTab', parent: QWidget = None):
 
-        super().__init__(parent)
+        # These URLs *should* still pass the security check
 
-        self._tab = tab
+        for good_url in ('/view/?param=http://example.com',
 
-        self._widget = typing.cast(QWidget, None)
+                         '/view/?param=https://example.com',
 
-        self.text = None  # type: typing.Optional[str]
+                         '/view?param=ftp://exampel.com',
 
-        self.search_displayed = False
+                         'view/?param=//example.com',
 
+                         'https:///',
 
+                         '//testserver/',
 
-    def _is_case_sensitive(self, ignore_case: usertypes.IgnoreCase) -> bool:
+                         '/url%20with%20spaces/', # see ticket #12534
 
-        """Check if case-sensitivity should be used.
+                         ):
 
+            safe_url = '%(url)s?%(next)s=%(good_url)s' % {
 
+                'url': login_url,
 
-        This assumes self.text is already set properly.
+                'next': REDIRECT_FIELD_NAME,
 
+                'good_url': urllib.quote(good_url)
 
+            }
 
-        Arguments:
+            response = self.client.post(safe_url, {
 
-            ignore_case: The ignore_case value from the config.
+                    'username': 'testclient',
 
-        """
+                    'password': password,
 
-        assert self.text is not None
+                }
 
-        mapping = {
+            )
 
-            usertypes.IgnoreCase.smart: not self.text.islower(),
+            self.assertEqual(response.status_code, 302)
 
-            usertypes.IgnoreCase.never: True,
+            self.assertTrue(good_url in response['Location'],
 
-            usertypes.IgnoreCase.always: False,
+                            "%s should be allowed" % good_url)
 
-        }
 
-        return mapping[ignore_case]
 
 
 
-    def search(self, text: str, *,
+class LoginURLSettings(AuthViewsTestCase):
 
-               ignore_case: usertypes.IgnoreCase = usertypes.IgnoreCase.never,
+    urls = 'django.contrib.auth.tests.urls'
 
-               reverse: bool = False,
 
-               wrap: bool = True,
 
-               result_cb: _Callback = None) -> None:
+    def setUp(self):
 
-        """Find the given text on the page.
+        super(LoginURLSettings, self).setUp()
 
+        self.old_LOGIN_URL = settings.LOGIN_URL
 
 
-        Args:
 
-            text: The text to search for.
+    def tearDown(self):
 
-            ignore_case: Search case-insensitively.
+        super(LoginURLSettings, self).tearDown()
 
-            reverse: Reverse search direction.
+        settings.LOGIN_URL = self.old_LOGIN_URL
 
-            wrap: Allow wrapping at the top or bottom of the page.
 
-            result_cb: Called with a bool indicating whether a match was found.
 
-        """
+    def get_login_required_url(self, login_url):
 
-        raise NotImplementedError
+        settings.LOGIN_URL = login_url
 
+        response = self.client.get('/login_required/')
 
+        self.assertEqual(response.status_code, 302)
 
-    def clear(self) -> None:
+        return response['Location']
 
-        """Clear the current search."""
 
-        raise NotImplementedError
 
+    def test_standard_login_url(self):
 
+        login_url = '/login/'
 
-    def prev_result(self, *, result_cb: _Callback = None) -> None:
+        login_required_url = self.get_login_required_url(login_url)
 
-        """Go to the previous result of the current search.
+        querystring = QueryDict('', mutable=True)
 
+        querystring['next'] = '/login_required/'
 
+        self.assertEqual(login_required_url,
 
-        Args:
+             'http://testserver%s?%s' % (login_url, querystring.urlencode('/')))
 
-            result_cb: Called with a bool indicating whether a match was found.
 
-        """
 
-        raise NotImplementedError
+    def test_remote_login_url(self):
 
+        login_url = 'http://remote.example.com/login'
 
+        login_required_url = self.get_login_required_url(login_url)
 
-    def next_result(self, *, result_cb: _Callback = None) -> None:
+        querystring = QueryDict('', mutable=True)
 
-        """Go to the next result of the current search.
+        querystring['next'] = 'http://testserver/login_required/'
 
+        self.assertEqual(login_required_url,
 
+                         '%s?%s' % (login_url, querystring.urlencode('/')))
 
-        Args:
 
-            result_cb: Called with a bool indicating whether a match was found.
 
-        """
+    def test_https_login_url(self):
 
-        raise NotImplementedError
+        login_url = 'https:///login/'
 
+        login_required_url = self.get_login_required_url(login_url)
 
+        querystring = QueryDict('', mutable=True)
 
+        querystring['next'] = 'http://testserver/login_required/'
 
+        self.assertEqual(login_required_url,
 
-class AbstractZoom(QObject):
+                         '%s?%s' % (login_url, querystring.urlencode('/')))
 
 
 
-    """Attribute ``zoom`` of AbstractTab for controlling zoom."""
+    def test_login_url_with_querystring(self):
 
+        login_url = '/login/?pretty=1'
 
+        login_required_url = self.get_login_required_url(login_url)
 
-    def __init__(self, tab: 'AbstractTab', parent: QWidget = None) -> None:
+        querystring = QueryDict('pretty=1', mutable=True)
 
-        super().__init__(parent)
+        querystring['next'] = '/login_required/'
 
-        self._tab = tab
+        self.assertEqual(login_required_url, 'http://testserver/login/?%s' %
 
-        self._widget = typing.cast(QWidget, None)
+                         querystring.urlencode('/'))
 
-        # Whether zoom was changed from the default.
 
-        self._default_zoom_changed = False
 
-        self._init_neighborlist()
+    def test_remote_login_url_with_next_querystring(self):
 
-        config.instance.changed.connect(self._on_config_changed)
+        login_url = 'http://remote.example.com/login/'
 
-        self._zoom_factor = float(config.val.zoom.default) / 100
+        login_required_url = self.get_login_required_url('%s?next=/default/' %
 
+                                                         login_url)
 
+        querystring = QueryDict('', mutable=True)
 
-    @pyqtSlot(str)
+        querystring['next'] = 'http://testserver/login_required/'
 
-    def _on_config_changed(self, option: str) -> None:
+        self.assertEqual(login_required_url, '%s?%s' % (login_url,
 
-        if option in ['zoom.levels', 'zoom.default']:
+                                                    querystring.urlencode('/')))
 
-            if not self._default_zoom_changed:
 
-                factor = float(config.val.zoom.default) / 100
 
-                self.set_factor(factor)
 
-            self._init_neighborlist()
 
+class LogoutTest(AuthViewsTestCase):
 
+    urls = 'django.contrib.auth.tests.urls'
 
-    def _init_neighborlist(self) -> None:
 
-        """Initialize self._neighborlist.
 
+    def confirm_logged_out(self):
 
+        self.assertTrue(SESSION_KEY not in self.client.session)
 
-        It is a NeighborList with the zoom levels."""
 
-        levels = config.val.zoom.levels
 
-        self._neighborlist = usertypes.NeighborList(
+    def test_logout_default(self):
 
-            levels, mode=usertypes.NeighborList.Modes.edge
+        "Logout without next_page option renders the default template"
 
-        )  # type: usertypes.NeighborList[float]
+        self.login()
 
-        self._neighborlist.fuzzyval = config.val.zoom.default
+        response = self.client.get('/logout/')
 
+        self.assertEqual(200, response.status_code)
 
+        self.assertTrue('Logged out' in response.content)
 
-    def apply_offset(self, offset: int) -> float:
+        self.confirm_logged_out()
 
-        """Increase/Decrease the zoom level by the given offset.
 
 
+    def test_14377(self):
 
-        Args:
+        # Bug 14377
 
-            offset: The offset in the zoom level list.
+        self.login()
 
+        response = self.client.get('/logout/')
 
+        self.assertTrue('site' in response.context)
 
-        Return:
 
-            The new zoom level.
 
-        """
+    def test_logout_with_overridden_redirect_url(self):
 
-        level = self._neighborlist.getitem(offset)
+        # Bug 11223
 
-        self.set_factor(float(level) / 100, fuzzyval=False)
+        self.login()
 
-        return level
+        response = self.client.get('/logout/next_page/')
 
+        self.assertEqual(response.status_code, 302)
 
+        self.assertTrue(response['Location'].endswith('/somewhere/'))
 
-    def _set_factor_internal(self, factor: float) -> None:
 
-        raise NotImplementedError
 
+        response = self.client.get('/logout/next_page/?next=/login/')
 
+        self.assertEqual(response.status_code, 302)
 
-    def set_factor(self, factor: float, *, fuzzyval: bool = True) -> None:
+        self.assertTrue(response['Location'].endswith('/login/'))
 
-        """Zoom to a given zoom factor.
 
 
+        self.confirm_logged_out()
 
-        Args:
 
-            factor: The zoom factor as float.
 
-            fuzzyval: Whether to set the NeighborLists fuzzyval.
+    def test_logout_with_next_page_specified(self):
 
-        """
+        "Logout with next_page option given redirects to specified resource"
 
-        if fuzzyval:
+        self.login()
 
-            self._neighborlist.fuzzyval = int(factor * 100)
+        response = self.client.get('/logout/next_page/')
 
-        if factor < 0:
+        self.assertEqual(response.status_code, 302)
 
-            raise ValueError("Can't zoom to factor {}!".format(factor))
+        self.assertTrue(response['Location'].endswith('/somewhere/'))
 
+        self.confirm_logged_out()
 
 
-        default_zoom_factor = float(config.val.zoom.default) / 100
 
-        self._default_zoom_changed = (factor != default_zoom_factor)
+    def test_logout_with_redirect_argument(self):
 
+        "Logout with query string redirects to specified resource"
 
+        self.login()
 
-        self._zoom_factor = factor
+        response = self.client.get('/logout/?next=/login/')
 
-        self._set_factor_internal(factor)
+        self.assertEqual(response.status_code, 302)
 
+        self.assertTrue(response['Location'].endswith('/login/'))
 
+        self.confirm_logged_out()
 
-    def factor(self) -> float:
 
-        return self._zoom_factor
 
+    def test_logout_with_custom_redirect_argument(self):
 
+        "Logout with custom query string redirects to specified resource"
 
-    def apply_default(self) -> None:
+        self.login()
 
-        self._set_factor_internal(float(config.val.zoom.default) / 100)
+        response = self.client.get('/logout/custom_query/?follow=/somewhere/')
 
+        self.assertEqual(response.status_code, 302)
 
+        self.assertTrue(response['Location'].endswith('/somewhere/'))
 
-    def reapply(self) -> None:
+        self.confirm_logged_out()
 
-        self._set_factor_internal(self._zoom_factor)
 
 
+    def test_security_check(self, password='password'):
 
+        logout_url = reverse('django.contrib.auth.views.logout')
 
 
-class AbstractCaret(QObject):
 
+        # Those URLs should not pass the security check
 
+        for bad_url in ('http://example.com',
 
-    """Attribute ``caret`` of AbstractTab for caret browsing."""
+                        'https://example.com',
 
+                        'ftp://exampel.com',
 
+                        '//example.com'
 
-    #: Signal emitted when the selection was toggled.
+                        ):
 
-    #: (argument - whether the selection is now active)
+            nasty_url = '%(url)s?%(next)s=%(bad_url)s' % {
 
-    selection_toggled = pyqtSignal(bool)
+                'url': logout_url,
 
-    #: Emitted when a ``follow_selection`` action is done.
+                'next': REDIRECT_FIELD_NAME,
 
-    follow_selected_done = pyqtSignal()
+                'bad_url': urllib.quote(bad_url)
 
+            }
 
+            self.login()
 
-    def __init__(self,
+            response = self.client.get(nasty_url)
 
-                 tab: 'AbstractTab',
+            self.assertEqual(response.status_code, 302)
 
-                 mode_manager: modeman.ModeManager,
+            self.assertFalse(bad_url in response['Location'],
 
-                 parent: QWidget = None) -> None:
+                             "%s should be blocked" % bad_url)
 
-        super().__init__(parent)
+            self.confirm_logged_out()
 
-        self._tab = tab
 
-        self._widget = typing.cast(QWidget, None)
 
-        self.selection_enabled = False
+        # These URLs *should* still pass the security check
 
-        self._mode_manager = mode_manager
+        for good_url in ('/view/?param=http://example.com',
 
-        mode_manager.entered.connect(self._on_mode_entered)
+                         '/view/?param=https://example.com',
 
-        mode_manager.left.connect(self._on_mode_left)
+                         '/view?param=ftp://exampel.com',
 
+                         'view/?param=//example.com',
 
+                         'https:///',
 
-    def _on_mode_entered(self, mode: usertypes.KeyMode) -> None:
+                         '//testserver/',
 
-        raise NotImplementedError
+                         '/url%20with%20spaces/', # see ticket #12534
 
+                         ):
 
+            safe_url = '%(url)s?%(next)s=%(good_url)s' % {
 
-    def _on_mode_left(self, mode: usertypes.KeyMode) -> None:
+                'url': logout_url,
 
-        raise NotImplementedError
+                'next': REDIRECT_FIELD_NAME,
 
+                'good_url': urllib.quote(good_url)
 
+            }
 
-    def move_to_next_line(self, count: int = 1) -> None:
+            self.login()
 
-        raise NotImplementedError
+            response = self.client.get(safe_url)
 
+            self.assertEqual(response.status_code, 302)
 
+            self.assertTrue(good_url in response['Location'],
 
-    def move_to_prev_line(self, count: int = 1) -> None:
+                            "%s should be allowed" % good_url)
 
-        raise NotImplementedError
-
-
-
-    def move_to_next_char(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_prev_char(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_end_of_word(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_next_word(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_prev_word(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_start_of_line(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_end_of_line(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_start_of_next_block(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_start_of_prev_block(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_end_of_next_block(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_end_of_prev_block(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_start_of_document(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_end_of_document(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def toggle_selection(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def drop_selection(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def selection(self, callback: typing.Callable[[str], None]) -> None:
-
-        raise NotImplementedError
-
-
-
-    def reverse_selection(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def _follow_enter(self, tab: bool) -> None:
-
-        """Follow a link by faking an enter press."""
-
-        if tab:
-
-            self._tab.fake_key_press(Qt.Key_Enter, modifier=Qt.ControlModifier)
-
-        else:
-
-            self._tab.fake_key_press(Qt.Key_Enter)
-
-
-
-    def follow_selected(self, *, tab: bool = False) -> None:
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractScroller(QObject):
-
-
-
-    """Attribute ``scroller`` of AbstractTab to manage scroll position."""
-
-
-
-    #: Signal emitted when the scroll position changed (int, int)
-
-    perc_changed = pyqtSignal(int, int)
-
-    #: Signal emitted before the user requested a jump.
-
-    #: Used to set the special ' mark so the user can return.
-
-    before_jump_requested = pyqtSignal()
-
-
-
-    def __init__(self, tab: 'AbstractTab', parent: QWidget = None):
-
-        super().__init__(parent)
-
-        self._tab = tab
-
-        self._widget = typing.cast(QWidget, None)
-
-        if 'log-scroll-pos' in objects.debug_flags:
-
-            self.perc_changed.connect(self._log_scroll_pos_change)
-
-
-
-    @pyqtSlot()
-
-    def _log_scroll_pos_change(self) -> None:
-
-        log.webview.vdebug(  # type: ignore
-
-            "Scroll position changed to {}".format(self.pos_px()))
-
-
-
-    def _init_widget(self, widget: QWidget) -> None:
-
-        self._widget = widget
-
-
-
-    def pos_px(self) -> int:
-
-        raise NotImplementedError
-
-
-
-    def pos_perc(self) -> int:
-
-        raise NotImplementedError
-
-
-
-    def to_perc(self, x: int = None, y: int = None) -> None:
-
-        raise NotImplementedError
-
-
-
-    def to_point(self, point: QPoint) -> None:
-
-        raise NotImplementedError
-
-
-
-    def to_anchor(self, name: str) -> None:
-
-        raise NotImplementedError
-
-
-
-    def delta(self, x: int = 0, y: int = 0) -> None:
-
-        raise NotImplementedError
-
-
-
-    def delta_page(self, x: float = 0, y: float = 0) -> None:
-
-        raise NotImplementedError
-
-
-
-    def up(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def down(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def left(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def right(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def top(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def bottom(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def page_up(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def page_down(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def at_top(self) -> bool:
-
-        raise NotImplementedError
-
-
-
-    def at_bottom(self) -> bool:
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractHistoryPrivate:
-
-
-
-    """Private API related to the history."""
-
-
-
-    def __init__(self, tab: 'AbstractTab'):
-
-        self._tab = tab
-
-        self._history = typing.cast(
-
-            typing.Union['QWebHistory', 'QWebEngineHistory'], None)
-
-
-
-    def serialize(self) -> bytes:
-
-        """Serialize into an opaque format understood by self.deserialize."""
-
-        raise NotImplementedError
-
-
-
-    def deserialize(self, data: bytes) -> None:
-
-        """Deserialize from a format produced by self.serialize."""
-
-        raise NotImplementedError
-
-
-
-    def load_items(self, items: typing.Sequence) -> None:
-
-        """Deserialize from a list of WebHistoryItems."""
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractHistory:
-
-
-
-    """The history attribute of a AbstractTab."""
-
-
-
-    def __init__(self, tab: 'AbstractTab') -> None:
-
-        self._tab = tab
-
-        self._history = typing.cast(
-
-            typing.Union['QWebHistory', 'QWebEngineHistory'], None)
-
-        self.private_api = AbstractHistoryPrivate(tab)
-
-
-
-    def __len__(self) -> int:
-
-        raise NotImplementedError
-
-
-
-    def __iter__(self) -> typing.Iterable:
-
-        raise NotImplementedError
-
-
-
-    def _check_count(self, count: int) -> None:
-
-        """Check whether the count is positive."""
-
-        if count < 0:
-
-            raise WebTabError("count needs to be positive!")
-
-
-
-    def current_idx(self) -> int:
-
-        raise NotImplementedError
-
-
-
-    def back(self, count: int = 1) -> None:
-
-        """Go back in the tab's history."""
-
-        self._check_count(count)
-
-        idx = self.current_idx() - count
-
-        if idx >= 0:
-
-            self._go_to_item(self._item_at(idx))
-
-        else:
-
-            self._go_to_item(self._item_at(0))
-
-            raise WebTabError("At beginning of history.")
-
-
-
-    def forward(self, count: int = 1) -> None:
-
-        """Go forward in the tab's history."""
-
-        self._check_count(count)
-
-        idx = self.current_idx() + count
-
-        if idx < len(self):
-
-            self._go_to_item(self._item_at(idx))
-
-        else:
-
-            self._go_to_item(self._item_at(len(self) - 1))
-
-            raise WebTabError("At end of history.")
-
-
-
-    def can_go_back(self) -> bool:
-
-        raise NotImplementedError
-
-
-
-    def can_go_forward(self) -> bool:
-
-        raise NotImplementedError
-
-
-
-    def _item_at(self, i: int) -> typing.Any:
-
-        raise NotImplementedError
-
-
-
-    def _go_to_item(self, item: typing.Any) -> None:
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractElements:
-
-
-
-    """Finding and handling of elements on the page."""
-
-
-
-    _MultiCallback = typing.Callable[
-
-        [typing.Sequence['webelem.AbstractWebElement']], None]
-
-    _SingleCallback = typing.Callable[
-
-        [typing.Optional['webelem.AbstractWebElement']], None]
-
-    _ErrorCallback = typing.Callable[[Exception], None]
-
-
-
-    def __init__(self, tab: 'AbstractTab') -> None:
-
-        self._widget = typing.cast(QWidget, None)
-
-        self._tab = tab
-
-
-
-    def find_css(self, selector: str,
-
-                 callback: _MultiCallback,
-
-                 error_cb: _ErrorCallback, *,
-
-                 only_visible: bool = False) -> None:
-
-        """Find all HTML elements matching a given selector async.
-
-
-
-        If there's an error, the callback is called with a webelem.Error
-
-        instance.
-
-
-
-        Args:
-
-            callback: The callback to be called when the search finished.
-
-            error_cb: The callback to be called when an error occurred.
-
-            selector: The CSS selector to search for.
-
-            only_visible: Only show elements which are visible on screen.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def find_id(self, elem_id: str, callback: _SingleCallback) -> None:
-
-        """Find the HTML element with the given ID async.
-
-
-
-        Args:
-
-            callback: The callback to be called when the search finished.
-
-                      Called with a WebEngineElement or None.
-
-            elem_id: The ID to search for.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def find_focused(self, callback: _SingleCallback) -> None:
-
-        """Find the focused element on the page async.
-
-
-
-        Args:
-
-            callback: The callback to be called when the search finished.
-
-                      Called with a WebEngineElement or None.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def find_at_pos(self, pos: QPoint, callback: _SingleCallback) -> None:
-
-        """Find the element at the given position async.
-
-
-
-        This is also called "hit test" elsewhere.
-
-
-
-        Args:
-
-            pos: The QPoint to get the element for.
-
-            callback: The callback to be called when the search finished.
-
-                      Called with a WebEngineElement or None.
-
-        """
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractAudio(QObject):
-
-
-
-    """Handling of audio/muting for this tab."""
-
-
-
-    muted_changed = pyqtSignal(bool)
-
-    recently_audible_changed = pyqtSignal(bool)
-
-
-
-    def __init__(self, tab: 'AbstractTab', parent: QWidget = None) -> None:
-
-        super().__init__(parent)
-
-        self._widget = typing.cast(QWidget, None)
-
-        self._tab = tab
-
-
-
-    def set_muted(self, muted: bool, override: bool = False) -> None:
-
-        """Set this tab as muted or not.
-
-
-
-        Arguments:
-
-            override: If set to True, muting/unmuting was done manually and
-
-                      overrides future automatic mute/unmute changes based on
-
-                      the URL.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def is_muted(self) -> bool:
-
-        raise NotImplementedError
-
-
-
-    def is_recently_audible(self) -> bool:
-
-        """Whether this tab has had audio playing recently."""
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractTabPrivate:
-
-
-
-    """Tab-related methods which are only needed in the core.
-
-
-
-    Those methods are not part of the API which is exposed to extensions, and
-
-    should ideally be removed at some point in the future.
-
-    """
-
-
-
-    def __init__(self, mode_manager: modeman.ModeManager,
-
-                 tab: 'AbstractTab') -> None:
-
-        self._widget = typing.cast(QWidget, None)
-
-        self._tab = tab
-
-        self._mode_manager = mode_manager
-
-
-
-    def event_target(self) -> QWidget:
-
-        """Return the widget events should be sent to."""
-
-        raise NotImplementedError
-
-
-
-    def handle_auto_insert_mode(self, ok: bool) -> None:
-
-        """Handle `input.insert_mode.auto_load` after loading finished."""
-
-        if not ok or not config.cache['input.insert_mode.auto_load']:
-
-            return
-
-
-
-        cur_mode = self._mode_manager.mode
-
-        if cur_mode == usertypes.KeyMode.insert:
-
-            return
-
-
-
-        def _auto_insert_mode_cb(
-
-                elem: typing.Optional['webelem.AbstractWebElement']
-
-        ) -> None:
-
-            """Called from JS after finding the focused element."""
-
-            if elem is None:
-
-                log.webview.debug("No focused element!")
-
-                return
-
-            if elem.is_editable():
-
-                modeman.enter(self._tab.win_id, usertypes.KeyMode.insert,
-
-                              'load finished', only_if_normal=True)
-
-
-
-        self._tab.elements.find_focused(_auto_insert_mode_cb)
-
-
-
-    def clear_ssl_errors(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def networkaccessmanager(self) -> typing.Optional[QNetworkAccessManager]:
-
-        """Get the QNetworkAccessManager for this tab.
-
-
-
-        This is only implemented for QtWebKit.
-
-        For QtWebEngine, always returns None.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def shutdown(self) -> None:
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractTab(QWidget):
-
-
-
-    """An adapter for QWebView/QWebEngineView representing a single tab."""
-
-
-
-    #: Signal emitted when a website requests to close this tab.
-
-    window_close_requested = pyqtSignal()
-
-    #: Signal emitted when a link is hovered (the hover text)
-
-    link_hovered = pyqtSignal(str)
-
-    #: Signal emitted when a page started loading
-
-    load_started = pyqtSignal()
-
-    #: Signal emitted when a page is loading (progress percentage)
-
-    load_progress = pyqtSignal(int)
-
-    #: Signal emitted when a page finished loading (success as bool)
-
-    load_finished = pyqtSignal(bool)
-
-    #: Signal emitted when a page's favicon changed (icon as QIcon)
-
-    icon_changed = pyqtSignal(QIcon)
-
-    #: Signal emitted when a page's title changed (new title as str)
-
-    title_changed = pyqtSignal(str)
-
-    #: Signal emitted when a new tab should be opened (url as QUrl)
-
-    new_tab_requested = pyqtSignal(QUrl)
-
-    #: Signal emitted when a page's URL changed (url as QUrl)
-
-    url_changed = pyqtSignal(QUrl)
-
-    #: Signal emitted when a tab's content size changed
-
-    #: (new size as QSizeF)
-
-    contents_size_changed = pyqtSignal(QSizeF)
-
-    #: Signal emitted when a page requested full-screen (bool)
-
-    fullscreen_requested = pyqtSignal(bool)
-
-    #: Signal emitted before load starts (URL as QUrl)
-
-    before_load_started = pyqtSignal(QUrl)
-
-
-
-    # Signal emitted when a page's load status changed
-
-    # (argument: usertypes.LoadStatus)
-
-    load_status_changed = pyqtSignal(usertypes.LoadStatus)
-
-    # Signal emitted before shutting down
-
-    shutting_down = pyqtSignal()
-
-    # Signal emitted when a history item should be added
-
-    history_item_triggered = pyqtSignal(QUrl, QUrl, str)
-
-    # Signal emitted when the underlying renderer process terminated.
-
-    # arg 0: A TerminationStatus member.
-
-    # arg 1: The exit code.
-
-    renderer_process_terminated = pyqtSignal(TerminationStatus, int)
-
-
-
-    # Hosts for which a certificate error happened. Shared between all tabs.
-
-    #
-
-    # Note that we remember hosts here, without scheme/port:
-
-    # QtWebEngine/Chromium also only remembers hostnames, and certificates are
-
-    # for a given hostname anyways.
-
-    _insecure_hosts = set()  # type: typing.Set[str]
-
-
-
-    def __init__(self, *, win_id: int, private: bool,
-
-                 parent: QWidget = None) -> None:
-
-        self.is_private = private
-
-        self.win_id = win_id
-
-        self.tab_id = next(tab_id_gen)
-
-        super().__init__(parent)
-
-
-
-        self.registry = objreg.ObjectRegistry()
-
-        tab_registry = objreg.get('tab-registry', scope='window',
-
-                                  window=win_id)
-
-        tab_registry[self.tab_id] = self
-
-        objreg.register('tab', self, registry=self.registry)
-
-
-
-        self.data = TabData()
-
-        self._layout = miscwidgets.WrapperLayout(self)
-
-        self._widget = typing.cast(QWidget, None)
-
-        self._progress = 0
-
-        self._load_status = usertypes.LoadStatus.none
-
-        self._tab_event_filter = eventfilter.TabEventFilter(
-
-            self, parent=self)
-
-        self.backend = None  # type: typing.Optional[usertypes.Backend]
-
-
-
-        # If true, this tab has been requested to be removed (or is removed).
-
-        self.pending_removal = False
-
-        self.shutting_down.connect(functools.partial(
-
-            setattr, self, 'pending_removal', True))
-
-
-
-        self.before_load_started.connect(self._on_before_load_started)
-
-
-
-    def _set_widget(self, widget: QWidget) -> None:
-
-        # pylint: disable=protected-access
-
-        self._widget = widget
-
-        self._layout.wrap(self, widget)
-
-        self.history._history = widget.history()
-
-        self.history.private_api._history = widget.history()
-
-        self.scroller._init_widget(widget)
-
-        self.caret._widget = widget
-
-        self.zoom._widget = widget
-
-        self.search._widget = widget
-
-        self.printing._widget = widget
-
-        self.action._widget = widget
-
-        self.elements._widget = widget
-
-        self.audio._widget = widget
-
-        self.private_api._widget = widget
-
-        self.settings._settings = widget.settings()
-
-
-
-        self._install_event_filter()
-
-        self.zoom.apply_default()
-
-
-
-    def _install_event_filter(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def _set_load_status(self, val: usertypes.LoadStatus) -> None:
-
-        """Setter for load_status."""
-
-        if not isinstance(val, usertypes.LoadStatus):
-
-            raise TypeError("Type {} is no LoadStatus member!".format(val))
-
-        log.webview.debug("load status for {}: {}".format(repr(self), val))
-
-        self._load_status = val
-
-        self.load_status_changed.emit(val)
-
-
-
-    def send_event(self, evt: QEvent) -> None:
-
-        """Send the given event to the underlying widget.
-
-
-
-        The event will be sent via QApplication.postEvent.
-
-        Note that a posted event must not be re-used in any way!
-
-        """
-
-        # This only gives us some mild protection against re-using events, but
-
-        # it's certainly better than a segfault.
-
-        if getattr(evt, 'posted', False):
-
-            raise utils.Unreachable("Can't re-use an event which was already "
-
-                                    "posted!")
-
-
-
-        recipient = self.private_api.event_target()
-
-        if recipient is None:
-
-            # https://github.com/qutebrowser/qutebrowser/issues/3888
-
-            log.webview.warning("Unable to find event target!")
-
-            return
-
-
-
-        evt.posted = True
-
-        QApplication.postEvent(recipient, evt)
-
-
-
-    def navigation_blocked(self) -> bool:
-
-        """Test if navigation is allowed on the current tab."""
-
-        return self.data.pinned and config.val.tabs.pinned.frozen
-
-
-
-    @pyqtSlot(QUrl)
-
-    def _on_before_load_started(self, url: QUrl) -> None:
-
-        """Adjust the title if we are going to visit a URL soon."""
-
-        qtutils.ensure_valid(url)
-
-        url_string = url.toDisplayString()
-
-        log.webview.debug("Going to start loading: {}".format(url_string))
-
-        self.title_changed.emit(url_string)
-
-
-
-    @pyqtSlot(QUrl)
-
-    def _on_url_changed(self, url: QUrl) -> None:
-
-        """Update title when URL has changed and no title is available."""
-
-        if url.isValid() and not self.title():
-
-            self.title_changed.emit(url.toDisplayString())
-
-        self.url_changed.emit(url)
-
-
-
-    @pyqtSlot()
-
-    def _on_load_started(self) -> None:
-
-        self._progress = 0
-
-        self.data.viewing_source = False
-
-        self._set_load_status(usertypes.LoadStatus.loading)
-
-        self.load_started.emit()
-
-
-
-    @pyqtSlot(usertypes.NavigationRequest)
-
-    def _on_navigation_request(
-
-            self,
-
-            navigation: usertypes.NavigationRequest
-
-    ) -> None:
-
-        """Handle common acceptNavigationRequest code."""
-
-        url = utils.elide(navigation.url.toDisplayString(), 100)
-
-        log.webview.debug("navigation request: url {}, type {}, is_main_frame "
-
-                          "{}".format(url,
-
-                                      navigation.navigation_type,
-
-                                      navigation.is_main_frame))
-
-
-
-        if navigation.is_main_frame:
-
-            self.data.last_navigation = navigation
-
-
-
-        if not navigation.url.isValid():
-
-            # Also a WORKAROUND for missing IDNA 2008 support in QUrl, see
-
-            # https://bugreports.qt.io/browse/QTBUG-60364
-
-
-
-            if navigation.navigation_type == navigation.Type.link_clicked:
-
-                msg = urlutils.get_errstring(navigation.url,
-
-                                             "Invalid link clicked")
-
-                message.error(msg)
-
-                self.data.open_target = usertypes.ClickTarget.normal
-
-
-
-            log.webview.debug("Ignoring invalid URL {} in "
-
-                              "acceptNavigationRequest: {}".format(
-
-                                  navigation.url.toDisplayString(),
-
-                                  navigation.url.errorString()))
-
-            navigation.accepted = False
-
-
-
-    @pyqtSlot(bool)
-
-    def _on_load_finished(self, ok: bool) -> None:
-
-        assert self._widget is not None
-
-        if sip.isdeleted(self._widget):
-
-            # https://github.com/qutebrowser/qutebrowser/issues/3498
-
-            return
-
-
-
-        if sessions.session_manager is not None:
-
-            sessions.session_manager.save_autosave()
-
-
-
-        self.load_finished.emit(ok)
-
-
-
-        if not self.title():
-
-            self.title_changed.emit(self.url().toDisplayString())
-
-
-
-        self.zoom.reapply()
-
-
-
-    def _update_load_status(self, ok: bool) -> None:
-
-        """Update the load status after a page finished loading.
-
-
-
-        Needs to be called by subclasses to trigger a load status update, e.g.
-
-        as a response to a loadFinished signal.
-
-        """
-
-        if ok:
-
-            if self.url().scheme() == 'https':
-
-                if self.url().host() in self._insecure_hosts:
-
-                    self._set_load_status(usertypes.LoadStatus.warn)
-
-                else:
-
-                    self._set_load_status(usertypes.LoadStatus.success_https)
-
-            else:
-
-                self._set_load_status(usertypes.LoadStatus.success)
-
-        elif ok:
-
-            self._set_load_status(usertypes.LoadStatus.warn)
-
-        else:
-
-            self._set_load_status(usertypes.LoadStatus.error)
-
-
-
-    @pyqtSlot()
-
-    def _on_history_trigger(self) -> None:
-
-        """Emit history_item_triggered based on backend-specific signal."""
-
-        raise NotImplementedError
-
-
-
-    @pyqtSlot(int)
-
-    def _on_load_progress(self, perc: int) -> None:
-
-        self._progress = perc
-
-        self.load_progress.emit(perc)
-
-
-
-    def url(self, *, requested: bool = False) -> QUrl:
-
-        raise NotImplementedError
-
-
-
-    def progress(self) -> int:
-
-        return self._progress
-
-
-
-    def load_status(self) -> usertypes.LoadStatus:
-
-        return self._load_status
-
-
-
-    def _load_url_prepare(self, url: QUrl, *,
-
-                          emit_before_load_started: bool = True) -> None:
-
-        qtutils.ensure_valid(url)
-
-        if emit_before_load_started:
-
-            self.before_load_started.emit(url)
-
-
-
-    def load_url(self, url: QUrl, *,
-
-                 emit_before_load_started: bool = True) -> None:
-
-        raise NotImplementedError
-
-
-
-    def reload(self, *, force: bool = False) -> None:
-
-        raise NotImplementedError
-
-
-
-    def stop(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def fake_key_press(self,
-
-                       key: Qt.Key,
-
-                       modifier: Qt.KeyboardModifier = Qt.NoModifier) -> None:
-
-        """Send a fake key event to this tab."""
-
-        press_evt = QKeyEvent(QEvent.KeyPress, key, modifier, 0, 0, 0)
-
-        release_evt = QKeyEvent(QEvent.KeyRelease, key, modifier,
-
-                                0, 0, 0)
-
-        self.send_event(press_evt)
-
-        self.send_event(release_evt)
-
-
-
-    def dump_async(self,
-
-                   callback: typing.Callable[[str], None], *,
-
-                   plain: bool = False) -> None:
-
-        """Dump the current page's html asynchronously.
-
-
-
-        The given callback will be called with the result when dumping is
-
-        complete.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def run_js_async(
-
-            self,
-
-            code: str,
-
-            callback: typing.Callable[[typing.Any], None] = None, *,
-
-            world: typing.Union[usertypes.JsWorld, int] = None
-
-    ) -> None:
-
-        """Run javascript async.
-
-
-
-        The given callback will be called with the result when running JS is
-
-        complete.
-
-
-
-        Args:
-
-            code: The javascript code to run.
-
-            callback: The callback to call with the result, or None.
-
-            world: A world ID (int or usertypes.JsWorld member) to run the JS
-
-                   in the main world or in another isolated world.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def title(self) -> str:
-
-        raise NotImplementedError
-
-
-
-    def icon(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def set_html(self, html: str, base_url: QUrl = QUrl()) -> None:
-
-        raise NotImplementedError
-
-
-
-    def __repr__(self) -> str:
-
-        try:
-
-            qurl = self.url()
-
-            url = qurl.toDisplayString(QUrl.EncodeUnicode)  # type: ignore
-
-        except (AttributeError, RuntimeError) as exc:
-
-            url = '<{}>'.format(exc.__class__.__name__)
-
-        else:
-
-            url = utils.elide(url, 100)
-
-        return utils.get_repr(self, tab_id=self.tab_id, url=url)
-
-
-
-    def is_deleted(self) -> bool:
-
-        assert self._widget is not None
-
-        return sip.isdeleted(self._widget)
+            self.confirm_logged_out()

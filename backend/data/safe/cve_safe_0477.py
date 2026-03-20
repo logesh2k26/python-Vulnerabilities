@@ -1,601 +1,241 @@
 # Source: CVEFixes dataset
-# Safety: safe
+# Safety: vulnerable
 # Category: safe
 
-"""
+# -*- coding: utf-8 -*-
 
-Custom Authenticator to use Google OAuth with JupyterHub.
+#
 
+#  (c) Cornelius Kölbel
 
+#  License:  AGPLv3
 
-Derived from the GitHub OAuth authenticator.
+#  contact:  http://www.privacyidea.org
 
-"""
+#
 
+# This code is free software; you can redistribute it and/or
 
+# modify it under the terms of the GNU AFFERO GENERAL PUBLIC LICENSE
 
-import os
+# License as published by the Free Software Foundation; either
 
-import json
+# version 3 of the License, or any later version.
 
-import urllib.parse
+#
 
+# This code is distributed in the hope that it will be useful,
 
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
 
-from tornado import gen
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 
-from tornado.httpclient import HTTPRequest, AsyncHTTPClient
+# GNU AFFERO GENERAL PUBLIC LICENSE for more details.
 
-from tornado.auth import GoogleOAuth2Mixin
+#
 
-from tornado.web import HTTPError
+# You should have received a copy of the GNU Affero General Public
 
+# License along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+#
 
-from traitlets import Dict, Unicode, List, default, validate, observe
 
 
+import logging
 
-from jupyterhub.crypto import decrypt, EncryptionUnavailable, InvalidToken
+import functools
 
-from jupyterhub.auth import LocalAuthenticator
+from privacyidea.lib.error import TokenAdminError
 
-from jupyterhub.utils import url_path_join
+from privacyidea.lib.error import ParameterError
 
+from privacyidea.lib import _
 
+log = logging.getLogger(__name__)
 
-from .oauth2 import OAuthLoginHandler, OAuthCallbackHandler, OAuthenticator
 
 
 
-def check_user_in_groups(member_groups, allowed_groups):
 
-    # Check if user is a member of any group in the allowed groups
+def check_token_locked(func):
 
-    if any(g in member_groups for g in allowed_groups):
+    """
 
-        return True  # user _is_ in group
+    Decorator to check if a token is locked or not.
 
-    else:
+    The decorator is to be used in token class methods.
 
-        return False
+    It can be used to avoid performing an action on a locked token.
 
 
 
+    If the token is locked, a TokenAdminError is raised.
 
+    """
 
-class GoogleOAuthenticator(OAuthenticator, GoogleOAuth2Mixin):
+    @functools.wraps(func)
 
-    _deprecated_oauth_aliases = {
+    def token_locked_wrapper(*args, **kwds):
 
-        "google_group_whitelist": ("allowed_google_groups", "0.12.0"),
+        # The token object
 
-        **OAuthenticator._deprecated_oauth_aliases,
+        token = args[0]
 
-    }
+        if token.is_locked():
 
+            raise TokenAdminError(_("This action is not possible, since the "
 
+                                    "token is locked"), id=1007)
 
-    google_api_url = Unicode("https://www.googleapis.com", config=True)
+        f_result = func(*args, **kwds)
 
+        return f_result
 
 
-    @default('google_api_url')
 
-    def _google_api_url(self):
+    return token_locked_wrapper
 
-        """get default google apis url from env"""
 
-        google_api_url = os.getenv('GOOGLE_API_URL')
 
 
 
-        # default to googleapis.com
+def check_user_or_serial(func):
 
-        if not google_api_url:
+    """
 
-            google_api_url = 'https://www.googleapis.com'
+    Decorator to check user and serial at the beginning of a function
 
+    The wrapper will check the parameters user and serial and verify that
 
+    not both parameters are None. Otherwise it will throw an exception
 
-        return google_api_url
+    ParameterError.
 
+    """
 
+    @functools.wraps(func)
 
-    @default('scope')
+    def user_or_serial_wrapper(*args, **kwds):
 
-    def _scope_default(self):
+        # If there is no user and serial keyword parameter and if
 
-        return ['openid', 'email']
+        # there is no normal argument, we do not have enough information
 
+        serial = kwds.get("serial")
 
+        user = kwds.get("user")
 
-    @default("authorize_url")
+        # We have no serial! The serial would be the first arg
 
-    def _authorize_url_default(self):
+        if (serial is None and (len(args) == 0 or args[0] is None) and
 
-        return "https://accounts.google.com/o/oauth2/v2/auth"
+                (user is None or (user is not None and user.is_empty()))):
 
+            # We either have an empty User object or None
 
+            raise ParameterError(ParameterError.USER_OR_SERIAL)
 
-    @default("token_url")
 
-    def _token_url_default(self):
 
-        return "%s/oauth2/v4/token" % (self.google_api_url)
+        f_result = func(*args, **kwds)
 
+        return f_result
 
 
-    google_service_account_keys = Dict(
 
-        Unicode(),
+    return user_or_serial_wrapper
 
-        help="Service account keys to use with each domain, see https://developers.google.com/admin-sdk/directory/v1/guides/delegation"
 
-    ).tag(config=True)
 
 
 
-    gsuite_administrator = Dict(
+class check_user_or_serial_in_request(object):
 
-        Unicode(),
+    """
 
-        help="Username of a G Suite Administrator for the service account to act as"
+    Decorator to check user and serial in a request.
 
-    ).tag(config=True)
+    If the request does not contain a serial number (serial) or a user
 
+    (user) it will throw a ParameterError.
 
+    """
 
-    google_group_whitelist = Dict(help="Deprecated, use `GoogleOAuthenticator.allowed_google_groups`", config=True,)
+    def __init__(self, request):
 
+        self.request = request
 
 
-    allowed_google_groups = Dict(
 
-        List(Unicode()),
+    def __call__(self, func):
 
-        help="Automatically allow members of selected groups"
+        @functools.wraps(func)
 
-    ).tag(config=True)
+        def check_user_or_serial_in_request_wrapper(*args, **kwds):
 
+            user = self.request.all_data.get("user")
 
+            serial = self.request.all_data.get("serial")
 
-    admin_google_groups = Dict(
+            if not serial and not user:
 
-        List(Unicode()),
+                raise ParameterError(_("You need to specify a serial or a user."))
 
-        help="Groups whose members should have Jupyterhub admin privileges"
+            f_result = func(*args, **kwds)
 
-    ).tag(config=True)
+            return f_result
 
 
 
-    user_info_url = Unicode(
+        return check_user_or_serial_in_request_wrapper
 
-        "https://www.googleapis.com/oauth2/v1/userinfo", config=True
 
-    )
 
 
 
-    hosted_domain = List(
+def check_copy_serials(func):
 
-        Unicode(),
+    """
 
-        config=True,
+    Decorator to check if the serial_from and serial_to exist.
 
-        help="""List of domains used to restrict sign-in, e.g. mycollege.edu""",
+    If the serials are not unique, we raise an error
 
-    )
+    """
 
+    from privacyidea.lib.token import get_tokens
 
+    @functools.wraps(func)
 
-    @default('hosted_domain')
+    def check_serial_wrapper(*args, **kwds):
 
-    def _hosted_domain_from_env(self):
+        tokenobject_list_from = get_tokens(serial=args[0])
 
-        domains = []
+        tokenobject_list_to = get_tokens(serial=args[1])
 
-        for domain in os.environ.get('HOSTED_DOMAIN', '').split(';'):
+        if len(tokenobject_list_from) != 1:
 
-            if domain:
+            log.error("not a unique token to copy from found")
 
-                # check falsy to avoid trailing separators
+            raise(TokenAdminError("No unique token to copy from found",
 
-                # adding empty domains
+                                   id=1016))
 
-                domains.append(domain)
+        if len(tokenobject_list_to) != 1:
 
-        return domains
+            log.error("not a unique token to copy to found")
 
+            raise(TokenAdminError("No unique token to copy to found",
 
+                                   id=1017))
 
-    @validate('hosted_domain')
 
-    def _cast_hosted_domain(self, proposal):
 
-        """handle backward-compatibility with hosted_domain is a single domain as a string"""
+        f_result = func(*args, **kwds)
 
-        if isinstance(proposal.value, str):
+        return f_result
 
-            # pre-0.9 hosted_domain was a string
 
-            # set it to a single item list
 
-            # (or if it's empty, an empty list)
-
-            if proposal.value == '':
-
-                return []
-
-            return [proposal.value]
-
-        return proposal.value
-
-
-
-    login_service = Unicode(
-
-        os.environ.get('LOGIN_SERVICE', 'Google'),
-
-        config=True,
-
-        help="""Google Apps hosted domain string, e.g. My College""",
-
-    )
-
-
-
-    async def authenticate(self, handler, data=None, google_groups=None):
-
-        code = handler.get_argument("code")
-
-        body = urllib.parse.urlencode(
-
-            dict(
-
-                code=code,
-
-                redirect_uri=self.get_callback_url(handler),
-
-                client_id=self.client_id,
-
-                client_secret=self.client_secret,
-
-                grant_type="authorization_code",
-
-            )
-
-        )
-
-
-
-        http_client = AsyncHTTPClient()
-
-
-
-        response = await http_client.fetch(
-
-            self.token_url,
-
-            method="POST",
-
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-
-            body=body,
-
-        )
-
-
-
-        user = json.loads(response.body.decode("utf-8", "replace"))
-
-        access_token = str(user['access_token'])
-
-        refresh_token = user.get('refresh_token', None)
-
-
-
-        response = await http_client.fetch(
-
-            self.user_info_url + '?access_token=' + access_token
-
-        )
-
-
-
-        if not response:
-
-            handler.clear_all_cookies()
-
-            raise HTTPError(500, 'Google authentication failed')
-
-
-
-        bodyjs = json.loads(response.body.decode())
-
-        user_email = username = bodyjs['email']
-
-        user_email_domain = user_email.split('@')[1]
-
-
-
-        if not bodyjs['verified_email']:
-
-            self.log.warning("Google OAuth unverified email attempt: %s", user_email)
-
-            raise HTTPError(403, "Google email {} not verified".format(user_email))
-
-
-
-        if self.hosted_domain:
-
-            if user_email_domain not in self.hosted_domain:
-
-                self.log.warning(
-
-                    "Google OAuth unauthorized domain attempt: %s", user_email
-
-                )
-
-                raise HTTPError(
-
-                    403,
-
-                    "Google account domain @{} not authorized.".format(
-
-                        user_email_domain
-
-                    ),
-
-                )
-
-            if len(self.hosted_domain) == 1:
-
-                # unambiguous domain, use only base name
-
-                username = user_email.split('@')[0]
-
-
-
-        if refresh_token is None:
-
-            self.log.debug("Refresh token was empty, will try to pull refresh_token from previous auth_state")
-
-            user = handler.find_user(username)
-
-
-
-            if user:
-
-                self.log.debug("encrypted_auth_state was found, will try to decrypt and pull refresh_token from it")
-
-                try:
-
-                    encrypted = user.encrypted_auth_state
-
-                    auth_state = await decrypt(encrypted)
-
-                    refresh_token = auth_state.get('refresh_token')
-
-                except (ValueError, InvalidToken, EncryptionUnavailable) as e:
-
-                    self.log.warning(
-
-                        "Failed to retrieve encrypted auth_state for %s because %s",
-
-                        username,
-
-                        e,
-
-                    )
-
-
-
-        user_info = {
-
-            'name': username,
-
-            'auth_state': {
-
-                'access_token': access_token,
-
-                'refresh_token': refresh_token,
-
-                'google_user': bodyjs
-
-            }
-
-        }
-
-
-
-        if self.admin_google_groups or self.allowed_google_groups:
-
-            user_info = await self._add_google_groups_info(user_info, google_groups)
-
-
-
-        return user_info
-
-
-
-    def _service_client_credentials(self, scopes, user_email_domain):
-
-        """
-
-        Return a configured service client credentials for the API.
-
-        """
-
-        try:
-
-            from google.oauth2 import service_account
-
-        except:
-
-            raise ImportError(
-
-                "Could not import google.oauth2's service_account,"
-
-                "you may need to run pip install oauthenticator[googlegroups] or not declare google groups"
-
-            )
-
-
-
-        gsuite_administrator_email = "{}@{}".format(self.gsuite_administrator[user_email_domain], user_email_domain)
-
-        self.log.debug("scopes are %s, user_email_domain is %s", scopes, user_email_domain)
-
-        credentials = service_account.Credentials.from_service_account_file(
-
-            self.google_service_account_keys[user_email_domain],
-
-            scopes=scopes
-
-        )
-
-
-
-        credentials = credentials.with_subject(gsuite_administrator_email)
-
-
-
-        return credentials
-
-
-
-    def _service_client(self, service_name, service_version, credentials, http=None):
-
-        """
-
-        Return a configured service client for the API.
-
-        """
-
-        try:
-
-            from googleapiclient.discovery import build
-
-        except:
-
-            raise ImportError(
-
-                "Could not import googleapiclient.discovery's build,"
-
-                "you may need to run pip install oauthenticator[googlegroups] or not declare google groups"
-
-            )
-
-
-
-        self.log.debug("service_name is %s, service_version is %s", service_name, service_version)
-
-
-
-        return build(
-
-            serviceName=service_name,
-
-            version=service_version,
-
-            credentials=credentials,
-
-            cache_discovery=False,
-
-            http=http)
-
-
-
-    async def _google_groups_for_user(self, user_email, credentials, http=None):
-
-        """
-
-        Return google groups a given user is a member of
-
-        """
-
-        service = self._service_client(
-
-            service_name='admin',
-
-            service_version='directory_v1',
-
-            credentials=credentials,
-
-            http=http)
-
-
-
-        results = service.groups().list(userKey=user_email).execute()
-
-        results = [ g['email'].split('@')[0] for g in results.get('groups', [{'email': None}]) ]
-
-        self.log.debug("user_email %s is a member of %s", user_email, results)
-
-        return results
-
-
-
-    async def _add_google_groups_info(self, user_info, google_groups=None):
-
-        user_email_domain=user_info['auth_state']['google_user']['hd']
-
-        user_email=user_info['auth_state']['google_user']['email']
-
-        if google_groups is None:
-
-            credentials = self._service_client_credentials(
-
-                    scopes=['%s/auth/admin.directory.group.readonly' % (self.google_api_url)],
-
-                    user_email_domain=user_email_domain)
-
-            google_groups = await self._google_groups_for_user(
-
-                    user_email=user_email,
-
-                    credentials=credentials)
-
-        user_info['auth_state']['google_user']['google_groups'] = google_groups
-
-
-
-        # Check if user is a member of any admin groups.
-
-        if self.admin_google_groups:
-
-            is_admin = check_user_in_groups(google_groups, self.admin_google_groups[user_email_domain])
-
-        # Check if user is a member of any allowed groups.
-
-        user_in_group = check_user_in_groups(google_groups, self.allowed_google_groups[user_email_domain])
-
-
-
-        if self.admin_google_groups and (is_admin or user_in_group):
-
-            user_info['admin'] = is_admin
-
-            return user_info
-
-        elif user_in_group:
-
-            return user_info
-
-        else:
-
-            return None
-
-
-
-
-
-class LocalGoogleOAuthenticator(LocalAuthenticator, GoogleOAuthenticator):
-
-    """A version that mixes in local system user creation"""
-
-
-
-    pass
+    return check_serial_wrapper

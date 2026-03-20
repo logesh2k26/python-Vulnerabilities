@@ -6,7 +6,7 @@
 
 
 
-# Copyright 2016-2019 Florian Bruhin (The Compiler) <mail@qutebrowser.org>
+# Copyright 2016-2018 Florian Bruhin (The Compiler) <mail@qutebrowser.org>
 
 #
 
@@ -40,2242 +40,976 @@
 
 
 
-"""Base class for a wrapper over QWebView/QWebEngineView."""
+"""Backend-independent qute://* code.
 
 
 
-import enum
+Module attributes:
 
-import itertools
+    pyeval_output: The output of the last :pyeval command.
 
-import typing
+    _HANDLERS: The handlers registered via decorators.
 
-
-
-import attr
-
-from PyQt5.QtCore import (pyqtSignal, pyqtSlot, QUrl, QObject, QSizeF, Qt,
-
-                          QEvent, QPoint)
-
-from PyQt5.QtGui import QKeyEvent, QIcon
-
-from PyQt5.QtWidgets import QWidget, QApplication, QDialog
-
-from PyQt5.QtPrintSupport import QPrintDialog, QPrinter
-
-from PyQt5.QtNetwork import QNetworkAccessManager
+"""
 
 
 
-import pygments
+import json
 
-import pygments.lexers
+import os
 
-import pygments.formatters
+import time
 
+import textwrap
 
+import mimetypes
 
-from qutebrowser.keyinput import modeman
+import urllib
 
-from qutebrowser.config import config
-
-from qutebrowser.utils import (utils, objreg, usertypes, log, qtutils,
-
-                               urlutils, message)
-
-from qutebrowser.misc import miscwidgets, objects
-
-from qutebrowser.browser import eventfilter, hints
-
-from qutebrowser.qt import sip
+import collections
 
 
 
-if typing.TYPE_CHECKING:
+import pkg_resources
 
-    # pylint: disable=unused-import,useless-suppression
+import sip
 
-    from qutebrowser.browser import webelem
+from PyQt5.QtCore import QUrlQuery, QUrl
 
-    from qutebrowser.browser.inspector import AbstractWebInspector
+
+
+import qutebrowser
+
+from qutebrowser.config import config, configdata, configexc, configdiff
+
+from qutebrowser.utils import (version, utils, jinja, log, message, docutils,
+
+                               objreg, urlutils)
+
+from qutebrowser.misc import objects
 
 
 
 
 
-tab_id_gen = itertools.count(0)
+pyeval_output = ":pyeval was never called"
+
+spawn_output = ":spawn was never called"
 
 
 
 
 
-def create(win_id: int,
+_HANDLERS = {}
 
-           private: bool,
 
-           parent: QWidget = None) -> 'AbstractTab':
 
-    """Get a QtWebKit/QtWebEngine tab object.
+
+
+class NoHandlerFound(Exception):
+
+
+
+    """Raised when no handler was found for the given URL."""
+
+
+
+    pass
+
+
+
+
+
+class QuteSchemeOSError(Exception):
+
+
+
+    """Called when there was an OSError inside a handler."""
+
+
+
+    pass
+
+
+
+
+
+class QuteSchemeError(Exception):
+
+
+
+    """Exception to signal that a handler should return an ErrorReply.
+
+
+
+    Attributes correspond to the arguments in
+
+    networkreply.ErrorNetworkReply.
+
+
+
+    Attributes:
+
+        errorstring: Error string to print.
+
+        error: Numerical error value.
+
+    """
+
+
+
+    def __init__(self, errorstring, error):
+
+        self.errorstring = errorstring
+
+        self.error = error
+
+        super().__init__(errorstring)
+
+
+
+
+
+class Redirect(Exception):
+
+
+
+    """Exception to signal a redirect should happen.
+
+
+
+    Attributes:
+
+        url: The URL to redirect to, as a QUrl.
+
+    """
+
+
+
+    def __init__(self, url):
+
+        super().__init__(url.toDisplayString())
+
+        self.url = url
+
+
+
+
+
+class add_handler:  # noqa: N801,N806 pylint: disable=invalid-name
+
+
+
+    """Decorator to register a qute://* URL handler.
+
+
+
+    Attributes:
+
+        _name: The 'foo' part of qute://foo
+
+        backend: Limit which backends the handler can run with.
+
+    """
+
+
+
+    def __init__(self, name, backend=None):
+
+        self._name = name
+
+        self._backend = backend
+
+        self._function = None
+
+
+
+    def __call__(self, function):
+
+        self._function = function
+
+        _HANDLERS[self._name] = self.wrapper
+
+        return function
+
+
+
+    def wrapper(self, *args, **kwargs):
+
+        """Call the underlying function."""
+
+        if self._backend is not None and objects.backend != self._backend:
+
+            return self.wrong_backend_handler(*args, **kwargs)
+
+        else:
+
+            return self._function(*args, **kwargs)
+
+
+
+    def wrong_backend_handler(self, url):
+
+        """Show an error page about using the invalid backend."""
+
+        html = jinja.render('error.html',
+
+                            title="Error while opening qute://url",
+
+                            url=url.toDisplayString(),
+
+                            error='{} is not available with this '
+
+                                  'backend'.format(url.toDisplayString()))
+
+        return 'text/html', html
+
+
+
+
+
+def data_for_url(url):
+
+    """Get the data to show for the given URL.
 
 
 
     Args:
 
-        win_id: The window ID where the tab will be shown.
+        url: The QUrl to show.
 
-        private: Whether the tab is a private/off the record tab.
 
-        parent: The Qt parent to set.
+
+    Return:
+
+        A (mimetype, data) tuple.
 
     """
 
-    # Importing modules here so we don't depend on QtWebEngine without the
+    norm_url = url.adjusted(QUrl.NormalizePathSegments |
 
-    # argument and to avoid circular imports.
+                            QUrl.StripTrailingSlash)
 
-    mode_manager = modeman.instance(win_id)
+    if norm_url != url:
 
-    if objects.backend == usertypes.Backend.QtWebEngine:
+        raise Redirect(norm_url)
 
-        from qutebrowser.browser.webengine import webenginetab
 
-        tab_class = webenginetab.WebEngineTab
+
+    path = url.path()
+
+    host = url.host()
+
+    query = urlutils.query_string(url)
+
+    # A url like "qute:foo" is split as "scheme:path", not "scheme:host".
+
+    log.misc.debug("url: {}, path: {}, host {}".format(
+
+        url.toDisplayString(), path, host))
+
+    if not path or not host:
+
+        new_url = QUrl()
+
+        new_url.setScheme('qute')
+
+        # When path is absent, e.g. qute://help (with no trailing slash)
+
+        if host:
+
+            new_url.setHost(host)
+
+        # When host is absent, e.g. qute:help
+
+        else:
+
+            new_url.setHost(path)
+
+
+
+        new_url.setPath('/')
+
+        if query:
+
+            new_url.setQuery(query)
+
+        if new_url.host():  # path was a valid host
+
+            raise Redirect(new_url)
+
+
+
+    try:
+
+        handler = _HANDLERS[host]
+
+    except KeyError:
+
+        raise NoHandlerFound(url)
+
+
+
+    try:
+
+        mimetype, data = handler(url)
+
+    except OSError as e:
+
+        # FIXME:qtwebengine how to handle this?
+
+        raise QuteSchemeOSError(e)
+
+    except QuteSchemeError as e:
+
+        raise
+
+
+
+    assert mimetype is not None, url
+
+    if mimetype == 'text/html' and isinstance(data, str):
+
+        # We let handlers return HTML as text
+
+        data = data.encode('utf-8', errors='xmlcharrefreplace')
+
+
+
+    return mimetype, data
+
+
+
+
+
+@add_handler('bookmarks')
+
+def qute_bookmarks(_url):
+
+    """Handler for qute://bookmarks. Display all quickmarks / bookmarks."""
+
+    bookmarks = sorted(objreg.get('bookmark-manager').marks.items(),
+
+                       key=lambda x: x[1])  # Sort by title
+
+    quickmarks = sorted(objreg.get('quickmark-manager').marks.items(),
+
+                        key=lambda x: x[0])  # Sort by name
+
+
+
+    html = jinja.render('bookmarks.html',
+
+                        title='Bookmarks',
+
+                        bookmarks=bookmarks,
+
+                        quickmarks=quickmarks)
+
+    return 'text/html', html
+
+
+
+
+
+@add_handler('tabs')
+
+def qute_tabs(_url):
+
+    """Handler for qute://tabs. Display information about all open tabs."""
+
+    tabs = collections.defaultdict(list)
+
+    for win_id, window in objreg.window_registry.items():
+
+        if sip.isdeleted(window):
+
+            continue
+
+        tabbed_browser = objreg.get('tabbed-browser',
+
+                                    scope='window',
+
+                                    window=win_id)
+
+        for tab in tabbed_browser.widgets():
+
+            if tab.url() not in [QUrl("qute://tabs/"), QUrl("qute://tabs")]:
+
+                urlstr = tab.url().toDisplayString()
+
+                tabs[str(win_id)].append((tab.title(), urlstr))
+
+
+
+    html = jinja.render('tabs.html',
+
+                        title='Tabs',
+
+                        tab_list_by_window=tabs)
+
+    return 'text/html', html
+
+
+
+
+
+def history_data(start_time, offset=None):
+
+    """Return history data.
+
+
+
+    Arguments:
+
+        start_time: select history starting from this timestamp.
+
+        offset: number of items to skip
+
+    """
+
+    # history atimes are stored as ints, ensure start_time is not a float
+
+    start_time = int(start_time)
+
+    hist = objreg.get('web-history')
+
+    if offset is not None:
+
+        entries = hist.entries_before(start_time, limit=1000, offset=offset)
 
     else:
 
-        from qutebrowser.browser.webkit import webkittab
+        # end is 24hrs earlier than start
 
-        tab_class = webkittab.WebKitTab
+        end_time = start_time - 24*60*60
 
-    return tab_class(win_id=win_id, mode_manager=mode_manager, private=private,
+        entries = hist.entries_between(end_time, start_time)
 
-                     parent=parent)
 
 
+    return [{"url": e.url, "title": e.title or e.url, "time": e.atime}
 
+            for e in entries]
 
 
-def init() -> None:
 
-    """Initialize backend-specific modules."""
 
-    if objects.backend == usertypes.Backend.QtWebEngine:
 
-        from qutebrowser.browser.webengine import webenginetab
+@add_handler('history')
 
-        webenginetab.init()
+def qute_history(url):
 
+    """Handler for qute://history. Display and serve history."""
 
+    if url.path() == '/data':
 
+        try:
 
+            offset = QUrlQuery(url).queryItemValue("offset")
 
-class WebTabError(Exception):
+            offset = int(offset) if offset else None
 
+        except ValueError as e:
 
+            raise QuteSchemeError("Query parameter offset is invalid", e)
 
-    """Base class for various errors."""
+        # Use start_time in query or current time.
 
+        try:
 
+            start_time = QUrlQuery(url).queryItemValue("start_time")
 
+            start_time = float(start_time) if start_time else time.time()
 
+        except ValueError as e:
 
-class UnsupportedOperationError(WebTabError):
+            raise QuteSchemeError("Query parameter start_time is invalid", e)
 
 
 
-    """Raised when an operation is not supported with the given backend."""
+        return 'text/html', json.dumps(history_data(start_time, offset))
 
+    else:
 
+        return 'text/html', jinja.render(
 
+            'history.html',
 
+            title='History',
 
-TerminationStatus = enum.Enum('TerminationStatus', [
+            gap_interval=config.val.history_gap_interval
 
-    'normal',
+        )
 
-    'abnormal',  # non-zero exit status
 
-    'crashed',   # e.g. segfault
 
-    'killed',
 
-    'unknown',
 
-])
+@add_handler('javascript')
 
+def qute_javascript(url):
 
+    """Handler for qute://javascript.
 
 
 
-@attr.s
-
-class TabData:
-
-
-
-    """A simple namespace with a fixed set of attributes.
-
-
-
-    Attributes:
-
-        keep_icon: Whether the (e.g. cloned) icon should not be cleared on page
-
-                   load.
-
-        inspector: The QWebInspector used for this webview.
-
-        viewing_source: Set if we're currently showing a source view.
-
-                        Only used when sources are shown via pygments.
-
-        open_target: Where to open the next link.
-
-                     Only used for QtWebKit.
-
-        override_target: Override for open_target for fake clicks (like hints).
-
-                         Only used for QtWebKit.
-
-        pinned: Flag to pin the tab.
-
-        fullscreen: Whether the tab has a video shown fullscreen currently.
-
-        netrc_used: Whether netrc authentication was performed.
-
-        input_mode: current input mode for the tab.
+    Return content of file given as query parameter.
 
     """
 
+    path = url.path()
 
+    if path:
 
-    keep_icon = attr.ib(False)  # type: bool
+        path = "javascript" + os.sep.join(path.split('/'))
 
-    viewing_source = attr.ib(False)  # type: bool
+        return 'text/html', utils.read_file(path, binary=False)
 
-    inspector = attr.ib(None)  # type: typing.Optional[AbstractWebInspector]
+    else:
 
-    open_target = attr.ib(
+        raise QuteSchemeError("No file specified", ValueError())
 
-        usertypes.ClickTarget.normal)  # type: usertypes.ClickTarget
 
-    override_target = attr.ib(None)  # type: usertypes.ClickTarget
 
-    pinned = attr.ib(False)  # type: bool
 
-    fullscreen = attr.ib(False)  # type: bool
 
-    netrc_used = attr.ib(False)  # type: bool
+@add_handler('pyeval')
 
-    input_mode = attr.ib(usertypes.KeyMode.normal)  # type: usertypes.KeyMode
+def qute_pyeval(_url):
 
+    """Handler for qute://pyeval."""
 
+    html = jinja.render('pre.html', title='pyeval', content=pyeval_output)
 
-    def should_show_icon(self) -> bool:
+    return 'text/html', html
 
-        return (config.val.tabs.favicons.show == 'always' or
 
-                config.val.tabs.favicons.show == 'pinned' and self.pinned)
 
 
 
+@add_handler('spawn-output')
 
+def qute_spawn_output(_url):
 
-class AbstractAction:
+    """Handler for qute://spawn-output."""
 
+    html = jinja.render('pre.html', title='spawn output', content=spawn_output)
 
+    return 'text/html', html
 
-    """Attribute ``action`` of AbstractTab for Qt WebActions."""
 
 
 
-    # The class actions are defined on (QWeb{Engine,}Page)
 
-    action_class = None  # type: type
+@add_handler('version')
 
-    # The type of the actions (QWeb{Engine,}Page.WebAction)
+@add_handler('verizon')
 
-    action_base = None  # type: type
+def qute_version(_url):
 
+    """Handler for qute://version."""
 
+    html = jinja.render('version.html', title='Version info',
 
-    def __init__(self, tab: 'AbstractTab') -> None:
+                        version=version.version(),
 
-        self._widget = typing.cast(QWidget, None)
+                        copyright=qutebrowser.__copyright__)
 
-        self._tab = tab
+    return 'text/html', html
 
 
 
-    def exit_fullscreen(self) -> None:
 
-        """Exit the fullscreen mode."""
 
-        raise NotImplementedError
+@add_handler('plainlog')
 
+def qute_plainlog(url):
 
+    """Handler for qute://plainlog.
 
-    def save_page(self) -> None:
 
-        """Save the current page."""
 
-        raise NotImplementedError
+    An optional query parameter specifies the minimum log level to print.
 
+    For example, qute://log?level=warning prints warnings and errors.
 
-
-    def run_string(self, name: str) -> None:
-
-        """Run a webaction based on its name."""
-
-        member = getattr(self.action_class, name, None)
-
-        if not isinstance(member, self.action_base):
-
-            raise WebTabError("{} is not a valid web action!".format(name))
-
-        self._widget.triggerPageAction(member)
-
-
-
-    def show_source(
-
-            self,
-
-            pygments: bool = False  # pylint: disable=redefined-outer-name
-
-    ) -> None:
-
-        """Show the source of the current page in a new tab."""
-
-        raise NotImplementedError
-
-
-
-    def _show_source_pygments(self) -> None:
-
-
-
-        def show_source_cb(source: str) -> None:
-
-            """Show source as soon as it's ready."""
-
-            # WORKAROUND for https://github.com/PyCQA/pylint/issues/491
-
-            # pylint: disable=no-member
-
-            lexer = pygments.lexers.HtmlLexer()
-
-            formatter = pygments.formatters.HtmlFormatter(
-
-                full=True, linenos='table')
-
-            # pylint: enable=no-member
-
-            highlighted = pygments.highlight(source, lexer, formatter)
-
-
-
-            tb = objreg.get('tabbed-browser', scope='window',
-
-                            window=self._tab.win_id)
-
-            new_tab = tb.tabopen(background=False, related=True)
-
-            new_tab.set_html(highlighted, self._tab.url())
-
-            new_tab.data.viewing_source = True
-
-
-
-        self._tab.dump_async(show_source_cb)
-
-
-
-
-
-class AbstractPrinting:
-
-
-
-    """Attribute ``printing`` of AbstractTab for printing the page."""
-
-
-
-    def __init__(self, tab: 'AbstractTab') -> None:
-
-        self._widget = None
-
-        self._tab = tab
-
-
-
-    def check_pdf_support(self) -> None:
-
-        """Check whether writing to PDFs is supported.
-
-
-
-        If it's not supported (by the current Qt version), a WebTabError is
-
-        raised.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def check_printer_support(self) -> None:
-
-        """Check whether writing to a printer is supported.
-
-
-
-        If it's not supported (by the current Qt version), a WebTabError is
-
-        raised.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def check_preview_support(self) -> None:
-
-        """Check whether showing a print preview is supported.
-
-
-
-        If it's not supported (by the current Qt version), a WebTabError is
-
-        raised.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def to_pdf(self, filename: str) -> bool:
-
-        """Print the tab to a PDF with the given filename."""
-
-        raise NotImplementedError
-
-
-
-    def to_printer(self, printer: QPrinter,
-
-                   callback: typing.Callable[[bool], None] = None) -> None:
-
-        """Print the tab.
-
-
-
-        Args:
-
-            printer: The QPrinter to print to.
-
-            callback: Called with a boolean
-
-                      (True if printing succeeded, False otherwise)
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def show_dialog(self) -> None:
-
-        """Print with a QPrintDialog."""
-
-        self.check_printer_support()
-
-
-
-        def print_callback(ok: bool) -> None:
-
-            """Called when printing finished."""
-
-            if not ok:
-
-                message.error("Printing failed!")
-
-            diag.deleteLater()
-
-
-
-        def do_print() -> None:
-
-            """Called when the dialog was closed."""
-
-            self.to_printer(diag.printer(), print_callback)
-
-
-
-        diag = QPrintDialog(self._tab)
-
-        if utils.is_mac:
-
-            # For some reason we get a segfault when using open() on macOS
-
-            ret = diag.exec_()
-
-            if ret == QDialog.Accepted:
-
-                do_print()
-
-        else:
-
-            diag.open(do_print)
-
-
-
-
-
-class AbstractSearch(QObject):
-
-
-
-    """Attribute ``search`` of AbstractTab for doing searches.
-
-
-
-    Attributes:
-
-        text: The last thing this view was searched for.
-
-        search_displayed: Whether we're currently displaying search results in
-
-                          this view.
-
-        _flags: The flags of the last search (needs to be set by subclasses).
-
-        _widget: The underlying WebView widget.
+    Level can be one of: vdebug, debug, info, warning, error, critical.
 
     """
 
+    if log.ram_handler is None:
 
+        text = "Log output was disabled."
 
-    #: Signal emitted when a search was finished
+    else:
 
-    #: (True if the text was found, False otherwise)
+        level = QUrlQuery(url).queryItemValue('level')
 
-    finished = pyqtSignal(bool)
+        if not level:
 
-    #: Signal emitted when an existing search was cleared.
+            level = 'vdebug'
 
-    cleared = pyqtSignal()
+        text = log.ram_handler.dump_log(html=False, level=level)
 
+    html = jinja.render('pre.html', title='log', content=text)
 
+    return 'text/html', html
 
-    _Callback = typing.Callable[[bool], None]
 
 
 
-    def __init__(self, tab: 'AbstractTab', parent: QWidget = None):
 
-        super().__init__(parent)
+@add_handler('log')
 
-        self._tab = tab
+def qute_log(url):
 
-        self._widget = None
+    """Handler for qute://log.
 
-        self.text = None  # type: typing.Optional[str]
 
-        self.search_displayed = False
 
+    An optional query parameter specifies the minimum log level to print.
 
+    For example, qute://log?level=warning prints warnings and errors.
 
-    def _is_case_sensitive(self, ignore_case: usertypes.IgnoreCase) -> bool:
-
-        """Check if case-sensitivity should be used.
-
-
-
-        This assumes self.text is already set properly.
-
-
-
-        Arguments:
-
-            ignore_case: The ignore_case value from the config.
-
-        """
-
-        assert self.text is not None
-
-        mapping = {
-
-            usertypes.IgnoreCase.smart: not self.text.islower(),
-
-            usertypes.IgnoreCase.never: True,
-
-            usertypes.IgnoreCase.always: False,
-
-        }
-
-        return mapping[ignore_case]
-
-
-
-    def search(self, text: str, *,
-
-               ignore_case: usertypes.IgnoreCase = usertypes.IgnoreCase.never,
-
-               reverse: bool = False,
-
-               result_cb: _Callback = None) -> None:
-
-        """Find the given text on the page.
-
-
-
-        Args:
-
-            text: The text to search for.
-
-            ignore_case: Search case-insensitively.
-
-            reverse: Reverse search direction.
-
-            result_cb: Called with a bool indicating whether a match was found.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def clear(self) -> None:
-
-        """Clear the current search."""
-
-        raise NotImplementedError
-
-
-
-    def prev_result(self, *, result_cb: _Callback = None) -> None:
-
-        """Go to the previous result of the current search.
-
-
-
-        Args:
-
-            result_cb: Called with a bool indicating whether a match was found.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def next_result(self, *, result_cb: _Callback = None) -> None:
-
-        """Go to the next result of the current search.
-
-
-
-        Args:
-
-            result_cb: Called with a bool indicating whether a match was found.
-
-        """
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractZoom(QObject):
-
-
-
-    """Attribute ``zoom`` of AbstractTab for controlling zoom."""
-
-
-
-    def __init__(self, tab: 'AbstractTab', parent: QWidget = None) -> None:
-
-        super().__init__(parent)
-
-        self._tab = tab
-
-        self._widget = None
-
-        # Whether zoom was changed from the default.
-
-        self._default_zoom_changed = False
-
-        self._init_neighborlist()
-
-        config.instance.changed.connect(self._on_config_changed)
-
-        self._zoom_factor = float(config.val.zoom.default) / 100
-
-
-
-    @pyqtSlot(str)
-
-    def _on_config_changed(self, option: str) -> None:
-
-        if option in ['zoom.levels', 'zoom.default']:
-
-            if not self._default_zoom_changed:
-
-                factor = float(config.val.zoom.default) / 100
-
-                self.set_factor(factor)
-
-            self._init_neighborlist()
-
-
-
-    def _init_neighborlist(self) -> None:
-
-        """Initialize self._neighborlist.
-
-
-
-        It is a NeighborList with the zoom levels."""
-
-        levels = config.val.zoom.levels
-
-        self._neighborlist = usertypes.NeighborList(
-
-            levels, mode=usertypes.NeighborList.Modes.edge)
-
-        self._neighborlist.fuzzyval = config.val.zoom.default
-
-
-
-    def apply_offset(self, offset: int) -> None:
-
-        """Increase/Decrease the zoom level by the given offset.
-
-
-
-        Args:
-
-            offset: The offset in the zoom level list.
-
-
-
-        Return:
-
-            The new zoom percentage.
-
-        """
-
-        level = self._neighborlist.getitem(offset)
-
-        self.set_factor(float(level) / 100, fuzzyval=False)
-
-        return level
-
-
-
-    def _set_factor_internal(self, factor: float) -> None:
-
-        raise NotImplementedError
-
-
-
-    def set_factor(self, factor: float, *, fuzzyval: bool = True) -> None:
-
-        """Zoom to a given zoom factor.
-
-
-
-        Args:
-
-            factor: The zoom factor as float.
-
-            fuzzyval: Whether to set the NeighborLists fuzzyval.
-
-        """
-
-        if fuzzyval:
-
-            self._neighborlist.fuzzyval = int(factor * 100)
-
-        if factor < 0:
-
-            raise ValueError("Can't zoom to factor {}!".format(factor))
-
-
-
-        default_zoom_factor = float(config.val.zoom.default) / 100
-
-        self._default_zoom_changed = (factor != default_zoom_factor)
-
-
-
-        self._zoom_factor = factor
-
-        self._set_factor_internal(factor)
-
-
-
-    def factor(self) -> float:
-
-        return self._zoom_factor
-
-
-
-    def apply_default(self) -> None:
-
-        self._set_factor_internal(float(config.val.zoom.default) / 100)
-
-
-
-    def reapply(self) -> None:
-
-        self._set_factor_internal(self._zoom_factor)
-
-
-
-
-
-class AbstractCaret(QObject):
-
-
-
-    """Attribute ``caret`` of AbstractTab for caret browsing."""
-
-
-
-    #: Signal emitted when the selection was toggled.
-
-    #: (argument - whether the selection is now active)
-
-    selection_toggled = pyqtSignal(bool)
-
-    #: Emitted when a ``follow_selection`` action is done.
-
-    follow_selected_done = pyqtSignal()
-
-
-
-    def __init__(self,
-
-                 tab: 'AbstractTab',
-
-                 mode_manager: modeman.ModeManager,
-
-                 parent: QWidget = None) -> None:
-
-        super().__init__(parent)
-
-        self._tab = tab
-
-        self._widget = None
-
-        self.selection_enabled = False
-
-        self._mode_manager = mode_manager
-
-        mode_manager.entered.connect(self._on_mode_entered)
-
-        mode_manager.left.connect(self._on_mode_left)
-
-
-
-    def _on_mode_entered(self, mode: usertypes.KeyMode) -> None:
-
-        raise NotImplementedError
-
-
-
-    def _on_mode_left(self, mode: usertypes.KeyMode) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_next_line(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_prev_line(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_next_char(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_prev_char(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_end_of_word(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_next_word(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_prev_word(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_start_of_line(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_end_of_line(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_start_of_next_block(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_start_of_prev_block(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_end_of_next_block(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_end_of_prev_block(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_start_of_document(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_end_of_document(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def toggle_selection(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def drop_selection(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def selection(self, callback: typing.Callable[[str], None]) -> None:
-
-        raise NotImplementedError
-
-
-
-    def reverse_selection(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def _follow_enter(self, tab: bool) -> None:
-
-        """Follow a link by faking an enter press."""
-
-        if tab:
-
-            self._tab.fake_key_press(Qt.Key_Enter, modifier=Qt.ControlModifier)
-
-        else:
-
-            self._tab.fake_key_press(Qt.Key_Enter)
-
-
-
-    def follow_selected(self, *, tab: bool = False) -> None:
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractScroller(QObject):
-
-
-
-    """Attribute ``scroller`` of AbstractTab to manage scroll position."""
-
-
-
-    #: Signal emitted when the scroll position changed (int, int)
-
-    perc_changed = pyqtSignal(int, int)
-
-    #: Signal emitted before the user requested a jump.
-
-    #: Used to set the special ' mark so the user can return.
-
-    before_jump_requested = pyqtSignal()
-
-
-
-    def __init__(self, tab: 'AbstractTab', parent: QWidget = None):
-
-        super().__init__(parent)
-
-        self._tab = tab
-
-        self._widget = None  # type: typing.Optional[QWidget]
-
-        if 'log-scroll-pos' in objects.debug_flags:
-
-            self.perc_changed.connect(self._log_scroll_pos_change)
-
-
-
-    @pyqtSlot()
-
-    def _log_scroll_pos_change(self) -> None:
-
-        log.webview.vdebug(  # type: ignore
-
-            "Scroll position changed to {}".format(self.pos_px()))
-
-
-
-    def _init_widget(self, widget: QWidget) -> None:
-
-        self._widget = widget
-
-
-
-    def pos_px(self) -> int:
-
-        raise NotImplementedError
-
-
-
-    def pos_perc(self) -> int:
-
-        raise NotImplementedError
-
-
-
-    def to_perc(self, x: int = None, y: int = None) -> None:
-
-        raise NotImplementedError
-
-
-
-    def to_point(self, point: QPoint) -> None:
-
-        raise NotImplementedError
-
-
-
-    def to_anchor(self, name: str) -> None:
-
-        raise NotImplementedError
-
-
-
-    def delta(self, x: int = 0, y: int = 0) -> None:
-
-        raise NotImplementedError
-
-
-
-    def delta_page(self, x: float = 0, y: float = 0) -> None:
-
-        raise NotImplementedError
-
-
-
-    def up(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def down(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def left(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def right(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def top(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def bottom(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def page_up(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def page_down(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def at_top(self) -> bool:
-
-        raise NotImplementedError
-
-
-
-    def at_bottom(self) -> bool:
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractHistoryPrivate:
-
-
-
-    """Private API related to the history."""
-
-
-
-    def __init__(self, tab: 'AbstractTab'):
-
-        self._tab = tab
-
-        self._history = None
-
-
-
-    def serialize(self) -> bytes:
-
-        """Serialize into an opaque format understood by self.deserialize."""
-
-        raise NotImplementedError
-
-
-
-    def deserialize(self, data: bytes) -> None:
-
-        """Deserialize from a format produced by self.serialize."""
-
-        raise NotImplementedError
-
-
-
-    def load_items(self, items: typing.Sequence) -> None:
-
-        """Deserialize from a list of WebHistoryItems."""
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractHistory:
-
-
-
-    """The history attribute of a AbstractTab."""
-
-
-
-    def __init__(self, tab: 'AbstractTab') -> None:
-
-        self._tab = tab
-
-        self._history = None
-
-        self.private_api = AbstractHistoryPrivate(tab)
-
-
-
-    def __len__(self) -> int:
-
-        raise NotImplementedError
-
-
-
-    def __iter__(self) -> typing.Iterable:
-
-        raise NotImplementedError
-
-
-
-    def _check_count(self, count: int) -> None:
-
-        """Check whether the count is positive."""
-
-        if count < 0:
-
-            raise WebTabError("count needs to be positive!")
-
-
-
-    def current_idx(self) -> int:
-
-        raise NotImplementedError
-
-
-
-    def back(self, count: int = 1) -> None:
-
-        """Go back in the tab's history."""
-
-        self._check_count(count)
-
-        idx = self.current_idx() - count
-
-        if idx >= 0:
-
-            self._go_to_item(self._item_at(idx))
-
-        else:
-
-            self._go_to_item(self._item_at(0))
-
-            raise WebTabError("At beginning of history.")
-
-
-
-    def forward(self, count: int = 1) -> None:
-
-        """Go forward in the tab's history."""
-
-        self._check_count(count)
-
-        idx = self.current_idx() + count
-
-        if idx < len(self):
-
-            self._go_to_item(self._item_at(idx))
-
-        else:
-
-            self._go_to_item(self._item_at(len(self) - 1))
-
-            raise WebTabError("At end of history.")
-
-
-
-    def can_go_back(self) -> bool:
-
-        raise NotImplementedError
-
-
-
-    def can_go_forward(self) -> bool:
-
-        raise NotImplementedError
-
-
-
-    def _item_at(self, i: int) -> typing.Any:
-
-        raise NotImplementedError
-
-
-
-    def _go_to_item(self, item: typing.Any) -> None:
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractElements:
-
-
-
-    """Finding and handling of elements on the page."""
-
-
-
-    _MultiCallback = typing.Callable[
-
-        [typing.Sequence['webelem.AbstractWebElement']], None]
-
-    _SingleCallback = typing.Callable[
-
-        [typing.Optional['webelem.AbstractWebElement']], None]
-
-    _ErrorCallback = typing.Callable[[Exception], None]
-
-
-
-    def __init__(self, tab: 'AbstractTab') -> None:
-
-        self._widget = None
-
-        self._tab = tab
-
-
-
-    def find_css(self, selector: str,
-
-                 callback: _MultiCallback,
-
-                 error_cb: _ErrorCallback, *,
-
-                 only_visible: bool = False) -> None:
-
-        """Find all HTML elements matching a given selector async.
-
-
-
-        If there's an error, the callback is called with a webelem.Error
-
-        instance.
-
-
-
-        Args:
-
-            callback: The callback to be called when the search finished.
-
-            error_cb: The callback to be called when an error occurred.
-
-            selector: The CSS selector to search for.
-
-            only_visible: Only show elements which are visible on screen.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def find_id(self, elem_id: str, callback: _SingleCallback) -> None:
-
-        """Find the HTML element with the given ID async.
-
-
-
-        Args:
-
-            callback: The callback to be called when the search finished.
-
-                      Called with a WebEngineElement or None.
-
-            elem_id: The ID to search for.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def find_focused(self, callback: _SingleCallback) -> None:
-
-        """Find the focused element on the page async.
-
-
-
-        Args:
-
-            callback: The callback to be called when the search finished.
-
-                      Called with a WebEngineElement or None.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def find_at_pos(self, pos: QPoint, callback: _SingleCallback) -> None:
-
-        """Find the element at the given position async.
-
-
-
-        This is also called "hit test" elsewhere.
-
-
-
-        Args:
-
-            pos: The QPoint to get the element for.
-
-            callback: The callback to be called when the search finished.
-
-                      Called with a WebEngineElement or None.
-
-        """
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractAudio(QObject):
-
-
-
-    """Handling of audio/muting for this tab."""
-
-
-
-    muted_changed = pyqtSignal(bool)
-
-    recently_audible_changed = pyqtSignal(bool)
-
-
-
-    def __init__(self, tab: 'AbstractTab', parent: QWidget = None) -> None:
-
-        super().__init__(parent)
-
-        self._widget = None  # type: typing.Optional[QWidget]
-
-        self._tab = tab
-
-
-
-    def set_muted(self, muted: bool, override: bool = False) -> None:
-
-        """Set this tab as muted or not.
-
-
-
-        Arguments:
-
-            override: If set to True, muting/unmuting was done manually and
-
-                      overrides future automatic mute/unmute changes based on
-
-                      the URL.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def is_muted(self) -> bool:
-
-        raise NotImplementedError
-
-
-
-    def is_recently_audible(self) -> bool:
-
-        """Whether this tab has had audio playing recently."""
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractTabPrivate:
-
-
-
-    """Tab-related methods which are only needed in the core.
-
-
-
-    Those methods are not part of the API which is exposed to extensions, and
-
-    should ideally be removed at some point in the future.
+    Level can be one of: vdebug, debug, info, warning, error, critical.
 
     """
 
+    if log.ram_handler is None:
 
+        html_log = None
 
-    def __init__(self, mode_manager: modeman.ModeManager,
+    else:
 
-                 tab: 'AbstractTab') -> None:
+        level = QUrlQuery(url).queryItemValue('level')
 
-        self._widget = None  # type: typing.Optional[QWidget]
+        if not level:
 
-        self._tab = tab
+            level = 'vdebug'
 
-        self._mode_manager = mode_manager
+        html_log = log.ram_handler.dump_log(html=True, level=level)
 
 
 
-    def event_target(self) -> QWidget:
+    html = jinja.render('log.html', title='log', content=html_log)
 
-        """Return the widget events should be sent to."""
+    return 'text/html', html
 
-        raise NotImplementedError
 
 
 
-    def handle_auto_insert_mode(self, ok: bool) -> None:
 
-        """Handle `input.insert_mode.auto_load` after loading finished."""
+@add_handler('gpl')
 
-        if not ok or not config.cache['input.insert_mode.auto_load']:
+def qute_gpl(_url):
 
-            return
+    """Handler for qute://gpl. Return HTML content as string."""
 
+    return 'text/html', utils.read_file('html/license.html')
 
 
-        cur_mode = self._mode_manager.mode
 
-        if cur_mode == usertypes.KeyMode.insert:
 
-            return
 
+@add_handler('help')
 
+def qute_help(url):
 
-        def _auto_insert_mode_cb(
+    """Handler for qute://help."""
 
-                elem: typing.Optional['webelem.AbstractWebElement']
+    urlpath = url.path()
 
-        ) -> None:
+    if not urlpath or urlpath == '/':
 
-            """Called from JS after finding the focused element."""
+        urlpath = 'index.html'
 
-            if elem is None:
+    else:
 
-                log.webview.debug("No focused element!")
+        urlpath = urlpath.lstrip('/')
 
-                return
+    if not docutils.docs_up_to_date(urlpath):
 
-            if elem.is_editable():
+        message.error("Your documentation is outdated! Please re-run "
 
-                modeman.enter(self._tab.win_id, usertypes.KeyMode.insert,
+                      "scripts/asciidoc2html.py.")
 
-                              'load finished', only_if_normal=True)
 
 
+    path = 'html/doc/{}'.format(urlpath)
 
-        self._tab.elements.find_focused(_auto_insert_mode_cb)
+    if not urlpath.endswith('.html'):
 
+        try:
 
+            bdata = utils.read_file(path, binary=True)
 
-    def clear_ssl_errors(self) -> None:
+        except OSError as e:
 
-        raise NotImplementedError
+            raise QuteSchemeOSError(e)
 
+        mimetype, _encoding = mimetypes.guess_type(urlpath)
 
+        assert mimetype is not None, url
 
-    def networkaccessmanager(self) -> typing.Optional[QNetworkAccessManager]:
+        return mimetype, bdata
 
-        """Get the QNetworkAccessManager for this tab.
 
 
+    try:
 
-        This is only implemented for QtWebKit.
+        data = utils.read_file(path)
 
-        For QtWebEngine, always returns None.
+    except OSError:
 
-        """
+        # No .html around, let's see if we find the asciidoc
 
-        raise NotImplementedError
+        asciidoc_path = path.replace('.html', '.asciidoc')
 
+        if asciidoc_path.startswith('html/doc/'):
 
-
-    def user_agent(self) -> typing.Optional[str]:
-
-        """Get the user agent for this tab.
-
-
-
-        This is only implemented for QtWebKit.
-
-        For QtWebEngine, always returns None.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def shutdown(self) -> None:
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractTab(QWidget):
-
-
-
-    """An adapter for QWebView/QWebEngineView representing a single tab."""
-
-
-
-    #: Signal emitted when a website requests to close this tab.
-
-    window_close_requested = pyqtSignal()
-
-    #: Signal emitted when a link is hovered (the hover text)
-
-    link_hovered = pyqtSignal(str)
-
-    #: Signal emitted when a page started loading
-
-    load_started = pyqtSignal()
-
-    #: Signal emitted when a page is loading (progress percentage)
-
-    load_progress = pyqtSignal(int)
-
-    #: Signal emitted when a page finished loading (success as bool)
-
-    load_finished = pyqtSignal(bool)
-
-    #: Signal emitted when a page's favicon changed (icon as QIcon)
-
-    icon_changed = pyqtSignal(QIcon)
-
-    #: Signal emitted when a page's title changed (new title as str)
-
-    title_changed = pyqtSignal(str)
-
-    #: Signal emitted when a new tab should be opened (url as QUrl)
-
-    new_tab_requested = pyqtSignal(QUrl)
-
-    #: Signal emitted when a page's URL changed (url as QUrl)
-
-    url_changed = pyqtSignal(QUrl)
-
-    #: Signal emitted when a tab's content size changed
-
-    #: (new size as QSizeF)
-
-    contents_size_changed = pyqtSignal(QSizeF)
-
-    #: Signal emitted when a page requested full-screen (bool)
-
-    fullscreen_requested = pyqtSignal(bool)
-
-    #: Signal emitted before load starts (URL as QUrl)
-
-    before_load_started = pyqtSignal(QUrl)
-
-
-
-    # Signal emitted when a page's load status changed
-
-    # (argument: usertypes.LoadStatus)
-
-    load_status_changed = pyqtSignal(usertypes.LoadStatus)
-
-    # Signal emitted before shutting down
-
-    shutting_down = pyqtSignal()
-
-    # Signal emitted when a history item should be added
-
-    history_item_triggered = pyqtSignal(QUrl, QUrl, str)
-
-    # Signal emitted when the underlying renderer process terminated.
-
-    # arg 0: A TerminationStatus member.
-
-    # arg 1: The exit code.
-
-    renderer_process_terminated = pyqtSignal(TerminationStatus, int)
-
-
-
-    def __init__(self, *, win_id: int, private: bool,
-
-                 parent: QWidget = None) -> None:
-
-        self.is_private = private
-
-        self.win_id = win_id
-
-        self.tab_id = next(tab_id_gen)
-
-        super().__init__(parent)
-
-
-
-        self.registry = objreg.ObjectRegistry()
-
-        tab_registry = objreg.get('tab-registry', scope='window',
-
-                                  window=win_id)
-
-        tab_registry[self.tab_id] = self
-
-        objreg.register('tab', self, registry=self.registry)
-
-
-
-        self.data = TabData()
-
-        self._layout = miscwidgets.WrapperLayout(self)
-
-        self._widget = None  # type: typing.Optional[QWidget]
-
-        self._progress = 0
-
-        self._has_ssl_errors = False
-
-        self._load_status = usertypes.LoadStatus.none
-
-        self._tab_event_filter = eventfilter.TabEventFilter(
-
-            self, parent=self)
-
-        self.backend = None
-
-
-
-        # FIXME:qtwebengine  Should this be public api via self.hints?
-
-        #                    Also, should we get it out of objreg?
-
-        hintmanager = hints.HintManager(win_id, self.tab_id, parent=self)
-
-        objreg.register('hintmanager', hintmanager, scope='tab',
-
-                        window=self.win_id, tab=self.tab_id)
-
-
-
-        self.before_load_started.connect(self._on_before_load_started)
-
-
-
-    def _set_widget(self, widget: QWidget) -> None:
-
-        # pylint: disable=protected-access
-
-        self._widget = widget
-
-        self._layout.wrap(self, widget)
-
-        self.history._history = widget.history()
-
-        self.history.private_api._history = widget.history()
-
-        self.scroller._init_widget(widget)
-
-        self.caret._widget = widget
-
-        self.zoom._widget = widget
-
-        self.search._widget = widget
-
-        self.printing._widget = widget
-
-        self.action._widget = widget
-
-        self.elements._widget = widget
-
-        self.audio._widget = widget
-
-        self.private_api._widget = widget
-
-        self.settings._settings = widget.settings()
-
-
-
-        self._install_event_filter()
-
-        self.zoom.apply_default()
-
-
-
-    def _install_event_filter(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def _set_load_status(self, val: usertypes.LoadStatus) -> None:
-
-        """Setter for load_status."""
-
-        if not isinstance(val, usertypes.LoadStatus):
-
-            raise TypeError("Type {} is no LoadStatus member!".format(val))
-
-        log.webview.debug("load status for {}: {}".format(repr(self), val))
-
-        self._load_status = val
-
-        self.load_status_changed.emit(val)
-
-
-
-    def send_event(self, evt: QEvent) -> None:
-
-        """Send the given event to the underlying widget.
-
-
-
-        The event will be sent via QApplication.postEvent.
-
-        Note that a posted event must not be re-used in any way!
-
-        """
-
-        # This only gives us some mild protection against re-using events, but
-
-        # it's certainly better than a segfault.
-
-        if getattr(evt, 'posted', False):
-
-            raise utils.Unreachable("Can't re-use an event which was already "
-
-                                    "posted!")
-
-
-
-        recipient = self.private_api.event_target()
-
-        if recipient is None:
-
-            # https://github.com/qutebrowser/qutebrowser/issues/3888
-
-            log.webview.warning("Unable to find event target!")
-
-            return
-
-
-
-        evt.posted = True
-
-        QApplication.postEvent(recipient, evt)
-
-
-
-    def navigation_blocked(self) -> bool:
-
-        """Test if navigation is allowed on the current tab."""
-
-        return self.data.pinned and config.val.tabs.pinned.frozen
-
-
-
-    @pyqtSlot(QUrl)
-
-    def _on_before_load_started(self, url: QUrl) -> None:
-
-        """Adjust the title if we are going to visit a URL soon."""
-
-        qtutils.ensure_valid(url)
-
-        url_string = url.toDisplayString()
-
-        log.webview.debug("Going to start loading: {}".format(url_string))
-
-        self.title_changed.emit(url_string)
-
-
-
-    @pyqtSlot(QUrl)
-
-    def _on_url_changed(self, url: QUrl) -> None:
-
-        """Update title when URL has changed and no title is available."""
-
-        if url.isValid() and not self.title():
-
-            self.title_changed.emit(url.toDisplayString())
-
-        self.url_changed.emit(url)
-
-
-
-    @pyqtSlot()
-
-    def _on_load_started(self) -> None:
-
-        self._progress = 0
-
-        self._has_ssl_errors = False
-
-        self.data.viewing_source = False
-
-        self._set_load_status(usertypes.LoadStatus.loading)
-
-        self.load_started.emit()
-
-
-
-    @pyqtSlot(usertypes.NavigationRequest)
-
-    def _on_navigation_request(
-
-            self,
-
-            navigation: usertypes.NavigationRequest
-
-    ) -> None:
-
-        """Handle common acceptNavigationRequest code."""
-
-        url = utils.elide(navigation.url.toDisplayString(), 100)
-
-        log.webview.debug("navigation request: url {}, type {}, is_main_frame "
-
-                          "{}".format(url,
-
-                                      navigation.navigation_type,
-
-                                      navigation.is_main_frame))
-
-
-
-        if not navigation.url.isValid():
-
-            # Also a WORKAROUND for missing IDNA 2008 support in QUrl, see
-
-            # https://bugreports.qt.io/browse/QTBUG-60364
-
-
-
-            if navigation.navigation_type == navigation.Type.link_clicked:
-
-                msg = urlutils.get_errstring(navigation.url,
-
-                                             "Invalid link clicked")
-
-                message.error(msg)
-
-                self.data.open_target = usertypes.ClickTarget.normal
-
-
-
-            log.webview.debug("Ignoring invalid URL {} in "
-
-                              "acceptNavigationRequest: {}".format(
-
-                                  navigation.url.toDisplayString(),
-
-                                  navigation.url.errorString()))
-
-            navigation.accepted = False
-
-
-
-    @pyqtSlot(bool)
-
-    def _on_load_finished(self, ok: bool) -> None:
-
-        assert self._widget is not None
-
-        if sip.isdeleted(self._widget):
-
-            # https://github.com/qutebrowser/qutebrowser/issues/3498
-
-            return
+            asciidoc_path = asciidoc_path.replace('html/doc/', '../doc/help/')
 
 
 
         try:
 
-            sess_manager = objreg.get('session-manager')
+            asciidoc = utils.read_file(asciidoc_path)
 
-        except KeyError:
+        except OSError:
 
-            # https://github.com/qutebrowser/qutebrowser/issues/4311
+            asciidoc = None
 
-            return
 
 
+        if asciidoc is None:
 
-        sess_manager.save_autosave()
+            raise
 
-        self.load_finished.emit(ok)
 
 
+        preamble = textwrap.dedent("""
 
-        if not self.title():
+            There was an error loading the documentation!
 
-            self.title_changed.emit(self.url().toDisplayString())
 
 
+            This most likely means the documentation was not generated
 
-        self.zoom.reapply()
+            properly. If you are running qutebrowser from the git repository,
 
+            please (re)run scripts/asciidoc2html.py and reload this page.
 
 
-    def _update_load_status(self, ok: bool) -> None:
 
-        """Update the load status after a page finished loading.
+            If you're running a released version this is a bug, please use
 
+            :report to report it.
 
 
-        Needs to be called by subclasses to trigger a load status update, e.g.
 
-        as a response to a loadFinished signal.
+            Falling back to the plaintext version.
 
-        """
 
-        if ok and not self._has_ssl_errors:
 
-            if self.url().scheme() == 'https':
+            ---------------------------------------------------------------
 
-                self._set_load_status(usertypes.LoadStatus.success_https)
 
-            else:
 
-                self._set_load_status(usertypes.LoadStatus.success)
 
-        elif ok:
 
-            self._set_load_status(usertypes.LoadStatus.warn)
+        """)
 
-        else:
+        return 'text/plain', (preamble + asciidoc).encode('utf-8')
 
-            self._set_load_status(usertypes.LoadStatus.error)
+    else:
 
+        return 'text/html', data
 
 
-    @pyqtSlot()
 
-    def _on_history_trigger(self) -> None:
 
-        """Emit history_item_triggered based on backend-specific signal."""
 
-        raise NotImplementedError
+@add_handler('backend-warning')
 
+def qute_backend_warning(_url):
 
+    """Handler for qute://backend-warning."""
 
-    @pyqtSlot(int)
+    html = jinja.render('backend-warning.html',
 
-    def _on_load_progress(self, perc: int) -> None:
+                        distribution=version.distribution(),
 
-        self._progress = perc
+                        Distribution=version.Distribution,
 
-        self.load_progress.emit(perc)
+                        version=pkg_resources.parse_version,
 
+                        title="Legacy backend warning")
 
+    return 'text/html', html
 
-    def url(self, *, requested: bool = False) -> QUrl:
 
-        raise NotImplementedError
 
 
 
-    def progress(self) -> int:
+def _qute_settings_set(url):
 
-        return self._progress
+    """Handler for qute://settings/set."""
 
+    query = QUrlQuery(url)
 
+    option = query.queryItemValue('option', QUrl.FullyDecoded)
 
-    def load_status(self) -> usertypes.LoadStatus:
+    value = query.queryItemValue('value', QUrl.FullyDecoded)
 
-        return self._load_status
 
 
+    # https://github.com/qutebrowser/qutebrowser/issues/727
 
-    def _load_url_prepare(self, url: QUrl, *,
+    if option == 'content.javascript.enabled' and value == 'false':
 
-                          emit_before_load_started: bool = True) -> None:
+        msg = ("Refusing to disable javascript via qute://settings "
 
-        qtutils.ensure_valid(url)
+               "as it needs javascript support.")
 
-        if emit_before_load_started:
+        message.error(msg)
 
-            self.before_load_started.emit(url)
+        return 'text/html', b'error: ' + msg.encode('utf-8')
 
 
 
-    def load_url(self, url: QUrl, *,
+    try:
 
-                 emit_before_load_started: bool = True) -> None:
+        config.instance.set_str(option, value, save_yaml=True)
 
-        raise NotImplementedError
+        return 'text/html', b'ok'
 
+    except configexc.Error as e:
 
+        message.error(str(e))
 
-    def reload(self, *, force: bool = False) -> None:
+        return 'text/html', b'error: ' + str(e).encode('utf-8')
 
-        raise NotImplementedError
 
 
 
-    def stop(self) -> None:
 
-        raise NotImplementedError
+@add_handler('settings')
 
+def qute_settings(url):
 
+    """Handler for qute://settings. View/change qute configuration."""
 
-    def fake_key_press(self,
+    if url.path() == '/set':
 
-                       key: Qt.Key,
+        return _qute_settings_set(url)
 
-                       modifier: Qt.KeyboardModifier = Qt.NoModifier) -> None:
 
-        """Send a fake key event to this tab."""
 
-        press_evt = QKeyEvent(QEvent.KeyPress, key, modifier, 0, 0, 0)
+    html = jinja.render('settings.html', title='settings',
 
-        release_evt = QKeyEvent(QEvent.KeyRelease, key, modifier,
+                        configdata=configdata,
 
-                                0, 0, 0)
+                        confget=config.instance.get_str)
 
-        self.send_event(press_evt)
+    return 'text/html', html
 
-        self.send_event(release_evt)
 
 
 
-    def dump_async(self,
 
-                   callback: typing.Callable[[str], None], *,
+@add_handler('bindings')
 
-                   plain: bool = False) -> None:
+def qute_bindings(_url):
 
-        """Dump the current page's html asynchronously.
+    """Handler for qute://bindings. View keybindings."""
 
+    bindings = {}
 
+    defaults = config.val.bindings.default
 
-        The given callback will be called with the result when dumping is
+    modes = set(defaults.keys()).union(config.val.bindings.commands)
 
-        complete.
+    modes.remove('normal')
 
-        """
+    modes = ['normal'] + sorted(list(modes))
 
-        raise NotImplementedError
+    for mode in modes:
 
+        bindings[mode] = config.key_instance.get_bindings_for(mode)
 
 
-    def run_js_async(
 
-            self,
+    html = jinja.render('bindings.html', title='Bindings',
 
-            code: str,
+                        bindings=bindings)
 
-            callback: typing.Callable[[typing.Any], None] = None, *,
+    return 'text/html', html
 
-            world: typing.Union[usertypes.JsWorld, int] = None
 
-    ) -> None:
 
-        """Run javascript async.
 
 
+@add_handler('back')
 
-        The given callback will be called with the result when running JS is
+def qute_back(url):
 
-        complete.
+    """Handler for qute://back.
 
 
 
-        Args:
+    Simple page to free ram / lazy load a site, goes back on focusing the tab.
 
-            code: The javascript code to run.
+    """
 
-            callback: The callback to call with the result, or None.
+    html = jinja.render(
 
-            world: A world ID (int or usertypes.JsWorld member) to run the JS
+        'back.html',
 
-                   in the main world or in another isolated world.
+        title='Suspended: ' + urllib.parse.unquote(url.fragment()))
 
-        """
+    return 'text/html', html
 
-        raise NotImplementedError
 
 
 
-    def title(self) -> str:
 
-        raise NotImplementedError
+@add_handler('configdiff')
 
+def qute_configdiff(url):
 
+    """Handler for qute://configdiff."""
 
-    def icon(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def set_html(self, html: str, base_url: QUrl = QUrl()) -> None:
-
-        raise NotImplementedError
-
-
-
-    def __repr__(self) -> str:
+    if url.path() == '/old':
 
         try:
 
-            qurl = self.url()
+            return 'text/html', configdiff.get_diff()
 
-            url = qurl.toDisplayString(QUrl.EncodeUnicode)  # type: ignore
+        except OSError as e:
 
-        except (AttributeError, RuntimeError) as exc:
+            error = (b'Failed to read old config: ' +
 
-            url = '<{}>'.format(exc.__class__.__name__)
+                     str(e.strerror).encode('utf-8'))
 
-        else:
+            return 'text/plain', error
 
-            url = utils.elide(url, 100)
+    else:
 
-        return utils.get_repr(self, tab_id=self.tab_id, url=url)
+        data = config.instance.dump_userconfig().encode('utf-8')
+
+        return 'text/plain', data
 
 
 
-    def is_deleted(self) -> bool:
 
-        assert self._widget is not None
 
-        return sip.isdeleted(self._widget)
+@add_handler('pastebin-version')
+
+def qute_pastebin_version(_url):
+
+    """Handler that pastebins the version string."""
+
+    version.pastebin_version()
+
+    return 'text/plain', b'Paste called.'

@@ -2,467 +2,117 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-#!/usr/bin/python
+# vim: ft=python fileencoding=utf-8 sts=4 sw=4 et:
 
-# -*- coding: utf-8 -*-
 
 
+# Copyright 2016-2018 Florian Bruhin (The Compiler) <mail@qutebrowser.org>
 
-# Copyright: (c) 2016, Yanis Guenane <yanis+ansible@guenane.org>
+#
 
-# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
+# This file is part of qutebrowser.
 
+#
 
+# qutebrowser is free software: you can redistribute it and/or modify
 
-from __future__ import absolute_import, division, print_function
+# it under the terms of the GNU General Public License as published by
 
-__metaclass__ = type
+# the Free Software Foundation, either version 3 of the License, or
 
+# (at your option) any later version.
 
+#
 
+# qutebrowser is distributed in the hope that it will be useful,
 
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
 
-DOCUMENTATION = r'''
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 
----
+# GNU General Public License for more details.
 
-module: openssl_publickey
+#
 
-short_description: Generate an OpenSSL public key from its private key.
+# You should have received a copy of the GNU General Public License
 
-description:
+# along with qutebrowser.  If not, see <http://www.gnu.org/licenses/>.
 
-    - This module allows one to (re)generate OpenSSL public keys from their private keys.
 
-    - Keys are generated in PEM or OpenSSH format.
 
-    - "The module can use the cryptography Python library, or the pyOpenSSL Python
+"""Backend-independent qute://* code.
 
-      library. By default, it tries to detect which one is available. This can be
 
-      overridden with the I(select_crypto_backend) option. When I(format) is C(OpenSSH),
 
-      the C(cryptography) backend has to be used. Please note that the PyOpenSSL backend
+Module attributes:
 
-      was deprecated in Ansible 2.9 and will be removed in community.crypto 2.0.0."
+    pyeval_output: The output of the last :pyeval command.
 
-requirements:
+    _HANDLERS: The handlers registered via decorators.
 
-    - Either cryptography >= 1.2.3 (older versions might work as well)
+"""
 
-    - Or pyOpenSSL >= 16.0.0
 
-    - Needs cryptography >= 1.4 if I(format) is C(OpenSSH)
 
-author:
-
-    - Yanis Guenane (@Spredzy)
-
-    - Felix Fontein (@felixfontein)
-
-options:
-
-    state:
-
-        description:
-
-            - Whether the public key should exist or not, taking action if the state is different from what is stated.
-
-        type: str
-
-        default: present
-
-        choices: [ absent, present ]
-
-    force:
-
-        description:
-
-            - Should the key be regenerated even it it already exists.
-
-        type: bool
-
-        default: no
-
-    format:
-
-        description:
-
-            - The format of the public key.
-
-        type: str
-
-        default: PEM
-
-        choices: [ OpenSSH, PEM ]
-
-    path:
-
-        description:
-
-            - Name of the file in which the generated TLS/SSL public key will be written.
-
-        type: path
-
-        required: true
-
-    privatekey_path:
-
-        description:
-
-            - Path to the TLS/SSL private key from which to generate the public key.
-
-            - Either I(privatekey_path) or I(privatekey_content) must be specified, but not both.
-
-              If I(state) is C(present), one of them is required.
-
-        type: path
-
-    privatekey_content:
-
-        description:
-
-            - The content of the TLS/SSL private key from which to generate the public key.
-
-            - Either I(privatekey_path) or I(privatekey_content) must be specified, but not both.
-
-              If I(state) is C(present), one of them is required.
-
-        type: str
-
-        version_added: '1.0.0'
-
-    privatekey_passphrase:
-
-        description:
-
-            - The passphrase for the private key.
-
-        type: str
-
-    backup:
-
-        description:
-
-            - Create a backup file including a timestamp so you can get the original
-
-              public key back if you overwrote it with a different one by accident.
-
-        type: bool
-
-        default: no
-
-    select_crypto_backend:
-
-        description:
-
-            - Determines which crypto backend to use.
-
-            - The default choice is C(auto), which tries to use C(cryptography) if available, and falls back to C(pyopenssl).
-
-            - If set to C(pyopenssl), will try to use the L(pyOpenSSL,https://pypi.org/project/pyOpenSSL/) library.
-
-            - If set to C(cryptography), will try to use the L(cryptography,https://cryptography.io/) library.
-
-        type: str
-
-        default: auto
-
-        choices: [ auto, cryptography, pyopenssl ]
-
-    return_content:
-
-        description:
-
-            - If set to C(yes), will return the (current or generated) public key's content as I(publickey).
-
-        type: bool
-
-        default: no
-
-        version_added: '1.0.0'
-
-extends_documentation_fragment:
-
-- files
-
-seealso:
-
-- module: community.crypto.x509_certificate
-
-- module: community.crypto.openssl_csr
-
-- module: community.crypto.openssl_dhparam
-
-- module: community.crypto.openssl_pkcs12
-
-- module: community.crypto.openssl_privatekey
-
-'''
-
-
-
-EXAMPLES = r'''
-
-- name: Generate an OpenSSL public key in PEM format
-
-  community.crypto.openssl_publickey:
-
-    path: /etc/ssl/public/ansible.com.pem
-
-    privatekey_path: /etc/ssl/private/ansible.com.pem
-
-
-
-- name: Generate an OpenSSL public key in PEM format from an inline key
-
-  community.crypto.openssl_publickey:
-
-    path: /etc/ssl/public/ansible.com.pem
-
-    privatekey_content: "{{ private_key_content }}"
-
-
-
-- name: Generate an OpenSSL public key in OpenSSH v2 format
-
-  community.crypto.openssl_publickey:
-
-    path: /etc/ssl/public/ansible.com.pem
-
-    privatekey_path: /etc/ssl/private/ansible.com.pem
-
-    format: OpenSSH
-
-
-
-- name: Generate an OpenSSL public key with a passphrase protected private key
-
-  community.crypto.openssl_publickey:
-
-    path: /etc/ssl/public/ansible.com.pem
-
-    privatekey_path: /etc/ssl/private/ansible.com.pem
-
-    privatekey_passphrase: ansible
-
-
-
-- name: Force regenerate an OpenSSL public key if it already exists
-
-  community.crypto.openssl_publickey:
-
-    path: /etc/ssl/public/ansible.com.pem
-
-    privatekey_path: /etc/ssl/private/ansible.com.pem
-
-    force: yes
-
-
-
-- name: Remove an OpenSSL public key
-
-  community.crypto.openssl_publickey:
-
-    path: /etc/ssl/public/ansible.com.pem
-
-    state: absent
-
-'''
-
-
-
-RETURN = r'''
-
-privatekey:
-
-    description:
-
-    - Path to the TLS/SSL private key the public key was generated from.
-
-    - Will be C(none) if the private key has been provided in I(privatekey_content).
-
-    returned: changed or success
-
-    type: str
-
-    sample: /etc/ssl/private/ansible.com.pem
-
-format:
-
-    description: The format of the public key (PEM, OpenSSH, ...).
-
-    returned: changed or success
-
-    type: str
-
-    sample: PEM
-
-filename:
-
-    description: Path to the generated TLS/SSL public key file.
-
-    returned: changed or success
-
-    type: str
-
-    sample: /etc/ssl/public/ansible.com.pem
-
-fingerprint:
-
-    description:
-
-    - The fingerprint of the public key. Fingerprint will be generated for each hashlib.algorithms available.
-
-    - Requires PyOpenSSL >= 16.0 for meaningful output.
-
-    returned: changed or success
-
-    type: dict
-
-    sample:
-
-      md5: "84:75:71:72:8d:04:b5:6c:4d:37:6d:66:83:f5:4c:29"
-
-      sha1: "51:cc:7c:68:5d:eb:41:43:88:7e:1a:ae:c7:f8:24:72:ee:71:f6:10"
-
-      sha224: "b1:19:a6:6c:14:ac:33:1d:ed:18:50:d3:06:5c:b2:32:91:f1:f1:52:8c:cb:d5:75:e9:f5:9b:46"
-
-      sha256: "41:ab:c7:cb:d5:5f:30:60:46:99:ac:d4:00:70:cf:a1:76:4f:24:5d:10:24:57:5d:51:6e:09:97:df:2f:de:c7"
-
-      sha384: "85:39:50:4e:de:d9:19:33:40:70:ae:10:ab:59:24:19:51:c3:a2:e4:0b:1c:b1:6e:dd:b3:0c:d9:9e:6a:46:af:da:18:f8:ef:ae:2e:c0:9a:75:2c:9b:b3:0f:3a:5f:3d"
-
-      sha512: "fd:ed:5e:39:48:5f:9f:fe:7f:25:06:3f:79:08:cd:ee:a5:e7:b3:3d:13:82:87:1f:84:e1:f5:c7:28:77:53:94:86:56:38:69:f0:d9:35:22:01:1e:a6:60:...:0f:9b"
-
-backup_file:
-
-    description: Name of backup file created.
-
-    returned: changed and if I(backup) is C(yes)
-
-    type: str
-
-    sample: /path/to/publickey.pem.2019-03-09@11:22~
-
-publickey:
-
-    description: The (current or generated) public key's content.
-
-    returned: if I(state) is C(present) and I(return_content) is C(yes)
-
-    type: str
-
-    version_added: '1.0.0'
-
-'''
-
-
+import json
 
 import os
 
-import traceback
+import time
+
+import textwrap
+
+import mimetypes
+
+import urllib
+
+import collections
 
 
 
-from distutils.version import LooseVersion
+import pkg_resources
+
+import sip
+
+from PyQt5.QtCore import QUrlQuery, QUrl
 
 
 
-from ansible.module_utils.basic import AnsibleModule, missing_required_lib
+import qutebrowser
 
-from ansible.module_utils._text import to_native
+from qutebrowser.config import config, configdata, configexc, configdiff
 
+from qutebrowser.utils import (version, utils, jinja, log, message, docutils,
 
+                               objreg, urlutils)
 
-from ansible_collections.community.crypto.plugins.module_utils.io import (
-
-    load_file_if_exists,
-
-    write_file,
-
-)
-
-
-
-from ansible_collections.community.crypto.plugins.module_utils.crypto.basic import (
-
-    OpenSSLObjectError,
-
-    OpenSSLBadPassphraseError,
-
-)
-
-
-
-from ansible_collections.community.crypto.plugins.module_utils.crypto.support import (
-
-    OpenSSLObject,
-
-    load_privatekey,
-
-    get_fingerprint,
-
-)
-
-
-
-MINIMAL_PYOPENSSL_VERSION = '16.0.0'
-
-MINIMAL_CRYPTOGRAPHY_VERSION = '1.2.3'
-
-MINIMAL_CRYPTOGRAPHY_VERSION_OPENSSH = '1.4'
-
-
-
-PYOPENSSL_IMP_ERR = None
-
-try:
-
-    import OpenSSL
-
-    from OpenSSL import crypto
-
-    PYOPENSSL_VERSION = LooseVersion(OpenSSL.__version__)
-
-except ImportError:
-
-    PYOPENSSL_IMP_ERR = traceback.format_exc()
-
-    PYOPENSSL_FOUND = False
-
-else:
-
-    PYOPENSSL_FOUND = True
-
-
-
-CRYPTOGRAPHY_IMP_ERR = None
-
-try:
-
-    import cryptography
-
-    from cryptography.hazmat.backends import default_backend
-
-    from cryptography.hazmat.primitives import serialization as crypto_serialization
-
-    CRYPTOGRAPHY_VERSION = LooseVersion(cryptography.__version__)
-
-except ImportError:
-
-    CRYPTOGRAPHY_IMP_ERR = traceback.format_exc()
-
-    CRYPTOGRAPHY_FOUND = False
-
-else:
-
-    CRYPTOGRAPHY_FOUND = True
+from qutebrowser.misc import objects
 
 
 
 
 
-class PublicKeyError(OpenSSLObjectError):
+pyeval_output = ":pyeval was never called"
+
+spawn_output = ":spawn was never called"
+
+
+
+
+
+_HANDLERS = {}
+
+
+
+
+
+class NoHandlerFound(Exception):
+
+
+
+    """Raised when no handler was found for the given URL."""
+
+
 
     pass
 
@@ -470,508 +120,896 @@ class PublicKeyError(OpenSSLObjectError):
 
 
 
-class PublicKey(OpenSSLObject):
+class QuteSchemeOSError(Exception):
 
 
 
-    def __init__(self, module, backend):
-
-        super(PublicKey, self).__init__(
-
-            module.params['path'],
-
-            module.params['state'],
-
-            module.params['force'],
-
-            module.check_mode
-
-        )
-
-        self.format = module.params['format']
-
-        self.privatekey_path = module.params['privatekey_path']
-
-        self.privatekey_content = module.params['privatekey_content']
-
-        if self.privatekey_content is not None:
-
-            self.privatekey_content = self.privatekey_content.encode('utf-8')
-
-        self.privatekey_passphrase = module.params['privatekey_passphrase']
-
-        self.privatekey = None
-
-        self.publickey_bytes = None
-
-        self.return_content = module.params['return_content']
-
-        self.fingerprint = {}
-
-        self.backend = backend
+    """Called when there was an OSError inside a handler."""
 
 
 
-        self.backup = module.params['backup']
-
-        self.backup_file = None
+    pass
 
 
 
-    def _create_publickey(self, module):
 
-        self.privatekey = load_privatekey(
 
-            path=self.privatekey_path,
+class QuteSchemeError(Exception):
 
-            content=self.privatekey_content,
 
-            passphrase=self.privatekey_passphrase,
 
-            backend=self.backend
+    """Exception to signal that a handler should return an ErrorReply.
 
-        )
 
-        if self.backend == 'cryptography':
 
-            if self.format == 'OpenSSH':
+    Attributes correspond to the arguments in
 
-                return self.privatekey.public_key().public_bytes(
+    networkreply.ErrorNetworkReply.
 
-                    crypto_serialization.Encoding.OpenSSH,
 
-                    crypto_serialization.PublicFormat.OpenSSH
 
-                )
+    Attributes:
 
-            else:
+        errorstring: Error string to print.
 
-                return self.privatekey.public_key().public_bytes(
+        error: Numerical error value.
 
-                    crypto_serialization.Encoding.PEM,
+    """
 
-                    crypto_serialization.PublicFormat.SubjectPublicKeyInfo
 
-                )
+
+    def __init__(self, errorstring, error):
+
+        self.errorstring = errorstring
+
+        self.error = error
+
+        super().__init__(errorstring)
+
+
+
+
+
+class Redirect(Exception):
+
+
+
+    """Exception to signal a redirect should happen.
+
+
+
+    Attributes:
+
+        url: The URL to redirect to, as a QUrl.
+
+    """
+
+
+
+    def __init__(self, url):
+
+        super().__init__(url.toDisplayString())
+
+        self.url = url
+
+
+
+
+
+class add_handler:  # noqa: N801,N806 pylint: disable=invalid-name
+
+
+
+    """Decorator to register a qute://* URL handler.
+
+
+
+    Attributes:
+
+        _name: The 'foo' part of qute://foo
+
+        backend: Limit which backends the handler can run with.
+
+    """
+
+
+
+    def __init__(self, name, backend=None):
+
+        self._name = name
+
+        self._backend = backend
+
+        self._function = None
+
+
+
+    def __call__(self, function):
+
+        self._function = function
+
+        _HANDLERS[self._name] = self.wrapper
+
+        return function
+
+
+
+    def wrapper(self, *args, **kwargs):
+
+        """Call the underlying function."""
+
+        if self._backend is not None and objects.backend != self._backend:
+
+            return self.wrong_backend_handler(*args, **kwargs)
 
         else:
 
-            try:
+            return self._function(*args, **kwargs)
 
-                return crypto.dump_publickey(crypto.FILETYPE_PEM, self.privatekey)
 
-            except AttributeError as dummy:
 
-                raise PublicKeyError('You need to have PyOpenSSL>=16.0.0 to generate public keys')
+    def wrong_backend_handler(self, url):
 
+        """Show an error page about using the invalid backend."""
 
+        html = jinja.render('error.html',
 
-    def generate(self, module):
+                            title="Error while opening qute://url",
 
-        """Generate the public key."""
+                            url=url.toDisplayString(),
 
+                            error='{} is not available with this '
 
+                                  'backend'.format(url.toDisplayString()))
 
-        if self.privatekey_content is None and not os.path.exists(self.privatekey_path):
+        return 'text/html', html
 
-            raise PublicKeyError(
 
-                'The private key %s does not exist' % self.privatekey_path
 
-            )
 
 
+def data_for_url(url):
 
-        if not self.check(module, perms_required=False) or self.force:
+    """Get the data to show for the given URL.
 
-            try:
 
-                publickey_content = self._create_publickey(module)
 
-                if self.return_content:
+    Args:
 
-                    self.publickey_bytes = publickey_content
+        url: The QUrl to show.
 
 
 
-                if self.backup:
+    Return:
 
-                    self.backup_file = module.backup_local(self.path)
+        A (mimetype, data) tuple.
 
-                write_file(module, publickey_content)
+    """
 
+    norm_url = url.adjusted(QUrl.NormalizePathSegments |
 
+                            QUrl.StripTrailingSlash)
 
-                self.changed = True
+    if norm_url != url:
 
-            except OpenSSLBadPassphraseError as exc:
+        raise Redirect(norm_url)
 
-                raise PublicKeyError(exc)
 
-            except (IOError, OSError) as exc:
 
-                raise PublicKeyError(exc)
+    path = url.path()
 
+    host = url.host()
 
+    query = urlutils.query_string(url)
 
-        self.fingerprint = get_fingerprint(
+    # A url like "qute:foo" is split as "scheme:path", not "scheme:host".
 
-            path=self.privatekey_path,
+    log.misc.debug("url: {}, path: {}, host {}".format(
 
-            content=self.privatekey_content,
+        url.toDisplayString(), path, host))
 
-            passphrase=self.privatekey_passphrase,
+    if not path or not host:
 
-            backend=self.backend,
+        new_url = QUrl()
 
-        )
+        new_url.setScheme('qute')
 
-        file_args = module.load_file_common_arguments(module.params)
+        # When path is absent, e.g. qute://help (with no trailing slash)
 
-        if module.set_fs_attributes_if_different(file_args, False):
+        if host:
 
-            self.changed = True
+            new_url.setHost(host)
 
+        # When host is absent, e.g. qute:help
 
+        else:
 
-    def check(self, module, perms_required=True):
+            new_url.setHost(path)
 
-        """Ensure the resource is in its desired state."""
 
 
+        new_url.setPath('/')
 
-        state_and_perms = super(PublicKey, self).check(module, perms_required)
+        if query:
 
+            new_url.setQuery(query)
 
+        if new_url.host():  # path was a valid host
 
-        def _check_privatekey():
-
-            if self.privatekey_content is None and not os.path.exists(self.privatekey_path):
-
-                return False
-
-
-
-            try:
-
-                with open(self.path, 'rb') as public_key_fh:
-
-                    publickey_content = public_key_fh.read()
-
-                if self.return_content:
-
-                    self.publickey_bytes = publickey_content
-
-                if self.backend == 'cryptography':
-
-                    if self.format == 'OpenSSH':
-
-                        # Read and dump public key. Makes sure that the comment is stripped off.
-
-                        current_publickey = crypto_serialization.load_ssh_public_key(publickey_content, backend=default_backend())
-
-                        publickey_content = current_publickey.public_bytes(
-
-                            crypto_serialization.Encoding.OpenSSH,
-
-                            crypto_serialization.PublicFormat.OpenSSH
-
-                        )
-
-                    else:
-
-                        current_publickey = crypto_serialization.load_pem_public_key(publickey_content, backend=default_backend())
-
-                        publickey_content = current_publickey.public_bytes(
-
-                            crypto_serialization.Encoding.PEM,
-
-                            crypto_serialization.PublicFormat.SubjectPublicKeyInfo
-
-                        )
-
-                else:
-
-                    publickey_content = crypto.dump_publickey(
-
-                        crypto.FILETYPE_PEM,
-
-                        crypto.load_publickey(crypto.FILETYPE_PEM, publickey_content)
-
-                    )
-
-            except Exception as dummy:
-
-                return False
-
-
-
-            try:
-
-                desired_publickey = self._create_publickey(module)
-
-            except OpenSSLBadPassphraseError as exc:
-
-                raise PublicKeyError(exc)
-
-
-
-            return publickey_content == desired_publickey
-
-
-
-        if not state_and_perms:
-
-            return state_and_perms
-
-
-
-        return _check_privatekey()
-
-
-
-    def remove(self, module):
-
-        if self.backup:
-
-            self.backup_file = module.backup_local(self.path)
-
-        super(PublicKey, self).remove(module)
-
-
-
-    def dump(self):
-
-        """Serialize the object into a dictionary."""
-
-
-
-        result = {
-
-            'privatekey': self.privatekey_path,
-
-            'filename': self.path,
-
-            'format': self.format,
-
-            'changed': self.changed,
-
-            'fingerprint': self.fingerprint,
-
-        }
-
-        if self.backup_file:
-
-            result['backup_file'] = self.backup_file
-
-        if self.return_content:
-
-            if self.publickey_bytes is None:
-
-                self.publickey_bytes = load_file_if_exists(self.path, ignore_errors=True)
-
-            result['publickey'] = self.publickey_bytes.decode('utf-8') if self.publickey_bytes else None
-
-
-
-        return result
-
-
-
-
-
-def main():
-
-
-
-    module = AnsibleModule(
-
-        argument_spec=dict(
-
-            state=dict(type='str', default='present', choices=['present', 'absent']),
-
-            force=dict(type='bool', default=False),
-
-            path=dict(type='path', required=True),
-
-            privatekey_path=dict(type='path'),
-
-            privatekey_content=dict(type='str'),
-
-            format=dict(type='str', default='PEM', choices=['OpenSSH', 'PEM']),
-
-            privatekey_passphrase=dict(type='str', no_log=True),
-
-            backup=dict(type='bool', default=False),
-
-            select_crypto_backend=dict(type='str', choices=['auto', 'pyopenssl', 'cryptography'], default='auto'),
-
-            return_content=dict(type='bool', default=False),
-
-        ),
-
-        supports_check_mode=True,
-
-        add_file_common_args=True,
-
-        required_if=[('state', 'present', ['privatekey_path', 'privatekey_content'], True)],
-
-        mutually_exclusive=(
-
-            ['privatekey_path', 'privatekey_content'],
-
-        ),
-
-    )
-
-
-
-    minimal_cryptography_version = MINIMAL_CRYPTOGRAPHY_VERSION
-
-    if module.params['format'] == 'OpenSSH':
-
-        minimal_cryptography_version = MINIMAL_CRYPTOGRAPHY_VERSION_OPENSSH
-
-
-
-    backend = module.params['select_crypto_backend']
-
-    if backend == 'auto':
-
-        # Detection what is possible
-
-        can_use_cryptography = CRYPTOGRAPHY_FOUND and CRYPTOGRAPHY_VERSION >= LooseVersion(minimal_cryptography_version)
-
-        can_use_pyopenssl = PYOPENSSL_FOUND and PYOPENSSL_VERSION >= LooseVersion(MINIMAL_PYOPENSSL_VERSION)
-
-
-
-        # Decision
-
-        if can_use_cryptography:
-
-            backend = 'cryptography'
-
-        elif can_use_pyopenssl:
-
-            if module.params['format'] == 'OpenSSH':
-
-                module.fail_json(
-
-                    msg=missing_required_lib('cryptography >= {0}'.format(MINIMAL_CRYPTOGRAPHY_VERSION_OPENSSH)),
-
-                    exception=CRYPTOGRAPHY_IMP_ERR
-
-                )
-
-            backend = 'pyopenssl'
-
-
-
-        # Success?
-
-        if backend == 'auto':
-
-            module.fail_json(msg=("Can't detect any of the required Python libraries "
-
-                                  "cryptography (>= {0}) or PyOpenSSL (>= {1})").format(
-
-                                      minimal_cryptography_version,
-
-                                      MINIMAL_PYOPENSSL_VERSION))
-
-
-
-    if module.params['format'] == 'OpenSSH' and backend != 'cryptography':
-
-        module.fail_json(msg="Format OpenSSH requires the cryptography backend.")
-
-
-
-    if backend == 'pyopenssl':
-
-        if not PYOPENSSL_FOUND:
-
-            module.fail_json(msg=missing_required_lib('pyOpenSSL >= {0}'.format(MINIMAL_PYOPENSSL_VERSION)),
-
-                             exception=PYOPENSSL_IMP_ERR)
-
-        module.deprecate('The module is using the PyOpenSSL backend. This backend has been deprecated',
-
-                         version='2.0.0', collection_name='community.crypto')
-
-    elif backend == 'cryptography':
-
-        if not CRYPTOGRAPHY_FOUND:
-
-            module.fail_json(msg=missing_required_lib('cryptography >= {0}'.format(minimal_cryptography_version)),
-
-                             exception=CRYPTOGRAPHY_IMP_ERR)
-
-
-
-    base_dir = os.path.dirname(module.params['path']) or '.'
-
-    if not os.path.isdir(base_dir):
-
-        module.fail_json(
-
-            name=base_dir,
-
-            msg="The directory '%s' does not exist or the file is not a directory" % base_dir
-
-        )
+            raise Redirect(new_url)
 
 
 
     try:
 
-        public_key = PublicKey(module, backend)
+        handler = _HANDLERS[host]
+
+    except KeyError:
+
+        raise NoHandlerFound(url)
 
 
 
-        if public_key.state == 'present':
+    try:
 
-            if module.check_mode:
+        mimetype, data = handler(url)
 
-                result = public_key.dump()
+    except OSError as e:
 
-                result['changed'] = module.params['force'] or not public_key.check(module)
+        # FIXME:qtwebengine how to handle this?
 
-                module.exit_json(**result)
+        raise QuteSchemeOSError(e)
 
+    except QuteSchemeError:
 
-
-            public_key.generate(module)
-
-        else:
-
-            if module.check_mode:
-
-                result = public_key.dump()
-
-                result['changed'] = os.path.exists(module.params['path'])
-
-                module.exit_json(**result)
+        raise
 
 
 
-            public_key.remove(module)
+    assert mimetype is not None, url
+
+    if mimetype == 'text/html' and isinstance(data, str):
+
+        # We let handlers return HTML as text
+
+        data = data.encode('utf-8', errors='xmlcharrefreplace')
 
 
 
-        result = public_key.dump()
-
-        module.exit_json(**result)
-
-    except OpenSSLObjectError as exc:
-
-        module.fail_json(msg=to_native(exc))
+    return mimetype, data
 
 
 
 
 
-if __name__ == '__main__':
+@add_handler('bookmarks')
 
-    main()
+def qute_bookmarks(_url):
+
+    """Handler for qute://bookmarks. Display all quickmarks / bookmarks."""
+
+    bookmarks = sorted(objreg.get('bookmark-manager').marks.items(),
+
+                       key=lambda x: x[1])  # Sort by title
+
+    quickmarks = sorted(objreg.get('quickmark-manager').marks.items(),
+
+                        key=lambda x: x[0])  # Sort by name
+
+
+
+    html = jinja.render('bookmarks.html',
+
+                        title='Bookmarks',
+
+                        bookmarks=bookmarks,
+
+                        quickmarks=quickmarks)
+
+    return 'text/html', html
+
+
+
+
+
+@add_handler('tabs')
+
+def qute_tabs(_url):
+
+    """Handler for qute://tabs. Display information about all open tabs."""
+
+    tabs = collections.defaultdict(list)
+
+    for win_id, window in objreg.window_registry.items():
+
+        if sip.isdeleted(window):
+
+            continue
+
+        tabbed_browser = objreg.get('tabbed-browser',
+
+                                    scope='window',
+
+                                    window=win_id)
+
+        for tab in tabbed_browser.widgets():
+
+            if tab.url() not in [QUrl("qute://tabs/"), QUrl("qute://tabs")]:
+
+                urlstr = tab.url().toDisplayString()
+
+                tabs[str(win_id)].append((tab.title(), urlstr))
+
+
+
+    html = jinja.render('tabs.html',
+
+                        title='Tabs',
+
+                        tab_list_by_window=tabs)
+
+    return 'text/html', html
+
+
+
+
+
+def history_data(start_time, offset=None):
+
+    """Return history data.
+
+
+
+    Arguments:
+
+        start_time: select history starting from this timestamp.
+
+        offset: number of items to skip
+
+    """
+
+    # history atimes are stored as ints, ensure start_time is not a float
+
+    start_time = int(start_time)
+
+    hist = objreg.get('web-history')
+
+    if offset is not None:
+
+        entries = hist.entries_before(start_time, limit=1000, offset=offset)
+
+    else:
+
+        # end is 24hrs earlier than start
+
+        end_time = start_time - 24*60*60
+
+        entries = hist.entries_between(end_time, start_time)
+
+
+
+    return [{"url": e.url, "title": e.title or e.url, "time": e.atime}
+
+            for e in entries]
+
+
+
+
+
+@add_handler('history')
+
+def qute_history(url):
+
+    """Handler for qute://history. Display and serve history."""
+
+    if url.path() == '/data':
+
+        try:
+
+            offset = QUrlQuery(url).queryItemValue("offset")
+
+            offset = int(offset) if offset else None
+
+        except ValueError as e:
+
+            raise QuteSchemeError("Query parameter offset is invalid", e)
+
+        # Use start_time in query or current time.
+
+        try:
+
+            start_time = QUrlQuery(url).queryItemValue("start_time")
+
+            start_time = float(start_time) if start_time else time.time()
+
+        except ValueError as e:
+
+            raise QuteSchemeError("Query parameter start_time is invalid", e)
+
+
+
+        return 'text/html', json.dumps(history_data(start_time, offset))
+
+    else:
+
+        return 'text/html', jinja.render(
+
+            'history.html',
+
+            title='History',
+
+            gap_interval=config.val.history_gap_interval
+
+        )
+
+
+
+
+
+@add_handler('javascript')
+
+def qute_javascript(url):
+
+    """Handler for qute://javascript.
+
+
+
+    Return content of file given as query parameter.
+
+    """
+
+    path = url.path()
+
+    if path:
+
+        path = "javascript" + os.sep.join(path.split('/'))
+
+        return 'text/html', utils.read_file(path, binary=False)
+
+    else:
+
+        raise QuteSchemeError("No file specified", ValueError())
+
+
+
+
+
+@add_handler('pyeval')
+
+def qute_pyeval(_url):
+
+    """Handler for qute://pyeval."""
+
+    html = jinja.render('pre.html', title='pyeval', content=pyeval_output)
+
+    return 'text/html', html
+
+
+
+
+
+@add_handler('spawn-output')
+
+def qute_spawn_output(_url):
+
+    """Handler for qute://spawn-output."""
+
+    html = jinja.render('pre.html', title='spawn output', content=spawn_output)
+
+    return 'text/html', html
+
+
+
+
+
+@add_handler('version')
+
+@add_handler('verizon')
+
+def qute_version(_url):
+
+    """Handler for qute://version."""
+
+    html = jinja.render('version.html', title='Version info',
+
+                        version=version.version(),
+
+                        copyright=qutebrowser.__copyright__)
+
+    return 'text/html', html
+
+
+
+
+
+@add_handler('plainlog')
+
+def qute_plainlog(url):
+
+    """Handler for qute://plainlog.
+
+
+
+    An optional query parameter specifies the minimum log level to print.
+
+    For example, qute://log?level=warning prints warnings and errors.
+
+    Level can be one of: vdebug, debug, info, warning, error, critical.
+
+    """
+
+    if log.ram_handler is None:
+
+        text = "Log output was disabled."
+
+    else:
+
+        level = QUrlQuery(url).queryItemValue('level')
+
+        if not level:
+
+            level = 'vdebug'
+
+        text = log.ram_handler.dump_log(html=False, level=level)
+
+    html = jinja.render('pre.html', title='log', content=text)
+
+    return 'text/html', html
+
+
+
+
+
+@add_handler('log')
+
+def qute_log(url):
+
+    """Handler for qute://log.
+
+
+
+    An optional query parameter specifies the minimum log level to print.
+
+    For example, qute://log?level=warning prints warnings and errors.
+
+    Level can be one of: vdebug, debug, info, warning, error, critical.
+
+    """
+
+    if log.ram_handler is None:
+
+        html_log = None
+
+    else:
+
+        level = QUrlQuery(url).queryItemValue('level')
+
+        if not level:
+
+            level = 'vdebug'
+
+        html_log = log.ram_handler.dump_log(html=True, level=level)
+
+
+
+    html = jinja.render('log.html', title='log', content=html_log)
+
+    return 'text/html', html
+
+
+
+
+
+@add_handler('gpl')
+
+def qute_gpl(_url):
+
+    """Handler for qute://gpl. Return HTML content as string."""
+
+    return 'text/html', utils.read_file('html/license.html')
+
+
+
+
+
+@add_handler('help')
+
+def qute_help(url):
+
+    """Handler for qute://help."""
+
+    urlpath = url.path()
+
+    if not urlpath or urlpath == '/':
+
+        urlpath = 'index.html'
+
+    else:
+
+        urlpath = urlpath.lstrip('/')
+
+    if not docutils.docs_up_to_date(urlpath):
+
+        message.error("Your documentation is outdated! Please re-run "
+
+                      "scripts/asciidoc2html.py.")
+
+
+
+    path = 'html/doc/{}'.format(urlpath)
+
+    if not urlpath.endswith('.html'):
+
+        try:
+
+            bdata = utils.read_file(path, binary=True)
+
+        except OSError as e:
+
+            raise QuteSchemeOSError(e)
+
+        mimetype, _encoding = mimetypes.guess_type(urlpath)
+
+        assert mimetype is not None, url
+
+        return mimetype, bdata
+
+
+
+    try:
+
+        data = utils.read_file(path)
+
+    except OSError:
+
+        # No .html around, let's see if we find the asciidoc
+
+        asciidoc_path = path.replace('.html', '.asciidoc')
+
+        if asciidoc_path.startswith('html/doc/'):
+
+            asciidoc_path = asciidoc_path.replace('html/doc/', '../doc/help/')
+
+
+
+        try:
+
+            asciidoc = utils.read_file(asciidoc_path)
+
+        except OSError:
+
+            asciidoc = None
+
+
+
+        if asciidoc is None:
+
+            raise
+
+
+
+        preamble = textwrap.dedent("""
+
+            There was an error loading the documentation!
+
+
+
+            This most likely means the documentation was not generated
+
+            properly. If you are running qutebrowser from the git repository,
+
+            please (re)run scripts/asciidoc2html.py and reload this page.
+
+
+
+            If you're running a released version this is a bug, please use
+
+            :report to report it.
+
+
+
+            Falling back to the plaintext version.
+
+
+
+            ---------------------------------------------------------------
+
+
+
+
+
+        """)
+
+        return 'text/plain', (preamble + asciidoc).encode('utf-8')
+
+    else:
+
+        return 'text/html', data
+
+
+
+
+
+@add_handler('backend-warning')
+
+def qute_backend_warning(_url):
+
+    """Handler for qute://backend-warning."""
+
+    html = jinja.render('backend-warning.html',
+
+                        distribution=version.distribution(),
+
+                        Distribution=version.Distribution,
+
+                        version=pkg_resources.parse_version,
+
+                        title="Legacy backend warning")
+
+    return 'text/html', html
+
+
+
+
+
+def _qute_settings_set(url):
+
+    """Handler for qute://settings/set."""
+
+    query = QUrlQuery(url)
+
+    option = query.queryItemValue('option', QUrl.FullyDecoded)
+
+    value = query.queryItemValue('value', QUrl.FullyDecoded)
+
+
+
+    # https://github.com/qutebrowser/qutebrowser/issues/727
+
+    if option == 'content.javascript.enabled' and value == 'false':
+
+        msg = ("Refusing to disable javascript via qute://settings "
+
+               "as it needs javascript support.")
+
+        message.error(msg)
+
+        return 'text/html', b'error: ' + msg.encode('utf-8')
+
+
+
+    try:
+
+        config.instance.set_str(option, value, save_yaml=True)
+
+        return 'text/html', b'ok'
+
+    except configexc.Error as e:
+
+        message.error(str(e))
+
+        return 'text/html', b'error: ' + str(e).encode('utf-8')
+
+
+
+
+
+@add_handler('settings')
+
+def qute_settings(url):
+
+    """Handler for qute://settings. View/change qute configuration."""
+
+    if url.path() == '/set':
+
+        return _qute_settings_set(url)
+
+
+
+    html = jinja.render('settings.html', title='settings',
+
+                        configdata=configdata,
+
+                        confget=config.instance.get_str)
+
+    return 'text/html', html
+
+
+
+
+
+@add_handler('bindings')
+
+def qute_bindings(_url):
+
+    """Handler for qute://bindings. View keybindings."""
+
+    bindings = {}
+
+    defaults = config.val.bindings.default
+
+    modes = set(defaults.keys()).union(config.val.bindings.commands)
+
+    modes.remove('normal')
+
+    modes = ['normal'] + sorted(list(modes))
+
+    for mode in modes:
+
+        bindings[mode] = config.key_instance.get_bindings_for(mode)
+
+
+
+    html = jinja.render('bindings.html', title='Bindings',
+
+                        bindings=bindings)
+
+    return 'text/html', html
+
+
+
+
+
+@add_handler('back')
+
+def qute_back(url):
+
+    """Handler for qute://back.
+
+
+
+    Simple page to free ram / lazy load a site, goes back on focusing the tab.
+
+    """
+
+    html = jinja.render(
+
+        'back.html',
+
+        title='Suspended: ' + urllib.parse.unquote(url.fragment()))
+
+    return 'text/html', html
+
+
+
+
+
+@add_handler('configdiff')
+
+def qute_configdiff(url):
+
+    """Handler for qute://configdiff."""
+
+    if url.path() == '/old':
+
+        try:
+
+            return 'text/html', configdiff.get_diff()
+
+        except OSError as e:
+
+            error = (b'Failed to read old config: ' +
+
+                     str(e.strerror).encode('utf-8'))
+
+            return 'text/plain', error
+
+    else:
+
+        data = config.instance.dump_userconfig().encode('utf-8')
+
+        return 'text/plain', data
+
+
+
+
+
+@add_handler('pastebin-version')
+
+def qute_pastebin_version(_url):
+
+    """Handler that pastebins the version string."""
+
+    version.pastebin_version()
+
+    return 'text/plain', b'Paste called.'

@@ -2,660 +2,1028 @@
 # Safety: safe
 # Category: safe
 
-# -*- coding: utf-8 -*-
+# Copyright (c) 2016 Red Hat, Inc.
 
-'''
+#
 
-    feedgen.ext.geo_entry
+# This software is licensed to you under the GNU General Public License,
 
-    ~~~~~~~~~~~~~~~~~~~
+# version 2 (GPLv2). There is NO WARRANTY for this software, express or
 
+# implied, including the implied warranties of MERCHANTABILITY or FITNESS
 
+# FOR A PARTICULAR PURPOSE. You should have received a copy of GPLv2
 
-    Extends the FeedGenerator to produce Simple GeoRSS feeds.
+# along with this software; if not, see
 
+# http://www.gnu.org/licenses/old-licenses/gpl-2.0.txt.
 
+#
 
-    :copyright: 2017, Bob Breznak <bob.breznak@gmail.com>
+# Red Hat trademarks are not licensed under GPLv2. No permission is
 
+# granted to use or replicate Red Hat trademarks that are incorporated
 
+# in this software or its documentation.
 
-    :license: FreeBSD and LGPL, see license.* for more details.
+import ast
 
-'''
+import re
 
-import numbers
-
-import warnings
-
-
-
-from feedgen.ext.base import BaseEntryExtension
-
-from feedgen.util import xml_elem
+import tokenize
 
 
 
+from distutils.spawn import spawn
+
+from distutils.text_file import TextFile
 
 
-class GeoRSSPolygonInteriorWarning(Warning):
+
+from build_ext.utils import Utils, BaseCommand, memoize
+
+
+
+# These dependencies aren't available in build environments.  We won't need any
+
+# linting functionality there though, so just create a dummy class so we can proceed.
+
+try:
+
+    # These dependencies aren't available in build environments.  We won't need any
+
+    # linting functionality there though, so just create a dummy class so we can proceed.
+
+    import pep8
+
+    import pkg_resources
+
+except ImportError:
+
+    pass
+
+
+
+try:
+
+    from flake8.main.setuptools_command import Flake8
+
+except ImportError:
+
+    class Flake8(object):
+
+        def __init__(self, *args, **kwargs):
+
+            raise NotImplementedError("flake8 could not be imported")
+
+
+
+try:
+
+    from lxml import etree as ElementTree
+
+except ImportError:
+
+    class ElementTree(object):
+
+        @staticmethod
+
+        def parse(*args, **kwargs):
+
+            raise NotImplementedError("lxml could not be imported")
+
+
+
+
+
+class Lint(BaseCommand):
+
+    description = "examine code for errors"
+
+
+
+    def has_pure_modules(self):
+
+        return self.distribution.has_pure_modules()
+
+
+
+    def has_glade_files(self):
+
+        try:
+
+            next(Utils.find_files_of_type('src', '*.glade'))
+
+            return True
+
+        except StopIteration:
+
+            return False
+
+
+
+    def has_spec_file(self):
+
+        try:
+
+            next(Utils.find_files_of_type('.', '*.spec'))
+
+            return True
+
+        except StopIteration:
+
+            return False
+
+
+
+    def run(self):
+
+        for cmd_name in self.get_sub_commands():
+
+            self.run_command(cmd_name)
+
+
+
+    # Defined at the end since it references unbound methods
+
+    sub_commands = [
+
+        ('lint_glade', has_glade_files),
+
+        ('lint_rpm', has_spec_file),
+
+        ('flake8', has_pure_modules),
+
+    ]
+
+
+
+
+
+class RpmLint(BaseCommand):
+
+    description = "run rpmlint on spec files"
+
+
+
+    def run(self):
+
+        for f in Utils.find_files_of_type('.', '*.spec'):
+
+            spawn(['rpmlint', '--file=rpmlint.config', f])
+
+
+
+
+
+class FileLint(BaseCommand):
+
+    def scan_file(self, f, regexs):
+
+        # Use TextFile since it has a nice function to print a warning with the
+
+        # offending line's number.
+
+        text_file = TextFile(f)
+
+
+
+        # Thanks to http://stackoverflow.com/a/17502838/6124862
+
+        contents = '\n'.join(text_file.readlines())
+
+        for r in regexs:
+
+            regex = re.compile(r, flags=re.MULTILINE | re.DOTALL)
+
+            for match in regex.finditer(contents):
+
+                lineno = contents.count('\n', 0, match.start())
+
+                text_file.warn("Found '%s' match" % r, lineno)
+
+        text_file.close()
+
+
+
+    def scan_xml(self, f, xpath_expressions, namespaces=None):
+
+        if not namespaces:
+
+            namespaces = {}
+
+
+
+        text_file = TextFile(f)
+
+        tree = ElementTree.parse(f)
+
+
+
+        for x in xpath_expressions:
+
+            # Python 2.6's element tree doesn't support findall with namespaces
+
+            # we aren't currently using namespaces so put in a shim to be compatible
+
+            # If we ever need to specify namespaces, we are not going to be able
+
+            # to run this code on 2.6
+
+            if namespaces:
+
+                elements = tree.findall(x, namespaces)
+
+            else:
+
+                elements = tree.findall(x)
+
+
+
+            for e in elements:
+
+                text_file.warn("Found '%s' match" % x, e.sourceline)
+
+        text_file.close()
+
+
+
+
+
+class GladeLint(FileLint):
+
+    """See BZ #826874.  Certain attributes cause issues on older libglade."""
+
+    description = "check Glade files for common errors"
+
+
+
+    def run(self):
+
+        for f in Utils.find_files_of_type('src', '*.glade'):
+
+            self.scan_xml(f, [".//property[@name='orientation']", ".//*[@swapped='no']"])
+
+
+
+
+
+class AstVisitor(object):
+
+    """Visitor pattern for looking at specific nodes in an AST.  Basically a copy of
+
+    ast.NodeVisitor, but with the additional feature of appending return values onto a result
+
+    list that is ultimately returned.
+
+
+
+    I recommend reading http://greentreesnakes.readthedocs.io/en/latest/index.html for a good
+
+    overview of the various Python AST node types.
 
     """
-
-    Simple placeholder for warning about ignored polygon interiors.
-
-
-
-    Stores the original geom on a ``geom`` attribute (if required warnings are
-
-    raised as errors).
-
-    """
-
-
-
-    def __init__(self, geom, *args, **kwargs):
-
-        self.geom = geom
-
-        super(GeoRSSPolygonInteriorWarning, self).__init__(*args, **kwargs)
-
-
-
-    def __str__(self):
-
-        return '{:d} interiors of polygon ignored'.format(
-
-            len(self.geom.__geo_interface__['coordinates']) - 1
-
-        )  # ignore exterior in count
-
-
-
-
-
-class GeoRSSGeometryError(ValueError):
-
-    """
-
-    Subclass of ValueError for a GeoRSS geometry error
-
-
-
-    Only some geometries are supported in Simple GeoRSS, so if not raise an
-
-    error. Offending geometry is stored on the ``geom`` attribute.
-
-    """
-
-
-
-    def __init__(self, geom, *args, **kwargs):
-
-        self.geom = geom
-
-        super(GeoRSSGeometryError, self).__init__(*args, **kwargs)
-
-
-
-    def __str__(self):
-
-        msg = "Geometry of type '{}' not in Point, Linestring or Polygon"
-
-        return msg.format(
-
-            self.geom.__geo_interface__['type']
-
-        )
-
-
-
-
-
-class GeoEntryExtension(BaseEntryExtension):
-
-    '''FeedEntry extension for Simple GeoRSS.
-
-    '''
 
 
 
     def __init__(self):
 
-        '''Simple GeoRSS tag'''
+        self.results = []
 
-        # geometries
 
-        self.__point = None
 
-        self.__line = None
+    def visit(self, node):
 
-        self.__polygon = None
+        method = 'visit_' + node.__class__.__name__
 
-        self.__box = None
+        visitor = getattr(self, method, self.generic_visit)
 
+        r = visitor(node)
 
+        if r is not None:
 
-        # additional properties
+            self.results.append(r)
 
-        self.__featuretypetag = None
+        return self.results
 
-        self.__relationshiptag = None
 
-        self.__featurename = None
 
+    def generic_visit(self, node):
 
+        for field, value in ast.iter_fields(node):
 
-        # elevation
+            if isinstance(value, list):
 
-        self.__elev = None
+                for item in value:
 
-        self.__floor = None
+                    if isinstance(item, ast.AST):
 
+                        self.visit(item)
 
+            elif isinstance(value, ast.AST):
 
-        # radius
+                self.visit(value)
 
-        self.__radius = None
 
 
 
-    def extend_file(self, entry):
 
-        '''Add additional fields to an RSS item.
+class WidgetVisitor(AstVisitor):
 
+    """Look for widgets that are used in code but not declared in the Glade files."""
 
+    codes = ['X100']
 
-        :param feed: The RSS item XML element to use.
 
-        '''
 
+    class StrVisitor(AstVisitor):
 
+        def visit_Str(self, node):
 
-        GEO_NS = 'http://www.georss.org/georss'
+            return node.s
 
 
 
-        if self.__point:
+    class NameVisitor(AstVisitor):
 
-            point = xml_elem('{%s}point' % GEO_NS, entry)
+        def visit_Name(self, node):
 
-            point.text = self.__point
+            return node.id
 
 
 
-        if self.__line:
+    def __init__(self, defined_widgets=None):
 
-            line = xml_elem('{%s}line' % GEO_NS, entry)
+        super(WidgetVisitor, self).__init__()
 
-            line.text = self.__line
+        if not defined_widgets:
 
+            defined_widgets = []
 
 
-        if self.__polygon:
 
-            polygon = xml_elem('{%s}polygon' % GEO_NS, entry)
+        self.defined_widgets = set(defined_widgets)
 
-            polygon.text = self.__polygon
 
 
+    def visit_Assign(self, node):
 
-        if self.__box:
+        # Likely not necessary but prudent
 
-            box = xml_elem('{%s}box' % GEO_NS, entry)
+        self.generic_visit(node)
 
-            box.text = self.__box
 
 
+        for target in node.targets:
 
-        if self.__featuretypetag:
+            names = self.NameVisitor().visit(target)
 
-            featuretypetag = xml_elem('{%s}featuretypetag' % GEO_NS, entry)
+            for name in names:
 
-            featuretypetag.text = self.__featuretypetag
+                if name in ['widget', 'widget_names']:
 
+                    widgets = set(self.StrVisitor().visit(node.value))
 
+                    widgets.difference_update(self.defined_widgets)
 
-        if self.__relationshiptag:
+                    if widgets:
 
-            relationshiptag = xml_elem('{%s}relationshiptag' % GEO_NS, entry)
+                        return (node, "X100 widgets %s are not defined in the Glade files" % list(widgets))
 
-            relationshiptag.text = self.__relationshiptag
 
 
 
-        if self.__featurename:
 
-            featurename = xml_elem('{%s}featurename' % GEO_NS, entry)
+class SignalVisitor(AstVisitor):
 
-            featurename.text = self.__featurename
+    """Look for signals that are used in code but not declared in the Glade files."""
 
+    codes = ['X101']
 
 
-        if self.__elev:
 
-            elevation = xml_elem('{%s}elev' % GEO_NS, entry)
+    class DictVisitor(AstVisitor):
 
-            elevation.text = str(self.__elev)
+        def visit_Dict(self, node):
 
+            # Note this will break if someone uses a Name for a key instead of an Str
 
+            # Hopefully no one will do that because we wouldn't be able to get at the value
 
-        if self.__floor:
+            # the Name holds
 
-            floor = xml_elem('{%s}floor' % GEO_NS, entry)
+            return [k.s for k in node.keys]
 
-            floor.text = str(self.__floor)
 
 
+    def __init__(self, defined_handlers=None):
 
-        if self.__radius:
+        super(SignalVisitor, self).__init__()
 
-            radius = xml_elem('{%s}radius' % GEO_NS, entry)
+        if not defined_handlers:
 
-            radius.text = str(self.__radius)
+            defined_handlers = []
 
 
 
-        return entry
+        self.defined_handlers = set(defined_handlers)
 
 
 
-    def extend_rss(self, entry):
+    def visit_Call(self, node):
 
-        return self.extend_file(entry)
+        self.generic_visit(node)
 
 
 
-    def extend_atom(self, entry):
+        func = node.func
 
-        return self.extend_file(entry)
+        if not isinstance(func, ast.Attribute):
 
+            return
 
 
-    def point(self, point=None):
 
-        '''Get or set the georss:point of the entry.
+        if func.attr == 'connect_signals':
 
+            keys = self.DictVisitor().visit(node.args[0])
 
+            # Flatten the list of lists
 
-        :param point: The GeoRSS formatted point (i.e. "42.36 -71.05")
+            handlers = set([item for sublist in keys for item in sublist])
 
-        :returns: The current georss:point of the entry.
+            handlers.difference_update(self.defined_handlers)
 
-        '''
+            if handlers:
 
+                return (node, "X101 handlers %s are not defined in the Glade files" % list(handlers))
 
 
-        if point is not None:
 
-            self.__point = point
 
 
+class DebugImportVisitor(AstVisitor):
 
-        return self.__point
+    """Look for imports of various debug modules"""
 
 
 
-    def line(self, line=None):
+    DEBUG_MODULES = ['pdb', 'pudb', 'ipdb', 'pydevd']
 
-        '''Get or set the georss:line of the entry
+    codes = ['X200']
 
 
 
-        :param point: The GeoRSS formatted line (i.e. "45.256 -110.45 46.46
+    def visit_Import(self, node):
 
-                      -109.48 43.84 -109.86")
+        # Likely not necessary but prudent
 
-        :return: The current georss:line of the entry
+        self.generic_visit(node)
 
-        '''
 
-        if line is not None:
 
-            self.__line = line
+        for alias in node.names:
 
+            module_name = alias.name
 
+            if module_name in self.DEBUG_MODULES:
 
-        return self.__line
+                return(node, "X200 imports of debug module '%s' should be removed" % module_name)
 
 
 
-    def polygon(self, polygon=None):
+    def visit_ImportFrom(self, node):
 
-        '''Get or set the georss:polygon of the entry
+        # Likely not necessary but prudent
 
+        self.generic_visit(node)
 
+        module_name = node.module
 
-        :param polygon: The GeoRSS formatted polygon (i.e. "45.256 -110.45
+        if module_name in self.DEBUG_MODULES:
 
-                        46.46 -109.48 43.84 -109.86 45.256 -110.45")
+            return(node, "X200 imports of debug module '%s' should be removed" % module_name)
 
-        :return: The current georss:polygon of the entry
 
-        '''
 
-        if polygon is not None:
 
-            self.__polygon = polygon
 
+class GettextVisitor(AstVisitor):
 
+    """Looks for Python string formats that are known to break xgettext.
 
-        return self.__polygon
+    Specifically, constructs of the forms:
 
+        _("a" + "b")
 
+        _("a" + \
 
-    def box(self, box=None):
+        "b")
 
-        '''
+    Also look for _(a) usages
 
-        Get or set the georss:box of the entry
+    """
 
+    codes = ['X300', 'X301', 'X302']
 
 
-        :param box: The GeoRSS formatted box (i.e. "42.943 -71.032 43.039
 
-                    -69.856")
+    def visit_Call(self, node):
 
-        :return: The current georss:box of the entry
+        # Descend first
 
-        '''
+        self.generic_visit(node)
 
-        if box is not None:
 
-            self.__box = box
 
+        func = node.func
 
+        if not isinstance(func, ast.Name):
 
-        return self.__box
+            return
 
 
 
-    def featuretypetag(self, featuretypetag=None):
+        if func.id != '_':
 
-        '''
+            return
 
-        Get or set the georss:featuretypetag of the entry
 
 
+        for arg in node.args:
 
-        :param featuretypetag: The GeoRSS feaaturertyptag (e.g. "city")
+            # ProTip: use print(ast.dump(node)) to figure out what the node looks like
 
-        :return: The current georss:featurertypetag
 
-        '''
 
-        if featuretypetag is not None:
+            # Things like _("a" + "b") (including such constructs across line continuations
 
-            self.__featuretypetag = featuretypetag
+            if isinstance(arg, ast.BinOp) and isinstance(arg.op, ast.Add):
 
+                return (node, "X300 string concatenation that will break xgettext")
 
 
-        return self.__featuretypetag
 
+            # Things like _(some_variable)
 
+            if isinstance(arg, ast.Name):
 
-    def relationshiptag(self, relationshiptag=None):
+                return (node, "X301 variable reference that will break xgettext")
 
-        '''
 
-        Get or set the georss:relationshiptag of the entry
 
+            # _("%s is great" % some_variable) should be _("%s is great") % some_variable
 
+            if isinstance(arg, ast.BinOp) and isinstance(arg.op, ast.Mod):
 
-        :param relationshiptag: The GeoRSS relationshiptag (e.g.
+                return (node, "X302 string formatting within gettext function: _('%s' % foo) should be _('%s') % foo")
 
-                                "is-centred-at")
 
-        :return: the current georss:relationshiptag
 
-        '''
 
-        if relationshiptag is not None:
 
-            self.__relationshiptag = relationshiptag
+class AstChecker(object):
 
+    name = "SubscriptionManagerAstChecker"
 
+    version = "1.0"
 
-        return self.__relationshiptag
 
 
+    def __init__(self, tree, filename):
 
-    def featurename(self, featurename=None):
+        self.tree = tree
 
-        '''
+        self.filename = filename
 
-        Get or set the georss:featurename of the entry
 
 
+        widgets = []
 
-        :param featuretypetag: The GeoRSS featurename (e.g. "Footscray")
+        handlers = []
 
-        :return: the current georss:featurename
+        for f in Utils.find_files_of_type('src', '*.glade', '*.ui'):
 
-        '''
+            # Note that we are sending in the file name rather than a file handle.  By using
 
-        if featurename is not None:
+            # the file name, we can take advantage of memoizing on the name instead of on an
 
-            self.__featurename = featurename
+            # instance of a file handle
 
+            widgets.extend(self.scan_widgets(f))
 
+            handlers.extend(self.scan_handlers(f))
 
-        return self.__featurename
 
 
+        self.visitors = [
 
-    def elev(self, elev=None):
+            (GettextVisitor, {}),
 
-        '''
+            (DebugImportVisitor, {}),
 
-        Get or set the georss:elev of the entry
+            (WidgetVisitor, {'defined_widgets': widgets}),
 
+            (SignalVisitor, {'defined_handlers': handlers}),
 
+        ]
 
-        :param elev: The GeoRSS elevation (e.g. 100.3)
 
-        :type elev: numbers.Number
 
-        :return: the current georss:elev
+    @staticmethod
 
-        '''
+    @memoize
 
-        if elev is not None:
+    def scan_widgets(f):
 
-            if not isinstance(elev, numbers.Number):
+        """Scan a file for object elements with a class and id attribute.  Return
 
-                raise ValueError("elev tag must be numeric: {}".format(elev))
+        the value of the id attribute.
 
+        """
 
 
-            self.__elev = elev
 
+        # We cache all the results because this class gets instantiated for every
 
+        # source file and this method scans every Glade file.  That would be a lot
 
-        return self.__elev
+        # of redundant XML parsing (N source files * M Glade files) if we didn't memoize it.
 
+        widgets = []
 
+        with open(f, 'r') as f:
 
-    def floor(self, floor=None):
+            tree = ElementTree.parse(f)
 
-        '''
+        elements = tree.findall(".//object[@class][@id]")
 
-        Get or set the georss:floor of the entry
+        for e in elements:
 
+            widgets.append(e.attrib['id'])
 
+        return widgets
 
-        :param floor: The GeoRSS floor (e.g. 4)
 
-        :type floor: int
 
-        :return: the current georss:floor
+    @staticmethod
 
-        '''
+    @memoize
 
-        if floor is not None:
+    def scan_handlers(f):
 
-            if not isinstance(floor, int):
+        handlers = []
 
-                raise ValueError("floor tag must be int: {}".format(floor))
+        with open(f, 'r') as f:
 
+            tree = ElementTree.parse(f)
 
+        elements = tree.findall(".//signal[@name][@handler]")
 
-            self.__floor = floor
+        for e in elements:
 
+            handlers.append(e.attrib['handler'])
 
+        return handlers
 
-        return self.__floor
 
 
+    def run(self):
 
-    def radius(self, radius=None):
+        if self.tree:
 
-        '''
+            for visitor, kwargs in self.visitors:
 
-        Get or set the georss:radius of the entry
+                result = visitor(**kwargs).visit(self.tree)
 
+                if result:
 
+                    for node, msg in result:
 
-        :param radius: The GeoRSS radius (e.g. 100.3)
+                        yield self.err(node, msg)
 
-        :type radius: numbers.Number
 
-        :return: the current georss:radius
 
-        '''
+    def err(self, node, msg=None):
 
-        if radius is not None:
+        if not msg:
 
-            if not isinstance(radius, numbers.Number):
+            msg = self._error_tmpl
 
-                raise ValueError(
 
-                    "radius tag must be numeric: {}".format(radius)
 
-                )
+        lineno = node.lineno
 
+        col_offset = node.col_offset
 
 
-            self.__radius = radius
 
+        # Adjust line number and offset if a decorator is applied
 
+        if isinstance(node, ast.ClassDef):
 
-        return self.__radius
+            lineno += len(node.decorator_list)
 
+            col_offset += 6
 
+        elif isinstance(node, ast.FunctionDef):
 
-    def geom_from_geo_interface(self, geom):
+            lineno += len(node.decorator_list)
 
-        '''
+            col_offset += 4
 
-        Generate a georss geometry from some Python object with a
 
-        ``__geo_interface__`` property (see the `geo_interface specification by
 
-        Sean Gillies`_geointerface )
+        ret = (lineno, col_offset, msg, self)
 
+        return ret
 
 
-        Note only a subset of GeoJSON (see `geojson.org`_geojson ) can be
 
-        easily converted to GeoRSS:
 
 
+def detect_overindent(logical_line, tokens, indent_level, hang_closing, indent_char, noqa, verbose):
 
-        - Point
+    """Flag lines that are overindented.  This includes lines that are indented solely to align
 
-        - LineString
+    vertically with an opening brace.  This rule allows continuation lines to be relatively
 
-        - Polygon (if there are holes / donuts in the polygons a warning will
+    indented up to 8 spaces and closes braces to be relatively indented up to 4 spaces.  Heavily
 
-          be generaated
+    adapted from pep8's continued_indentation method
 
 
 
-        Other GeoJson types will raise a ``ValueError``.
+    Okay: foo = my_func('hello',
 
+              'world'
 
+              )
 
-        .. note:: The geometry is assumed to be x, y as longitude, latitude in
+    Okay: foo = my_func('hello',
 
-           the WGS84 projection.
+                  'world')
 
 
 
-        .. _geointerface: https://gist.github.com/sgillies/2217756
+    Okay: foo = my_func('hello',
 
-        .. _geojson: https://geojson.org/
+              )
 
 
 
-        :param geom: Geometry object with a __geo_interface__ property
+    E198: foo = my_func('hello',
 
-        :return: the formatted GeoRSS geometry
+                       )
 
-        '''
+    E199: foo = my_func('hello',
 
-        geojson = geom.__geo_interface__
+                        'world')
 
+    """
 
+    first_row = tokens[0][2][0]
 
-        if geojson['type'] not in ('Point', 'LineString', 'Polygon'):
+    nrows = 1 + tokens[-1][2][0] - first_row
 
-            raise GeoRSSGeometryError(geom)
+    if noqa or nrows == 1:
 
+        return
 
 
-        if geojson['type'] == 'Point':
 
+    row = depth = 0
 
 
-            coords = '{:f} {:f}'.format(
 
-                geojson['coordinates'][1],  # latitude is y
+    # relative indents of physical lines
 
-                geojson['coordinates'][0]
+    rel_indent = [0] * nrows
 
-            )
+    open_rows = [[0]]
 
-            return self.point(coords)
+    last_indent = tokens[0][2]
 
+    indent = [last_indent[1]]
 
 
-        elif geojson['type'] == 'LineString':
 
+    last_token_multiline = False
 
 
-            coords = ' '.join(
 
-                '{:f} {:f}'.format(vertex[1], vertex[0])
+    if verbose >= 3:
 
-                for vertex in
+        print(">>> " + tokens[0][4].rstrip())
 
-                geojson['coordinates']
 
-            )
 
-            return self.line(coords)
+    for token_type, text, start, end, line in tokens:
 
+        newline = row < start[0] - first_row
 
+        if newline:
 
-        elif geojson['type'] == 'Polygon':
+            row = start[0] - first_row
 
+            newline = not last_token_multiline and token_type not in pep8.NEWLINE
 
 
-            if len(geojson['coordinates']) > 1:
 
-                warnings.warn(GeoRSSPolygonInteriorWarning(geom))
+        if newline:
 
+            # this is the beginning of a continuation line.
 
+            last_indent = start
 
-            coords = ' '.join(
+            if verbose >= 3:
 
-                '{:f} {:f}'.format(vertex[1], vertex[0])
+                print("... " + line.rstrip())
 
-                for vertex in
 
-                geojson['coordinates'][0]
 
-            )
+            # record the initial indent.
 
-            return self.polygon(coords)
+            rel_indent[row] = pep8.expand_indent(line) - indent_level
+
+
+
+            # identify closing bracket
+
+            close_bracket = (token_type == tokenize.OP and text in ']})')
+
+
+
+            # is the indent relative to an opening bracket line?
+
+            for open_row in reversed(open_rows[depth]):
+
+                hang = rel_indent[row] - rel_indent[open_row]
+
+
+
+            if not close_bracket and hang > 8:
+
+                yield start, "E199 continuation line over-indented"
+
+
+
+            if close_bracket and hang > 4:
+
+                yield (start, "E198 closing bracket over-indented")
+
+
+
+        # Keep track of bracket depth to check for proper indentation in nested
+
+        # brackets
+
+        # E.g.
+
+        # Okay: foo = [[
+
+        #           '1'
+
+        #       ]]
+
+        #
+
+        # but even though we are nested twice, we should only allow one level of indentation, so:
+
+        #
+
+        # E199: foo = [[
+
+        #               '1'
+
+        #       ]]
+
+
+
+        if token_type == tokenize.OP:
+
+            if text in '([{':
+
+                depth += 1
+
+                indent.append(0)
+
+                if len(open_rows) == depth:
+
+                    open_rows.append([])
+
+                open_rows[depth].append(row)
+
+                if verbose >= 4:
+
+                    print("bracket depth %s seen, col %s, visual min = %s" %
+
+                          (depth, start[1], indent[depth]))
+
+            elif text in ')]}' and depth > 0:
+
+                # parent indents should not be more than this one
+
+                prev_indent = indent.pop() or last_indent[1]
+
+                for d in range(depth):
+
+                    if indent[d] > prev_indent:
+
+                        indent[d] = 0
+
+                del open_rows[depth + 1:]
+
+                depth -= 1
+
+            assert len(indent) == depth + 1
+
+
+
+        last_token_multiline = (start[0] != end[0])
+
+        if last_token_multiline:
+
+            rel_indent[end[0] - first_row] = rel_indent[row]
+
+
+
+
+
+class PluginLoadingFlake8(Flake8):
+
+    """A Flake8 runner that will load our custom plugins.  It's important to note
+
+    that this has to be invoked via `./setup.py flake8`.  Just running `flake8` won't
+
+    cut it.
+
+
+
+    Flake8 normally wants to load plugins via entry_points, but as far as I can tell
+
+    that would require packaging our checkers separately.  Instead, we create a phony
+
+    pkg_resources Distribution that loads up the build_ext directory.  That directory
+
+    has some metadata files that associate the AstChecker class with the flake8.extension
+
+    entry point.
+
+
+
+    See http://peak.telecommunity.com/DevCenter/PkgResources
+
+    """
+
+    def __init__(self, *args, **kwargs):
+
+        ext_dir = pkg_resources.normalize_path('build_ext')
+
+        dist = pkg_resources.Distribution(
+
+            ext_dir,
+
+            project_name='build_ext',
+
+            metadata=pkg_resources.PathMetadata(ext_dir, ext_dir)
+
+        )
+
+        pkg_resources.working_set.add(dist)
+
+        Flake8.__init__(self, *args, **kwargs)
+
+
+
+    def distribution_files(self):
+
+        # By default Flake8 only runs on packages registered with
+
+        # setuptools.  We want it to look at tests and other things as well
+
+        for d in ['src', 'test', 'build_ext', 'example-plugins', 'setup.py']:
+
+            yield d
+
+
+
+    def run(self):
+
+        # Flake8.run(self)  - use when issue 199 is fixed
+
+        # Required until https://gitlab.com/pycqa/flake8/issues/199 is fixed
+
+        self.flake8.run_checks(list(self.distribution_files()))
+
+        self.flake8.formatter.start()
+
+        self.flake8.report_errors()
+
+        self.flake8.report_statistics()
+
+        self.flake8.report_benchmarks()
+
+        self.flake8.formatter.stop()
+
+        self.flake8.exit()

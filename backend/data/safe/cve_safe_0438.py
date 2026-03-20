@@ -2,214 +2,520 @@
 # Safety: safe
 # Category: safe
 
-"""
+# -*- coding: utf-8 -*-
 
-This module defines a built-in contrib module that enables external files to
-
-be included within the slide. This is extremely useful when having source
-
-code displayed in a code block, and then running/doing something with the
-
-source data in a terminal on the same slide.
-
-"""
+from __future__ import absolute_import, print_function, division
 
 
 
 
 
-from marshmallow import fields, Schema
+# standard library dependencies
 
-import os
+try:
 
-import subprocess
+    # prefer lxml as it supports XPath
 
-import yaml
+    from lxml import etree
 
+except ImportError:
 
-
-
-
-import lookatme.config
-
-from lookatme.exceptions import IgnoredByContrib
+    import xml.etree.ElementTree as etree
 
 
 
+from operator import attrgetter
+
+import itertools
+
+from petl.compat import string_types, text_type
 
 
-def user_warnings():
 
-    """Provide warnings to the user that loading this extension may cause
 
-    shell commands specified in the markdown to be run.
+
+# internal dependencies
+
+from petl.util.base import Table
+
+from petl.io.sources import read_source_from_arg
+
+
+
+
+
+def fromxml(source, *args, **kwargs):
 
     """
 
-    return [
-
-        "Code-blocks with a language starting with 'file' may cause shell",
-
-        "  commands from the source markdown to be run if the 'transform'",
-
-        "  field is set",
-
-        "See https://lookatme.readthedocs.io/en/latest/builtin_extensions/file_loader.html",
-
-        "  for more details",
-
-    ]
+    Extract data from an XML file. E.g.::
 
 
 
+        >>> import petl as etl
+
+        >>> # setup a file to demonstrate with
+
+        ... d = '''<table>
+
+        ...     <tr>
+
+        ...         <td>foo</td><td>bar</td>
+
+        ...     </tr>
+
+        ...     <tr>
+
+        ...         <td>a</td><td>1</td>
+
+        ...     </tr>
+
+        ...     <tr>
+
+        ...         <td>b</td><td>2</td>
+
+        ...     </tr>
+
+        ...     <tr>
+
+        ...         <td>c</td><td>2</td>
+
+        ...     </tr>
+
+        ... </table>'''
+
+        >>> with open('example1.xml', 'w') as f:
+
+        ...     f.write(d)
+
+        ...
+
+        212
+
+        >>> table1 = etl.fromxml('example1.xml', 'tr', 'td')
+
+        >>> table1
+
+        +-----+-----+
+
+        | foo | bar |
+
+        +=====+=====+
+
+        | 'a' | '1' |
+
+        +-----+-----+
+
+        | 'b' | '2' |
+
+        +-----+-----+
+
+        | 'c' | '2' |
+
+        +-----+-----+
 
 
-class YamlRender:
-
-    loads = lambda data: yaml.safe_load(data)
-
-    dumps = lambda data: yaml.safe_dump(data)
 
 
 
+    If the data values are stored in an attribute, provide the attribute
 
-
-class LineRange(Schema):
-
-    start = fields.Integer(default=0, missing=0)
-
-    end = fields.Integer(default=None, missing=None)
+    name as an extra positional argument::
 
 
 
+        >>> d = '''<table>
+
+        ...     <tr>
+
+        ...         <td v='foo'/><td v='bar'/>
+
+        ...     </tr>
+
+        ...     <tr>
+
+        ...         <td v='a'/><td v='1'/>
+
+        ...     </tr>
+
+        ...     <tr>
+
+        ...         <td v='b'/><td v='2'/>
+
+        ...     </tr>
+
+        ...     <tr>
+
+        ...         <td v='c'/><td v='2'/>
+
+        ...     </tr>
+
+        ... </table>'''
+
+        >>> with open('example2.xml', 'w') as f:
+
+        ...     f.write(d)
+
+        ...
+
+        220
+
+        >>> table2 = etl.fromxml('example2.xml', 'tr', 'td', 'v')
+
+        >>> table2
+
+        +-----+-----+
+
+        | foo | bar |
+
+        +=====+=====+
+
+        | 'a' | '1' |
+
+        +-----+-----+
+
+        | 'b' | '2' |
+
+        +-----+-----+
+
+        | 'c' | '2' |
+
+        +-----+-----+
 
 
-class FileSchema(Schema):
 
-    path = fields.Str()
+    Data values can also be extracted by providing a mapping of field
 
-    relative = fields.Boolean(default=True, missing=True)
-
-    lang = fields.Str(default="auto", missing="auto")
-
-    transform = fields.Str(default=None, missing=None)
-
-    lines = fields.Nested(
-
-        LineRange,
-
-        default=LineRange().dump(LineRange()),
-
-        missing=LineRange().dump(LineRange()),
-
-    )
+    names to element paths::
 
 
 
-    class Meta:
+        >>> d = '''<table>
 
-        render_module = YamlRender
+        ...     <row>
+
+        ...         <foo>a</foo><baz><bar v='1'/><bar v='3'/></baz>
+
+        ...     </row>
+
+        ...     <row>
+
+        ...         <foo>b</foo><baz><bar v='2'/></baz>
+
+        ...     </row>
+
+        ...     <row>
+
+        ...         <foo>c</foo><baz><bar v='2'/></baz>
+
+        ...     </row>
+
+        ... </table>'''
+
+        >>> with open('example3.xml', 'w') as f:
+
+        ...     f.write(d)
+
+        ...
+
+        223
+
+        >>> table3 = etl.fromxml('example3.xml', 'row',
+
+        ...                      {'foo': 'foo', 'bar': ('baz/bar', 'v')})
+
+        >>> table3
+
+        +------------+-----+
+
+        | bar        | foo |
+
+        +============+=====+
+
+        | ('1', '3') | 'a' |
+
+        +------------+-----+
+
+        | '2'        | 'b' |
+
+        +------------+-----+
+
+        | '2'        | 'c' |
+
+        +------------+-----+
 
 
 
+    If `lxml <http://lxml.de/>`_ is installed, full XPath expressions can be
+
+    used.
 
 
-def transform_data(transform_shell_cmd, input_data):
 
-    """Transform the ``input_data`` using the ``transform_shell_cmd``
+    Note that the implementation is currently **not** streaming, i.e.,
 
-    shell command.
+    the whole document is loaded into memory.
+
+
+
+    If multiple elements match a given field, all values are reported as a
+
+    tuple.
+
+
+
+    If there is more than one element name used for row values, a tuple
+
+    or list of paths can be provided, e.g.,
+
+    ``fromxml('example.html', './/tr', ('th', 'td'))``.
+
+
+
+    Optionally a custom parser can be provided, e.g.,
+
+    ``etl.fromxml('example1.xml', 'tr', 'td', parser=my_parser)``.
+
+
 
     """
 
-    proc = subprocess.Popen(
 
-        transform_shell_cmd,
 
-        shell=True,
+    source = read_source_from_arg(source)
 
-        stdout=subprocess.PIPE,
-
-        stderr=subprocess.STDOUT,
-
-        stdin=subprocess.PIPE,
-
-    )
-
-    stdout, _ = proc.communicate(input=input_data)
-
-    return stdout
+    return XmlView(source, *args, **kwargs)
 
 
 
 
 
-def render_code(token, body, stack, loop):
-
-    """Render the code, ignoring all code blocks except ones with the language
-
-    set to ``file``.
-
-    """
-
-    lang = token["lang"] or ""
-
-    if lang != "file":
-
-        raise IgnoredByContrib
+class XmlView(Table):
 
 
 
-    file_info_data = token["text"]
+    def __init__(self, source, *args, **kwargs):
 
-    file_info = FileSchema().loads(file_info_data)
+        self.source = source
+
+        self.args = args
+
+        if len(args) == 2 and isinstance(args[1], (string_types, tuple, list)):
+
+            self.rmatch = args[0]
+
+            self.vmatch = args[1]
+
+            self.vdict = None
+
+            self.attr = None
+
+        elif len(args) == 2 and isinstance(args[1], dict):
+
+            self.rmatch = args[0]
+
+            self.vmatch = None
+
+            self.vdict = args[1]
+
+            self.attr = None
+
+        elif len(args) == 3:
+
+            self.rmatch = args[0]
+
+            self.vmatch = args[1]
+
+            self.vdict = None
+
+            self.attr = args[2]
+
+        else:
+
+            assert False, 'bad parameters'
+
+        self.missing = kwargs.get('missing', None)
+
+        self.user_parser = kwargs.get('parser', None)
 
 
 
-    # relative to the slide source
+    def __iter__(self):
 
-    if file_info["relative"]:
+        vmatch = self.vmatch
 
-        base_dir = lookatme.config.SLIDE_SOURCE_DIR
-
-    else:
-
-        base_dir = os.getcwd()
+        vdict = self.vdict
 
 
 
-    full_path = os.path.join(base_dir, file_info["path"])
+        with self.source.open('rb') as xmlf:
 
-    if not os.path.exists(full_path):
+            parser2 = _create_xml_parser(self.user_parser)
 
-        token["text"] = "File not found"
+            tree = etree.parse(xmlf, parser=parser2)
 
-        token["lang"] = "text"
+            if not hasattr(tree, 'iterfind'):
 
-        raise IgnoredByContrib
+                # Python 2.6 compatibility
 
-    
-
-    with open(full_path, "rb") as f:
-
-        file_data = f.read()
+                tree.iterfind = tree.findall
 
 
 
-    if file_info["transform"] is not None:
+            if vmatch is not None:
 
-        file_data = transform_data(file_info["transform"], file_data)
+                # simple case, all value paths are the same
+
+                for rowelm in tree.iterfind(self.rmatch):
+
+                    if self.attr is None:
+
+                        getv = attrgetter('text')
+
+                    else:
+
+                        getv = lambda e: e.get(self.attr)
+
+                    if isinstance(vmatch, string_types):
+
+                        # match only one path
+
+                        velms = rowelm.findall(vmatch)
+
+                    else:
+
+                        # match multiple paths
+
+                        velms = itertools.chain(*[rowelm.findall(enm)
+
+                                                  for enm in vmatch])
+
+                    yield tuple(getv(velm)
+
+                                for velm in velms)
 
 
 
-    lines = file_data.split(b"\n")
+            else:
 
-    lines = lines[file_info["lines"]["start"]:file_info["lines"]["end"]]
+                # difficult case, deal with different paths for each field
 
-    file_data = b"\n".join(lines)
 
-    token["text"] = file_data
 
-    token["lang"] = file_info["lang"]
+                # determine output header
 
-    raise IgnoredByContrib
+                flds = tuple(sorted(map(text_type, vdict.keys())))
+
+                yield flds
+
+
+
+                # setup value getters
+
+                vmatches = dict()
+
+                vgetters = dict()
+
+                for f in flds:
+
+                    vmatch = self.vdict[f]
+
+                    if isinstance(vmatch, string_types):
+
+                        # match element path
+
+                        vmatches[f] = vmatch
+
+                        vgetters[f] = element_text_getter(self.missing)
+
+                    else:
+
+                        # match element path and attribute name
+
+                        vmatches[f] = vmatch[0]
+
+                        attr = vmatch[1]
+
+                        vgetters[f] = attribute_text_getter(attr, self.missing)
+
+
+
+                # determine data rows
+
+                for rowelm in tree.iterfind(self.rmatch):
+
+                    yield tuple(vgetters[f](rowelm.findall(vmatches[f]))
+
+                                for f in flds)
+
+
+
+
+
+def _create_xml_parser(user_parser):
+
+    if user_parser is not None:
+
+        return user_parser
+
+    try:
+
+        # Default lxml parser.
+
+        # This will throw an error if parser is not set and lxml could not be imported
+
+        # because Python's built XML parser doesn't like the `resolve_entities` kwarg.
+
+        # return etree.XMLParser(resolve_entities=False)
+
+        return etree.XMLParser(resolve_entities=False)
+
+    except TypeError:
+
+        # lxml not available
+
+        return None
+
+
+
+
+
+def element_text_getter(missing):
+
+    def _get(v):
+
+        if len(v) > 1:
+
+            return tuple(e.text for e in v)
+
+        elif len(v) == 1:
+
+            return v[0].text
+
+        else:
+
+            return missing
+
+    return _get
+
+
+
+
+
+def attribute_text_getter(attr, missing):
+
+    def _get(v):
+
+        if len(v) > 1:
+
+            return tuple(e.get(attr) for e in v)
+
+        elif len(v) == 1:
+
+            return v[0].get(attr)
+
+        else:
+
+            return missing
+
+    return _get

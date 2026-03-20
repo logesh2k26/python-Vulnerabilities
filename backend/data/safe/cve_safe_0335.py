@@ -2,372 +2,148 @@
 # Safety: vulnerable
 # Category: safe
 
-# -*- coding: utf-8 -*-
+import time
 
-'''
+from pydoc import locate
 
-    feedgen.ext.media
 
-    ~~~~~~~~~~~~~~~~~
 
+from django.conf import settings
 
 
-    Extends the feedgen to produce media tags.
 
+DEFAULT_CONFIG = {
 
+    'config_version': 4,
 
-    :copyright: 2013-2017, Lars Kiesow <lkiesow@uos.de>
+    'flag_prefix': 'ractf',
 
+    'graph_members': 10,
 
+    'register_end_time': -1,
 
-    :license: FreeBSD and LGPL, see license.* for more details.
+    'end_time': time.time() + 7 * 24 * 60 * 60,
 
-'''
+    'start_time': time.time(),
 
+    'register_start_time': time.time(),
 
+    'team_size': -1,
 
-from lxml import etree
+    'email_regex': '',
 
+    'email_domain': '',
 
+    'login_provider': 'basic_auth',
 
-from feedgen.ext.base import BaseEntryExtension, BaseExtension
+    'registration_provider': 'basic_auth',
 
-from feedgen.util import ensure_format
+    'token_provider': 'basic_auth',
 
+    'enable_bot_users': True,
 
+    'enable_ctftime': True,
 
-MEDIA_NS = 'http://search.yahoo.com/mrss/'
+    'enable_flag_submission': True,
 
+    'enable_flag_submission_after_competition': True,
 
+    'enable_force_admin_2fa': False,
 
+    'enable_track_incorrect_submissions': True,
 
+    'enable_login': True,
 
-class MediaExtension(BaseExtension):
+    'enable_prelogin': True,
 
-    '''FeedGenerator extension for torrent feeds.
+    'enable_maintenance_mode': False,
 
-    '''
+    'enable_registration': True,
 
+    'enable_scoreboard': True,
 
+    'enable_scoring': True,
 
-    def extend_ns(self):
+    'enable_solve_broadcast': True,
 
-        return {'media': MEDIA_NS}
+    'enable_teams': True,
 
+    'enable_team_join': True,
 
+    'enable_view_challenges_after_competion': True,
 
+    'enable_team_leave': False,
 
+    'invite_required': False,
 
-class MediaEntryExtension(BaseEntryExtension):
+    'hide_scoreboard_at': -1,
 
-    '''FeedEntry extension for media tags.
+    'setup_wizard_complete': False,
 
-    '''
+    'sensitive_fields': ['sensitive_fields', 'enable_force_admin_2fa']
 
+}
 
 
-    def __init__(self):
 
-        self.__media_content = []
+backend = locate(settings.CONFIG['BACKEND'])()
 
-        self.__media_thumbnail = []
+backend.load(defaults=DEFAULT_CONFIG)
 
 
 
-    def extend_atom(self, entry):
 
-        '''Add additional fields to an RSS item.
 
+def get(key):
 
+    return backend.get(key)
 
-        :param feed: The RSS item XML element to use.
 
-        '''
 
 
 
-        groups = {None: entry}
+def set(key, value):
 
-        for media_content in self.__media_content:
+    backend.set(key, value)
 
-            # Define current media:group
 
-            group = groups.get(media_content.get('group'))
 
-            if group is None:
 
-                group = etree.SubElement(entry, '{%s}group' % MEDIA_NS)
 
-                groups[media_content.get('group')] = group
+def get_all():
 
-            # Add content
+    return backend.get_all()
 
-            content = etree.SubElement(group, '{%s}content' % MEDIA_NS)
 
-            for attr in ('url', 'fileSize', 'type', 'medium', 'isDefault',
 
-                         'expression', 'bitrate', 'framerate', 'samplingrate',
 
-                         'channels', 'duration', 'height', 'width', 'lang'):
 
-                if media_content.get(attr):
+def get_all_non_sensitive():
 
-                    content.set(attr, media_content[attr])
+    sensitive = backend.get('sensitive_fields')
 
+    config = backend.get_all()
 
+    for field in sensitive:
 
-        for media_thumbnail in self.__media_thumbnail:
+        del config[field]
 
-            # Define current media:group
+    return config
 
-            group = groups.get(media_thumbnail.get('group'))
 
-            if group is None:
 
-                group = etree.SubElement(entry, '{%s}group' % MEDIA_NS)
 
-                groups[media_thumbnail.get('group')] = group
 
-            # Add thumbnails
+def set_bulk(values: dict):
 
-            thumbnail = etree.SubElement(group, '{%s}thumbnail' % MEDIA_NS)
+    for key, value in values.items():
 
-            for attr in ('url', 'height', 'width', 'time'):
+        set(key, value)
 
-                if media_thumbnail.get(attr):
 
-                    thumbnail.set(attr, media_thumbnail[attr])
 
 
 
-        return entry
+def add_plugin_config(name, config):
 
-
-
-    def extend_rss(self, item):
-
-        return self.extend_atom(item)
-
-
-
-    def content(self, content=None, replace=False, group='default', **kwargs):
-
-        '''Get or set media:content data.
-
-
-
-        This method can be called with:
-
-        - the fields of a media:content as keyword arguments
-
-        - the fields of a media:content as a dictionary
-
-        - a list of dictionaries containing the media:content fields
-
-
-
-        <media:content> is a sub-element of either <item> or <media:group>.
-
-        Media objects that are not the same content should not be included in
-
-        the same <media:group> element. The sequence of these items implies
-
-        the order of presentation. While many of the attributes appear to be
-
-        audio/video specific, this element can be used to publish any type
-
-        of media. It contains 14 attributes, most of which are optional.
-
-
-
-        media:content has the following fields:
-
-        - *url* should specify the direct URL to the media object.
-
-        - *fileSize* number of bytes of the media object.
-
-        - *type* standard MIME type of the object.
-
-        - *medium* type of object (image | audio | video | document |
-
-          executable).
-
-        - *isDefault* determines if this is the default object.
-
-        - *expression* determines if the object is a sample or the full version
-
-          of the object, or even if it is a continuous stream (sample | full |
-
-          nonstop).
-
-        - *bitrate* kilobits per second rate of media.
-
-        - *framerate* number of frames per second for the media object.
-
-        - *samplingrate* number of samples per second taken to create the media
-
-          object. It is expressed in thousands of samples per second (kHz).
-
-        - *channels* number of audio channels in the media object.
-
-        - *duration* number of seconds the media object plays.
-
-        - *height* height of the media object.
-
-        - *width* width of the media object.
-
-        - *lang* is the primary language encapsulated in the media object.
-
-
-
-        :param content: Dictionary or list of dictionaries with content data.
-
-        :param replace: Add or replace old data.
-
-        :param group: Media group to put this content in.
-
-
-
-        :returns: The media content tag.
-
-        '''
-
-        # Handle kwargs
-
-        if content is None and kwargs:
-
-            content = kwargs
-
-        # Handle new data
-
-        if content is not None:
-
-            # Reset data if we want to replace them
-
-            if replace or self.__media_content is None:
-
-                self.__media_content = []
-
-            # Ensure list
-
-            if not isinstance(content, list):
-
-                content = [content]
-
-            # define media group
-
-            for c in content:
-
-                c['group'] = c.get('group', group)
-
-            self.__media_content += ensure_format(
-
-                    content,
-
-                    set(['url', 'fileSize', 'type', 'medium', 'isDefault',
-
-                         'expression', 'bitrate', 'framerate', 'samplingrate',
-
-                         'channels', 'duration', 'height', 'width', 'lang',
-
-                         'group']),
-
-                    set(['url', 'group']))
-
-        return self.__media_content
-
-
-
-    def thumbnail(self, thumbnail=None, replace=False, group='default',
-
-                  **kwargs):
-
-        '''Get or set media:thumbnail data.
-
-
-
-        This method can be called with:
-
-        - the fields of a media:content as keyword arguments
-
-        - the fields of a media:content as a dictionary
-
-        - a list of dictionaries containing the media:content fields
-
-
-
-        Allows particular images to be used as representative images for
-
-        the media object. If multiple thumbnails are included, and time
-
-        coding is not at play, it is assumed that the images are in order
-
-        of importance. It has one required attribute and three optional
-
-        attributes.
-
-
-
-        media:thumbnail has the following fields:
-
-        - *url* should specify the direct URL to the media object.
-
-        - *height* height of the media object.
-
-        - *width* width of the media object.
-
-        - *time* specifies the time offset in relation to the media object.
-
-
-
-        :param thumbnail: Dictionary or list of dictionaries with thumbnail
-
-                          data.
-
-        :param replace: Add or replace old data.
-
-        :param group: Media group to put this content in.
-
-
-
-        :returns: The media thumbnail tag.
-
-        '''
-
-        # Handle kwargs
-
-        if thumbnail is None and kwargs:
-
-            thumbnail = kwargs
-
-        # Handle new data
-
-        if thumbnail is not None:
-
-            # Reset data if we want to replace them
-
-            if replace or self.__media_thumbnail is None:
-
-                self.__media_thumbnail = []
-
-            # Ensure list
-
-            if not isinstance(thumbnail, list):
-
-                thumbnail = [thumbnail]
-
-            # Define media group
-
-            for t in thumbnail:
-
-                t['group'] = t.get('group', group)
-
-            self.__media_thumbnail += ensure_format(
-
-                    thumbnail,
-
-                    set(['url', 'height', 'width', 'time', 'group']),
-
-                    set(['url', 'group']))
-
-        return self.__media_thumbnail
+    DEFAULT_CONFIG[name] = config

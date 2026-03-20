@@ -2,31 +2,23 @@
 # Safety: safe
 # Category: safe
 
-# vim: ft=python fileencoding=utf-8 sts=4 sw=4 et:
+#
 
-
-
-# Copyright 2014-2018 Florian Bruhin (The Compiler) <mail@qutebrowser.org>
-
-# Copyright 2015-2018 Antoni Boucher (antoyo) <bouanto@zoho.com>
+# Copyright (C) 2006-2011 Red Hat, Inc.
 
 #
 
-# This file is part of qutebrowser.
-
-#
-
-# qutebrowser is free software: you can redistribute it and/or modify
+# This program is free software; you can redistribute it and/or modify
 
 # it under the terms of the GNU General Public License as published by
 
-# the Free Software Foundation, either version 3 of the License, or
+# the Free Software Foundation; either version 2 of the License, or
 
 # (at your option) any later version.
 
 #
 
-# qutebrowser is distributed in the hope that it will be useful,
+# This program is distributed in the hope that it will be useful,
 
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 
@@ -38,232 +30,192 @@
 
 # You should have received a copy of the GNU General Public License
 
-# along with qutebrowser.  If not, see <http://www.gnu.org/licenses/>.
+# along with this program; if not, write to the Free Software
+
+# Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
 
 #
 
-# pylint complains when using .render() on jinja templates, so we make it shut
 
-# up for this whole module.
 
+import selinux
 
+from stat import *
 
-"""Handler functions for file:... pages."""
+import gettext
 
+translation=gettext.translation('setroubleshoot-plugins', fallback=True)
 
+_=translation.gettext
 
-import os
 
 
+from setroubleshoot.util import *
 
-from qutebrowser.browser.webkit.network import networkreply
+from setroubleshoot.Plugin import Plugin
 
-from qutebrowser.utils import jinja
 
 
+class plugin(Plugin):
 
+    summary =_('''
 
+    SELinux is preventing $SOURCE_PATH from loading $TARGET_PATH which requires text relocation.
 
-def get_file_list(basedir, all_files, filterfunc):
+    ''')
 
-    """Get a list of files filtered by a filter function and sorted by name.
+    
 
+    problem_description = _('''
 
+    The $SOURCE application attempted to load $TARGET_PATH which
 
-    Args:
+    requires text relocation.  This is a potential security problem.
 
-        basedir: The parent directory of all files.
+    Most libraries do not need this permission. Libraries are
 
-        all_files: The list of files to filter and sort.
+    sometimes coded incorrectly and request this permission.  The
 
-        filterfunc: The filter function.
+    <a href="http://people.redhat.com/drepper/selinux-mem.html">SELinux Memory Protection Tests</a>
 
+    web page explains how to remove this requirement.  You can configure
 
+    SELinux temporarily to allow $TARGET_PATH to use relocation as a
 
-    Return:
+    workaround, until the library is fixed. Please file a 
 
-        A list of dicts. Each dict contains the name and absname keys.
+bug report.
 
-    """
+    ''')
 
-    items = []
+    
 
-    for filename in all_files:
+    unsafe_problem_description = _('''
 
-        absname = os.path.join(basedir, filename)
+    The $SOURCE application attempted to load $TARGET_PATH which
 
-        if filterfunc(absname):
+    requires text relocation.  This is a potential security problem.
 
-            items.append({'name': filename, 'absname': absname})
+    Most libraries should not need this permission.   The   
 
-    return sorted(items, key=lambda v: v['name'].lower())
+    <a href="http://people.redhat.com/drepper/selinux-mem.html">
 
+    SELinux Memory Protection Tests</a>
 
+    web page explains this check.  This tool examined the library and it looks 
 
+    like it was built correctly. So setroubleshoot can not determine if this 
 
+    application is compromized or not.  This could be a serious issue. Your 
 
-def is_root(directory):
+    system may very well be compromised.
 
-    """Check if the directory is the root directory.
 
 
+    Contact your security administrator and report this issue.
 
-    Args:
 
-        directory: The directory to check.
 
+    ''')
 
+    
 
-    Return:
+    unsafe_fix_description = "Contact your security administrator and report this issue." 
 
-        Whether the directory is a root directory or not.
 
-    """
 
-    # If you're curious as why this works:
+    fix_description = _('''
 
-    # dirname('/') = '/'
+    If you trust $TARGET_PATH to run correctly, you can change the
 
-    # dirname('/home') = '/'
+    file context to textrel_shlib_t. "chcon -t textrel_shlib_t
 
-    # dirname('/home/') = '/home'
+    '$TARGET_PATH'"
 
-    # dirname('/home/foo') = '/home'
+    You must also change the default file context files on the system in order to preserve them even on a full relabel.  "semanage fcontext -a -t textrel_shlib_t '$FIX_TARGET_PATH'"
 
-    # basically, for files (no trailing slash) it removes the file part, and
+    
 
-    # for directories, it removes the trailing slash, so the only way for this
+    ''')
 
-    # to be equal is if the directory is the root directory.
 
-    return os.path.dirname(directory) == directory
 
+    unsafe_then_text = """
 
+setroubleshoot examined '$FIX_TARGET_PATH' to make sure it was built correctly, but can not determine if this application has been compromized.  This alert could be a serious issue and your system could be compromised.
 
+"""
 
+    unsafe_do_text = "Contact your security administrator and report this issue." 
 
-def parent_dir(directory):
 
-    """Return the parent directory for the given directory.
 
+    then_text = "You need to change the label on '$FIX_TARGET_PATH'"
 
+    do_text = """# semanage fcontext -a -t textrel_shlib_t '$FIX_TARGET_PATH'
 
-    Args:
+# restorecon -v '$FIX_TARGET_PATH'"""
 
-        directory: The path to the directory.
 
 
+    def get_then_text(self, avc, args):
 
-    Return:
+        if len(args) > 0:
 
-        The path to the parent directory.
+            return self.unsafe_then_text
 
-    """
+        return self.then_text
 
-    return os.path.normpath(os.path.join(directory, os.pardir))
 
 
+    def get_do_text(self, avc, args):
 
+        if len(args) > 0:
 
+            return self.unsafe_do_text
 
-def dirbrowser_html(path):
+        return self.do_text
 
-    """Get the directory browser web page.
 
 
+    def __init__(self):
 
-    Args:
+        Plugin.__init__(self,__name__)
 
-        path: The directory path.
+        self.set_priority(10)
 
 
 
-    Return:
+    def analyze(self, avc):
 
-        The HTML of the web page.
+        import subprocess
 
-    """
+        if avc.has_any_access_in(['execmod']):
 
-    title = "Browse directory: {}".format(path)
+            # MATCH
 
+            # from https://docs.python.org/2.7/library/subprocess.html#replacing-shell-pipeline
 
+            p1 = subprocess.Popen(['eu-readelf', '-d', avc.tpath], stdout=subprocess.PIPE)
 
-    if is_root(path):
+            p2 = subprocess.Popen(["fgrep", "-q", "TEXTREL"], stdin=p1.stdout, stdout=subprocess.PIPE)
 
-        parent = None
+            p1.stdout.close()  # Allow p1 to receive a SIGPIPE if p2 exits.
 
-    else:
+            p1.wait()
 
-        parent = parent_dir(path)
+            p2.wait()
 
+            if p2.returncode == 1:
 
+                return self.report(("unsafe"))
 
-    try:
 
-        all_files = os.listdir(path)
 
-    except OSError as e:
+            mcon = selinux.matchpathcon(avc.tpath.strip('"'), S_IFREG)[1]
 
-        html = jinja.render('error.html',
+            if mcon.split(":")[2] == "lib_t":
 
-                            title="Error while reading directory",
-
-                            url='file:///{}'.format(path), error=str(e))
-
-        return html.encode('UTF-8', errors='xmlcharrefreplace')
-
-
-
-    files = get_file_list(path, all_files, os.path.isfile)
-
-    directories = get_file_list(path, all_files, os.path.isdir)
-
-    html = jinja.render('dirbrowser.html', title=title, url=path,
-
-                        parent=parent, files=files, directories=directories)
-
-    return html.encode('UTF-8', errors='xmlcharrefreplace')
-
-
-
-
-
-def handler(request, _operation, _current_url):
-
-    """Handler for a file:// URL.
-
-
-
-    Args:
-
-        request: QNetworkRequest to answer to.
-
-        _operation: The HTTP operation being done.
-
-        _current_url: The page we're on currently.
-
-
-
-    Return:
-
-        A QNetworkReply for directories, None for files.
-
-    """
-
-    path = request.url().toLocalFile()
-
-    try:
-
-        if os.path.isdir(path):
-
-            data = dirbrowser_html(path)
-
-            return networkreply.FixedDataNetworkReply(
-
-                request, data, 'text/html')
-
-        return None
-
-    except UnicodeEncodeError:
+                return self.report()
 
         return None

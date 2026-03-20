@@ -2,216 +2,444 @@
 # Safety: safe
 # Category: safe
 
-# Copyright 2011 OpenStack LLC.
+# -*- coding: utf-8 -*-
 
-# All Rights Reserved.
+from wagtail.core.models import Page
 
-#
+from wagtail.tests.testapp.models import (
 
-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+    FormField, FormFieldWithCustomSubmission, FormPage, FormPageWithCustomSubmission,
 
-#    not use this file except in compliance with the License. You may obtain
+    FormPageWithRedirect, RedirectFormField)
 
-#    a copy of the License at
 
-#
 
-#         http://www.apache.org/licenses/LICENSE-2.0
 
-#
 
-#    Unless required by applicable law or agreed to in writing, software
+def make_form_page(**kwargs):
 
-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+    kwargs.setdefault('title', "Contact us")
 
-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+    kwargs.setdefault('slug', "contact-us")
 
-#    License for the specific language governing permissions and limitations
+    kwargs.setdefault('to_address', "to@email.com")
 
-#    under the License.
+    kwargs.setdefault('from_address', "from@email.com")
 
+    kwargs.setdefault('subject', "The subject")
 
 
-import json
 
-import stubout
+    home_page = Page.objects.get(url_path='/home/')
 
-import webob
+    form_page = home_page.add_child(instance=FormPage(**kwargs))
 
 
 
-from nova import compute
+    FormField.objects.create(
 
-from nova import context
+        page=form_page,
 
-from nova import test
+        sort_order=1,
 
-from nova.tests.api.openstack import fakes
+        label="Your email",
 
+        field_type='email',
 
+        required=True,
 
+    )
 
+    FormField.objects.create(
 
-last_add_fixed_ip = (None, None)
+        page=form_page,
 
-last_remove_fixed_ip = (None, None)
+        sort_order=2,
 
+        label="Your message",
 
+        field_type='multiline',
 
+        required=True,
 
+        help_text="<em>please</em> be polite"
 
-def compute_api_add_fixed_ip(self, context, instance_id, network_id):
+    )
 
-    global last_add_fixed_ip
+    FormField.objects.create(
 
+        page=form_page,
 
+        sort_order=3,
 
-    last_add_fixed_ip = (instance_id, network_id)
+        label="Your choices",
 
+        field_type='checkboxes',
 
+        required=False,
 
+        choices='foo,bar,baz',
 
+    )
 
-def compute_api_remove_fixed_ip(self, context, instance_id, address):
 
-    global last_remove_fixed_ip
 
+    return form_page
 
 
-    last_remove_fixed_ip = (instance_id, address)
 
 
 
+def make_form_page_with_custom_submission(**kwargs):
 
+    kwargs.setdefault('title', "Contact us")
 
-class FixedIpTest(test.TestCase):
+    kwargs.setdefault('intro', "<p>Boring intro text</p>")
 
-    def setUp(self):
+    kwargs.setdefault('thank_you_text', "<p>Thank you for your patience!</p>")
 
-        super(FixedIpTest, self).setUp()
+    kwargs.setdefault('slug', "contact-us")
 
-        fakes.stub_out_networking(self.stubs)
+    kwargs.setdefault('to_address', "to@email.com")
 
-        fakes.stub_out_rate_limiting(self.stubs)
+    kwargs.setdefault('from_address', "from@email.com")
 
-        self.stubs.Set(compute.api.API, "add_fixed_ip",
+    kwargs.setdefault('subject', "The subject")
 
-                       compute_api_add_fixed_ip)
 
-        self.stubs.Set(compute.api.API, "remove_fixed_ip",
 
-                       compute_api_remove_fixed_ip)
+    home_page = Page.objects.get(url_path='/home/')
 
-        self.context = context.get_admin_context()
+    form_page = home_page.add_child(instance=FormPageWithCustomSubmission(**kwargs))
 
 
 
-    def test_add_fixed_ip(self):
+    FormFieldWithCustomSubmission.objects.create(
 
-        global last_add_fixed_ip
+        page=form_page,
 
-        last_add_fixed_ip = (None, None)
+        sort_order=1,
 
+        label="Your email",
 
+        field_type='email',
 
-        body = dict(addFixedIp=dict(networkId='test_net'))
+        required=True,
 
-        req = webob.Request.blank('/v1.1/fake/servers/test_inst/action')
+    )
 
-        req.method = 'POST'
+    FormFieldWithCustomSubmission.objects.create(
 
-        req.body = json.dumps(body)
+        page=form_page,
 
-        req.headers['content-type'] = 'application/json'
+        sort_order=2,
 
+        label="Your message",
 
+        field_type='multiline',
 
-        resp = req.get_response(fakes.wsgi_app())
+        required=True,
 
-        self.assertEqual(resp.status_int, 202)
+    )
 
-        self.assertEqual(last_add_fixed_ip, ('test_inst', 'test_net'))
+    FormFieldWithCustomSubmission.objects.create(
 
+        page=form_page,
 
+        sort_order=3,
 
-    def test_add_fixed_ip_no_network(self):
+        label="Your choices",
 
-        global last_add_fixed_ip
+        field_type='checkboxes',
 
-        last_add_fixed_ip = (None, None)
+        required=False,
 
+        choices='foo,bar,baz',
 
+    )
 
-        body = dict(addFixedIp=dict())
 
-        req = webob.Request.blank('/v1.1/fake/servers/test_inst/action')
 
-        req.method = 'POST'
+    return form_page
 
-        req.body = json.dumps(body)
 
-        req.headers['content-type'] = 'application/json'
 
 
 
-        resp = req.get_response(fakes.wsgi_app())
+def make_form_page_with_redirect(**kwargs):
 
-        self.assertEqual(resp.status_int, 422)
+    kwargs.setdefault('title', "Contact us")
 
-        self.assertEqual(last_add_fixed_ip, (None, None))
+    kwargs.setdefault('slug', "contact-us")
 
+    kwargs.setdefault('to_address', "to@email.com")
 
+    kwargs.setdefault('from_address', "from@email.com")
 
-    def test_remove_fixed_ip(self):
+    kwargs.setdefault('subject', "The subject")
 
-        global last_remove_fixed_ip
 
-        last_remove_fixed_ip = (None, None)
 
 
 
-        body = dict(removeFixedIp=dict(address='10.10.10.1'))
+    home_page = Page.objects.get(url_path='/home/')
 
-        req = webob.Request.blank('/v1.1/fake/servers/test_inst/action')
+    kwargs.setdefault('thank_you_redirect_page', home_page)
 
-        req.method = 'POST'
+    form_page = home_page.add_child(instance=FormPageWithRedirect(**kwargs))
 
-        req.body = json.dumps(body)
+    # form_page.thank_you_redirect_page = home_page
 
-        req.headers['content-type'] = 'application/json'
 
 
+    RedirectFormField.objects.create(
 
-        resp = req.get_response(fakes.wsgi_app())
+        page=form_page,
 
-        self.assertEqual(resp.status_int, 202)
+        sort_order=1,
 
-        self.assertEqual(last_remove_fixed_ip, ('test_inst', '10.10.10.1'))
+        label="Your email",
 
+        field_type='email',
 
+        required=True,
 
-    def test_remove_fixed_ip_no_address(self):
+    )
 
-        global last_remove_fixed_ip
+    RedirectFormField.objects.create(
 
-        last_remove_fixed_ip = (None, None)
+        page=form_page,
 
+        sort_order=2,
 
+        label="Your message",
 
-        body = dict(removeFixedIp=dict())
+        field_type='multiline',
 
-        req = webob.Request.blank('/v1.1/fake/servers/test_inst/action')
+        required=True,
 
-        req.method = 'POST'
+    )
 
-        req.body = json.dumps(body)
+    RedirectFormField.objects.create(
 
-        req.headers['content-type'] = 'application/json'
+        page=form_page,
 
+        sort_order=3,
 
+        label="Your choices",
 
-        resp = req.get_response(fakes.wsgi_app())
+        field_type='checkboxes',
 
-        self.assertEqual(resp.status_int, 422)
+        required=False,
 
-        self.assertEqual(last_remove_fixed_ip, (None, None))
+        choices='foo,bar,baz',
+
+    )
+
+
+
+    return form_page
+
+
+
+
+
+def make_types_test_form_page(**kwargs):
+
+    kwargs.setdefault('title', "Contact us")
+
+    kwargs.setdefault('slug', "contact-us")
+
+    kwargs.setdefault('to_address', "to@email.com")
+
+    kwargs.setdefault('from_address', "from@email.com")
+
+    kwargs.setdefault('subject', "The subject")
+
+
+
+    home_page = Page.objects.get(url_path='/home/')
+
+    form_page = home_page.add_child(instance=FormPage(**kwargs))
+
+
+
+    FormField.objects.create(
+
+        page=form_page,
+
+        sort_order=1,
+
+        label="Single line text",
+
+        field_type='singleline',
+
+        required=False,
+
+    )
+
+    FormField.objects.create(
+
+        page=form_page,
+
+        sort_order=2,
+
+        label="Multiline",
+
+        field_type='multiline',
+
+        required=False,
+
+    )
+
+    FormField.objects.create(
+
+        page=form_page,
+
+        sort_order=3,
+
+        label="Email",
+
+        field_type='email',
+
+        required=False,
+
+    )
+
+    FormField.objects.create(
+
+        page=form_page,
+
+        sort_order=4,
+
+        label="Number",
+
+        field_type='number',
+
+        required=False,
+
+    )
+
+    FormField.objects.create(
+
+        page=form_page,
+
+        sort_order=5,
+
+        label="URL",
+
+        field_type='url',
+
+        required=False,
+
+    )
+
+    FormField.objects.create(
+
+        page=form_page,
+
+        sort_order=6,
+
+        label="Checkbox",
+
+        field_type='checkbox',
+
+        required=False,
+
+    )
+
+    FormField.objects.create(
+
+        page=form_page,
+
+        sort_order=7,
+
+        label="Checkboxes",
+
+        field_type='checkboxes',
+
+        required=False,
+
+        choices='foo,bar,baz',
+
+    )
+
+    FormField.objects.create(
+
+        page=form_page,
+
+        sort_order=8,
+
+        label="Drop down",
+
+        field_type='dropdown',
+
+        required=False,
+
+        choices='spam,ham,eggs',
+
+    )
+
+    FormField.objects.create(
+
+        page=form_page,
+
+        sort_order=9,
+
+        label="Multiple select",
+
+        field_type='multiselect',
+
+        required=False,
+
+        choices='qux,quux,quuz,corge',
+
+    )
+
+    FormField.objects.create(
+
+        page=form_page,
+
+        sort_order=10,
+
+        label="Radio buttons",
+
+        field_type='radio',
+
+        required=False,
+
+        choices='wibble,wobble,wubble',
+
+    )
+
+    FormField.objects.create(
+
+        page=form_page,
+
+        sort_order=11,
+
+        label="Date",
+
+        field_type='date',
+
+        required=False,
+
+    )
+
+    FormField.objects.create(
+
+        page=form_page,
+
+        sort_order=12,
+
+        label="Datetime",
+
+        field_type='datetime',
+
+        required=False,
+
+    )
+
+
+
+    return form_page

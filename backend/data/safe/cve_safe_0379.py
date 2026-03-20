@@ -6,290 +6,282 @@
 
 
 
-# Copyright 2012 OpenStack LLC
+# Copyright 2011 Isaku Yamahata
+
+# All Rights Reserved.
 
 #
 
-# Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
 
-# not use this file except in compliance with the License. You may obtain
+#    not use this file except in compliance with the License. You may obtain
 
-# a copy of the License at
-
-#
-
-#      http://www.apache.org/licenses/LICENSE-2.0
+#    a copy of the License at
 
 #
 
-# Unless required by applicable law or agreed to in writing, software
+#         http://www.apache.org/licenses/LICENSE-2.0
 
-# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#
 
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    Unless required by applicable law or agreed to in writing, software
 
-# License for the specific language governing permissions and limitations
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-# under the License.
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
-import re
+#    License for the specific language governing permissions and limitations
 
+#    under the License.
 
 
 
+import os
 
-class Error(StandardError):
 
-    """Base error class.
 
+from nova import context
 
+import nova.db.api
 
-    Child classes should define an HTTP status code, title, and a doc string.
+from nova import exception
 
+from nova import test
 
+from nova.image import s3
 
-    """
 
-    code = None
 
-    title = None
 
 
+ami_manifest_xml = """<?xml version="1.0" ?>
 
-    def __init__(self, message=None, **kwargs):
+<manifest>
 
-        """Use the doc string as the error message by default."""
+        <version>2011-06-17</version>
 
-        message = message or self.__doc__ % kwargs
+        <bundler>
 
-        super(Error, self).__init__(message)
+                <name>test-s3</name>
 
+                <version>0</version>
 
+                <release>0</release>
 
-    def __str__(self):
+        </bundler>
 
-        """Cleans up line breaks and indentation from doc strings."""
+        <machine_configuration>
 
-        string = super(Error, self).__str__()
+                <architecture>x86_64</architecture>
 
-        string = re.sub('[ \n]+', ' ', string)
+                <block_device_mapping>
 
-        string = string.strip()
+                        <mapping>
 
-        return string
+                                <virtual>ami</virtual>
 
+                                <device>sda1</device>
 
+                        </mapping>
 
+                        <mapping>
 
+                                <virtual>root</virtual>
 
-class ValidationError(Error):
+                                <device>/dev/sda1</device>
 
-    """Expecting to find %(attribute)s in %(target)s.
+                        </mapping>
 
+                        <mapping>
 
+                                <virtual>ephemeral0</virtual>
 
-    The server could not comply with the request since it is either malformed
+                                <device>sda2</device>
 
-    or otherwise incorrect.
+                        </mapping>
 
+                        <mapping>
 
+                                <virtual>swap</virtual>
 
-    The client is assumed to be in error.
+                                <device>sda3</device>
 
+                        </mapping>
 
+                </block_device_mapping>
 
-    """
+                <kernel_id>aki-00000001</kernel_id>
 
-    code = 400
+                <ramdisk_id>ari-00000001</ramdisk_id>
 
-    title = 'Bad Request'
+        </machine_configuration>
 
+</manifest>
 
+"""
 
 
 
-class ValidationSizeError(Error):
 
-    """Request attribute %(attribute)s must be less than or equal to %(size)i.
 
+class TestS3ImageService(test.TestCase):
 
+    def setUp(self):
 
-    The server could not comply with the request because the attribute
+        super(TestS3ImageService, self).setUp()
 
-    size is invalid (too large).
+        self.flags(image_service='nova.image.fake.FakeImageService')
 
+        self.image_service = s3.S3ImageService()
 
+        self.context = context.RequestContext(None, None)
 
-    The client is assumed to be in error.
 
 
+        # set up one fixture to test shows, should have id '1'
 
-    """
+        nova.db.api.s3_image_create(self.context,
 
-    code = 400
+                                    '155d900f-4e14-4e4c-a73d-069cbf4541e6')
 
-    title = 'Bad Request'
 
 
+    def _assertEqualList(self, list0, list1, keys):
 
+        self.assertEqual(len(list0), len(list1))
 
+        key = keys[0]
 
-class Unauthorized(Error):
+        for x in list0:
 
-    """The request you have made requires authentication."""
+            self.assertEqual(len(x), len(keys))
 
-    code = 401
+            self.assertTrue(key in x)
 
-    title = 'Not Authorized'
+            for y in list1:
 
+                self.assertTrue(key in y)
 
+                if x[key] == y[key]:
 
+                    for k in keys:
 
+                        self.assertEqual(x[k], y[k])
 
-class Forbidden(Error):
 
-    """You are not authorized to perform the requested action."""
 
-    code = 403
+    def test_show_cannot_use_uuid(self):
 
-    title = 'Not Authorized'
+        self.assertRaises(exception.ImageNotFound,
 
+                          self.image_service.show, self.context,
 
+                          '155d900f-4e14-4e4c-a73d-069cbf4541e6')
 
 
 
-class ForbiddenAction(Forbidden):
+    def test_show_translates_correctly(self):
 
-    """You are not authorized to perform the requested action: %(action)s"""
+        self.image_service.show(self.context, '1')
 
 
 
+    def test_detail(self):
 
+        self.image_service.detail(self.context)
 
-class NotFound(Error):
 
-    """Could not find: %(target)s"""
 
-    code = 404
+    def test_s3_create(self):
 
-    title = 'Not Found'
+        metadata = {'properties': {
 
+            'root_device_name': '/dev/sda1',
 
+            'block_device_mapping': [
 
+                {'device_name': '/dev/sda1',
 
+                 'snapshot_id': 'snap-12345678',
 
-class EndpointNotFound(NotFound):
+                 'delete_on_termination': True},
 
-    """Could not find endpoint: %(endpoint_id)s"""
+                {'device_name': '/dev/sda2',
 
+                 'virutal_name': 'ephemeral0'},
 
+                {'device_name': '/dev/sdb0',
 
+                 'no_device': True}]}}
 
+        _manifest, image, image_uuid = self.image_service._s3_parse_manifest(
 
-class MetadataNotFound(NotFound):
+            self.context, metadata, ami_manifest_xml)
 
-    """An unhandled exception has occurred: Could not find metadata."""
 
-    # (dolph): metadata is not a user-facing concept,
 
-    #          so this exception should not be exposed
+        ret_image = self.image_service.show(self.context, image['id'])
 
+        self.assertTrue('properties' in ret_image)
 
+        properties = ret_image['properties']
 
 
 
-class RoleNotFound(NotFound):
+        self.assertTrue('mappings' in properties)
 
-    """Could not find role: %(role_id)s"""
+        mappings = properties['mappings']
 
+        expected_mappings = [
 
+            {"device": "sda1", "virtual": "ami"},
 
+            {"device": "/dev/sda1", "virtual": "root"},
 
+            {"device": "sda2", "virtual": "ephemeral0"},
 
-class ServiceNotFound(NotFound):
+            {"device": "sda3", "virtual": "swap"}]
 
-    """Could not find service: %(service_id)s"""
+        self._assertEqualList(mappings, expected_mappings,
 
+            ['device', 'virtual'])
 
 
 
+        self.assertTrue('block_device_mapping', properties)
 
-class TenantNotFound(NotFound):
+        block_device_mapping = properties['block_device_mapping']
 
-    """Could not find tenant: %(tenant_id)s"""
+        expected_bdm = [
 
+            {'device_name': '/dev/sda1',
 
+             'snapshot_id': 'snap-12345678',
 
+             'delete_on_termination': True},
 
+            {'device_name': '/dev/sda2',
 
-class TokenNotFound(NotFound):
+             'virutal_name': 'ephemeral0'},
 
-    """Could not find token: %(token_id)s"""
+            {'device_name': '/dev/sdb0',
 
+             'no_device': True}]
 
+        self.assertEqual(block_device_mapping, expected_bdm)
 
 
 
-class UserNotFound(NotFound):
+    def test_s3_malicious_tarballs(self):
 
-    """Could not find user: %(user_id)s"""
+        self.assertRaises(exception.Error,
 
+            self.image_service._test_for_malicious_tarball,
 
+            "/unused", os.path.join(os.path.dirname(__file__), 'abs.tar.gz'))
 
+        self.assertRaises(exception.Error,
 
+            self.image_service._test_for_malicious_tarball,
 
-class Conflict(Error):
-
-    """Conflict occurred attempting to store %(type)s.
-
-
-
-    %(details)s
-
-
-
-    """
-
-    code = 409
-
-    title = 'Conflict'
-
-
-
-
-
-class UnexpectedError(Error):
-
-    """An unexpected error prevented the server from fulfilling your request.
-
-
-
-    %(exception)s
-
-
-
-    """
-
-    code = 500
-
-    title = 'Internal Server Error'
-
-
-
-
-
-class MalformedEndpoint(UnexpectedError):
-
-    """Malformed endpoint URL (see ERROR log for details): %(endpoint)s"""
-
-
-
-
-
-class NotImplemented(Error):
-
-    """The action you have requested has not been implemented."""
-
-    code = 501
-
-    title = 'Not Implemented'
+            "/unused", os.path.join(os.path.dirname(__file__), 'rel.tar.gz'))

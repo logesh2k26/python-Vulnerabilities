@@ -2,242 +2,550 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-from typing import Any, List
+# -*- coding: utf-8 -*-
 
+# Copyright 2019 The Matrix.org Foundation C.I.C.
 
+#
 
-import bleach
+# Licensed under the Apache License, Version 2.0 (the "License");
 
+# you may not use this file except in compliance with the License.
 
+# You may obtain a copy of the License at
 
-from .rest_api import ValidationError
+#
 
+#     http://www.apache.org/licenses/LICENSE-2.0
 
+#
 
+# Unless required by applicable law or agreed to in writing, software
 
+# distributed under the License is distributed on an "AS IS" BASIS,
 
-allowed_tags_strict = [
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 
-    "a",
+# See the License for the specific language governing permissions and
 
-    "img",  # links and images
+# limitations under the License.
 
-    "br",
+import logging
 
-    "p",
+from unittest import TestCase
 
-    "span",
 
-    "blockquote",  # text layout
 
-    "strike",
+from synapse.api.constants import EventTypes
 
-    "del",
+from synapse.api.errors import AuthError, Codes, SynapseError
 
-    "ins",
+from synapse.api.room_versions import RoomVersions
 
-    "strong",
+from synapse.events import EventBase
 
-    "u",
+from synapse.federation.federation_base import event_from_pdu_json
 
-    "em",
+from synapse.logging.context import LoggingContext, run_in_background
 
-    "sup",
+from synapse.rest import admin
 
-    "sub",
+from synapse.rest.client.v1 import login, room
 
-    "pre",  # text formatting
 
-    "h1",
 
-    "h2",
+from tests import unittest
 
-    "h3",
 
-    "h4",
 
-    "h5",
+logger = logging.getLogger(__name__)
 
-    "h6",  # headings
 
-    "ol",
 
-    "ul",
 
-    "li",  # lists
 
-    "table",
+class FederationTestCase(unittest.HomeserverTestCase):
 
-    "caption",
+    servlets = [
 
-    "thead",
+        admin.register_servlets,
 
-    "tbody",
+        login.register_servlets,
 
-    "th",
+        room.register_servlets,
 
-    "tr",
+    ]
 
-    "td",  # tables
 
-    "div",
 
-]
+    def make_homeserver(self, reactor, clock):
 
-allowed_tags_permissive = allowed_tags_strict + [
+        hs = self.setup_test_homeserver(http_client=None)
 
-    "video",
+        self.handler = hs.get_federation_handler()
 
-]
+        self.store = hs.get_datastore()
 
+        return hs
 
 
 
+    def test_exchange_revoked_invite(self):
 
-def allow_all(tag: str, name: str, value: str) -> bool:
+        user_id = self.register_user("kermit", "test")
 
-    return True
+        tok = self.login("kermit", "test")
 
 
 
+        room_id = self.helper.create_room_as(room_creator=user_id, tok=tok)
 
 
-allowed_attributes = allow_all
 
-allowed_styles = [
+        # Send a 3PID invite event with an empty body so it's considered as a revoked one.
 
-    "color",
+        invite_token = "sometoken"
 
-    "background-color",
+        self.helper.send_state(
 
-    "height",
+            room_id=room_id,
 
-    "width",
+            event_type=EventTypes.ThirdPartyInvite,
 
-    "text-align",
+            state_key=invite_token,
 
-    "vertical-align",
+            body={},
 
-    "float",
+            tok=tok,
 
-    "text-decoration",
+        )
 
-    "margin",
 
-    "padding",
 
-    "line-height",
+        d = self.handler.on_exchange_third_party_invite_request(
 
-    "max-width",
+            room_id=room_id,
 
-    "min-width",
+            event_dict={
 
-    "max-height",
+                "type": EventTypes.Member,
 
-    "min-height",
+                "room_id": room_id,
 
-    "overflow",
+                "sender": user_id,
 
-    "word-break",
+                "state_key": "@someone:example.org",
 
-    "word-wrap",
+                "content": {
 
-]
+                    "membership": "invite",
 
+                    "third_party_invite": {
 
+                        "display_name": "alice",
 
+                        "signed": {
 
+                            "mxid": "@alice:localhost",
 
-def validate_html_strict(html: str) -> str:
+                            "token": invite_token,
 
-    """
+                            "signatures": {
 
-    This method takes a string and escapes all non-whitelisted html entries.
+                                "magic.forest": {
 
-    Every field of a model that is loaded trusted in the DOM should be validated.
+                                    "ed25519:3": "fQpGIW1Snz+pwLZu6sTy2aHy/DYWWTspTJRPyNp0PKkymfIsNffysMl6ObMMFdIJhk6g6pwlIqZ54rxo8SLmAg"
 
-    During copy and paste from Word maybe some tabs are spread over the html. Remove them.
+                                }
 
-    """
+                            },
 
-    return base_validate_html(html, allowed_tags_strict)
+                        },
 
+                    },
 
+                },
 
+            },
 
+        )
 
-def validate_html_permissive(html: str) -> str:
 
-    """
 
-    See validate_html_strict, but allows some more tags, like iframes and videos.
+        failure = self.get_failure(d, AuthError).value
 
-    Do not use on validation for normal users, only for admins!
 
-    """
 
-    return base_validate_html(html, allowed_tags_permissive)
+        self.assertEqual(failure.code, 403, failure)
 
+        self.assertEqual(failure.errcode, Codes.FORBIDDEN, failure)
 
+        self.assertEqual(failure.msg, "You are not invited to this room.")
 
 
 
-def base_validate_html(html: str, allowed_tags: List[str]) -> str:
+    def test_rejected_message_event_state(self):
 
-    """
+        """
 
-    For internal use only.
+        Check that we store the state group correctly for rejected non-state events.
 
-    """
 
-    html = html.replace("\t", "")
 
-    return bleach.clean(
+        Regression test for #6289.
 
-        html, tags=allowed_tags, attributes=allowed_attributes, styles=allowed_styles
+        """
 
-    )
+        OTHER_SERVER = "otherserver"
 
+        OTHER_USER = "@otheruser:" + OTHER_SERVER
 
 
 
+        # create the room
 
-def validate_json(json: Any, max_depth: int) -> Any:
+        user_id = self.register_user("kermit", "test")
 
-    """
+        tok = self.login("kermit", "test")
 
-    Traverses through the JSON structure (dicts and lists) and runs
+        room_id = self.helper.create_room_as(room_creator=user_id, tok=tok)
 
-    validate_html_strict on every found string.
+        room_version = self.get_success(self.store.get_room_version(room_id))
 
 
 
-    Give max-depth to protect against stack-overflows. This should be the
+        # pretend that another server has joined
 
-    maximum nested depth of the object expected.
+        join_event = self._build_and_send_join_event(OTHER_SERVER, OTHER_USER, room_id)
 
-    """
 
 
+        # check the state group
 
-    if max_depth == 0:
+        sg = self.successResultOf(
 
-        raise ValidationError({"detail": "The JSON is too nested."})
+            self.store._get_state_group_for_event(join_event.event_id)
 
+        )
 
 
-    if isinstance(json, dict):
 
-        return {key: validate_json(value, max_depth - 1) for key, value in json.items()}
+        # build and send an event which will be rejected
 
-    if isinstance(json, list):
+        ev = event_from_pdu_json(
 
-        return [validate_json(item, max_depth - 1) for item in json]
+            {
 
-    if isinstance(json, str):
+                "type": EventTypes.Message,
 
-        return validate_html_strict(json)
+                "content": {},
 
+                "room_id": room_id,
 
+                "sender": "@yetanotheruser:" + OTHER_SERVER,
 
-    return json
+                "depth": join_event["depth"] + 1,
+
+                "prev_events": [join_event.event_id],
+
+                "auth_events": [],
+
+                "origin_server_ts": self.clock.time_msec(),
+
+            },
+
+            room_version,
+
+        )
+
+
+
+        with LoggingContext(request="send_rejected"):
+
+            d = run_in_background(self.handler.on_receive_pdu, OTHER_SERVER, ev)
+
+        self.get_success(d)
+
+
+
+        # that should have been rejected
+
+        e = self.get_success(self.store.get_event(ev.event_id, allow_rejected=True))
+
+        self.assertIsNotNone(e.rejected_reason)
+
+
+
+        # ... and the state group should be the same as before
+
+        sg2 = self.successResultOf(self.store._get_state_group_for_event(ev.event_id))
+
+
+
+        self.assertEqual(sg, sg2)
+
+
+
+    def test_rejected_state_event_state(self):
+
+        """
+
+        Check that we store the state group correctly for rejected state events.
+
+
+
+        Regression test for #6289.
+
+        """
+
+        OTHER_SERVER = "otherserver"
+
+        OTHER_USER = "@otheruser:" + OTHER_SERVER
+
+
+
+        # create the room
+
+        user_id = self.register_user("kermit", "test")
+
+        tok = self.login("kermit", "test")
+
+        room_id = self.helper.create_room_as(room_creator=user_id, tok=tok)
+
+        room_version = self.get_success(self.store.get_room_version(room_id))
+
+
+
+        # pretend that another server has joined
+
+        join_event = self._build_and_send_join_event(OTHER_SERVER, OTHER_USER, room_id)
+
+
+
+        # check the state group
+
+        sg = self.successResultOf(
+
+            self.store._get_state_group_for_event(join_event.event_id)
+
+        )
+
+
+
+        # build and send an event which will be rejected
+
+        ev = event_from_pdu_json(
+
+            {
+
+                "type": "org.matrix.test",
+
+                "state_key": "test_key",
+
+                "content": {},
+
+                "room_id": room_id,
+
+                "sender": "@yetanotheruser:" + OTHER_SERVER,
+
+                "depth": join_event["depth"] + 1,
+
+                "prev_events": [join_event.event_id],
+
+                "auth_events": [],
+
+                "origin_server_ts": self.clock.time_msec(),
+
+            },
+
+            room_version,
+
+        )
+
+
+
+        with LoggingContext(request="send_rejected"):
+
+            d = run_in_background(self.handler.on_receive_pdu, OTHER_SERVER, ev)
+
+        self.get_success(d)
+
+
+
+        # that should have been rejected
+
+        e = self.get_success(self.store.get_event(ev.event_id, allow_rejected=True))
+
+        self.assertIsNotNone(e.rejected_reason)
+
+
+
+        # ... and the state group should be the same as before
+
+        sg2 = self.successResultOf(self.store._get_state_group_for_event(ev.event_id))
+
+
+
+        self.assertEqual(sg, sg2)
+
+
+
+    def _build_and_send_join_event(self, other_server, other_user, room_id):
+
+        join_event = self.get_success(
+
+            self.handler.on_make_join_request(other_server, room_id, other_user)
+
+        )
+
+        # the auth code requires that a signature exists, but doesn't check that
+
+        # signature... go figure.
+
+        join_event.signatures[other_server] = {"x": "y"}
+
+        with LoggingContext(request="send_join"):
+
+            d = run_in_background(
+
+                self.handler.on_send_join_request, other_server, join_event
+
+            )
+
+        self.get_success(d)
+
+
+
+        # sanity-check: the room should show that the new user is a member
+
+        r = self.get_success(self.store.get_current_state_ids(room_id))
+
+        self.assertEqual(r[(EventTypes.Member, other_user)], join_event.event_id)
+
+
+
+        return join_event
+
+
+
+
+
+class EventFromPduTestCase(TestCase):
+
+    def test_valid_json(self):
+
+        """Valid JSON should be turned into an event."""
+
+        ev = event_from_pdu_json(
+
+            {
+
+                "type": EventTypes.Message,
+
+                "content": {"bool": True, "null": None, "int": 1, "str": "foobar"},
+
+                "room_id": "!room:test",
+
+                "sender": "@user:test",
+
+                "depth": 1,
+
+                "prev_events": [],
+
+                "auth_events": [],
+
+                "origin_server_ts": 1234,
+
+            },
+
+            RoomVersions.V6,
+
+        )
+
+
+
+        self.assertIsInstance(ev, EventBase)
+
+
+
+    def test_invalid_numbers(self):
+
+        """Invalid values for an integer should be rejected, all floats should be rejected."""
+
+        for value in [
+
+            -(2 ** 53),
+
+            2 ** 53,
+
+            1.0,
+
+            float("inf"),
+
+            float("-inf"),
+
+            float("nan"),
+
+        ]:
+
+            with self.assertRaises(SynapseError):
+
+                event_from_pdu_json(
+
+                    {
+
+                        "type": EventTypes.Message,
+
+                        "content": {"foo": value},
+
+                        "room_id": "!room:test",
+
+                        "sender": "@user:test",
+
+                        "depth": 1,
+
+                        "prev_events": [],
+
+                        "auth_events": [],
+
+                        "origin_server_ts": 1234,
+
+                    },
+
+                    RoomVersions.V6,
+
+                )
+
+
+
+    def test_invalid_nested(self):
+
+        """List and dictionaries are recursively searched."""
+
+        with self.assertRaises(SynapseError):
+
+            event_from_pdu_json(
+
+                {
+
+                    "type": EventTypes.Message,
+
+                    "content": {"foo": [{"bar": 2 ** 56}]},
+
+                    "room_id": "!room:test",
+
+                    "sender": "@user:test",
+
+                    "depth": 1,
+
+                    "prev_events": [],
+
+                    "auth_events": [],
+
+                    "origin_server_ts": 1234,
+
+                },
+
+                RoomVersions.V6,
+
+            )

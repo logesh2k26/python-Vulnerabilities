@@ -2,2274 +2,4768 @@
 # Safety: safe
 # Category: safe
 
-# vim: ft=python fileencoding=utf-8 sts=4 sw=4 et:
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
 
 
 
-# Copyright 2016-2019 Florian Bruhin (The Compiler) <mail@qutebrowser.org>
-
-#
-
-# This file is part of qutebrowser.
+#    Copyright (c) 2010 Citrix Systems, Inc.
 
 #
 
-# qutebrowser is free software: you can redistribute it and/or modify
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
 
-# it under the terms of the GNU General Public License as published by
+#    not use this file except in compliance with the License. You may obtain
 
-# the Free Software Foundation, either version 3 of the License, or
-
-# (at your option) any later version.
+#    a copy of the License at
 
 #
 
-# qutebrowser is distributed in the hope that it will be useful,
-
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-
-# GNU General Public License for more details.
+#         http://www.apache.org/licenses/LICENSE-2.0
 
 #
 
-# You should have received a copy of the GNU General Public License
+#    Unless required by applicable law or agreed to in writing, software
 
-# along with qutebrowser.  If not, see <http://www.gnu.org/licenses/>.
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
+#    License for the specific language governing permissions and limitations
 
-"""Base class for a wrapper over QWebView/QWebEngineView."""
-
-
-
-import enum
-
-import itertools
-
-import typing
+#    under the License.
 
 
 
-import attr
-
-from PyQt5.QtCore import (pyqtSignal, pyqtSlot, QUrl, QObject, QSizeF, Qt,
-
-                          QEvent, QPoint)
-
-from PyQt5.QtGui import QKeyEvent, QIcon
-
-from PyQt5.QtWidgets import QWidget, QApplication, QDialog
-
-from PyQt5.QtPrintSupport import QPrintDialog, QPrinter
-
-from PyQt5.QtNetwork import QNetworkAccessManager
+"""Test suite for XenAPI."""
 
 
 
-import pygments
+import ast
 
-import pygments.lexers
+import contextlib
 
-import pygments.formatters
+import cPickle as pickle
 
+import functools
 
+import os
 
-from qutebrowser.keyinput import modeman
-
-from qutebrowser.config import config
-
-from qutebrowser.utils import (utils, objreg, usertypes, log, qtutils,
-
-                               urlutils, message)
-
-from qutebrowser.misc import miscwidgets, objects
-
-from qutebrowser.browser import mouse, hints
-
-from qutebrowser.qt import sip
-
-MYPY = False
-
-if MYPY:
-
-    # pylint can't interpret type comments with Python 3.7
-
-    # pylint: disable=unused-import,useless-suppression
-
-    from qutebrowser.browser import webelem
-
-    from qutebrowser.browser.inspector import AbstractWebInspector
+import re
 
 
 
+from nova.compute import api as compute_api
+
+from nova.compute import instance_types
+
+from nova.compute import power_state
+
+from nova import context
+
+from nova import db
+
+from nova import exception
+
+from nova import flags
+
+from nova.openstack.common import importutils
+
+from nova.openstack.common import jsonutils
+
+from nova.openstack.common import log as logging
+
+from nova.openstack.common import timeutils
+
+from nova import test
+
+from nova.tests.db import fakes as db_fakes
+
+from nova.tests import fake_network
+
+from nova.tests import fake_utils
+
+import nova.tests.image.fake as fake_image
+
+from nova.tests.xenapi import stubs
+
+from nova.virt.xenapi import agent
+
+from nova.virt.xenapi import driver as xenapi_conn
+
+from nova.virt.xenapi import fake as xenapi_fake
+
+from nova.virt.xenapi import pool_states
+
+from nova.virt.xenapi import vm_utils
+
+from nova.virt.xenapi import vmops
+
+from nova.virt.xenapi import volume_utils
 
 
-tab_id_gen = itertools.count(0)
+
+
+
+LOG = logging.getLogger(__name__)
+
+
+
+FLAGS = flags.FLAGS
+
+
+
+IMAGE_MACHINE = '1'
+
+IMAGE_KERNEL = '2'
+
+IMAGE_RAMDISK = '3'
+
+IMAGE_RAW = '4'
+
+IMAGE_VHD = '5'
+
+IMAGE_ISO = '6'
+
+
+
+IMAGE_FIXTURES = {
+
+    IMAGE_MACHINE: {
+
+        'image_meta': {'name': 'fakemachine', 'size': 0,
+
+                       'disk_format': 'ami',
+
+                       'container_format': 'ami'},
+
+    },
+
+    IMAGE_KERNEL: {
+
+        'image_meta': {'name': 'fakekernel', 'size': 0,
+
+                       'disk_format': 'aki',
+
+                       'container_format': 'aki'},
+
+    },
+
+    IMAGE_RAMDISK: {
+
+        'image_meta': {'name': 'fakeramdisk', 'size': 0,
+
+                       'disk_format': 'ari',
+
+                       'container_format': 'ari'},
+
+    },
+
+    IMAGE_RAW: {
+
+        'image_meta': {'name': 'fakeraw', 'size': 0,
+
+                       'disk_format': 'raw',
+
+                       'container_format': 'bare'},
+
+    },
+
+    IMAGE_VHD: {
+
+        'image_meta': {'name': 'fakevhd', 'size': 0,
+
+                       'disk_format': 'vhd',
+
+                       'container_format': 'ovf'},
+
+    },
+
+    IMAGE_ISO: {
+
+        'image_meta': {'name': 'fakeiso', 'size': 0,
+
+                       'disk_format': 'iso',
+
+                       'container_format': 'bare'},
+
+    },
+
+}
 
 
 
 
 
-def create(win_id: int,
+def set_image_fixtures():
 
-           private: bool,
+    image_service = fake_image.FakeImageService()
 
-           parent: QWidget = None) -> 'AbstractTab':
+    image_service.images.clear()
 
-    """Get a QtWebKit/QtWebEngine tab object.
+    for image_id, image_meta in IMAGE_FIXTURES.items():
+
+        image_meta = image_meta['image_meta']
+
+        image_meta['id'] = image_id
+
+        image_service.create(None, image_meta)
 
 
 
-    Args:
 
-        win_id: The window ID where the tab will be shown.
 
-        private: Whether the tab is a private/off the record tab.
-
-        parent: The Qt parent to set.
+def stub_vm_utils_with_vdi_attached_here(function, should_return=True):
 
     """
 
-    # Importing modules here so we don't depend on QtWebEngine without the
+    vm_utils.with_vdi_attached_here needs to be stubbed out because it
 
-    # argument and to avoid circular imports.
+    calls down to the filesystem to attach a vdi. This provides a
 
-    mode_manager = modeman.instance(win_id)
-
-    if objects.backend == usertypes.Backend.QtWebEngine:
-
-        from qutebrowser.browser.webengine import webenginetab
-
-        tab_class = webenginetab.WebEngineTab
-
-    else:
-
-        from qutebrowser.browser.webkit import webkittab
-
-        tab_class = webkittab.WebKitTab
-
-    return tab_class(win_id=win_id, mode_manager=mode_manager, private=private,
-
-                     parent=parent)
-
-
-
-
-
-def init() -> None:
-
-    """Initialize backend-specific modules."""
-
-    if objects.backend == usertypes.Backend.QtWebEngine:
-
-        from qutebrowser.browser.webengine import webenginetab
-
-        webenginetab.init()
-
-
-
-
-
-class WebTabError(Exception):
-
-
-
-    """Base class for various errors."""
-
-
-
-
-
-class UnsupportedOperationError(WebTabError):
-
-
-
-    """Raised when an operation is not supported with the given backend."""
-
-
-
-
-
-TerminationStatus = enum.Enum('TerminationStatus', [
-
-    'normal',
-
-    'abnormal',  # non-zero exit status
-
-    'crashed',   # e.g. segfault
-
-    'killed',
-
-    'unknown',
-
-])
-
-
-
-
-
-@attr.s
-
-class TabData:
-
-
-
-    """A simple namespace with a fixed set of attributes.
-
-
-
-    Attributes:
-
-        keep_icon: Whether the (e.g. cloned) icon should not be cleared on page
-
-                   load.
-
-        inspector: The QWebInspector used for this webview.
-
-        viewing_source: Set if we're currently showing a source view.
-
-                        Only used when sources are shown via pygments.
-
-        open_target: Where to open the next link.
-
-                     Only used for QtWebKit.
-
-        override_target: Override for open_target for fake clicks (like hints).
-
-                         Only used for QtWebKit.
-
-        pinned: Flag to pin the tab.
-
-        fullscreen: Whether the tab has a video shown fullscreen currently.
-
-        netrc_used: Whether netrc authentication was performed.
-
-        input_mode: current input mode for the tab.
+    decorator to handle that.
 
     """
 
+    @functools.wraps(function)
 
+    def decorated_function(self, *args, **kwargs):
 
-    keep_icon = attr.ib(False)  # type: bool
+        @contextlib.contextmanager
 
-    viewing_source = attr.ib(False)  # type: bool
+        def fake_vdi_attached_here(*args, **kwargs):
 
-    inspector = attr.ib(None)  # type: typing.Optional[AbstractWebInspector]
+            fake_dev = 'fakedev'
 
-    open_target = attr.ib(
+            yield fake_dev
 
-        usertypes.ClickTarget.normal)  # type: usertypes.ClickTarget
 
-    override_target = attr.ib(None)  # type: usertypes.ClickTarget
 
-    pinned = attr.ib(False)  # type: bool
+        def fake_image_download(*args, **kwargs):
 
-    fullscreen = attr.ib(False)  # type: bool
+            pass
 
-    netrc_used = attr.ib(False)  # type: bool
 
-    input_mode = attr.ib(usertypes.KeyMode.normal)  # type: usertypes.KeyMode
 
+        def fake_is_vdi_pv(*args, **kwargs):
 
+            return should_return
 
-    def should_show_icon(self) -> bool:
 
-        return (config.val.tabs.favicons.show == 'always' or
 
-                config.val.tabs.favicons.show == 'pinned' and self.pinned)
+        orig_vdi_attached_here = vm_utils.vdi_attached_here
 
+        orig_image_download = fake_image._FakeImageService.download
 
+        orig_is_vdi_pv = vm_utils._is_vdi_pv
 
+        try:
 
+            vm_utils.vdi_attached_here = fake_vdi_attached_here
 
-class AbstractAction:
+            fake_image._FakeImageService.download = fake_image_download
 
+            vm_utils._is_vdi_pv = fake_is_vdi_pv
 
+            return function(self, *args, **kwargs)
 
-    """Attribute ``action`` of AbstractTab for Qt WebActions."""
+        finally:
 
+            vm_utils._is_vdi_pv = orig_is_vdi_pv
 
+            fake_image._FakeImageService.download = orig_image_download
 
-    # The class actions are defined on (QWeb{Engine,}Page)
+            vm_utils.vdi_attached_here = orig_vdi_attached_here
 
-    action_class = None  # type: type
 
-    # The type of the actions (QWeb{Engine,}Page.WebAction)
 
-    action_base = None  # type: type
+    return decorated_function
 
 
 
-    def __init__(self, tab: 'AbstractTab') -> None:
 
-        self._widget = typing.cast(QWidget, None)
 
-        self._tab = tab
+class XenAPIVolumeTestCase(stubs.XenAPITestBase):
 
+    """Unit tests for Volume operations."""
 
+    def setUp(self):
 
-    def exit_fullscreen(self) -> None:
+        super(XenAPIVolumeTestCase, self).setUp()
 
-        """Exit the fullscreen mode."""
+        self.user_id = 'fake'
 
-        raise NotImplementedError
+        self.project_id = 'fake'
 
+        self.context = context.RequestContext(self.user_id, self.project_id)
 
+        self.flags(xenapi_connection_url='test_url',
 
-    def save_page(self) -> None:
+                   xenapi_connection_password='test_pass',
 
-        """Save the current page."""
+                   firewall_driver='nova.virt.xenapi.firewall.'
 
-        raise NotImplementedError
+                                   'Dom0IptablesFirewallDriver')
 
+        db_fakes.stub_out_db_instance_api(self.stubs)
 
+        self.instance_values = {'id': 1,
 
-    def run_string(self, name: str) -> None:
+                  'project_id': self.user_id,
 
-        """Run a webaction based on its name."""
+                  'user_id': 'fake',
 
-        member = getattr(self.action_class, name, None)
+                  'image_ref': 1,
 
-        if not isinstance(member, self.action_base):
+                  'kernel_id': 2,
 
-            raise WebTabError("{} is not a valid web action!".format(name))
+                  'ramdisk_id': 3,
 
-        self._widget.triggerPageAction(member)
+                  'root_gb': 20,
 
+                  'instance_type_id': '3',  # m1.large
 
+                  'os_type': 'linux',
 
-    def show_source(
+                  'architecture': 'x86-64'}
 
-            self,
 
-            pygments: bool = False  # pylint: disable=redefined-outer-name
 
-    ) -> None:
+    def _create_volume(self, size=0):
 
-        """Show the source of the current page in a new tab."""
+        """Create a volume object."""
 
-        raise NotImplementedError
+        vol = {}
 
+        vol['size'] = size
 
+        vol['user_id'] = 'fake'
 
-    def _show_source_pygments(self) -> None:
+        vol['project_id'] = 'fake'
 
+        vol['host'] = 'localhost'
 
+        vol['availability_zone'] = FLAGS.storage_availability_zone
 
-        def show_source_cb(source: str) -> None:
+        vol['status'] = "creating"
 
-            """Show source as soon as it's ready."""
+        vol['attach_status'] = "detached"
 
-            # WORKAROUND for https://github.com/PyCQA/pylint/issues/491
+        return db.volume_create(self.context, vol)
 
-            # pylint: disable=no-member
 
-            lexer = pygments.lexers.HtmlLexer()
 
-            formatter = pygments.formatters.HtmlFormatter(
+    @staticmethod
 
-                full=True, linenos='table')
+    def _make_info():
 
-            # pylint: enable=no-member
+        return {
 
-            highlighted = pygments.highlight(source, lexer, formatter)
+            'driver_volume_type': 'iscsi',
 
+            'data': {
 
+                'volume_id': 1,
 
-            tb = objreg.get('tabbed-browser', scope='window',
+                'target_iqn': 'iqn.2010-10.org.openstack:volume-00000001',
 
-                            window=self._tab.win_id)
+                'target_portal': '127.0.0.1:3260,fake',
 
-            new_tab = tb.tabopen(background=False, related=True)
+                'target_lun': None,
 
-            new_tab.set_html(highlighted, self._tab.url())
+                'auth_method': 'CHAP',
 
-            new_tab.data.viewing_source = True
+                'auth_method': 'fake',
 
+                'auth_method': 'fake',
 
-
-        self._tab.dump_async(show_source_cb)
-
-
-
-
-
-class AbstractPrinting:
-
-
-
-    """Attribute ``printing`` of AbstractTab for printing the page."""
-
-
-
-    def __init__(self, tab: 'AbstractTab') -> None:
-
-        self._widget = None
-
-        self._tab = tab
-
-
-
-    def check_pdf_support(self) -> None:
-
-        """Check whether writing to PDFs is supported.
-
-
-
-        If it's not supported (by the current Qt version), a WebTabError is
-
-        raised.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def check_printer_support(self) -> None:
-
-        """Check whether writing to a printer is supported.
-
-
-
-        If it's not supported (by the current Qt version), a WebTabError is
-
-        raised.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def check_preview_support(self) -> None:
-
-        """Check whether showing a print preview is supported.
-
-
-
-        If it's not supported (by the current Qt version), a WebTabError is
-
-        raised.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def to_pdf(self, filename: str) -> bool:
-
-        """Print the tab to a PDF with the given filename."""
-
-        raise NotImplementedError
-
-
-
-    def to_printer(self, printer: QPrinter,
-
-                   callback: typing.Callable[[bool], None] = None) -> None:
-
-        """Print the tab.
-
-
-
-        Args:
-
-            printer: The QPrinter to print to.
-
-            callback: Called with a boolean
-
-                      (True if printing succeeded, False otherwise)
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def show_dialog(self) -> None:
-
-        """Print with a QPrintDialog."""
-
-        self.check_printer_support()
-
-
-
-        def print_callback(ok: bool) -> None:
-
-            """Called when printing finished."""
-
-            if not ok:
-
-                message.error("Printing failed!")
-
-            diag.deleteLater()
-
-
-
-        def do_print() -> None:
-
-            """Called when the dialog was closed."""
-
-            self.to_printer(diag.printer(), print_callback)
-
-
-
-        diag = QPrintDialog(self._tab)
-
-        if utils.is_mac:
-
-            # For some reason we get a segfault when using open() on macOS
-
-            ret = diag.exec_()
-
-            if ret == QDialog.Accepted:
-
-                do_print()
-
-        else:
-
-            diag.open(do_print)
-
-
-
-
-
-class AbstractSearch(QObject):
-
-
-
-    """Attribute ``search`` of AbstractTab for doing searches.
-
-
-
-    Attributes:
-
-        text: The last thing this view was searched for.
-
-        search_displayed: Whether we're currently displaying search results in
-
-                          this view.
-
-        _flags: The flags of the last search (needs to be set by subclasses).
-
-        _widget: The underlying WebView widget.
-
-    """
-
-
-
-    #: Signal emitted when a search was finished
-
-    #: (True if the text was found, False otherwise)
-
-    finished = pyqtSignal(bool)
-
-    #: Signal emitted when an existing search was cleared.
-
-    cleared = pyqtSignal()
-
-
-
-    _Callback = typing.Callable[[bool], None]
-
-
-
-    def __init__(self, tab: 'AbstractTab', parent: QWidget = None):
-
-        super().__init__(parent)
-
-        self._tab = tab
-
-        self._widget = None
-
-        self.text = None  # type: typing.Optional[str]
-
-        self.search_displayed = False
-
-
-
-    def _is_case_sensitive(self, ignore_case: usertypes.IgnoreCase) -> bool:
-
-        """Check if case-sensitivity should be used.
-
-
-
-        This assumes self.text is already set properly.
-
-
-
-        Arguments:
-
-            ignore_case: The ignore_case value from the config.
-
-        """
-
-        assert self.text is not None
-
-        mapping = {
-
-            usertypes.IgnoreCase.smart: not self.text.islower(),
-
-            usertypes.IgnoreCase.never: True,
-
-            usertypes.IgnoreCase.always: False,
+            }
 
         }
 
-        return mapping[ignore_case]
 
 
+    def test_mountpoint_to_number(self):
 
-    def search(self, text: str, *,
+        cases = {
 
-               ignore_case: usertypes.IgnoreCase = usertypes.IgnoreCase.never,
+            'sda': 0,
 
-               reverse: bool = False,
+            'sdp': 15,
 
-               result_cb: _Callback = None) -> None:
+            'hda': 0,
 
-        """Find the given text on the page.
+            'hdp': 15,
 
+            'vda': 0,
 
+            'xvda': 0,
 
-        Args:
+            '0': 0,
 
-            text: The text to search for.
+            '10': 10,
 
-            ignore_case: Search case-insensitively.
+            'vdq': -1,
 
-            reverse: Reverse search direction.
+            'sdq': -1,
 
-            result_cb: Called with a bool indicating whether a match was found.
+            'hdq': -1,
 
-        """
+            'xvdq': -1,
 
-        raise NotImplementedError
+        }
 
 
 
-    def clear(self) -> None:
+        for (input, expected) in cases.iteritems():
 
-        """Clear the current search."""
+            actual = volume_utils.mountpoint_to_number(input)
 
-        raise NotImplementedError
+            self.assertEqual(actual, expected,
 
+                    '%s yielded %s, not %s' % (input, actual, expected))
 
 
-    def prev_result(self, *, result_cb: _Callback = None) -> None:
 
-        """Go to the previous result of the current search.
+    def test_parse_volume_info_raise_exception(self):
 
+        """This shows how to test helper classes' methods."""
 
+        stubs.stubout_session(self.stubs, stubs.FakeSessionForVolumeTests)
 
-        Args:
+        session = xenapi_conn.XenAPISession('test_url', 'root', 'test_pass')
 
-            result_cb: Called with a bool indicating whether a match was found.
+        vol = self._create_volume()
 
-        """
+        # oops, wrong mount point!
 
-        raise NotImplementedError
+        self.assertRaises(volume_utils.StorageError,
 
+                          volume_utils.parse_volume_info,
 
+                          self._make_info(),
 
-    def next_result(self, *, result_cb: _Callback = None) -> None:
+                          'dev/sd'
 
-        """Go to the next result of the current search.
+                          )
 
+        db.volume_destroy(context.get_admin_context(), vol['id'])
 
 
-        Args:
 
-            result_cb: Called with a bool indicating whether a match was found.
+    def test_attach_volume(self):
 
-        """
+        """This shows how to test Ops classes' methods."""
 
-        raise NotImplementedError
+        stubs.stubout_session(self.stubs, stubs.FakeSessionForVolumeTests)
 
+        conn = xenapi_conn.XenAPIDriver(False)
 
+        volume = self._create_volume()
 
+        instance = db.instance_create(self.context, self.instance_values)
 
+        vm = xenapi_fake.create_vm(instance.name, 'Running')
 
-class AbstractZoom(QObject):
+        result = conn.attach_volume(self._make_info(),
 
+                                    instance.name, '/dev/sdc')
 
 
-    """Attribute ``zoom`` of AbstractTab for controlling zoom."""
 
+        # check that the VM has a VBD attached to it
 
+        # Get XenAPI record for VBD
 
-    def __init__(self, tab: 'AbstractTab', parent: QWidget = None) -> None:
+        vbds = xenapi_fake.get_all('VBD')
 
-        super().__init__(parent)
+        vbd = xenapi_fake.get_record('VBD', vbds[0])
 
-        self._tab = tab
+        vm_ref = vbd['VM']
 
-        self._widget = None
+        self.assertEqual(vm_ref, vm)
 
-        # Whether zoom was changed from the default.
 
-        self._default_zoom_changed = False
 
-        self._init_neighborlist()
+    def test_attach_volume_raise_exception(self):
 
-        config.instance.changed.connect(self._on_config_changed)
+        """This shows how to test when exceptions are raised."""
 
-        self._zoom_factor = float(config.val.zoom.default) / 100
+        stubs.stubout_session(self.stubs,
 
+                              stubs.FakeSessionForVolumeFailedTests)
 
+        conn = xenapi_conn.XenAPIDriver(False)
 
-    @pyqtSlot(str)
+        volume = self._create_volume()
 
-    def _on_config_changed(self, option: str) -> None:
+        instance = db.instance_create(self.context, self.instance_values)
 
-        if option in ['zoom.levels', 'zoom.default']:
+        xenapi_fake.create_vm(instance.name, 'Running')
 
-            if not self._default_zoom_changed:
+        self.assertRaises(exception.VolumeDriverNotFound,
 
-                factor = float(config.val.zoom.default) / 100
+                          conn.attach_volume,
 
-                self.set_factor(factor)
+                          {'driver_volume_type': 'nonexist'},
 
-            self._init_neighborlist()
+                          instance.name,
 
+                          '/dev/sdc')
 
 
-    def _init_neighborlist(self) -> None:
 
-        """Initialize self._neighborlist.
 
 
+class XenAPIVMTestCase(stubs.XenAPITestBase):
 
-        It is a NeighborList with the zoom levels."""
+    """Unit tests for VM operations."""
 
-        levels = config.val.zoom.levels
+    def setUp(self):
 
-        self._neighborlist = usertypes.NeighborList(
+        super(XenAPIVMTestCase, self).setUp()
 
-            levels, mode=usertypes.NeighborList.Modes.edge)
+        self.network = importutils.import_object(FLAGS.network_manager)
 
-        self._neighborlist.fuzzyval = config.val.zoom.default
+        self.flags(xenapi_connection_url='test_url',
 
+                   xenapi_connection_password='test_pass',
 
+                   instance_name_template='%d',
 
-    def apply_offset(self, offset: int) -> None:
+                   firewall_driver='nova.virt.xenapi.firewall.'
 
-        """Increase/Decrease the zoom level by the given offset.
+                                   'Dom0IptablesFirewallDriver')
 
+        xenapi_fake.create_local_srs()
 
+        xenapi_fake.create_local_pifs()
 
-        Args:
+        db_fakes.stub_out_db_instance_api(self.stubs)
 
-            offset: The offset in the zoom level list.
+        xenapi_fake.create_network('fake', FLAGS.flat_network_bridge)
 
+        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
 
+        stubs.stubout_get_this_vm_uuid(self.stubs)
 
-        Return:
+        stubs.stubout_is_vdi_pv(self.stubs)
 
-            The new zoom percentage.
+        stubs.stub_out_vm_methods(self.stubs)
 
-        """
+        fake_utils.stub_out_utils_execute(self.stubs)
 
-        level = self._neighborlist.getitem(offset)
+        self.user_id = 'fake'
 
-        self.set_factor(float(level) / 100, fuzzyval=False)
+        self.project_id = 'fake'
 
-        return level
+        self.context = context.RequestContext(self.user_id, self.project_id)
 
+        self.conn = xenapi_conn.XenAPIDriver(False)
 
 
-    def _set_factor_internal(self, factor: float) -> None:
 
-        raise NotImplementedError
+        fake_image.stub_out_image_service(self.stubs)
 
+        set_image_fixtures()
 
+        stubs.stubout_image_service_download(self.stubs)
 
-    def set_factor(self, factor: float, *, fuzzyval: bool = True) -> None:
+        stubs.stubout_stream_disk(self.stubs)
 
-        """Zoom to a given zoom factor.
 
 
+        def fake_inject_instance_metadata(self, instance, vm):
 
-        Args:
+            pass
 
-            factor: The zoom factor as float.
+        self.stubs.Set(vmops.VMOps, 'inject_instance_metadata',
 
-            fuzzyval: Whether to set the NeighborLists fuzzyval.
+                       fake_inject_instance_metadata)
 
-        """
 
-        if fuzzyval:
 
-            self._neighborlist.fuzzyval = int(factor * 100)
+        def fake_safe_copy_vdi(session, sr_ref, instance, vdi_to_copy_ref):
 
-        if factor < 0:
+            name_label = "fakenamelabel"
 
-            raise ValueError("Can't zoom to factor {}!".format(factor))
+            disk_type = "fakedisktype"
 
+            virtual_size = 777
 
+            return vm_utils.create_vdi(
 
-        default_zoom_factor = float(config.val.zoom.default) / 100
+                    session, sr_ref, instance, name_label, disk_type,
 
-        self._default_zoom_changed = (factor != default_zoom_factor)
+                    virtual_size)
 
+        self.stubs.Set(vm_utils, '_safe_copy_vdi', fake_safe_copy_vdi)
 
 
-        self._zoom_factor = factor
 
-        self._set_factor_internal(factor)
+    def tearDown(self):
 
+        super(XenAPIVMTestCase, self).tearDown()
 
+        fake_image.FakeImageService_reset()
 
-    def factor(self) -> float:
 
-        return self._zoom_factor
 
+    def test_init_host(self):
 
+        session = xenapi_conn.XenAPISession('test_url', 'root', 'test_pass')
 
-    def apply_default(self) -> None:
+        vm = vm_utils._get_this_vm_ref(session)
 
-        self._set_factor_internal(float(config.val.zoom.default) / 100)
+        # Local root disk
 
+        vdi0 = xenapi_fake.create_vdi('compute', None)
 
+        vbd0 = xenapi_fake.create_vbd(vm, vdi0)
 
-    def reapply(self) -> None:
+        # Instance VDI
 
-        self._set_factor_internal(self._zoom_factor)
+        vdi1 = xenapi_fake.create_vdi('instance-aaaa', None,
 
+                other_config={'nova_instance_uuid': 'aaaa'})
 
+        vbd1 = xenapi_fake.create_vbd(vm, vdi1)
 
+        # Only looks like instance VDI
 
+        vdi2 = xenapi_fake.create_vdi('instance-bbbb', None)
 
-class AbstractCaret(QObject):
+        vbd2 = xenapi_fake.create_vbd(vm, vdi2)
 
 
 
-    """Attribute ``caret`` of AbstractTab for caret browsing."""
+        self.conn.init_host(None)
 
+        self.assertEquals(set(xenapi_fake.get_all('VBD')), set([vbd0, vbd2]))
 
 
-    #: Signal emitted when the selection was toggled.
 
-    #: (argument - whether the selection is now active)
+    def test_list_instances_0(self):
 
-    selection_toggled = pyqtSignal(bool)
+        instances = self.conn.list_instances()
 
-    #: Emitted when a ``follow_selection`` action is done.
+        self.assertEquals(instances, [])
 
-    follow_selected_done = pyqtSignal()
 
 
+    def test_get_rrd_server(self):
 
-    def __init__(self,
+        self.flags(xenapi_connection_url='myscheme://myaddress/')
 
-                 tab: 'AbstractTab',
+        server_info = vm_utils._get_rrd_server()
 
-                 mode_manager: modeman.ModeManager,
+        self.assertEqual(server_info[0], 'myscheme')
 
-                 parent: QWidget = None) -> None:
+        self.assertEqual(server_info[1], 'myaddress')
 
-        super().__init__(parent)
 
-        self._tab = tab
 
-        self._widget = None
+    def test_get_diagnostics(self):
 
-        self.selection_enabled = False
+        def fake_get_rrd(host, vm_uuid):
 
-        mode_manager.entered.connect(self._on_mode_entered)
+            with open('xenapi/vm_rrd.xml') as f:
 
-        mode_manager.left.connect(self._on_mode_left)
+                return re.sub(r'\s', '', f.read())
 
+        self.stubs.Set(vm_utils, '_get_rrd', fake_get_rrd)
 
 
-    def _on_mode_entered(self, mode: usertypes.KeyMode) -> None:
 
-        raise NotImplementedError
+        fake_diagnostics = {
 
+            'vbd_xvdb_write': '0.0',
 
+            'memory_target': '4294967296.0000',
 
-    def _on_mode_left(self, mode: usertypes.KeyMode) -> None:
+            'memory_internal_free': '1415564.0000',
 
-        raise NotImplementedError
+            'memory': '4294967296.0000',
 
+            'vbd_xvda_write': '0.0',
 
+            'cpu0': '0.0042',
 
-    def move_to_next_line(self, count: int = 1) -> None:
+            'vif_0_tx': '287.4134',
 
-        raise NotImplementedError
+            'vbd_xvda_read': '0.0',
 
+            'vif_0_rx': '1816.0144',
 
+            'vif_2_rx': '0.0',
 
-    def move_to_prev_line(self, count: int = 1) -> None:
+            'vif_2_tx': '0.0',
 
-        raise NotImplementedError
+            'vbd_xvdb_read': '0.0',
 
+            'last_update': '1328795567',
 
+        }
 
-    def move_to_next_char(self, count: int = 1) -> None:
+        instance = self._create_instance()
 
-        raise NotImplementedError
+        expected = self.conn.get_diagnostics(instance)
 
+        self.assertDictMatch(fake_diagnostics, expected)
 
 
-    def move_to_prev_char(self, count: int = 1) -> None:
 
-        raise NotImplementedError
+    def test_instance_snapshot_fails_with_no_primary_vdi(self):
 
+        def create_bad_vbd(vm_ref, vdi_ref):
 
+            vbd_rec = {'VM': vm_ref,
 
-    def move_to_end_of_word(self, count: int = 1) -> None:
+               'VDI': vdi_ref,
 
-        raise NotImplementedError
+               'userdevice': 'fake',
 
+               'currently_attached': False}
 
+            vbd_ref = xenapi_fake._create_object('VBD', vbd_rec)
 
-    def move_to_next_word(self, count: int = 1) -> None:
+            xenapi_fake.after_VBD_create(vbd_ref, vbd_rec)
 
-        raise NotImplementedError
+            return vbd_ref
 
 
 
-    def move_to_prev_word(self, count: int = 1) -> None:
+        self.stubs.Set(xenapi_fake, 'create_vbd', create_bad_vbd)
 
-        raise NotImplementedError
+        stubs.stubout_instance_snapshot(self.stubs)
 
+        # Stubbing out firewall driver as previous stub sets alters
 
+        # xml rpc result parsing
 
-    def move_to_start_of_line(self) -> None:
+        stubs.stubout_firewall_driver(self.stubs, self.conn)
 
-        raise NotImplementedError
+        instance = self._create_instance()
 
 
 
-    def move_to_end_of_line(self) -> None:
+        image_id = "my_snapshot_id"
 
-        raise NotImplementedError
+        self.assertRaises(exception.NovaException, self.conn.snapshot,
 
+                          self.context, instance, image_id)
 
 
-    def move_to_start_of_next_block(self, count: int = 1) -> None:
 
-        raise NotImplementedError
+    def test_instance_snapshot(self):
 
+        stubs.stubout_instance_snapshot(self.stubs)
 
+        stubs.stubout_is_snapshot(self.stubs)
 
-    def move_to_start_of_prev_block(self, count: int = 1) -> None:
+        # Stubbing out firewall driver as previous stub sets alters
 
-        raise NotImplementedError
+        # xml rpc result parsing
 
+        stubs.stubout_firewall_driver(self.stubs, self.conn)
 
+        instance = self._create_instance()
 
-    def move_to_end_of_next_block(self, count: int = 1) -> None:
 
-        raise NotImplementedError
 
+        image_id = "my_snapshot_id"
 
+        self.conn.snapshot(self.context, instance, image_id)
 
-    def move_to_end_of_prev_block(self, count: int = 1) -> None:
 
-        raise NotImplementedError
 
+        # Ensure VM was torn down
 
+        vm_labels = []
 
-    def move_to_start_of_document(self) -> None:
+        for vm_ref in xenapi_fake.get_all('VM'):
 
-        raise NotImplementedError
+            vm_rec = xenapi_fake.get_record('VM', vm_ref)
 
+            if not vm_rec["is_control_domain"]:
 
+                vm_labels.append(vm_rec["name_label"])
 
-    def move_to_end_of_document(self) -> None:
 
-        raise NotImplementedError
 
+        self.assertEquals(vm_labels, [instance.name])
 
 
-    def toggle_selection(self) -> None:
 
-        raise NotImplementedError
+        # Ensure VBDs were torn down
 
+        vbd_labels = []
 
+        for vbd_ref in xenapi_fake.get_all('VBD'):
 
-    def drop_selection(self) -> None:
+            vbd_rec = xenapi_fake.get_record('VBD', vbd_ref)
 
-        raise NotImplementedError
+            vbd_labels.append(vbd_rec["vm_name_label"])
 
 
 
-    def selection(self, callback: typing.Callable[[str], None]) -> None:
+        self.assertEquals(vbd_labels, [instance.name])
 
-        raise NotImplementedError
 
 
+        # Ensure VDIs were torn down
 
-    def _follow_enter(self, tab: bool) -> None:
+        for vdi_ref in xenapi_fake.get_all('VDI'):
 
-        """Follow a link by faking an enter press."""
+            vdi_rec = xenapi_fake.get_record('VDI', vdi_ref)
 
-        if tab:
+            name_label = vdi_rec["name_label"]
 
-            self._tab.fake_key_press(Qt.Key_Enter, modifier=Qt.ControlModifier)
+            self.assert_(not name_label.endswith('snapshot'))
 
-        else:
 
-            self._tab.fake_key_press(Qt.Key_Enter)
 
+    def create_vm_record(self, conn, os_type, name):
 
+        instances = conn.list_instances()
 
-    def follow_selected(self, *, tab: bool = False) -> None:
+        self.assertEquals(instances, [name])
 
-        raise NotImplementedError
 
 
+        # Get Nova record for VM
 
+        vm_info = conn.get_info({'name': name})
 
+        # Get XenAPI record for VM
 
-class AbstractScroller(QObject):
+        vms = [rec for ref, rec
 
+               in xenapi_fake.get_all_records('VM').iteritems()
 
+               if not rec['is_control_domain']]
 
-    """Attribute ``scroller`` of AbstractTab to manage scroll position."""
+        vm = vms[0]
 
+        self.vm_info = vm_info
 
+        self.vm = vm
 
-    #: Signal emitted when the scroll position changed (int, int)
 
-    perc_changed = pyqtSignal(int, int)
 
-    #: Signal emitted before the user requested a jump.
+    def check_vm_record(self, conn, check_injection=False):
 
-    #: Used to set the special ' mark so the user can return.
+        # Check that m1.large above turned into the right thing.
 
-    before_jump_requested = pyqtSignal()
+        instance_type = db.instance_type_get_by_name(conn, 'm1.large')
 
+        mem_kib = long(instance_type['memory_mb']) << 10
 
+        mem_bytes = str(mem_kib << 10)
 
-    def __init__(self, tab: 'AbstractTab', parent: QWidget = None):
+        vcpus = instance_type['vcpus']
 
-        super().__init__(parent)
+        self.assertEquals(self.vm_info['max_mem'], mem_kib)
 
-        self._tab = tab
+        self.assertEquals(self.vm_info['mem'], mem_kib)
 
-        self._widget = None  # type: typing.Optional[QWidget]
+        self.assertEquals(self.vm['memory_static_max'], mem_bytes)
 
-        self.perc_changed.connect(self._log_scroll_pos_change)
+        self.assertEquals(self.vm['memory_dynamic_max'], mem_bytes)
 
+        self.assertEquals(self.vm['memory_dynamic_min'], mem_bytes)
 
+        self.assertEquals(self.vm['VCPUs_max'], str(vcpus))
 
-    @pyqtSlot()
+        self.assertEquals(self.vm['VCPUs_at_startup'], str(vcpus))
 
-    def _log_scroll_pos_change(self) -> None:
 
-        log.webview.vdebug(  # type: ignore
 
-            "Scroll position changed to {}".format(self.pos_px()))
+        # Check that the VM is running according to Nova
 
+        self.assertEquals(self.vm_info['state'], power_state.RUNNING)
 
 
-    def _init_widget(self, widget: QWidget) -> None:
 
-        self._widget = widget
+        # Check that the VM is running according to XenAPI.
 
+        self.assertEquals(self.vm['power_state'], 'Running')
 
 
-    def pos_px(self) -> int:
 
-        raise NotImplementedError
+        if check_injection:
 
+            xenstore_data = self.vm['xenstore_data']
 
+            self.assertEquals(xenstore_data['vm-data/hostname'], 'test')
 
-    def pos_perc(self) -> int:
+            key = 'vm-data/networking/DEADBEEF0001'
 
-        raise NotImplementedError
+            xenstore_value = xenstore_data[key]
 
+            tcpip_data = ast.literal_eval(xenstore_value)
 
+            self.assertEquals(tcpip_data,
 
-    def to_perc(self, x: int = None, y: int = None) -> None:
+                              {'broadcast': '192.168.1.255',
 
-        raise NotImplementedError
+                               'dns': ['192.168.1.4', '192.168.1.3'],
 
+                               'gateway': '192.168.1.1',
 
+                               'gateway_v6': 'fe80::def',
 
-    def to_point(self, point: QPoint) -> None:
+                               'ip6s': [{'enabled': '1',
 
-        raise NotImplementedError
+                                         'ip': '2001:db8:0:1::1',
 
+                                         'netmask': 64,
 
+                                         'gateway': 'fe80::def'}],
 
-    def to_anchor(self, name: str) -> None:
+                               'ips': [{'enabled': '1',
 
-        raise NotImplementedError
+                                        'ip': '192.168.1.100',
 
+                                        'netmask': '255.255.255.0',
 
+                                        'gateway': '192.168.1.1'},
 
-    def delta(self, x: int = 0, y: int = 0) -> None:
+                                       {'enabled': '1',
 
-        raise NotImplementedError
+                                        'ip': '192.168.1.101',
 
+                                        'netmask': '255.255.255.0',
 
+                                        'gateway': '192.168.1.1'}],
 
-    def delta_page(self, x: float = 0, y: float = 0) -> None:
+                               'label': 'test1',
 
-        raise NotImplementedError
+                               'mac': 'DE:AD:BE:EF:00:01'})
 
 
 
-    def up(self, count: int = 1) -> None:
+    def check_vm_params_for_windows(self):
 
-        raise NotImplementedError
+        self.assertEquals(self.vm['platform']['nx'], 'true')
 
+        self.assertEquals(self.vm['HVM_boot_params'], {'order': 'dc'})
 
+        self.assertEquals(self.vm['HVM_boot_policy'], 'BIOS order')
 
-    def down(self, count: int = 1) -> None:
 
-        raise NotImplementedError
 
+        # check that these are not set
 
+        self.assertEquals(self.vm['PV_args'], '')
 
-    def left(self, count: int = 1) -> None:
+        self.assertEquals(self.vm['PV_bootloader'], '')
 
-        raise NotImplementedError
+        self.assertEquals(self.vm['PV_kernel'], '')
 
+        self.assertEquals(self.vm['PV_ramdisk'], '')
 
 
-    def right(self, count: int = 1) -> None:
 
-        raise NotImplementedError
+    def check_vm_params_for_linux(self):
 
+        self.assertEquals(self.vm['platform']['nx'], 'false')
 
+        self.assertEquals(self.vm['PV_args'], '')
 
-    def top(self) -> None:
+        self.assertEquals(self.vm['PV_bootloader'], 'pygrub')
 
-        raise NotImplementedError
 
 
+        # check that these are not set
 
-    def bottom(self) -> None:
+        self.assertEquals(self.vm['PV_kernel'], '')
 
-        raise NotImplementedError
+        self.assertEquals(self.vm['PV_ramdisk'], '')
 
+        self.assertEquals(self.vm['HVM_boot_params'], {})
 
+        self.assertEquals(self.vm['HVM_boot_policy'], '')
 
-    def page_up(self, count: int = 1) -> None:
 
-        raise NotImplementedError
 
+    def check_vm_params_for_linux_with_external_kernel(self):
 
+        self.assertEquals(self.vm['platform']['nx'], 'false')
 
-    def page_down(self, count: int = 1) -> None:
+        self.assertEquals(self.vm['PV_args'], 'root=/dev/xvda1')
 
-        raise NotImplementedError
+        self.assertNotEquals(self.vm['PV_kernel'], '')
 
+        self.assertNotEquals(self.vm['PV_ramdisk'], '')
 
 
-    def at_top(self) -> bool:
 
-        raise NotImplementedError
+        # check that these are not set
 
+        self.assertEquals(self.vm['HVM_boot_params'], {})
 
+        self.assertEquals(self.vm['HVM_boot_policy'], '')
 
-    def at_bottom(self) -> bool:
 
-        raise NotImplementedError
 
+    def _list_vdis(self):
 
+        url = FLAGS.xenapi_connection_url
 
+        username = FLAGS.xenapi_connection_username
 
+        password = FLAGS.xenapi_connection_password
 
-class AbstractHistoryPrivate:
+        session = xenapi_conn.XenAPISession(url, username, password)
 
+        return session.call_xenapi('VDI.get_all')
 
 
-    """Private API related to the history."""
 
+    def _check_vdis(self, start_list, end_list):
 
+        for vdi_ref in end_list:
 
-    def __init__(self, tab: 'AbstractTab'):
+            if not vdi_ref in start_list:
 
-        self._tab = tab
+                vdi_rec = xenapi_fake.get_record('VDI', vdi_ref)
 
-        self._history = None
+                # If the cache is turned on then the base disk will be
 
+                # there even after the cleanup
 
+                if 'other_config' in vdi_rec:
 
-    def serialize(self) -> bytes:
+                    if 'image-id' not in vdi_rec['other_config']:
 
-        """Serialize into an opaque format understood by self.deserialize."""
-
-        raise NotImplementedError
-
-
-
-    def deserialize(self, data: bytes) -> None:
-
-        """Deserialize from a format produced by self.serialize."""
-
-        raise NotImplementedError
-
-
-
-    def load_items(self, items: typing.Sequence) -> None:
-
-        """Deserialize from a list of WebHistoryItems."""
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractHistory:
-
-
-
-    """The history attribute of a AbstractTab."""
-
-
-
-    def __init__(self, tab: 'AbstractTab') -> None:
-
-        self._tab = tab
-
-        self._history = None
-
-        self.private_api = AbstractHistoryPrivate(tab)
-
-
-
-    def __len__(self) -> int:
-
-        raise NotImplementedError
-
-
-
-    def __iter__(self) -> typing.Iterable:
-
-        raise NotImplementedError
-
-
-
-    def _check_count(self, count: int) -> None:
-
-        """Check whether the count is positive."""
-
-        if count < 0:
-
-            raise WebTabError("count needs to be positive!")
-
-
-
-    def current_idx(self) -> int:
-
-        raise NotImplementedError
-
-
-
-    def back(self, count: int = 1) -> None:
-
-        """Go back in the tab's history."""
-
-        self._check_count(count)
-
-        idx = self.current_idx() - count
-
-        if idx >= 0:
-
-            self._go_to_item(self._item_at(idx))
-
-        else:
-
-            self._go_to_item(self._item_at(0))
-
-            raise WebTabError("At beginning of history.")
-
-
-
-    def forward(self, count: int = 1) -> None:
-
-        """Go forward in the tab's history."""
-
-        self._check_count(count)
-
-        idx = self.current_idx() + count
-
-        if idx < len(self):
-
-            self._go_to_item(self._item_at(idx))
-
-        else:
-
-            self._go_to_item(self._item_at(len(self) - 1))
-
-            raise WebTabError("At end of history.")
-
-
-
-    def can_go_back(self) -> bool:
-
-        raise NotImplementedError
-
-
-
-    def can_go_forward(self) -> bool:
-
-        raise NotImplementedError
-
-
-
-    def _item_at(self, i: int) -> typing.Any:
-
-        raise NotImplementedError
-
-
-
-    def _go_to_item(self, item: typing.Any) -> None:
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractElements:
-
-
-
-    """Finding and handling of elements on the page."""
-
-
-
-    _MultiCallback = typing.Callable[
-
-        [typing.Sequence['webelem.AbstractWebElement']], None]
-
-    _SingleCallback = typing.Callable[
-
-        [typing.Optional['webelem.AbstractWebElement']], None]
-
-    _ErrorCallback = typing.Callable[[Exception], None]
-
-
-
-    def __init__(self, tab: 'AbstractTab') -> None:
-
-        self._widget = None
-
-        self._tab = tab
-
-
-
-    def find_css(self, selector: str,
-
-                 callback: _MultiCallback,
-
-                 error_cb: _ErrorCallback, *,
-
-                 only_visible: bool = False) -> None:
-
-        """Find all HTML elements matching a given selector async.
-
-
-
-        If there's an error, the callback is called with a webelem.Error
-
-        instance.
-
-
-
-        Args:
-
-            callback: The callback to be called when the search finished.
-
-            error_cb: The callback to be called when an error occurred.
-
-            selector: The CSS selector to search for.
-
-            only_visible: Only show elements which are visible on screen.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def find_id(self, elem_id: str, callback: _SingleCallback) -> None:
-
-        """Find the HTML element with the given ID async.
-
-
-
-        Args:
-
-            callback: The callback to be called when the search finished.
-
-                      Called with a WebEngineElement or None.
-
-            elem_id: The ID to search for.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def find_focused(self, callback: _SingleCallback) -> None:
-
-        """Find the focused element on the page async.
-
-
-
-        Args:
-
-            callback: The callback to be called when the search finished.
-
-                      Called with a WebEngineElement or None.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def find_at_pos(self, pos: QPoint, callback: _SingleCallback) -> None:
-
-        """Find the element at the given position async.
-
-
-
-        This is also called "hit test" elsewhere.
-
-
-
-        Args:
-
-            pos: The QPoint to get the element for.
-
-            callback: The callback to be called when the search finished.
-
-                      Called with a WebEngineElement or None.
-
-        """
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractAudio(QObject):
-
-
-
-    """Handling of audio/muting for this tab."""
-
-
-
-    muted_changed = pyqtSignal(bool)
-
-    recently_audible_changed = pyqtSignal(bool)
-
-
-
-    def __init__(self, tab: 'AbstractTab', parent: QWidget = None) -> None:
-
-        super().__init__(parent)
-
-        self._widget = None  # type: typing.Optional[QWidget]
-
-        self._tab = tab
-
-
-
-    def set_muted(self, muted: bool, override: bool = False) -> None:
-
-        """Set this tab as muted or not.
-
-
-
-        Arguments:
-
-            override: If set to True, muting/unmuting was done manually and
-
-                      overrides future automatic mute/unmute changes based on
-
-                      the URL.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def is_muted(self) -> bool:
-
-        raise NotImplementedError
-
-
-
-    def is_recently_audible(self) -> bool:
-
-        """Whether this tab has had audio playing recently."""
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractTabPrivate:
-
-
-
-    """Tab-related methods which are only needed in the core.
-
-
-
-    Those methods are not part of the API which is exposed to extensions, and
-
-    should ideally be removed at some point in the future.
-
-    """
-
-
-
-    def __init__(self, mode_manager: modeman.ModeManager,
-
-                 tab: 'AbstractTab') -> None:
-
-        self._widget = None  # type: typing.Optional[QWidget]
-
-        self._tab = tab
-
-        self._mode_manager = mode_manager
-
-
-
-    def event_target(self) -> QWidget:
-
-        """Return the widget events should be sent to."""
-
-        raise NotImplementedError
-
-
-
-    def handle_auto_insert_mode(self, ok: bool) -> None:
-
-        """Handle `input.insert_mode.auto_load` after loading finished."""
-
-        if not config.val.input.insert_mode.auto_load or not ok:
-
-            return
-
-
-
-        cur_mode = self._mode_manager.mode
-
-        if cur_mode == usertypes.KeyMode.insert:
-
-            return
-
-
-
-        def _auto_insert_mode_cb(elem: 'webelem.AbstractWebElement') -> None:
-
-            """Called from JS after finding the focused element."""
-
-            if elem is None:
-
-                log.webview.debug("No focused element!")
-
-                return
-
-            if elem.is_editable():
-
-                modeman.enter(self._tab.win_id, usertypes.KeyMode.insert,
-
-                              'load finished', only_if_normal=True)
-
-
-
-        self._tab.elements.find_focused(_auto_insert_mode_cb)
-
-
-
-    def clear_ssl_errors(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def networkaccessmanager(self) -> typing.Optional[QNetworkAccessManager]:
-
-        """Get the QNetworkAccessManager for this tab.
-
-
-
-        This is only implemented for QtWebKit.
-
-        For QtWebEngine, always returns None.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def user_agent(self) -> typing.Optional[str]:
-
-        """Get the user agent for this tab.
-
-
-
-        This is only implemented for QtWebKit.
-
-        For QtWebEngine, always returns None.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def shutdown(self) -> None:
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractTab(QWidget):
-
-
-
-    """An adapter for QWebView/QWebEngineView representing a single tab."""
-
-
-
-    #: Signal emitted when a website requests to close this tab.
-
-    window_close_requested = pyqtSignal()
-
-    #: Signal emitted when a link is hovered (the hover text)
-
-    link_hovered = pyqtSignal(str)
-
-    #: Signal emitted when a page started loading
-
-    load_started = pyqtSignal()
-
-    #: Signal emitted when a page is loading (progress percentage)
-
-    load_progress = pyqtSignal(int)
-
-    #: Signal emitted when a page finished loading (success as bool)
-
-    load_finished = pyqtSignal(bool)
-
-    #: Signal emitted when a page's favicon changed (icon as QIcon)
-
-    icon_changed = pyqtSignal(QIcon)
-
-    #: Signal emitted when a page's title changed (new title as str)
-
-    title_changed = pyqtSignal(str)
-
-    #: Signal emitted when a new tab should be opened (url as QUrl)
-
-    new_tab_requested = pyqtSignal(QUrl)
-
-    #: Signal emitted when a page's URL changed (url as QUrl)
-
-    url_changed = pyqtSignal(QUrl)
-
-    #: Signal emitted when a tab's content size changed
-
-    #: (new size as QSizeF)
-
-    contents_size_changed = pyqtSignal(QSizeF)
-
-    #: Signal emitted when a page requested full-screen (bool)
-
-    fullscreen_requested = pyqtSignal(bool)
-
-    #: Signal emitted before load starts (URL as QUrl)
-
-    before_load_started = pyqtSignal(QUrl)
-
-
-
-    # Signal emitted when a page's load status changed
-
-    # (argument: usertypes.LoadStatus)
-
-    load_status_changed = pyqtSignal(usertypes.LoadStatus)
-
-    # Signal emitted before shutting down
-
-    shutting_down = pyqtSignal()
-
-    # Signal emitted when a history item should be added
-
-    history_item_triggered = pyqtSignal(QUrl, QUrl, str)
-
-    # Signal emitted when the underlying renderer process terminated.
-
-    # arg 0: A TerminationStatus member.
-
-    # arg 1: The exit code.
-
-    renderer_process_terminated = pyqtSignal(TerminationStatus, int)
-
-
-
-    # Hosts for which a certificate error happened. Shared between all tabs.
-
-    #
-
-    # Note that we remember hosts here, without scheme/port:
-
-    # QtWebEngine/Chromium also only remembers hostnames, and certificates are
-
-    # for a given hostname anyways.
-
-    _insecure_hosts = set()  # type: typing.Set[str]
-
-
-
-    def __init__(self, *, win_id: int, private: bool,
-
-                 parent: QWidget = None) -> None:
-
-        self.is_private = private
-
-        self.win_id = win_id
-
-        self.tab_id = next(tab_id_gen)
-
-        super().__init__(parent)
-
-
-
-        self.registry = objreg.ObjectRegistry()
-
-        tab_registry = objreg.get('tab-registry', scope='window',
-
-                                  window=win_id)
-
-        tab_registry[self.tab_id] = self
-
-        objreg.register('tab', self, registry=self.registry)
-
-
-
-        self.data = TabData()
-
-        self._layout = miscwidgets.WrapperLayout(self)
-
-        self._widget = None  # type: typing.Optional[QWidget]
-
-        self._progress = 0
-
-        self._load_status = usertypes.LoadStatus.none
-
-        self._mouse_event_filter = mouse.MouseEventFilter(
-
-            self, parent=self)
-
-        self.backend = None
-
-
-
-        # FIXME:qtwebengine  Should this be public api via self.hints?
-
-        #                    Also, should we get it out of objreg?
-
-        hintmanager = hints.HintManager(win_id, self.tab_id, parent=self)
-
-        objreg.register('hintmanager', hintmanager, scope='tab',
-
-                        window=self.win_id, tab=self.tab_id)
-
-
-
-        self.before_load_started.connect(self._on_before_load_started)
-
-
-
-    def _set_widget(self, widget: QWidget) -> None:
-
-        # pylint: disable=protected-access
-
-        self._widget = widget
-
-        self._layout.wrap(self, widget)
-
-        self.history._history = widget.history()
-
-        self.history.private_api._history = widget.history()
-
-        self.scroller._init_widget(widget)
-
-        self.caret._widget = widget
-
-        self.zoom._widget = widget
-
-        self.search._widget = widget
-
-        self.printing._widget = widget
-
-        self.action._widget = widget
-
-        self.elements._widget = widget
-
-        self.audio._widget = widget
-
-        self.private_api._widget = widget
-
-        self.settings._settings = widget.settings()
-
-
-
-        self._install_event_filter()
-
-        self.zoom.apply_default()
-
-
-
-    def _install_event_filter(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def _set_load_status(self, val: usertypes.LoadStatus) -> None:
-
-        """Setter for load_status."""
-
-        if not isinstance(val, usertypes.LoadStatus):
-
-            raise TypeError("Type {} is no LoadStatus member!".format(val))
-
-        log.webview.debug("load status for {}: {}".format(repr(self), val))
-
-        self._load_status = val
-
-        self.load_status_changed.emit(val)
-
-
-
-    def send_event(self, evt: QEvent) -> None:
-
-        """Send the given event to the underlying widget.
-
-
-
-        The event will be sent via QApplication.postEvent.
-
-        Note that a posted event must not be re-used in any way!
-
-        """
-
-        # This only gives us some mild protection against re-using events, but
-
-        # it's certainly better than a segfault.
-
-        if getattr(evt, 'posted', False):
-
-            raise utils.Unreachable("Can't re-use an event which was already "
-
-                                    "posted!")
-
-
-
-        recipient = self.private_api.event_target()
-
-        if recipient is None:
-
-            # https://github.com/qutebrowser/qutebrowser/issues/3888
-
-            log.webview.warning("Unable to find event target!")
-
-            return
-
-
-
-        evt.posted = True
-
-        QApplication.postEvent(recipient, evt)
-
-
-
-    def navigation_blocked(self) -> bool:
-
-        """Test if navigation is allowed on the current tab."""
-
-        return self.data.pinned and config.val.tabs.pinned.frozen
-
-
-
-    @pyqtSlot(QUrl)
-
-    def _on_before_load_started(self, url: QUrl) -> None:
-
-        """Adjust the title if we are going to visit a URL soon."""
-
-        qtutils.ensure_valid(url)
-
-        url_string = url.toDisplayString()
-
-        log.webview.debug("Going to start loading: {}".format(url_string))
-
-        self.title_changed.emit(url_string)
-
-
-
-    @pyqtSlot(QUrl)
-
-    def _on_url_changed(self, url: QUrl) -> None:
-
-        """Update title when URL has changed and no title is available."""
-
-        if url.isValid() and not self.title():
-
-            self.title_changed.emit(url.toDisplayString())
-
-        self.url_changed.emit(url)
-
-
-
-    @pyqtSlot()
-
-    def _on_load_started(self) -> None:
-
-        self._progress = 0
-
-        self.data.viewing_source = False
-
-        self._set_load_status(usertypes.LoadStatus.loading)
-
-        self.load_started.emit()
-
-
-
-    @pyqtSlot(usertypes.NavigationRequest)
-
-    def _on_navigation_request(
-
-            self,
-
-            navigation: usertypes.NavigationRequest
-
-    ) -> None:
-
-        """Handle common acceptNavigationRequest code."""
-
-        url = utils.elide(navigation.url.toDisplayString(), 100)
-
-        log.webview.debug("navigation request: url {}, type {}, is_main_frame "
-
-                          "{}".format(url,
-
-                                      navigation.navigation_type,
-
-                                      navigation.is_main_frame))
-
-
-
-        if not navigation.url.isValid():
-
-            # Also a WORKAROUND for missing IDNA 2008 support in QUrl, see
-
-            # https://bugreports.qt.io/browse/QTBUG-60364
-
-
-
-            if navigation.navigation_type == navigation.Type.link_clicked:
-
-                msg = urlutils.get_errstring(navigation.url,
-
-                                             "Invalid link clicked")
-
-                message.error(msg)
-
-                self.data.open_target = usertypes.ClickTarget.normal
-
-
-
-            log.webview.debug("Ignoring invalid URL {} in "
-
-                              "acceptNavigationRequest: {}".format(
-
-                                  navigation.url.toDisplayString(),
-
-                                  navigation.url.errorString()))
-
-            navigation.accepted = False
-
-
-
-    @pyqtSlot(bool)
-
-    def _on_load_finished(self, ok: bool) -> None:
-
-        assert self._widget is not None
-
-        if sip.isdeleted(self._widget):
-
-            # https://github.com/qutebrowser/qutebrowser/issues/3498
-
-            return
-
-
-
-        try:
-
-            sess_manager = objreg.get('session-manager')
-
-        except KeyError:
-
-            # https://github.com/qutebrowser/qutebrowser/issues/4311
-
-            return
-
-
-
-        sess_manager.save_autosave()
-
-
-
-        if ok:
-
-            if self.url().scheme() == 'https':
-
-                if self.url().host() in self._insecure_hosts:
-
-                    self._set_load_status(usertypes.LoadStatus.warn)
+                        self.fail('Found unexpected VDI:%s' % vdi_ref)
 
                 else:
 
-                    self._set_load_status(usertypes.LoadStatus.success_https)
+                    self.fail('Found unexpected VDI:%s' % vdi_ref)
 
-            else:
 
-                self._set_load_status(usertypes.LoadStatus.success)
 
-        elif ok:
+    def _test_spawn(self, image_ref, kernel_id, ramdisk_id,
 
-            self._set_load_status(usertypes.LoadStatus.warn)
+                    instance_type_id="3", os_type="linux",
+
+                    hostname="test", architecture="x86-64", instance_id=1,
+
+                    check_injection=False,
+
+                    create_record=True, empty_dns=False):
+
+        # Fake out inject_instance_metadata
+
+        def fake_inject_instance_metadata(self, instance, vm):
+
+            pass
+
+        self.stubs.Set(vmops.VMOps, 'inject_instance_metadata',
+
+                       fake_inject_instance_metadata)
+
+
+
+        if create_record:
+
+            instance_values = {'id': instance_id,
+
+                      'project_id': self.project_id,
+
+                      'user_id': self.user_id,
+
+                      'image_ref': image_ref,
+
+                      'kernel_id': kernel_id,
+
+                      'ramdisk_id': ramdisk_id,
+
+                      'root_gb': 20,
+
+                      'instance_type_id': instance_type_id,
+
+                      'os_type': os_type,
+
+                      'hostname': hostname,
+
+                      'architecture': architecture}
+
+            instance = db.instance_create(self.context, instance_values)
 
         else:
 
-            self._set_load_status(usertypes.LoadStatus.error)
+            instance = db.instance_get(self.context, instance_id)
 
 
 
-        self.load_finished.emit(ok)
+        network_info = fake_network.fake_get_instance_nw_info(self.stubs,
 
+                                                              spectacular=True)
 
+        if empty_dns:
 
-        if not self.title():
+            # NOTE(tr3buchet): this is a terrible way to do this...
 
-            self.title_changed.emit(self.url().toDisplayString())
+            network_info[0]['network']['subnets'][0]['dns'] = []
 
 
 
-        self.zoom.reapply()
+        # admin_pass isn't part of the DB model, but it does get set as
 
+        # an attribute for spawn to use
 
+        instance.admin_pass = 'herp'
 
-    @pyqtSlot()
+        image_meta = {'id': IMAGE_VHD,
 
-    def _on_history_trigger(self) -> None:
+                      'disk_format': 'vhd'}
 
-        """Emit history_item_triggered based on backend-specific signal."""
+        self.conn.spawn(self.context, instance, image_meta, network_info)
 
-        raise NotImplementedError
+        self.create_vm_record(self.conn, os_type, instance['name'])
 
+        self.check_vm_record(self.conn, check_injection)
 
+        self.assertTrue(instance.os_type)
 
-    @pyqtSlot(int)
+        self.assertTrue(instance.architecture)
 
-    def _on_load_progress(self, perc: int) -> None:
 
-        self._progress = perc
 
-        self.load_progress.emit(perc)
+    def test_spawn_empty_dns(self):
 
+        """Test spawning with an empty dns list"""
 
+        self._test_spawn(IMAGE_VHD, None, None,
 
-    def url(self, *, requested: bool = False) -> QUrl:
+                         os_type="linux", architecture="x86-64",
 
-        raise NotImplementedError
+                         empty_dns=True)
 
+        self.check_vm_params_for_linux()
 
 
-    def progress(self) -> int:
 
-        return self._progress
+    def test_spawn_not_enough_memory(self):
 
+        self.assertRaises(exception.InsufficientFreeMemory,
 
+                          self._test_spawn,
 
-    def load_status(self) -> usertypes.LoadStatus:
+                          1, 2, 3, "4")  # m1.xlarge
 
-        return self._load_status
 
 
+    def test_spawn_fail_cleanup_1(self):
 
-    def _load_url_prepare(self, url: QUrl, *,
+        """Simulates an error while downloading an image.
 
-                          emit_before_load_started: bool = True) -> None:
 
-        qtutils.ensure_valid(url)
 
-        if emit_before_load_started:
+        Verifies that VDIs created are properly cleaned up.
 
-            self.before_load_started.emit(url)
 
-
-
-    def load_url(self, url: QUrl, *,
-
-                 emit_before_load_started: bool = True) -> None:
-
-        raise NotImplementedError
-
-
-
-    def reload(self, *, force: bool = False) -> None:
-
-        raise NotImplementedError
-
-
-
-    def stop(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def fake_key_press(self,
-
-                       key: Qt.Key,
-
-                       modifier: Qt.KeyboardModifier = Qt.NoModifier) -> None:
-
-        """Send a fake key event to this tab."""
-
-        press_evt = QKeyEvent(QEvent.KeyPress, key, modifier, 0, 0, 0)
-
-        release_evt = QKeyEvent(QEvent.KeyRelease, key, modifier,
-
-                                0, 0, 0)
-
-        self.send_event(press_evt)
-
-        self.send_event(release_evt)
-
-
-
-    def dump_async(self,
-
-                   callback: typing.Callable[[str], None], *,
-
-                   plain: bool = False) -> None:
-
-        """Dump the current page's html asynchronously.
-
-
-
-        The given callback will be called with the result when dumping is
-
-        complete.
 
         """
 
-        raise NotImplementedError
+        vdi_recs_start = self._list_vdis()
+
+        stubs.stubout_fetch_disk_image(self.stubs, raise_failure=True)
+
+        self.assertRaises(xenapi_fake.Failure,
+
+                          self._test_spawn, 1, 2, 3)
+
+        # No additional VDI should be found.
+
+        vdi_recs_end = self._list_vdis()
+
+        self._check_vdis(vdi_recs_start, vdi_recs_end)
 
 
 
-    def run_js_async(
+    def test_spawn_fail_cleanup_2(self):
 
-            self,
-
-            code: str,
-
-            callback: typing.Callable[[typing.Any], None] = None, *,
-
-            world: typing.Union[usertypes.JsWorld, int] = None
-
-    ) -> None:
-
-        """Run javascript async.
+        """Simulates an error while creating VM record.
 
 
 
-        The given callback will be called with the result when running JS is
-
-        complete.
+        It verifies that VDIs created are properly cleaned up.
 
 
-
-        Args:
-
-            code: The javascript code to run.
-
-            callback: The callback to call with the result, or None.
-
-            world: A world ID (int or usertypes.JsWorld member) to run the JS
-
-                   in the main world or in another isolated world.
 
         """
 
-        raise NotImplementedError
+        vdi_recs_start = self._list_vdis()
+
+        stubs.stubout_create_vm(self.stubs)
+
+        self.assertRaises(xenapi_fake.Failure,
+
+                          self._test_spawn, 1, 2, 3)
+
+        # No additional VDI should be found.
+
+        vdi_recs_end = self._list_vdis()
+
+        self._check_vdis(vdi_recs_start, vdi_recs_end)
 
 
 
-    def title(self) -> str:
+    @stub_vm_utils_with_vdi_attached_here
 
-        raise NotImplementedError
+    def test_spawn_raw_glance(self):
 
+        self._test_spawn(IMAGE_RAW, None, None)
 
-
-    def icon(self) -> None:
-
-        raise NotImplementedError
+        self.check_vm_params_for_linux()
 
 
 
-    def set_html(self, html: str, base_url: QUrl = QUrl()) -> None:
+    def test_spawn_vhd_glance_linux(self):
 
-        raise NotImplementedError
+        self._test_spawn(IMAGE_VHD, None, None,
+
+                         os_type="linux", architecture="x86-64")
+
+        self.check_vm_params_for_linux()
 
 
 
-    def __repr__(self) -> str:
+    def test_spawn_vhd_glance_swapdisk(self):
+
+        # Change the default host_call_plugin to one that'll return
+
+        # a swap disk
+
+        orig_func = stubs.FakeSessionForVMTests.host_call_plugin
+
+        _host_call_plugin = stubs.FakeSessionForVMTests.host_call_plugin_swap
+
+        stubs.FakeSessionForVMTests.host_call_plugin = _host_call_plugin
+
+        # Stubbing out firewall driver as previous stub sets a particular
+
+        # stub for async plugin calls
+
+        stubs.stubout_firewall_driver(self.stubs, self.conn)
 
         try:
 
-            qurl = self.url()
+            # We'll steal the above glance linux test
 
-            url = qurl.toDisplayString(QUrl.EncodeUnicode)  # type: ignore
+            self.test_spawn_vhd_glance_linux()
 
-        except (AttributeError, RuntimeError) as exc:
+        finally:
 
-            url = '<{}>'.format(exc.__class__.__name__)
+            # Make sure to put this back
 
-        else:
-
-            url = utils.elide(url, 100)
-
-        return utils.get_repr(self, tab_id=self.tab_id, url=url)
+            stubs.FakeSessionForVMTests.host_call_plugin = orig_func
 
 
 
-    def is_deleted(self) -> bool:
+        # We should have 2 VBDs.
 
-        assert self._widget is not None
+        self.assertEqual(len(self.vm['VBDs']), 2)
 
-        return sip.isdeleted(self._widget)
+        # Now test that we have 1.
+
+        self.tearDown()
+
+        self.setUp()
+
+        self.test_spawn_vhd_glance_linux()
+
+        self.assertEqual(len(self.vm['VBDs']), 1)
+
+
+
+    def test_spawn_vhd_glance_windows(self):
+
+        self._test_spawn(IMAGE_VHD, None, None,
+
+                         os_type="windows", architecture="i386")
+
+        self.check_vm_params_for_windows()
+
+
+
+    def test_spawn_iso_glance(self):
+
+        self._test_spawn(IMAGE_ISO, None, None,
+
+                         os_type="windows", architecture="i386")
+
+        self.check_vm_params_for_windows()
+
+
+
+    def test_spawn_glance(self):
+
+        stubs.stubout_fetch_disk_image(self.stubs)
+
+        self._test_spawn(IMAGE_MACHINE,
+
+                         IMAGE_KERNEL,
+
+                         IMAGE_RAMDISK)
+
+        self.check_vm_params_for_linux_with_external_kernel()
+
+
+
+    def test_spawn_netinject_file(self):
+
+        self.flags(flat_injected=True)
+
+        db_fakes.stub_out_db_instance_api(self.stubs, injected=True)
+
+
+
+        self._tee_executed = False
+
+
+
+        def _tee_handler(cmd, **kwargs):
+
+            input = kwargs.get('process_input', None)
+
+            self.assertNotEqual(input, None)
+
+            config = [line.strip() for line in input.split("\n")]
+
+            # Find the start of eth0 configuration and check it
+
+            index = config.index('auto eth0')
+
+            self.assertEquals(config[index + 1:index + 8], [
+
+                'iface eth0 inet static',
+
+                'address 192.168.1.100',
+
+                'netmask 255.255.255.0',
+
+                'broadcast 192.168.1.255',
+
+                'gateway 192.168.1.1',
+
+                'dns-nameservers 192.168.1.3 192.168.1.4',
+
+                ''])
+
+            self._tee_executed = True
+
+            return '', ''
+
+
+
+        def _readlink_handler(cmd_parts, **kwargs):
+
+            return os.path.realpath(cmd_parts[2]), ''
+
+
+
+        fake_utils.fake_execute_set_repliers([
+
+            # Capture the tee .../etc/network/interfaces command
+
+            (r'tee.*interfaces', _tee_handler),
+
+            (r'readlink -nm.*', _readlink_handler),
+
+        ])
+
+        self._test_spawn(IMAGE_MACHINE,
+
+                         IMAGE_KERNEL,
+
+                         IMAGE_RAMDISK,
+
+                         check_injection=True)
+
+        self.assertTrue(self._tee_executed)
+
+
+
+    def test_spawn_netinject_xenstore(self):
+
+        db_fakes.stub_out_db_instance_api(self.stubs, injected=True)
+
+
+
+        self._tee_executed = False
+
+
+
+        def _mount_handler(cmd, *ignore_args, **ignore_kwargs):
+
+            # When mounting, create real files under the mountpoint to simulate
+
+            # files in the mounted filesystem
+
+
+
+            # mount point will be the last item of the command list
+
+            self._tmpdir = cmd[len(cmd) - 1]
+
+            LOG.debug(_('Creating files in %s to simulate guest agent'),
+
+                      self._tmpdir)
+
+            os.makedirs(os.path.join(self._tmpdir, 'usr', 'sbin'))
+
+            # Touch the file using open
+
+            open(os.path.join(self._tmpdir, 'usr', 'sbin',
+
+                'xe-update-networking'), 'w').close()
+
+            return '', ''
+
+
+
+        def _umount_handler(cmd, *ignore_args, **ignore_kwargs):
+
+            # Umount would normall make files in the m,ounted filesystem
+
+            # disappear, so do that here
+
+            LOG.debug(_('Removing simulated guest agent files in %s'),
+
+                      self._tmpdir)
+
+            os.remove(os.path.join(self._tmpdir, 'usr', 'sbin',
+
+                'xe-update-networking'))
+
+            os.rmdir(os.path.join(self._tmpdir, 'usr', 'sbin'))
+
+            os.rmdir(os.path.join(self._tmpdir, 'usr'))
+
+            return '', ''
+
+
+
+        def _tee_handler(cmd, *ignore_args, **ignore_kwargs):
+
+            self._tee_executed = True
+
+            return '', ''
+
+
+
+        fake_utils.fake_execute_set_repliers([
+
+            (r'mount', _mount_handler),
+
+            (r'umount', _umount_handler),
+
+            (r'tee.*interfaces', _tee_handler)])
+
+        self._test_spawn(1, 2, 3, check_injection=True)
+
+
+
+        # tee must not run in this case, where an injection-capable
+
+        # guest agent is detected
+
+        self.assertFalse(self._tee_executed)
+
+
+
+    def test_spawn_vlanmanager(self):
+
+        self.flags(network_manager='nova.network.manager.VlanManager',
+
+                   vlan_interface='fake0')
+
+
+
+        def dummy(*args, **kwargs):
+
+            pass
+
+
+
+        self.stubs.Set(vmops.VMOps, '_create_vifs', dummy)
+
+        # Reset network table
+
+        xenapi_fake.reset_table('network')
+
+        # Instance id = 2 will use vlan network (see db/fakes.py)
+
+        ctxt = self.context.elevated()
+
+        instance = self._create_instance(2, False)
+
+        networks = self.network.db.network_get_all(ctxt)
+
+        for network in networks:
+
+            self.network.set_network_host(ctxt, network)
+
+
+
+        self.network.allocate_for_instance(ctxt,
+
+                          instance_id=2,
+
+                          instance_uuid='00000000-0000-0000-0000-000000000002',
+
+                          host=FLAGS.host,
+
+                          vpn=None,
+
+                          rxtx_factor=3,
+
+                          project_id=self.project_id)
+
+        self._test_spawn(IMAGE_MACHINE,
+
+                         IMAGE_KERNEL,
+
+                         IMAGE_RAMDISK,
+
+                         instance_id=2,
+
+                         create_record=False)
+
+        # TODO(salvatore-orlando): a complete test here would require
+
+        # a check for making sure the bridge for the VM's VIF is
+
+        # consistent with bridge specified in nova db
+
+
+
+    def test_spawn_with_network_qos(self):
+
+        self._create_instance()
+
+        for vif_ref in xenapi_fake.get_all('VIF'):
+
+            vif_rec = xenapi_fake.get_record('VIF', vif_ref)
+
+            self.assertEquals(vif_rec['qos_algorithm_type'], 'ratelimit')
+
+            self.assertEquals(vif_rec['qos_algorithm_params']['kbps'],
+
+                              str(3 * 10 * 1024))
+
+
+
+    def test_rescue(self):
+
+        instance = self._create_instance()
+
+        session = xenapi_conn.XenAPISession('test_url', 'root', 'test_pass')
+
+        vm_ref = vm_utils.lookup(session, instance.name)
+
+
+
+        swap_vdi_ref = xenapi_fake.create_vdi('swap', None)
+
+        root_vdi_ref = xenapi_fake.create_vdi('root', None)
+
+
+
+        xenapi_fake.create_vbd(vm_ref, swap_vdi_ref, userdevice=1)
+
+        xenapi_fake.create_vbd(vm_ref, root_vdi_ref, userdevice=0)
+
+
+
+        conn = xenapi_conn.XenAPIDriver(False)
+
+        image_meta = {'id': IMAGE_VHD,
+
+                      'disk_format': 'vhd'}
+
+        conn.rescue(self.context, instance, [], image_meta)
+
+
+
+        vm = xenapi_fake.get_record('VM', vm_ref)
+
+        rescue_name = "%s-rescue" % vm["name_label"]
+
+        rescue_ref = vm_utils.lookup(session, rescue_name)
+
+        rescue_vm = xenapi_fake.get_record('VM', rescue_ref)
+
+
+
+        vdi_uuids = []
+
+        for vbd_uuid in rescue_vm["VBDs"]:
+
+            vdi_uuids.append(xenapi_fake.get_record('VBD', vbd_uuid)["VDI"])
+
+        self.assertTrue("swap" not in vdi_uuids)
+
+
+
+    def test_unrescue(self):
+
+        instance = self._create_instance()
+
+        conn = xenapi_conn.XenAPIDriver(False)
+
+        # Unrescue expects the original instance to be powered off
+
+        conn.power_off(instance)
+
+        rescue_vm = xenapi_fake.create_vm(instance.name + '-rescue', 'Running')
+
+        conn.unrescue(instance, None)
+
+
+
+    def test_unrescue_not_in_rescue(self):
+
+        instance = self._create_instance()
+
+        conn = xenapi_conn.XenAPIDriver(False)
+
+        # Ensure that it will not unrescue a non-rescued instance.
+
+        self.assertRaises(exception.InstanceNotInRescueMode, conn.unrescue,
+
+                          instance, None)
+
+
+
+    def test_finish_revert_migration(self):
+
+        instance = self._create_instance()
+
+
+
+        class VMOpsMock():
+
+
+
+            def __init__(self):
+
+                self.finish_revert_migration_called = False
+
+
+
+            def finish_revert_migration(self, instance):
+
+                self.finish_revert_migration_called = True
+
+
+
+        conn = xenapi_conn.XenAPIDriver(False)
+
+        conn._vmops = VMOpsMock()
+
+        conn.finish_revert_migration(instance, None)
+
+        self.assertTrue(conn._vmops.finish_revert_migration_called)
+
+
+
+    def test_reboot_hard(self):
+
+        instance = self._create_instance()
+
+        conn = xenapi_conn.XenAPIDriver(False)
+
+        conn.reboot(instance, None, "HARD")
+
+
+
+    def test_reboot_soft(self):
+
+        instance = self._create_instance()
+
+        conn = xenapi_conn.XenAPIDriver(False)
+
+        conn.reboot(instance, None, "SOFT")
+
+
+
+    def test_reboot_halted(self):
+
+        session = xenapi_conn.XenAPISession('test_url', 'root', 'test_pass')
+
+        instance = self._create_instance(spawn=False)
+
+        conn = xenapi_conn.XenAPIDriver(False)
+
+        xenapi_fake.create_vm(instance.name, 'Halted')
+
+        conn.reboot(instance, None, "SOFT")
+
+        vm_ref = vm_utils.lookup(session, instance.name)
+
+        vm = xenapi_fake.get_record('VM', vm_ref)
+
+        self.assertEquals(vm['power_state'], 'Running')
+
+
+
+    def test_reboot_unknown_state(self):
+
+        instance = self._create_instance(spawn=False)
+
+        conn = xenapi_conn.XenAPIDriver(False)
+
+        xenapi_fake.create_vm(instance.name, 'Unknown')
+
+        self.assertRaises(xenapi_fake.Failure, conn.reboot, instance,
+
+                None, "SOFT")
+
+
+
+    def _create_instance(self, instance_id=1, spawn=True):
+
+        """Creates and spawns a test instance."""
+
+        instance_values = {
+
+            'id': instance_id,
+
+            'uuid': '00000000-0000-0000-0000-00000000000%d' % instance_id,
+
+            'project_id': self.project_id,
+
+            'user_id': self.user_id,
+
+            'image_ref': 1,
+
+            'kernel_id': 2,
+
+            'ramdisk_id': 3,
+
+            'root_gb': 20,
+
+            'instance_type_id': '3',  # m1.large
+
+            'os_type': 'linux',
+
+            'vm_mode': 'hvm',
+
+            'architecture': 'x86-64'}
+
+        instance = db.instance_create(self.context, instance_values)
+
+        network_info = fake_network.fake_get_instance_nw_info(self.stubs,
+
+                                                              spectacular=True)
+
+        image_meta = {'id': IMAGE_VHD,
+
+                      'disk_format': 'vhd'}
+
+        if spawn:
+
+            instance.admin_pass = 'herp'
+
+            self.conn.spawn(self.context, instance, image_meta, network_info)
+
+        return instance
+
+
+
+
+
+class XenAPIDiffieHellmanTestCase(test.TestCase):
+
+    """Unit tests for Diffie-Hellman code."""
+
+    def setUp(self):
+
+        super(XenAPIDiffieHellmanTestCase, self).setUp()
+
+        self.alice = agent.SimpleDH()
+
+        self.bob = agent.SimpleDH()
+
+
+
+    def test_shared(self):
+
+        alice_pub = self.alice.get_public()
+
+        bob_pub = self.bob.get_public()
+
+        alice_shared = self.alice.compute_shared(bob_pub)
+
+        bob_shared = self.bob.compute_shared(alice_pub)
+
+        self.assertEquals(alice_shared, bob_shared)
+
+
+
+    def _test_encryption(self, message):
+
+        enc = self.alice.encrypt(message)
+
+        self.assertFalse(enc.endswith('\n'))
+
+        dec = self.bob.decrypt(enc)
+
+        self.assertEquals(dec, message)
+
+
+
+    def test_encrypt_simple_message(self):
+
+        self._test_encryption('This is a simple message.')
+
+
+
+    def test_encrypt_message_with_newlines_at_end(self):
+
+        self._test_encryption('This message has a newline at the end.\n')
+
+
+
+    def test_encrypt_many_newlines_at_end(self):
+
+        self._test_encryption('Message with lotsa newlines.\n\n\n')
+
+
+
+    def test_encrypt_newlines_inside_message(self):
+
+        self._test_encryption('Message\nwith\ninterior\nnewlines.')
+
+
+
+    def test_encrypt_with_leading_newlines(self):
+
+        self._test_encryption('\n\nMessage with leading newlines.')
+
+
+
+    def test_encrypt_really_long_message(self):
+
+        self._test_encryption(''.join(['abcd' for i in xrange(1024)]))
+
+
+
+
+
+class XenAPIMigrateInstance(stubs.XenAPITestBase):
+
+    """Unit test for verifying migration-related actions."""
+
+
+
+    def setUp(self):
+
+        super(XenAPIMigrateInstance, self).setUp()
+
+        self.flags(xenapi_connection_url='test_url',
+
+                   xenapi_connection_password='test_pass',
+
+                   firewall_driver='nova.virt.xenapi.firewall.'
+
+                                   'Dom0IptablesFirewallDriver')
+
+        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+
+        db_fakes.stub_out_db_instance_api(self.stubs)
+
+        xenapi_fake.create_network('fake', FLAGS.flat_network_bridge)
+
+        self.user_id = 'fake'
+
+        self.project_id = 'fake'
+
+        self.context = context.RequestContext(self.user_id, self.project_id)
+
+        self.instance_values = {'id': 1,
+
+                  'project_id': self.project_id,
+
+                  'user_id': self.user_id,
+
+                  'image_ref': 1,
+
+                  'kernel_id': None,
+
+                  'ramdisk_id': None,
+
+                  'root_gb': 5,
+
+                  'instance_type_id': '3',  # m1.large
+
+                  'os_type': 'linux',
+
+                  'architecture': 'x86-64'}
+
+
+
+        migration_values = {
+
+            'source_compute': 'nova-compute',
+
+            'dest_compute': 'nova-compute',
+
+            'dest_host': '10.127.5.114',
+
+            'status': 'post-migrating',
+
+            'instance_uuid': '15f23e6a-cc6e-4d22-b651-d9bdaac316f7',
+
+            'old_instance_type_id': 5,
+
+            'new_instance_type_id': 1
+
+        }
+
+        self.migration = db.migration_create(
+
+            context.get_admin_context(), migration_values)
+
+
+
+        fake_utils.stub_out_utils_execute(self.stubs)
+
+        stubs.stub_out_migration_methods(self.stubs)
+
+        stubs.stubout_get_this_vm_uuid(self.stubs)
+
+
+
+        def fake_inject_instance_metadata(self, instance, vm):
+
+            pass
+
+        self.stubs.Set(vmops.VMOps, 'inject_instance_metadata',
+
+                       fake_inject_instance_metadata)
+
+
+
+    def test_resize_xenserver_6(self):
+
+        instance = db.instance_create(self.context, self.instance_values)
+
+        called = {'resize': False}
+
+
+
+        def fake_vdi_resize(*args, **kwargs):
+
+            called['resize'] = True
+
+
+
+        self.stubs.Set(stubs.FakeSessionForVMTests,
+
+                       "VDI_resize", fake_vdi_resize)
+
+        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests,
+
+                              product_version=(6, 0, 0),
+
+                              product_brand='XenServer')
+
+        conn = xenapi_conn.XenAPIDriver(False)
+
+        vdi_ref = xenapi_fake.create_vdi('hurr', 'fake')
+
+        vdi_uuid = xenapi_fake.get_record('VDI', vdi_ref)['uuid']
+
+        conn._vmops._resize_instance(instance,
+
+                                     {'uuid': vdi_uuid, 'ref': vdi_ref})
+
+        self.assertEqual(called['resize'], True)
+
+
+
+    def test_resize_xcp(self):
+
+        instance = db.instance_create(self.context, self.instance_values)
+
+        called = {'resize': False}
+
+
+
+        def fake_vdi_resize(*args, **kwargs):
+
+            called['resize'] = True
+
+
+
+        self.stubs.Set(stubs.FakeSessionForVMTests,
+
+                       "VDI_resize", fake_vdi_resize)
+
+        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests,
+
+                              product_version=(1, 4, 99),
+
+                              product_brand='XCP')
+
+        conn = xenapi_conn.XenAPIDriver(False)
+
+        vdi_ref = xenapi_fake.create_vdi('hurr', 'fake')
+
+        vdi_uuid = xenapi_fake.get_record('VDI', vdi_ref)['uuid']
+
+        conn._vmops._resize_instance(instance,
+
+                                     {'uuid': vdi_uuid, 'ref': vdi_ref})
+
+        self.assertEqual(called['resize'], True)
+
+
+
+    def test_migrate_disk_and_power_off(self):
+
+        instance = db.instance_create(self.context, self.instance_values)
+
+        xenapi_fake.create_vm(instance.name, 'Running')
+
+        instance_type = db.instance_type_get_by_name(self.context, 'm1.large')
+
+        conn = xenapi_conn.XenAPIDriver(False)
+
+        conn.migrate_disk_and_power_off(self.context, instance,
+
+                                        '127.0.0.1', instance_type, None)
+
+
+
+    def test_migrate_disk_and_power_off(self):
+
+        instance = db.instance_create(self.context, self.instance_values)
+
+        xenapi_fake.create_vm(instance.name, 'Running')
+
+        instance_type = db.instance_type_get_by_name(self.context, 'm1.large')
+
+        conn = xenapi_conn.XenAPIDriver(False)
+
+        conn.migrate_disk_and_power_off(self.context, instance,
+
+                                        '127.0.0.1', instance_type, None)
+
+
+
+    def test_migrate_disk_and_power_off_passes_exceptions(self):
+
+        instance = db.instance_create(self.context, self.instance_values)
+
+        xenapi_fake.create_vm(instance.name, 'Running')
+
+        instance_type = db.instance_type_get_by_name(self.context, 'm1.large')
+
+
+
+        def fake_raise(*args, **kwargs):
+
+            raise exception.MigrationError(reason='test failure')
+
+        self.stubs.Set(vmops.VMOps, "_migrate_vhd", fake_raise)
+
+
+
+        conn = xenapi_conn.XenAPIDriver(False)
+
+        self.assertRaises(exception.MigrationError,
+
+                          conn.migrate_disk_and_power_off,
+
+                          self.context, instance,
+
+                          '127.0.0.1', instance_type, None)
+
+
+
+    def test_revert_migrate(self):
+
+        instance = db.instance_create(self.context, self.instance_values)
+
+        self.called = False
+
+        self.fake_vm_start_called = False
+
+        self.fake_finish_revert_migration_called = False
+
+
+
+        def fake_vm_start(*args, **kwargs):
+
+            self.fake_vm_start_called = True
+
+
+
+        def fake_vdi_resize(*args, **kwargs):
+
+            self.called = True
+
+
+
+        def fake_finish_revert_migration(*args, **kwargs):
+
+            self.fake_finish_revert_migration_called = True
+
+
+
+        self.stubs.Set(stubs.FakeSessionForVMTests,
+
+                       "VDI_resize_online", fake_vdi_resize)
+
+        self.stubs.Set(vmops.VMOps, '_start', fake_vm_start)
+
+        self.stubs.Set(vmops.VMOps, 'finish_revert_migration',
+
+                       fake_finish_revert_migration)
+
+        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests,
+
+                              product_version=(4, 0, 0),
+
+                              product_brand='XenServer')
+
+
+
+        conn = xenapi_conn.XenAPIDriver(False)
+
+        network_info = fake_network.fake_get_instance_nw_info(self.stubs,
+
+                                                              spectacular=True)
+
+        image_meta = {'id': instance.image_ref, 'disk_format': 'vhd'}
+
+        base = xenapi_fake.create_vdi('hurr', 'fake')
+
+        base_uuid = xenapi_fake.get_record('VDI', base)['uuid']
+
+        cow = xenapi_fake.create_vdi('durr', 'fake')
+
+        cow_uuid = xenapi_fake.get_record('VDI', cow)['uuid']
+
+        conn.finish_migration(self.context, self.migration, instance,
+
+                              dict(base_copy=base_uuid, cow=cow_uuid),
+
+                              network_info, image_meta, resize_instance=True)
+
+        self.assertEqual(self.called, True)
+
+        self.assertEqual(self.fake_vm_start_called, True)
+
+
+
+        conn.finish_revert_migration(instance, network_info)
+
+        self.assertEqual(self.fake_finish_revert_migration_called, True)
+
+
+
+    def test_finish_migrate(self):
+
+        instance = db.instance_create(self.context, self.instance_values)
+
+        self.called = False
+
+        self.fake_vm_start_called = False
+
+
+
+        def fake_vm_start(*args, **kwargs):
+
+            self.fake_vm_start_called = True
+
+
+
+        def fake_vdi_resize(*args, **kwargs):
+
+            self.called = True
+
+
+
+        self.stubs.Set(vmops.VMOps, '_start', fake_vm_start)
+
+        self.stubs.Set(stubs.FakeSessionForVMTests,
+
+                       "VDI_resize_online", fake_vdi_resize)
+
+        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests,
+
+                              product_version=(4, 0, 0),
+
+                              product_brand='XenServer')
+
+
+
+        conn = xenapi_conn.XenAPIDriver(False)
+
+        network_info = fake_network.fake_get_instance_nw_info(self.stubs,
+
+                                                              spectacular=True)
+
+        image_meta = {'id': instance.image_ref, 'disk_format': 'vhd'}
+
+        conn.finish_migration(self.context, self.migration, instance,
+
+                              dict(base_copy='hurr', cow='durr'),
+
+                              network_info, image_meta, resize_instance=True)
+
+        self.assertEqual(self.called, True)
+
+        self.assertEqual(self.fake_vm_start_called, True)
+
+
+
+    def test_finish_migrate_no_local_storage(self):
+
+        tiny_type = instance_types.get_instance_type_by_name('m1.tiny')
+
+        tiny_type_id = tiny_type['id']
+
+        self.instance_values.update({'instance_type_id': tiny_type_id,
+
+                                     'root_gb': 0})
+
+        instance = db.instance_create(self.context, self.instance_values)
+
+
+
+        def fake_vdi_resize(*args, **kwargs):
+
+            raise Exception("This shouldn't be called")
+
+
+
+        self.stubs.Set(stubs.FakeSessionForVMTests,
+
+                       "VDI_resize_online", fake_vdi_resize)
+
+        conn = xenapi_conn.XenAPIDriver(False)
+
+        network_info = fake_network.fake_get_instance_nw_info(self.stubs,
+
+                                                              spectacular=True)
+
+        image_meta = {'id': instance.image_ref, 'disk_format': 'vhd'}
+
+        conn.finish_migration(self.context, self.migration, instance,
+
+                              dict(base_copy='hurr', cow='durr'),
+
+                              network_info, image_meta, resize_instance=True)
+
+
+
+    def test_finish_migrate_no_resize_vdi(self):
+
+        instance = db.instance_create(self.context, self.instance_values)
+
+
+
+        def fake_vdi_resize(*args, **kwargs):
+
+            raise Exception("This shouldn't be called")
+
+
+
+        self.stubs.Set(stubs.FakeSessionForVMTests,
+
+                       "VDI_resize_online", fake_vdi_resize)
+
+        conn = xenapi_conn.XenAPIDriver(False)
+
+        network_info = fake_network.fake_get_instance_nw_info(self.stubs,
+
+                                                              spectacular=True)
+
+        # Resize instance would be determined by the compute call
+
+        image_meta = {'id': instance.image_ref, 'disk_format': 'vhd'}
+
+        conn.finish_migration(self.context, self.migration, instance,
+
+                              dict(base_copy='hurr', cow='durr'),
+
+                              network_info, image_meta, resize_instance=False)
+
+
+
+
+
+class XenAPIImageTypeTestCase(test.TestCase):
+
+    """Test ImageType class."""
+
+
+
+    def test_to_string(self):
+
+        """Can convert from type id to type string."""
+
+        self.assertEquals(
+
+            vm_utils.ImageType.to_string(vm_utils.ImageType.KERNEL),
+
+            vm_utils.ImageType.KERNEL_STR)
+
+
+
+    def test_from_string(self):
+
+        """Can convert from string to type id."""
+
+        self.assertEquals(
+
+            vm_utils.ImageType.from_string(vm_utils.ImageType.KERNEL_STR),
+
+            vm_utils.ImageType.KERNEL)
+
+
+
+
+
+class XenAPIDetermineDiskImageTestCase(test.TestCase):
+
+    """Unit tests for code that detects the ImageType."""
+
+    def assert_disk_type(self, image_meta, expected_disk_type):
+
+        actual = vm_utils.determine_disk_image_type(image_meta)
+
+        self.assertEqual(expected_disk_type, actual)
+
+
+
+    def test_machine(self):
+
+        image_meta = {'id': 'a', 'disk_format': 'ami'}
+
+        self.assert_disk_type(image_meta, vm_utils.ImageType.DISK)
+
+
+
+    def test_raw(self):
+
+        image_meta = {'id': 'a', 'disk_format': 'raw'}
+
+        self.assert_disk_type(image_meta, vm_utils.ImageType.DISK_RAW)
+
+
+
+    def test_vhd(self):
+
+        image_meta = {'id': 'a', 'disk_format': 'vhd'}
+
+        self.assert_disk_type(image_meta, vm_utils.ImageType.DISK_VHD)
+
+
+
+
+
+class CompareVersionTestCase(test.TestCase):
+
+    def test_less_than(self):
+
+        """Test that cmp_version compares a as less than b"""
+
+        self.assertTrue(vmops.cmp_version('1.2.3.4', '1.2.3.5') < 0)
+
+
+
+    def test_greater_than(self):
+
+        """Test that cmp_version compares a as greater than b"""
+
+        self.assertTrue(vmops.cmp_version('1.2.3.5', '1.2.3.4') > 0)
+
+
+
+    def test_equal(self):
+
+        """Test that cmp_version compares a as equal to b"""
+
+        self.assertTrue(vmops.cmp_version('1.2.3.4', '1.2.3.4') == 0)
+
+
+
+    def test_non_lexical(self):
+
+        """Test that cmp_version compares non-lexically"""
+
+        self.assertTrue(vmops.cmp_version('1.2.3.10', '1.2.3.4') > 0)
+
+
+
+    def test_length(self):
+
+        """Test that cmp_version compares by length as last resort"""
+
+        self.assertTrue(vmops.cmp_version('1.2.3', '1.2.3.4') < 0)
+
+
+
+
+
+class XenAPIHostTestCase(stubs.XenAPITestBase):
+
+    """Tests HostState, which holds metrics from XenServer that get
+
+    reported back to the Schedulers."""
+
+
+
+    def setUp(self):
+
+        super(XenAPIHostTestCase, self).setUp()
+
+        self.flags(xenapi_connection_url='test_url',
+
+                   xenapi_connection_password='test_pass')
+
+        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+
+        xenapi_fake.create_local_srs()
+
+        self.conn = xenapi_conn.XenAPIDriver(False)
+
+
+
+    def test_host_state(self):
+
+        stats = self.conn.get_host_stats()
+
+        self.assertEquals(stats['disk_total'], 10000)
+
+        self.assertEquals(stats['disk_used'], 20000)
+
+        self.assertEquals(stats['host_memory_total'], 10)
+
+        self.assertEquals(stats['host_memory_overhead'], 20)
+
+        self.assertEquals(stats['host_memory_free'], 30)
+
+        self.assertEquals(stats['host_memory_free_computed'], 40)
+
+
+
+    def _test_host_action(self, method, action, expected=None):
+
+        result = method('host', action)
+
+        if not expected:
+
+            expected = action
+
+        self.assertEqual(result, expected)
+
+
+
+    def test_host_reboot(self):
+
+        self._test_host_action(self.conn.host_power_action, 'reboot')
+
+
+
+    def test_host_shutdown(self):
+
+        self._test_host_action(self.conn.host_power_action, 'shutdown')
+
+
+
+    def test_host_startup(self):
+
+        self.assertRaises(NotImplementedError,
+
+                          self.conn.host_power_action, 'host', 'startup')
+
+
+
+    def test_host_maintenance_on(self):
+
+        self._test_host_action(self.conn.host_maintenance_mode,
+
+                               True, 'on_maintenance')
+
+
+
+    def test_host_maintenance_off(self):
+
+        self._test_host_action(self.conn.host_maintenance_mode,
+
+                               False, 'off_maintenance')
+
+
+
+    def test_set_enable_host_enable(self):
+
+        self._test_host_action(self.conn.set_host_enabled, True, 'enabled')
+
+
+
+    def test_set_enable_host_disable(self):
+
+        self._test_host_action(self.conn.set_host_enabled, False, 'disabled')
+
+
+
+    def test_get_host_uptime(self):
+
+        result = self.conn.get_host_uptime('host')
+
+        self.assertEqual(result, 'fake uptime')
+
+
+
+
+
+class XenAPIAutoDiskConfigTestCase(stubs.XenAPITestBase):
+
+    def setUp(self):
+
+        super(XenAPIAutoDiskConfigTestCase, self).setUp()
+
+        self.flags(xenapi_connection_url='test_url',
+
+                   xenapi_connection_password='test_pass',
+
+                   firewall_driver='nova.virt.xenapi.firewall.'
+
+                                   'Dom0IptablesFirewallDriver')
+
+        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+
+        self.conn = xenapi_conn.XenAPIDriver(False)
+
+
+
+        self.user_id = 'fake'
+
+        self.project_id = 'fake'
+
+
+
+        self.instance_values = {'id': 1,
+
+                  'project_id': self.project_id,
+
+                  'user_id': self.user_id,
+
+                  'image_ref': 1,
+
+                  'kernel_id': 2,
+
+                  'ramdisk_id': 3,
+
+                  'root_gb': 20,
+
+                  'instance_type_id': '3',  # m1.large
+
+                  'os_type': 'linux',
+
+                  'architecture': 'x86-64'}
+
+
+
+        self.context = context.RequestContext(self.user_id, self.project_id)
+
+
+
+        def fake_create_vbd(session, vm_ref, vdi_ref, userdevice,
+
+                            vbd_type='disk', read_only=False, bootable=True):
+
+            pass
+
+
+
+        self.stubs.Set(vm_utils, 'create_vbd', fake_create_vbd)
+
+
+
+    def assertIsPartitionCalled(self, called):
+
+        marker = {"partition_called": False}
+
+
+
+        def fake_resize_part_and_fs(dev, start, old, new):
+
+            marker["partition_called"] = True
+
+        self.stubs.Set(vm_utils, "_resize_part_and_fs",
+
+                       fake_resize_part_and_fs)
+
+
+
+        ctx = context.RequestContext(self.user_id, self.project_id)
+
+        session = xenapi_conn.XenAPISession('test_url', 'root', 'test_pass')
+
+
+
+        disk_image_type = vm_utils.ImageType.DISK_VHD
+
+        instance = db.instance_create(self.context, self.instance_values)
+
+        vm_ref = xenapi_fake.create_vm(instance['name'], 'Halted')
+
+        vdi_ref = xenapi_fake.create_vdi(instance['name'], 'fake')
+
+
+
+        vdi_uuid = session.call_xenapi('VDI.get_record', vdi_ref)['uuid']
+
+        vdis = {'root': {'uuid': vdi_uuid, 'ref': vdi_ref}}
+
+
+
+        self.conn._vmops._attach_disks(instance, vm_ref, instance['name'],
+
+                                       disk_image_type, vdis)
+
+
+
+        self.assertEqual(marker["partition_called"], called)
+
+
+
+    def test_instance_not_auto_disk_config(self):
+
+        """Should not partition unless instance is marked as
+
+        auto_disk_config.
+
+        """
+
+        self.instance_values['auto_disk_config'] = False
+
+        self.assertIsPartitionCalled(False)
+
+
+
+    @stub_vm_utils_with_vdi_attached_here
+
+    def test_instance_auto_disk_config_doesnt_pass_fail_safes(self):
+
+        """Should not partition unless fail safes pass"""
+
+        self.instance_values['auto_disk_config'] = True
+
+
+
+        def fake_get_partitions(dev):
+
+            return [(1, 0, 100, 'ext4'), (2, 100, 200, 'ext4')]
+
+        self.stubs.Set(vm_utils, "_get_partitions",
+
+                       fake_get_partitions)
+
+
+
+        self.assertIsPartitionCalled(False)
+
+
+
+    @stub_vm_utils_with_vdi_attached_here
+
+    def test_instance_auto_disk_config_passes_fail_safes(self):
+
+        """Should partition if instance is marked as auto_disk_config=True and
+
+        virt-layer specific fail-safe checks pass.
+
+        """
+
+        self.instance_values['auto_disk_config'] = True
+
+
+
+        def fake_get_partitions(dev):
+
+            return [(1, 0, 100, 'ext4')]
+
+        self.stubs.Set(vm_utils, "_get_partitions",
+
+                       fake_get_partitions)
+
+
+
+        self.assertIsPartitionCalled(True)
+
+
+
+
+
+class XenAPIGenerateLocal(stubs.XenAPITestBase):
+
+    """Test generating of local disks, like swap and ephemeral"""
+
+    def setUp(self):
+
+        super(XenAPIGenerateLocal, self).setUp()
+
+        self.flags(xenapi_connection_url='test_url',
+
+                   xenapi_connection_password='test_pass',
+
+                   xenapi_generate_swap=True,
+
+                   firewall_driver='nova.virt.xenapi.firewall.'
+
+                                   'Dom0IptablesFirewallDriver')
+
+        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+
+        db_fakes.stub_out_db_instance_api(self.stubs)
+
+        self.conn = xenapi_conn.XenAPIDriver(False)
+
+
+
+        self.user_id = 'fake'
+
+        self.project_id = 'fake'
+
+
+
+        self.instance_values = {'id': 1,
+
+                  'project_id': self.project_id,
+
+                  'user_id': self.user_id,
+
+                  'image_ref': 1,
+
+                  'kernel_id': 2,
+
+                  'ramdisk_id': 3,
+
+                  'root_gb': 20,
+
+                  'instance_type_id': '3',  # m1.large
+
+                  'os_type': 'linux',
+
+                  'architecture': 'x86-64'}
+
+
+
+        self.context = context.RequestContext(self.user_id, self.project_id)
+
+
+
+        def fake_create_vbd(session, vm_ref, vdi_ref, userdevice,
+
+                            vbd_type='disk', read_only=False, bootable=True):
+
+            pass
+
+
+
+        self.stubs.Set(vm_utils, 'create_vbd', fake_create_vbd)
+
+
+
+    def assertCalled(self, instance):
+
+        ctx = context.RequestContext(self.user_id, self.project_id)
+
+        session = xenapi_conn.XenAPISession('test_url', 'root', 'test_pass')
+
+
+
+        disk_image_type = vm_utils.ImageType.DISK_VHD
+
+        vm_ref = xenapi_fake.create_vm(instance['name'], 'Halted')
+
+        vdi_ref = xenapi_fake.create_vdi(instance['name'], 'fake')
+
+
+
+        vdi_uuid = session.call_xenapi('VDI.get_record', vdi_ref)['uuid']
+
+        vdis = {'root': {'uuid': vdi_uuid, 'ref': vdi_ref}}
+
+
+
+        self.called = False
+
+        self.conn._vmops._attach_disks(instance, vm_ref, instance['name'],
+
+                                       disk_image_type, vdis)
+
+        self.assertTrue(self.called)
+
+
+
+    def test_generate_swap(self):
+
+        """Test swap disk generation."""
+
+        instance = db.instance_create(self.context, self.instance_values)
+
+        instance = db.instance_update(self.context, instance['uuid'],
+
+                                      {'instance_type_id': 5})
+
+
+
+        def fake_generate_swap(*args, **kwargs):
+
+            self.called = True
+
+        self.stubs.Set(vm_utils, 'generate_swap', fake_generate_swap)
+
+
+
+        self.assertCalled(instance)
+
+
+
+    def test_generate_ephemeral(self):
+
+        """Test ephemeral disk generation."""
+
+        instance = db.instance_create(self.context, self.instance_values)
+
+        instance = db.instance_update(self.context, instance['uuid'],
+
+                                      {'instance_type_id': 4})
+
+
+
+        def fake_generate_ephemeral(*args):
+
+            self.called = True
+
+        self.stubs.Set(vm_utils, 'generate_ephemeral', fake_generate_ephemeral)
+
+
+
+        self.assertCalled(instance)
+
+
+
+
+
+class XenAPIBWUsageTestCase(stubs.XenAPITestBase):
+
+    def setUp(self):
+
+        super(XenAPIBWUsageTestCase, self).setUp()
+
+        self.stubs.Set(vm_utils, 'compile_metrics',
+
+                       XenAPIBWUsageTestCase._fake_compile_metrics)
+
+        self.flags(xenapi_connection_url='test_url',
+
+                   xenapi_connection_password='test_pass',
+
+                   firewall_driver='nova.virt.xenapi.firewall.'
+
+                                   'Dom0IptablesFirewallDriver')
+
+        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+
+        self.conn = xenapi_conn.XenAPIDriver(False)
+
+
+
+    @classmethod
+
+    def _fake_compile_metrics(cls, start_time, stop_time=None):
+
+        raise exception.CouldNotFetchMetrics()
+
+
+
+    def test_get_all_bw_usage_in_failure_case(self):
+
+        """Test that get_all_bw_usage returns an empty list when metrics
+
+        compilation failed.  c.f. bug #910045.
+
+        """
+
+        class testinstance(object):
+
+            def __init__(self):
+
+                self.name = "instance-0001"
+
+                self.uuid = "1-2-3-4-5"
+
+
+
+        result = self.conn.get_all_bw_usage([testinstance()],
+
+                                            timeutils.utcnow())
+
+        self.assertEqual(result, [])
+
+
+
+
+
+# TODO(salvatore-orlando): this class and
+
+# nova.tests.test_libvirt.IPTablesFirewallDriverTestCase share a lot of code.
+
+# Consider abstracting common code in a base class for firewall driver testing.
+
+class XenAPIDom0IptablesFirewallTestCase(stubs.XenAPITestBase):
+
+
+
+    _in_nat_rules = [
+
+      '# Generated by iptables-save v1.4.10 on Sat Feb 19 00:03:19 2011',
+
+      '*nat',
+
+      ':PREROUTING ACCEPT [1170:189210]',
+
+      ':INPUT ACCEPT [844:71028]',
+
+      ':OUTPUT ACCEPT [5149:405186]',
+
+      ':POSTROUTING ACCEPT [5063:386098]',
+
+    ]
+
+
+
+    _in_filter_rules = [
+
+      '# Generated by iptables-save v1.4.4 on Mon Dec  6 11:54:13 2010',
+
+      '*filter',
+
+      ':INPUT ACCEPT [969615:281627771]',
+
+      ':FORWARD ACCEPT [0:0]',
+
+      ':OUTPUT ACCEPT [915599:63811649]',
+
+      ':nova-block-ipv4 - [0:0]',
+
+      '-A INPUT -i virbr0 -p tcp -m tcp --dport 67 -j ACCEPT ',
+
+      '-A FORWARD -d 192.168.122.0/24 -o virbr0 -m state --state RELATED'
+
+      ',ESTABLISHED -j ACCEPT ',
+
+      '-A FORWARD -s 192.168.122.0/24 -i virbr0 -j ACCEPT ',
+
+      '-A FORWARD -i virbr0 -o virbr0 -j ACCEPT ',
+
+      '-A FORWARD -o virbr0 -j REJECT --reject-with icmp-port-unreachable ',
+
+      '-A FORWARD -i virbr0 -j REJECT --reject-with icmp-port-unreachable ',
+
+      'COMMIT',
+
+      '# Completed on Mon Dec  6 11:54:13 2010',
+
+    ]
+
+
+
+    _in6_filter_rules = [
+
+      '# Generated by ip6tables-save v1.4.4 on Tue Jan 18 23:47:56 2011',
+
+      '*filter',
+
+      ':INPUT ACCEPT [349155:75810423]',
+
+      ':FORWARD ACCEPT [0:0]',
+
+      ':OUTPUT ACCEPT [349256:75777230]',
+
+      'COMMIT',
+
+      '# Completed on Tue Jan 18 23:47:56 2011',
+
+    ]
+
+
+
+    def setUp(self):
+
+        super(XenAPIDom0IptablesFirewallTestCase, self).setUp()
+
+        self.flags(xenapi_connection_url='test_url',
+
+                   xenapi_connection_password='test_pass',
+
+                   instance_name_template='%d',
+
+                   firewall_driver='nova.virt.xenapi.firewall.'
+
+                                   'Dom0IptablesFirewallDriver')
+
+        xenapi_fake.create_local_srs()
+
+        xenapi_fake.create_local_pifs()
+
+        self.user_id = 'mappin'
+
+        self.project_id = 'fake'
+
+        stubs.stubout_session(self.stubs, stubs.FakeSessionForFirewallTests,
+
+                              test_case=self)
+
+        self.context = context.RequestContext(self.user_id, self.project_id)
+
+        self.network = importutils.import_object(FLAGS.network_manager)
+
+        self.conn = xenapi_conn.XenAPIDriver(False)
+
+        self.fw = self.conn._vmops.firewall_driver
+
+
+
+    def _create_instance_ref(self):
+
+        return db.instance_create(self.context,
+
+                                  {'user_id': self.user_id,
+
+                                   'project_id': self.project_id,
+
+                                   'instance_type_id': 1})
+
+
+
+    def _create_test_security_group(self):
+
+        admin_ctxt = context.get_admin_context()
+
+        secgroup = db.security_group_create(admin_ctxt,
+
+                                {'user_id': self.user_id,
+
+                                 'project_id': self.project_id,
+
+                                 'name': 'testgroup',
+
+                                 'description': 'test group'})
+
+        db.security_group_rule_create(admin_ctxt,
+
+                                      {'parent_group_id': secgroup['id'],
+
+                                       'protocol': 'icmp',
+
+                                       'from_port': -1,
+
+                                       'to_port': -1,
+
+                                       'cidr': '192.168.11.0/24'})
+
+
+
+        db.security_group_rule_create(admin_ctxt,
+
+                                      {'parent_group_id': secgroup['id'],
+
+                                       'protocol': 'icmp',
+
+                                       'from_port': 8,
+
+                                       'to_port': -1,
+
+                                       'cidr': '192.168.11.0/24'})
+
+
+
+        db.security_group_rule_create(admin_ctxt,
+
+                                      {'parent_group_id': secgroup['id'],
+
+                                       'protocol': 'tcp',
+
+                                       'from_port': 80,
+
+                                       'to_port': 81,
+
+                                       'cidr': '192.168.10.0/24'})
+
+        return secgroup
+
+
+
+    def _validate_security_group(self):
+
+        in_rules = filter(lambda l: not l.startswith('#'),
+
+                          self._in_filter_rules)
+
+        for rule in in_rules:
+
+            if not 'nova' in rule:
+
+                self.assertTrue(rule in self._out_rules,
+
+                                'Rule went missing: %s' % rule)
+
+
+
+        instance_chain = None
+
+        for rule in self._out_rules:
+
+            # This is pretty crude, but it'll do for now
+
+            # last two octets change
+
+            if re.search('-d 192.168.[0-9]{1,3}.[0-9]{1,3} -j', rule):
+
+                instance_chain = rule.split(' ')[-1]
+
+                break
+
+        self.assertTrue(instance_chain, "The instance chain wasn't added")
+
+        security_group_chain = None
+
+        for rule in self._out_rules:
+
+            # This is pretty crude, but it'll do for now
+
+            if '-A %s -j' % instance_chain in rule:
+
+                security_group_chain = rule.split(' ')[-1]
+
+                break
+
+        self.assertTrue(security_group_chain,
+
+                        "The security group chain wasn't added")
+
+
+
+        regex = re.compile('-A .* -j ACCEPT -p icmp -s 192.168.11.0/24')
+
+        self.assertTrue(len(filter(regex.match, self._out_rules)) > 0,
+
+                        "ICMP acceptance rule wasn't added")
+
+
+
+        regex = re.compile('-A .* -j ACCEPT -p icmp -m icmp --icmp-type 8'
+
+                           ' -s 192.168.11.0/24')
+
+        self.assertTrue(len(filter(regex.match, self._out_rules)) > 0,
+
+                        "ICMP Echo Request acceptance rule wasn't added")
+
+
+
+        regex = re.compile('-A .* -j ACCEPT -p tcp --dport 80:81'
+
+                           ' -s 192.168.10.0/24')
+
+        self.assertTrue(len(filter(regex.match, self._out_rules)) > 0,
+
+                        "TCP port 80/81 acceptance rule wasn't added")
+
+
+
+    def test_static_filters(self):
+
+        instance_ref = self._create_instance_ref()
+
+        src_instance_ref = self._create_instance_ref()
+
+        admin_ctxt = context.get_admin_context()
+
+        secgroup = self._create_test_security_group()
+
+
+
+        src_secgroup = db.security_group_create(admin_ctxt,
+
+                                                {'user_id': self.user_id,
+
+                                                 'project_id': self.project_id,
+
+                                                 'name': 'testsourcegroup',
+
+                                                 'description': 'src group'})
+
+        db.security_group_rule_create(admin_ctxt,
+
+                                      {'parent_group_id': secgroup['id'],
+
+                                       'protocol': 'tcp',
+
+                                       'from_port': 80,
+
+                                       'to_port': 81,
+
+                                       'group_id': src_secgroup['id']})
+
+
+
+        db.instance_add_security_group(admin_ctxt, instance_ref['uuid'],
+
+                                       secgroup['id'])
+
+        db.instance_add_security_group(admin_ctxt, src_instance_ref['uuid'],
+
+                                       src_secgroup['id'])
+
+        instance_ref = db.instance_get(admin_ctxt, instance_ref['id'])
+
+        src_instance_ref = db.instance_get(admin_ctxt, src_instance_ref['id'])
+
+
+
+        network_model = fake_network.fake_get_instance_nw_info(self.stubs,
+
+                                                      1, spectacular=True)
+
+
+
+        fake_network.stub_out_nw_api_get_instance_nw_info(self.stubs,
+
+                                      lambda *a, **kw: network_model)
+
+
+
+        network_info = network_model.legacy()
+
+        self.fw.prepare_instance_filter(instance_ref, network_info)
+
+        self.fw.apply_instance_filter(instance_ref, network_info)
+
+
+
+        self._validate_security_group()
+
+        # Extra test for TCP acceptance rules
+
+        for ip in network_model.fixed_ips():
+
+            if ip['version'] != 4:
+
+                continue
+
+            regex = re.compile('-A .* -j ACCEPT -p tcp'
+
+                               ' --dport 80:81 -s %s' % ip['address'])
+
+            self.assertTrue(len(filter(regex.match, self._out_rules)) > 0,
+
+                            "TCP port 80/81 acceptance rule wasn't added")
+
+
+
+        db.instance_destroy(admin_ctxt, instance_ref['uuid'])
+
+
+
+    def test_filters_for_instance_with_ip_v6(self):
+
+        self.flags(use_ipv6=True)
+
+        network_info = fake_network.fake_get_instance_nw_info(self.stubs, 1)
+
+        rulesv4, rulesv6 = self.fw._filters_for_instance("fake", network_info)
+
+        self.assertEquals(len(rulesv4), 2)
+
+        self.assertEquals(len(rulesv6), 1)
+
+
+
+    def test_filters_for_instance_without_ip_v6(self):
+
+        self.flags(use_ipv6=False)
+
+        network_info = fake_network.fake_get_instance_nw_info(self.stubs, 1)
+
+        rulesv4, rulesv6 = self.fw._filters_for_instance("fake", network_info)
+
+        self.assertEquals(len(rulesv4), 2)
+
+        self.assertEquals(len(rulesv6), 0)
+
+
+
+    def test_multinic_iptables(self):
+
+        ipv4_rules_per_addr = 1
+
+        ipv4_addr_per_network = 2
+
+        ipv6_rules_per_addr = 1
+
+        ipv6_addr_per_network = 1
+
+        networks_count = 5
+
+        instance_ref = self._create_instance_ref()
+
+        _get_instance_nw_info = fake_network.fake_get_instance_nw_info
+
+        network_info = _get_instance_nw_info(self.stubs,
+
+                                             networks_count,
+
+                                             ipv4_addr_per_network)
+
+        ipv4_len = len(self.fw.iptables.ipv4['filter'].rules)
+
+        ipv6_len = len(self.fw.iptables.ipv6['filter'].rules)
+
+        inst_ipv4, inst_ipv6 = self.fw.instance_rules(instance_ref,
+
+                                                      network_info)
+
+        self.fw.prepare_instance_filter(instance_ref, network_info)
+
+        ipv4 = self.fw.iptables.ipv4['filter'].rules
+
+        ipv6 = self.fw.iptables.ipv6['filter'].rules
+
+        ipv4_network_rules = len(ipv4) - len(inst_ipv4) - ipv4_len
+
+        ipv6_network_rules = len(ipv6) - len(inst_ipv6) - ipv6_len
+
+        self.assertEquals(ipv4_network_rules,
+
+                  ipv4_rules_per_addr * ipv4_addr_per_network * networks_count)
+
+        self.assertEquals(ipv6_network_rules,
+
+                  ipv6_rules_per_addr * ipv6_addr_per_network * networks_count)
+
+
+
+    def test_do_refresh_security_group_rules(self):
+
+        admin_ctxt = context.get_admin_context()
+
+        instance_ref = self._create_instance_ref()
+
+        network_info = fake_network.fake_get_instance_nw_info(self.stubs, 1, 1)
+
+        secgroup = self._create_test_security_group()
+
+        db.instance_add_security_group(admin_ctxt, instance_ref['uuid'],
+
+                                       secgroup['id'])
+
+        self.fw.prepare_instance_filter(instance_ref, network_info)
+
+        self.fw.instances[instance_ref['id']] = instance_ref
+
+        self._validate_security_group()
+
+        # add a rule to the security group
+
+        db.security_group_rule_create(admin_ctxt,
+
+                                      {'parent_group_id': secgroup['id'],
+
+                                       'protocol': 'udp',
+
+                                       'from_port': 200,
+
+                                       'to_port': 299,
+
+                                       'cidr': '192.168.99.0/24'})
+
+        #validate the extra rule
+
+        self.fw.refresh_security_group_rules(secgroup)
+
+        regex = re.compile('-A .* -j ACCEPT -p udp --dport 200:299'
+
+                           ' -s 192.168.99.0/24')
+
+        self.assertTrue(len(filter(regex.match, self._out_rules)) > 0,
+
+                        "Rules were not updated properly."
+
+                        "The rule for UDP acceptance is missing")
+
+
+
+    def test_provider_firewall_rules(self):
+
+        # setup basic instance data
+
+        instance_ref = self._create_instance_ref()
+
+        # FRAGILE: as in libvirt tests
+
+        # peeks at how the firewall names chains
+
+        chain_name = 'inst-%s' % instance_ref['id']
+
+
+
+        network_info = fake_network.fake_get_instance_nw_info(self.stubs, 1, 1)
+
+        self.fw.prepare_instance_filter(instance_ref, network_info)
+
+        self.assertTrue('provider' in self.fw.iptables.ipv4['filter'].chains)
+
+        rules = [rule for rule in self.fw.iptables.ipv4['filter'].rules
+
+                      if rule.chain == 'provider']
+
+        self.assertEqual(0, len(rules))
+
+
+
+        admin_ctxt = context.get_admin_context()
+
+        # add a rule and send the update message, check for 1 rule
+
+        provider_fw0 = db.provider_fw_rule_create(admin_ctxt,
+
+                                                  {'protocol': 'tcp',
+
+                                                   'cidr': '10.99.99.99/32',
+
+                                                   'from_port': 1,
+
+                                                   'to_port': 65535})
+
+        self.fw.refresh_provider_fw_rules()
+
+        rules = [rule for rule in self.fw.iptables.ipv4['filter'].rules
+
+                      if rule.chain == 'provider']
+
+        self.assertEqual(1, len(rules))
+
+
+
+        # Add another, refresh, and make sure number of rules goes to two
+
+        provider_fw1 = db.provider_fw_rule_create(admin_ctxt,
+
+                                                  {'protocol': 'udp',
+
+                                                   'cidr': '10.99.99.99/32',
+
+                                                   'from_port': 1,
+
+                                                   'to_port': 65535})
+
+        self.fw.refresh_provider_fw_rules()
+
+        rules = [rule for rule in self.fw.iptables.ipv4['filter'].rules
+
+                      if rule.chain == 'provider']
+
+        self.assertEqual(2, len(rules))
+
+
+
+        # create the instance filter and make sure it has a jump rule
+
+        self.fw.prepare_instance_filter(instance_ref, network_info)
+
+        self.fw.apply_instance_filter(instance_ref, network_info)
+
+        inst_rules = [rule for rule in self.fw.iptables.ipv4['filter'].rules
+
+                           if rule.chain == chain_name]
+
+        jump_rules = [rule for rule in inst_rules if '-j' in rule.rule]
+
+        provjump_rules = []
+
+        # IptablesTable doesn't make rules unique internally
+
+        for rule in jump_rules:
+
+            if 'provider' in rule.rule and rule not in provjump_rules:
+
+                provjump_rules.append(rule)
+
+        self.assertEqual(1, len(provjump_rules))
+
+
+
+        # remove a rule from the db, cast to compute to refresh rule
+
+        db.provider_fw_rule_destroy(admin_ctxt, provider_fw1['id'])
+
+        self.fw.refresh_provider_fw_rules()
+
+        rules = [rule for rule in self.fw.iptables.ipv4['filter'].rules
+
+                      if rule.chain == 'provider']
+
+        self.assertEqual(1, len(rules))
+
+
+
+
+
+class XenAPISRSelectionTestCase(stubs.XenAPITestBase):
+
+    """Unit tests for testing we find the right SR."""
+
+    def test_safe_find_sr_raise_exception(self):
+
+        """Ensure StorageRepositoryNotFound is raise when wrong filter."""
+
+        self.flags(sr_matching_filter='yadayadayada')
+
+        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+
+        session = xenapi_conn.XenAPISession('test_url', 'root', 'test_pass')
+
+        self.assertRaises(exception.StorageRepositoryNotFound,
+
+                          vm_utils.safe_find_sr, session)
+
+
+
+    def test_safe_find_sr_local_storage(self):
+
+        """Ensure the default local-storage is found."""
+
+        self.flags(sr_matching_filter='other-config:i18n-key=local-storage')
+
+        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+
+        session = xenapi_conn.XenAPISession('test_url', 'root', 'test_pass')
+
+        host_ref = xenapi_fake.get_all('host')[0]
+
+        local_sr = xenapi_fake.create_sr(
+
+                              name_label='Fake Storage',
+
+                              type='lvm',
+
+                              other_config={'i18n-original-value-name_label':
+
+                                            'Local storage',
+
+                                            'i18n-key': 'local-storage'},
+
+                              host_ref=host_ref)
+
+        expected = vm_utils.safe_find_sr(session)
+
+        self.assertEqual(local_sr, expected)
+
+
+
+    def test_safe_find_sr_by_other_criteria(self):
+
+        """Ensure the SR is found when using a different filter."""
+
+        self.flags(sr_matching_filter='other-config:my_fake_sr=true')
+
+        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+
+        session = xenapi_conn.XenAPISession('test_url', 'root', 'test_pass')
+
+        host_ref = xenapi_fake.get_all('host')[0]
+
+        local_sr = xenapi_fake.create_sr(name_label='Fake Storage',
+
+                                         type='lvm',
+
+                                         other_config={'my_fake_sr': 'true'},
+
+                                         host_ref=host_ref)
+
+        expected = vm_utils.safe_find_sr(session)
+
+        self.assertEqual(local_sr, expected)
+
+
+
+    def test_safe_find_sr_default(self):
+
+        """Ensure the default SR is found regardless of other-config."""
+
+        self.flags(sr_matching_filter='default-sr:true')
+
+        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+
+        session = xenapi_conn.XenAPISession('test_url', 'root', 'test_pass')
+
+        pool_ref = xenapi_fake.create_pool('')
+
+        expected = vm_utils.safe_find_sr(session)
+
+        self.assertEqual(session.call_xenapi('pool.get_default_SR', pool_ref),
+
+                         expected)
+
+
+
+
+
+def _create_service_entries(context, values={'avail_zone1': ['fake_host1',
+
+                                                         'fake_host2'],
+
+                                         'avail_zone2': ['fake_host3'], }):
+
+    for avail_zone, hosts in values.iteritems():
+
+        for host in hosts:
+
+            db.service_create(context,
+
+                              {'host': host,
+
+                               'binary': 'nova-compute',
+
+                               'topic': 'compute',
+
+                               'report_count': 0,
+
+                               'availability_zone': avail_zone})
+
+    return values
+
+
+
+
+
+class XenAPIAggregateTestCase(stubs.XenAPITestBase):
+
+    """Unit tests for aggregate operations."""
+
+    def setUp(self):
+
+        super(XenAPIAggregateTestCase, self).setUp()
+
+        self.flags(xenapi_connection_url='http://test_url',
+
+                   xenapi_connection_username='test_user',
+
+                   xenapi_connection_password='test_pass',
+
+                   instance_name_template='%d',
+
+                   firewall_driver='nova.virt.xenapi.firewall.'
+
+                                   'Dom0IptablesFirewallDriver',
+
+                   host='host',
+
+                   connection_type='xenapi',
+
+                   compute_driver='nova.virt.xenapi.driver.XenAPIDriver')
+
+        host_ref = xenapi_fake.get_all('host')[0]
+
+        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+
+        self.context = context.get_admin_context()
+
+        self.conn = xenapi_conn.XenAPIDriver(False)
+
+        self.compute = importutils.import_object(FLAGS.compute_manager)
+
+        self.api = compute_api.AggregateAPI()
+
+        values = {'name': 'test_aggr',
+
+                  'availability_zone': 'test_zone',
+
+                  'metadata': {pool_states.POOL_FLAG: 'XenAPI'}}
+
+        self.aggr = db.aggregate_create(self.context, values)
+
+        self.fake_metadata = {pool_states.POOL_FLAG: 'XenAPI',
+
+                              'master_compute': 'host',
+
+                              pool_states.KEY: pool_states.ACTIVE,
+
+                              'host': xenapi_fake.get_record('host',
+
+                                                             host_ref)['uuid']}
+
+
+
+    def test_add_to_aggregate_called(self):
+
+        def fake_add_to_aggregate(context, aggregate, host):
+
+            fake_add_to_aggregate.called = True
+
+        self.stubs.Set(self.conn._pool,
+
+                       "add_to_aggregate",
+
+                       fake_add_to_aggregate)
+
+
+
+        self.conn.add_to_aggregate(None, None, None)
+
+        self.assertTrue(fake_add_to_aggregate.called)
+
+
+
+    def test_add_to_aggregate_for_first_host_sets_metadata(self):
+
+        def fake_init_pool(id, name):
+
+            fake_init_pool.called = True
+
+        self.stubs.Set(self.conn._pool, "_init_pool", fake_init_pool)
+
+
+
+        aggregate = self._aggregate_setup()
+
+        self.conn._pool.add_to_aggregate(self.context, aggregate, "host")
+
+        result = db.aggregate_get(self.context, aggregate.id)
+
+        self.assertTrue(fake_init_pool.called)
+
+        self.assertDictMatch(self.fake_metadata, result.metadetails)
+
+
+
+    def test_join_slave(self):
+
+        """Ensure join_slave gets called when the request gets to master."""
+
+        def fake_join_slave(id, compute_uuid, host, url, user, password):
+
+            fake_join_slave.called = True
+
+        self.stubs.Set(self.conn._pool, "_join_slave", fake_join_slave)
+
+
+
+        aggregate = self._aggregate_setup(hosts=['host', 'host2'],
+
+                                          metadata=self.fake_metadata)
+
+        self.conn._pool.add_to_aggregate(self.context, aggregate, "host2",
+
+                                         compute_uuid='fake_uuid',
+
+                                         url='fake_url',
+
+                                         user='fake_user',
+
+                                         passwd='fake_pass',
+
+                                         xenhost_uuid='fake_uuid')
+
+        self.assertTrue(fake_join_slave.called)
+
+
+
+    def test_add_to_aggregate_first_host(self):
+
+        def fake_pool_set_name_label(self, session, pool_ref, name):
+
+            fake_pool_set_name_label.called = True
+
+        self.stubs.Set(xenapi_fake.SessionBase, "pool_set_name_label",
+
+                       fake_pool_set_name_label)
+
+        self.conn._session.call_xenapi("pool.create", {"name": "asdf"})
+
+
+
+        values = {"name": 'fake_aggregate',
+
+                  "availability_zone": 'fake_zone'}
+
+        result = db.aggregate_create(self.context, values)
+
+        metadata = {pool_states.POOL_FLAG: "XenAPI",
+
+                    pool_states.KEY: pool_states.CREATED}
+
+        db.aggregate_metadata_add(self.context, result.id, metadata)
+
+
+
+        db.aggregate_host_add(self.context, result.id, "host")
+
+        aggregate = db.aggregate_get(self.context, result.id)
+
+        self.assertEqual(["host"], aggregate.hosts)
+
+        self.assertEqual(metadata, aggregate.metadetails)
+
+
+
+        self.conn._pool.add_to_aggregate(self.context, aggregate, "host")
+
+        self.assertTrue(fake_pool_set_name_label.called)
+
+
+
+    def test_remove_from_aggregate_called(self):
+
+        def fake_remove_from_aggregate(context, aggregate, host):
+
+            fake_remove_from_aggregate.called = True
+
+        self.stubs.Set(self.conn._pool,
+
+                       "remove_from_aggregate",
+
+                       fake_remove_from_aggregate)
+
+
+
+        self.conn.remove_from_aggregate(None, None, None)
+
+        self.assertTrue(fake_remove_from_aggregate.called)
+
+
+
+    def test_remove_from_empty_aggregate(self):
+
+        result = self._aggregate_setup()
+
+        self.assertRaises(exception.InvalidAggregateAction,
+
+                          self.conn._pool.remove_from_aggregate,
+
+                          self.context, result, "test_host")
+
+
+
+    def test_remove_slave(self):
+
+        """Ensure eject slave gets called."""
+
+        def fake_eject_slave(id, compute_uuid, host_uuid):
+
+            fake_eject_slave.called = True
+
+        self.stubs.Set(self.conn._pool, "_eject_slave", fake_eject_slave)
+
+
+
+        self.fake_metadata['host2'] = 'fake_host2_uuid'
+
+        aggregate = self._aggregate_setup(hosts=['host', 'host2'],
+
+                metadata=self.fake_metadata, aggr_state=pool_states.ACTIVE)
+
+        self.conn._pool.remove_from_aggregate(self.context, aggregate, "host2")
+
+        self.assertTrue(fake_eject_slave.called)
+
+
+
+    def test_remove_master_solo(self):
+
+        """Ensure metadata are cleared after removal."""
+
+        def fake_clear_pool(id):
+
+            fake_clear_pool.called = True
+
+        self.stubs.Set(self.conn._pool, "_clear_pool", fake_clear_pool)
+
+
+
+        aggregate = self._aggregate_setup(metadata=self.fake_metadata)
+
+        self.conn._pool.remove_from_aggregate(self.context, aggregate, "host")
+
+        result = db.aggregate_get(self.context, aggregate.id)
+
+        self.assertTrue(fake_clear_pool.called)
+
+        self.assertDictMatch({pool_states.POOL_FLAG: 'XenAPI',
+
+                pool_states.KEY: pool_states.ACTIVE}, result.metadetails)
+
+
+
+    def test_remote_master_non_empty_pool(self):
+
+        """Ensure AggregateError is raised if removing the master."""
+
+        aggregate = self._aggregate_setup(hosts=['host', 'host2'],
+
+                                          metadata=self.fake_metadata)
+
+
+
+        self.assertRaises(exception.InvalidAggregateAction,
+
+                          self.conn._pool.remove_from_aggregate,
+
+                          self.context, aggregate, "host")
+
+
+
+    def _aggregate_setup(self, aggr_name='fake_aggregate',
+
+                         aggr_zone='fake_zone',
+
+                         aggr_state=pool_states.CREATED,
+
+                         hosts=['host'], metadata=None):
+
+        values = {"name": aggr_name,
+
+                  "availability_zone": aggr_zone}
+
+        result = db.aggregate_create(self.context, values)
+
+        pool_flag = {pool_states.POOL_FLAG: "XenAPI",
+
+                    pool_states.KEY: aggr_state}
+
+        db.aggregate_metadata_add(self.context, result.id, pool_flag)
+
+
+
+        for host in hosts:
+
+            db.aggregate_host_add(self.context, result.id, host)
+
+        if metadata:
+
+            db.aggregate_metadata_add(self.context, result.id, metadata)
+
+        return db.aggregate_get(self.context, result.id)
+
+
+
+    def test_add_host_to_aggregate_invalid_changing_status(self):
+
+        """Ensure InvalidAggregateAction is raised when adding host while
+
+        aggregate is not ready."""
+
+        aggregate = self._aggregate_setup(aggr_state=pool_states.CHANGING)
+
+        self.assertRaises(exception.InvalidAggregateAction,
+
+                          self.conn.add_to_aggregate, self.context,
+
+                          aggregate, 'host')
+
+
+
+    def test_add_host_to_aggregate_invalid_dismissed_status(self):
+
+        """Ensure InvalidAggregateAction is raised when aggregate is
+
+        deleted."""
+
+        aggregate = self._aggregate_setup(aggr_state=pool_states.DISMISSED)
+
+        self.assertRaises(exception.InvalidAggregateAction,
+
+                          self.conn.add_to_aggregate, self.context,
+
+                          aggregate, 'fake_host')
+
+
+
+    def test_add_host_to_aggregate_invalid_error_status(self):
+
+        """Ensure InvalidAggregateAction is raised when aggregate is
+
+        in error."""
+
+        aggregate = self._aggregate_setup(aggr_state=pool_states.ERROR)
+
+        self.assertRaises(exception.InvalidAggregateAction,
+
+                          self.conn.add_to_aggregate, self.context,
+
+                          aggregate, 'fake_host')
+
+
+
+    def test_remove_host_from_aggregate_error(self):
+
+        """Ensure we can remove a host from an aggregate even if in error."""
+
+        values = _create_service_entries(self.context)
+
+        fake_zone = values.keys()[0]
+
+        aggr = self.api.create_aggregate(self.context,
+
+                                         'fake_aggregate', fake_zone)
+
+        # let's mock the fact that the aggregate is ready!
+
+        metadata = {pool_states.POOL_FLAG: "XenAPI",
+
+                    pool_states.KEY: pool_states.ACTIVE}
+
+        db.aggregate_metadata_add(self.context, aggr['id'], metadata)
+
+        for host in values[fake_zone]:
+
+            aggr = self.api.add_host_to_aggregate(self.context,
+
+                                                  aggr['id'], host)
+
+        # let's mock the fact that the aggregate is in error!
+
+        status = {'operational_state': pool_states.ERROR}
+
+        expected = self.api.remove_host_from_aggregate(self.context,
+
+                                                       aggr['id'],
+
+                                                       values[fake_zone][0])
+
+        self.assertEqual(len(aggr['hosts']) - 1, len(expected['hosts']))
+
+        self.assertEqual(expected['metadata'][pool_states.KEY],
+
+                         pool_states.ACTIVE)
+
+
+
+    def test_remove_host_from_aggregate_invalid_dismissed_status(self):
+
+        """Ensure InvalidAggregateAction is raised when aggregate is
+
+        deleted."""
+
+        aggregate = self._aggregate_setup(aggr_state=pool_states.DISMISSED)
+
+        self.assertRaises(exception.InvalidAggregateAction,
+
+                          self.conn.remove_from_aggregate, self.context,
+
+                          aggregate, 'fake_host')
+
+
+
+    def test_remove_host_from_aggregate_invalid_changing_status(self):
+
+        """Ensure InvalidAggregateAction is raised when aggregate is
+
+        changing."""
+
+        aggregate = self._aggregate_setup(aggr_state=pool_states.CHANGING)
+
+        self.assertRaises(exception.InvalidAggregateAction,
+
+                          self.conn.remove_from_aggregate, self.context,
+
+                          aggregate, 'fake_host')
+
+
+
+    def test_add_aggregate_host_raise_err(self):
+
+        """Ensure the undo operation works correctly on add."""
+
+        def fake_driver_add_to_aggregate(context, aggregate, host):
+
+            raise exception.AggregateError
+
+        self.stubs.Set(self.compute.driver, "add_to_aggregate",
+
+                       fake_driver_add_to_aggregate)
+
+        metadata = {pool_states.POOL_FLAG: "XenAPI",
+
+                    pool_states.KEY: pool_states.ACTIVE}
+
+        db.aggregate_metadata_add(self.context, self.aggr.id, metadata)
+
+        db.aggregate_host_add(self.context, self.aggr.id, 'fake_host')
+
+
+
+        self.assertRaises(exception.AggregateError,
+
+                          self.compute.add_aggregate_host,
+
+                          self.context, self.aggr.id, "fake_host")
+
+        excepted = db.aggregate_get(self.context, self.aggr.id)
+
+        self.assertEqual(excepted.metadetails[pool_states.KEY],
+
+                pool_states.ERROR)
+
+        self.assertEqual(excepted.hosts, [])
+
+
+
+
+
+class VmUtilsTestCase(test.TestCase):
+
+    """Unit tests for xenapi utils."""
+
+
+
+    def test_upload_image(self):
+
+        """Ensure image properties include instance system metadata
+
+           as well as few local settings."""
+
+
+
+        def fake_instance_system_metadata_get(context, uuid):
+
+            return dict(image_a=1, image_b=2, image_c='c', d='d')
+
+
+
+        def fake_get_sr_path(session):
+
+            return "foo"
+
+
+
+        class FakeInstance(dict):
+
+            def __init__(self):
+
+                super(FakeInstance, self).__init__({
+
+                        'auto_disk_config': 'auto disk config',
+
+                        'os_type': 'os type'})
+
+
+
+            def __missing__(self, item):
+
+                return "whatever"
+
+
+
+        class FakeSession(object):
+
+            def call_plugin(session_self, service, command, kwargs):
+
+                self.kwargs = kwargs
+
+
+
+        def fake_dumps(thing):
+
+            return thing
+
+
+
+        self.stubs.Set(db, "instance_system_metadata_get",
+
+                                             fake_instance_system_metadata_get)
+
+        self.stubs.Set(vm_utils, "get_sr_path", fake_get_sr_path)
+
+        self.stubs.Set(pickle, "dumps", fake_dumps)
+
+
+
+        ctx = context.get_admin_context()
+
+
+
+        instance = FakeInstance()
+
+        session = FakeSession()
+
+        vm_utils.upload_image(ctx, session, instance, "vmi uuids", "image id")
+
+
+
+        actual = self.kwargs['params']['properties']
+
+        expected = dict(a=1, b=2, c='c', d='d',
+
+                        auto_disk_config='auto disk config',
+
+                        os_type='os type')
+
+        self.assertEquals(expected, actual)
+
+
+
+
+
+class XenAPILiveMigrateTestCase(stubs.XenAPITestBase):
+
+    """Unit tests for live_migration."""
+
+    def setUp(self):
+
+        super(XenAPILiveMigrateTestCase, self).setUp()
+
+        self.flags(xenapi_connection_url='test_url',
+
+                   xenapi_connection_password='test_pass',
+
+                   firewall_driver='nova.virt.xenapi.firewall.'
+
+                                   'Dom0IptablesFirewallDriver',
+
+                   host='host')
+
+        db_fakes.stub_out_db_instance_api(self.stubs)
+
+        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+
+        self.context = context.get_admin_context()
+
+        self.conn = xenapi_conn.XenAPIDriver(False)
+
+
+
+    def test_live_migration_calls_vmops(self):
+
+        def fake_live_migrate(context, instance_ref, dest, post_method,
+
+                              recover_method, block_migration):
+
+            fake_live_migrate.called = True
+
+        self.stubs.Set(self.conn._vmops, "live_migrate", fake_live_migrate)
+
+
+
+        self.conn.live_migration(None, None, None, None, None)
+
+        self.assertTrue(fake_live_migrate.called)
+
+
+
+    def test_pre_live_migration(self):
+
+        # ensure method is present
+
+        self.conn.pre_live_migration(None, None, None, None)
+
+
+
+    def test_post_live_migration_at_destination(self):
+
+        # ensure method is present
+
+        self.conn.post_live_migration_at_destination(None, None, None, None)
+
+
+
+    def test_check_can_live_migrate_raises_on_block_migrate(self):
+
+        self.assertRaises(NotImplementedError,
+
+                          self.conn.check_can_live_migrate_destination,
+
+                          None, None, True, None)
+
+
+
+    def test_check_can_live_migrate_works(self):
+
+        class fake_aggregate:
+
+            def __init__(self):
+
+                self.metadetails = {"host": "test_host_uuid"}
+
+
+
+        def fake_aggregate_get_by_host(context, host):
+
+            self.assertEqual(FLAGS.host, host)
+
+            return fake_aggregate()
+
+
+
+        self.stubs.Set(db, "aggregate_get_by_host",
+
+                fake_aggregate_get_by_host)
+
+        self.conn.check_can_live_migrate_destination(self.context,
+
+                {'host': 'host'}, False, False)
+
+
+
+    def test_check_can_live_migrate_fails(self):
+
+        class fake_aggregate:
+
+            def __init__(self):
+
+                self.metadetails = {"dest_other": "test_host_uuid"}
+
+
+
+        def fake_aggregate_get_by_host(context, host):
+
+            self.assertEqual(FLAGS.host, host)
+
+            return fake_aggregate()
+
+
+
+        self.stubs.Set(db, "aggregate_get_by_host",
+
+                      fake_aggregate_get_by_host)
+
+        self.assertRaises(exception.MigrationError,
+
+                          self.conn.check_can_live_migrate_destination,
+
+                          self.context, {'host': 'host'}, None, None)
+
+
+
+    def test_live_migration(self):
+
+        def fake_get_vm_opaque_ref(instance):
+
+            return "fake_vm"
+
+        self.stubs.Set(self.conn._vmops, "_get_vm_opaque_ref",
+
+                       fake_get_vm_opaque_ref)
+
+
+
+        def fake_get_host_opaque_ref(context, destination_hostname):
+
+            return "fake_host"
+
+        self.stubs.Set(self.conn._vmops, "_get_host_opaque_ref",
+
+                       fake_get_host_opaque_ref)
+
+
+
+        def post_method(context, instance, destination_hostname,
+
+                        block_migration):
+
+            post_method.called = True
+
+
+
+        self.conn.live_migration(self.conn, None, None, post_method, None)
+
+
+
+        self.assertTrue(post_method.called, "post_method.called")
+
+
+
+    def test_live_migration_on_failure(self):
+
+        def fake_get_vm_opaque_ref(instance):
+
+            return "fake_vm"
+
+        self.stubs.Set(self.conn._vmops, "_get_vm_opaque_ref",
+
+                       fake_get_vm_opaque_ref)
+
+
+
+        def fake_get_host_opaque_ref(context, destination_hostname):
+
+            return "fake_host"
+
+        self.stubs.Set(self.conn._vmops, "_get_host_opaque_ref",
+
+                       fake_get_host_opaque_ref)
+
+
+
+        def fake_call_xenapi(*args):
+
+            raise NotImplementedError()
+
+        self.stubs.Set(self.conn._vmops._session, "call_xenapi",
+
+                       fake_call_xenapi)
+
+
+
+        def recover_method(context, instance, destination_hostname,
+
+                        block_migration):
+
+            recover_method.called = True
+
+
+
+        self.assertRaises(NotImplementedError, self.conn.live_migration,
+
+                          self.conn, None, None, None, recover_method)
+
+        self.assertTrue(recover_method.called, "recover_method.called")
+
+
+
+
+
+class XenAPIInjectMetadataTestCase(stubs.XenAPITestBase):
+
+    def setUp(self):
+
+        super(XenAPIInjectMetadataTestCase, self).setUp()
+
+        self.flags(xenapi_connection_url='test_url',
+
+                   xenapi_connection_password='test_pass',
+
+                   firewall_driver='nova.virt.xenapi.firewall.'
+
+                                   'Dom0IptablesFirewallDriver')
+
+        stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
+
+        self.conn = xenapi_conn.XenAPIDriver(False)
+
+
+
+        self.xenstore = dict(persist={}, ephem={})
+
+
+
+        def fake_get_vm_opaque_ref(inst, instance):
+
+            self.assertEqual(instance, 'instance')
+
+            return 'vm_ref'
+
+
+
+        def fake_add_to_param_xenstore(inst, vm_ref, key, val):
+
+            self.assertEqual(vm_ref, 'vm_ref')
+
+            self.xenstore['persist'][key] = val
+
+
+
+        def fake_remove_from_param_xenstore(inst, vm_ref, key):
+
+            self.assertEqual(vm_ref, 'vm_ref')
+
+            if key in self.xenstore['persist']:
+
+                del self.xenstore['persist'][key]
+
+
+
+        def fake_write_to_xenstore(inst, instance, path, value, vm_ref=None):
+
+            self.assertEqual(instance, 'instance')
+
+            self.assertEqual(vm_ref, 'vm_ref')
+
+            self.xenstore['ephem'][path] = jsonutils.dumps(value)
+
+
+
+        def fake_delete_from_xenstore(inst, instance, path, vm_ref=None):
+
+            self.assertEqual(instance, 'instance')
+
+            self.assertEqual(vm_ref, 'vm_ref')
+
+            if path in self.xenstore['ephem']:
+
+                del self.xenstore['ephem'][path]
+
+
+
+        self.stubs.Set(vmops.VMOps, '_get_vm_opaque_ref',
+
+                       fake_get_vm_opaque_ref)
+
+        self.stubs.Set(vmops.VMOps, '_add_to_param_xenstore',
+
+                       fake_add_to_param_xenstore)
+
+        self.stubs.Set(vmops.VMOps, '_remove_from_param_xenstore',
+
+                       fake_remove_from_param_xenstore)
+
+        self.stubs.Set(vmops.VMOps, '_write_to_xenstore',
+
+                       fake_write_to_xenstore)
+
+        self.stubs.Set(vmops.VMOps, '_delete_from_xenstore',
+
+                       fake_delete_from_xenstore)
+
+
+
+    def test_inject_instance_metadata(self):
+
+
+
+        # Add some system_metadata to ensure it doesn't get added
+
+        # to xenstore
+
+        instance = dict(metadata=[{'key': 'a', 'value': 1},
+
+                                  {'key': 'b', 'value': 2},
+
+                                  {'key': 'c', 'value': 3},
+
+                                  # Check xenstore key sanitizing
+
+                                  {'key': 'hi.there', 'value': 4},
+
+                                  {'key': 'hi!t.e/e', 'value': 5}],
+
+                                  # Check xenstore key sanitizing
+
+                        system_metadata=[{'key': 'sys_a', 'value': 1},
+
+                                         {'key': 'sys_b', 'value': 2},
+
+                                         {'key': 'sys_c', 'value': 3}])
+
+        self.conn._vmops.inject_instance_metadata(instance, 'vm_ref')
+
+
+
+        self.assertEqual(self.xenstore, {
+
+                'persist': {
+
+                    'vm-data/user-metadata/a': '1',
+
+                    'vm-data/user-metadata/b': '2',
+
+                    'vm-data/user-metadata/c': '3',
+
+                    'vm-data/user-metadata/hi_there': '4',
+
+                    'vm-data/user-metadata/hi_t_e_e': '5',
+
+                    },
+
+                'ephem': {},
+
+                })
+
+
+
+    def test_change_instance_metadata_add(self):
+
+        # Test XenStore key sanitizing here, too.
+
+        diff = {'test.key': ['+', 4]}
+
+        self.xenstore = {
+
+            'persist': {
+
+                'vm-data/user-metadata/a': '1',
+
+                'vm-data/user-metadata/b': '2',
+
+                'vm-data/user-metadata/c': '3',
+
+                },
+
+            'ephem': {
+
+                'vm-data/user-metadata/a': '1',
+
+                'vm-data/user-metadata/b': '2',
+
+                'vm-data/user-metadata/c': '3',
+
+                },
+
+            }
+
+
+
+        self.conn._vmops.change_instance_metadata('instance', diff)
+
+
+
+        self.assertEqual(self.xenstore, {
+
+                'persist': {
+
+                    'vm-data/user-metadata/a': '1',
+
+                    'vm-data/user-metadata/b': '2',
+
+                    'vm-data/user-metadata/c': '3',
+
+                    'vm-data/user-metadata/test_key': '4',
+
+                    },
+
+                'ephem': {
+
+                    'vm-data/user-metadata/a': '1',
+
+                    'vm-data/user-metadata/b': '2',
+
+                    'vm-data/user-metadata/c': '3',
+
+                    'vm-data/user-metadata/test_key': '4',
+
+                    },
+
+                })
+
+
+
+    def test_change_instance_metadata_update(self):
+
+        diff = dict(b=['+', 4])
+
+        self.xenstore = {
+
+            'persist': {
+
+                'vm-data/user-metadata/a': '1',
+
+                'vm-data/user-metadata/b': '2',
+
+                'vm-data/user-metadata/c': '3',
+
+                },
+
+            'ephem': {
+
+                'vm-data/user-metadata/a': '1',
+
+                'vm-data/user-metadata/b': '2',
+
+                'vm-data/user-metadata/c': '3',
+
+                },
+
+            }
+
+
+
+        self.conn._vmops.change_instance_metadata('instance', diff)
+
+
+
+        self.assertEqual(self.xenstore, {
+
+                'persist': {
+
+                    'vm-data/user-metadata/a': '1',
+
+                    'vm-data/user-metadata/b': '4',
+
+                    'vm-data/user-metadata/c': '3',
+
+                    },
+
+                'ephem': {
+
+                    'vm-data/user-metadata/a': '1',
+
+                    'vm-data/user-metadata/b': '4',
+
+                    'vm-data/user-metadata/c': '3',
+
+                    },
+
+                })
+
+
+
+    def test_change_instance_metadata_delete(self):
+
+        diff = dict(b=['-'])
+
+        self.xenstore = {
+
+            'persist': {
+
+                'vm-data/user-metadata/a': '1',
+
+                'vm-data/user-metadata/b': '2',
+
+                'vm-data/user-metadata/c': '3',
+
+                },
+
+            'ephem': {
+
+                'vm-data/user-metadata/a': '1',
+
+                'vm-data/user-metadata/b': '2',
+
+                'vm-data/user-metadata/c': '3',
+
+                },
+
+            }
+
+
+
+        self.conn._vmops.change_instance_metadata('instance', diff)
+
+
+
+        self.assertEqual(self.xenstore, {
+
+                'persist': {
+
+                    'vm-data/user-metadata/a': '1',
+
+                    'vm-data/user-metadata/c': '3',
+
+                    },
+
+                'ephem': {
+
+                    'vm-data/user-metadata/a': '1',
+
+                    'vm-data/user-metadata/c': '3',
+
+                    },
+
+                })

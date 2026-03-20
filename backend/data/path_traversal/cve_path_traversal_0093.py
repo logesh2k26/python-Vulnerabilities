@@ -2,338 +2,576 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-# -*- coding: utf-8 -*-
-
-from setuptools import setup, find_packages
-
 import os
 
-import stat
+import os.path
 
-import sys
+import tempfile
 
+import shutil
 
+from nose.tools import eq_
 
-#VERSION="2.1dev4"
+from build_pack_utils import utils
 
-VERSION="2.23.1"
+from compile_helpers import setup_webdir_if_it_doesnt_exist
 
+from compile_helpers import convert_php_extensions
 
+from compile_helpers import is_web_app
 
-# Taken from kennethreitz/requests/setup.py
+from compile_helpers import find_stand_alone_app_to_run
 
-package_directory = os.path.realpath(os.path.dirname(__file__))
+from compile_helpers import load_manifest
 
+from compile_helpers import find_all_php_versions
 
+from compile_helpers import validate_php_version
 
+from compile_helpers import setup_log_dir
 
 
-def get_file_contents(file_path):
 
-    """Get the context of the file using full path name."""
 
-    content = ""
 
-    try:
+class TestCompileHelpers(object):
 
-        full_path = os.path.join(package_directory, file_path)
+    def setUp(self):
 
-        content = open(full_path, 'r').read()
+        self.build_dir = tempfile.mkdtemp(prefix='build-')
 
-    except:
+        self.cache_dir = tempfile.mkdtemp(prefix='cache-')
 
-        print >> sys.stderr, "### could not open file {0!r}".format(file_path)
+        os.rmdir(self.build_dir)  # delete otherwise copytree complains
 
-    return content
+        os.rmdir(self.cache_dir)  # cache dir does not exist normally
 
 
 
-def get_file_list(file_path):
+    def tearDown(self):
 
-    full_path = os.path.join(package_directory, file_path)
+        if os.path.exists(self.build_dir):
 
-    file_list = os.listdir(full_path)
+            shutil.rmtree(self.build_dir)
 
-    # now we need to add the path to the files
+        if os.path.exists(self.cache_dir):
 
-    return [ file_path + f for f in file_list ]
+            shutil.rmtree(self.cache_dir)
 
+        for name in os.listdir(os.environ['TMPDIR']):
 
+            if name.startswith('httpd-') and name.endswith('.gz'):
 
+                os.remove(os.path.join(os.environ['TMPDIR'], name))
 
+            if name.startswith('php-') and name.endswith('.gz'):
 
-install_requires = ["Flask>=0.10.1",
+                os.remove(os.path.join(os.environ['TMPDIR'], name))
 
-                    "Flask-Migrate>=1.2.0",
 
-                    "Flask-SQLAlchemy>=2.0",
 
-                    "Flask-Script>=2.0.5",
+    def assert_exists(self, *args):
 
-                    "Jinja2>=2.7.3",
+        eq_(True, os.path.exists(os.path.join(*args)),
 
-                    "Mako>=0.9.1",
+            "Does not exists: %s" % os.path.join(*args))
 
-                    "MarkupSafe>=0.23",
 
-                    "PyMySQL>=0.6.6",
 
-                    "Pillow>=2.6.1",
+    def test_setup_log_dir(self):
 
-                    "PyJWT>=1.3.0",
+        eq_(False, os.path.exists(os.path.join(self.build_dir, 'logs')))
 
-                    "PyYAML>=3.11",
+        setup_log_dir({
 
-                    "Pygments>=2.0.2",
+            'BUILD_DIR': self.build_dir
 
-                    "SQLAlchemy>=1.0.5",
+        })
 
-                    "Werkzeug>=0.10.4",
+        self.assert_exists(self.build_dir, 'logs')
 
-                    "alembic>=0.6.7",
 
-                    "argparse>=1.2.1",
 
-                    "bcrypt>=1.1.0",
+    def test_setup_if_webdir_exists(self):
 
-                    "beautifulsoup4>=4.3.2",
+        shutil.copytree('tests/data/app-1', self.build_dir)
 
-                    "cffi>=0.8.6",
+        setup_webdir_if_it_doesnt_exist(utils.FormattedDict({
 
-                    "configobj>=5.0.6",
+            'BUILD_DIR': self.build_dir,
 
-                    "docutils>=0.12",
+            'WEBDIR': 'htdocs',
 
-                    "funcparserlib>=0.3.6",
+            'LIBDIR': 'lib'
 
-                    "itsdangerous>=0.24",
+        }))
 
-                    "ldap3>=2.5",
+        self.assert_exists(self.build_dir, 'htdocs')
 
-                    "netaddr>=0.7.12",
+        self.assert_exists(self.build_dir, 'htdocs', 'index.php')
 
-                    "passlib>=1.6.2",
+        self.assert_exists(self.build_dir, 'htdocs', 'info.php')
 
-                    "pyasn1>=0.4.2",
+        self.assert_exists(self.build_dir, 'htdocs',
 
-                    "pyOpenSSL>=0.15.1",
+                           'technical-difficulties1.jpg')
 
-                    "pycparser>=2.10",
+        self.assert_exists(self.build_dir, '.bp-config')
 
-                    "pycrypto>=2.6.1",
+        self.assert_exists(self.build_dir, '.bp-config', 'options.json')
 
-                    "pyrad>=2.0",
+        self.assert_exists(self.build_dir, '.bp-config', 'httpd', 'extra',
 
-                    "pyusb>=1.0.0b2",
+                           'httpd-remoteip.conf')
 
-                    "qrcode>=5.1",
+        eq_(2, len(os.listdir(self.build_dir)))
 
-                    "requests>=2.7.0",
+        eq_(3, len(os.listdir(os.path.join(self.build_dir, 'htdocs'))))
 
-                    "sqlsoup>=0.9.0",
 
-                    "ecdsa>=0.13",
 
-                    "lxml>=3.3",
+    def test_setup_if_custom_webdir_exists(self):
 
-                    "python-gnupg>=0.3.8",
+        shutil.copytree('tests/data/app-6', self.build_dir)
 
-                    "defusedxml>=0.4.1",
+        setup_webdir_if_it_doesnt_exist(utils.FormattedDict({
 
-                    "flask-babel>=0.9",
+            'BUILD_DIR': self.build_dir,
 
-                    "croniter>=0.3.8"
+            'WEBDIR': 'public',
 
-                    ]
+            'LIBDIR': 'lib'
 
+        }))
 
+        self.assert_exists(self.build_dir, 'public')
 
-# For python 2.6 we need additional dependency importlib
+        self.assert_exists(self.build_dir, 'public', 'index.php')
 
-try:
+        self.assert_exists(self.build_dir, 'public', 'info.php')
 
-    import importlib
+        self.assert_exists(self.build_dir, 'public',
 
-except ImportError:
+                           'technical-difficulties1.jpg')
 
-    install_requires.append('importlib')
+        self.assert_exists(self.build_dir, '.bp-config')
 
+        self.assert_exists(self.build_dir, '.bp-config', 'options.json')
 
+        self.assert_exists(self.build_dir, '.bp-config', 'httpd', 'extra',
 
+                           'httpd-remoteip.conf')
 
+        eq_(3, len(os.listdir(self.build_dir)))
 
-def get_man_pages(dir):
+        eq_(3, len(os.listdir(os.path.join(self.build_dir, 'public'))))
 
-    """
 
-    Get man pages in a directory.
 
-    :param dir: 
+    def test_setup_if_htdocs_does_not_exist(self):
 
-    :return: list of file names
+        shutil.copytree('tests/data/app-2', self.build_dir)
 
-    """
+        setup_webdir_if_it_doesnt_exist(utils.FormattedDict({
 
-    files = os.listdir(dir)
+            'BUILD_DIR': self.build_dir,
 
-    r_files = []
+            'WEBDIR': 'htdocs',
 
-    for file in files:
+            'LIBDIR': 'lib'
 
-        if file.endswith(".1"):
+        }))
 
-            r_files.append(dir + "/" + file)
+        self.assert_exists(self.build_dir, 'htdocs')
 
-    return r_files
+        self.assert_exists(self.build_dir, 'htdocs', 'index.php')
 
+        self.assert_exists(self.build_dir, 'htdocs', 'info.php')
 
+        self.assert_exists(self.build_dir, 'htdocs',
 
+                           'technical-difficulties1.jpg')
 
+        self.assert_exists(self.build_dir, '.bp-config')
 
-def get_scripts(dir):
+        self.assert_exists(self.build_dir, '.bp-config', 'options.json')
 
-    """
+        self.assert_exists(self.build_dir, '.bp-config', 'httpd', 'extra',
 
-    Get files that are executable
+                           'httpd-remoteip.conf')
 
-    :param dir: 
+        eq_(2, len(os.listdir(self.build_dir)))
 
-    :return: list of file names
+        eq_(3, len(os.listdir(os.path.join(self.build_dir, 'htdocs'))))
 
-    """
 
-    files = os.listdir(dir)
 
-    r_files = []
+    def test_setup_if_htdocs_does_not_exist_but_library_does(self):
 
-    for file in files:
+        shutil.copytree('tests/data/app-7', self.build_dir)
 
-        if os.stat(dir + "/" + file)[stat.ST_MODE] & stat.S_IEXEC:
+        setup_webdir_if_it_doesnt_exist(utils.FormattedDict({
 
-            r_files.append(dir + "/" + file)
+            'BUILD_DIR': self.build_dir,
 
-    return r_files
+            'WEBDIR': 'htdocs',
 
+            'LIBDIR': 'lib'
 
+        }))
 
+        self.assert_exists(self.build_dir, 'htdocs')
 
+        self.assert_exists(self.build_dir, 'htdocs', 'index.php')
 
-setup(
+        self.assert_exists(self.build_dir, 'htdocs', 'info.php')
 
-    name='privacyIDEA',
+        self.assert_exists(self.build_dir, 'htdocs',
 
-    version=VERSION,
+                           'technical-difficulties1.jpg')
 
-    description='privacyIDEA: identity, multifactor authentication (OTP), '
+        self.assert_exists(self.build_dir, 'htdocs', 'library')
 
-                'authorization, audit',
+        self.assert_exists(self.build_dir, 'htdocs', 'library', 'junk.php')
 
-    author='privacyidea.org',
+        self.assert_exists(self.build_dir, 'lib')
 
-    license='AGPLv3',
+        self.assert_exists(self.build_dir, 'lib', 'test.php')
 
-    author_email='cornelius@privacyidea.org',
+        self.assert_exists(self.build_dir, '.bp-config')
 
-    url='http://www.privacyidea.org',
+        self.assert_exists(self.build_dir, '.bp-config', 'options.json')
 
-    keywords='OTP, two factor authentication, management, security',
+        self.assert_exists(self.build_dir, '.bp-config', 'httpd', 'extra',
 
-    packages=find_packages(),
+                           'httpd-remoteip.conf')
 
-    scripts=["pi-manage"] + get_scripts("tools"),
+        self.assert_exists(self.build_dir, 'manifest.yml')
 
-    extras_require={
+        eq_(4, len(os.listdir(self.build_dir)))
 
-        'dev': ["Sphinx>=1.3.1",
+        eq_(4, len(os.listdir(os.path.join(self.build_dir, 'htdocs'))))
 
-                "sphinxcontrib-httpdomain>=1.3.0"],
 
-        'test': ["coverage>=3.7.1",
 
-                 "mock>=1.0.1",
+    def test_setup_if_custom_webdir_does_not_exist(self):
 
-                 "pyparsing>=2.0.3",
+        shutil.copytree('tests/data/app-2', self.build_dir)
 
-                 "nose>=1.3.4",
+        setup_webdir_if_it_doesnt_exist(utils.FormattedDict({
 
-                 "responses>=0.4.0",
+            'BUILD_DIR': self.build_dir,
 
-                 "six>=1.8.0"],
+            'WEBDIR': 'public',
 
-    },
+            'LIBDIR': 'lib'
 
-    install_requires=install_requires,
+        }))
 
-    include_package_data=True,
+        self.assert_exists(self.build_dir, 'public')
 
-    data_files=[('etc/privacyidea/',
+        self.assert_exists(self.build_dir, 'public', 'index.php')
 
-                 ['deploy/apache/privacyideaapp.wsgi',
+        self.assert_exists(self.build_dir, 'public', 'info.php')
 
-                  'deploy/privacyidea/dictionary',
+        self.assert_exists(self.build_dir, 'public',
 
-                  'deploy/privacyidea/enckey',
+                           'technical-difficulties1.jpg')
 
-                  'deploy/privacyidea/private.pem',
+        self.assert_exists(self.build_dir, '.bp-config')
 
-                  'deploy/privacyidea/public.pem']),
+        self.assert_exists(self.build_dir, '.bp-config', 'options.json')
 
-                ('share/man/man1', get_man_pages("tools")),
+        self.assert_exists(self.build_dir, '.bp-config', 'httpd', 'extra',
 
-                ('lib/privacyidea/authmodules/FreeRADIUS',
+                           'httpd-remoteip.conf')
 
-                 ["authmodules/FreeRADIUS/LICENSE",
+        eq_(2, len(os.listdir(self.build_dir)))
 
-                  "authmodules/FreeRADIUS/privacyidea_radius.pm"]),
+        eq_(3, len(os.listdir(os.path.join(self.build_dir, 'public'))))
 
-               ('lib/privacyidea/authmodules/OTRS',
 
-                 ["authmodules/OTRS/privacyIDEA.pm"]),
 
-                ('lib/privacyidea/migrations',
+    def test_setup_if_htdocs_does_not_exist_with_extensions(self):
 
-                 ["migrations/alembic.ini",
+        shutil.copytree('tests/data/app-4', self.build_dir)
 
-                  "migrations/env.py",
+        setup_webdir_if_it_doesnt_exist(utils.FormattedDict({
 
-                  "migrations/README",
+            'BUILD_DIR': self.build_dir,
 
-                  "migrations/script.py.mako"]),
+            'WEBDIR': 'htdocs',
 
-                ('lib/privacyidea/migrations/versions',
+            'LIBDIR': 'lib'
 
-                 get_file_list("migrations/versions/"))
+        }))
 
-                ],
+        self.assert_exists(self.build_dir, 'htdocs')
 
-    classifiers=["Framework :: Flask",
+        self.assert_exists(self.build_dir, 'htdocs', 'index.php')
 
-                 "License :: OSI Approved :: "
+        self.assert_exists(self.build_dir, 'htdocs', 'info.php')
 
-                 "GNU Affero General Public License v3",
+        self.assert_exists(self.build_dir, 'htdocs',
 
-                 "Programming Language :: Python",
+                           'technical-difficulties1.jpg')
 
-                 "Development Status :: 5 - Production/Stable",
+        self.assert_exists(self.build_dir, '.bp-config')
 
-                 "Topic :: Internet",
+        self.assert_exists(self.build_dir, '.bp-config', 'options.json')
 
-                 "Topic :: Security",
+        self.assert_exists(self.build_dir, '.bp-config', 'httpd', 'extra',
 
-                 "Topic :: System ::"
+                           'httpd-remoteip.conf')
 
-                 " Systems Administration :: Authentication/Directory"
+        self.assert_exists(self.build_dir, '.bp')
 
-                 ],
+        self.assert_exists(self.build_dir, '.bp', 'logs')
 
-    #message_extractors={'privacyidea': [
+        self.assert_exists(self.build_dir, '.bp', 'logs', 'some.log')
 
-    #        ('**.py', 'python', None),
+        self.assert_exists(self.build_dir, '.extensions')
 
-    #        ('static/**.html', 'html', {'input_encoding': 'utf-8'})]},
+        self.assert_exists(self.build_dir, '.extensions', 'some-ext')
 
-    zip_safe=False,
+        self.assert_exists(self.build_dir, '.extensions', 'some-ext',
 
-    long_description=get_file_contents('README.rst')
+                           'extension.py')
 
-)
+        eq_(4, len(os.listdir(self.build_dir)))
+
+        eq_(3, len(os.listdir(os.path.join(self.build_dir, 'htdocs'))))
+
+
+
+    def test_setup_if_custom_webdir_does_not_exist_with_extensions(self):
+
+        shutil.copytree('tests/data/app-4', self.build_dir)
+
+        setup_webdir_if_it_doesnt_exist(utils.FormattedDict({
+
+            'BUILD_DIR': self.build_dir,
+
+            'WEBDIR': 'public',
+
+            'LIBDIR': 'lib'
+
+        }))
+
+        self.assert_exists(self.build_dir, 'public')
+
+        self.assert_exists(self.build_dir, 'public', 'index.php')
+
+        self.assert_exists(self.build_dir, 'public', 'info.php')
+
+        self.assert_exists(self.build_dir, 'public',
+
+                           'technical-difficulties1.jpg')
+
+        self.assert_exists(self.build_dir, '.bp-config')
+
+        self.assert_exists(self.build_dir, '.bp-config', 'options.json')
+
+        self.assert_exists(self.build_dir, '.bp-config', 'httpd', 'extra',
+
+                           'httpd-remoteip.conf')
+
+        self.assert_exists(self.build_dir, '.bp')
+
+        self.assert_exists(self.build_dir, '.bp', 'logs')
+
+        self.assert_exists(self.build_dir, '.bp', 'logs', 'some.log')
+
+        self.assert_exists(self.build_dir, '.extensions')
+
+        self.assert_exists(self.build_dir, '.extensions', 'some-ext')
+
+        self.assert_exists(self.build_dir, '.extensions', 'some-ext',
+
+                           'extension.py')
+
+        eq_(4, len(os.listdir(self.build_dir)))
+
+        eq_(3, len(os.listdir(os.path.join(self.build_dir, 'public'))))
+
+
+
+    def test_setup_if_htdocs_with_stand_alone_app(self):
+
+        shutil.copytree('tests/data/app-5', self.build_dir)
+
+        setup_webdir_if_it_doesnt_exist(utils.FormattedDict({
+
+            'BUILD_DIR': self.build_dir,
+
+            'WEB_SERVER': 'none'
+
+        }))
+
+        self.assert_exists(self.build_dir, 'app.php')
+
+        eq_(1, len(os.listdir(self.build_dir)))
+
+
+
+    def test_convert_php_extensions_55(self):
+
+        ctx = {
+
+            'PHP_VERSION': '5.5.x',
+
+            'PHP_EXTENSIONS': ['mod1', 'mod2', 'mod3'],
+
+            'ZEND_EXTENSIONS': ['zmod1', 'zmod2']
+
+        }
+
+        convert_php_extensions(ctx)
+
+        eq_('extension=mod1.so\nextension=mod2.so\nextension=mod3.so',
+
+            ctx['PHP_EXTENSIONS'])
+
+        eq_('zend_extension="zmod1.so"\nzend_extension="zmod2.so"',
+
+            ctx['ZEND_EXTENSIONS'])
+
+
+
+    def test_convert_php_extensions_55_none(self):
+
+        ctx = {
+
+            'PHP_VERSION': '5.5.x',
+
+            'PHP_EXTENSIONS': [],
+
+            'ZEND_EXTENSIONS': []
+
+        }
+
+        convert_php_extensions(ctx)
+
+        eq_('', ctx['PHP_EXTENSIONS'])
+
+        eq_('', ctx['ZEND_EXTENSIONS'])
+
+
+
+    def test_convert_php_extensions_55_one(self):
+
+        ctx = {
+
+            'PHP_VERSION': '5.5.x',
+
+            'PHP_EXTENSIONS': ['mod1'],
+
+            'ZEND_EXTENSIONS': ['zmod1']
+
+        }
+
+        convert_php_extensions(ctx)
+
+        eq_('zend_extension="zmod1.so"',
+
+            ctx['ZEND_EXTENSIONS'])
+
+
+
+    def test_is_web_app(self):
+
+        ctx = {}
+
+        eq_(True, is_web_app(ctx))
+
+        ctx['WEB_SERVER'] = 'nginx'
+
+        eq_(True, is_web_app(ctx))
+
+        ctx['WEB_SERVER'] = 'httpd'
+
+        eq_(True, is_web_app(ctx))
+
+        ctx['WEB_SERVER'] = 'none'
+
+        eq_(False, is_web_app(ctx))
+
+
+
+    def test_find_stand_alone_app_to_run_app_start_cmd(self):
+
+        ctx = {'APP_START_CMD': "echo 'Hello World!'"}
+
+        eq_("echo 'Hello World!'", find_stand_alone_app_to_run(ctx))
+
+        results = ('app.php', 'main.php', 'run.php', 'start.php', 'app.php')
+
+        for i, res in enumerate(results):
+
+            ctx = {'BUILD_DIR': 'tests/data/standalone/test%d' % (i + 1)}
+
+            eq_(res, find_stand_alone_app_to_run(ctx))
+
+
+
+    def test_load_manifest(self):
+
+        ctx = {'BP_DIR': '.'}
+
+        manifest = load_manifest(ctx)
+
+        assert manifest is not None
+
+        assert 'dependencies' in manifest.keys()
+
+        assert 'language' in manifest.keys()
+
+        assert 'url_to_dependency_map' in manifest.keys()
+
+        assert 'exclude_files' in manifest.keys()
+
+
+
+    def test_find_all_php_versions(self):
+
+        ctx = {'BP_DIR': '.'}
+
+        manifest = load_manifest(ctx)
+
+        dependencies = manifest['dependencies']
+
+        versions = find_all_php_versions(dependencies)
+
+        eq_(2, len([v for v in versions if v.startswith('5.5.')]))
+
+        eq_(2, len([v for v in versions if v.startswith('5.6.')]))
+
+
+
+    def test_validate_php_version(self):
+
+        ctx = {
+
+            'ALL_PHP_VERSIONS': ['5.5.31', '5.5.30'],
+
+            'PHP_55_LATEST': '5.5.31',
+
+            'PHP_VERSION': '5.5.30'
+
+        }
+
+        validate_php_version(ctx)
+
+        eq_('5.5.30', ctx['PHP_VERSION'])
+
+        ctx['PHP_VERSION'] = '5.5.29'
+
+        validate_php_version(ctx)
+
+        eq_('5.5.31', ctx['PHP_VERSION'])
+
+        ctx['PHP_VERSION'] = '5.5.30'
+
+        validate_php_version(ctx)
+
+        eq_('5.5.30', ctx['PHP_VERSION'])

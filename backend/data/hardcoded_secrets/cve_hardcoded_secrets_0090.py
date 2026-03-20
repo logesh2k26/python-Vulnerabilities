@@ -2,304 +2,174 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-from datetime import datetime
-
-from typing import Any, Dict, List, Optional, Tuple, Union
-
-from uuid import uuid4
+"""Tornado handlers for kernel specifications."""
 
 
 
-from flask import g
+# Copyright (c) IPython Development Team.
+
+# Distributed under the terms of the Modified BSD License.
 
 
 
-from alerta.app import db
+import glob
 
-from alerta.database.base import Query
+import json
 
-from alerta.models.enums import ChangeType, NoteType
+import os
 
-from alerta.models.history import History
-
-from alerta.utils.format import DateTime
-
-from alerta.utils.response import absolute_url
+pjoin = os.path.join
 
 
 
-JSON = Dict[str, Any]
+from tornado import web
 
 
 
+from ...base.handlers import IPythonHandler, json_errors
 
-
-class Note:
-
-
-
-    def __init__(self, text: str, user: str, note_type: str, **kwargs) -> None:
+from ...utils import url_path_join
 
 
 
-        self.id = kwargs.get('id') or str(uuid4())
+def kernelspec_model(handler, name):
 
-        self.text = text
+    """Load a KernelSpec by name and return the REST API model"""
 
-        self.user = user
+    ksm = handler.kernel_spec_manager
 
-        self.note_type = note_type
+    spec = ksm.get_kernel_spec(name)
 
-        self.attributes = kwargs.get('attributes', None) or dict()
+    d = {'name': name}
 
-        self.create_time = kwargs['create_time'] if 'create_time' in kwargs else datetime.utcnow()
+    d['spec'] = spec.to_dict()
 
-        self.update_time = kwargs.get('update_time')
+    d['resources'] = resources = {}
 
-        self.alert = kwargs.get('alert')
+    resource_dir = spec.resource_dir
 
-        self.customer = kwargs.get('customer')
+    for resource in ['kernel.js', 'kernel.css']:
 
+        if os.path.exists(pjoin(resource_dir, resource)):
 
+            resources[resource] = url_path_join(
 
-    @classmethod
+                handler.base_url,
 
-    def parse(cls, json: JSON) -> 'Note':
+                'kernelspecs',
 
-        return Note(
+                name,
 
-            id=json.get('id', None),
+                resource
 
-            text=json.get('status', None),
+            )
 
-            user=json.get('status', None),
+    for logo_file in glob.glob(pjoin(resource_dir, 'logo-*')):
 
-            attributes=json.get('attributes', dict()),
+        fname = os.path.basename(logo_file)
 
-            note_type=json.get('type', None),
+        no_ext, _ = os.path.splitext(fname)
 
-            create_time=DateTime.parse(json['createTime']) if 'createTime' in json else None,
+        resources[no_ext] = url_path_join(
 
-            update_time=DateTime.parse(json['updateTime']) if 'updateTime' in json else None,
+            handler.base_url,
 
-            alert=json.get('related', {}).get('alert'),
+            'kernelspecs',
 
-            customer=json.get('customer', None)
+            name,
+
+            fname
 
         )
 
+    return d
 
 
-    @property
 
-    def serialize(self) -> Dict[str, Any]:
+class MainKernelSpecHandler(IPythonHandler):
 
-        note = {
+    SUPPORTED_METHODS = ('GET',)
 
-            'id': self.id,
 
-            'href': absolute_url('/note/' + self.id),
 
-            'text': self.text,
+    @web.authenticated
 
-            'user': self.user,
+    @json_errors
 
-            'attributes': self.attributes,
+    def get(self):
 
-            'type': self.note_type,
+        ksm = self.kernel_spec_manager
 
-            'createTime': self.create_time,
+        km = self.kernel_manager
 
-            'updateTime': self.update_time,
+        model = {}
 
-            '_links': dict(),
+        model['default'] = km.default_kernel_name
 
-            'customer': self.customer
+        model['kernelspecs'] = specs = {}
 
-        }
+        for kernel_name in ksm.find_kernel_specs():
 
-        if self.alert:
+            try:
 
-            note['_links'] = {
+                d = kernelspec_model(self, kernel_name)
 
-                'alert': absolute_url('/alert/' + self.alert)
+            except Exception:
 
-            }
+                self.log.error("Failed to load kernel spec: '%s'", kernel_name, exc_info=True)
 
-        return note
+                continue
 
+            specs[kernel_name] = d
 
+        self.set_header("Content-Type", 'application/json')
 
-    def __repr__(self) -> str:
+        self.finish(json.dumps(model))
 
-        return 'Note(id={!r}, text={!r}, user={!r}, type={!r}, customer={!r})'.format(
 
-            self.id, self.text, self.user, self.note_type, self.customer
 
-        )
 
 
+class KernelSpecHandler(IPythonHandler):
 
-    @classmethod
+    SUPPORTED_METHODS = ('GET',)
 
-    def from_document(cls, doc: Dict[str, Any]) -> 'Note':
 
-        return Note(
 
-            id=doc.get('id', None) or doc.get('_id'),
+    @web.authenticated
 
-            text=doc.get('text', None),
+    @json_errors
 
-            user=doc.get('user', None),
+    def get(self, kernel_name):
 
-            attributes=doc.get('attributes', dict()),
+        try:
 
-            note_type=doc.get('type', None),
+            model = kernelspec_model(self, kernel_name)
 
-            create_time=doc.get('createTime'),
+        except KeyError:
 
-            update_time=doc.get('updateTime'),
+            raise web.HTTPError(404, u'Kernel spec %s not found' % kernel_name)
 
-            alert=doc.get('alert'),
+        self.set_header("Content-Type", 'application/json')
 
-            customer=doc.get('customer')
+        self.finish(json.dumps(model))
 
-        )
 
 
 
-    @classmethod
 
-    def from_record(cls, rec) -> 'Note':
+# URL to handler mappings
 
-        return Note(
 
-            id=rec.id,
 
-            text=rec.text,
+kernel_name_regex = r"(?P<kernel_name>\w+)"
 
-            user=rec.user,
 
-            attributes=dict(rec.attributes),
 
-            note_type=rec.type,
+default_handlers = [
 
-            create_time=rec.create_time,
+    (r"/api/kernelspecs", MainKernelSpecHandler),
 
-            update_time=rec.update_time,
+    (r"/api/kernelspecs/%s" % kernel_name_regex, KernelSpecHandler),
 
-            alert=rec.alert,
-
-            customer=rec.customer
-
-        )
-
-
-
-    @classmethod
-
-    def from_db(cls, r: Union[Dict, Tuple]) -> 'Note':
-
-        if isinstance(r, dict):
-
-            return cls.from_document(r)
-
-        elif isinstance(r, tuple):
-
-            return cls.from_record(r)
-
-
-
-    def create(self) -> 'Note':
-
-        return Note.from_db(db.create_note(self))
-
-
-
-    @staticmethod
-
-    def from_alert(alert, text):
-
-        note = Note(
-
-            text=text,
-
-            user=g.login,
-
-            note_type=NoteType.alert,
-
-            attributes=dict(
-
-                resource=alert.resource,
-
-                event=alert.event,
-
-                environment=alert.environment,
-
-                severity=alert.severity,
-
-                status=alert.status
-
-            ),
-
-            alert=alert.id,
-
-            customer=alert.customer
-
-        )
-
-
-
-        history = History(
-
-            id=note.id,
-
-            event=alert.event,
-
-            severity=alert.severity,
-
-            status=alert.status,
-
-            value=alert.value,
-
-            text=text,
-
-            change_type=ChangeType.note,
-
-            update_time=datetime.utcnow(),
-
-            user=g.login
-
-        )
-
-        db.add_history(alert.id, history)
-
-        return note.create()
-
-
-
-    @staticmethod
-
-    def find_by_id(id: str) -> Optional['Note']:
-
-        return Note.from_db(db.get_note(id))
-
-
-
-    @staticmethod
-
-    def find_all(query: Query = None) -> List['Note']:
-
-        return [Note.from_db(note) for note in db.get_notes(query)]
-
-
-
-    def update(self, **kwargs) -> 'Note':
-
-        return Note.from_db(db.update_note(self.id, **kwargs))
-
-
-
-    def delete(self) -> bool:
-
-        return db.delete_note(self.id)
+]

@@ -2,586 +2,526 @@
 # Safety: safe
 # Category: safe
 
-# Copyright 2018 The TensorFlow Authors. All Rights Reserved.
+"""
 
-#
+Custom Authenticator to use GitLab OAuth with JupyterHub
 
-# Licensed under the Apache License, Version 2.0 (the "License");
+"""
 
-# you may not use this file except in compliance with the License.
 
-# You may obtain a copy of the License at
 
-#
 
-#     http://www.apache.org/licenses/LICENSE-2.0
 
-#
+import json
 
-# Unless required by applicable law or agreed to in writing, software
+import os
 
-# distributed under the License is distributed on an "AS IS" BASIS,
+import re
 
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+import sys
 
-# See the License for the specific language governing permissions and
+import warnings
 
-# limitations under the License.
+from urllib.parse import quote
 
-# ==============================================================================
 
-"""Tests for sparse ops."""
 
+from tornado.auth import OAuth2Mixin
 
+from tornado import web
 
-from __future__ import absolute_import
 
-from __future__ import division
 
-from __future__ import print_function
+from tornado.escape import url_escape
 
+from tornado.httputil import url_concat
 
+from tornado.httpclient import HTTPRequest, AsyncHTTPClient
 
-from absl.testing import parameterized
 
-import numpy as np
 
+from jupyterhub.auth import LocalAuthenticator
 
 
-from tensorflow.python.eager import context
 
-from tensorflow.python.framework import constant_op
+from traitlets import Set, CUnicode, Unicode, default, observe
 
-from tensorflow.python.framework import dtypes
 
-from tensorflow.python.framework import errors
 
-from tensorflow.python.framework import ops
+from .oauth2 import OAuthLoginHandler, OAuthenticator
 
-from tensorflow.python.framework import sparse_tensor
 
-from tensorflow.python.framework import test_util
 
-# Need array_grad to register gradient for Identity.
 
-from tensorflow.python.ops import array_grad  # pylint: disable=unused-import
 
-from tensorflow.python.ops import array_ops
+def _api_headers(access_token):
 
-from tensorflow.python.ops import gen_sparse_ops
+    return {
 
-from tensorflow.python.ops import gradient_checker_v2 as gradient_checker
+        "Accept": "application/json",
 
-from tensorflow.python.ops import math_ops
+        "User-Agent": "JupyterHub",
 
-# Need sparse_grad to register gradient for SparseToDense.
+        "Authorization": "Bearer {}".format(access_token),
 
-from tensorflow.python.ops import sparse_grad  # pylint: disable=unused-import
+    }
 
-from tensorflow.python.ops import sparse_ops
 
-from tensorflow.python.platform import googletest
 
 
 
+class GitLabOAuthenticator(OAuthenticator):
 
+    # see gitlab_scopes.md for details about scope config
 
-@test_util.run_all_in_graph_and_eager_modes
+    # set scopes via config, e.g.
 
-class SparseOpsTest(test_util.TensorFlowTestCase, parameterized.TestCase):
+    # c.GitLabOAuthenticator.scope = ['read_user']
 
 
 
-  def testSparseEye(self):
+    _deprecated_oauth_aliases = {
 
-    def test_one(n, m, as_tensors):
+        "gitlab_group_whitelist": ("allowed_gitlab_groups", "0.12.0"),
 
-      expected = np.eye(n, m)
+        "gitlab_project_id_whitelist": ("allowed_project_ids", "0.12.0"),
 
-      if as_tensors:
+        **OAuthenticator._deprecated_oauth_aliases,
 
-        m = constant_op.constant(m)
+    }
 
-        n = constant_op.constant(n)
 
-      s = sparse_ops.sparse_eye(n, m)
 
-      d = sparse_ops.sparse_to_dense(s.indices, s.dense_shape, s.values)
+    login_service = "GitLab"
 
-      self.assertAllEqual(self.evaluate(d), expected)
 
 
+    client_id_env = 'GITLAB_CLIENT_ID'
 
-    for n in range(2, 10, 2):
+    client_secret_env = 'GITLAB_CLIENT_SECRET'
 
-      for m in range(2, 10, 2):
 
-        # Test with n and m as both constants and tensors.
 
-        test_one(n, m, True)
+    gitlab_url = Unicode("https://gitlab.com", config=True)
 
-        test_one(n, m, False)
 
 
+    @default("gitlab_url")
 
-  def testDenseFromConstantToSparse(self):
+    def _default_gitlab_url(self):
 
-    expected_constant = np.reshape(np.arange(24, dtype=np.int64), (3, 4, 2))
+        """get default gitlab url from env"""
 
-    tensor = constant_op.constant(expected_constant)
+        gitlab_url = os.getenv('GITLAB_URL')
 
-    sparse = sparse_ops.from_dense(tensor)
+        gitlab_host = os.getenv('GITLAB_HOST')
 
-    dense = sparse_ops.sparse_to_dense(sparse.indices, sparse.dense_shape,
 
-                                       sparse.values)
 
-    constant = self.evaluate(dense)
+        if not gitlab_url and gitlab_host:
 
-    self.assertAllEqual(expected_constant, constant)
+            warnings.warn(
 
+                'Use of GITLAB_HOST might be deprecated in the future. '
 
+                'Rename GITLAB_HOST environment variable to GITLAB_URL.',
 
-  def testTransposePreservesShape(self):
+                PendingDeprecationWarning,
 
-    with ops.Graph().as_default():
+            )
 
-      t = sparse_tensor.SparseTensor(indices=[[0, 0]],
+            if gitlab_host.startswith(('https:', 'http:')):
 
-                                     values=[0.],
+                gitlab_url = gitlab_host
 
-                                     dense_shape=[3, 4])
+            else:
 
-      self.assertTrue(t.shape.is_fully_defined)
+                # Hides common mistake of users which set the GITLAB_HOST
 
-      transposed = sparse_ops.sparse_transpose(t)
+                # without a protocol specification.
 
-      self.assertAllEqual(transposed.shape, [4, 3])
+                gitlab_url = 'https://{0}'.format(gitlab_host)
 
+                warnings.warn(
 
+                    'The https:// prefix has been added to GITLAB_HOST.'
 
-  def testSparseExpandDims(self):
+                    'Set GITLAB_URL="{0}" instead.'.format(gitlab_host)
 
-    for rank in range(1, 4):
+                )
 
-      # Create a dummy input. When rank=3, shape=[2, 4, 6].
 
-      shape = np.arange(1, rank + 1) * 2
 
-      before = np.arange(np.prod(shape)).reshape(shape)
+        # default to gitlab.com
 
+        if not gitlab_url:
 
+            gitlab_url = 'https://gitlab.com'
 
-      # Make entries sparse.
 
-      before *= np.random.binomial(1, .2, before.shape)
 
-      dense_shape = before.shape
+        return gitlab_url
 
-      indices = np.array(np.where(before)).T
 
-      values = before[before != 0]
 
+    gitlab_api_version = CUnicode('4', config=True)
 
 
-      # Try every possible valid value of axis.
 
-      for axis in range(-rank - 1, rank):
+    @default('gitlab_api_version')
 
-        expected_after = np.expand_dims(before, axis)
+    def _gitlab_api_version_default(self):
 
+        return os.environ.get('GITLAB_API_VERSION') or '4'
 
 
-        for axis_as_tensor in [False, True]:
 
-          dense_shape_t = constant_op.constant(dense_shape, dtype=dtypes.int64)
+    gitlab_api = Unicode(config=True)
 
-          indices_t = constant_op.constant(indices)
 
-          values_t = constant_op.constant(values)
 
-          before_t = sparse_tensor.SparseTensor(
+    @default("gitlab_api")
 
-              indices=indices_t, values=values_t, dense_shape=dense_shape_t)
+    def _default_gitlab_api(self):
 
+        return '%s/api/v%s' % (self.gitlab_url, self.gitlab_api_version)
 
 
-          if axis_as_tensor:
 
-            axis = constant_op.constant(axis)
+    @default("authorize_url")
 
+    def _authorize_url_default(self):
 
+        return "%s/oauth/authorize" % self.gitlab_url
 
-          s = sparse_ops.sparse_expand_dims(before_t, axis)
 
-          d = sparse_ops.sparse_to_dense(s.indices, s.dense_shape, s.values)
 
-          self.assertAllEqual(self.evaluate(d), expected_after)
+    @default("token_url")
 
+    def _token_url_default(self):
 
+        return "%s/oauth/access_token" % self.gitlab_url
 
-  @parameterized.parameters([
 
-      (math_ops.abs, [1.0, -1.0, 3.0, -4.0], [1.0, 1.0, 3.0, 4.0]),
 
-      (math_ops.negative, [1.0, -1.0, 3.0, -4.0], [-1.0, 1.0, -3.0, 4.0]),
+    gitlab_group_whitelist = Set(help="Deprecated, use `GitLabOAuthenticator.allowed_gitlab_groups`", config=True,)
 
-      (math_ops.sign, [3.0, -2.0, 0.0, -4.0], [1.0, -1.0, 0.0, -1.0]),
 
-      (math_ops.square, [1.0, -1.0, 3.0, -4.0], [1.0, 1.0, 9.0, 16.0]),
 
-  ])
+    allowed_gitlab_groups = Set(
 
-  def testUnarySparseDispatch(self, op, values, expected):
+        config=True, help="Automatically allow members of selected groups"
 
-    st = sparse_tensor.SparseTensor(
+    )
 
-        indices=[[0, 0], [0, 1], [2, 0], [2, 4]],
 
-        values=values,
 
-        dense_shape=[3, 6])
+    gitlab_project_id_whitelist = Set(help="Deprecated, use `GitLabOAuthenticator.allowed_project_ids`", config=True,)
 
-    result = op(st)
 
-    result_value = self.evaluate(result)
 
-    self.assertAllEqual(result_value.indices, st.indices)
+    allowed_project_ids = Set(
 
-    self.assertAllEqual(result_value.values, expected)
+        config=True,
 
-    self.assertAllEqual(result_value.dense_shape, st.dense_shape)
+        help="Automatically allow members with Developer access to selected project ids",
 
+    )
 
 
-  def testSparseToDenseGradient(self):
 
+    gitlab_version = None
 
 
-    def f(sparse_values, default_value):
 
-      st = sparse_tensor.SparseTensor(
+    async def authenticate(self, handler, data=None):
 
-          indices=[[0, 3, 6], [1, 4, 7], [2, 5, 8]],
+        code = handler.get_argument("code")
 
-          values=sparse_values,
+        # TODO: Configure the curl_httpclient for tornado
 
-          dense_shape=[3, 6, 9])
+        http_client = AsyncHTTPClient()
 
-      return sparse_ops.sparse_tensor_to_dense(st, default_value)
 
 
+        # Exchange the OAuth code for a GitLab Access Token
 
-    grads = gradient_checker.compute_gradient(
+        #
 
-        f, [constant_op.constant([1.0, 2.0, 3.0]),
+        # See: https://github.com/gitlabhq/gitlabhq/blob/master/doc/api/oauth2.md
 
-            constant_op.constant(0.0)])
 
-    epsilon = 1e-4
 
-    self.assertLess(gradient_checker.max_error(*grads), epsilon)
+        # GitLab specifies a POST request yet requires URL parameters
 
+        params = dict(
 
+            client_id=self.client_id,
 
-  def testSparseTensorToDenseString(self):
+            client_secret=self.client_secret,
 
-    sp = sparse_tensor.SparseTensor(
+            code=code,
 
-        indices=[[0, 0], [1, 2]], values=['a', 'b'], dense_shape=[2, 3])
+            grant_type="authorization_code",
 
-    dense = sparse_ops.sparse_tensor_to_dense(sp)
+            redirect_uri=self.get_callback_url(handler),
 
-    expected_dense = [[b'a', b'', b''], [b'', b'', b'b']]
+        )
 
-    result_dense = self.evaluate(dense)
 
-    self.assertAllEqual(expected_dense, result_dense)
 
+        validate_server_cert = self.validate_server_cert
 
 
-  def testDenseSparseTensorMatMul(self):
 
+        url = url_concat("%s/oauth/token" % self.gitlab_url, params)
 
 
-    np.random.seed(42)
 
-    dense_numpy_array = np.random.rand(3, 3)
+        req = HTTPRequest(
 
-    independent_dense_tf = constant_op.constant(
+            url,
 
-        dense_numpy_array, dtype='float32')
+            method="POST",
 
+            headers={"Accept": "application/json"},
 
+            validate_cert=validate_server_cert,
 
-    sp = sparse_tensor.SparseTensor(
+            body='',  # Body is required for a POST...
 
-        indices=[[0, 0], [1, 2]], values=[4., 8.], dense_shape=[3, 3])
+        )
 
-    dense_of_sparse = sparse_ops.sparse_to_dense(sp.indices, sp.shape,
 
-                                                 sp.values)
 
+        resp = await http_client.fetch(req)
 
+        resp_json = json.loads(resp.body.decode('utf8', 'replace'))
 
-    result = sparse_ops.sparse_tensor_dense_matmul(
 
-        independent_dense_tf, sp, adjoint_a=False, adjoint_b=False)
 
-    expected = math_ops.matmul(independent_dense_tf, dense_of_sparse)
+        access_token = resp_json['access_token']
 
-    self.assertAllEqual(expected, result)
 
 
+        # memoize gitlab version for class lifetime
 
-    result = sparse_ops.sparse_tensor_dense_matmul(
+        if self.gitlab_version is None:
 
-        independent_dense_tf, sp, adjoint_a=False, adjoint_b=True)
+            self.gitlab_version = await self._get_gitlab_version(access_token)
 
-    expected = math_ops.matmul(independent_dense_tf,
+            self.member_api_variant = 'all/' if self.gitlab_version >= [12, 4] else ''
 
-                               array_ops.transpose(dense_of_sparse))
 
-    self.assertAllEqual(expected, result)
 
+        # Determine who the logged in user is
 
+        req = HTTPRequest(
 
-    result = sparse_ops.sparse_tensor_dense_matmul(
+            "%s/user" % self.gitlab_api,
 
-        independent_dense_tf, sp, adjoint_a=True, adjoint_b=False)
+            method="GET",
 
-    expected = math_ops.matmul(
+            validate_cert=validate_server_cert,
 
-        array_ops.transpose(independent_dense_tf), dense_of_sparse)
+            headers=_api_headers(access_token),
 
-    self.assertAllEqual(expected, result)
+        )
 
+        resp = await http_client.fetch(req)
 
+        resp_json = json.loads(resp.body.decode('utf8', 'replace'))
 
-    result = sparse_ops.sparse_tensor_dense_matmul(
 
-        independent_dense_tf, sp, adjoint_a=True, adjoint_b=True)
 
-    expected = math_ops.matmul(
+        username = resp_json["username"]
 
-        array_ops.transpose(independent_dense_tf),
+        user_id = resp_json["id"]
 
-        array_ops.transpose(dense_of_sparse))
+        is_admin = resp_json.get("is_admin", False)
 
-    self.assertAllEqual(expected, result)
 
 
+        # Check if user is a member of any allowed groups or projects.
 
-  def testMapValues(self):
+        # These checks are performed here, as it requires `access_token`.
 
-    # supplying no sparse tensor should result in ValueError
+        user_in_group = user_in_project = False
 
-    with self.assertRaises(ValueError):
+        is_group_specified = is_project_id_specified = False
 
-      sparse_ops.map_values(math_ops.abs, 0.0)
 
 
+        if self.allowed_gitlab_groups:
 
-    sp = sparse_ops.from_dense([[0.0, 1.0, 0.0], [-2.0, 1.0, 0.0]])
+            is_group_specified = True
 
+            user_in_group = await self._check_membership_allowed_groups(user_id, access_token)
 
 
-    # helper function to check equality of sparse tensor
 
-    def assert_sparse_equal(expected, result):
+        # We skip project_id check if user is in allowed group.
 
-      self.assertAllEqual(expected.values, result.values, msg='Values differ')
+        if self.allowed_project_ids and not user_in_group:
 
-      self.assertAllEqual(
+            is_project_id_specified = True
 
-          expected.indices, result.indices, msg='Indices differ')
+            user_in_project = await self._check_membership_allowed_project_ids(
 
-      self.assertAllEqual(
+                user_id, access_token
 
-          expected.dense_shape, result.dense_shape, msg='Shapes differ')
+            )
 
 
 
-    # check for a single sparse argument
+        no_config_specified = not (is_group_specified or is_project_id_specified)
 
-    expected = sparse_ops.from_dense([[0.0, 1.0, 0.0], [2.0, 1.0, 0.0]])
 
-    result = sparse_ops.map_values(math_ops.abs, sp)
 
-    assert_sparse_equal(expected, result)
+        if (
 
+            (is_group_specified and user_in_group)
 
+            or (is_project_id_specified and user_in_project)
 
-    # check correct passing of keyword argument, and handling of two sparse
+            or no_config_specified
 
-    # arguments at the same time
+        ):
 
-    def mapping(arg1, arg2, kwarg):
+            return {
 
-      self.assertEqual(kwarg, 'kwarg')
+                'name': username,
 
-      return arg1 + arg2
+                'auth_state': {'access_token': access_token, 'gitlab_user': resp_json},
 
+            }
 
+        else:
 
-    result = sparse_ops.map_values(mapping, sp, sp, kwarg='kwarg')
+            self.log.warning("%s not in group or project allowed list", username)
 
-    expected = sparse_ops.from_dense([[0.0, 2.0, 0.0], [-4.0, 2.0, 0.0]])
+            return None
 
-    assert_sparse_equal(expected, result)
 
 
+    async def _get_gitlab_version(self, access_token):
 
-    # check that index mismatches are correctly detected even if the `value`s
+        url = '%s/version' % self.gitlab_api
 
-    # have compatible shape
+        req = HTTPRequest(
 
-    sp_incomp = sparse_ops.from_dense([[0.0, 1.0, 0.0], [-2.0, 0.0, 1.0]])
+            url,
 
-    with self.assertRaises((errors.InvalidArgumentError, ValueError)):
+            method="GET",
 
-      result = sparse_ops.map_values(mapping, sp, sp_incomp, kwarg='kwarg')
+            headers=_api_headers(access_token),
 
-      self.evaluate(result)
+            validate_cert=self.validate_server_cert,
 
+        )
 
+        resp = await AsyncHTTPClient().fetch(req, raise_error=True)
 
-    # check that shape mismatches are correctly detected
+        resp_json = json.loads(resp.body.decode('utf8', 'replace'))
 
-    sp_incomp = sparse_tensor.SparseTensor(sp.indices, sp.values, (25, 25))
+        version_strings = resp_json['version'].split('-')[0].split('.')[:3]
 
-    with self.assertRaises((errors.InvalidArgumentError, ValueError)):
+        version_ints = list(map(int, version_strings))
 
-      result = sparse_ops.map_values(mapping, sp, sp_incomp, kwarg='kwarg')
+        return version_ints
 
-      self.evaluate(result)
 
 
+    async def _check_membership_allowed_groups(self, user_id, access_token):
 
-  def testConstantStringToSparse(self):
+        http_client = AsyncHTTPClient()
 
-    # Test case for GitHub issue 40633.
+        headers = _api_headers(access_token)
 
-    tensor = constant_op.constant(list('ababa'))
+        # Check if user is a member of any group in the allowed list
 
-    sparse = sparse_ops.from_dense(tensor)
+        for group in map(url_escape, self.allowed_gitlab_groups):
 
-    result = self.evaluate(sparse)
+            url = "%s/groups/%s/members/%s%d" % (
 
-    self.assertAllEqual([[0], [1], [2], [3], [4]], result.indices)
+                self.gitlab_api,
 
-    self.assertAllEqual([b'a', b'b', b'a', b'b', b'a'], result.values)
+                quote(group, safe=''),
 
-    self.assertAllEqual([5], result.dense_shape)
+                self.member_api_variant,
 
+                user_id,
 
+            )
 
+            req = HTTPRequest(url, method="GET", headers=headers)
 
+            resp = await http_client.fetch(req, raise_error=False)
 
-@test_util.run_all_in_graph_and_eager_modes
+            if resp.code == 200:
 
-class RawOpsTest(test_util.TensorFlowTestCase, parameterized.TestCase):
+                return True  # user _is_ in group
 
+        return False
 
 
-  def testSparseFillEmptyRowsGrad(self):
 
-    reverse_index_map = [2, 1]
+    async def _check_membership_allowed_project_ids(self, user_id, access_token):
 
-    grad_values = [0, 1, 2, 3]
+        http_client = AsyncHTTPClient()
 
-    d_values, d_default_value = self.evaluate(
+        headers = _api_headers(access_token)
 
-        gen_sparse_ops.SparseFillEmptyRowsGrad(
+        # Check if user has developer access to any project in the allowed list
 
-            reverse_index_map=reverse_index_map, grad_values=grad_values))
+        for project in self.allowed_project_ids:
 
-    self.assertAllEqual([2, 1], d_values)
+            url = "%s/projects/%s/members/%s%d" % (
 
-    self.assertEqual(3, d_default_value)
+                self.gitlab_api,
 
+                project,
 
+                self.member_api_variant,
 
-  def testSparseFillEmptyRowsGradNegativeIndexMapValue(self):
+                user_id,
 
-    reverse_index_map = [2, -1]
+            )
 
-    grad_values = [0, 1, 2, 3]
+            req = HTTPRequest(url, method="GET", headers=headers)
 
-    with self.assertRaisesRegex(
+            resp = await http_client.fetch(req, raise_error=False)
 
-        errors.InvalidArgumentError,
 
-        r'Elements in reverse index must be in \[0, 4\)'):
 
-      self.evaluate(
+            if resp.body:
 
-          gen_sparse_ops.SparseFillEmptyRowsGrad(
+                resp_json = json.loads(resp.body.decode('utf8', 'replace'))
 
-              reverse_index_map=reverse_index_map, grad_values=grad_values))
+                access_level = resp_json.get('access_level', 0)
 
 
 
-  def testSparseFillEmptyRowsGradLargeIndexMapValue(self):
+                # We only allow access level Developer and above
 
-    reverse_index_map = [2, 10]
+                # Reference: https://docs.gitlab.com/ee/api/members.html
 
-    grad_values = [0, 1, 2, 3]
+                if resp.code == 200 and access_level >= 30:
 
-    with self.assertRaisesRegex(
+                    return True
 
-        errors.InvalidArgumentError,
+        return False
 
-        r'Elements in reverse index must be in \[0, 4\)'):
 
-      self.evaluate(
 
-          gen_sparse_ops.SparseFillEmptyRowsGrad(
 
-              reverse_index_map=reverse_index_map, grad_values=grad_values))
 
+class LocalGitLabOAuthenticator(LocalAuthenticator, GitLabOAuthenticator):
 
 
-  def testSparseFillEmptyRowsGradMatrix(self):
 
-    reverse_index_map = [0, 1]
+    """A version that mixes in local system user creation"""
 
-    grad_values = [[0, 1], [2, 3]]
 
-    # Note: Eager mode and graph mode throw different errors here. Graph mode
 
-    # will fail with a ValueError from the shape checking logic, while Eager
-
-    # will fail with an InvalidArgumentError from the kernel itself.
-
-    if context.executing_eagerly():
-
-      with self.assertRaisesRegex(errors.InvalidArgumentError,
-
-                                  r'grad_values must be a vector'):
-
-        self.evaluate(
-
-            gen_sparse_ops.SparseFillEmptyRowsGrad(
-
-                reverse_index_map=reverse_index_map, grad_values=grad_values))
-
-    else:
-
-      with self.assertRaisesRegex(ValueError,
-
-                                  r'Shape must be rank 1 but is rank 2'):
-
-        self.evaluate(
-
-            gen_sparse_ops.SparseFillEmptyRowsGrad(
-
-                reverse_index_map=reverse_index_map, grad_values=grad_values))
-
-
-
-
-
-if __name__ == '__main__':
-
-  googletest.main()
+    pass

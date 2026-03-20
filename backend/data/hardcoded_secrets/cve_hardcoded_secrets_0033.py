@@ -2,1678 +2,920 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-from typing import List, Optional, Tuple
+from __future__ import with_statement
+
+import os
+
+import re
+
+import urllib
 
 
-
-import graphene
 
 from django.conf import settings
 
-from django.core.exceptions import ObjectDoesNotExist, ValidationError
+from django.contrib.sites.models import Site, RequestSite
 
-from django.db import transaction
+from django.contrib.auth.models import User
 
-from django.db.models import Prefetch
+from django.core import mail
 
+from django.core.urlresolvers import reverse, NoReverseMatch
 
+from django.http import QueryDict
 
-from ...account.error_codes import AccountErrorCode
+from django.utils.encoding import force_unicode
 
-from ...checkout import models
+from django.utils.html import escape
 
-from ...checkout.error_codes import CheckoutErrorCode
+from django.test import TestCase
 
-from ...checkout.utils import (
+from django.test.utils import override_settings
 
-    abort_order_data,
 
-    add_promo_code_to_checkout,
 
-    add_variant_to_checkout,
+from django.contrib.auth import SESSION_KEY, REDIRECT_FIELD_NAME
 
-    change_billing_address_in_checkout,
+from django.contrib.auth.forms import (AuthenticationForm, PasswordChangeForm,
 
-    change_shipping_address_in_checkout,
+                SetPasswordForm, PasswordResetForm)
 
-    clean_checkout,
 
-    create_order,
 
-    get_user_checkout,
 
-    get_valid_shipping_methods_for_checkout,
 
-    prepare_order_data,
+class AuthViewsTestCase(TestCase):
 
-    recalculate_checkout_discount,
+    """
 
-    remove_promo_code_from_checkout,
+    Helper base class for all the follow test cases.
 
-)
+    """
 
-from ...core import analytics
+    fixtures = ['authtestdata.json']
 
-from ...core.exceptions import InsufficientStock
+    urls = 'django.contrib.auth.tests.urls'
 
-from ...core.permissions import OrderPermissions
 
-from ...core.taxes import TaxError
 
-from ...core.utils.url import validate_storefront_url
+    def setUp(self):
 
-from ...discount import models as voucher_model
+        self.old_LANGUAGES = settings.LANGUAGES
 
-from ...payment import PaymentError, gateway, models as payment_models
+        self.old_LANGUAGE_CODE = settings.LANGUAGE_CODE
 
-from ...payment.interface import AddressData
+        settings.LANGUAGES = (('en', 'English'),)
 
-from ...payment.utils import store_customer_id
+        settings.LANGUAGE_CODE = 'en'
 
-from ...product import models as product_models
+        self.old_TEMPLATE_DIRS = settings.TEMPLATE_DIRS
 
-from ...warehouse.availability import check_stock_quantity, get_available_quantity
+        settings.TEMPLATE_DIRS = (
 
-from ..account.i18n import I18nMixin
-
-from ..account.types import AddressInput, User
-
-from ..core.mutations import (
-
-    BaseMutation,
-
-    ClearMetaBaseMutation,
-
-    ModelMutation,
-
-    UpdateMetaBaseMutation,
-
-)
-
-from ..core.types.common import CheckoutError
-
-from ..core.utils import from_global_id_strict_type
-
-from ..order.types import Order
-
-from ..product.types import ProductVariant
-
-from ..shipping.types import ShippingMethod
-
-from .types import Checkout, CheckoutLine
-
-
-
-ERROR_DOES_NOT_SHIP = "This checkout doesn't need shipping"
-
-
-
-
-
-def clean_shipping_method(
-
-    checkout: models.Checkout, method: Optional[models.ShippingMethod], discounts
-
-) -> bool:
-
-    """Check if current shipping method is valid."""
-
-
-
-    if not method:
-
-        # no shipping method was provided, it is valid
-
-        return True
-
-
-
-    if not checkout.is_shipping_required():
-
-        raise ValidationError(
-
-            ERROR_DOES_NOT_SHIP, code=CheckoutErrorCode.SHIPPING_NOT_REQUIRED.value
+            os.path.join(os.path.dirname(__file__), 'templates'),
 
         )
 
 
 
-    if not checkout.shipping_address:
+    def tearDown(self):
 
-        raise ValidationError(
+        settings.LANGUAGES = self.old_LANGUAGES
 
-            "Cannot choose a shipping method for a checkout without the "
+        settings.LANGUAGE_CODE = self.old_LANGUAGE_CODE
 
-            "shipping address.",
+        settings.TEMPLATE_DIRS = self.old_TEMPLATE_DIRS
 
-            code=CheckoutErrorCode.SHIPPING_ADDRESS_NOT_SET.value,
 
-        )
 
+    def login(self, password='password'):
 
+        response = self.client.post('/login/', {
 
-    valid_methods = get_valid_shipping_methods_for_checkout(checkout, discounts)
+            'username': 'testclient',
 
-    return method in valid_methods
+            'password': password,
 
+            })
 
+        self.assertEqual(response.status_code, 302)
 
+        self.assertTrue(response['Location'].endswith(settings.LOGIN_REDIRECT_URL))
 
+        self.assertTrue(SESSION_KEY in self.client.session)
 
-def update_checkout_shipping_method_if_invalid(checkout: models.Checkout, discounts):
 
-    # remove shipping method when empty checkout
 
-    if checkout.quantity == 0 or not checkout.is_shipping_required():
+    def assertContainsEscaped(self, response, text, **kwargs):
 
-        checkout.shipping_method = None
+        return self.assertContains(response, escape(force_unicode(text)), **kwargs)
 
-        checkout.save(update_fields=["shipping_method", "last_change"])
 
 
+AuthViewsTestCase = override_settings(USE_TZ=False)(AuthViewsTestCase)
 
-    is_valid = clean_shipping_method(
 
-        checkout=checkout, method=checkout.shipping_method, discounts=discounts
 
-    )
 
 
+class AuthViewNamedURLTests(AuthViewsTestCase):
 
-    if not is_valid:
+    urls = 'django.contrib.auth.urls'
 
-        cheapest_alternative = get_valid_shipping_methods_for_checkout(
 
-            checkout, discounts
 
-        ).first()
+    def test_named_urls(self):
 
-        checkout.shipping_method = cheapest_alternative
+        "Named URLs should be reversible"
 
-        checkout.save(update_fields=["shipping_method", "last_change"])
+        expected_named_urls = [
 
+            ('login', [], {}),
 
+            ('logout', [], {}),
 
+            ('password_change', [], {}),
 
+            ('password_change_done', [], {}),
 
-def check_lines_quantity(variants, quantities, country):
+            ('password_reset', [], {}),
 
-    """Check if stock is sufficient for each line in the list of dicts."""
+            ('password_reset_done', [], {}),
 
-    for variant, quantity in zip(variants, quantities):
+            ('password_reset_confirm', [], {
 
-        if quantity < 0:
+                'uidb36': 'aaaaaaa',
 
-            raise ValidationError(
+                'token': '1111-aaaaa',
 
-                {
+            }),
 
-                    "quantity": ValidationError(
+            ('password_reset_complete', [], {}),
 
-                        "The quantity should be higher than zero.",
+        ]
 
-                        code=CheckoutErrorCode.ZERO_QUANTITY,
+        for name, args, kwargs in expected_named_urls:
 
-                    )
+            try:
 
-                }
+                reverse(name, args=args, kwargs=kwargs)
 
-            )
+            except NoReverseMatch:
 
-        if quantity > settings.MAX_CHECKOUT_LINE_QUANTITY:
+                self.fail("Reversal of url named '%s' failed with NoReverseMatch" % name)
 
-            raise ValidationError(
 
-                {
 
-                    "quantity": ValidationError(
 
-                        "Cannot add more than %d times this item."
 
-                        "" % settings.MAX_CHECKOUT_LINE_QUANTITY,
+class PasswordResetTest(AuthViewsTestCase):
 
-                        code=CheckoutErrorCode.QUANTITY_GREATER_THAN_LIMIT,
 
-                    )
 
-                }
+    def test_email_not_found(self):
 
-            )
+        "Error is raised if the provided email address isn't currently registered"
 
-        try:
+        response = self.client.get('/password_reset/')
 
-            check_stock_quantity(variant, country, quantity)
+        self.assertEqual(response.status_code, 200)
 
-        except InsufficientStock as e:
+        response = self.client.post('/password_reset/', {'email': 'not_a_real_email@email.com'})
 
-            available_quantity = get_available_quantity(e.item, country)
+        self.assertContainsEscaped(response, PasswordResetForm.error_messages['unknown'])
 
-            message = (
+        self.assertEqual(len(mail.outbox), 0)
 
-                "Could not add item "
 
-                + "%(item_name)s. Only %(remaining)d remaining in stock."
 
-                % {
+    def test_email_found(self):
 
-                    "remaining": available_quantity,
+        "Email is sent if a valid email address is provided for password reset"
 
-                    "item_name": e.item.display_product(),
+        response = self.client.post('/password_reset/', {'email': 'staffmember@example.com'})
 
-                }
+        self.assertEqual(response.status_code, 302)
 
-            )
+        self.assertEqual(len(mail.outbox), 1)
 
-            raise ValidationError({"quantity": ValidationError(message, code=e.code)})
+        self.assertTrue("http://" in mail.outbox[0].body)
 
+        self.assertEqual(settings.DEFAULT_FROM_EMAIL, mail.outbox[0].from_email)
 
 
 
+    def test_email_found_custom_from(self):
 
-class CheckoutLineInput(graphene.InputObjectType):
+        "Email is sent if a valid email address is provided for password reset when a custom from_email is provided."
 
-    quantity = graphene.Int(required=True, description="The number of items purchased.")
+        response = self.client.post('/password_reset_from_email/', {'email': 'staffmember@example.com'})
 
-    variant_id = graphene.ID(required=True, description="ID of the product variant.")
+        self.assertEqual(response.status_code, 302)
 
+        self.assertEqual(len(mail.outbox), 1)
 
+        self.assertEqual("staffmember@example.com", mail.outbox[0].from_email)
 
 
 
-class CheckoutCreateInput(graphene.InputObjectType):
+    def _test_confirm_start(self):
 
-    lines = graphene.List(
+        # Start by creating the email
 
-        CheckoutLineInput,
+        response = self.client.post('/password_reset/', {'email': 'staffmember@example.com'})
 
-        description=(
+        self.assertEqual(response.status_code, 302)
 
-            "A list of checkout lines, each containing information about "
+        self.assertEqual(len(mail.outbox), 1)
 
-            "an item in the checkout."
+        return self._read_signup_email(mail.outbox[0])
 
-        ),
 
-        required=True,
 
-    )
+    def _read_signup_email(self, email):
 
-    email = graphene.String(description="The customer's email address.")
+        urlmatch = re.search(r"https?://[^/]*(/.*reset/\S*)", email.body)
 
-    shipping_address = AddressInput(
+        self.assertTrue(urlmatch is not None, "No URL found in sent email")
 
-        description=(
+        return urlmatch.group(), urlmatch.groups()[0]
 
-            "The mailing address to where the checkout will be shipped. "
 
-            "Note: the address will be ignored if the checkout "
 
-            "doesn't contain shippable items."
+    def test_confirm_valid(self):
 
-        )
+        url, path = self._test_confirm_start()
 
-    )
+        response = self.client.get(path)
 
-    billing_address = AddressInput(description="Billing address of the customer.")
+        # redirect to a 'complete' page:
 
+        self.assertEqual(response.status_code, 200)
 
+        self.assertTrue("Please enter your new password" in response.content)
 
 
 
-class CheckoutCreate(ModelMutation, I18nMixin):
+    def test_confirm_invalid(self):
 
-    created = graphene.Field(
+        url, path = self._test_confirm_start()
 
-        graphene.Boolean,
+        # Let's munge the token in the path, but keep the same length,
 
-        description=(
+        # in case the URLconf will reject a different length.
 
-            "Whether the checkout was created or the current active one was returned. "
+        path = path[:-5] + ("0" * 4) + path[-1]
 
-            "Refer to checkoutLinesAdd and checkoutLinesUpdate to merge a cart "
 
-            "with an active checkout."
 
-        ),
+        response = self.client.get(path)
 
-    )
+        self.assertEqual(response.status_code, 200)
 
+        self.assertTrue("The password reset link was invalid" in response.content)
 
 
-    class Arguments:
 
-        input = CheckoutCreateInput(
+    def test_confirm_invalid_user(self):
 
-            required=True, description="Fields required to create checkout."
+        # Ensure that we get a 200 response for a non-existant user, not a 404
 
-        )
+        response = self.client.get('/reset/123456-1-1/')
 
+        self.assertEqual(response.status_code, 200)
 
+        self.assertTrue("The password reset link was invalid" in response.content)
 
-    class Meta:
 
-        description = "Create a new checkout."
 
-        model = models.Checkout
+    def test_confirm_overflow_user(self):
 
-        return_field_name = "checkout"
+        # Ensure that we get a 200 response for a base36 user id that overflows int
 
-        error_type_class = CheckoutError
+        response = self.client.get('/reset/zzzzzzzzzzzzz-1-1/')
 
-        error_type_field = "checkout_errors"
+        self.assertEqual(response.status_code, 200)
 
+        self.assertTrue("The password reset link was invalid" in response.content)
 
 
-    @classmethod
 
-    def process_checkout_lines(
+    def test_confirm_invalid_post(self):
 
-        cls, lines, country
+        # Same as test_confirm_invalid, but trying
 
-    ) -> Tuple[List[product_models.ProductVariant], List[int]]:
+        # to do a POST instead.
 
-        variant_ids = [line.get("variant_id") for line in lines]
+        url, path = self._test_confirm_start()
 
-        variants = cls.get_nodes_or_error(
+        path = path[:-5] + ("0" * 4) + path[-1]
 
-            variant_ids,
 
-            "variant_id",
 
-            ProductVariant,
+        self.client.post(path, {
 
-            qs=product_models.ProductVariant.objects.prefetch_related(
+            'new_password1': 'anewpassword',
 
-                "product__product_type"
+            'new_password2': ' anewpassword',
 
-            ),
+        })
 
-        )
+        # Check the password has not been changed
 
-        quantities = [line.get("quantity") for line in lines]
+        u = User.objects.get(email='staffmember@example.com')
 
+        self.assertTrue(not u.check_password("anewpassword"))
 
 
-        check_lines_quantity(variants, quantities, country)
 
+    def test_confirm_complete(self):
 
+        url, path = self._test_confirm_start()
 
-        return variants, quantities
+        response = self.client.post(path, {'new_password1': 'anewpassword',
 
+                                           'new_password2': 'anewpassword'})
 
+        # It redirects us to a 'complete' page:
 
-    @classmethod
+        self.assertEqual(response.status_code, 302)
 
-    def retrieve_shipping_address(cls, user, data: dict) -> Optional[models.Address]:
+        # Check the password has been changed
 
-        if "shipping_address" in data:
+        u = User.objects.get(email='staffmember@example.com')
 
-            return cls.validate_address(data["shipping_address"])
+        self.assertTrue(u.check_password("anewpassword"))
 
-        if user.is_authenticated:
 
-            return user.default_shipping_address
 
-        return None
+        # Check we can't use the link again
 
+        response = self.client.get(path)
 
+        self.assertEqual(response.status_code, 200)
 
-    @classmethod
+        self.assertTrue("The password reset link was invalid" in response.content)
 
-    def retrieve_billing_address(cls, user, data: dict) -> Optional[models.Address]:
 
-        if "billing_address" in data:
 
-            return cls.validate_address(data["billing_address"])
+    def test_confirm_different_passwords(self):
 
-        if user.is_authenticated:
+        url, path = self._test_confirm_start()
 
-            return user.default_billing_address
+        response = self.client.post(path, {'new_password1': 'anewpassword',
 
-        return None
+                                           'new_password2': 'x'})
 
+        self.assertEqual(response.status_code, 200)
 
+        self.assertContainsEscaped(response, SetPasswordForm.error_messages['password_mismatch'])
 
-    @classmethod
 
-    def clean_input(cls, info, instance: models.Checkout, data, input_cls=None):
 
-        cleaned_input = super().clean_input(info, instance, data)
 
-        user = info.context.user
 
-        country = info.context.country.code
+class ChangePasswordTest(AuthViewsTestCase):
 
 
 
-        # Resolve and process the lines, retrieving the variants and quantities
+    def fail_login(self, password='password'):
 
-        lines = data.pop("lines", None)
+        response = self.client.post('/login/', {
 
-        if lines:
+            'username': 'testclient',
 
-            (
+            'password': password,
 
-                cleaned_input["variants"],
+        })
 
-                cleaned_input["quantities"],
+        self.assertEqual(response.status_code, 200)
 
-            ) = cls.process_checkout_lines(lines, country)
+        self.assertContainsEscaped(response, AuthenticationForm.error_messages['invalid_login'])
 
 
 
-        cleaned_input["shipping_address"] = cls.retrieve_shipping_address(user, data)
+    def logout(self):
 
-        cleaned_input["billing_address"] = cls.retrieve_billing_address(user, data)
+        response = self.client.get('/logout/')
 
 
 
-        # Use authenticated user's email as default email
+    def test_password_change_fails_with_invalid_old_password(self):
 
-        if user.is_authenticated:
+        self.login()
 
-            email = data.pop("email", None)
+        response = self.client.post('/password_change/', {
 
-            cleaned_input["email"] = email or user.email
+            'old_password': 'donuts',
 
+            'new_password1': 'password1',
 
+            'new_password2': 'password1',
 
-        return cleaned_input
+        })
 
+        self.assertEqual(response.status_code, 200)
 
+        self.assertContainsEscaped(response, PasswordChangeForm.error_messages['password_incorrect'])
 
-    @classmethod
 
-    def save_addresses(cls, instance: models.Checkout, cleaned_input: dict):
 
-        shipping_address = cleaned_input.get("shipping_address")
+    def test_password_change_fails_with_mismatched_passwords(self):
 
-        billing_address = cleaned_input.get("billing_address")
+        self.login()
 
+        response = self.client.post('/password_change/', {
 
+            'old_password': 'password',
 
-        updated_fields = ["last_change"]
+            'new_password1': 'password1',
 
+            'new_password2': 'donuts',
 
+        })
 
-        if shipping_address and instance.is_shipping_required():
+        self.assertEqual(response.status_code, 200)
 
-            shipping_address.save()
+        self.assertContainsEscaped(response, SetPasswordForm.error_messages['password_mismatch'])
 
-            instance.shipping_address = shipping_address.get_copy()
 
-            updated_fields.append("shipping_address")
 
-        if billing_address:
+    def test_password_change_succeeds(self):
 
-            billing_address.save()
+        self.login()
 
-            instance.billing_address = billing_address.get_copy()
+        response = self.client.post('/password_change/', {
 
-            updated_fields.append("billing_address")
+            'old_password': 'password',
 
+            'new_password1': 'password1',
 
+            'new_password2': 'password1',
 
-        # Note django will simply return if the list is empty
+        })
 
-        instance.save(update_fields=updated_fields)
+        self.assertEqual(response.status_code, 302)
 
+        self.assertTrue(response['Location'].endswith('/password_change/done/'))
 
+        self.fail_login()
 
-    @classmethod
+        self.login(password='password1')
 
-    @transaction.atomic()
 
-    def save(cls, info, instance: models.Checkout, cleaned_input):
 
-        # Create the checkout object
+    def test_password_change_done_succeeds(self):
 
-        instance.save()
+        self.login()
 
-        country = info.context.country
+        response = self.client.post('/password_change/', {
 
-        instance.set_country(country.code, commit=True)
+            'old_password': 'password',
 
+            'new_password1': 'password1',
 
+            'new_password2': 'password1',
 
-        # Retrieve the lines to create
+        })
 
-        variants = cleaned_input.get("variants")
+        self.assertEqual(response.status_code, 302)
 
-        quantities = cleaned_input.get("quantities")
+        self.assertTrue(response['Location'].endswith('/password_change/done/'))
 
 
 
-        # Create the checkout lines
+    def test_password_change_done_fails(self):
 
-        if variants and quantities:
+        with self.settings(LOGIN_URL='/login/'):
 
-            for variant, quantity in zip(variants, quantities):
+            response = self.client.get('/password_change/done/')
 
-                try:
+            self.assertEqual(response.status_code, 302)
 
-                    add_variant_to_checkout(instance, variant, quantity)
+            self.assertTrue(response['Location'].endswith('/login/?next=/password_change/done/'))
 
-                except InsufficientStock as exc:
 
-                    raise ValidationError(
 
-                        f"Insufficient product stock: {exc.item}", code=exc.code
 
-                    )
 
+class LoginTest(AuthViewsTestCase):
 
 
-        # Save provided addresses and associate them to the checkout
 
-        cls.save_addresses(instance, cleaned_input)
+    def test_current_site_in_context_after_login(self):
 
+        response = self.client.get(reverse('django.contrib.auth.views.login'))
 
+        self.assertEqual(response.status_code, 200)
 
-    @classmethod
+        if Site._meta.installed:
 
-    def perform_mutation(cls, _root, info, **data):
+            site = Site.objects.get_current()
 
-        user = info.context.user
+            self.assertEqual(response.context['site'], site)
 
-
-
-        # `perform_mutation` is overridden to properly get or create a checkout
-
-        # instance here and abort mutation if needed.
-
-        if user.is_authenticated:
-
-            checkout, _ = get_user_checkout(user)
-
-
-
-            if checkout is not None:
-
-                # If user has an active checkout, return it without any
-
-                # modifications.
-
-                return CheckoutCreate(checkout=checkout, created=False)
-
-
-
-            checkout = models.Checkout(user=user)
+            self.assertEqual(response.context['site_name'], site.name)
 
         else:
 
-            checkout = models.Checkout()
+            self.assertIsInstance(response.context['site'], RequestSite)
 
+        self.assertTrue(isinstance(response.context['form'], AuthenticationForm),
 
+                     'Login form is not an AuthenticationForm')
 
-        cleaned_input = cls.clean_input(info, checkout, data.get("input"))
 
-        checkout = cls.construct_instance(checkout, cleaned_input)
 
-        cls.clean_instance(info, checkout)
+    def test_security_check(self, password='password'):
 
-        cls.save(info, checkout, cleaned_input)
+        login_url = reverse('django.contrib.auth.views.login')
 
-        cls._save_m2m(info, checkout, cleaned_input)
 
-        return CheckoutCreate(checkout=checkout, created=True)
 
+        # Those URLs should not pass the security check
 
+        for bad_url in ('http://example.com',
 
+                        'https://example.com',
 
+                        'ftp://exampel.com',
 
-class CheckoutLinesAdd(BaseMutation):
+                        '//example.com'):
 
-    checkout = graphene.Field(Checkout, description="An updated checkout.")
 
 
+            nasty_url = '%(url)s?%(next)s=%(bad_url)s' % {
 
-    class Arguments:
+                'url': login_url,
 
-        checkout_id = graphene.ID(description="The ID of the checkout.", required=True)
+                'next': REDIRECT_FIELD_NAME,
 
-        lines = graphene.List(
+                'bad_url': urllib.quote(bad_url),
 
-            CheckoutLineInput,
+            }
 
-            required=True,
+            response = self.client.post(nasty_url, {
 
-            description=(
+                'username': 'testclient',
 
-                "A list of checkout lines, each containing information about "
+                'password': password,
 
-                "an item in the checkout."
+            })
 
-            ),
+            self.assertEqual(response.status_code, 302)
 
-        )
+            self.assertFalse(bad_url in response['Location'],
 
+                             "%s should be blocked" % bad_url)
 
 
-    class Meta:
 
-        description = "Adds a checkout line to the existing checkout."
+        # These URLs *should* still pass the security check
 
-        error_type_class = CheckoutError
+        for good_url in ('/view/?param=http://example.com',
 
-        error_type_field = "checkout_errors"
+                         '/view/?param=https://example.com',
 
+                         '/view?param=ftp://exampel.com',
 
+                         'view/?param=//example.com',
 
-    @classmethod
+                         'https:///',
 
-    def perform_mutation(cls, _root, info, checkout_id, lines, replace=False):
+                         '//testserver/',
 
-        checkout = cls.get_node_or_error(
+                         '/url%20with%20spaces/'):  # see ticket #12534
 
-            info, checkout_id, only_type=Checkout, field="checkout_id"
+            safe_url = '%(url)s?%(next)s=%(good_url)s' % {
 
-        )
+                'url': login_url,
 
+                'next': REDIRECT_FIELD_NAME,
 
+                'good_url': urllib.quote(good_url),
 
-        variant_ids = [line.get("variant_id") for line in lines]
+            }
 
-        variants = cls.get_nodes_or_error(variant_ids, "variant_id", ProductVariant)
+            response = self.client.post(safe_url, {
 
-        quantities = [line.get("quantity") for line in lines]
+                    'username': 'testclient',
 
+                    'password': password,
 
+            })
 
-        check_lines_quantity(variants, quantities, checkout.get_country())
+            self.assertEqual(response.status_code, 302)
 
+            self.assertTrue(good_url in response['Location'],
 
+                            "%s should be allowed" % good_url)
 
-        if variants and quantities:
 
-            for variant, quantity in zip(variants, quantities):
 
-                try:
 
-                    add_variant_to_checkout(
 
-                        checkout, variant, quantity, replace=replace
+class LoginURLSettings(AuthViewsTestCase):
 
-                    )
 
-                except InsufficientStock as exc:
 
-                    raise ValidationError(
+    def setUp(self):
 
-                        f"Insufficient product stock: {exc.item}", code=exc.code
+        super(LoginURLSettings, self).setUp()
 
-                    )
+        self.old_LOGIN_URL = settings.LOGIN_URL
 
 
 
-        update_checkout_shipping_method_if_invalid(checkout, info.context.discounts)
+    def tearDown(self):
 
-        recalculate_checkout_discount(checkout, info.context.discounts)
+        super(LoginURLSettings, self).tearDown()
 
+        settings.LOGIN_URL = self.old_LOGIN_URL
 
 
-        return CheckoutLinesAdd(checkout=checkout)
 
+    def get_login_required_url(self, login_url):
 
+        settings.LOGIN_URL = login_url
 
+        response = self.client.get('/login_required/')
 
+        self.assertEqual(response.status_code, 302)
 
-class CheckoutLinesUpdate(CheckoutLinesAdd):
+        return response['Location']
 
-    checkout = graphene.Field(Checkout, description="An updated checkout.")
 
 
+    def test_standard_login_url(self):
 
-    class Meta:
+        login_url = '/login/'
 
-        description = "Updates checkout line in the existing checkout."
+        login_required_url = self.get_login_required_url(login_url)
 
-        error_type_class = CheckoutError
+        querystring = QueryDict('', mutable=True)
 
-        error_type_field = "checkout_errors"
+        querystring['next'] = '/login_required/'
 
+        self.assertEqual(login_required_url, 'http://testserver%s?%s' %
 
+                         (login_url, querystring.urlencode('/')))
 
-    @classmethod
 
-    def perform_mutation(cls, root, info, checkout_id, lines):
 
-        return super().perform_mutation(root, info, checkout_id, lines, replace=True)
+    def test_remote_login_url(self):
 
+        login_url = 'http://remote.example.com/login'
 
+        login_required_url = self.get_login_required_url(login_url)
 
+        querystring = QueryDict('', mutable=True)
 
+        querystring['next'] = 'http://testserver/login_required/'
 
-class CheckoutLineDelete(BaseMutation):
+        self.assertEqual(login_required_url,
 
-    checkout = graphene.Field(Checkout, description="An updated checkout.")
+                         '%s?%s' % (login_url, querystring.urlencode('/')))
 
 
 
-    class Arguments:
+    def test_https_login_url(self):
 
-        checkout_id = graphene.ID(description="The ID of the checkout.", required=True)
+        login_url = 'https:///login/'
 
-        line_id = graphene.ID(description="ID of the checkout line to delete.")
+        login_required_url = self.get_login_required_url(login_url)
 
+        querystring = QueryDict('', mutable=True)
 
+        querystring['next'] = 'http://testserver/login_required/'
 
-    class Meta:
+        self.assertEqual(login_required_url,
 
-        description = "Deletes a CheckoutLine."
+                         '%s?%s' % (login_url, querystring.urlencode('/')))
 
-        error_type_class = CheckoutError
 
-        error_type_field = "checkout_errors"
 
+    def test_login_url_with_querystring(self):
 
+        login_url = '/login/?pretty=1'
 
-    @classmethod
+        login_required_url = self.get_login_required_url(login_url)
 
-    def perform_mutation(cls, _root, info, checkout_id, line_id):
+        querystring = QueryDict('pretty=1', mutable=True)
 
-        checkout = cls.get_node_or_error(
+        querystring['next'] = '/login_required/'
 
-            info, checkout_id, only_type=Checkout, field="checkout_id"
+        self.assertEqual(login_required_url, 'http://testserver/login/?%s' %
 
-        )
+                         querystring.urlencode('/'))
 
-        line = cls.get_node_or_error(
 
-            info, line_id, only_type=CheckoutLine, field="line_id"
 
-        )
+    def test_remote_login_url_with_next_querystring(self):
 
+        login_url = 'http://remote.example.com/login/'
 
+        login_required_url = self.get_login_required_url('%s?next=/default/' %
 
-        if line and line in checkout.lines.all():
+                                                         login_url)
 
-            line.delete()
+        querystring = QueryDict('', mutable=True)
 
+        querystring['next'] = 'http://testserver/login_required/'
 
+        self.assertEqual(login_required_url, '%s?%s' % (login_url,
 
-        update_checkout_shipping_method_if_invalid(checkout, info.context.discounts)
+                                                    querystring.urlencode('/')))
 
-        recalculate_checkout_discount(checkout, info.context.discounts)
 
 
 
-        return CheckoutLineDelete(checkout=checkout)
 
+class LogoutTest(AuthViewsTestCase):
 
 
 
+    def confirm_logged_out(self):
 
-class CheckoutCustomerAttach(BaseMutation):
+        self.assertTrue(SESSION_KEY not in self.client.session)
 
-    checkout = graphene.Field(Checkout, description="An updated checkout.")
 
 
+    def test_logout_default(self):
 
-    class Arguments:
+        "Logout without next_page option renders the default template"
 
-        checkout_id = graphene.ID(required=True, description="ID of the checkout.")
+        self.login()
 
-        customer_id = graphene.ID(required=True, description="The ID of the customer.")
+        response = self.client.get('/logout/')
 
+        self.assertEqual(200, response.status_code)
 
+        self.assertTrue('Logged out' in response.content)
 
-    class Meta:
+        self.confirm_logged_out()
 
-        description = "Sets the customer as the owner of the checkout."
 
-        error_type_class = CheckoutError
 
-        error_type_field = "checkout_errors"
+    def test_14377(self):
 
+        # Bug 14377
 
+        self.login()
 
-    @classmethod
+        response = self.client.get('/logout/')
 
-    def perform_mutation(cls, _root, info, checkout_id, customer_id):
+        self.assertTrue('site' in response.context)
 
-        checkout = cls.get_node_or_error(
 
-            info, checkout_id, only_type=Checkout, field="checkout_id"
 
-        )
+    def test_logout_with_overridden_redirect_url(self):
 
-        customer = cls.get_node_or_error(
+        # Bug 11223
 
-            info, customer_id, only_type=User, field="customer_id"
+        self.login()
 
-        )
+        response = self.client.get('/logout/next_page/')
 
-        checkout.user = customer
+        self.assertEqual(response.status_code, 302)
 
-        checkout.save(update_fields=["user", "last_change"])
+        self.assertTrue(response['Location'].endswith('/somewhere/'))
 
-        return CheckoutCustomerAttach(checkout=checkout)
 
 
+        response = self.client.get('/logout/next_page/?next=/login/')
 
+        self.assertEqual(response.status_code, 302)
 
+        self.assertTrue(response['Location'].endswith('/login/'))
 
-class CheckoutCustomerDetach(BaseMutation):
 
-    checkout = graphene.Field(Checkout, description="An updated checkout.")
 
+        self.confirm_logged_out()
 
 
-    class Arguments:
 
-        checkout_id = graphene.ID(description="Checkout ID.", required=True)
+    def test_logout_with_next_page_specified(self):
 
+        "Logout with next_page option given redirects to specified resource"
 
+        self.login()
 
-    class Meta:
+        response = self.client.get('/logout/next_page/')
 
-        description = "Removes the user assigned as the owner of the checkout."
+        self.assertEqual(response.status_code, 302)
 
-        error_type_class = CheckoutError
+        self.assertTrue(response['Location'].endswith('/somewhere/'))
 
-        error_type_field = "checkout_errors"
+        self.confirm_logged_out()
 
 
 
-    @classmethod
+    def test_logout_with_redirect_argument(self):
 
-    def perform_mutation(cls, _root, info, checkout_id):
+        "Logout with query string redirects to specified resource"
 
-        checkout = cls.get_node_or_error(
+        self.login()
 
-            info, checkout_id, only_type=Checkout, field="checkout_id"
+        response = self.client.get('/logout/?next=/login/')
 
-        )
+        self.assertEqual(response.status_code, 302)
 
-        checkout.user = None
+        self.assertTrue(response['Location'].endswith('/login/'))
 
-        checkout.save(update_fields=["user", "last_change"])
+        self.confirm_logged_out()
 
-        return CheckoutCustomerDetach(checkout=checkout)
 
 
+    def test_logout_with_custom_redirect_argument(self):
 
+        "Logout with custom query string redirects to specified resource"
 
+        self.login()
 
-class CheckoutShippingAddressUpdate(BaseMutation, I18nMixin):
+        response = self.client.get('/logout/custom_query/?follow=/somewhere/')
 
-    checkout = graphene.Field(Checkout, description="An updated checkout.")
+        self.assertEqual(response.status_code, 302)
 
+        self.assertTrue(response['Location'].endswith('/somewhere/'))
 
+        self.confirm_logged_out()
 
-    class Arguments:
 
-        checkout_id = graphene.ID(required=True, description="ID of the checkout.")
 
-        shipping_address = AddressInput(
+    def test_security_check(self, password='password'):
 
-            required=True,
+        logout_url = reverse('django.contrib.auth.views.logout')
 
-            description="The mailing address to where the checkout will be shipped.",
 
-        )
 
+        # Those URLs should not pass the security check
 
+        for bad_url in ('http://example.com',
 
-    class Meta:
+                        'https://example.com',
 
-        description = "Update shipping address in the existing checkout."
+                        'ftp://exampel.com',
 
-        error_type_class = CheckoutError
+                        '//example.com'):
 
-        error_type_field = "checkout_errors"
+            nasty_url = '%(url)s?%(next)s=%(bad_url)s' % {
 
+                'url': logout_url,
 
+                'next': REDIRECT_FIELD_NAME,
 
-    @classmethod
+                'bad_url': urllib.quote(bad_url),
 
-    def perform_mutation(cls, _root, info, checkout_id, shipping_address):
+            }
 
-        pk = from_global_id_strict_type(checkout_id, Checkout, field="checkout_id")
+            self.login()
 
+            response = self.client.get(nasty_url)
 
+            self.assertEqual(response.status_code, 302)
 
-        try:
+            self.assertFalse(bad_url in response['Location'],
 
-            checkout = models.Checkout.objects.prefetch_related(
+                             "%s should be blocked" % bad_url)
 
-                "lines__variant__product__product_type"
+            self.confirm_logged_out()
 
-            ).get(pk=pk)
 
-        except ObjectDoesNotExist:
 
-            raise ValidationError(
+        # These URLs *should* still pass the security check
 
-                {
+        for good_url in ('/view/?param=http://example.com',
 
-                    "checkout_id": ValidationError(
+                         '/view/?param=https://example.com',
 
-                        f"Couldn't resolve to a node: {checkout_id}",
+                         '/view?param=ftp://exampel.com',
 
-                        code=CheckoutErrorCode.NOT_FOUND,
+                         'view/?param=//example.com',
 
-                    )
+                         'https:///',
 
-                }
+                         '//testserver/',
 
-            )
+                         '/url%20with%20spaces/'):  # see ticket #12534
 
+            safe_url = '%(url)s?%(next)s=%(good_url)s' % {
 
+                'url': logout_url,
 
-        if not checkout.is_shipping_required():
+                'next': REDIRECT_FIELD_NAME,
 
-            raise ValidationError(
+                'good_url': urllib.quote(good_url),
 
-                {
+            }
 
-                    "shipping_address": ValidationError(
+            self.login()
 
-                        ERROR_DOES_NOT_SHIP,
+            response = self.client.get(safe_url)
 
-                        code=CheckoutErrorCode.SHIPPING_NOT_REQUIRED,
+            self.assertEqual(response.status_code, 302)
 
-                    )
+            self.assertTrue(good_url in response['Location'],
 
-                }
+                            "%s should be allowed" % good_url)
 
-            )
-
-
-
-        shipping_address = cls.validate_address(
-
-            shipping_address, instance=checkout.shipping_address, info=info
-
-        )
-
-
-
-        update_checkout_shipping_method_if_invalid(checkout, info.context.discounts)
-
-
-
-        with transaction.atomic():
-
-            shipping_address.save()
-
-            change_shipping_address_in_checkout(checkout, shipping_address)
-
-        recalculate_checkout_discount(checkout, info.context.discounts)
-
-
-
-        return CheckoutShippingAddressUpdate(checkout=checkout)
-
-
-
-
-
-class CheckoutBillingAddressUpdate(CheckoutShippingAddressUpdate):
-
-    checkout = graphene.Field(Checkout, description="An updated checkout.")
-
-
-
-    class Arguments:
-
-        checkout_id = graphene.ID(required=True, description="ID of the checkout.")
-
-        billing_address = AddressInput(
-
-            required=True, description="The billing address of the checkout."
-
-        )
-
-
-
-    class Meta:
-
-        description = "Update billing address in the existing checkout."
-
-        error_type_class = CheckoutError
-
-        error_type_field = "checkout_errors"
-
-
-
-    @classmethod
-
-    def perform_mutation(cls, _root, info, checkout_id, billing_address):
-
-        checkout = cls.get_node_or_error(
-
-            info, checkout_id, only_type=Checkout, field="checkout_id"
-
-        )
-
-
-
-        billing_address = cls.validate_address(
-
-            billing_address, instance=checkout.billing_address, info=info
-
-        )
-
-        with transaction.atomic():
-
-            billing_address.save()
-
-            change_billing_address_in_checkout(checkout, billing_address)
-
-        return CheckoutBillingAddressUpdate(checkout=checkout)
-
-
-
-
-
-class CheckoutEmailUpdate(BaseMutation):
-
-    checkout = graphene.Field(Checkout, description="An updated checkout.")
-
-
-
-    class Arguments:
-
-        checkout_id = graphene.ID(description="Checkout ID.")
-
-        email = graphene.String(required=True, description="email.")
-
-
-
-    class Meta:
-
-        description = "Updates email address in the existing checkout object."
-
-        error_type_class = CheckoutError
-
-        error_type_field = "checkout_errors"
-
-
-
-    @classmethod
-
-    def perform_mutation(cls, _root, info, checkout_id, email):
-
-        checkout = cls.get_node_or_error(
-
-            info, checkout_id, only_type=Checkout, field="checkout_id"
-
-        )
-
-
-
-        checkout.email = email
-
-        cls.clean_instance(info, checkout)
-
-        checkout.save(update_fields=["email", "last_change"])
-
-        return CheckoutEmailUpdate(checkout=checkout)
-
-
-
-
-
-class CheckoutShippingMethodUpdate(BaseMutation):
-
-    checkout = graphene.Field(Checkout, description="An updated checkout.")
-
-
-
-    class Arguments:
-
-        checkout_id = graphene.ID(description="Checkout ID.")
-
-        shipping_method_id = graphene.ID(required=True, description="Shipping method.")
-
-
-
-    class Meta:
-
-        description = "Updates the shipping address of the checkout."
-
-        error_type_class = CheckoutError
-
-        error_type_field = "checkout_errors"
-
-
-
-    @classmethod
-
-    def perform_mutation(cls, _root, info, checkout_id, shipping_method_id):
-
-        pk = from_global_id_strict_type(
-
-            checkout_id, only_type=Checkout, field="checkout_id"
-
-        )
-
-
-
-        try:
-
-            checkout = models.Checkout.objects.prefetch_related(
-
-                "lines__variant__product__collections",
-
-                "lines__variant__product__product_type",
-
-            ).get(pk=pk)
-
-        except ObjectDoesNotExist:
-
-            raise ValidationError(
-
-                {
-
-                    "checkout_id": ValidationError(
-
-                        f"Couldn't resolve to a node: {checkout_id}",
-
-                        code=CheckoutErrorCode.NOT_FOUND,
-
-                    )
-
-                }
-
-            )
-
-
-
-        if not checkout.is_shipping_required():
-
-            raise ValidationError(
-
-                {
-
-                    "shipping_method": ValidationError(
-
-                        ERROR_DOES_NOT_SHIP,
-
-                        code=CheckoutErrorCode.SHIPPING_NOT_REQUIRED,
-
-                    )
-
-                }
-
-            )
-
-
-
-        shipping_method = cls.get_node_or_error(
-
-            info,
-
-            shipping_method_id,
-
-            only_type=ShippingMethod,
-
-            field="shipping_method_id",
-
-        )
-
-
-
-        shipping_method_is_valid = clean_shipping_method(
-
-            checkout=checkout, method=shipping_method, discounts=info.context.discounts
-
-        )
-
-
-
-        if not shipping_method_is_valid:
-
-            raise ValidationError(
-
-                {
-
-                    "shipping_method": ValidationError(
-
-                        "This shipping method is not applicable.",
-
-                        code=CheckoutErrorCode.SHIPPING_METHOD_NOT_APPLICABLE,
-
-                    )
-
-                }
-
-            )
-
-
-
-        checkout.shipping_method = shipping_method
-
-        checkout.save(update_fields=["shipping_method", "last_change"])
-
-        recalculate_checkout_discount(checkout, info.context.discounts)
-
-
-
-        return CheckoutShippingMethodUpdate(checkout=checkout)
-
-
-
-
-
-class CheckoutComplete(BaseMutation):
-
-    order = graphene.Field(Order, description="Placed order.")
-
-
-
-    class Arguments:
-
-        checkout_id = graphene.ID(description="Checkout ID.", required=True)
-
-        store_source = graphene.Boolean(
-
-            default_value=False,
-
-            description=(
-
-                "Determines whether to store the payment source for future usage."
-
-            ),
-
-        )
-
-        redirect_url = graphene.String(
-
-            required=False,
-
-            description=(
-
-                "URL of a view where users should be redirected to "
-
-                "see the order details. URL in RFC 1808 format."
-
-            ),
-
-        )
-
-
-
-    class Meta:
-
-        description = (
-
-            "Completes the checkout. As a result a new order is created and "
-
-            "a payment charge is made. This action requires a successful "
-
-            "payment before it can be performed."
-
-        )
-
-        error_type_class = CheckoutError
-
-        error_type_field = "checkout_errors"
-
-
-
-    @classmethod
-
-    def perform_mutation(cls, _root, info, checkout_id, store_source, **data):
-
-        checkout = cls.get_node_or_error(
-
-            info,
-
-            checkout_id,
-
-            only_type=Checkout,
-
-            field="checkout_id",
-
-            qs=models.Checkout.objects.prefetch_related(
-
-                "gift_cards",
-
-                "lines",
-
-                Prefetch(
-
-                    "payments",
-
-                    queryset=payment_models.Payment.objects.prefetch_related(
-
-                        "order", "order__lines"
-
-                    ),
-
-                ),
-
-            ).select_related("shipping_method", "shipping_method__shipping_zone"),
-
-        )
-
-
-
-        discounts = info.context.discounts
-
-        user = info.context.user
-
-        clean_checkout(checkout, discounts)
-
-
-
-        payment = checkout.get_last_active_payment()
-
-
-
-        with transaction.atomic():
-
-            try:
-
-                order_data = prepare_order_data(
-
-                    checkout=checkout,
-
-                    tracking_code=analytics.get_client_id(info.context),
-
-                    discounts=discounts,
-
-                )
-
-            except InsufficientStock as e:
-
-                raise ValidationError(
-
-                    f"Insufficient product stock: {e.item}", code=e.code
-
-                )
-
-            except voucher_model.NotApplicable:
-
-                raise ValidationError(
-
-                    "Voucher not applicable",
-
-                    code=CheckoutErrorCode.VOUCHER_NOT_APPLICABLE,
-
-                )
-
-            except TaxError as tax_error:
-
-                return ValidationError(
-
-                    "Unable to calculate taxes - %s" % str(tax_error),
-
-                    code=CheckoutErrorCode.TAX_ERROR,
-
-                )
-
-
-
-        billing_address = order_data["billing_address"]
-
-        shipping_address = order_data.get("shipping_address", None)
-
-
-
-        billing_address = AddressData(**billing_address.as_data())
-
-
-
-        if shipping_address is not None:
-
-            shipping_address = AddressData(**shipping_address.as_data())
-
-
-
-        try:
-
-            txn = gateway.process_payment(
-
-                payment=payment, token=payment.token, store_source=store_source
-
-            )
-
-
-
-            if not txn.is_success:
-
-                raise PaymentError(txn.error)
-
-
-
-        except PaymentError as e:
-
-            abort_order_data(order_data)
-
-            raise ValidationError(str(e), code=CheckoutErrorCode.PAYMENT_ERROR)
-
-
-
-        if txn.customer_id and user.is_authenticated:
-
-            store_customer_id(user, payment.gateway, txn.customer_id)
-
-
-
-        redirect_url = data.get("redirect_url", "")
-
-        if redirect_url:
-
-            try:
-
-                validate_storefront_url(redirect_url)
-
-            except ValidationError as error:
-
-                raise ValidationError(
-
-                    {"redirect_url": error}, code=AccountErrorCode.INVALID
-
-                )
-
-
-
-        # create the order into the database
-
-        order = create_order(
-
-            checkout=checkout,
-
-            order_data=order_data,
-
-            user=user,
-
-            redirect_url=redirect_url,
-
-        )
-
-
-
-        # remove checkout after order is successfully paid
-
-        checkout.delete()
-
-
-
-        # return the success response with the newly created order data
-
-        return CheckoutComplete(order=order)
-
-
-
-
-
-class CheckoutAddPromoCode(BaseMutation):
-
-    checkout = graphene.Field(
-
-        Checkout, description="The checkout with the added gift card or voucher."
-
-    )
-
-
-
-    class Arguments:
-
-        checkout_id = graphene.ID(description="Checkout ID.", required=True)
-
-        promo_code = graphene.String(
-
-            description="Gift card code or voucher code.", required=True
-
-        )
-
-
-
-    class Meta:
-
-        description = "Adds a gift card or a voucher to a checkout."
-
-        error_type_class = CheckoutError
-
-        error_type_field = "checkout_errors"
-
-
-
-    @classmethod
-
-    def perform_mutation(cls, _root, info, checkout_id, promo_code):
-
-        checkout = cls.get_node_or_error(
-
-            info, checkout_id, only_type=Checkout, field="checkout_id"
-
-        )
-
-        add_promo_code_to_checkout(checkout, promo_code, info.context.discounts)
-
-        return CheckoutAddPromoCode(checkout=checkout)
-
-
-
-
-
-class CheckoutRemovePromoCode(BaseMutation):
-
-    checkout = graphene.Field(
-
-        Checkout, description="The checkout with the removed gift card or voucher."
-
-    )
-
-
-
-    class Arguments:
-
-        checkout_id = graphene.ID(description="Checkout ID.", required=True)
-
-        promo_code = graphene.String(
-
-            description="Gift card code or voucher code.", required=True
-
-        )
-
-
-
-    class Meta:
-
-        description = "Remove a gift card or a voucher from a checkout."
-
-        error_type_class = CheckoutError
-
-        error_type_field = "checkout_errors"
-
-
-
-    @classmethod
-
-    def perform_mutation(cls, _root, info, checkout_id, promo_code):
-
-        checkout = cls.get_node_or_error(
-
-            info, checkout_id, only_type=Checkout, field="checkout_id"
-
-        )
-
-        remove_promo_code_from_checkout(checkout, promo_code)
-
-        return CheckoutRemovePromoCode(checkout=checkout)
-
-
-
-
-
-class CheckoutUpdateMeta(UpdateMetaBaseMutation):
-
-    class Meta:
-
-        description = "Updates metadata for checkout."
-
-        permissions = (OrderPermissions.MANAGE_ORDERS,)
-
-        model = models.Checkout
-
-        public = True
-
-        error_type_class = CheckoutError
-
-        error_type_field = "checkout_errors"
-
-
-
-
-
-class CheckoutUpdatePrivateMeta(UpdateMetaBaseMutation):
-
-    class Meta:
-
-        description = "Updates private metadata for checkout."
-
-        permissions = (OrderPermissions.MANAGE_ORDERS,)
-
-        model = models.Checkout
-
-        public = False
-
-        error_type_class = CheckoutError
-
-        error_type_field = "checkout_errors"
-
-
-
-
-
-class CheckoutClearMeta(ClearMetaBaseMutation):
-
-    class Meta:
-
-        description = "Clear metadata for checkout."
-
-        permissions = (OrderPermissions.MANAGE_ORDERS,)
-
-        model = models.Checkout
-
-        public = True
-
-        error_type_class = CheckoutError
-
-        error_type_field = "checkout_errors"
-
-
-
-
-
-class CheckoutClearPrivateMeta(ClearMetaBaseMutation):
-
-    class Meta:
-
-        description = "Clear private metadata for checkout."
-
-        permissions = (OrderPermissions.MANAGE_ORDERS,)
-
-        model = models.Checkout
-
-        public = False
-
-        error_type_class = CheckoutError
-
-        error_type_field = "checkout_errors"
+            self.confirm_logged_out()

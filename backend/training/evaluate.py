@@ -73,8 +73,10 @@ def evaluate_model(model_path: str, data_dir: str):
     label_map = {
         0: "safe", 1: "eval_exec", 2: "command_injection",
         3: "unsafe_deserialization", 4: "hardcoded_secrets",
-        5: "sql_injection", 6: "path_traversal"
+        5: "sql_injection", 6: "path_traversal", 7: "ssrf",
+        8: "insecure_cryptography", 9: "xxe", 10: "redos", 11: "xss"
     }
+
     
     target_names = [label_map.get(i, str(i)) for i in sorted(list(set(all_labels) | set(all_preds)))]
     

@@ -2,2878 +2,896 @@
 # Safety: safe
 # Category: safe
 
-#!/usr/bin/env  python2
+#!/usr/bin/env python
 
-__license__   = 'GPL v3'
+# -*- coding: utf-8 -*-
 
-__copyright__ = '2008, Kovid Goyal kovid@kovidgoyal.net'
+"""
 
-__docformat__ = 'restructuredtext en'
+RESTful Filesystem access using HTTP
 
+------------------------------------
 
 
-# Imports {{{
 
-import os, math, json
+This controller and helper classes exposes parts or all of the server's
 
-from base64 import b64encode
+filesystem. Means to retrieve and delete files are provided as well as the
 
-from functools import partial
+ability to list folder contents.
 
-from future_builtins import map
 
 
+The generated responses are returned as JSON data with appropriate HTTP headers.
 
-from PyQt5.Qt import (
+Output will be compressed using gzip most of the times.
 
-    QSize, QSizePolicy, QUrl, Qt, pyqtProperty, QPainter, QPalette, QBrush,
 
-    QDialog, QColor, QPoint, QImage, QRegion, QIcon, QAction, QMenu,
 
-    pyqtSignal, QApplication, pyqtSlot, QKeySequence, QMimeData)
+Example calls using curl
 
-from PyQt5.QtWebKitWidgets import QWebPage, QWebView
+++++++++++++++++++++++++
 
-from PyQt5.QtWebKit import QWebSettings, QWebElement
 
 
+The following examples assume that the FileController instance is accessible
 
-from calibre.gui2.viewer.flip import SlideFlip
+as '/file' on 'localhost', port 18888 (http://localhost:18888/file).
 
-from calibre.gui2.shortcuts import Shortcuts
 
-from calibre.gui2 import open_url
 
-from calibre import prints
+Fetch list of files and folders in root folder:
 
-from calibre.customize.ui import all_viewer_plugins
 
-from calibre.gui2.viewer.keys import SHORTCUTS
 
-from calibre.gui2.viewer.javascript import JavaScriptLoader
+    curl --noproxy localhost -iv http://localhost:18888/file
 
-from calibre.gui2.viewer.position import PagePosition
 
-from calibre.gui2.viewer.config import config, ConfigDialog, load_themes
 
-from calibre.gui2.viewer.image_popup import ImagePopup
+Fetch example file 'example.txt'
 
-from calibre.gui2.viewer.table_popup import TablePopup
 
-from calibre.gui2.viewer.inspector import WebInspector
 
-from calibre.gui2.viewer.gestures import GestureHandler
+    curl --noproxy localhost -iv http://localhost:18888/file/example.txt
 
-from calibre.gui2.viewer.footnote import Footnotes
 
-from calibre.ebooks.oeb.display.webview import load_html
 
-from calibre.constants import isxp, iswindows, DEBUG, __version__
+Fetch gzipped example file 'example.txt'
 
-# }}}
 
 
+    curl --compressed -H "Accept-Encoding: gzip" --noproxy localhost -iv http://localhost:18888/file/example.txt
 
 
 
-def apply_settings(settings, opts):
+Delete example file 'example.txt'
 
-    settings.setFontSize(QWebSettings.DefaultFontSize, opts.default_font_size)
 
-    settings.setFontSize(QWebSettings.DefaultFixedFontSize, opts.mono_font_size)
 
-    settings.setFontSize(QWebSettings.MinimumLogicalFontSize, opts.minimum_font_size)
+    curl --noproxy localhost -iv -X DELETE http://localhost:18888/file/example.txt
 
-    settings.setFontSize(QWebSettings.MinimumFontSize, opts.minimum_font_size)
 
-    settings.setFontFamily(QWebSettings.StandardFont, {'serif':opts.serif_family, 'sans':opts.sans_family, 'mono':opts.mono_family}[opts.standard_font])
 
-    settings.setFontFamily(QWebSettings.SerifFont, opts.serif_family)
+"""
 
-    settings.setFontFamily(QWebSettings.SansSerifFont, opts.sans_family)
+import os
 
-    settings.setFontFamily(QWebSettings.FixedFont, opts.mono_family)
+import json
 
-    settings.setAttribute(QWebSettings.ZoomTextOnly, True)
+import glob
 
+import re
 
+import urlparse
 
 
 
-def apply_basic_settings(settings):
+import twisted.web.static
 
-    # Security
+from twisted.web import http
 
-    settings.setAttribute(QWebSettings.JavaEnabled, False)
 
-    settings.setAttribute(QWebSettings.PluginsEnabled, False)
 
-    settings.setAttribute(QWebSettings.JavascriptCanOpenWindows, False)
+from utilities import MANY_SLASHES_REGEX
 
-    settings.setAttribute(QWebSettings.JavascriptCanAccessClipboard, False)
+import file
 
-    settings.setAttribute(QWebSettings.LocalContentCanAccessFileUrls, False)  # ensure javascript cannot read from local files
 
-    # PrivateBrowsing disables console messages
 
-    # settings.setAttribute(QWebSettings.PrivateBrowsingEnabled, True)
+#: default path from which files will be served
 
-    settings.setAttribute(QWebSettings.NotificationsEnabled, False)
+DEFAULT_ROOT_PATH = os.path.abspath(os.path.dirname(__file__))
 
-    settings.setThirdPartyCookiePolicy(QWebSettings.AlwaysBlockThirdPartyCookies)
 
 
+#: CORS - HTTP headers the client may use
 
-    # Miscellaneous
+CORS_ALLOWED_CLIENT_HEADERS = [
 
-    settings.setAttribute(QWebSettings.LinksIncludedInFocusChain, True)
+	'Content-Type',
 
-    settings.setAttribute(QWebSettings.DeveloperExtrasEnabled, True)
+]
 
 
 
+#: CORS - HTTP methods the client may use
 
+CORS_ALLOWED_METHODS_DEFAULT = ['GET', 'PUT', 'POST', 'DELETE', 'OPTIONS']
 
-class Document(QWebPage):  # {{{
 
 
+#: CORS - default origin header value
 
-    page_turn = pyqtSignal(object)
+CORS_DEFAULT_ALLOW_ORIGIN = '*'
 
-    mark_element = pyqtSignal(QWebElement)
 
-    settings_changed = pyqtSignal()
 
-    animated_scroll_done_signal = pyqtSignal()
+#: CORS - HTTP headers the server will send as part of OPTIONS response
 
+CORS_DEFAULT = {
 
+	'Access-Control-Allow-Origin': CORS_DEFAULT_ALLOW_ORIGIN,
 
-    def set_font_settings(self, opts):
+	'Access-Control-Allow-Credentials': 'true',
 
-        settings = self.settings()
+	'Access-Control-Max-Age': '86400',
 
-        apply_settings(settings, opts)
+	'Access-Control-Allow-Methods': ','.join(CORS_ALLOWED_METHODS_DEFAULT),
 
+	'Access-Control-Allow-Headers': ', '.join(CORS_ALLOWED_CLIENT_HEADERS)
 
+}
 
-    def do_config(self, parent=None):
 
-        d = ConfigDialog(self.shortcuts, parent)
 
-        if d.exec_() == QDialog.Accepted:
+#: paths where file delete operations shall be allowed
 
-            opts = config().parse()
+DELETE_WHITELIST = [
 
-            self.apply_settings(opts)
+	'/media',
 
+]
 
 
-    def apply_settings(self, opts):
 
-        with self.page_position:
 
-            self.set_font_settings(opts)
 
-            self.set_user_stylesheet(opts)
+class FileController(twisted.web.resource.Resource):
 
-            self.misc_config(opts)
+	isLeaf = True
 
-            self.settings_changed.emit()
+	_override_args = (
 
-            self.after_load()
+		'resource_prefix', 'root', 'do_delete', 'delete_whitelist')
 
+	_resource_prefix = '/file'
 
+	_root = os.path.abspath(os.path.dirname(__file__))
 
-    def __init__(self, shortcuts, parent=None, debug_javascript=False):
+	_do_delete = False
 
-        QWebPage.__init__(self, parent)
+	_delete_whitelist = DELETE_WHITELIST
 
-        self.setObjectName("py_bridge")
+	never_gzip_extensions = ('.ts',)
 
-        self.in_paged_mode = False
 
-        # Use this to pass arbitrary JSON encodable objects between python and
 
-        # javascript. In python get/set the value as: self.bridge_value. In
+	def __init__(self, *args, **kwargs):
 
-        # javascript, get/set the value as: py_bridge.value
+		"""
 
-        self.bridge_value = None
+		Default Constructor.
 
-        self.first_load = True
 
-        self.jump_to_cfi_listeners = set()
 
+		Args:
 
+			resource_prefix: Prefix value for this controller instance.
 
-        self.debug_javascript = debug_javascript
+				Default is :py:data:`FileController._resource_prefix`
 
-        self.anchor_positions = {}
+			root: Root path of files to be served.
 
-        self.index_anchors = set()
+				Default is the path where the current file is located
 
-        self.current_language = None
+			do_delete: Try to actually delete files?
 
-        self.loaded_javascript = False
+				Default is False.
 
-        self.js_loader = JavaScriptLoader(
+			delete_whitelist: Folder prefixes where delete operations are
 
-                    dynamic_coffeescript=self.debug_javascript)
+				allowed _at all_. Default is :py:data:`DELETE_WHITELIST`
 
-        self.in_fullscreen_mode = False
+		"""
 
-        self.math_present = False
+		if args:
 
+			for key, value in zip(self._override_args, args):
 
+				kwargs[key] = value
 
-        self.setLinkDelegationPolicy(self.DelegateAllLinks)
 
-        self.scroll_marks = []
 
-        self.shortcuts = shortcuts
+		for arg_name in self._override_args:
 
-        pal = self.palette()
+			if kwargs.get(arg_name) is not None:
 
-        pal.setBrush(QPalette.Background, QColor(0xee, 0xee, 0xee))
+				attr_name = '_{:s}'.format(arg_name)
 
-        self.setPalette(pal)
+				setattr(self, attr_name, kwargs.get(arg_name))
 
-        self.page_position = PagePosition(self)
+		self.session = kwargs.get("session")
 
 
 
-        settings = self.settings()
+	def _json_response(self, request, data):
 
+		"""
 
+		Create a JSON representation for *data* and set HTTP headers indicating
 
-        # Fonts
+		that JSON encoded data is returned.
 
-        self.all_viewer_plugins = tuple(all_viewer_plugins())
 
-        for pl in self.all_viewer_plugins:
 
-            pl.load_fonts()
+		Args:
 
-        opts = config().parse()
+			request (twisted.web.server.Request): HTTP request object
 
-        self.set_font_settings(opts)
+			data: response content
 
+		Returns:
 
+			JSON representation of *data* with appropriate HTTP headers
 
-        apply_basic_settings(settings)
+		"""
 
-        self.set_user_stylesheet(opts)
+		request.setHeader("content-type", "application/json; charset=utf-8")
 
-        self.misc_config(opts)
+		return json.dumps(data, indent=2)
 
 
 
-        # Load javascript
+	def get_response_data_template(self, request):
 
-        self.mainFrame().javaScriptWindowObjectCleared.connect(
+		"""
 
-                self.add_window_objects)
+		Generate a response data :class:`dict` containing default values and
 
+		some request attribute values for debugging purposes.
 
 
-        self.turn_off_internal_scrollbars()
 
+		Args:
 
+			request (twisted.web.server.Request): HTTP request object
 
-    def turn_off_internal_scrollbars(self):
+		Returns:
 
-        mf = self.mainFrame()
+			(dict) response template data
 
-        mf.setScrollBarPolicy(Qt.Vertical, Qt.ScrollBarAlwaysOff)
+		"""
 
-        mf.setScrollBarPolicy(Qt.Horizontal, Qt.ScrollBarAlwaysOff)
+		file_path = None
 
+		if request.path.startswith(self._resource_prefix):
 
+			file_path = request.path[len(self._resource_prefix):]
 
-    def set_user_stylesheet(self, opts):
 
-        brules = ['background-color: %s !important'%opts.background_color] if opts.background_color else ['background-color: white']
 
-        prefix = '''
+		response_data = {
 
-            body { %s  }
+			"_request": {
 
-        '''%('; '.join(brules))
+				"path": request.path,
 
-        if opts.text_color:
+				"uri": request.uri,
 
-            prefix += '\n\nbody, p, div { color: %s !important }'%opts.text_color
+				"method": request.method,
 
-        raw = prefix + opts.user_css
+				"postpath": request.postpath,
 
-        raw = '::selection {background:#ffff00; color:#000;}\n'+raw
+				"file_path": file_path,
 
-        data = 'data:text/css;charset=utf-8;base64,'
+			},
 
-        data += b64encode(raw.encode('utf-8'))
+			"result": False,
 
-        self.settings().setUserStyleSheetUrl(QUrl(data))
+		}
 
 
 
-    def findText(self, q, flags):
+		return response_data
 
-        if self.hyphenatable:
 
-            q = unicode(q)
 
-            hyphenated_q = self.javascript(
+	def error_response(self, request, response_code=None, **kwargs):
 
-                'hyphenate_text(%s, "%s")' % (json.dumps(q, ensure_ascii=False), self.loaded_lang), typ='string')
+		"""
 
-            if hyphenated_q and QWebPage.findText(self, hyphenated_q, flags):
+		Create and return an HTTP error response with data as JSON.
 
-                return True
 
-        return QWebPage.findText(self, q, flags)
 
+		Args:
 
+			request (twisted.web.server.Request): HTTP request object
 
-    def misc_config(self, opts):
+			response_code: HTTP Status Code (default is 500)
 
-        self.hyphenate = opts.hyphenate
+			**kwargs: additional key/value pairs
 
-        self.hyphenate_default_lang = opts.hyphenate_default_lang
+		Returns:
 
-        self.do_fit_images = opts.fit_images
+			JSON encoded data with appropriate HTTP headers
 
-        self.page_flip_duration = opts.page_flip_duration
+		"""
 
-        self.enable_page_flip = self.page_flip_duration > 0.1
+		if response_code is None:
 
-        self.font_magnification_step = opts.font_magnification_step
+			response_code = http.INTERNAL_SERVER_ERROR
 
-        self.wheel_flips_pages = opts.wheel_flips_pages
 
-        self.wheel_scroll_fraction = opts.wheel_scroll_fraction
 
-        self.line_scroll_fraction = opts.line_scroll_fraction
+		response_data = self.get_response_data_template(request)
 
-        self.tap_flips_pages = opts.tap_flips_pages
+		response_data.update(**kwargs)
 
-        self.line_scrolling_stops_on_pagebreaks = opts.line_scrolling_stops_on_pagebreaks
 
-        screen_width = QApplication.desktop().screenGeometry().width()
 
-        # Leave some space for the scrollbar and some border
+		response_data['me'] = dict()
 
-        self.max_fs_width = min(opts.max_fs_width, screen_width-50)
+		for arg_name in self._override_args:
 
-        self.max_fs_height = opts.max_fs_height
+			attr_name = '_{:s}'.format(arg_name)
 
-        self.fullscreen_clock = opts.fullscreen_clock
+			response_data['me'][attr_name] = getattr(self, attr_name)
 
-        self.fullscreen_scrollbar = opts.fullscreen_scrollbar
 
-        self.fullscreen_pos = opts.fullscreen_pos
 
-        self.start_in_fullscreen = opts.start_in_fullscreen
+		request.setResponseCode(response_code)
 
-        self.show_fullscreen_help = opts.show_fullscreen_help
+		return self._json_response(request, response_data)
 
-        self.use_book_margins = opts.use_book_margins
 
-        self.cols_per_screen_portrait = opts.cols_per_screen_portrait
 
-        self.cols_per_screen_landscape = opts.cols_per_screen_landscape
+	def _existing_path_or_bust(self, request):
 
-        self.side_margin = opts.side_margin
+		"""
 
-        self.top_margin, self.bottom_margin = opts.top_margin, opts.bottom_margin
+		Verify that a filesystem location which is contained in *request.path*
 
-        self.show_controls = opts.show_controls
+		is valid and an existing path.
 
-        self.remember_current_page = opts.remember_current_page
 
-        self.copy_bookmarks_to_file = opts.copy_bookmarks_to_file
 
-        self.search_online_url = opts.search_online_url or 'https://www.google.com/search?q={text}'
+		Args:
 
+			request (twisted.web.server.Request): HTTP request object
 
+		Returns:
 
-    def fit_images(self):
+			path
 
-        if self.do_fit_images and not self.in_paged_mode:
+		Raises:
 
-            self.javascript('setup_image_scaling_handlers()')
+			ValueError: If contained path value is invalid.
 
+			IOError: If contained path value is not existing.
 
+		"""
 
-    def add_window_objects(self):
+		rq_path = urlparse.unquote(request.path)
 
-        self.mainFrame().addToJavaScriptWindowObject("py_bridge", self)
+		if not rq_path.startswith(self._resource_prefix):
 
-        self.javascript('''
+			raise ValueError("Invalid Request Path {!r}".format(request.path))
 
-        Object.defineProperty(py_bridge, 'value', {
 
-               get : function() { return JSON.parse(this._pass_json_value); },
 
-               set : function(val) { this._pass_json_value = JSON.stringify(val); }
+		file_path = os.path.join(
 
-        });
+			self._root, rq_path[len(self._resource_prefix) + 1:])
 
-        ''')
+		file_path = re.sub(MANY_SLASHES_REGEX, '/', file_path)
 
-        self.loaded_javascript = False
 
 
+		if not os.path.exists(file_path):
 
-    def load_javascript_libraries(self):
+			raise IOError("Not Found {!r}".format(file_path))
 
-        if self.loaded_javascript:
 
-            return
 
-        self.loaded_javascript = True
+		return file_path
 
-        evaljs = self.mainFrame().evaluateJavaScript
 
-        self.loaded_lang = self.js_loader(evaljs, self.current_language,
 
-                self.hyphenate_default_lang)
+	def render_OPTIONS(self, request):
 
-        evaljs('window.calibre_utils.setup_epub_reading_system(%s, %s, %s, %s)' % tuple(map(json.dumps, (
+		"""
 
-            'calibre-desktop', __version__, 'paginated' if self.in_paged_mode else 'scrolling',
+		Render response for an HTTP OPTIONS request.
 
-            'dom-manipulation layout-changes mouse-events keyboard-events'.split()))))
 
-        mjpath = P(u'viewer/mathjax').replace(os.sep, '/')
 
-        if iswindows:
+		Example request
 
-            mjpath = u'/' + mjpath
 
-        self.javascript(u'window.mathjax.base = %s'%(json.dumps(mjpath,
 
-            ensure_ascii=False)))
+			curl -iv --noproxy localhost http://localhost:18888/file
 
-        for pl in self.all_viewer_plugins:
 
-            pl.load_javascript(evaljs)
 
-        evaljs('py_bridge.mark_element.connect(window.calibre_extract.mark)')
+		Args:
 
+			request (twisted.web.server.Request): HTTP request object
 
+		Returns:
 
-    @pyqtSlot()
+			HTTP response with headers
 
-    def animated_scroll_done(self):
+		"""
 
-        self.animated_scroll_done_signal.emit()
+		for key in CORS_DEFAULT:
 
+			request.setHeader(key, CORS_DEFAULT[key])
 
 
-    @property
 
-    def hyphenatable(self):
+		return ''
 
-        # Qt fails to render soft hyphens correctly on windows xp
 
-        return not isxp and self.hyphenate and getattr(self, 'loaded_lang', '') and not self.math_present
 
+	def render_legacy(self, request):
 
+		"""
 
-    @pyqtSlot()
+		Render response for an HTTP GET request. In order to maintain
 
-    def init_hyphenate(self):
+		backward compatibility this method emulates the behaviour of the
 
-        if self.hyphenatable:
+		legacy method implementation.
 
-            self.javascript('do_hyphenation("%s")'%self.loaded_lang)
 
 
+		Args:
 
-    @pyqtSlot(int)
+			request (twisted.web.server.Request): HTTP request object
 
-    def page_turn_requested(self, backwards):
+		Returns:
 
-        self.page_turn.emit(bool(backwards))
+			HTTP response with headers
 
+		"""
 
+		return file.FileController().render(request)
 
-    def _pass_json_value_getter(self):
 
-        val = json.dumps(self.bridge_value)
 
-        return val
+	def _glob(self, path, pattern='*'):
 
+		if path == '/':
 
+			glob_me = '/' + pattern
 
-    def _pass_json_value_setter(self, value):
+		else:
 
-        self.bridge_value = json.loads(unicode(value))
+			glob_me = '/'.join((path, pattern))
 
+		return glob.iglob(glob_me)
 
 
-    _pass_json_value = pyqtProperty(str, fget=_pass_json_value_getter,
 
-            fset=_pass_json_value_setter)
+	def _walk(self, path):
 
+		for root, dirs, files in os.walk(path):
 
+			for dir_item in dirs:
 
-    def after_load(self, last_loaded_path=None):
+				yield os.path.join(root, dir_item)
 
-        self.javascript('window.paged_display.read_document_margins()')
+			for file_item in files:
 
-        self.set_bottom_padding(0)
+				yield os.path.join(root, file_item)
 
-        self.fit_images()
 
-        w = 1 if iswindows else 0
 
-        self.math_present = self.javascript('window.mathjax.check_for_math(%d)' % w, bool)
+	def render_path_listing(self, request, path):
 
-        self.init_hyphenate()
+		"""
 
-        self.javascript('full_screen.save_margins()')
+		Generate a file/folder listing of *path*'s contents.
 
-        if self.in_fullscreen_mode:
 
-            self.switch_to_fullscreen_mode()
 
-        if self.in_paged_mode:
+		Args:
 
-            self.switch_to_paged_mode(last_loaded_path=last_loaded_path)
+			request (twisted.web.server.Request): HTTP request object
 
-        self.read_anchor_positions(use_cache=False)
+			path: folder location
 
-        evaljs = self.mainFrame().evaluateJavaScript
+		Returns:
 
-        for pl in self.all_viewer_plugins:
+			HTTP response with headers
 
-            pl.run_javascript(evaljs)
+		"""
 
-        self.first_load = False
+		response_data = self.get_response_data_template(request)
 
+		response_data.update(
 
+			{
 
-    def colors(self):
+				'result': True,
 
-        self.javascript('''
+				'dirs': [],
 
-            bs = getComputedStyle(document.body);
+				'files': [],
 
-            py_bridge.value = [bs.backgroundColor, bs.color]
+			}
 
-            ''')
+		)
 
-        ans = self.bridge_value
 
-        return (ans if isinstance(ans, list) else ['white', 'black'])
 
+		generator = None
 
+		if "pattern" in request.args:
 
-    def read_anchor_positions(self, use_cache=True):
+			generator = self._glob(path, request.args["pattern"][0])
 
-        self.bridge_value = tuple(self.index_anchors)
 
-        self.javascript(u'''
 
-            py_bridge.value = book_indexing.anchor_positions(py_bridge.value, %s);
+		if "recursive" in request.args:
 
-            '''%('true' if use_cache else 'false'))
+			generator = self._walk(path)
 
-        self.anchor_positions = self.bridge_value
 
-        if not isinstance(self.anchor_positions, dict):
 
-            # Some weird javascript error happened
+		if generator is None:
 
-            self.anchor_positions = {}
+			generator = self._glob(path)
 
-        return {k:tuple(v) for k, v in self.anchor_positions.iteritems()}
 
 
+		for item in generator:
 
-    def switch_to_paged_mode(self, onresize=False, last_loaded_path=None):
+			if os.path.isdir(item):
 
-        if onresize and not self.loaded_javascript:
+				response_data['dirs'].append(item)
 
-            return
+			else:
 
-        cols_per_screen = self.cols_per_screen_portrait if self.is_portrait else self.cols_per_screen_landscape
+				response_data['files'].append(item)
 
-        cols_per_screen = max(1, min(5, cols_per_screen))
 
-        self.javascript('''
 
-            window.paged_display.use_document_margins = %s;
+		return self._json_response(request, response_data)
 
-            window.paged_display.set_geometry(%d, %d, %d, %d);
 
-            '''%(
 
-            ('true' if self.use_book_margins else 'false'),
+	def render_file(self, request, path):
 
-            cols_per_screen, self.top_margin, self.side_margin,
+		"""
 
-            self.bottom_margin
+		Return the contents of file *path*.
 
-            ))
 
-        force_fullscreen_layout = bool(getattr(last_loaded_path,
 
-                                               'is_single_page', False))
+		Args:
 
-        self.update_contents_size_for_paged_mode(force_fullscreen_layout)
+			request (twisted.web.server.Request): HTTP request object
 
+			path: file path
 
+		Returns:
 
-    def update_contents_size_for_paged_mode(self, force_fullscreen_layout=None):
+			HTTP response with headers
 
-        # Setup the contents size to ensure that there is a right most margin.
+		"""
 
-        # Without this WebKit renders the final column with no margin, as the
+		(_, ext) = os.path.splitext(path)
 
-        # columns extend beyond the boundaries (and margin) of body
 
-        if force_fullscreen_layout is None:
 
-            force_fullscreen_layout = self.javascript('window.paged_display.is_full_screen_layout', typ=bool)
+		if ext in self.never_gzip_extensions:
 
-        f = 'true' if force_fullscreen_layout else 'false'
+			# hack: remove gzip from the list of supported encodings
 
-        side_margin = self.javascript('window.paged_display.layout(%s)'%f, typ=int)
+			acceptHeaders = request.requestHeaders.getRawHeaders(
 
-        mf = self.mainFrame()
+				'accept-encoding', [])
 
-        sz = mf.contentsSize()
+			supported = ','.join(acceptHeaders).split(',')
 
-        scroll_width = self.javascript('document.body.scrollWidth', int)
+			request.requestHeaders.setRawHeaders(
 
-        # At this point sz.width() is not reliable, presumably because Qt
+				'accept-encoding', list(set(supported) - {'gzip'}))
 
-        # has not yet been updated
 
-        if scroll_width > self.window_width:
 
-            sz.setWidth(scroll_width+side_margin)
+		result = twisted.web.static.File(
 
-            self.setPreferredContentsSize(sz)
+			path, defaultType="application/octet-stream")
 
-        self.javascript('window.paged_display.fit_images()')
 
 
+		return result.render(request)
 
-    @property
 
-    def column_boundaries(self):
 
-        if not self.loaded_javascript:
+	def render_GET(self, request):
 
-            return (0, 1)
+		"""
 
-        self.javascript(u'py_bridge.value = paged_display.column_boundaries()')
+		HTTP GET request handler returning
 
-        return tuple(self.bridge_value)
 
 
+			* legacy response if the query *file* or *dir* parameter is set
 
-    def after_resize(self):
+			* file contents if *request.path* contains a file path
 
-        if self.in_paged_mode:
+			* directory listing if *request.path* contains a folder path
 
-            self.setPreferredContentsSize(QSize())
 
-            self.switch_to_paged_mode(onresize=True)
 
-        self.javascript('if (window.mathjax) window.mathjax.after_resize();')
+		Args:
 
+			request (twisted.web.server.Request): HTTP request object
 
+		Returns:
 
-    def switch_to_fullscreen_mode(self):
+			HTTP response with headers
 
-        self.in_fullscreen_mode = True
+		"""
 
-        self.javascript('full_screen.on(%d, %d, %s)'%(self.max_fs_width, self.max_fs_height,
+		attic_args = {'file', 'dir'}
 
-            'true' if self.in_paged_mode else 'false'))
 
 
+		if len(attic_args & set(request.args.keys())) >= 1:
 
-    def switch_to_window_mode(self):
+			return self.render_legacy(request)
 
-        self.in_fullscreen_mode = False
 
-        self.javascript('full_screen.off(%s)'%('true' if self.in_paged_mode
 
-            else 'false'))
+		request.setHeader(
 
+			'Access-Control-Allow-Origin', CORS_DEFAULT_ALLOW_ORIGIN)
 
 
-    @pyqtSlot(str)
 
-    def debug(self, msg):
+		try:
 
-        prints(unicode(msg))
+			target_path = self._existing_path_or_bust(request)
 
+		except ValueError as vexc:
 
+			return self.error_response(
 
-    @pyqtSlot(int)
+				request, response_code=http.BAD_REQUEST, message=vexc.message)
 
-    def jump_to_cfi_finished(self, job_id):
+		except IOError as iexc:
 
-        for l in self.jump_to_cfi_listeners:
+			return self.error_response(
 
-            l(job_id)
+				request, response_code=http.NOT_FOUND, message=iexc.message)
 
 
 
-    def reference_mode(self, enable):
+		if os.path.isdir(target_path):
 
-        self.javascript(('enter' if enable else 'leave')+'_reference_mode()')
+			return self.render_path_listing(request, target_path)
 
+		else:
 
+			return self.render_file(request, target_path)
 
-    def set_reference_prefix(self, prefix):
 
-        self.javascript('reference_prefix = "%s"'%prefix)
 
+	def render_POST(self, request):
 
+		"""
 
-    def goto(self, ref):
+		HTTP POST request handler (currently NOT implemented).
 
-        self.javascript('goto_reference("%s")'%ref)
 
 
+		Args:
 
-    def goto_bookmark(self, bm):
+			request (twisted.web.server.Request): HTTP request object
 
-        if bm['type'] == 'legacy':
+		Returns:
 
-            bm = bm['pos']
+			HTTP response with headers
 
-            bm = bm.strip()
+		"""
 
-            if bm.startswith('>'):
+		request.setHeader(
 
-                bm = bm[1:].strip()
+			'Access-Control-Allow-Origin', CORS_DEFAULT_ALLOW_ORIGIN)
 
-            self.javascript('scroll_to_bookmark("%s")'%bm)
+		return self.error_response(request, response_code=http.NOT_IMPLEMENTED)
 
-        elif bm['type'] == 'cfi':
 
-            self.page_position.to_pos(bm['pos'])
 
+	def render_PUT(self, request):
 
+		"""
 
-    def javascript(self, string, typ=None):
+		HTTP PUT request handler (currently NOT implemented).
 
-        ans = self.mainFrame().evaluateJavaScript(string)
 
-        if typ in {'int', int}:
 
-            try:
+		Args:
 
-                return int(ans)
+			request (twisted.web.server.Request): HTTP request object
 
-            except (TypeError, ValueError):
+		Returns:
 
-                return 0
+			HTTP response with headers
 
-        if typ in {'float', float}:
+		"""
 
-            try:
+		request.setHeader(
 
-                return float(ans)
+			'Access-Control-Allow-Origin', CORS_DEFAULT_ALLOW_ORIGIN)
 
-            except (TypeError, ValueError):
+		return self.error_response(request, response_code=http.NOT_IMPLEMENTED)
 
-                return 0.0
 
-        if typ == 'string':
 
-            return ans or u''
+	def render_DELETE(self, request):
 
-        if typ in {bool, 'bool'}:
+		"""
 
-            return bool(ans)
+		HTTP DELETE request handler which may try to delete a file if its
 
-        return ans
+		path's prefix is in :py:data:`FileController._delete_whitelist` and
 
+		:py:data:`FileController._do_delete` is True.
 
 
-    def javaScriptConsoleMessage(self, msg, lineno, msgid):
 
-        if DEBUG or self.debug_javascript:
+		Args:
 
-            prints(msg)
+			request (twisted.web.server.Request): HTTP request object
 
+		Returns:
 
+			HTTP response with headers
 
-    def javaScriptAlert(self, frame, msg):
+		"""
 
-        if DEBUG:
+		request.setHeader(
 
-            prints(msg)
+			'Access-Control-Allow-Origin', CORS_DEFAULT_ALLOW_ORIGIN)
 
-        else:
 
-            return QWebPage.javaScriptAlert(self, frame, msg)
 
+		try:
 
+			target_path = self._existing_path_or_bust(request)
 
-    def scroll_by(self, dx=0, dy=0):
+		except ValueError as vexc:
 
-        self.mainFrame().scroll(dx, dy)
+			return self.error_response(
 
+				request, response_code=http.BAD_REQUEST, message=vexc.message)
 
+		except IOError as iexc:
 
-    def scroll_to(self, x=0, y=0):
+			return self.error_response(
 
-        self.mainFrame().setScrollPosition(QPoint(x, y))
+				request, response_code=http.NOT_FOUND, message=iexc.message)
 
 
 
-    def jump_to_anchor(self, anchor):
+		if os.path.isdir(target_path):
 
-        if not self.loaded_javascript:
+			return self.error_response(
 
-            return
+				request, response_code=http.NOT_IMPLEMENTED,
 
-        self.javascript('window.paged_display.jump_to_anchor("%s")'%anchor)
+				message='Will not remove folder {!r}'.format(target_path))
 
 
 
-    def element_ypos(self, elem):
+		for prefix in self._delete_whitelist:
 
-        try:
+			if not target_path.startswith(os.path.abspath(prefix)):
 
-            ans = int(elem.evaluateJavaScript('$(this).offset().top'))
+				return self.error_response(request,
 
-        except (TypeError, ValueError):
+										   response_code=http.FORBIDDEN)
 
-            raise ValueError('No ypos found')
 
-        return ans
 
+		response_data = self.get_response_data_template(request)
 
+		try:
 
-    def elem_outer_xml(self, elem):
+			response_data['result'] = True
 
-        return unicode(elem.toOuterXml())
+			if self._do_delete:
 
+				os.unlink(target_path)
 
+				message = 'Removed {!r}'.format(target_path)
 
-    def bookmark(self):
+			else:
 
-        pos = self.page_position.current_pos
+				message = 'WOULD remove {!r}'.format(target_path)
 
-        return {'type':'cfi', 'pos':pos}
+			response_data['message'] = message
 
+		except Exception as eexc:
 
+			response_data['message'] = 'Cannot remove {!r}: {!s}'.format(
 
-    @property
+				target_path, eexc.message)
 
-    def at_bottom(self):
+			request.setResponseCode(http.INTERNAL_SERVER_ERROR)
 
-        return self.height - self.ypos <= self.window_height
 
 
+		return self._json_response(request, response_data)
 
-    @property
 
-    def at_top(self):
 
-        return self.ypos <=0
 
 
+if __name__ == '__main__':
 
-    def test(self):
+	from twisted.web.resource import Resource, EncodingResourceWrapper
 
-        pass
+	from twisted.web.server import Site, GzipEncoderFactory
 
+	from twisted.internet import reactor
 
 
-    @property
 
-    def ypos(self):
+	# standard factory example
 
-        return self.mainFrame().scrollPosition().y()
+	factory_s = Site(FileController(DEFAULT_ROOT_PATH))
 
 
 
-    @property
+	# experimental factory
 
-    def window_height(self):
+	root = Resource()
 
-        return self.javascript('window.innerHeight', 'int')
+	root.putChild("/", FileController)
 
+	root.putChild("/file", FileController)
 
+	factory_r = Site(root)
 
-    @property
 
-    def window_width(self):
 
-        return self.javascript('window.innerWidth', 'int')
+	#  experimental factory: enable gzip compression
 
+	wrapped = EncodingResourceWrapper(
 
+		FileController(
 
-    @property
+			root=DEFAULT_ROOT_PATH,
 
-    def is_portrait(self):
+			# DANGER, WILL ROBINSON! These values allow deletion of ALL files!
 
-        return self.window_width < self.window_height
+			do_delete=True, delete_whitelist=[]
 
+		),
 
+		[GzipEncoderFactory()])
 
-    @property
+	factory_s_gz = Site(wrapped)
 
-    def xpos(self):
 
-        return self.mainFrame().scrollPosition().x()
 
+	reactor.listenTCP(18888, factory_s_gz)
 
-
-    @dynamic_property
-
-    def scroll_fraction(self):
-
-        def fget(self):
-
-            if self.in_paged_mode:
-
-                return self.javascript('''
-
-                ans = 0.0;
-
-                if (window.paged_display) {
-
-                    ans = window.paged_display.current_pos();
-
-                }
-
-                ans;''',  typ='float')
-
-            else:
-
-                try:
-
-                    return abs(float(self.ypos)/(self.height-self.window_height))
-
-                except ZeroDivisionError:
-
-                    return 0.
-
-
-
-        def fset(self, val):
-
-            if self.in_paged_mode and self.loaded_javascript:
-
-                self.javascript('paged_display.scroll_to_pos(%f)'%val)
-
-            else:
-
-                npos = val * (self.height - self.window_height)
-
-                if npos < 0:
-
-                    npos = 0
-
-                self.scroll_to(x=self.xpos, y=npos)
-
-        return property(fget=fget, fset=fset)
-
-
-
-    @dynamic_property
-
-    def page_number(self):
-
-        ' The page number is the number of the page at the left most edge of the screen (starting from 0) '
-
-
-
-        def fget(self):
-
-            if self.in_paged_mode:
-
-                return self.javascript(
-
-                    'ans = 0; if (window.paged_display) ans = window.paged_display.column_boundaries()[0]; ans;', typ='int')
-
-
-
-        def fset(self, val):
-
-            if self.in_paged_mode and self.loaded_javascript:
-
-                self.javascript('if (window.paged_display) window.paged_display.scroll_to_column(%d)' % int(val))
-
-                return True
-
-        return property(fget=fget, fset=fset)
-
-
-
-    @property
-
-    def page_dimensions(self):
-
-        if self.in_paged_mode:
-
-            return self.javascript(
-
-                '''
-
-                ans = ''
-
-                if (window.paged_display)
-
-                    ans = window.paged_display.col_width + ':' + window.paged_display.current_page_height;
-
-                ans;''', typ='string')
-
-
-
-    @property
-
-    def hscroll_fraction(self):
-
-        try:
-
-            return float(self.xpos)/self.width
-
-        except ZeroDivisionError:
-
-            return 0.
-
-
-
-    @property
-
-    def height(self):
-
-        # Note that document.body.offsetHeight does not include top and bottom
-
-        # margins on body and in some cases does not include the top margin on
-
-        # the first element inside body either. See ticket #8791 for an example
-
-        # of the latter.
-
-        q = self.mainFrame().contentsSize().height()
-
-        if q < 0:
-
-            # Don't know if this is still needed, but it can't hurt
-
-            j = self.javascript('document.body.offsetHeight', 'int')
-
-            if j >= 0:
-
-                q = j
-
-        return q
-
-
-
-    @property
-
-    def width(self):
-
-        return self.mainFrame().contentsSize().width()  # offsetWidth gives inaccurate results
-
-
-
-    def set_bottom_padding(self, amount):
-
-        s = QSize(-1, -1) if amount == 0 else QSize(self.viewportSize().width(),
-
-                self.height+amount)
-
-        self.setPreferredContentsSize(s)
-
-
-
-    def extract_node(self):
-
-        return unicode(self.mainFrame().evaluateJavaScript(
-
-            'window.calibre_extract.extract()'))
-
-
-
-# }}}
-
-
-
-
-
-class DocumentView(QWebView):  # {{{
-
-
-
-    magnification_changed = pyqtSignal(object)
-
-    DISABLED_BRUSH = QBrush(Qt.lightGray, Qt.Dense5Pattern)
-
-    gesture_handler = lambda s, e: False
-
-    last_loaded_path = None
-
-
-
-    def initialize_view(self, debug_javascript=False):
-
-        self.setRenderHints(QPainter.Antialiasing|QPainter.TextAntialiasing|QPainter.SmoothPixmapTransform)
-
-        self.flipper = SlideFlip(self)
-
-        self.gesture_handler = GestureHandler(self)
-
-        self.is_auto_repeat_event = False
-
-        self.debug_javascript = debug_javascript
-
-        self.shortcuts =  Shortcuts(SHORTCUTS, 'shortcuts/viewer')
-
-        self.setSizePolicy(QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding))
-
-        self._size_hint = QSize(510, 680)
-
-        self.initial_pos = 0.0
-
-        self.to_bottom = False
-
-        self.document = Document(self.shortcuts, parent=self,
-
-                debug_javascript=debug_javascript)
-
-        self.footnotes = Footnotes(self)
-
-        self.document.settings_changed.connect(self.footnotes.clone_settings)
-
-        self.setPage(self.document)
-
-        self.inspector = WebInspector(self, self.document)
-
-        self.manager = None
-
-        self._reference_mode = False
-
-        self._ignore_scrollbar_signals = False
-
-        self.loading_url = None
-
-        self.loadFinished.connect(self.load_finished)
-
-        self.document.linkClicked.connect(self.link_clicked)
-
-        self.document.linkHovered.connect(self.link_hovered)
-
-        self.document.selectionChanged[()].connect(self.selection_changed)
-
-        self.document.animated_scroll_done_signal.connect(self.animated_scroll_done, type=Qt.QueuedConnection)
-
-        self.document.page_turn.connect(self.page_turn_requested)
-
-        copy_action = self.copy_action
-
-        copy_action.setIcon(QIcon(I('edit-copy.png')))
-
-        copy_action.triggered.connect(self.copy, Qt.QueuedConnection)
-
-        d = self.document
-
-        self.unimplemented_actions = list(map(self.pageAction,
-
-            [d.DownloadImageToDisk, d.OpenLinkInNewWindow, d.DownloadLinkToDisk,
-
-                d.OpenImageInNewWindow, d.OpenLink, d.Reload, d.InspectElement]))
-
-
-
-        self.search_online_action = QAction(QIcon(I('search.png')), '', self)
-
-        self.search_online_action.triggered.connect(self.search_online)
-
-        self.addAction(self.search_online_action)
-
-        self.dictionary_action = QAction(QIcon(I('dictionary.png')),
-
-                _('&Lookup in dictionary'), self)
-
-        self.dictionary_action.triggered.connect(self.lookup)
-
-        self.addAction(self.dictionary_action)
-
-        self.image_popup = ImagePopup(self)
-
-        self.table_popup = TablePopup(self)
-
-        self.view_image_action = QAction(QIcon(I('view-image.png')), _('View &image...'), self)
-
-        self.view_image_action.triggered.connect(self.image_popup)
-
-        self.view_table_action = QAction(QIcon(I('view.png')), _('View &table...'), self)
-
-        self.view_table_action.triggered.connect(self.popup_table)
-
-        self.search_action = QAction(QIcon(I('dictionary.png')),
-
-                _('&Search for next occurrence'), self)
-
-        self.search_action.triggered.connect(self.search_next)
-
-        self.addAction(self.search_action)
-
-
-
-        self.goto_location_action = QAction(_('Go to...'), self)
-
-        self.goto_location_menu = m = QMenu(self)
-
-        self.goto_location_actions = a = {
-
-                'Next Page': self.next_page,
-
-                'Previous Page': self.previous_page,
-
-                'Section Top' : partial(self.scroll_to, 0),
-
-                'Document Top': self.goto_document_start,
-
-                'Section Bottom':partial(self.scroll_to, 1),
-
-                'Document Bottom': self.goto_document_end,
-
-                'Next Section': self.goto_next_section,
-
-                'Previous Section': self.goto_previous_section,
-
-        }
-
-        for name, key in [(_('Next Section'), 'Next Section'),
-
-                (_('Previous Section'), 'Previous Section'),
-
-                (None, None),
-
-                (_('Document Start'), 'Document Top'),
-
-                (_('Document End'), 'Document Bottom'),
-
-                (None, None),
-
-                (_('Section Start'), 'Section Top'),
-
-                (_('Section End'), 'Section Bottom'),
-
-                (None, None),
-
-                (_('Next Page'), 'Next Page'),
-
-                (_('Previous Page'), 'Previous Page')]:
-
-            if key is None:
-
-                m.addSeparator()
-
-            else:
-
-                m.addAction(name, a[key], self.shortcuts.get_sequences(key)[0])
-
-        self.goto_location_action.setMenu(self.goto_location_menu)
-
-
-
-        self.restore_fonts_action = QAction(_('Default font size'), self)
-
-        self.restore_fonts_action.setCheckable(True)
-
-        self.restore_fonts_action.triggered.connect(self.restore_font_size)
-
-
-
-    def goto_next_section(self, *args):
-
-        if self.manager is not None:
-
-            self.manager.goto_next_section()
-
-
-
-    def goto_previous_section(self, *args):
-
-        if self.manager is not None:
-
-            self.manager.goto_previous_section()
-
-
-
-    def goto_document_start(self, *args):
-
-        if self.manager is not None:
-
-            self.manager.goto_start()
-
-
-
-    def goto_document_end(self, *args):
-
-        if self.manager is not None:
-
-            self.manager.goto_end()
-
-
-
-    @property
-
-    def copy_action(self):
-
-        return self.pageAction(self.document.Copy)
-
-
-
-    def animated_scroll_done(self):
-
-        if self.manager is not None:
-
-            self.manager.scrolled(self.document.scroll_fraction)
-
-
-
-    def reference_mode(self, enable):
-
-        self._reference_mode = enable
-
-        self.document.reference_mode(enable)
-
-
-
-    def goto(self, ref):
-
-        self.document.goto(ref)
-
-
-
-    def goto_bookmark(self, bm):
-
-        self.document.goto_bookmark(bm)
-
-
-
-    def config(self, parent=None):
-
-        self.document.do_config(parent)
-
-        if self.document.in_fullscreen_mode:
-
-            self.document.switch_to_fullscreen_mode()
-
-        self.setFocus(Qt.OtherFocusReason)
-
-
-
-    def load_theme(self, theme_id):
-
-        themes = load_themes()
-
-        theme = themes[theme_id]
-
-        opts = config(theme).parse()
-
-        self.document.apply_settings(opts)
-
-        if self.document.in_fullscreen_mode:
-
-            self.document.switch_to_fullscreen_mode()
-
-        self.setFocus(Qt.OtherFocusReason)
-
-
-
-    def bookmark(self):
-
-        return self.document.bookmark()
-
-
-
-    @property
-
-    def selected_text(self):
-
-        return self.document.selectedText().replace(u'\u00ad', u'').strip()
-
-
-
-    def copy(self):
-
-        self.document.triggerAction(self.document.Copy)
-
-        c = QApplication.clipboard()
-
-        md = c.mimeData()
-
-        if iswindows:
-
-            nmd = QMimeData()
-
-            nmd.setHtml(md.html().replace(u'\u00ad', ''))
-
-            md = nmd
-
-        md.setText(self.selected_text)
-
-        QApplication.clipboard().setMimeData(md)
-
-
-
-    def selection_changed(self):
-
-        if self.manager is not None:
-
-            self.manager.selection_changed(self.selected_text)
-
-
-
-    def _selectedText(self):
-
-        t = unicode(self.selectedText()).strip()
-
-        if not t:
-
-            return u''
-
-        if len(t) > 40:
-
-            t = t[:40] + u'...'
-
-        t = t.replace(u'&', u'&&')
-
-        return _("S&earch online for '%s'")%t
-
-
-
-    def popup_table(self):
-
-        html = self.document.extract_node()
-
-        self.table_popup(html, QUrl.fromLocalFile(self.last_loaded_path),
-
-                         self.document.font_magnification_step)
-
-
-
-    def contextMenuEvent(self, ev):
-
-        from_touch = ev.reason() == ev.Other
-
-        mf = self.document.mainFrame()
-
-        r = mf.hitTestContent(ev.pos())
-
-        img = r.pixmap()
-
-        elem = r.element()
-
-        if elem.isNull():
-
-            elem = r.enclosingBlockElement()
-
-        table = None
-
-        parent = elem
-
-        while not parent.isNull():
-
-            if (unicode(parent.tagName()) == u'table' or
-
-                unicode(parent.localName()) == u'table'):
-
-                table = parent
-
-                break
-
-            parent = parent.parent()
-
-        self.image_popup.current_img = img
-
-        self.image_popup.current_url = r.imageUrl()
-
-        menu = self.document.createStandardContextMenu()
-
-        for action in self.unimplemented_actions:
-
-            menu.removeAction(action)
-
-
-
-        if not img.isNull():
-
-            menu.addAction(self.view_image_action)
-
-        if table is not None:
-
-            self.document.mark_element.emit(table)
-
-            menu.addAction(self.view_table_action)
-
-
-
-        text = self._selectedText()
-
-        if text and img.isNull():
-
-            self.search_online_action.setText(text)
-
-            for x, sc in (('search_online', 'Search online'), ('dictionary', 'Lookup word'), ('search', 'Next occurrence')):
-
-                ac = getattr(self, '%s_action' % x)
-
-                menu.addAction(ac.icon(), '%s [%s]' % (unicode(ac.text()), ','.join(self.shortcuts.get_shortcuts(sc))), ac.trigger)
-
-
-
-        if from_touch and self.manager is not None:
-
-            word = unicode(mf.evaluateJavaScript('window.calibre_utils.word_at_point(%f, %f)' % (ev.pos().x(), ev.pos().y())) or '')
-
-            if word:
-
-                menu.addAction(self.dictionary_action.icon(), _('Lookup %s in the dictionary') % word, partial(self.manager.lookup, word))
-
-                menu.addAction(self.search_online_action.icon(), _('Search for %s online') % word, partial(self.do_search_online, word))
-
-
-
-        if not text and img.isNull():
-
-            menu.addSeparator()
-
-            if self.manager.action_back.isEnabled():
-
-                menu.addAction(self.manager.action_back)
-
-            if self.manager.action_forward.isEnabled():
-
-                menu.addAction(self.manager.action_forward)
-
-            menu.addAction(self.goto_location_action)
-
-
-
-            if self.manager is not None:
-
-                menu.addSeparator()
-
-                menu.addAction(self.manager.action_table_of_contents)
-
-
-
-                menu.addSeparator()
-
-                menu.addAction(self.manager.action_font_size_larger)
-
-                self.restore_fonts_action.setChecked(self.multiplier == 1)
-
-                menu.addAction(self.restore_fonts_action)
-
-                menu.addAction(self.manager.action_font_size_smaller)
-
-
-
-        menu.addSeparator()
-
-        menu.addAction(_('Inspect'), self.inspect)
-
-
-
-        if not text and img.isNull() and self.manager is not None:
-
-            menu.addSeparator()
-
-            if (not self.document.show_controls or self.document.in_fullscreen_mode) and self.manager is not None:
-
-                menu.addAction(self.manager.toggle_toolbar_action)
-
-            menu.addAction(self.manager.action_full_screen)
-
-
-
-            menu.addSeparator()
-
-            menu.addAction(self.manager.action_reload)
-
-            menu.addAction(self.manager.action_quit)
-
-
-
-        for plugin in self.document.all_viewer_plugins:
-
-            plugin.customize_context_menu(menu, ev, r)
-
-
-
-        if from_touch:
-
-            from calibre.constants import plugins
-
-            pi = plugins['progress_indicator'][0]
-
-            for x in (menu, self.goto_location_menu):
-
-                if hasattr(pi, 'set_touch_menu_style'):
-
-                    pi.set_touch_menu_style(x)
-
-            helpt = QAction(QIcon(I('help.png')), _('Show supported touch screen gestures'), menu)
-
-            helpt.triggered.connect(self.gesture_handler.show_help)
-
-            menu.insertAction(menu.actions()[0], helpt)
-
-        else:
-
-            self.goto_location_menu.setStyle(self.style())
-
-        self.context_menu = menu
-
-        menu.exec_(ev.globalPos())
-
-
-
-    def inspect(self):
-
-        self.inspector.show()
-
-        self.inspector.raise_()
-
-        self.pageAction(self.document.InspectElement).trigger()
-
-
-
-    def lookup(self, *args):
-
-        if self.manager is not None:
-
-            t = unicode(self.selectedText()).strip()
-
-            if t:
-
-                self.manager.lookup(t.split()[0])
-
-
-
-    def search_next(self):
-
-        if self.manager is not None:
-
-            t = unicode(self.selectedText()).strip()
-
-            if t:
-
-                self.manager.search.set_search_string(t)
-
-
-
-    def search_online(self):
-
-        t = unicode(self.selectedText()).strip()
-
-        if t:
-
-            self.do_search_online(t)
-
-
-
-    def do_search_online(self, text):
-
-        url = self.document.search_online_url.replace('{text}', QUrl().toPercentEncoding(text))
-
-        if not isinstance(url, bytes):
-
-            url = url.encode('utf-8')
-
-        open_url(QUrl.fromEncoded(url))
-
-
-
-    def set_manager(self, manager):
-
-        self.manager = manager
-
-        self.scrollbar = manager.horizontal_scrollbar
-
-        self.scrollbar.valueChanged[(int)].connect(self.scroll_horizontally)
-
-
-
-    def scroll_horizontally(self, amount):
-
-        self.document.scroll_to(y=self.document.ypos, x=amount)
-
-
-
-    @property
-
-    def scroll_pos(self):
-
-        return (self.document.ypos, self.document.ypos +
-
-                self.document.window_height)
-
-
-
-    @property
-
-    def viewport_rect(self):
-
-        # (left, top, right, bottom) of the viewport in document co-ordinates
-
-        # When in paged mode, left and right are the numbers of the columns
-
-        # at the left edge and *after* the right edge of the viewport
-
-        d = self.document
-
-        if d.in_paged_mode:
-
-            try:
-
-                l, r = d.column_boundaries
-
-            except ValueError:
-
-                l, r = (0, 1)
-
-        else:
-
-            l, r = d.xpos, d.xpos + d.window_width
-
-        return (l, d.ypos, r, d.ypos + d.window_height)
-
-
-
-    def link_hovered(self, link, text, context):
-
-        link, text = unicode(link), unicode(text)
-
-        if link:
-
-            self.setCursor(Qt.PointingHandCursor)
-
-        else:
-
-            self.unsetCursor()
-
-
-
-    def link_clicked(self, url):
-
-        if self.manager is not None:
-
-            self.manager.link_clicked(url)
-
-
-
-    def sizeHint(self):
-
-        return self._size_hint
-
-
-
-    @dynamic_property
-
-    def scroll_fraction(self):
-
-        def fget(self):
-
-            return self.document.scroll_fraction
-
-
-
-        def fset(self, val):
-
-            self.document.scroll_fraction = float(val)
-
-        return property(fget=fget, fset=fset)
-
-
-
-    @property
-
-    def hscroll_fraction(self):
-
-        return self.document.hscroll_fraction
-
-
-
-    @property
-
-    def content_size(self):
-
-        return self.document.width, self.document.height
-
-
-
-    @dynamic_property
-
-    def current_language(self):
-
-        def fget(self):
-
-            return self.document.current_language
-
-
-
-        def fset(self, val):
-
-            self.document.current_language = val
-
-        return property(fget=fget, fset=fset)
-
-
-
-    def search(self, text, backwards=False):
-
-        flags = self.document.FindBackward if backwards else self.document.FindFlags(0)
-
-        found = self.document.findText(text, flags)
-
-        if found and self.document.in_paged_mode:
-
-            self.document.javascript('paged_display.snap_to_selection()')
-
-        return found
-
-
-
-    def path(self):
-
-        return os.path.abspath(unicode(self.url().toLocalFile()))
-
-
-
-    def load_path(self, path, pos=0.0):
-
-        self.initial_pos = pos
-
-        self.last_loaded_path = path
-
-        # This is needed otherwise percentage margins on body are not correctly
-
-        # evaluated in read_document_margins() in paged mode.
-
-        self.document.setPreferredContentsSize(QSize())
-
-
-
-        def callback(lu):
-
-            self.loading_url = lu
-
-            if self.manager is not None:
-
-                self.manager.load_started()
-
-
-
-        load_html(path, self, codec=getattr(path, 'encoding', 'utf-8'), mime_type=getattr(path,
-
-            'mime_type', 'text/html'), pre_load_callback=callback)
-
-        entries = set()
-
-        for ie in getattr(path, 'index_entries', []):
-
-            if ie.start_anchor:
-
-                entries.add(ie.start_anchor)
-
-            if ie.end_anchor:
-
-                entries.add(ie.end_anchor)
-
-        self.document.index_anchors = entries
-
-
-
-    def initialize_scrollbar(self):
-
-        if getattr(self, 'scrollbar', None) is not None:
-
-            if self.document.in_paged_mode:
-
-                self.scrollbar.setVisible(False)
-
-                return
-
-            delta = self.document.width - self.size().width()
-
-            if delta > 0:
-
-                self._ignore_scrollbar_signals = True
-
-                self.scrollbar.blockSignals(True)
-
-                self.scrollbar.setRange(0, delta)
-
-                self.scrollbar.setValue(0)
-
-                self.scrollbar.setSingleStep(1)
-
-                self.scrollbar.setPageStep(int(delta/10.))
-
-            self.scrollbar.setVisible(delta > 0)
-
-            self.scrollbar.blockSignals(False)
-
-            self._ignore_scrollbar_signals = False
-
-
-
-    def load_finished(self, ok):
-
-        if self.loading_url is None:
-
-            # An <iframe> finished loading
-
-            return
-
-        self.loading_url = None
-
-        self.document.load_javascript_libraries()
-
-        self.document.after_load(self.last_loaded_path)
-
-        self._size_hint = self.document.mainFrame().contentsSize()
-
-        scrolled = False
-
-        if self.to_bottom:
-
-            self.to_bottom = False
-
-            self.initial_pos = 1.0
-
-        if self.initial_pos > 0.0:
-
-            scrolled = True
-
-        self.scroll_to(self.initial_pos, notify=False)
-
-        self.initial_pos = 0.0
-
-        self.update()
-
-        self.initialize_scrollbar()
-
-        self.document.reference_mode(self._reference_mode)
-
-        if self.manager is not None:
-
-            spine_index = self.manager.load_finished(bool(ok))
-
-            if spine_index > -1:
-
-                self.document.set_reference_prefix('%d.'%(spine_index+1))
-
-            if scrolled:
-
-                self.manager.scrolled(self.document.scroll_fraction,
-
-                        onload=True)
-
-
-
-        if self.flipper.isVisible():
-
-            if self.flipper.running:
-
-                self.flipper.setVisible(False)
-
-            else:
-
-                self.flipper(self.current_page_image(),
-
-                        duration=self.document.page_flip_duration)
-
-
-
-    @classmethod
-
-    def test_line(cls, img, y):
-
-        'Test if line contains pixels of exactly the same color'
-
-        start = img.pixel(0, y)
-
-        for i in range(1, img.width()):
-
-            if img.pixel(i, y) != start:
-
-                return False
-
-        return True
-
-
-
-    def current_page_image(self, overlap=-1):
-
-        if overlap < 0:
-
-            overlap = self.height()
-
-        img = QImage(self.width(), overlap, QImage.Format_ARGB32_Premultiplied)
-
-        painter = QPainter(img)
-
-        painter.setRenderHints(self.renderHints())
-
-        self.document.mainFrame().render(painter, QRegion(0, 0, self.width(), overlap))
-
-        painter.end()
-
-        return img
-
-
-
-    def find_next_blank_line(self, overlap):
-
-        img = self.current_page_image(overlap)
-
-        for i in range(overlap-1, -1, -1):
-
-            if self.test_line(img, i):
-
-                self.scroll_by(y=i, notify=False)
-
-                return
-
-        self.scroll_by(y=overlap)
-
-
-
-    def previous_page(self):
-
-        if self.flipper.running and not self.is_auto_repeat_event:
-
-            return
-
-        if self.loading_url is not None:
-
-            return
-
-        epf = self.document.enable_page_flip and not self.is_auto_repeat_event
-
-
-
-        if self.document.in_paged_mode:
-
-            loc = self.document.javascript(
-
-                    'paged_display.previous_screen_location()', typ='int')
-
-            if loc < 0:
-
-                if self.manager is not None:
-
-                    if epf:
-
-                        self.flipper.initialize(self.current_page_image(),
-
-                                forwards=False)
-
-                    self.manager.previous_document()
-
-            else:
-
-                if epf:
-
-                    self.flipper.initialize(self.current_page_image(),
-
-                            forwards=False)
-
-                self.document.scroll_to(x=loc, y=0)
-
-                if epf:
-
-                    self.flipper(self.current_page_image(),
-
-                            duration=self.document.page_flip_duration)
-
-                if self.manager is not None:
-
-                    self.manager.scrolled(self.scroll_fraction)
-
-
-
-            return
-
-
-
-        delta_y = self.document.window_height - 25
-
-        if self.document.at_top:
-
-            if self.manager is not None:
-
-                self.to_bottom = True
-
-                if epf:
-
-                    self.flipper.initialize(self.current_page_image(), False)
-
-                self.manager.previous_document()
-
-        else:
-
-            opos = self.document.ypos
-
-            upper_limit = opos - delta_y
-
-            if upper_limit < 0:
-
-                upper_limit = 0
-
-            if upper_limit < opos:
-
-                if epf:
-
-                    self.flipper.initialize(self.current_page_image(),
-
-                            forwards=False)
-
-                self.document.scroll_to(self.document.xpos, upper_limit)
-
-                if epf:
-
-                    self.flipper(self.current_page_image(),
-
-                            duration=self.document.page_flip_duration)
-
-                if self.manager is not None:
-
-                    self.manager.scrolled(self.scroll_fraction)
-
-
-
-    def next_page(self):
-
-        if self.flipper.running and not self.is_auto_repeat_event:
-
-            return
-
-        if self.loading_url is not None:
-
-            return
-
-        epf = self.document.enable_page_flip and not self.is_auto_repeat_event
-
-
-
-        if self.document.in_paged_mode:
-
-            loc = self.document.javascript(
-
-                    'paged_display.next_screen_location()', typ='int')
-
-            if loc < 0:
-
-                if self.manager is not None:
-
-                    if epf:
-
-                        self.flipper.initialize(self.current_page_image())
-
-                    self.manager.next_document()
-
-            else:
-
-                if epf:
-
-                    self.flipper.initialize(self.current_page_image())
-
-                self.document.scroll_to(x=loc, y=0)
-
-                if epf:
-
-                    self.flipper(self.current_page_image(),
-
-                            duration=self.document.page_flip_duration)
-
-                if self.manager is not None:
-
-                    self.manager.scrolled(self.scroll_fraction)
-
-
-
-            return
-
-
-
-        window_height = self.document.window_height
-
-        document_height = self.document.height
-
-        ddelta = document_height - window_height
-
-        # print '\nWindow height:', window_height
-
-        # print 'Document height:', self.document.height
-
-
-
-        delta_y = window_height - 25
-
-        if self.document.at_bottom or ddelta <= 0:
-
-            if self.manager is not None:
-
-                if epf:
-
-                    self.flipper.initialize(self.current_page_image())
-
-                self.manager.next_document()
-
-        elif ddelta < 25:
-
-            self.scroll_by(y=ddelta)
-
-            return
-
-        else:
-
-            oopos = self.document.ypos
-
-            # print 'Original position:', oopos
-
-            self.document.set_bottom_padding(0)
-
-            opos = self.document.ypos
-
-            # print 'After set padding=0:', self.document.ypos
-
-            if opos < oopos:
-
-                if self.manager is not None:
-
-                    if epf:
-
-                        self.flipper.initialize(self.current_page_image())
-
-                    self.manager.next_document()
-
-                return
-
-            # oheight = self.document.height
-
-            lower_limit = opos + delta_y  # Max value of top y co-ord after scrolling
-
-            max_y = self.document.height - window_height  # The maximum possible top y co-ord
-
-            if max_y < lower_limit:
-
-                padding = lower_limit - max_y
-
-                if padding == window_height:
-
-                    if self.manager is not None:
-
-                        if epf:
-
-                            self.flipper.initialize(self.current_page_image())
-
-                        self.manager.next_document()
-
-                    return
-
-                # print 'Setting padding to:', lower_limit - max_y
-
-                self.document.set_bottom_padding(lower_limit - max_y)
-
-            if epf:
-
-                self.flipper.initialize(self.current_page_image())
-
-            # print 'Document height:', self.document.height
-
-            # print 'Height change:', (self.document.height - oheight)
-
-            max_y = self.document.height - window_height
-
-            lower_limit = min(max_y, lower_limit)
-
-            # print 'Scroll to:', lower_limit
-
-            if lower_limit > opos:
-
-                self.document.scroll_to(self.document.xpos, lower_limit)
-
-            actually_scrolled = self.document.ypos - opos
-
-            # print 'After scroll pos:', self.document.ypos
-
-            # print 'Scrolled by:', self.document.ypos - opos
-
-            self.find_next_blank_line(window_height - actually_scrolled)
-
-            # print 'After blank line pos:', self.document.ypos
-
-            if epf:
-
-                self.flipper(self.current_page_image(),
-
-                        duration=self.document.page_flip_duration)
-
-            if self.manager is not None:
-
-                self.manager.scrolled(self.scroll_fraction)
-
-            # print 'After all:', self.document.ypos
-
-
-
-    def page_turn_requested(self, backwards):
-
-        if backwards:
-
-            self.previous_page()
-
-        else:
-
-            self.next_page()
-
-
-
-    def scroll_by(self, x=0, y=0, notify=True):
-
-        old_pos = (self.document.xpos if self.document.in_paged_mode else
-
-                self.document.ypos)
-
-        self.document.scroll_by(x, y)
-
-        new_pos = (self.document.xpos if self.document.in_paged_mode else
-
-                self.document.ypos)
-
-        if notify and self.manager is not None and new_pos != old_pos:
-
-            self.manager.scrolled(self.scroll_fraction)
-
-
-
-    def scroll_to(self, pos, notify=True):
-
-        if self._ignore_scrollbar_signals:
-
-            return
-
-        old_pos = (self.document.xpos if self.document.in_paged_mode else
-
-                self.document.ypos)
-
-        if self.document.in_paged_mode:
-
-            if isinstance(pos, basestring):
-
-                self.document.jump_to_anchor(pos)
-
-            else:
-
-                self.document.scroll_fraction = pos
-
-        else:
-
-            if isinstance(pos, basestring):
-
-                self.document.jump_to_anchor(pos)
-
-            else:
-
-                if pos >= 1:
-
-                    self.document.scroll_to(0, self.document.height)
-
-                else:
-
-                    y = int(math.ceil(
-
-                            pos*(self.document.height-self.document.window_height)))
-
-                    self.document.scroll_to(0, y)
-
-
-
-        new_pos = (self.document.xpos if self.document.in_paged_mode else
-
-                self.document.ypos)
-
-        if notify and self.manager is not None and new_pos != old_pos:
-
-            self.manager.scrolled(self.scroll_fraction)
-
-
-
-    @dynamic_property
-
-    def multiplier(self):
-
-        def fget(self):
-
-            return self.zoomFactor()
-
-
-
-        def fset(self, val):
-
-            oval = self.zoomFactor()
-
-            self.setZoomFactor(val)
-
-            if val != oval:
-
-                if self.document.in_paged_mode:
-
-                    self.document.update_contents_size_for_paged_mode()
-
-                self.magnification_changed.emit(val)
-
-        return property(fget=fget, fset=fset)
-
-
-
-    def magnify_fonts(self, amount=None):
-
-        if amount is None:
-
-            amount = self.document.font_magnification_step
-
-        with self.document.page_position:
-
-            self.multiplier += amount
-
-        return self.document.scroll_fraction
-
-
-
-    def shrink_fonts(self, amount=None):
-
-        if amount is None:
-
-            amount = self.document.font_magnification_step
-
-        if self.multiplier >= amount:
-
-            with self.document.page_position:
-
-                self.multiplier -= amount
-
-        return self.document.scroll_fraction
-
-
-
-    def restore_font_size(self):
-
-        with self.document.page_position:
-
-            self.multiplier = 1
-
-        return self.document.scroll_fraction
-
-
-
-    def changeEvent(self, event):
-
-        if event.type() == event.EnabledChange:
-
-            self.update()
-
-        return QWebView.changeEvent(self, event)
-
-
-
-    def paintEvent(self, event):
-
-        painter = QPainter(self)
-
-        painter.setRenderHints(self.renderHints())
-
-        self.document.mainFrame().render(painter, event.region())
-
-        if not self.isEnabled():
-
-            painter.fillRect(event.region().boundingRect(), self.DISABLED_BRUSH)
-
-        painter.end()
-
-
-
-    def wheelEvent(self, event):
-
-        if event.phase() not in (Qt.ScrollUpdate, 0):
-
-            # 0 is Qt.NoScrollPhase which is not yet available in PyQt
-
-            return
-
-        mods = event.modifiers()
-
-        num_degrees = event.angleDelta().y() // 8
-
-        if mods & Qt.CTRL:
-
-            if self.manager is not None and num_degrees != 0:
-
-                (self.manager.font_size_larger if num_degrees > 0 else
-
-                        self.manager.font_size_smaller)()
-
-                return
-
-
-
-        if self.document.in_paged_mode:
-
-            if abs(num_degrees) < 15:
-
-                return
-
-            typ = 'screen' if self.document.wheel_flips_pages else 'col'
-
-            direction = 'next' if num_degrees < 0 else 'previous'
-
-            loc = self.document.javascript('paged_display.%s_%s_location()'%(
-
-                direction, typ), typ='int')
-
-            if loc > -1:
-
-                self.document.scroll_to(x=loc, y=0)
-
-                if self.manager is not None:
-
-                    self.manager.scrolled(self.scroll_fraction)
-
-                event.accept()
-
-            elif self.manager is not None:
-
-                if direction == 'next':
-
-                    self.manager.next_document()
-
-                else:
-
-                    self.manager.previous_document()
-
-                event.accept()
-
-            return
-
-
-
-        if num_degrees < -14:
-
-            if self.document.wheel_flips_pages:
-
-                self.next_page()
-
-                event.accept()
-
-                return
-
-            if self.document.at_bottom:
-
-                self.scroll_by(y=15)  # at_bottom can lie on windows
-
-                if self.manager is not None:
-
-                    self.manager.next_document()
-
-                    event.accept()
-
-                    return
-
-        elif num_degrees > 14:
-
-            if self.document.wheel_flips_pages:
-
-                self.previous_page()
-
-                event.accept()
-
-                return
-
-
-
-            if self.document.at_top:
-
-                if self.manager is not None:
-
-                    self.manager.previous_document()
-
-                    event.accept()
-
-                    return
-
-
-
-        ret = QWebView.wheelEvent(self, event)
-
-
-
-        num_degrees_h = event.angleDelta().x() // 8
-
-        vertical = abs(num_degrees) > abs(num_degrees_h)
-
-        scroll_amount = ((num_degrees if vertical else num_degrees_h)/ 120.0) * .2 * -1 * 8
-
-        dim = self.document.viewportSize().height() if vertical else self.document.viewportSize().width()
-
-        amt =  dim * scroll_amount
-
-        mult = -1 if amt < 0 else 1
-
-        if self.document.wheel_scroll_fraction != 100:
-
-            amt = mult * max(1, abs(int(amt * self.document.wheel_scroll_fraction / 100.)))
-
-        self.scroll_by(0, amt) if vertical else self.scroll_by(amt, 0)
-
-
-
-        if self.manager is not None:
-
-            self.manager.scrolled(self.scroll_fraction)
-
-        return ret
-
-
-
-    def keyPressEvent(self, event):
-
-        if not self.handle_key_press(event):
-
-            return QWebView.keyPressEvent(self, event)
-
-
-
-    def paged_col_scroll(self, forward=True, scroll_past_end=True):
-
-        dir = 'next' if forward else 'previous'
-
-        loc = self.document.javascript(
-
-                'paged_display.%s_col_location()'%dir, typ='int')
-
-        if loc > -1:
-
-            self.document.scroll_to(x=loc, y=0)
-
-            self.manager.scrolled(self.document.scroll_fraction)
-
-        elif scroll_past_end:
-
-            (self.manager.next_document() if forward else
-
-                    self.manager.previous_document())
-
-
-
-    def handle_key_press(self, event):
-
-        handled = True
-
-        key = self.shortcuts.get_match(event)
-
-        func = self.goto_location_actions.get(key, None)
-
-        if func is not None:
-
-            self.is_auto_repeat_event = event.isAutoRepeat()
-
-            try:
-
-                func()
-
-            finally:
-
-                self.is_auto_repeat_event = False
-
-        elif key == 'Down':
-
-            if self.document.in_paged_mode:
-
-                self.paged_col_scroll(scroll_past_end=not
-
-                        self.document.line_scrolling_stops_on_pagebreaks)
-
-            else:
-
-                if (not self.document.line_scrolling_stops_on_pagebreaks and
-
-                        self.document.at_bottom):
-
-                    self.manager.next_document()
-
-                else:
-
-                    amt = int((self.document.line_scroll_fraction / 100.) * 15)
-
-                    self.scroll_by(y=amt)
-
-        elif key == 'Up':
-
-            if self.document.in_paged_mode:
-
-                self.paged_col_scroll(forward=False, scroll_past_end=not
-
-                        self.document.line_scrolling_stops_on_pagebreaks)
-
-            else:
-
-                if (not self.document.line_scrolling_stops_on_pagebreaks and
-
-                        self.document.at_top):
-
-                    self.manager.previous_document()
-
-                else:
-
-                    amt = int((self.document.line_scroll_fraction / 100.) * 15)
-
-                    self.scroll_by(y=-amt)
-
-        elif key == 'Left':
-
-            if self.document.in_paged_mode:
-
-                self.paged_col_scroll(forward=False)
-
-            else:
-
-                amt = int((self.document.line_scroll_fraction / 100.) * 15)
-
-                self.scroll_by(x=-amt)
-
-        elif key == 'Right':
-
-            if self.document.in_paged_mode:
-
-                self.paged_col_scroll()
-
-            else:
-
-                amt = int((self.document.line_scroll_fraction / 100.) * 15)
-
-                self.scroll_by(x=amt)
-
-        elif key == 'Back':
-
-            if self.manager is not None:
-
-                self.manager.back(None)
-
-        elif key == 'Forward':
-
-            if self.manager is not None:
-
-                self.manager.forward(None)
-
-        elif event.matches(QKeySequence.Copy):
-
-            self.copy()
-
-        else:
-
-            handled = False
-
-        return handled
-
-
-
-    def resizeEvent(self, event):
-
-        if self.manager is not None:
-
-            self.manager.viewport_resize_started(event)
-
-        return QWebView.resizeEvent(self, event)
-
-
-
-    def event(self, ev):
-
-        if self.gesture_handler(ev):
-
-            return True
-
-        return QWebView.event(self, ev)
-
-
-
-    def mouseMoveEvent(self, ev):
-
-        if self.document.in_paged_mode and ev.buttons() & Qt.LeftButton and not self.rect().contains(ev.pos(), True):
-
-            # Prevent this event from causing WebKit to scroll the viewport
-
-            # See https://bugs.launchpad.net/bugs/1464862
-
-            return
-
-        return QWebView.mouseMoveEvent(self, ev)
-
-
-
-    def mouseReleaseEvent(self, ev):
-
-        r = self.document.mainFrame().hitTestContent(ev.pos())
-
-        a, url = r.linkElement(), r.linkUrl()
-
-        if url.isValid() and not a.isNull() and self.manager is not None:
-
-            fd = self.footnotes.get_footnote_data(a, url)
-
-            if fd:
-
-                self.footnotes.show_footnote(fd)
-
-                self.manager.show_footnote_view()
-
-                ev.accept()
-
-                return
-
-        opos = self.document.ypos
-
-        if self.manager is not None:
-
-            prev_pos = self.manager.update_page_number()
-
-        ret = QWebView.mouseReleaseEvent(self, ev)
-
-        if self.manager is not None and opos != self.document.ypos:
-
-            self.manager.scrolled(self.scroll_fraction)
-
-            self.manager.internal_link_clicked(prev_pos)
-
-        return ret
-
-
-
-    def follow_footnote_link(self):
-
-        qurl =  self.footnotes.showing_url
-
-        if qurl and qurl.isValid():
-
-            self.link_clicked(qurl)
-
-
-
-# }}}
+	reactor.run()

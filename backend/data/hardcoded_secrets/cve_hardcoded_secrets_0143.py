@@ -2,1184 +2,1850 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
+# -*- coding: utf-8 -*-
 
+from __future__ import unicode_literals
 
 
-# Copyright 2012 OpenStack, LLC
 
-# All Rights Reserved.
+import datetime
 
-#
+import os
 
-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+import tempfile
 
-#    not use this file except in compliance with the License. You may obtain
+import uuid
 
-#    a copy of the License at
 
-#
 
-#         http://www.apache.org/licenses/LICENSE-2.0
+from django.contrib.auth.models import User
 
-#
+from django.contrib.contenttypes.fields import (
 
-#    Unless required by applicable law or agreed to in writing, software
+    GenericForeignKey, GenericRelation,
 
-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+)
 
-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+from django.contrib.contenttypes.models import ContentType
 
-#    License for the specific language governing permissions and limitations
+from django.core.files.storage import FileSystemStorage
 
-#    under the License.
+from django.db import models
 
+from django.utils.encoding import python_2_unicode_compatible
 
 
-import json
 
 
 
-import requests
+class Section(models.Model):
 
+    """
 
+    A simple section that links to articles, to test linking to related items
 
-from glance.common import utils
+    in admin views.
 
-from glance.tests import functional
+    """
 
+    name = models.CharField(max_length=100)
 
 
 
+    @property
 
-TENANT1 = utils.generate_uuid()
+    def name_property(self):
 
-TENANT2 = utils.generate_uuid()
+        """
 
-TENANT3 = utils.generate_uuid()
+        A property that simply returns the name. Used to test #24461
 
-TENANT4 = utils.generate_uuid()
+        """
 
+        return self.name
 
 
 
 
-class TestImages(functional.FunctionalTest):
 
+@python_2_unicode_compatible
 
+class Article(models.Model):
 
-    def setUp(self):
+    """
 
-        super(TestImages, self).setUp()
+    A simple article to test admin views. Test backwards compatibility.
 
-        self.cleanup()
+    """
 
-        self.api_server.deployment_flavor = 'noauth'
+    title = models.CharField(max_length=100)
 
-        self.start_servers(**self.__dict__.copy())
+    content = models.TextField()
 
+    date = models.DateTimeField()
 
+    section = models.ForeignKey(Section, null=True, blank=True)
 
-    def _url(self, path):
+    sub_section = models.ForeignKey(Section, null=True, blank=True, on_delete=models.SET_NULL, related_name='+')
 
-        return 'http://127.0.0.1:%d%s' % (self.api_port, path)
 
 
+    def __str__(self):
 
-    def _headers(self, custom_headers=None):
+        return self.title
 
-        base_headers = {
 
-            'X-Identity-Status': 'Confirmed',
 
-            'X-Auth-Token': '932c5c84-02ac-4fe5-a9ba-620af0e2bb96',
+    def model_year(self):
 
-            'X-User-Id': 'f9a41d13-0c13-47e9-bee2-ce4e8bfe958e',
+        return self.date.year
 
-            'X-Tenant-Id': TENANT1,
+    model_year.admin_order_field = 'date'
 
-            'X-Roles': 'member',
+    model_year.short_description = ''
 
-        }
 
-        base_headers.update(custom_headers or {})
 
-        return base_headers
+    def model_year_reversed(self):
 
+        return self.date.year
 
+    model_year_reversed.admin_order_field = '-date'
 
-    def test_image_lifecycle(self):
+    model_year_reversed.short_description = ''
 
-        # Image list should be empty
 
-        path = self._url('/v2/images')
 
-        response = requests.get(path, headers=self._headers())
 
-        self.assertEqual(200, response.status_code)
 
-        images = json.loads(response.text)['images']
+@python_2_unicode_compatible
 
-        self.assertEqual(0, len(images))
+class Book(models.Model):
 
+    """
 
+    A simple book that has chapters.
 
-        # Create an image (with a deployer-defined property)
+    """
 
-        path = self._url('/v2/images')
+    name = models.CharField(max_length=100, verbose_name='¿Name?')
 
-        headers = self._headers({'content-type': 'application/json'})
 
-        data = json.dumps({'name': 'image-1', 'type': 'kernel', 'foo': 'bar'})
 
-        response = requests.post(path, headers=headers, data=data)
+    def __str__(self):
 
-        self.assertEqual(201, response.status_code)
+        return self.name
 
-        image_location_header = response.headers['Location']
 
 
 
-        # Returned image entity should have a generated id and status
 
-        image = json.loads(response.text)
+@python_2_unicode_compatible
 
-        image_id = image['id']
+class Promo(models.Model):
 
-        self.assertEqual(image['status'], 'queued')
+    name = models.CharField(max_length=100, verbose_name='¿Name?')
 
+    book = models.ForeignKey(Book)
 
 
-        # Image list should now have one entry
 
-        path = self._url('/v2/images')
+    def __str__(self):
 
-        response = requests.get(path, headers=self._headers())
+        return self.name
 
-        self.assertEqual(200, response.status_code)
 
-        images = json.loads(response.text)['images']
 
-        self.assertEqual(1, len(images))
 
-        self.assertEqual(images[0]['id'], image_id)
 
+@python_2_unicode_compatible
 
+class Chapter(models.Model):
 
-        # Get the image using the returned Location header
+    title = models.CharField(max_length=100, verbose_name='¿Title?')
 
-        response = requests.get(image_location_header, headers=self._headers())
+    content = models.TextField()
 
-        self.assertEqual(200, response.status_code)
+    book = models.ForeignKey(Book)
 
-        image = json.loads(response.text)
 
-        self.assertEqual(image_id, image['id'])
 
-        self.assertFalse('checksum' in image)
+    def __str__(self):
 
-        self.assertFalse('size' in image)
+        return self.title
 
-        self.assertEqual('bar', image['foo'])
 
-        self.assertEqual(False, image['protected'])
 
-        self.assertEqual('kernel', image['type'])
+    class Meta:
 
-        self.assertTrue(image['created_at'])
+        # Use a utf-8 bytestring to ensure it works (see #11710)
 
-        self.assertTrue(image['updated_at'])
+        verbose_name = '¿Chapter?'
 
-        self.assertEqual(image['updated_at'], image['created_at'])
 
 
 
-        # The image should be mutable, including adding and removing properties
 
-        path = self._url('/v2/images/%s' % image_id)
+@python_2_unicode_compatible
 
-        media_type = 'application/openstack-images-v2.0-json-patch'
+class ChapterXtra1(models.Model):
 
-        headers = self._headers({'content-type': media_type})
+    chap = models.OneToOneField(Chapter, verbose_name='¿Chap?')
 
-        data = json.dumps([
+    xtra = models.CharField(max_length=100, verbose_name='¿Xtra?')
 
-            {'replace': '/name', 'value': 'image-2'},
 
-            {'replace': '/disk_format', 'value': 'vhd'},
 
-            {'replace': '/foo', 'value': 'baz'},
+    def __str__(self):
 
-            {'add': '/ping', 'value': 'pong'},
+        return '¿Xtra1: %s' % self.xtra
 
-            {'replace': '/protected', 'value': True},
 
-            {'remove': '/type'},
 
-        ])
 
-        response = requests.patch(path, headers=headers, data=data)
 
-        self.assertEqual(200, response.status_code, response.text)
+@python_2_unicode_compatible
 
+class ChapterXtra2(models.Model):
 
+    chap = models.OneToOneField(Chapter, verbose_name='¿Chap?')
 
-        # Returned image entity should reflect the changes
+    xtra = models.CharField(max_length=100, verbose_name='¿Xtra?')
 
-        image = json.loads(response.text)
 
-        self.assertEqual('image-2', image['name'])
 
-        self.assertEqual('vhd', image['disk_format'])
+    def __str__(self):
 
-        self.assertEqual('baz', image['foo'])
+        return '¿Xtra2: %s' % self.xtra
 
-        self.assertEqual('pong', image['ping'])
 
-        self.assertEqual(True, image['protected'])
 
-        self.assertFalse('type' in image, response.text)
 
 
+class RowLevelChangePermissionModel(models.Model):
 
-        # Updates should persist across requests
+    name = models.CharField(max_length=100, blank=True)
 
-        path = self._url('/v2/images/%s' % image_id)
 
-        response = requests.get(path, headers=self._headers())
 
-        self.assertEqual(200, response.status_code)
 
-        image = json.loads(response.text)
 
-        self.assertEqual(image_id, image['id'])
+class CustomArticle(models.Model):
 
-        self.assertEqual('image-2', image['name'])
+    content = models.TextField()
 
-        self.assertEqual('baz', image['foo'])
+    date = models.DateTimeField()
 
-        self.assertEqual('pong', image['ping'])
 
-        self.assertEqual(True, image['protected'])
 
-        self.assertFalse('type' in image, response.text)
 
 
+@python_2_unicode_compatible
 
-        # Try to download data before its uploaded
+class ModelWithStringPrimaryKey(models.Model):
 
-        path = self._url('/v2/images/%s/file' % image_id)
+    string_pk = models.CharField(max_length=255, primary_key=True)
 
-        headers = self._headers()
 
-        response = requests.get(path, headers=headers)
 
-        self.assertEqual(404, response.status_code)
+    def __str__(self):
 
+        return self.string_pk
 
 
-        # Upload some image data
 
-        path = self._url('/v2/images/%s/file' % image_id)
+    def get_absolute_url(self):
 
-        headers = self._headers({'Content-Type': 'application/octet-stream'})
+        return '/dummy/%s/' % self.string_pk
 
-        response = requests.put(path, headers=headers, data='ZZZZZ')
 
-        self.assertEqual(201, response.status_code)
 
 
 
-        # Checksum should be populated automatically
+@python_2_unicode_compatible
 
-        path = self._url('/v2/images/%s' % image_id)
+class Color(models.Model):
 
-        response = requests.get(path, headers=self._headers())
+    value = models.CharField(max_length=10)
 
-        self.assertEqual(200, response.status_code)
+    warm = models.BooleanField(default=False)
 
-        image = json.loads(response.text)
 
-        self.assertEqual('8f113e38d28a79a5a451b16048cc2b72', image['checksum'])
 
+    def __str__(self):
 
+        return self.value
 
-        # Try to download the data that was just uploaded
 
-        path = self._url('/v2/images/%s/file' % image_id)
 
-        headers = self._headers()
 
-        response = requests.get(path, headers=headers)
 
-        self.assertEqual(200, response.status_code)
+# we replicate Color to register with another ModelAdmin
 
-        self.assertEqual('8f113e38d28a79a5a451b16048cc2b72',
+class Color2(Color):
 
-                         response.headers['Content-MD5'])
+    class Meta:
 
-        self.assertEqual(response.text, 'ZZZZZ')
+        proxy = True
 
 
 
-        # Uploading duplicate data should be rejected with a 409
 
-        path = self._url('/v2/images/%s/file' % image_id)
 
-        headers = self._headers({'Content-Type': 'application/octet-stream'})
+@python_2_unicode_compatible
 
-        response = requests.put(path, headers=headers, data='XXX')
+class Thing(models.Model):
 
-        self.assertEqual(409, response.status_code)
+    title = models.CharField(max_length=20)
 
+    color = models.ForeignKey(Color, limit_choices_to={'warm': True})
 
+    pub_date = models.DateField(blank=True, null=True)
 
-        # Ensure the size is updated to reflect the data uploaded
 
-        path = self._url('/v2/images/%s' % image_id)
 
-        headers = self._headers()
+    def __str__(self):
 
-        response = requests.get(path, headers=headers)
+        return self.title
 
-        self.assertEqual(200, response.status_code)
 
-        self.assertEqual(5, json.loads(response.text)['size'])
 
 
 
-        # Deletion should not work on protected images
+@python_2_unicode_compatible
 
-        path = self._url('/v2/images/%s' % image_id)
+class Actor(models.Model):
 
-        response = requests.delete(path, headers=self._headers())
+    name = models.CharField(max_length=50)
 
-        self.assertEqual(403, response.status_code)
+    age = models.IntegerField()
 
+    title = models.CharField(max_length=50, null=True, blank=True)
 
 
-        # Unprotect image for deletion
 
-        path = self._url('/v2/images/%s' % image_id)
+    def __str__(self):
 
-        media_type = 'application/openstack-images-v2.0-json-patch'
+        return self.name
 
-        headers = self._headers({'content-type': media_type})
 
-        data = json.dumps([{'replace': '/protected', 'value': False}])
 
-        response = requests.patch(path, headers=headers, data=data)
 
-        self.assertEqual(200, response.status_code, response.text)
 
+@python_2_unicode_compatible
 
+class Inquisition(models.Model):
 
-        # Deletion should work
+    expected = models.BooleanField(default=False)
 
-        path = self._url('/v2/images/%s' % image_id)
+    leader = models.ForeignKey(Actor)
 
-        response = requests.delete(path, headers=self._headers())
+    country = models.CharField(max_length=20)
 
-        self.assertEqual(204, response.status_code)
 
 
+    def __str__(self):
 
-        # This image should be no longer be directly accessible
+        return "by %s from %s" % (self.leader, self.country)
 
-        path = self._url('/v2/images/%s' % image_id)
 
-        response = requests.get(path, headers=self._headers())
 
-        self.assertEqual(404, response.status_code)
 
 
+@python_2_unicode_compatible
 
-        # And neither should its data
+class Sketch(models.Model):
 
-        path = self._url('/v2/images/%s/file' % image_id)
+    title = models.CharField(max_length=100)
 
-        headers = self._headers()
+    inquisition = models.ForeignKey(Inquisition, limit_choices_to={'leader__name': 'Palin',
 
-        response = requests.get(path, headers=headers)
+                                                                   'leader__age': 27,
 
-        self.assertEqual(404, response.status_code)
+                                                                   'expected': False,
 
+                                                                   })
 
+    defendant0 = models.ForeignKey(Actor, limit_choices_to={'title__isnull': False}, related_name='as_defendant0')
 
-        # Image list should now be empty
+    defendant1 = models.ForeignKey(Actor, limit_choices_to={'title__isnull': True}, related_name='as_defendant1')
 
-        path = self._url('/v2/images')
 
-        response = requests.get(path, headers=self._headers())
 
-        self.assertEqual(200, response.status_code)
+    def __str__(self):
 
-        images = json.loads(response.text)['images']
+        return self.title
 
-        self.assertEqual(0, len(images))
 
 
 
-        self.stop_servers()
 
+def today_callable_dict():
 
+    return {"last_action__gte": datetime.datetime.today()}
 
-    def test_permissions(self):
 
-        # Create an image that belongs to TENANT1
 
-        path = self._url('/v2/images')
 
-        headers = self._headers({'Content-Type': 'application/json'})
 
-        data = json.dumps({'name': 'image-1'})
+def today_callable_q():
 
-        response = requests.post(path, headers=headers, data=data)
+    return models.Q(last_action__gte=datetime.datetime.today())
 
-        self.assertEqual(201, response.status_code)
 
-        image_id = json.loads(response.text)['id']
 
 
 
-        # TENANT1 should see the image in their list
+@python_2_unicode_compatible
 
-        path = self._url('/v2/images')
+class Character(models.Model):
 
-        response = requests.get(path, headers=self._headers())
+    username = models.CharField(max_length=100)
 
-        self.assertEqual(200, response.status_code)
+    last_action = models.DateTimeField()
 
-        images = json.loads(response.text)['images']
 
-        self.assertEqual(image_id, images[0]['id'])
 
+    def __str__(self):
 
+        return self.username
 
-        # TENANT1 should be able to access the image directly
 
-        path = self._url('/v2/images/%s' % image_id)
 
-        response = requests.get(path, headers=self._headers())
 
-        self.assertEqual(200, response.status_code)
 
+@python_2_unicode_compatible
 
+class StumpJoke(models.Model):
 
-        # TENANT2 should not see the image in their list
+    variation = models.CharField(max_length=100)
 
-        path = self._url('/v2/images')
+    most_recently_fooled = models.ForeignKey(Character, limit_choices_to=today_callable_dict, related_name="+")
 
-        headers = self._headers({'X-Tenant-Id': TENANT2})
+    has_fooled_today = models.ManyToManyField(Character, limit_choices_to=today_callable_q, related_name="+")
 
-        response = requests.get(path, headers=headers)
 
-        self.assertEqual(200, response.status_code)
 
-        images = json.loads(response.text)['images']
+    def __str__(self):
 
-        self.assertEqual(0, len(images))
+        return self.variation
 
 
 
-        # TENANT2 should not be able to access the image directly
 
-        path = self._url('/v2/images/%s' % image_id)
 
-        headers = self._headers({'X-Tenant-Id': TENANT2})
+class Fabric(models.Model):
 
-        response = requests.get(path, headers=headers)
+    NG_CHOICES = (
 
-        self.assertEqual(404, response.status_code)
+        ('Textured', (
 
+            ('x', 'Horizontal'),
 
+            ('y', 'Vertical'),
 
-        # TENANT2 should not be able to modify the image, either
+        )),
 
-        path = self._url('/v2/images/%s' % image_id)
+        ('plain', 'Smooth'),
 
-        headers = self._headers({
+    )
 
-            'Content-Type': 'application/openstack-images-v2.0-json-patch',
+    surface = models.CharField(max_length=20, choices=NG_CHOICES)
 
-            'X-Tenant-Id': TENANT2,
 
-        })
 
-        data = json.dumps([{'replace': '/name', 'value': 'image-2'}])
 
-        response = requests.patch(path, headers=headers, data=data)
 
-        self.assertEqual(404, response.status_code)
+@python_2_unicode_compatible
 
+class Person(models.Model):
 
+    GENDER_CHOICES = (
 
-        # TENANT2 should not be able to delete the image, either
+        (1, "Male"),
 
-        path = self._url('/v2/images/%s' % image_id)
+        (2, "Female"),
 
-        headers = self._headers({'X-Tenant-Id': TENANT2})
+    )
 
-        response = requests.delete(path, headers=headers)
+    name = models.CharField(max_length=100)
 
-        self.assertEqual(404, response.status_code)
+    gender = models.IntegerField(choices=GENDER_CHOICES)
 
+    age = models.IntegerField(default=21)
 
+    alive = models.BooleanField(default=True)
 
-        # Publicize the image as an admin of TENANT1
 
-        path = self._url('/v2/images/%s' % image_id)
 
-        headers = self._headers({
+    def __str__(self):
 
-            'Content-Type': 'application/openstack-images-v2.0-json-patch',
+        return self.name
 
-            'X-Roles': 'admin',
 
-        })
 
-        data = json.dumps([{'replace': '/visibility', 'value': 'public'}])
 
-        response = requests.patch(path, headers=headers, data=data)
 
-        self.assertEqual(200, response.status_code)
+@python_2_unicode_compatible
 
+class Persona(models.Model):
 
+    """
 
-        # TENANT3 should now see the image in their list
+    A simple persona associated with accounts, to test inlining of related
 
-        path = self._url('/v2/images')
+    accounts which inherit from a common accounts class.
 
-        headers = self._headers({'X-Tenant-Id': TENANT3})
+    """
 
-        response = requests.get(path, headers=headers)
+    name = models.CharField(blank=False, max_length=80)
 
-        self.assertEqual(200, response.status_code)
 
-        images = json.loads(response.text)['images']
 
-        self.assertEqual(image_id, images[0]['id'])
+    def __str__(self):
 
+        return self.name
 
 
-        # TENANT3 should also be able to access the image directly
 
-        path = self._url('/v2/images/%s' % image_id)
 
-        headers = self._headers({'X-Tenant-Id': TENANT3})
 
-        response = requests.get(path, headers=headers)
+@python_2_unicode_compatible
 
-        self.assertEqual(200, response.status_code)
+class Account(models.Model):
 
+    """
 
+    A simple, generic account encapsulating the information shared by all
 
-        # TENANT3 still should not be able to modify the image
+    types of accounts.
 
-        path = self._url('/v2/images/%s' % image_id)
+    """
 
-        headers = self._headers({
+    username = models.CharField(blank=False, max_length=80)
 
-            'Content-Type': 'application/openstack-images-v2.0-json-patch',
+    persona = models.ForeignKey(Persona, related_name="accounts")
 
-            'X-Tenant-Id': TENANT3,
+    servicename = 'generic service'
 
-        })
 
-        data = json.dumps([{'replace': '/name', 'value': 'image-2'}])
 
-        response = requests.patch(path, headers=headers, data=data)
+    def __str__(self):
 
-        self.assertEqual(404, response.status_code)
+        return "%s: %s" % (self.servicename, self.username)
 
 
 
-        # TENANT3 should not be able to delete the image, either
 
-        path = self._url('/v2/images/%s' % image_id)
 
-        headers = self._headers({'X-Tenant-Id': TENANT3})
+class FooAccount(Account):
 
-        response = requests.delete(path, headers=headers)
+    """A service-specific account of type Foo."""
 
-        self.assertEqual(404, response.status_code)
+    servicename = 'foo'
 
 
 
-        self.stop_servers()
 
 
+class BarAccount(Account):
 
-    def test_tag_lifecycle(self):
+    """A service-specific account of type Bar."""
 
-        # Create an image with a tag - duplicate should be ignored
+    servicename = 'bar'
 
-        path = self._url('/v2/images')
 
-        headers = self._headers({'Content-Type': 'application/json'})
 
-        data = json.dumps({'name': 'image-1', 'tags': ['sniff', 'sniff']})
 
-        response = requests.post(path, headers=headers, data=data)
 
-        self.assertEqual(201, response.status_code)
+@python_2_unicode_compatible
 
-        image_id = json.loads(response.text)['id']
+class Subscriber(models.Model):
 
+    name = models.CharField(blank=False, max_length=80)
 
+    email = models.EmailField(blank=False, max_length=175)
 
-        # Image should show a list with a single tag
 
-        path = self._url('/v2/images/%s' % image_id)
 
-        response = requests.get(path, headers=self._headers())
+    def __str__(self):
 
-        self.assertEqual(200, response.status_code)
+        return "%s (%s)" % (self.name, self.email)
 
-        tags = json.loads(response.text)['tags']
 
-        self.assertEqual(['sniff'], tags)
 
 
 
-        # Update image with duplicate tag - it should be ignored
+class ExternalSubscriber(Subscriber):
 
-        path = self._url('/v2/images/%s' % image_id)
+    pass
 
-        media_type = 'application/openstack-images-v2.0-json-patch'
 
-        headers = self._headers({'content-type': media_type})
 
-        data = json.dumps([{'replace': '/tags',
 
-                            'value': ['sniff', 'snozz', 'snozz']}])
 
-        response = requests.patch(path, headers=headers, data=data)
+class OldSubscriber(Subscriber):
 
-        self.assertEqual(200, response.status_code)
+    pass
 
-        tags = json.loads(response.text)['tags']
 
-        self.assertEqual(['snozz', 'sniff'], tags)
 
 
 
-        # Image should show the appropriate tags
+class Media(models.Model):
 
-        path = self._url('/v2/images/%s' % image_id)
+    name = models.CharField(max_length=60)
 
-        response = requests.get(path, headers=self._headers())
 
-        self.assertEqual(200, response.status_code)
 
-        tags = json.loads(response.text)['tags']
 
-        self.assertEqual(['sniff', 'snozz'], tags)
 
+class Podcast(Media):
 
+    release_date = models.DateField()
 
-        # Attempt to tag the image with a duplicate should be ignored
 
-        path = self._url('/v2/images/%s/tags/snozz' % image_id)
 
-        response = requests.put(path, headers=self._headers())
+    class Meta:
 
-        self.assertEqual(204, response.status_code)
+        ordering = ('release_date',)  # overridden in PodcastAdmin
 
 
 
-        # Create another more complex tag
 
-        path = self._url('/v2/images/%s/tags/gabe%%40example.com' % image_id)
 
-        response = requests.put(path, headers=self._headers())
+class Vodcast(Media):
 
-        self.assertEqual(204, response.status_code)
+    media = models.OneToOneField(Media, primary_key=True, parent_link=True)
 
+    released = models.BooleanField(default=False)
 
 
-        # Double-check that the tags container on the image is populated
 
-        path = self._url('/v2/images/%s' % image_id)
 
-        response = requests.get(path, headers=self._headers())
 
-        self.assertEqual(200, response.status_code)
+class Parent(models.Model):
 
-        tags = json.loads(response.text)['tags']
+    name = models.CharField(max_length=128)
 
-        self.assertEqual(['sniff', 'snozz', 'gabe@example.com'], tags)
 
 
 
-        # The tag should be deletable
 
-        path = self._url('/v2/images/%s/tags/gabe%%40example.com' % image_id)
+class Child(models.Model):
 
-        response = requests.delete(path, headers=self._headers())
+    parent = models.ForeignKey(Parent, editable=False)
 
-        self.assertEqual(204, response.status_code)
+    name = models.CharField(max_length=30, blank=True)
 
 
 
-        # List of tags should reflect the deletion
 
-        path = self._url('/v2/images/%s' % image_id)
 
-        response = requests.get(path, headers=self._headers())
+@python_2_unicode_compatible
 
-        self.assertEqual(200, response.status_code)
+class EmptyModel(models.Model):
 
-        tags = json.loads(response.text)['tags']
+    def __str__(self):
 
-        self.assertEqual(['sniff', 'snozz'], tags)
+        return "Primary key = %s" % self.id
 
 
 
-        # Deleting the same tag should return a 404
 
-        path = self._url('/v2/images/%s/tags/gabe%%40example.com' % image_id)
 
-        response = requests.delete(path, headers=self._headers())
+temp_storage = FileSystemStorage(tempfile.mkdtemp())
 
-        self.assertEqual(404, response.status_code)
+UPLOAD_TO = os.path.join(temp_storage.location, 'test_upload')
 
 
 
-        self.stop_servers()
 
 
+class Gallery(models.Model):
 
-    def test_images_container(self):
+    name = models.CharField(max_length=100)
 
-        # Image list should be empty and no next link should be present
 
-        path = self._url('/v2/images')
 
-        response = requests.get(path, headers=self._headers())
 
-        self.assertEqual(200, response.status_code)
 
-        images = json.loads(response.text)['images']
+class Picture(models.Model):
 
-        first = json.loads(response.text)['first']
+    name = models.CharField(max_length=100)
 
-        self.assertEqual(0, len(images))
+    image = models.FileField(storage=temp_storage, upload_to='test_upload')
 
-        self.assertTrue('next' not in json.loads(response.text))
+    gallery = models.ForeignKey(Gallery, related_name="pictures")
 
-        self.assertEqual('/v2/images', first)
 
 
 
-        # Create 7 images
 
-        images = []
+class Language(models.Model):
 
-        fixtures = [
+    iso = models.CharField(max_length=5, primary_key=True)
 
-            {'name': 'image-3', 'type': 'kernel', 'ping': 'pong'},
+    name = models.CharField(max_length=50)
 
-            {'name': 'image-4', 'type': 'kernel', 'ping': 'pong'},
+    english_name = models.CharField(max_length=50)
 
-            {'name': 'image-1', 'type': 'kernel', 'ping': 'pong'},
+    shortlist = models.BooleanField(default=False)
 
-            {'name': 'image-3', 'type': 'ramdisk', 'ping': 'pong'},
 
-            {'name': 'image-2', 'type': 'kernel', 'ping': 'ding'},
 
-            {'name': 'image-3', 'type': 'kernel', 'ping': 'pong'},
+    class Meta:
 
-            {'name': 'image-2', 'type': 'kernel', 'ping': 'pong'},
+        ordering = ('iso',)
 
-        ]
 
-        path = self._url('/v2/images')
 
-        headers = self._headers({'content-type': 'application/json'})
 
-        for fixture in fixtures:
 
-            data = json.dumps(fixture)
+# a base class for Recommender and Recommendation
 
-            response = requests.post(path, headers=headers, data=data)
+class Title(models.Model):
 
-            self.assertEqual(201, response.status_code)
+    pass
 
-            images.append(json.loads(response.text))
 
 
 
-        # Image list should contain 7 images
 
-        path = self._url('/v2/images')
+class TitleTranslation(models.Model):
 
-        response = requests.get(path, headers=self._headers())
+    title = models.ForeignKey(Title)
 
-        self.assertEqual(200, response.status_code)
+    text = models.CharField(max_length=100)
 
-        body = json.loads(response.text)
 
-        self.assertEqual(7, len(body['images']))
 
-        self.assertEqual('/v2/images', body['first'])
 
-        self.assertFalse('next' in json.loads(response.text))
 
+class Recommender(Title):
 
+    pass
 
-        # Begin pagination after the first image
 
-        template_url = ('/v2/images?limit=2&sort_dir=asc&sort_key=name'
 
-                        '&marker=%s&type=kernel&ping=pong')
 
-        path = self._url(template_url % images[2]['id'])
 
-        response = requests.get(path, headers=self._headers())
+class Recommendation(Title):
 
-        self.assertEqual(200, response.status_code)
+    recommender = models.ForeignKey(Recommender)
 
-        body = json.loads(response.text)
 
-        self.assertEqual(2, len(body['images']))
 
-        response_ids = [image['id'] for image in body['images']]
 
-        self.assertEqual([images[6]['id'], images[0]['id']], response_ids)
 
+class Collector(models.Model):
 
+    name = models.CharField(max_length=100)
 
-        # Continue pagination using next link from previous request
 
-        path = self._url(body['next'])
 
-        response = requests.get(path, headers=self._headers())
 
-        self.assertEqual(200, response.status_code)
 
-        body = json.loads(response.text)
+class Widget(models.Model):
 
-        self.assertEqual(2, len(body['images']))
+    owner = models.ForeignKey(Collector)
 
-        response_ids = [image['id'] for image in body['images']]
+    name = models.CharField(max_length=100)
 
-        self.assertEqual([images[5]['id'], images[1]['id']], response_ids)
 
 
 
-        # Continue pagination - expect no results
 
-        path = self._url(body['next'])
+class DooHickey(models.Model):
 
-        response = requests.get(path, headers=self._headers())
+    code = models.CharField(max_length=10, primary_key=True)
 
-        self.assertEqual(200, response.status_code)
+    owner = models.ForeignKey(Collector)
 
-        body = json.loads(response.text)
+    name = models.CharField(max_length=100)
 
-        self.assertEqual(0, len(body['images']))
 
 
 
-        # Delete first image
 
-        path = self._url('/v2/images/%s' % images[0]['id'])
+class Grommet(models.Model):
 
-        response = requests.delete(path, headers=self._headers())
+    code = models.AutoField(primary_key=True)
 
-        self.assertEqual(204, response.status_code)
+    owner = models.ForeignKey(Collector)
 
+    name = models.CharField(max_length=100)
 
 
-        # Ensure bad request for using a deleted image as marker
 
-        path = self._url('/v2/images?marker=%s' % images[0]['id'])
 
-        response = requests.get(path, headers=self._headers())
 
-        self.assertEqual(400, response.status_code)
+class Whatsit(models.Model):
 
+    index = models.IntegerField(primary_key=True)
 
+    owner = models.ForeignKey(Collector)
 
-        self.stop_servers()
+    name = models.CharField(max_length=100)
 
 
 
 
 
-class TestImageDirectURLVisibility(functional.FunctionalTest):
+class Doodad(models.Model):
 
+    name = models.CharField(max_length=100)
 
 
-    def setUp(self):
 
-        super(TestImageDirectURLVisibility, self).setUp()
 
-        self.cleanup()
 
-        self.api_server.deployment_flavor = 'noauth'
+class FancyDoodad(Doodad):
 
+    owner = models.ForeignKey(Collector)
 
+    expensive = models.BooleanField(default=True)
 
-    def _url(self, path):
 
-        return 'http://127.0.0.1:%d%s' % (self.api_port, path)
 
 
 
-    def _headers(self, custom_headers=None):
+@python_2_unicode_compatible
 
-        base_headers = {
+class Category(models.Model):
 
-            'X-Identity-Status': 'Confirmed',
+    collector = models.ForeignKey(Collector)
 
-            'X-Auth-Token': '932c5c84-02ac-4fe5-a9ba-620af0e2bb96',
+    order = models.PositiveIntegerField()
 
-            'X-User-Id': 'f9a41d13-0c13-47e9-bee2-ce4e8bfe958e',
 
-            'X-Tenant-Id': TENANT1,
 
-            'X-Roles': 'member',
+    class Meta:
 
-        }
+        ordering = ('order',)
 
-        base_headers.update(custom_headers or {})
 
-        return base_headers
 
+    def __str__(self):
 
+        return '%s:o%s' % (self.id, self.order)
 
-    def test_v2_not_enabled(self):
 
-        self.api_server.enable_v2_api = False
 
-        self.start_servers(**self.__dict__.copy())
 
-        path = self._url('/v2/images')
 
-        response = requests.get(path, headers=self._headers())
+class Link(models.Model):
 
-        self.assertEqual(300, response.status_code)
+    posted = models.DateField(
 
-        self.stop_servers()
+        default=lambda: datetime.date.today() - datetime.timedelta(days=7)
 
+    )
 
+    url = models.URLField()
 
-    def test_v2_enabled(self):
+    post = models.ForeignKey("Post")
 
-        self.api_server.enable_v2_api = True
+    readonly_link_content = models.TextField()
 
-        self.start_servers(**self.__dict__.copy())
 
-        path = self._url('/v2/images')
 
-        response = requests.get(path, headers=self._headers())
 
-        self.assertEqual(200, response.status_code)
 
-        self.stop_servers()
+class PrePopulatedPost(models.Model):
 
+    title = models.CharField(max_length=100)
 
+    published = models.BooleanField(default=False)
 
-    def test_image_direct_url_visible(self):
+    slug = models.SlugField()
 
 
 
-        self.api_server.show_image_direct_url = True
 
-        self.start_servers(**self.__dict__.copy())
 
+class PrePopulatedSubPost(models.Model):
 
+    post = models.ForeignKey(PrePopulatedPost)
 
-        # Image list should be empty
+    subtitle = models.CharField(max_length=100)
 
-        path = self._url('/v2/images')
+    subslug = models.SlugField()
 
-        response = requests.get(path, headers=self._headers())
 
-        self.assertEqual(200, response.status_code)
 
-        images = json.loads(response.text)['images']
 
-        self.assertEqual(0, len(images))
 
+class Post(models.Model):
 
+    title = models.CharField(max_length=100, help_text="Some help text for the title (with unicode ŠĐĆŽćžšđ)")
 
-        # Create an image
+    content = models.TextField(help_text="Some help text for the content (with unicode ŠĐĆŽćžšđ)")
 
-        path = self._url('/v2/images')
+    readonly_content = models.TextField()
 
-        headers = self._headers({'content-type': 'application/json'})
+    posted = models.DateField(
 
-        data = json.dumps({'name': 'image-1', 'type': 'kernel', 'foo': 'bar'})
+        default=datetime.date.today,
 
-        response = requests.post(path, headers=headers, data=data)
+        help_text="Some help text for the date (with unicode ŠĐĆŽćžšđ)"
 
-        self.assertEqual(201, response.status_code)
+    )
 
+    public = models.NullBooleanField()
 
 
-        # Get the image id
 
-        image = json.loads(response.text)
+    def awesomeness_level(self):
 
-        image_id = image['id']
+        return "Very awesome."
 
 
 
-        # Image direct_url should not be visible before location is set
 
-        path = self._url('/v2/images/%s' % image_id)
 
-        headers = self._headers({'Content-Type': 'application/json'})
+# Proxy model to test overridden fields attrs on Post model so as not to
 
-        response = requests.get(path, headers=headers)
+# interfere with other tests.
 
-        self.assertEqual(200, response.status_code)
+class FieldOverridePost(Post):
 
-        image = json.loads(response.text)
+    class Meta:
 
-        self.assertFalse('direct_url' in image)
+        proxy = True
 
 
 
-        # Upload some image data, setting the image location
 
-        path = self._url('/v2/images/%s/file' % image_id)
 
-        headers = self._headers({'Content-Type': 'application/octet-stream'})
+@python_2_unicode_compatible
 
-        response = requests.put(path, headers=headers, data='ZZZZZ')
+class Gadget(models.Model):
 
-        self.assertEqual(201, response.status_code)
+    name = models.CharField(max_length=100)
 
 
 
-        # Image direct_url should be visible
+    def __str__(self):
 
-        path = self._url('/v2/images/%s' % image_id)
+        return self.name
 
-        headers = self._headers({'Content-Type': 'application/json'})
 
-        response = requests.get(path, headers=headers)
 
-        self.assertEqual(200, response.status_code)
 
-        image = json.loads(response.text)
 
-        self.assertTrue('direct_url' in image)
+@python_2_unicode_compatible
 
+class Villain(models.Model):
 
+    name = models.CharField(max_length=100)
 
-        # Image direct_url should be visible in a list
 
-        path = self._url('/v2/images')
 
-        headers = self._headers({'Content-Type': 'application/json'})
+    def __str__(self):
 
-        response = requests.get(path, headers=headers)
+        return self.name
 
-        self.assertEqual(200, response.status_code)
 
-        image = json.loads(response.text)['images'][0]
 
-        self.assertTrue('direct_url' in image)
 
 
+class SuperVillain(Villain):
 
-        self.stop_servers()
+    pass
 
 
 
-    def test_image_direct_url_not_visible(self):
 
 
+@python_2_unicode_compatible
 
-        self.api_server.show_image_direct_url = False
+class FunkyTag(models.Model):
 
-        self.start_servers(**self.__dict__.copy())
+    "Because we all know there's only one real use case for GFKs."
 
+    name = models.CharField(max_length=25)
 
+    content_type = models.ForeignKey(ContentType)
 
-        # Image list should be empty
+    object_id = models.PositiveIntegerField()
 
-        path = self._url('/v2/images')
+    content_object = GenericForeignKey('content_type', 'object_id')
 
-        response = requests.get(path, headers=self._headers())
 
-        self.assertEqual(200, response.status_code)
 
-        images = json.loads(response.text)['images']
+    def __str__(self):
 
-        self.assertEqual(0, len(images))
+        return self.name
 
 
 
-        # Create an image
 
-        path = self._url('/v2/images')
 
-        headers = self._headers({'content-type': 'application/json'})
+@python_2_unicode_compatible
 
-        data = json.dumps({'name': 'image-1', 'type': 'kernel', 'foo': 'bar'})
+class Plot(models.Model):
 
-        response = requests.post(path, headers=headers, data=data)
+    name = models.CharField(max_length=100)
 
-        self.assertEqual(201, response.status_code)
+    team_leader = models.ForeignKey(Villain, related_name='lead_plots')
 
+    contact = models.ForeignKey(Villain, related_name='contact_plots')
 
+    tags = GenericRelation(FunkyTag)
 
-        # Get the image id
 
-        image = json.loads(response.text)
 
-        image_id = image['id']
+    def __str__(self):
 
+        return self.name
 
 
-        # Upload some image data, setting the image location
 
-        path = self._url('/v2/images/%s/file' % image_id)
 
-        headers = self._headers({'Content-Type': 'application/octet-stream'})
 
-        response = requests.put(path, headers=headers, data='ZZZZZ')
+@python_2_unicode_compatible
 
-        self.assertEqual(201, response.status_code)
+class PlotDetails(models.Model):
 
+    details = models.CharField(max_length=100)
 
+    plot = models.OneToOneField(Plot, null=True, blank=True)
 
-        # Image direct_url should not be visible
 
-        path = self._url('/v2/images/%s' % image_id)
 
-        headers = self._headers({'Content-Type': 'application/json'})
+    def __str__(self):
 
-        response = requests.get(path, headers=headers)
+        return self.details
 
-        self.assertEqual(200, response.status_code)
 
-        image = json.loads(response.text)
 
-        self.assertFalse('direct_url' in image)
 
 
+class PlotProxy(Plot):
 
-        # Image direct_url should not be visible in a list
+    class Meta:
 
-        path = self._url('/v2/images')
+        proxy = True
 
-        headers = self._headers({'Content-Type': 'application/json'})
 
-        response = requests.get(path, headers=headers)
 
-        self.assertEqual(200, response.status_code)
 
-        image = json.loads(response.text)['images'][0]
 
-        self.assertFalse('direct_url' in image)
+@python_2_unicode_compatible
 
+class SecretHideout(models.Model):
 
+    """ Secret! Not registered with the admin! """
 
-        self.stop_servers()
+    location = models.CharField(max_length=100)
+
+    villain = models.ForeignKey(Villain)
+
+
+
+    def __str__(self):
+
+        return self.location
+
+
+
+
+
+@python_2_unicode_compatible
+
+class SuperSecretHideout(models.Model):
+
+    """ Secret! Not registered with the admin! """
+
+    location = models.CharField(max_length=100)
+
+    supervillain = models.ForeignKey(SuperVillain)
+
+
+
+    def __str__(self):
+
+        return self.location
+
+
+
+
+
+@python_2_unicode_compatible
+
+class CyclicOne(models.Model):
+
+    name = models.CharField(max_length=25)
+
+    two = models.ForeignKey('CyclicTwo')
+
+
+
+    def __str__(self):
+
+        return self.name
+
+
+
+
+
+@python_2_unicode_compatible
+
+class CyclicTwo(models.Model):
+
+    name = models.CharField(max_length=25)
+
+    one = models.ForeignKey(CyclicOne)
+
+
+
+    def __str__(self):
+
+        return self.name
+
+
+
+
+
+class Topping(models.Model):
+
+    name = models.CharField(max_length=20)
+
+
+
+
+
+class Pizza(models.Model):
+
+    name = models.CharField(max_length=20)
+
+    toppings = models.ManyToManyField('Topping', related_name='pizzas')
+
+
+
+
+
+class Album(models.Model):
+
+    owner = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL)
+
+    title = models.CharField(max_length=30)
+
+
+
+
+
+class Employee(Person):
+
+    code = models.CharField(max_length=20)
+
+
+
+
+
+class WorkHour(models.Model):
+
+    datum = models.DateField()
+
+    employee = models.ForeignKey(Employee)
+
+
+
+
+
+class Question(models.Model):
+
+    question = models.CharField(max_length=20)
+
+
+
+
+
+@python_2_unicode_compatible
+
+class Answer(models.Model):
+
+    question = models.ForeignKey(Question, on_delete=models.PROTECT)
+
+    answer = models.CharField(max_length=20)
+
+
+
+    def __str__(self):
+
+        return self.answer
+
+
+
+
+
+class Reservation(models.Model):
+
+    start_date = models.DateTimeField()
+
+    price = models.IntegerField()
+
+
+
+
+
+DRIVER_CHOICES = (
+
+    ('bill', 'Bill G'),
+
+    ('steve', 'Steve J'),
+
+)
+
+
+
+RESTAURANT_CHOICES = (
+
+    ('indian', 'A Taste of India'),
+
+    ('thai', 'Thai Pography'),
+
+    ('pizza', 'Pizza Mama'),
+
+)
+
+
+
+
+
+class FoodDelivery(models.Model):
+
+    reference = models.CharField(max_length=100)
+
+    driver = models.CharField(max_length=100, choices=DRIVER_CHOICES, blank=True)
+
+    restaurant = models.CharField(max_length=100, choices=RESTAURANT_CHOICES, blank=True)
+
+
+
+    class Meta:
+
+        unique_together = (("driver", "restaurant"),)
+
+
+
+
+
+@python_2_unicode_compatible
+
+class CoverLetter(models.Model):
+
+    author = models.CharField(max_length=30)
+
+    date_written = models.DateField(null=True, blank=True)
+
+
+
+    def __str__(self):
+
+        return self.author
+
+
+
+
+
+class Paper(models.Model):
+
+    title = models.CharField(max_length=30)
+
+    author = models.CharField(max_length=30, blank=True, null=True)
+
+
+
+
+
+class ShortMessage(models.Model):
+
+    content = models.CharField(max_length=140)
+
+    timestamp = models.DateTimeField(null=True, blank=True)
+
+
+
+
+
+@python_2_unicode_compatible
+
+class Telegram(models.Model):
+
+    title = models.CharField(max_length=30)
+
+    date_sent = models.DateField(null=True, blank=True)
+
+
+
+    def __str__(self):
+
+        return self.title
+
+
+
+
+
+class Story(models.Model):
+
+    title = models.CharField(max_length=100)
+
+    content = models.TextField()
+
+
+
+
+
+class OtherStory(models.Model):
+
+    title = models.CharField(max_length=100)
+
+    content = models.TextField()
+
+
+
+
+
+class ComplexSortedPerson(models.Model):
+
+    name = models.CharField(max_length=100)
+
+    age = models.PositiveIntegerField()
+
+    is_employee = models.NullBooleanField()
+
+
+
+
+
+class PluggableSearchPerson(models.Model):
+
+    name = models.CharField(max_length=100)
+
+    age = models.PositiveIntegerField()
+
+
+
+
+
+class PrePopulatedPostLargeSlug(models.Model):
+
+    """
+
+    Regression test for #15938: a large max_length for the slugfield must not
+
+    be localized in prepopulated_fields_js.html or it might end up breaking
+
+    the javascript (ie, using THOUSAND_SEPARATOR ends up with maxLength=1,000)
+
+    """
+
+    title = models.CharField(max_length=100)
+
+    published = models.BooleanField(default=False)
+
+    # `db_index=False` because MySQL cannot index large CharField (#21196).
+
+    slug = models.SlugField(max_length=1000, db_index=False)
+
+
+
+
+
+class AdminOrderedField(models.Model):
+
+    order = models.IntegerField()
+
+    stuff = models.CharField(max_length=200)
+
+
+
+
+
+class AdminOrderedModelMethod(models.Model):
+
+    order = models.IntegerField()
+
+    stuff = models.CharField(max_length=200)
+
+
+
+    def some_order(self):
+
+        return self.order
+
+    some_order.admin_order_field = 'order'
+
+
+
+
+
+class AdminOrderedAdminMethod(models.Model):
+
+    order = models.IntegerField()
+
+    stuff = models.CharField(max_length=200)
+
+
+
+
+
+class AdminOrderedCallable(models.Model):
+
+    order = models.IntegerField()
+
+    stuff = models.CharField(max_length=200)
+
+
+
+
+
+@python_2_unicode_compatible
+
+class Report(models.Model):
+
+    title = models.CharField(max_length=100)
+
+
+
+    def __str__(self):
+
+        return self.title
+
+
+
+
+
+class MainPrepopulated(models.Model):
+
+    name = models.CharField(max_length=100)
+
+    pubdate = models.DateField()
+
+    status = models.CharField(
+
+        max_length=20,
+
+        choices=(('option one', 'Option One'),
+
+                 ('option two', 'Option Two')))
+
+    slug1 = models.SlugField(blank=True)
+
+    slug2 = models.SlugField(blank=True)
+
+
+
+
+
+class RelatedPrepopulated(models.Model):
+
+    parent = models.ForeignKey(MainPrepopulated)
+
+    name = models.CharField(max_length=75)
+
+    pubdate = models.DateField()
+
+    status = models.CharField(
+
+        max_length=20,
+
+        choices=(('option one', 'Option One'),
+
+                 ('option two', 'Option Two')))
+
+    slug1 = models.SlugField(max_length=50)
+
+    slug2 = models.SlugField(max_length=60)
+
+
+
+
+
+class UnorderedObject(models.Model):
+
+    """
+
+    Model without any defined `Meta.ordering`.
+
+    Refs #16819.
+
+    """
+
+    name = models.CharField(max_length=255)
+
+    bool = models.BooleanField(default=True)
+
+
+
+
+
+class UndeletableObject(models.Model):
+
+    """
+
+    Model whose show_delete in admin change_view has been disabled
+
+    Refs #10057.
+
+    """
+
+    name = models.CharField(max_length=255)
+
+
+
+
+
+class UnchangeableObject(models.Model):
+
+    """
+
+    Model whose change_view is disabled in admin
+
+    Refs #20640.
+
+    """
+
+
+
+
+
+class UserMessenger(models.Model):
+
+    """
+
+    Dummy class for testing message_user functions on ModelAdmin
+
+    """
+
+
+
+
+
+class Simple(models.Model):
+
+    """
+
+    Simple model with nothing on it for use in testing
+
+    """
+
+
+
+
+
+class Choice(models.Model):
+
+    choice = models.IntegerField(blank=True, null=True,
+
+        choices=((1, 'Yes'), (0, 'No'), (None, 'No opinion')))
+
+
+
+
+
+class ParentWithDependentChildren(models.Model):
+
+    """
+
+    Issue #20522
+
+    Model where the validation of child foreign-key relationships depends
+
+    on validation of the parent
+
+    """
+
+    some_required_info = models.PositiveIntegerField()
+
+    family_name = models.CharField(max_length=255, blank=False)
+
+
+
+
+
+class DependentChild(models.Model):
+
+    """
+
+    Issue #20522
+
+    Model that depends on validation of the parent class for one of its
+
+    fields to validate during clean
+
+    """
+
+    parent = models.ForeignKey(ParentWithDependentChildren)
+
+    family_name = models.CharField(max_length=255)
+
+
+
+
+
+class _Manager(models.Manager):
+
+    def get_queryset(self):
+
+        return super(_Manager, self).get_queryset().filter(pk__gt=1)
+
+
+
+
+
+class FilteredManager(models.Model):
+
+    def __str__(self):
+
+        return "PK=%d" % self.pk
+
+
+
+    pk_gt_1 = _Manager()
+
+    objects = models.Manager()
+
+
+
+
+
+class EmptyModelVisible(models.Model):
+
+    """ See ticket #11277. """
+
+
+
+
+
+class EmptyModelHidden(models.Model):
+
+    """ See ticket #11277. """
+
+
+
+
+
+class EmptyModelMixin(models.Model):
+
+    """ See ticket #11277. """
+
+
+
+
+
+class State(models.Model):
+
+    name = models.CharField(max_length=100)
+
+
+
+
+
+class City(models.Model):
+
+    state = models.ForeignKey(State)
+
+    name = models.CharField(max_length=100)
+
+
+
+    def get_absolute_url(self):
+
+        return '/dummy/%s/' % self.pk
+
+
+
+
+
+class Restaurant(models.Model):
+
+    city = models.ForeignKey(City)
+
+    name = models.CharField(max_length=100)
+
+
+
+    def get_absolute_url(self):
+
+        return '/dummy/%s/' % self.pk
+
+
+
+
+
+class Worker(models.Model):
+
+    work_at = models.ForeignKey(Restaurant)
+
+    name = models.CharField(max_length=50)
+
+    surname = models.CharField(max_length=50)
+
+
+
+
+
+# Models for #23329
+
+class ReferencedByParent(models.Model):
+
+    name = models.CharField(max_length=20, unique=True)
+
+
+
+
+
+class ParentWithFK(models.Model):
+
+    fk = models.ForeignKey(
+
+        ReferencedByParent, to_field='name', related_name='hidden+',
+
+    )
+
+
+
+
+
+class ChildOfReferer(ParentWithFK):
+
+    pass
+
+
+
+
+
+# Models for #23431
+
+class ReferencedByInline(models.Model):
+
+    name = models.CharField(max_length=20, unique=True)
+
+
+
+
+
+class InlineReference(models.Model):
+
+    fk = models.ForeignKey(
+
+        ReferencedByInline, to_field='name', related_name='hidden+',
+
+    )
+
+
+
+
+
+class InlineReferer(models.Model):
+
+    refs = models.ManyToManyField(InlineReference)
+
+
+
+
+
+# Models for #23604 and #23915
+
+class Recipe(models.Model):
+
+    rname = models.CharField(max_length=20, unique=True)
+
+
+
+
+
+class Ingredient(models.Model):
+
+    iname = models.CharField(max_length=20, unique=True)
+
+    recipes = models.ManyToManyField(Recipe, through='RecipeIngredient')
+
+
+
+
+
+class RecipeIngredient(models.Model):
+
+    ingredient = models.ForeignKey(Ingredient, to_field='iname')
+
+    recipe = models.ForeignKey(Recipe, to_field='rname')
+
+
+
+
+
+# Model for #23839
+
+class NotReferenced(models.Model):
+
+    # Don't point any FK at this model.
+
+    pass
+
+
+
+
+
+# Models for #23934
+
+class ExplicitlyProvidedPK(models.Model):
+
+    name = models.IntegerField(primary_key=True)
+
+
+
+
+
+class ImplicitlyGeneratedPK(models.Model):
+
+    name = models.IntegerField(unique=True)
+
+
+
+
+
+# Models for #25622
+
+class ReferencedByGenRel(models.Model):
+
+    content_type = models.ForeignKey(ContentType, on_delete=models.CASCADE)
+
+    object_id = models.PositiveIntegerField()
+
+    content_object = GenericForeignKey('content_type', 'object_id')
+
+
+
+
+
+class GenRelReference(models.Model):
+
+    references = GenericRelation(ReferencedByGenRel)
+
+
+
+
+
+class ParentWithUUIDPK(models.Model):
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    title = models.CharField(max_length=100)
+
+
+
+    def __str__(self):
+
+        return str(self.id)
+
+
+
+
+
+class RelatedWithUUIDPKModel(models.Model):
+
+    parent = models.ForeignKey(ParentWithUUIDPK, on_delete=models.CASCADE)

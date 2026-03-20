@@ -2,2006 +2,850 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-from __future__ import unicode_literals
+
+
+#    Copyright 2010 United States Government as represented by the
+
+#    Administrator of the National Aeronautics and Space Administration.
+
+#    All Rights Reserved.
+
+#    Copyright (c) 2010 Citrix Systems, Inc.
+
+#    Copyright (c) 2011 Piston Cloud Computing, Inc
+
+#    Copyright (c) 2011 OpenStack LLC
+
+#
+
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+
+#    not use this file except in compliance with the License. You may obtain
+
+#    a copy of the License at
+
+#
+
+#         http://www.apache.org/licenses/LICENSE-2.0
+
+#
+
+#    Unless required by applicable law or agreed to in writing, software
+
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+
+#    License for the specific language governing permissions and limitations
+
+#    under the License.
 
 
 
 import os
 
-import tempfile
+import time
 
 
 
-from django import forms
+from lxml import etree
 
-from django.conf.urls import url
 
-from django.contrib import admin
 
-from django.contrib.admin import BooleanFieldListFilter
+from nova import exception
 
-from django.contrib.admin.views.main import ChangeList
+from nova.openstack.common import cfg
 
-from django.contrib.auth.admin import GroupAdmin, UserAdmin
+from nova.openstack.common import log as logging
 
-# Register core models we need in our tests
+from nova import utils
 
-from django.contrib.auth.models import Group, User
+from nova.virt import images
 
-from django.core.exceptions import ValidationError
 
-from django.core.files.storage import FileSystemStorage
 
-from django.core.mail import EmailMessage
+CONF = cfg.CONF
 
-from django.core.servers.basehttp import FileWrapper
+LOG = logging.getLogger(__name__)
 
-from django.forms.models import BaseModelFormSet
 
-from django.http import HttpResponse, StreamingHttpResponse
 
-from django.utils.safestring import mark_safe
 
-from django.utils.six import StringIO
 
+def execute(*args, **kwargs):
 
+    return utils.execute(*args, **kwargs)
 
-from .models import (
 
-    Actor, AdminOrderedAdminMethod, AdminOrderedCallable, AdminOrderedField,
 
-    AdminOrderedModelMethod, Album, Answer, Article, BarAccount, Book,
 
-    Category, Chapter, ChapterXtra1, Child, ChildOfReferer, Choice, City,
 
-    Collector, Color, Color2, ComplexSortedPerson, CoverLetter, CustomArticle,
+def get_iscsi_initiator():
 
-    CyclicOne, CyclicTwo, DependentChild, DooHickey, EmptyModel,
+    """Get iscsi initiator name for this machine"""
 
-    EmptyModelHidden, EmptyModelMixin, EmptyModelVisible, ExplicitlyProvidedPK,
+    # NOTE(vish) openiscsi stores initiator name in a file that
 
-    ExternalSubscriber, Fabric, FancyDoodad, FieldOverridePost,
+    #            needs root permission to read.
 
-    FilteredManager, FooAccount, FoodDelivery, FunkyTag, Gadget, Gallery,
+    contents = utils.read_file_as_root('/etc/iscsi/initiatorname.iscsi')
 
-    GenRelReference, Grommet, ImplicitlyGeneratedPK, Ingredient,
+    for l in contents.split('\n'):
 
-    InlineReference, InlineReferer, Inquisition, Language, Link,
+        if l.startswith('InitiatorName='):
 
-    MainPrepopulated, ModelWithStringPrimaryKey, NotReferenced, OldSubscriber,
+            return l[l.index('=') + 1:].strip()
 
-    OtherStory, Paper, Parent, ParentWithDependentChildren, ParentWithUUIDPK,
 
-    Person, Persona, Picture, Pizza, Plot, PlotDetails, PlotProxy,
 
-    PluggableSearchPerson, Podcast, Post, PrePopulatedPost,
 
-    PrePopulatedPostLargeSlug, PrePopulatedSubPost, Promo, Question, Recipe,
 
-    Recommendation, Recommender, ReferencedByGenRel, ReferencedByInline,
+def create_image(disk_format, path, size):
 
-    ReferencedByParent, RelatedPrepopulated, RelatedWithUUIDPKModel, Report,
+    """Create a disk image
 
-    Reservation, Restaurant, RowLevelChangePermissionModel, Section,
 
-    ShortMessage, Simple, Sketch, State, Story, StumpJoke, Subscriber,
 
-    SuperVillain, Telegram, Thing, Topping, UnchangeableObject,
+    :param disk_format: Disk image format (as known by qemu-img)
 
-    UndeletableObject, UnorderedObject, UserMessenger, Villain, Vodcast,
+    :param path: Desired location of the disk image
 
-    Whatsit, Widget, Worker, WorkHour,
+    :param size: Desired size of disk image. May be given as an int or
 
-)
+                 a string. If given as an int, it will be interpreted
 
+                 as bytes. If it's a string, it should consist of a number
 
+                 with an optional suffix ('K' for Kibibytes,
 
+                 M for Mebibytes, 'G' for Gibibytes, 'T' for Tebibytes).
 
-
-def callable_year(dt_value):
-
-    try:
-
-        return dt_value.year
-
-    except AttributeError:
-
-        return None
-
-callable_year.admin_order_field = 'date'
-
-
-
-
-
-class ArticleInline(admin.TabularInline):
-
-    model = Article
-
-    fk_name = 'section'
-
-    prepopulated_fields = {
-
-        'title': ('content',)
-
-    }
-
-    fieldsets = (
-
-        ('Some fields', {
-
-            'classes': ('collapse',),
-
-            'fields': ('title', 'content')
-
-        }),
-
-        ('Some other fields', {
-
-            'classes': ('wide',),
-
-            'fields': ('date', 'section')
-
-        })
-
-    )
-
-
-
-
-
-class ChapterInline(admin.TabularInline):
-
-    model = Chapter
-
-
-
-
-
-class ChapterXtra1Admin(admin.ModelAdmin):
-
-    list_filter = ('chap',
-
-                   'chap__title',
-
-                   'chap__book',
-
-                   'chap__book__name',
-
-                   'chap__book__promo',
-
-                   'chap__book__promo__name',)
-
-
-
-
-
-class ArticleAdmin(admin.ModelAdmin):
-
-    list_display = ('content', 'date', callable_year, 'model_year',
-
-                    'modeladmin_year', 'model_year_reversed')
-
-    list_filter = ('date', 'section')
-
-    view_on_site = False
-
-    fieldsets = (
-
-        ('Some fields', {
-
-            'classes': ('collapse',),
-
-            'fields': ('title', 'content')
-
-        }),
-
-        ('Some other fields', {
-
-            'classes': ('wide',),
-
-            'fields': ('date', 'section', 'sub_section')
-
-        })
-
-    )
-
-
-
-    def changelist_view(self, request):
-
-        "Test that extra_context works"
-
-        return super(ArticleAdmin, self).changelist_view(
-
-            request, extra_context={
-
-                'extra_var': 'Hello!'
-
-            }
-
-        )
-
-
-
-    def modeladmin_year(self, obj):
-
-        return obj.date.year
-
-    modeladmin_year.admin_order_field = 'date'
-
-    modeladmin_year.short_description = None
-
-
-
-    def delete_model(self, request, obj):
-
-        EmailMessage(
-
-            'Greetings from a deleted object',
-
-            'I hereby inform you that some user deleted me',
-
-            'from@example.com',
-
-            ['to@example.com']
-
-        ).send()
-
-        return super(ArticleAdmin, self).delete_model(request, obj)
-
-
-
-    def save_model(self, request, obj, form, change=True):
-
-        EmailMessage(
-
-            'Greetings from a created object',
-
-            'I hereby inform you that some user created me',
-
-            'from@example.com',
-
-            ['to@example.com']
-
-        ).send()
-
-        return super(ArticleAdmin, self).save_model(request, obj, form, change)
-
-
-
-
-
-class ArticleAdmin2(admin.ModelAdmin):
-
-
-
-    def has_module_permission(self, request):
-
-        return False
-
-
-
-
-
-class RowLevelChangePermissionModelAdmin(admin.ModelAdmin):
-
-    def has_change_permission(self, request, obj=None):
-
-        """ Only allow changing objects with even id number """
-
-        return request.user.is_staff and (obj is not None) and (obj.id % 2 == 0)
-
-
-
-
-
-class CustomArticleAdmin(admin.ModelAdmin):
+                 If no suffix is given, it will be interpreted as bytes.
 
     """
 
-    Tests various hooks for using custom templates and contexts.
+    execute('qemu-img', 'create', '-f', disk_format, path, size)
+
+
+
+
+
+def create_cow_image(backing_file, path):
+
+    """Create COW image
+
+
+
+    Creates a COW image with the given backing file
+
+
+
+    :param backing_file: Existing image on which to base the COW image
+
+    :param path: Desired location of the COW image
 
     """
 
-    change_list_template = 'custom_admin/change_list.html'
+    base_cmd = ['qemu-img', 'create', '-f', 'qcow2']
 
-    change_form_template = 'custom_admin/change_form.html'
+    cow_opts = []
 
-    add_form_template = 'custom_admin/add_form.html'
+    if backing_file:
 
-    object_history_template = 'custom_admin/object_history.html'
+        cow_opts += ['backing_file=%s' % backing_file]
 
-    delete_confirmation_template = 'custom_admin/delete_confirmation.html'
+        base_details = images.qemu_img_info(backing_file)
 
-    delete_selected_confirmation_template = 'custom_admin/delete_selected_confirmation.html'
+    else:
 
+        base_details = None
 
+    # This doesn't seem to get inherited so force it to...
 
-    def changelist_view(self, request):
+    # http://paste.ubuntu.com/1213295/
 
-        "Test that extra_context works"
+    # TODO(harlowja) probably file a bug against qemu-img/qemu
 
-        return super(CustomArticleAdmin, self).changelist_view(
+    if base_details and base_details.cluster_size is not None:
 
-            request, extra_context={
+        cow_opts += ['cluster_size=%s' % base_details.cluster_size]
 
-                'extra_var': 'Hello!'
+    # For now don't inherit this due the following discussion...
 
-            }
+    # See: http://www.gossamer-threads.com/lists/openstack/dev/10592
 
-        )
+    # if 'preallocation' in base_details:
 
+    #     cow_opts += ['preallocation=%s' % base_details['preallocation']]
 
+    if base_details and base_details.encryption:
 
+        cow_opts += ['encryption=%s' % base_details.encryption]
 
+    if cow_opts:
 
-class ThingAdmin(admin.ModelAdmin):
+        # Format as a comma separated list
 
-    list_filter = ('color__warm', 'color__value', 'pub_date',)
+        csv_opts = ",".join(cow_opts)
 
+        cow_opts = ['-o', csv_opts]
 
+    cmd = base_cmd + cow_opts + [path]
 
+    execute(*cmd)
 
 
-class InquisitionAdmin(admin.ModelAdmin):
 
-    list_display = ('leader', 'country', 'expected', 'sketch')
 
 
+def create_lvm_image(vg, lv, size, sparse=False):
 
-    def sketch(self, obj):
+    """Create LVM image.
 
-        # A method with the same name as a reverse accessor.
 
-        return 'list-display-sketch'
 
+    Creates a LVM image with given size.
 
 
 
+    :param vg: existing volume group which should hold this image
 
-class SketchAdmin(admin.ModelAdmin):
+    :param lv: name for this image (logical volume)
 
-    raw_id_fields = ('inquisition', 'defendant0', 'defendant1')
+    :size: size of image in bytes
 
+    :sparse: create sparse logical volume
 
+    """
 
+    free_space = volume_group_free_space(vg)
 
 
-class FabricAdmin(admin.ModelAdmin):
 
-    list_display = ('surface',)
+    def check_size(size):
 
-    list_filter = ('surface',)
+        if size > free_space:
 
+            raise RuntimeError(_('Insufficient Space on Volume Group %(vg)s.'
 
+                                 ' Only %(free_space)db available,'
 
+                                 ' but %(size)db required'
 
+                                 ' by volume %(lv)s.') % locals())
 
-class BasePersonModelFormSet(BaseModelFormSet):
 
-    def clean(self):
 
-        for person_dict in self.cleaned_data:
+    if sparse:
 
-            person = person_dict.get('id')
+        preallocated_space = 64 * 1024 * 1024
 
-            alive = person_dict.get('alive')
+        check_size(preallocated_space)
 
-            if person and alive and person.name == "Grace Hopper":
+        if free_space < size:
 
-                raise forms.ValidationError("Grace is not a Zombie")
+            LOG.warning(_('Volume group %(vg)s will not be able'
 
+                          ' to hold sparse volume %(lv)s.'
 
+                          ' Virtual volume size is %(size)db,'
 
+                          ' but free space on volume group is'
 
+                          ' only %(free_space)db.') % locals())
 
-class PersonAdmin(admin.ModelAdmin):
 
-    list_display = ('name', 'gender', 'alive')
 
-    list_editable = ('gender', 'alive')
+        cmd = ('lvcreate', '-L', '%db' % preallocated_space,
 
-    list_filter = ('gender',)
+                '--virtualsize', '%db' % size, '-n', lv, vg)
 
-    search_fields = ('^name',)
+    else:
 
-    save_as = True
+        check_size(size)
 
+        cmd = ('lvcreate', '-L', '%db' % size, '-n', lv, vg)
 
+    execute(*cmd, run_as_root=True, attempts=3)
 
-    def get_changelist_formset(self, request, **kwargs):
 
-        return super(PersonAdmin, self).get_changelist_formset(request,
 
-            formset=BasePersonModelFormSet, **kwargs)
 
 
+def volume_group_free_space(vg):
 
-    def get_queryset(self, request):
+    """Return available space on volume group in bytes.
 
-        # Order by a field that isn't in list display, to be able to test
 
-        # whether ordering is preserved.
 
-        return super(PersonAdmin, self).get_queryset(request).order_by('age')
+    :param vg: volume group name
 
+    """
 
+    out, err = execute('vgs', '--noheadings', '--nosuffix',
 
+                       '--units', 'b', '-o', 'vg_free', vg,
 
+                       run_as_root=True)
 
-class FooAccountAdmin(admin.StackedInline):
+    return int(out.strip())
 
-    model = FooAccount
 
-    extra = 1
 
 
 
+def list_logical_volumes(vg):
 
+    """List logical volumes paths for given volume group.
 
-class BarAccountAdmin(admin.StackedInline):
 
-    model = BarAccount
 
-    extra = 1
+    :param vg: volume group name
 
+    """
 
+    out, err = execute('lvs', '--noheadings', '-o', 'lv_name', vg,
 
+                       run_as_root=True)
 
 
-class PersonaAdmin(admin.ModelAdmin):
 
-    inlines = (
+    return [line.strip() for line in out.splitlines()]
 
-        FooAccountAdmin,
 
-        BarAccountAdmin
 
-    )
 
 
+def logical_volume_info(path):
 
+    """Get logical volume info.
 
 
-class SubscriberAdmin(admin.ModelAdmin):
 
-    actions = ['mail_admin']
+    :param path: logical volume path
 
+    """
 
+    out, err = execute('lvs', '-o', 'vg_all,lv_all',
 
-    def mail_admin(self, request, selected):
+                       '--separator', '|', path, run_as_root=True)
 
-        EmailMessage(
 
-            'Greetings from a ModelAdmin action',
 
-            'This is the test email from an admin action',
+    info = [line.split('|') for line in out.splitlines()]
 
-            'from@example.com',
 
-            ['to@example.com']
 
-        ).send()
+    if len(info) != 2:
 
+        raise RuntimeError(_("Path %s must be LVM logical volume") % path)
 
 
 
+    return dict(zip(*info))
 
-def external_mail(modeladmin, request, selected):
 
-    EmailMessage(
 
-        'Greetings from a function action',
 
-        'This is the test email from a function action',
 
-        'from@example.com',
+def remove_logical_volumes(*paths):
 
-        ['to@example.com']
+    """Remove one or more logical volume."""
 
-    ).send()
+    if paths:
 
-external_mail.short_description = 'External mail (Another awesome action)'
+        lvremove = ('lvremove', '-f') + paths
 
+        execute(*lvremove, attempts=3, run_as_root=True)
 
 
 
 
-def redirect_to(modeladmin, request, selected):
 
-    from django.http import HttpResponseRedirect
+def pick_disk_driver_name(is_block_dev=False):
 
-    return HttpResponseRedirect('/some-where-else/')
+    """Pick the libvirt primary backend driver name
 
-redirect_to.short_description = 'Redirect to (Awesome action)'
 
 
+    If the hypervisor supports multiple backend drivers, then the name
 
+    attribute selects the primary backend driver name, while the optional
 
+    type attribute provides the sub-type.  For example, xen supports a name
 
-def download(modeladmin, request, selected):
+    of "tap", "tap2", "phy", or "file", with a type of "aio" or "qcow2",
 
-    buf = StringIO('This is the content of the file')
+    while qemu only supports a name of "qemu", but multiple types including
 
-    return StreamingHttpResponse(FileWrapper(buf))
+    "raw", "bochs", "qcow2", and "qed".
 
-download.short_description = 'Download subscription'
 
 
+    :param is_block_dev:
 
+    :returns: driver_name or None
 
+    """
 
-def no_perm(modeladmin, request, selected):
+    if CONF.libvirt_type == "xen":
 
-    return HttpResponse(content='No permission to perform this action',
+        if is_block_dev:
 
-                        status=403)
-
-no_perm.short_description = 'No permission to run'
-
-
-
-
-
-class ExternalSubscriberAdmin(admin.ModelAdmin):
-
-    actions = [redirect_to, external_mail, download, no_perm]
-
-
-
-
-
-class PodcastAdmin(admin.ModelAdmin):
-
-    list_display = ('name', 'release_date')
-
-    list_editable = ('release_date',)
-
-    date_hierarchy = 'release_date'
-
-    ordering = ('name',)
-
-
-
-
-
-class VodcastAdmin(admin.ModelAdmin):
-
-    list_display = ('name', 'released')
-
-    list_editable = ('released',)
-
-
-
-    ordering = ('name',)
-
-
-
-
-
-class ChildInline(admin.StackedInline):
-
-    model = Child
-
-
-
-
-
-class ParentAdmin(admin.ModelAdmin):
-
-    model = Parent
-
-    inlines = [ChildInline]
-
-
-
-    list_editable = ('name',)
-
-
-
-    def save_related(self, request, form, formsets, change):
-
-        super(ParentAdmin, self).save_related(request, form, formsets, change)
-
-        first_name, last_name = form.instance.name.split()
-
-        for child in form.instance.child_set.all():
-
-            if len(child.name.split()) < 2:
-
-                child.name = child.name + ' ' + last_name
-
-                child.save()
-
-
-
-
-
-class EmptyModelAdmin(admin.ModelAdmin):
-
-    def get_queryset(self, request):
-
-        return super(EmptyModelAdmin, self).get_queryset(request).filter(pk__gt=1)
-
-
-
-
-
-class OldSubscriberAdmin(admin.ModelAdmin):
-
-    actions = None
-
-
-
-
-
-temp_storage = FileSystemStorage(tempfile.mkdtemp())
-
-UPLOAD_TO = os.path.join(temp_storage.location, 'test_upload')
-
-
-
-
-
-class PictureInline(admin.TabularInline):
-
-    model = Picture
-
-    extra = 1
-
-
-
-
-
-class GalleryAdmin(admin.ModelAdmin):
-
-    inlines = [PictureInline]
-
-
-
-
-
-class PictureAdmin(admin.ModelAdmin):
-
-    pass
-
-
-
-
-
-class LanguageAdmin(admin.ModelAdmin):
-
-    list_display = ['iso', 'shortlist', 'english_name', 'name']
-
-    list_editable = ['shortlist']
-
-
-
-
-
-class RecommendationAdmin(admin.ModelAdmin):
-
-    show_full_result_count = False
-
-    search_fields = ('=titletranslation__text', '=recommender__titletranslation__text',)
-
-
-
-
-
-class WidgetInline(admin.StackedInline):
-
-    model = Widget
-
-
-
-
-
-class DooHickeyInline(admin.StackedInline):
-
-    model = DooHickey
-
-
-
-
-
-class GrommetInline(admin.StackedInline):
-
-    model = Grommet
-
-
-
-
-
-class WhatsitInline(admin.StackedInline):
-
-    model = Whatsit
-
-
-
-
-
-class FancyDoodadInline(admin.StackedInline):
-
-    model = FancyDoodad
-
-
-
-
-
-class CategoryAdmin(admin.ModelAdmin):
-
-    list_display = ('id', 'collector', 'order')
-
-    list_editable = ('order',)
-
-
-
-
-
-class CategoryInline(admin.StackedInline):
-
-    model = Category
-
-
-
-
-
-class CollectorAdmin(admin.ModelAdmin):
-
-    inlines = [
-
-        WidgetInline, DooHickeyInline, GrommetInline, WhatsitInline,
-
-        FancyDoodadInline, CategoryInline
-
-    ]
-
-
-
-
-
-class LinkInline(admin.TabularInline):
-
-    model = Link
-
-    extra = 1
-
-
-
-    readonly_fields = ("posted", "multiline", "readonly_link_content")
-
-
-
-    def multiline(self, instance):
-
-        return "InlineMultiline\ntest\nstring"
-
-
-
-
-
-class SubPostInline(admin.TabularInline):
-
-    model = PrePopulatedSubPost
-
-
-
-    prepopulated_fields = {
-
-        'subslug': ('subtitle',)
-
-    }
-
-
-
-    def get_readonly_fields(self, request, obj=None):
-
-        if obj and obj.published:
-
-            return ('subslug',)
-
-        return self.readonly_fields
-
-
-
-    def get_prepopulated_fields(self, request, obj=None):
-
-        if obj and obj.published:
-
-            return {}
-
-        return self.prepopulated_fields
-
-
-
-
-
-class PrePopulatedPostAdmin(admin.ModelAdmin):
-
-    list_display = ['title', 'slug']
-
-    prepopulated_fields = {
-
-        'slug': ('title',)
-
-    }
-
-
-
-    inlines = [SubPostInline]
-
-
-
-    def get_readonly_fields(self, request, obj=None):
-
-        if obj and obj.published:
-
-            return ('slug',)
-
-        return self.readonly_fields
-
-
-
-    def get_prepopulated_fields(self, request, obj=None):
-
-        if obj and obj.published:
-
-            return {}
-
-        return self.prepopulated_fields
-
-
-
-
-
-class PostAdmin(admin.ModelAdmin):
-
-    list_display = ['title', 'public']
-
-    readonly_fields = (
-
-        'posted', 'awesomeness_level', 'coolness', 'value',
-
-        'multiline', 'multiline_html', lambda obj: "foo", 'readonly_content',
-
-    )
-
-
-
-    inlines = [
-
-        LinkInline
-
-    ]
-
-
-
-    def coolness(self, instance):
-
-        if instance.pk:
-
-            return "%d amount of cool." % instance.pk
+            return "phy"
 
         else:
 
-            return "Unknown coolness."
+            return "tap"
 
+    elif CONF.libvirt_type in ('kvm', 'qemu'):
 
+        return "qemu"
 
-    def value(self, instance):
+    else:
 
-        return 1000
+        # UML doesn't want a driver_name set
 
+        return None
 
 
-    def multiline(self, instance):
 
-        return "Multiline\ntest\nstring"
 
 
+def get_disk_size(path):
 
-    def multiline_html(self, instance):
+    """Get the (virtual) size of a disk image
 
-        return mark_safe("Multiline<br>\nhtml<br>\ncontent")
 
-    multiline_html.allow_tags = True
 
+    :param path: Path to the disk image
 
+    :returns: Size (in bytes) of the given disk image as it would be seen
 
-    value.short_description = 'Value in $US'
-
-
-
-
-
-class FieldOverridePostForm(forms.ModelForm):
-
-    model = FieldOverridePost
-
-
-
-    class Meta:
-
-        help_texts = {
-
-            'posted': 'Overridden help text for the date',
-
-        }
-
-        labels = {
-
-            'public': 'Overridden public label',
-
-        }
-
-
-
-
-
-class FieldOverridePostAdmin(PostAdmin):
-
-    form = FieldOverridePostForm
-
-
-
-
-
-class CustomChangeList(ChangeList):
-
-    def get_queryset(self, request):
-
-        return self.root_queryset.filter(pk=9999)  # Does not exist
-
-
-
-
-
-class GadgetAdmin(admin.ModelAdmin):
-
-    def get_changelist(self, request, **kwargs):
-
-        return CustomChangeList
-
-
-
-
-
-class ToppingAdmin(admin.ModelAdmin):
-
-    readonly_fields = ('pizzas',)
-
-
-
-
-
-class PizzaAdmin(admin.ModelAdmin):
-
-    readonly_fields = ('toppings',)
-
-
-
-
-
-class WorkHourAdmin(admin.ModelAdmin):
-
-    list_display = ('datum', 'employee')
-
-    list_filter = ('employee',)
-
-
-
-
-
-class FoodDeliveryAdmin(admin.ModelAdmin):
-
-    list_display = ('reference', 'driver', 'restaurant')
-
-    list_editable = ('driver', 'restaurant')
-
-
-
-
-
-class CoverLetterAdmin(admin.ModelAdmin):
+              by a virtual machine.
 
     """
 
-    A ModelAdmin with a custom get_queryset() method that uses defer(), to test
+    size = images.qemu_img_info(path).virtual_size
 
-    verbose_name display in messages shown after adding/editing CoverLetter
+    return int(size)
 
-    instances.
 
-    Note that the CoverLetter model defines a __unicode__ method.
 
-    For testing fix for ticket #14529.
+
+
+def get_disk_backing_file(path):
+
+    """Get the backing file of a disk image
+
+
+
+    :param path: Path to the disk image
+
+    :returns: a path to the image's backing store
+
+    """
+
+    backing_file = images.qemu_img_info(path).backing_file
+
+    if backing_file:
+
+        backing_file = os.path.basename(backing_file)
+
+
+
+    return backing_file
+
+
+
+
+
+def copy_image(src, dest, host=None):
+
+    """Copy a disk image to an existing directory
+
+
+
+    :param src: Source image
+
+    :param dest: Destination path
+
+    :param host: Remote host
 
     """
 
 
 
-    def get_queryset(self, request):
+    if not host:
 
-        return super(CoverLetterAdmin, self).get_queryset(request).defer('date_written')
+        # We shell out to cp because that will intelligently copy
 
+        # sparse files.  I.E. holes will not be written to DEST,
 
+        # rather recreated efficiently.  In addition, since
 
+        # coreutils 8.11, holes can be read efficiently too.
 
+        execute('cp', src, dest)
 
-class PaperAdmin(admin.ModelAdmin):
+    else:
 
-    """
+        dest = "%s:%s" % (host, dest)
 
-    A ModelAdmin with a custom get_queryset() method that uses only(), to test
+        # Try rsync first as that can compress and create sparse dest files.
 
-    verbose_name display in messages shown after adding/editing Paper
+        # Note however that rsync currently doesn't read sparse files
 
-    instances.
+        # efficiently: https://bugzilla.samba.org/show_bug.cgi?id=8918
 
-    For testing fix for ticket #14529.
-
-    """
-
-
-
-    def get_queryset(self, request):
-
-        return super(PaperAdmin, self).get_queryset(request).only('title')
-
-
-
-
-
-class ShortMessageAdmin(admin.ModelAdmin):
-
-    """
-
-    A ModelAdmin with a custom get_queryset() method that uses defer(), to test
-
-    verbose_name display in messages shown after adding/editing ShortMessage
-
-    instances.
-
-    For testing fix for ticket #14529.
-
-    """
-
-
-
-    def get_queryset(self, request):
-
-        return super(ShortMessageAdmin, self).get_queryset(request).defer('timestamp')
-
-
-
-
-
-class TelegramAdmin(admin.ModelAdmin):
-
-    """
-
-    A ModelAdmin with a custom get_queryset() method that uses only(), to test
-
-    verbose_name display in messages shown after adding/editing Telegram
-
-    instances.
-
-    Note that the Telegram model defines a __unicode__ method.
-
-    For testing fix for ticket #14529.
-
-    """
-
-
-
-    def get_queryset(self, request):
-
-        return super(TelegramAdmin, self).get_queryset(request).only('title')
-
-
-
-
-
-class StoryForm(forms.ModelForm):
-
-    class Meta:
-
-        widgets = {'title': forms.HiddenInput}
-
-
-
-
-
-class StoryAdmin(admin.ModelAdmin):
-
-    list_display = ('id', 'title', 'content')
-
-    list_display_links = ('title',)  # 'id' not in list_display_links
-
-    list_editable = ('content', )
-
-    form = StoryForm
-
-    ordering = ["-pk"]
-
-
-
-
-
-class OtherStoryAdmin(admin.ModelAdmin):
-
-    list_display = ('id', 'title', 'content')
-
-    list_display_links = ('title', 'id')  # 'id' in list_display_links
-
-    list_editable = ('content', )
-
-    ordering = ["-pk"]
-
-
-
-
-
-class ComplexSortedPersonAdmin(admin.ModelAdmin):
-
-    list_display = ('name', 'age', 'is_employee', 'colored_name')
-
-    ordering = ('name',)
-
-
-
-    def colored_name(self, obj):
-
-        return '<span style="color: #%s;">%s</span>' % ('ff00ff', obj.name)
-
-    colored_name.allow_tags = True
-
-    colored_name.admin_order_field = 'name'
-
-
-
-
-
-class PluggableSearchPersonAdmin(admin.ModelAdmin):
-
-    list_display = ('name', 'age')
-
-    search_fields = ('name',)
-
-
-
-    def get_search_results(self, request, queryset, search_term):
-
-        queryset, use_distinct = super(PluggableSearchPersonAdmin, self).get_search_results(request, queryset, search_term)
+        # At least network traffic is mitigated with compression.
 
         try:
 
-            search_term_as_int = int(search_term)
+            # Do a relatively light weight test first, so that we
 
-            queryset |= self.model.objects.filter(age=search_term_as_int)
+            # can fall back to scp, without having run out of space
 
-        except:
+            # on the destination for example.
 
-            pass
+            execute('rsync', '--sparse', '--compress', '--dry-run', src, dest)
 
-        return queryset, use_distinct
+        except exception.ProcessExecutionError:
 
+            execute('scp', src, dest)
 
+        else:
 
+            execute('rsync', '--sparse', '--compress', src, dest)
 
 
-class AlbumAdmin(admin.ModelAdmin):
 
-    list_filter = ['title']
 
 
+def write_to_file(path, contents, umask=None):
 
+    """Write the given contents to a file
 
 
-class PrePopulatedPostLargeSlugAdmin(admin.ModelAdmin):
 
-    prepopulated_fields = {
+    :param path: Destination file
 
-        'slug': ('title',)
+    :param contents: Desired contents of the file
 
-    }
-
-
-
-
-
-class AdminOrderedFieldAdmin(admin.ModelAdmin):
-
-    ordering = ('order',)
-
-    list_display = ('stuff', 'order')
-
-
-
-
-
-class AdminOrderedModelMethodAdmin(admin.ModelAdmin):
-
-    ordering = ('order',)
-
-    list_display = ('stuff', 'some_order')
-
-
-
-
-
-class AdminOrderedAdminMethodAdmin(admin.ModelAdmin):
-
-    def some_admin_order(self, obj):
-
-        return obj.order
-
-    some_admin_order.admin_order_field = 'order'
-
-    ordering = ('order',)
-
-    list_display = ('stuff', 'some_admin_order')
-
-
-
-
-
-def admin_ordered_callable(obj):
-
-    return obj.order
-
-admin_ordered_callable.admin_order_field = 'order'
-
-
-
-
-
-class AdminOrderedCallableAdmin(admin.ModelAdmin):
-
-    ordering = ('order',)
-
-    list_display = ('stuff', admin_ordered_callable)
-
-
-
-
-
-class ReportAdmin(admin.ModelAdmin):
-
-    def extra(self, request):
-
-        return HttpResponse()
-
-
-
-    def get_urls(self):
-
-        # Corner case: Don't call parent implementation
-
-        return [
-
-            url(r'^extra/$',
-
-                self.extra,
-
-                name='cable_extra'),
-
-        ]
-
-
-
-
-
-class CustomTemplateBooleanFieldListFilter(BooleanFieldListFilter):
-
-    template = 'custom_filter_template.html'
-
-
-
-
-
-class CustomTemplateFilterColorAdmin(admin.ModelAdmin):
-
-    list_filter = (('warm', CustomTemplateBooleanFieldListFilter),)
-
-
-
-
-
-# For Selenium Prepopulated tests -------------------------------------
-
-class RelatedPrepopulatedInline1(admin.StackedInline):
-
-    fieldsets = (
-
-        (None, {
-
-            'fields': (('pubdate', 'status'), ('name', 'slug1', 'slug2',),)
-
-        }),
-
-    )
-
-    model = RelatedPrepopulated
-
-    extra = 1
-
-    prepopulated_fields = {'slug1': ['name', 'pubdate'],
-
-                           'slug2': ['status', 'name']}
-
-
-
-
-
-class RelatedPrepopulatedInline2(admin.TabularInline):
-
-    model = RelatedPrepopulated
-
-    extra = 1
-
-    prepopulated_fields = {'slug1': ['name', 'pubdate'],
-
-                           'slug2': ['status', 'name']}
-
-
-
-
-
-class MainPrepopulatedAdmin(admin.ModelAdmin):
-
-    inlines = [RelatedPrepopulatedInline1, RelatedPrepopulatedInline2]
-
-    fieldsets = (
-
-        (None, {
-
-            'fields': (('pubdate', 'status'), ('name', 'slug1', 'slug2',),)
-
-        }),
-
-    )
-
-    prepopulated_fields = {'slug1': ['name', 'pubdate'],
-
-                           'slug2': ['status', 'name']}
-
-
-
-
-
-class UnorderedObjectAdmin(admin.ModelAdmin):
-
-    list_display = ['name']
-
-    list_editable = ['name']
-
-    list_per_page = 2
-
-
-
-
-
-class UndeletableObjectAdmin(admin.ModelAdmin):
-
-    def change_view(self, *args, **kwargs):
-
-        kwargs['extra_context'] = {'show_delete': False}
-
-        return super(UndeletableObjectAdmin, self).change_view(*args, **kwargs)
-
-
-
-
-
-class UnchangeableObjectAdmin(admin.ModelAdmin):
-
-    def get_urls(self):
-
-        # Disable change_view, but leave other urls untouched
-
-        urlpatterns = super(UnchangeableObjectAdmin, self).get_urls()
-
-        return [p for p in urlpatterns if not p.name.endswith("_change")]
-
-
-
-
-
-def callable_on_unknown(obj):
-
-    return obj.unknown
-
-
-
-
-
-class AttributeErrorRaisingAdmin(admin.ModelAdmin):
-
-    list_display = [callable_on_unknown, ]
-
-
-
-
-
-class CustomManagerAdmin(admin.ModelAdmin):
-
-    def get_queryset(self, request):
-
-        return FilteredManager.objects
-
-
-
-
-
-class MessageTestingAdmin(admin.ModelAdmin):
-
-    actions = ["message_debug", "message_info", "message_success",
-
-               "message_warning", "message_error", "message_extra_tags"]
-
-
-
-    def message_debug(self, request, selected):
-
-        self.message_user(request, "Test debug", level="debug")
-
-
-
-    def message_info(self, request, selected):
-
-        self.message_user(request, "Test info", level="info")
-
-
-
-    def message_success(self, request, selected):
-
-        self.message_user(request, "Test success", level="success")
-
-
-
-    def message_warning(self, request, selected):
-
-        self.message_user(request, "Test warning", level="warning")
-
-
-
-    def message_error(self, request, selected):
-
-        self.message_user(request, "Test error", level="error")
-
-
-
-    def message_extra_tags(self, request, selected):
-
-        self.message_user(request, "Test tags", extra_tags="extra_tag")
-
-
-
-
-
-class ChoiceList(admin.ModelAdmin):
-
-    list_display = ['choice']
-
-    readonly_fields = ['choice']
-
-    fields = ['choice']
-
-
-
-
-
-class DependentChildAdminForm(forms.ModelForm):
+    :param umask: Umask to set when creating this file (will be reset)
 
     """
 
-    Issue #20522
+    if umask:
 
-    Form to test child dependency on parent object's validation
+        saved_umask = os.umask(umask)
+
+
+
+    try:
+
+        with open(path, 'w') as f:
+
+            f.write(contents)
+
+    finally:
+
+        if umask:
+
+            os.umask(saved_umask)
+
+
+
+
+
+def chown(path, owner):
+
+    """Change ownership of file or directory
+
+
+
+    :param path: File or directory whose ownership to change
+
+    :param owner: Desired new owner (given as uid or username)
 
     """
 
-    def clean(self):
+    execute('chown', owner, path, run_as_root=True)
 
-        parent = self.cleaned_data.get('parent')
 
-        if parent.family_name and parent.family_name != self.cleaned_data.get('family_name'):
 
-            raise ValidationError("Children must share a family name with their parents " +
 
-                                  "in this contrived test case")
 
-        return super(DependentChildAdminForm, self).clean()
+def create_snapshot(disk_path, snapshot_name):
 
+    """Create a snapshot in a disk image
 
 
 
+    :param disk_path: Path to disk image
 
-class DependentChildInline(admin.TabularInline):
+    :param snapshot_name: Name of snapshot in disk image
 
-    model = DependentChild
+    """
 
-    form = DependentChildAdminForm
+    qemu_img_cmd = ('qemu-img',
 
+                    'snapshot',
 
+                    '-c',
 
+                    snapshot_name,
 
+                    disk_path)
 
-class ParentWithDependentChildrenAdmin(admin.ModelAdmin):
+    # NOTE(vish): libvirt changes ownership of images
 
-    inlines = [DependentChildInline]
+    execute(*qemu_img_cmd, run_as_root=True)
 
 
 
 
 
-# Tests for ticket 11277 ----------------------------------
+def delete_snapshot(disk_path, snapshot_name):
 
+    """Create a snapshot in a disk image
 
 
-class FormWithoutHiddenField(forms.ModelForm):
 
-    first = forms.CharField()
+    :param disk_path: Path to disk image
 
-    second = forms.CharField()
+    :param snapshot_name: Name of snapshot in disk image
 
+    """
 
+    qemu_img_cmd = ('qemu-img',
 
+                    'snapshot',
 
+                    '-d',
 
-class FormWithoutVisibleField(forms.ModelForm):
+                    snapshot_name,
 
-    first = forms.CharField(widget=forms.HiddenInput)
+                    disk_path)
 
-    second = forms.CharField(widget=forms.HiddenInput)
+    # NOTE(vish): libvirt changes ownership of images
 
+    execute(*qemu_img_cmd, run_as_root=True)
 
 
 
 
-class FormWithVisibleAndHiddenField(forms.ModelForm):
 
-    first = forms.CharField(widget=forms.HiddenInput)
+def extract_snapshot(disk_path, source_fmt, snapshot_name, out_path, dest_fmt):
 
-    second = forms.CharField()
+    """Extract a named snapshot from a disk image
 
 
 
+    :param disk_path: Path to disk image
 
+    :param snapshot_name: Name of snapshot in disk image
 
-class EmptyModelVisibleAdmin(admin.ModelAdmin):
+    :param out_path: Desired path of extracted snapshot
 
-    form = FormWithoutHiddenField
+    """
 
-    fieldsets = (
+    # NOTE(markmc): ISO is just raw to qemu-img
 
-        (None, {
+    if dest_fmt == 'iso':
 
-            'fields': (('first', 'second'),),
+        dest_fmt = 'raw'
 
-        }),
+    qemu_img_cmd = ('qemu-img',
 
-    )
+                    'convert',
 
+                    '-f',
 
+                    source_fmt,
 
+                    '-O',
 
+                    dest_fmt,
 
-class EmptyModelHiddenAdmin(admin.ModelAdmin):
+                    '-s',
 
-    form = FormWithoutVisibleField
+                    snapshot_name,
 
-    fieldsets = EmptyModelVisibleAdmin.fieldsets
+                    disk_path,
 
+                    out_path)
 
+    execute(*qemu_img_cmd)
 
 
 
-class EmptyModelMixinAdmin(admin.ModelAdmin):
 
-    form = FormWithVisibleAndHiddenField
 
-    fieldsets = EmptyModelVisibleAdmin.fieldsets
+def load_file(path):
 
+    """Read contents of file
 
 
 
+    :param path: File to read
 
-class CityInlineAdmin(admin.TabularInline):
+    """
 
-    model = City
+    with open(path, 'r') as fp:
 
-    view_on_site = False
+        return fp.read()
 
 
 
 
 
-class StateAdmin(admin.ModelAdmin):
+def file_open(*args, **kwargs):
 
-    inlines = [CityInlineAdmin]
+    """Open file
 
 
 
+    see built-in file() documentation for more details
 
 
-class RestaurantInlineAdmin(admin.TabularInline):
 
-    model = Restaurant
+    Note: The reason this is kept in a separate module is to easily
 
-    view_on_site = True
+          be able to provide a stub module that doesn't alter system
 
+          state at all (for unit tests)
 
+    """
 
+    return file(*args, **kwargs)
 
 
-class CityAdmin(admin.ModelAdmin):
 
-    inlines = [RestaurantInlineAdmin]
 
-    view_on_site = True
 
+def file_delete(path):
 
+    """Delete (unlink) file
 
 
 
-class WorkerAdmin(admin.ModelAdmin):
+    Note: The reason this is kept in a separate module is to easily
 
-    def view_on_site(self, obj):
+          be able to provide a stub module that doesn't alter system
 
-        return '/worker/%s/%s/' % (obj.surname, obj.name)
+          state at all (for unit tests)
 
+    """
 
+    return os.unlink(path)
 
 
 
-class WorkerInlineAdmin(admin.TabularInline):
 
-    model = Worker
 
+def find_disk(virt_dom):
 
+    """Find root device path for instance
 
-    def view_on_site(self, obj):
 
-        return '/worker_inline/%s/%s/' % (obj.surname, obj.name)
 
+    May be file or device"""
 
+    xml_desc = virt_dom.XMLDesc(0)
 
+    domain = etree.fromstring(xml_desc)
 
+    if CONF.libvirt_type == 'lxc':
 
-class RestaurantAdmin(admin.ModelAdmin):
+        source = domain.find('devices/filesystem/source')
 
-    inlines = [WorkerInlineAdmin]
+        disk_path = source.get('dir')
 
-    view_on_site = False
+        disk_path = disk_path[0:disk_path.rfind('rootfs')]
 
+        disk_path = os.path.join(disk_path, 'disk')
 
+    else:
 
-    def get_changeform_initial_data(self, request):
+        source = domain.find('devices/disk/source')
 
-        return {'name': 'overridden_value'}
+        disk_path = source.get('file') or source.get('dev')
 
 
 
+    if not disk_path:
 
+        raise RuntimeError(_("Can't retrieve root device path "
 
-class FunkyTagAdmin(admin.ModelAdmin):
+                             "from instance libvirt configuration"))
 
-    list_display = ('name', 'content_object')
 
 
+    return disk_path
 
 
 
-class InlineReferenceInline(admin.TabularInline):
 
-    model = InlineReference
 
+def get_disk_type(path):
 
+    """Retrieve disk type (raw, qcow2, lvm) for given file"""
 
+    if path.startswith('/dev'):
 
+        return 'lvm'
 
-class InlineRefererAdmin(admin.ModelAdmin):
 
-    inlines = [InlineReferenceInline]
 
+    return images.qemu_img_info(path).file_format
 
 
 
 
-class PlotReadonlyAdmin(admin.ModelAdmin):
 
-    readonly_fields = ('plotdetails',)
+def get_fs_info(path):
 
+    """Get free/used/total space info for a filesystem
 
 
 
+    :param path: Any dirent on the filesystem
 
-class GetFormsetsArgumentCheckingAdmin(admin.ModelAdmin):
+    :returns: A dict containing:
 
-    fields = ['name']
 
 
+             :free: How much space is free (in bytes)
 
-    def add_view(self, request, *args, **kwargs):
+             :used: How much space is used (in bytes)
 
-        request.is_add_view = True
+             :total: How big the filesystem is (in bytes)
 
-        return super(GetFormsetsArgumentCheckingAdmin, self).add_view(request, *args, **kwargs)
+    """
 
+    hddinfo = os.statvfs(path)
 
+    total = hddinfo.f_frsize * hddinfo.f_blocks
 
-    def change_view(self, request, *args, **kwargs):
+    free = hddinfo.f_frsize * hddinfo.f_bavail
 
-        request.is_add_view = False
+    used = hddinfo.f_frsize * (hddinfo.f_blocks - hddinfo.f_bfree)
 
-        return super(GetFormsetsArgumentCheckingAdmin, self).change_view(request, *args, **kwargs)
+    return {'total': total,
 
+            'free': free,
 
+            'used': used}
 
-    def get_formsets_with_inlines(self, request, obj=None):
 
-        if request.is_add_view and obj is not None:
 
-            raise Exception("'obj' passed to get_formsets_with_inlines wasn't None during add_view")
 
-        if not request.is_add_view and obj is None:
 
-            raise Exception("'obj' passed to get_formsets_with_inlines was None during change_view")
+def fetch_image(context, target, image_id, user_id, project_id):
 
-        return super(GetFormsetsArgumentCheckingAdmin, self).get_formsets_with_inlines(request, obj)
+    """Grab image"""
 
-
-
-
-
-site = admin.AdminSite(name="admin")
-
-site.site_url = '/my-site-url/'
-
-site.register(Article, ArticleAdmin)
-
-site.register(CustomArticle, CustomArticleAdmin)
-
-site.register(Section, save_as=True, inlines=[ArticleInline], readonly_fields=['name_property'])
-
-site.register(ModelWithStringPrimaryKey)
-
-site.register(Color)
-
-site.register(Thing, ThingAdmin)
-
-site.register(Actor)
-
-site.register(Inquisition, InquisitionAdmin)
-
-site.register(Sketch, SketchAdmin)
-
-site.register(Person, PersonAdmin)
-
-site.register(Persona, PersonaAdmin)
-
-site.register(Subscriber, SubscriberAdmin)
-
-site.register(ExternalSubscriber, ExternalSubscriberAdmin)
-
-site.register(OldSubscriber, OldSubscriberAdmin)
-
-site.register(Podcast, PodcastAdmin)
-
-site.register(Vodcast, VodcastAdmin)
-
-site.register(Parent, ParentAdmin)
-
-site.register(EmptyModel, EmptyModelAdmin)
-
-site.register(Fabric, FabricAdmin)
-
-site.register(Gallery, GalleryAdmin)
-
-site.register(Picture, PictureAdmin)
-
-site.register(Language, LanguageAdmin)
-
-site.register(Recommendation, RecommendationAdmin)
-
-site.register(Recommender)
-
-site.register(Collector, CollectorAdmin)
-
-site.register(Category, CategoryAdmin)
-
-site.register(Post, PostAdmin)
-
-site.register(FieldOverridePost, FieldOverridePostAdmin)
-
-site.register(Gadget, GadgetAdmin)
-
-site.register(Villain)
-
-site.register(SuperVillain)
-
-site.register(Plot)
-
-site.register(PlotDetails)
-
-site.register(PlotProxy, PlotReadonlyAdmin)
-
-site.register(CyclicOne)
-
-site.register(CyclicTwo)
-
-site.register(WorkHour, WorkHourAdmin)
-
-site.register(Reservation)
-
-site.register(FoodDelivery, FoodDeliveryAdmin)
-
-site.register(RowLevelChangePermissionModel, RowLevelChangePermissionModelAdmin)
-
-site.register(Paper, PaperAdmin)
-
-site.register(CoverLetter, CoverLetterAdmin)
-
-site.register(ShortMessage, ShortMessageAdmin)
-
-site.register(Telegram, TelegramAdmin)
-
-site.register(Story, StoryAdmin)
-
-site.register(OtherStory, OtherStoryAdmin)
-
-site.register(Report, ReportAdmin)
-
-site.register(MainPrepopulated, MainPrepopulatedAdmin)
-
-site.register(UnorderedObject, UnorderedObjectAdmin)
-
-site.register(UndeletableObject, UndeletableObjectAdmin)
-
-site.register(UnchangeableObject, UnchangeableObjectAdmin)
-
-site.register(State, StateAdmin)
-
-site.register(City, CityAdmin)
-
-site.register(Restaurant, RestaurantAdmin)
-
-site.register(Worker, WorkerAdmin)
-
-site.register(FunkyTag, FunkyTagAdmin)
-
-site.register(ReferencedByParent)
-
-site.register(ChildOfReferer)
-
-site.register(ReferencedByInline)
-
-site.register(InlineReferer, InlineRefererAdmin)
-
-site.register(ReferencedByGenRel)
-
-site.register(GenRelReference)
-
-
-
-# We intentionally register Promo and ChapterXtra1 but not Chapter nor ChapterXtra2.
-
-# That way we cover all four cases:
-
-#     related ForeignKey object registered in admin
-
-#     related ForeignKey object not registered in admin
-
-#     related OneToOne object registered in admin
-
-#     related OneToOne object not registered in admin
-
-# when deleting Book so as exercise all four troublesome (w.r.t escaping
-
-# and calling force_text to avoid problems on Python 2.3) paths through
-
-# contrib.admin.utils's get_deleted_objects function.
-
-site.register(Book, inlines=[ChapterInline])
-
-site.register(Promo)
-
-site.register(ChapterXtra1, ChapterXtra1Admin)
-
-site.register(Pizza, PizzaAdmin)
-
-site.register(Topping, ToppingAdmin)
-
-site.register(Album, AlbumAdmin)
-
-site.register(Question)
-
-site.register(Answer)
-
-site.register(PrePopulatedPost, PrePopulatedPostAdmin)
-
-site.register(ComplexSortedPerson, ComplexSortedPersonAdmin)
-
-site.register(FilteredManager, CustomManagerAdmin)
-
-site.register(PluggableSearchPerson, PluggableSearchPersonAdmin)
-
-site.register(PrePopulatedPostLargeSlug, PrePopulatedPostLargeSlugAdmin)
-
-site.register(AdminOrderedField, AdminOrderedFieldAdmin)
-
-site.register(AdminOrderedModelMethod, AdminOrderedModelMethodAdmin)
-
-site.register(AdminOrderedAdminMethod, AdminOrderedAdminMethodAdmin)
-
-site.register(AdminOrderedCallable, AdminOrderedCallableAdmin)
-
-site.register(Color2, CustomTemplateFilterColorAdmin)
-
-site.register(Simple, AttributeErrorRaisingAdmin)
-
-site.register(UserMessenger, MessageTestingAdmin)
-
-site.register(Choice, ChoiceList)
-
-site.register(ParentWithDependentChildren, ParentWithDependentChildrenAdmin)
-
-site.register(EmptyModelHidden, EmptyModelHiddenAdmin)
-
-site.register(EmptyModelVisible, EmptyModelVisibleAdmin)
-
-site.register(EmptyModelMixin, EmptyModelMixinAdmin)
-
-site.register(StumpJoke)
-
-site.register(Recipe)
-
-site.register(Ingredient)
-
-site.register(NotReferenced)
-
-site.register(ExplicitlyProvidedPK, GetFormsetsArgumentCheckingAdmin)
-
-site.register(ImplicitlyGeneratedPK, GetFormsetsArgumentCheckingAdmin)
-
-
-
-site.register(User, UserAdmin)
-
-site.register(Group, GroupAdmin)
-
-
-
-# Used to test URL namespaces
-
-site2 = admin.AdminSite(name="namespaced_admin")
-
-site2.register(User, UserAdmin)
-
-site2.register(Group, GroupAdmin)
-
-site2.register(ParentWithUUIDPK)
-
-site2.register(
-
-    RelatedWithUUIDPKModel,
-
-    list_display=['pk', 'parent'],
-
-    list_editable=['parent'],
-
-    raw_id_fields=['parent'],
-
-)
-
-
-
-site7 = admin.AdminSite(name="admin7")
-
-site7.register(Article, ArticleAdmin2)
+    images.fetch_to_raw(context, image_id, target, user_id, project_id)

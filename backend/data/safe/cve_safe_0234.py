@@ -1,27 +1,21 @@
 # Source: CVEFixes dataset
-# Safety: safe
+# Safety: vulnerable
 # Category: safe
 
-import pytest
-
-from jinja2 import Environment, PackageLoader
+from django.apps import AppConfig
 
 
 
 
 
-@pytest.fixture(scope="session")
+class AnymailBaseConfig(AppConfig):
 
-def env() -> Environment:
+    name = 'anymail'
 
-    from openapi_python_client import utils
+    verbose_name = "Anymail"
 
 
 
-    TEMPLATE_FILTERS = {"snakecase": utils.snake_case, "kebabcase": utils.kebab_case}
+    def ready(self):
 
-    env = Environment(loader=PackageLoader("openapi_python_client"), trim_blocks=True, lstrip_blocks=True)
-
-    env.filters.update(TEMPLATE_FILTERS)
-
-    return env
+        pass

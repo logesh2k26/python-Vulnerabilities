@@ -2,188 +2,686 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# tests.environ_tests
-
-# Tests the environment configuration ability
-
-#
-
-# Author:   Benjamin Bengfort <benjamin@bengfort.com>
-
-# Created:  Mon Jul 21 11:17:23 2014 -0400
-
-#
-
-# Copyright (C) 2014 Bengfort.com
-
-# For license information, see LICENSE.txt
-
-#
-
-# ID: environ_tests.py [] benjamin@bengfort.com $
+"""Tornado handlers for the contents web service."""
 
 
 
-"""
+# Copyright (c) IPython Development Team.
 
-Tests the environment configuration ability
-
-"""
+# Distributed under the terms of the Modified BSD License.
 
 
 
-##########################################################################
-
-## Imports
-
-##########################################################################
+import json
 
 
 
-import os
-
-import pytest
+from tornado import gen, web
 
 
 
-from confire import environ_setting
+from IPython.html.utils import url_path_join, url_escape
 
-from confire.exceptions import ImproperlyConfigured, ConfigurationMissing
+from IPython.utils.jsonutil import date_default
+
+
+
+from IPython.html.base.handlers import (
+
+    IPythonHandler, APIHandler, json_errors, path_regex,
+
+)
 
 
 
 
 
-##########################################################################
+def sort_key(model):
 
-## Fixtures
+    """key function for case-insensitive sort by name and type"""
 
-##########################################################################
+    iname = model['name'].lower()
 
+    type_key = {
 
+        'directory' : '0',
 
-ENVKEY = 'TEST_SETTING'
+        'notebook'  : '1',
 
-ENVVAL = '42'
+        'file'      : '2',
 
+    }.get(model['type'], '9')
 
-
-@pytest.fixture(scope='function')
-
-def environ():
-
-    os.environ[ENVKEY] = ENVVAL
-
-    yield
-
-    os.environ.pop(ENVKEY)
-
-    assert ENVKEY not in os.environ
+    return u'%s%s' % (type_key, iname)
 
 
 
 
 
-##########################################################################
+def validate_model(model, expect_content):
 
-## Test case
+    """
 
-##########################################################################
-
-
-
-class TestEnviron(object):
+    Validate a model returned by a ContentsManager method.
 
 
 
-    def test_environ_setting(self, environ):
+    If expect_content is True, then we expect non-null entries for 'content'
+
+    and 'format'.
+
+    """
+
+    required_keys = {
+
+        "name",
+
+        "path",
+
+        "type",
+
+        "writable",
+
+        "created",
+
+        "last_modified",
+
+        "mimetype",
+
+        "content",
+
+        "format",
+
+    }
+
+    missing = required_keys - set(model.keys())
+
+    if missing:
+
+        raise web.HTTPError(
+
+            500,
+
+            u"Missing Model Keys: {missing}".format(missing=missing),
+
+        )
+
+
+
+    maybe_none_keys = ['content', 'format']
+
+    if model['type'] == 'file':
+
+        # mimetype should be populated only for file models
+
+        maybe_none_keys.append('mimetype')
+
+    if expect_content:
+
+        errors = [key for key in maybe_none_keys if model[key] is None]
+
+        if errors:
+
+            raise web.HTTPError(
+
+                500,
+
+                u"Keys unexpectedly None: {keys}".format(keys=errors),
+
+            )
+
+    else:
+
+        errors = {
+
+            key: model[key]
+
+            for key in maybe_none_keys
+
+            if model[key] is not None
+
+        }
+
+        if errors:
+
+            raise web.HTTPError(
+
+                500,
+
+                u"Keys unexpectedly not None: {keys}".format(keys=errors),
+
+            )
+
+
+
+
+
+class ContentsHandler(APIHandler):
+
+
+
+    SUPPORTED_METHODS = (u'GET', u'PUT', u'PATCH', u'POST', u'DELETE')
+
+
+
+    def location_url(self, path):
+
+        """Return the full URL location of a file.
+
+
+
+        Parameters
+
+        ----------
+
+        path : unicode
+
+            The API path of the file, such as "foo/bar.txt".
 
         """
 
-        Test settings can be grabbed from environment
+        return url_escape(url_path_join(
+
+            self.base_url, 'api', 'contents', path
+
+        ))
+
+
+
+    def _finish_model(self, model, location=True):
+
+        """Finish a JSON request with a model, setting relevant headers, etc."""
+
+        if location:
+
+            location = self.location_url(model['path'])
+
+            self.set_header('Location', location)
+
+        self.set_header('Last-Modified', model['last_modified'])
+
+        self.set_header('Content-Type', 'application/json')
+
+        self.finish(json.dumps(model, default=date_default))
+
+
+
+    @web.authenticated
+
+    @json_errors
+
+    @gen.coroutine
+
+    def get(self, path=''):
+
+        """Return a model for a file or directory.
+
+
+
+        A directory model contains a list of models (without content)
+
+        of the files and directories it contains.
 
         """
 
-        assert ENVVAL == environ_setting(ENVKEY)
+        path = path or ''
 
-        assert ENVVAL == environ_setting(ENVKEY, default='15')
+        type = self.get_query_argument('type', default=None)
 
-        assert ENVVAL == environ_setting(ENVKEY, required=False)
+        if type not in {None, 'directory', 'file', 'notebook'}:
 
-        assert ENVVAL == environ_setting(ENVKEY, default='15', required=False)
+            raise web.HTTPError(400, u'Type %r is invalid' % type)
 
 
 
-    def test_improperly_configured(self):
+        format = self.get_query_argument('format', default=None)
+
+        if format not in {None, 'text', 'base64'}:
+
+            raise web.HTTPError(400, u'Format %r is invalid' % format)
+
+        content = self.get_query_argument('content', default='1')
+
+        if content not in {'0', '1'}:
+
+            raise web.HTTPError(400, u'Content %r is invalid' % content)
+
+        content = int(content)
+
+        
+
+        model = yield gen.maybe_future(self.contents_manager.get(
+
+            path=path, type=type, format=format, content=content,
+
+        ))
+
+        if model['type'] == 'directory' and content:
+
+            # group listing by type, then by name (case-insensitive)
+
+            # FIXME: sorting should be done in the frontends
+
+            model['content'].sort(key=sort_key)
+
+        validate_model(model, expect_content=content)
+
+        self._finish_model(model, location=False)
+
+
+
+    @web.authenticated
+
+    @json_errors
+
+    @gen.coroutine
+
+    def patch(self, path=''):
+
+        """PATCH renames a file or directory without re-uploading content."""
+
+        cm = self.contents_manager
+
+        model = self.get_json_body()
+
+        if model is None:
+
+            raise web.HTTPError(400, u'JSON body missing')
+
+        model = yield gen.maybe_future(cm.update(model, path))
+
+        validate_model(model, expect_content=False)
+
+        self._finish_model(model)
+
+    
+
+    @gen.coroutine
+
+    def _copy(self, copy_from, copy_to=None):
+
+        """Copy a file, optionally specifying a target directory."""
+
+        self.log.info(u"Copying {copy_from} to {copy_to}".format(
+
+            copy_from=copy_from,
+
+            copy_to=copy_to or '',
+
+        ))
+
+        model = yield gen.maybe_future(self.contents_manager.copy(copy_from, copy_to))
+
+        self.set_status(201)
+
+        validate_model(model, expect_content=False)
+
+        self._finish_model(model)
+
+
+
+    @gen.coroutine
+
+    def _upload(self, model, path):
+
+        """Handle upload of a new file to path"""
+
+        self.log.info(u"Uploading file to %s", path)
+
+        model = yield gen.maybe_future(self.contents_manager.new(model, path))
+
+        self.set_status(201)
+
+        validate_model(model, expect_content=False)
+
+        self._finish_model(model)
+
+    
+
+    @gen.coroutine
+
+    def _new_untitled(self, path, type='', ext=''):
+
+        """Create a new, empty untitled entity"""
+
+        self.log.info(u"Creating new %s in %s", type or 'file', path)
+
+        model = yield gen.maybe_future(self.contents_manager.new_untitled(path=path, type=type, ext=ext))
+
+        self.set_status(201)
+
+        validate_model(model, expect_content=False)
+
+        self._finish_model(model)
+
+    
+
+    @gen.coroutine
+
+    def _save(self, model, path):
+
+        """Save an existing file."""
+
+        self.log.info(u"Saving file at %s", path)
+
+        model = yield gen.maybe_future(self.contents_manager.save(model, path))
+
+        validate_model(model, expect_content=False)
+
+        self._finish_model(model)
+
+
+
+    @web.authenticated
+
+    @json_errors
+
+    @gen.coroutine
+
+    def post(self, path=''):
+
+        """Create a new file in the specified path.
+
+
+
+        POST creates new files. The server always decides on the name.
+
+
+
+        POST /api/contents/path
+
+          New untitled, empty file or directory.
+
+        POST /api/contents/path
+
+          with body {"copy_from" : "/path/to/OtherNotebook.ipynb"}
+
+          New copy of OtherNotebook in path
 
         """
 
-        Test that ImproperlyConfigured is raised on missing setting
+
+
+        cm = self.contents_manager
+
+
+
+        if cm.file_exists(path):
+
+            raise web.HTTPError(400, "Cannot POST to files, use PUT instead.")
+
+
+
+        if not cm.dir_exists(path):
+
+            raise web.HTTPError(404, "No such directory: %s" % path)
+
+
+
+        model = self.get_json_body()
+
+
+
+        if model is not None:
+
+            copy_from = model.get('copy_from')
+
+            ext = model.get('ext', '')
+
+            type = model.get('type', '')
+
+            if copy_from:
+
+                yield self._copy(copy_from, path)
+
+            else:
+
+                yield self._new_untitled(path, type=type, ext=ext)
+
+        else:
+
+            yield self._new_untitled(path)
+
+
+
+    @web.authenticated
+
+    @json_errors
+
+    @gen.coroutine
+
+    def put(self, path=''):
+
+        """Saves the file in the location specified by name and path.
+
+
+
+        PUT is very similar to POST, but the requester specifies the name,
+
+        whereas with POST, the server picks the name.
+
+
+
+        PUT /api/contents/path/Name.ipynb
+
+          Save notebook at ``path/Name.ipynb``. Notebook structure is specified
+
+          in `content` key of JSON request body. If content is not specified,
+
+          create a new empty notebook.
 
         """
 
-        FAKEKEY = 'MISSING_SETTING'
+        model = self.get_json_body()
 
-        with pytest.raises(ImproperlyConfigured):
+        if model:
 
-            environ_setting(FAKEKEY)
+            if model.get('copy_from'):
 
+                raise web.HTTPError(400, "Cannot copy with PUT, only POST")
 
+            exists = yield gen.maybe_future(self.contents_manager.file_exists(path))
 
-    def test_configuration_missing(self):
+            if exists:
 
-        """
+                yield gen.maybe_future(self._save(model, path))
 
-        Test that ConfigurationMissing is warned on missing setting
+            else:
 
-        """
+                yield gen.maybe_future(self._upload(model, path))
 
-        FAKEKEY = 'MISSING_SETTING'
+        else:
 
-        with pytest.warns(ConfigurationMissing):
-
-            environ_setting(FAKEKEY, required=False)
-
-
-
-    def test_environ_default(self):
-
-        """
-
-        Test that a default is returned on required
-
-        """
-
-        FAKEKEY = 'MISSING_SETTING'
-
-        assert environ_setting(FAKEKEY, default='15') == '15'
+            yield gen.maybe_future(self._new_untitled(path))
 
 
 
-    @pytest.mark.filterwarnings("ignore")
+    @web.authenticated
 
-    def test_environ_default_none(self):
+    @json_errors
 
-        """
+    @gen.coroutine
 
-        Test that None is returned on not required
+    def delete(self, path=''):
 
-        """
+        """delete a file in the given path"""
 
-        FAKEKEY = 'MISSING_SETTING'
+        cm = self.contents_manager
 
-        assert environ_setting(FAKEKEY, required=False) is None
+        self.log.warn('delete %s', path)
+
+        yield gen.maybe_future(cm.delete(path))
+
+        self.set_status(204)
+
+        self.finish()
 
 
 
-    def test_enivron_default_other(self):
 
-        """
 
-        Test that a default is returned on not required
+class CheckpointsHandler(APIHandler):
 
-        """
 
-        FAKEKEY = 'MISSING_SETTING'
 
-        assert environ_setting(FAKEKEY, required=False, default='15') == '15'
+    SUPPORTED_METHODS = ('GET', 'POST')
+
+
+
+    @web.authenticated
+
+    @json_errors
+
+    @gen.coroutine
+
+    def get(self, path=''):
+
+        """get lists checkpoints for a file"""
+
+        cm = self.contents_manager
+
+        checkpoints = yield gen.maybe_future(cm.list_checkpoints(path))
+
+        data = json.dumps(checkpoints, default=date_default)
+
+        self.finish(data)
+
+
+
+    @web.authenticated
+
+    @json_errors
+
+    @gen.coroutine
+
+    def post(self, path=''):
+
+        """post creates a new checkpoint"""
+
+        cm = self.contents_manager
+
+        checkpoint = yield gen.maybe_future(cm.create_checkpoint(path))
+
+        data = json.dumps(checkpoint, default=date_default)
+
+        location = url_path_join(self.base_url, 'api/contents',
+
+            path, 'checkpoints', checkpoint['id'])
+
+        self.set_header('Location', url_escape(location))
+
+        self.set_status(201)
+
+        self.finish(data)
+
+
+
+
+
+class ModifyCheckpointsHandler(APIHandler):
+
+
+
+    SUPPORTED_METHODS = ('POST', 'DELETE')
+
+
+
+    @web.authenticated
+
+    @json_errors
+
+    @gen.coroutine
+
+    def post(self, path, checkpoint_id):
+
+        """post restores a file from a checkpoint"""
+
+        cm = self.contents_manager
+
+        yield gen.maybe_future(cm.restore_checkpoint(checkpoint_id, path))
+
+        self.set_status(204)
+
+        self.finish()
+
+
+
+    @web.authenticated
+
+    @json_errors
+
+    @gen.coroutine
+
+    def delete(self, path, checkpoint_id):
+
+        """delete clears a checkpoint for a given file"""
+
+        cm = self.contents_manager
+
+        yield gen.maybe_future(cm.delete_checkpoint(checkpoint_id, path))
+
+        self.set_status(204)
+
+        self.finish()
+
+
+
+
+
+class NotebooksRedirectHandler(IPythonHandler):
+
+    """Redirect /api/notebooks to /api/contents"""
+
+    SUPPORTED_METHODS = ('GET', 'PUT', 'PATCH', 'POST', 'DELETE')
+
+
+
+    def get(self, path):
+
+        self.log.warn("/api/notebooks is deprecated, use /api/contents")
+
+        self.redirect(url_path_join(
+
+            self.base_url,
+
+            'api/contents',
+
+            path
+
+        ))
+
+
+
+    put = patch = post = delete = get
+
+
+
+
+
+#-----------------------------------------------------------------------------
+
+# URL to handler mappings
+
+#-----------------------------------------------------------------------------
+
+
+
+
+
+_checkpoint_id_regex = r"(?P<checkpoint_id>[\w-]+)"
+
+
+
+default_handlers = [
+
+    (r"/api/contents%s/checkpoints" % path_regex, CheckpointsHandler),
+
+    (r"/api/contents%s/checkpoints/%s" % (path_regex, _checkpoint_id_regex),
+
+        ModifyCheckpointsHandler),
+
+    (r"/api/contents%s" % path_regex, ContentsHandler),
+
+    (r"/api/notebooks/?(.*)", NotebooksRedirectHandler),
+
+]

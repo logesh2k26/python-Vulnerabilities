@@ -2,1224 +2,1018 @@
 # Safety: safe
 # Category: safe
 
-import pathlib
+# vim: ft=python fileencoding=utf-8 sts=4 sw=4 et:
 
 
 
-import httpcore
+# Copyright 2016-2018 Florian Bruhin (The Compiler) <mail@qutebrowser.org>
 
-import jinja2
+#
 
-import pytest
+# This file is part of qutebrowser.
 
-import yaml
+#
 
+# qutebrowser is free software: you can redistribute it and/or modify
 
+# it under the terms of the GNU General Public License as published by
 
-from openapi_python_client import GeneratorError
+# the Free Software Foundation, either version 3 of the License, or
 
+# (at your option) any later version.
 
+#
 
+# qutebrowser is distributed in the hope that it will be useful,
 
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
 
-def test__get_project_for_url_or_path(mocker):
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 
-    data_dict = mocker.MagicMock()
+# GNU General Public License for more details.
 
-    _get_document = mocker.patch("openapi_python_client._get_document", return_value=data_dict)
+#
 
-    openapi = mocker.MagicMock()
+# You should have received a copy of the GNU General Public License
 
-    from_dict = mocker.patch("openapi_python_client.parser.GeneratorData.from_dict", return_value=openapi)
+# along with qutebrowser.  If not, see <http://www.gnu.org/licenses/>.
 
-    _Project = mocker.patch("openapi_python_client.Project")
 
-    url = mocker.MagicMock()
 
-    path = mocker.MagicMock()
+"""Backend-independent qute://* code.
 
 
 
-    from openapi_python_client import _get_project_for_url_or_path
+Module attributes:
 
+    pyeval_output: The output of the last :pyeval command.
 
+    _HANDLERS: The handlers registered via decorators.
 
-    project = _get_project_for_url_or_path(url=url, path=path)
+"""
 
 
 
-    _get_document.assert_called_once_with(url=url, path=path)
+import html
 
-    from_dict.assert_called_once_with(data_dict)
+import json
 
-    _Project.assert_called_once_with(openapi=openapi)
+import os
 
-    assert project == _Project()
+import time
 
+import textwrap
 
+import mimetypes
 
+import urllib
 
+import collections
 
-def test__get_project_for_url_or_path_generator_error(mocker):
 
-    data_dict = mocker.MagicMock()
 
-    _get_document = mocker.patch("openapi_python_client._get_document", return_value=data_dict)
+import pkg_resources
 
-    error = GeneratorError()
+import sip
 
-    from_dict = mocker.patch("openapi_python_client.parser.GeneratorData.from_dict", return_value=error)
+from PyQt5.QtCore import QUrlQuery, QUrl
 
-    _Project = mocker.patch("openapi_python_client.Project")
 
-    url = mocker.MagicMock()
 
-    path = mocker.MagicMock()
+import qutebrowser
 
+from qutebrowser.config import config, configdata, configexc, configdiff
 
+from qutebrowser.utils import (version, utils, jinja, log, message, docutils,
 
-    from openapi_python_client import _get_project_for_url_or_path
+                               objreg, urlutils)
 
+from qutebrowser.misc import objects
 
 
-    project = _get_project_for_url_or_path(url=url, path=path)
 
 
 
-    _get_document.assert_called_once_with(url=url, path=path)
+pyeval_output = ":pyeval was never called"
 
-    from_dict.assert_called_once_with(data_dict)
+spawn_output = ":spawn was never called"
 
-    _Project.assert_not_called()
 
-    assert project == error
 
 
 
+_HANDLERS = {}
 
 
-def test__get_project_for_url_or_path_document_error(mocker):
 
-    error = GeneratorError()
 
-    _get_document = mocker.patch("openapi_python_client._get_document", return_value=error)
 
+class NoHandlerFound(Exception):
 
 
-    from_dict = mocker.patch("openapi_python_client.parser.GeneratorData.from_dict")
 
-    url = mocker.MagicMock()
+    """Raised when no handler was found for the given URL."""
 
-    path = mocker.MagicMock()
 
 
+    pass
 
-    from openapi_python_client import _get_project_for_url_or_path
 
 
 
-    project = _get_project_for_url_or_path(url=url, path=path)
 
+class QuteSchemeOSError(Exception):
 
 
-    _get_document.assert_called_once_with(url=url, path=path)
 
-    from_dict.assert_not_called()
+    """Called when there was an OSError inside a handler."""
 
-    assert project == error
 
 
+    pass
 
 
 
-def test_create_new_client(mocker):
 
-    project = mocker.MagicMock()
 
-    _get_project_for_url_or_path = mocker.patch(
+class QuteSchemeError(Exception):
 
-        "openapi_python_client._get_project_for_url_or_path", return_value=project
 
-    )
 
-    url = mocker.MagicMock()
+    """Exception to signal that a handler should return an ErrorReply.
 
-    path = mocker.MagicMock()
 
 
+    Attributes correspond to the arguments in
 
-    from openapi_python_client import create_new_client
+    networkreply.ErrorNetworkReply.
 
 
 
-    result = create_new_client(url=url, path=path)
+    Attributes:
 
+        errorstring: Error string to print.
 
+        error: Numerical error value.
 
-    _get_project_for_url_or_path.assert_called_once_with(url=url, path=path)
+    """
 
-    project.build.assert_called_once()
 
-    assert result == project.build.return_value
 
+    def __init__(self, errorstring, error):
 
+        self.errorstring = errorstring
 
+        self.error = error
 
+        super().__init__(errorstring)
 
-def test_create_new_client_project_error(mocker):
 
-    error = GeneratorError()
 
-    _get_project_for_url_or_path = mocker.patch(
 
-        "openapi_python_client._get_project_for_url_or_path", return_value=error
 
-    )
+class Redirect(Exception):
 
-    url = mocker.MagicMock()
 
-    path = mocker.MagicMock()
 
+    """Exception to signal a redirect should happen.
 
 
-    from openapi_python_client import create_new_client
 
+    Attributes:
 
+        url: The URL to redirect to, as a QUrl.
 
-    result = create_new_client(url=url, path=path)
+    """
 
 
 
-    _get_project_for_url_or_path.assert_called_once_with(url=url, path=path)
+    def __init__(self, url):
 
-    assert result == [error]
+        super().__init__(url.toDisplayString())
 
+        self.url = url
 
 
 
 
-def test_update_existing_client(mocker):
 
-    project = mocker.MagicMock()
+class add_handler:  # noqa: N801,N806 pylint: disable=invalid-name
 
-    _get_project_for_url_or_path = mocker.patch(
 
-        "openapi_python_client._get_project_for_url_or_path", return_value=project
 
-    )
+    """Decorator to register a qute://* URL handler.
 
-    url = mocker.MagicMock()
 
-    path = mocker.MagicMock()
 
+    Attributes:
 
+        _name: The 'foo' part of qute://foo
 
-    from openapi_python_client import update_existing_client
+        backend: Limit which backends the handler can run with.
 
+    """
 
 
-    result = update_existing_client(url=url, path=path)
 
+    def __init__(self, name, backend=None):
 
+        self._name = name
 
-    _get_project_for_url_or_path.assert_called_once_with(url=url, path=path)
+        self._backend = backend
 
-    project.update.assert_called_once()
+        self._function = None
 
-    assert result == project.update.return_value
 
 
+    def __call__(self, function):
 
+        self._function = function
 
+        _HANDLERS[self._name] = self.wrapper
 
-def test_update_existing_client_project_error(mocker):
+        return function
 
-    error = GeneratorError()
 
-    _get_project_for_url_or_path = mocker.patch(
 
-        "openapi_python_client._get_project_for_url_or_path", return_value=error
+    def wrapper(self, *args, **kwargs):
 
-    )
+        """Call the underlying function."""
 
-    url = mocker.MagicMock()
+        if self._backend is not None and objects.backend != self._backend:
 
-    path = mocker.MagicMock()
+            return self.wrong_backend_handler(*args, **kwargs)
 
+        else:
 
+            return self._function(*args, **kwargs)
 
-    from openapi_python_client import update_existing_client
 
 
+    def wrong_backend_handler(self, url):
 
-    result = update_existing_client(url=url, path=path)
+        """Show an error page about using the invalid backend."""
 
+        html = jinja.render('error.html',
 
+                            title="Error while opening qute://url",
 
-    _get_project_for_url_or_path.assert_called_once_with(url=url, path=path)
+                            url=url.toDisplayString(),
 
-    assert result == [error]
+                            error='{} is not available with this '
 
+                                  'backend'.format(url.toDisplayString()))
 
+        return 'text/html', html
 
 
 
-class TestGetJson:
 
-    def test__get_document_no_url_or_path(self, mocker):
 
-        get = mocker.patch("httpx.get")
+def data_for_url(url):
 
-        Path = mocker.patch("openapi_python_client.Path")
+    """Get the data to show for the given URL.
 
-        loads = mocker.patch("yaml.safe_load")
 
 
+    Args:
 
-        from openapi_python_client import _get_document
+        url: The QUrl to show.
 
 
 
-        result = _get_document(url=None, path=None)
+    Return:
 
+        A (mimetype, data) tuple.
 
+    """
 
-        assert result == GeneratorError(header="No URL or Path provided")
+    norm_url = url.adjusted(QUrl.NormalizePathSegments |
 
-        get.assert_not_called()
+                            QUrl.StripTrailingSlash)
 
-        Path.assert_not_called()
+    if norm_url != url:
 
-        loads.assert_not_called()
+        raise Redirect(norm_url)
 
 
 
-    def test__get_document_url_and_path(self, mocker):
+    path = url.path()
 
-        get = mocker.patch("httpx.get")
+    host = url.host()
 
-        Path = mocker.patch("openapi_python_client.Path")
+    query = urlutils.query_string(url)
 
-        loads = mocker.patch("yaml.safe_load")
+    # A url like "qute:foo" is split as "scheme:path", not "scheme:host".
 
+    log.misc.debug("url: {}, path: {}, host {}".format(
 
+        url.toDisplayString(), path, host))
 
-        from openapi_python_client import _get_document
+    if not path or not host:
 
+        new_url = QUrl()
 
+        new_url.setScheme('qute')
 
-        result = _get_document(url=mocker.MagicMock(), path=mocker.MagicMock())
+        # When path is absent, e.g. qute://help (with no trailing slash)
 
+        if host:
 
+            new_url.setHost(host)
 
-        assert result == GeneratorError(header="Provide URL or Path, not both.")
+        # When host is absent, e.g. qute:help
 
-        get.assert_not_called()
+        else:
 
-        Path.assert_not_called()
+            new_url.setHost(path)
 
-        loads.assert_not_called()
 
 
+        new_url.setPath('/')
 
-    def test__get_document_bad_url(self, mocker):
+        if query:
 
-        get = mocker.patch("httpx.get", side_effect=httpcore.NetworkError)
+            new_url.setQuery(query)
 
-        Path = mocker.patch("openapi_python_client.Path")
+        if new_url.host():  # path was a valid host
 
-        loads = mocker.patch("yaml.safe_load")
+            raise Redirect(new_url)
 
 
 
-        from openapi_python_client import _get_document
+    try:
 
+        handler = _HANDLERS[host]
 
+    except KeyError:
 
-        url = mocker.MagicMock()
+        raise NoHandlerFound(url)
 
-        result = _get_document(url=url, path=None)
 
 
+    try:
 
-        assert result == GeneratorError(header="Could not get OpenAPI document from provided URL")
+        mimetype, data = handler(url)
 
-        get.assert_called_once_with(url)
+    except OSError as e:
 
-        Path.assert_not_called()
+        # FIXME:qtwebengine how to handle this?
 
-        loads.assert_not_called()
+        raise QuteSchemeOSError(e)
 
+    except QuteSchemeError as e:
 
+        raise
 
-    def test__get_document_url_no_path(self, mocker):
 
-        get = mocker.patch("httpx.get")
 
-        Path = mocker.patch("openapi_python_client.Path")
+    assert mimetype is not None, url
 
-        loads = mocker.patch("yaml.safe_load")
+    if mimetype == 'text/html' and isinstance(data, str):
 
+        # We let handlers return HTML as text
 
+        data = data.encode('utf-8', errors='xmlcharrefreplace')
 
-        from openapi_python_client import _get_document
 
 
+    return mimetype, data
 
-        url = mocker.MagicMock()
 
-        _get_document(url=url, path=None)
 
 
 
-        get.assert_called_once_with(url)
+@add_handler('bookmarks')
 
-        Path.assert_not_called()
+def qute_bookmarks(_url):
 
-        loads.assert_called_once_with(get().content)
+    """Handler for qute://bookmarks. Display all quickmarks / bookmarks."""
 
+    bookmarks = sorted(objreg.get('bookmark-manager').marks.items(),
 
+                       key=lambda x: x[1])  # Sort by title
 
-    def test__get_document_path_no_url(self, mocker):
+    quickmarks = sorted(objreg.get('quickmark-manager').marks.items(),
 
-        get = mocker.patch("httpx.get")
+                        key=lambda x: x[0])  # Sort by name
 
-        loads = mocker.patch("yaml.safe_load")
 
 
+    html = jinja.render('bookmarks.html',
 
-        from openapi_python_client import _get_document
+                        title='Bookmarks',
 
+                        bookmarks=bookmarks,
 
+                        quickmarks=quickmarks)
 
-        path = mocker.MagicMock()
+    return 'text/html', html
 
-        _get_document(url=None, path=path)
 
 
 
-        get.assert_not_called()
 
-        path.read_bytes.assert_called_once()
+@add_handler('tabs')
 
-        loads.assert_called_once_with(path.read_bytes())
+def qute_tabs(_url):
 
+    """Handler for qute://tabs. Display information about all open tabs."""
 
+    tabs = collections.defaultdict(list)
 
-    def test__get_document_bad_yaml(self, mocker):
+    for win_id, window in objreg.window_registry.items():
 
-        get = mocker.patch("httpx.get")
+        if sip.isdeleted(window):
 
-        loads = mocker.patch("yaml.safe_load", side_effect=yaml.YAMLError)
+            continue
 
+        tabbed_browser = objreg.get('tabbed-browser',
 
+                                    scope='window',
 
-        from openapi_python_client import _get_document
+                                    window=win_id)
 
+        for tab in tabbed_browser.widgets():
 
+            if tab.url() not in [QUrl("qute://tabs/"), QUrl("qute://tabs")]:
 
-        path = mocker.MagicMock()
+                urlstr = tab.url().toDisplayString()
 
-        result = _get_document(url=None, path=path)
+                tabs[str(win_id)].append((tab.title(), urlstr))
 
 
 
-        get.assert_not_called()
+    html = jinja.render('tabs.html',
 
-        path.read_bytes.assert_called_once()
+                        title='Tabs',
 
-        loads.assert_called_once_with(path.read_bytes())
+                        tab_list_by_window=tabs)
 
-        assert result == GeneratorError(header="Invalid YAML from provided source")
+    return 'text/html', html
 
 
 
 
 
-class TestProject:
+def history_data(start_time, offset=None):
 
-    def test___init__(self, mocker):
+    """Return history data.
 
-        openapi = mocker.MagicMock(title="My Test API")
 
 
+    Arguments:
 
-        from openapi_python_client import Project
+        start_time: select history starting from this timestamp.
 
+        offset: number of items to skip
 
+    """
 
-        project = Project(openapi=openapi)
+    # history atimes are stored as ints, ensure start_time is not a float
 
+    start_time = int(start_time)
 
+    hist = objreg.get('web-history')
 
-        assert project.openapi == openapi
+    if offset is not None:
 
-        assert project.project_name == "my-test-api-client"
+        entries = hist.entries_before(start_time, limit=1000, offset=offset)
 
-        assert project.package_name == "my_test_api_client"
+    else:
 
-        assert project.package_description == "A client library for accessing My Test API"
+        # end is 24hrs earlier than start
 
+        end_time = start_time - 24*60*60
 
+        entries = hist.entries_between(end_time, start_time)
 
-    def test_project_and_package_name_overrides(self, mocker):
 
-        openapi = mocker.MagicMock(title="My Test API")
 
+    return [{"url": html.escape(e.url),
 
+             "title": html.escape(e.title) or html.escape(e.url),
 
-        from openapi_python_client import Project
+             "time": e.atime} for e in entries]
 
 
 
-        Project.project_name_override = "my-special-project-name"
 
-        project = Project(openapi=openapi)
 
+@add_handler('history')
 
+def qute_history(url):
 
-        assert project.project_name == "my-special-project-name"
+    """Handler for qute://history. Display and serve history."""
 
-        assert project.package_name == "my_special_project_name"
+    if url.path() == '/data':
 
+        try:
 
+            offset = QUrlQuery(url).queryItemValue("offset")
 
-        Project.package_name_override = "my_special_package_name"
+            offset = int(offset) if offset else None
 
-        project = Project(openapi=openapi)
+        except ValueError as e:
 
+            raise QuteSchemeError("Query parameter offset is invalid", e)
 
+        # Use start_time in query or current time.
 
-        assert project.project_name == "my-special-project-name"
+        try:
 
-        assert project.package_name == "my_special_package_name"
+            start_time = QUrlQuery(url).queryItemValue("start_time")
 
+            start_time = float(start_time) if start_time else time.time()
 
+        except ValueError as e:
 
-    def test_build(self, mocker):
+            raise QuteSchemeError("Query parameter start_time is invalid", e)
 
-        from openapi_python_client import Project
 
 
+        return 'text/html', json.dumps(history_data(start_time, offset))
 
-        project = Project(openapi=mocker.MagicMock(title="My Test API"))
+    else:
 
-        project.project_dir = mocker.MagicMock()
+        return 'text/html', jinja.render(
 
-        project.package_dir = mocker.MagicMock()
+            'history.html',
 
-        project._build_metadata = mocker.MagicMock()
+            title='History',
 
-        project._build_models = mocker.MagicMock()
-
-        project._build_api = mocker.MagicMock()
-
-        project._create_package = mocker.MagicMock()
-
-        project._reformat = mocker.MagicMock()
-
-        project._get_errors = mocker.MagicMock()
-
-
-
-        result = project.build()
-
-
-
-        project.project_dir.mkdir.assert_called_once()
-
-        project._create_package.assert_called_once()
-
-        project._build_metadata.assert_called_once()
-
-        project._build_models.assert_called_once()
-
-        project._build_api.assert_called_once()
-
-        project._reformat.assert_called_once()
-
-        project._get_errors.assert_called_once()
-
-        assert result == project._get_errors.return_value
-
-
-
-    def test_build_file_exists(self, mocker):
-
-        from openapi_python_client import Project
-
-
-
-        project = Project(openapi=mocker.MagicMock(title="My Test API"))
-
-        project.project_dir = mocker.MagicMock()
-
-        project.project_dir.mkdir.side_effect = FileExistsError
-
-        result = project.build()
-
-
-
-        project.project_dir.mkdir.assert_called_once()
-
-
-
-        assert result == [GeneratorError(detail="Directory already exists. Delete it or use the update command.")]
-
-
-
-    def test_update(self, mocker):
-
-        from openapi_python_client import Project, shutil
-
-
-
-        rmtree = mocker.patch.object(shutil, "rmtree")
-
-        project = Project(openapi=mocker.MagicMock(title="My Test API"))
-
-        project.package_dir = mocker.MagicMock()
-
-        project._build_metadata = mocker.MagicMock()
-
-        project._build_models = mocker.MagicMock()
-
-        project._build_api = mocker.MagicMock()
-
-        project._create_package = mocker.MagicMock()
-
-        project._reformat = mocker.MagicMock()
-
-        project._get_errors = mocker.MagicMock()
-
-
-
-        result = project.update()
-
-
-
-        rmtree.assert_called_once_with(project.package_dir)
-
-        project._create_package.assert_called_once()
-
-        project._build_models.assert_called_once()
-
-        project._build_api.assert_called_once()
-
-        project._reformat.assert_called_once()
-
-        project._get_errors.assert_called_once()
-
-        assert result == project._get_errors.return_value
-
-
-
-    def test_update_missing_dir(self, mocker):
-
-        from openapi_python_client import Project
-
-
-
-        project = Project(openapi=mocker.MagicMock(title="My Test API"))
-
-        project.package_dir = mocker.MagicMock()
-
-        project.package_dir.is_dir.return_value = False
-
-        project._build_models = mocker.MagicMock()
-
-
-
-        with pytest.raises(FileNotFoundError):
-
-            project.update()
-
-
-
-        project.package_dir.is_dir.assert_called_once()
-
-        project._build_models.assert_not_called()
-
-
-
-    def test__create_package(self, mocker):
-
-        from openapi_python_client import Project
-
-
-
-        project = Project(openapi=mocker.MagicMock(title="My Test API"))
-
-        project.package_dir = mocker.MagicMock()
-
-        package_init_template = mocker.MagicMock()
-
-        project.env = mocker.MagicMock()
-
-        project.env.get_template.return_value = package_init_template
-
-        package_init_path = mocker.MagicMock(autospec=pathlib.Path)
-
-        pytyped_path = mocker.MagicMock(autospec=pathlib.Path)
-
-        paths = {
-
-            "__init__.py": package_init_path,
-
-            "py.typed": pytyped_path,
-
-        }
-
-
-
-        project.package_dir.__truediv__.side_effect = lambda x: paths[x]
-
-
-
-        project._create_package()
-
-
-
-        project.package_dir.mkdir.assert_called_once()
-
-        project.env.get_template.assert_called_once_with("package_init.pyi")
-
-        package_init_template.render.assert_called_once_with(description=project.package_description)
-
-        package_init_path.write_text.assert_called_once_with(package_init_template.render())
-
-        pytyped_path.write_text.assert_called_once_with("# Marker file for PEP 561")
-
-
-
-    def test__build_metadata(self, mocker):
-
-        from openapi_python_client import Project
-
-
-
-        project = Project(openapi=mocker.MagicMock(title="My Test API"))
-
-        project.project_dir = mocker.MagicMock()
-
-        pyproject_path = mocker.MagicMock(autospec=pathlib.Path)
-
-        readme_path = mocker.MagicMock(autospec=pathlib.Path)
-
-        git_ignore_path = mocker.MagicMock(autospec=pathlib.Path)
-
-        paths = {
-
-            "pyproject.toml": pyproject_path,
-
-            "README.md": readme_path,
-
-            ".gitignore": git_ignore_path,
-
-        }
-
-        project.project_dir.__truediv__.side_effect = lambda x: paths[x]
-
-
-
-        pyproject_template = mocker.MagicMock(autospec=jinja2.Template)
-
-        readme_template = mocker.MagicMock(autospec=jinja2.Template)
-
-        git_ignore_template = mocker.MagicMock(autospec=jinja2.Template)
-
-        project.env = mocker.MagicMock(autospec=jinja2.Environment)
-
-        templates = {
-
-            "pyproject.toml": pyproject_template,
-
-            "README.md": readme_template,
-
-            ".gitignore": git_ignore_template,
-
-        }
-
-        project.env.get_template.side_effect = lambda x: templates[x]
-
-
-
-        project._build_metadata()
-
-
-
-        project.env.get_template.assert_has_calls(
-
-            [mocker.call("pyproject.toml"), mocker.call("README.md"), mocker.call(".gitignore")]
+            gap_interval=config.val.history_gap_interval
 
         )
 
 
 
-        pyproject_template.render.assert_called_once_with(
 
-            project_name=project.project_name,
 
-            package_name=project.package_name,
+@add_handler('javascript')
 
-            version=project.version,
+def qute_javascript(url):
 
-            description=project.package_description,
+    """Handler for qute://javascript.
 
-        )
 
-        pyproject_path.write_text.assert_called_once_with(pyproject_template.render())
 
-        readme_template.render.assert_called_once_with(
+    Return content of file given as query parameter.
 
-            description=project.package_description,
+    """
 
-            project_name=project.project_name,
+    path = url.path()
 
-            package_name=project.package_name,
+    if path:
 
-        )
+        path = "javascript" + os.sep.join(path.split('/'))
 
-        readme_path.write_text.assert_called_once_with(readme_template.render())
+        return 'text/html', utils.read_file(path, binary=False)
 
-        git_ignore_template.render.assert_called_once()
+    else:
 
-        git_ignore_path.write_text.assert_called_once_with(git_ignore_template.render())
+        raise QuteSchemeError("No file specified", ValueError())
 
 
 
-    def test__build_models(self, mocker):
 
-        from openapi_python_client import GeneratorData, Project
 
+@add_handler('pyeval')
 
+def qute_pyeval(_url):
 
-        openapi = mocker.MagicMock(autospec=GeneratorData, title="My Test API")
+    """Handler for qute://pyeval."""
 
-        model_1 = mocker.MagicMock()
+    html = jinja.render('pre.html', title='pyeval', content=pyeval_output)
 
-        model_2 = mocker.MagicMock()
+    return 'text/html', html
 
-        openapi.schemas.models = {"1": model_1, "2": model_2}
 
-        enum_1 = mocker.MagicMock()
 
-        enum_2 = mocker.MagicMock()
 
-        openapi.enums = {"1": enum_1, "2": enum_2}
 
-        project = Project(openapi=openapi)
+@add_handler('spawn-output')
 
-        project.package_dir = mocker.MagicMock()
+def qute_spawn_output(_url):
 
-        models_init = mocker.MagicMock()
+    """Handler for qute://spawn-output."""
 
-        types_py = mocker.MagicMock()
+    html = jinja.render('pre.html', title='spawn output', content=spawn_output)
 
-        models_dir = mocker.MagicMock()
+    return 'text/html', html
 
-        model_1_module_path = mocker.MagicMock()
 
-        model_2_module_path = mocker.MagicMock()
 
-        enum_1_module_path = mocker.MagicMock()
 
-        enum_2_module_path = mocker.MagicMock()
 
-        module_paths = {
+@add_handler('version')
 
-            "__init__.py": models_init,
+@add_handler('verizon')
 
-            "types.py": types_py,
+def qute_version(_url):
 
-            f"{model_1.reference.module_name}.py": model_1_module_path,
+    """Handler for qute://version."""
 
-            f"{model_2.reference.module_name}.py": model_2_module_path,
+    html = jinja.render('version.html', title='Version info',
 
-            f"{enum_1.reference.module_name}.py": enum_1_module_path,
+                        version=version.version(),
 
-            f"{enum_2.reference.module_name}.py": enum_2_module_path,
+                        copyright=qutebrowser.__copyright__)
 
-        }
+    return 'text/html', html
 
 
 
-        def models_dir_get(x):
 
-            return module_paths[x]
 
+@add_handler('plainlog')
 
+def qute_plainlog(url):
 
-        models_dir.__truediv__.side_effect = models_dir_get
+    """Handler for qute://plainlog.
 
-        project.package_dir.__truediv__.return_value = models_dir
 
-        model_render_1 = mocker.MagicMock()
 
-        model_render_2 = mocker.MagicMock()
+    An optional query parameter specifies the minimum log level to print.
 
-        model_template = mocker.MagicMock()
+    For example, qute://log?level=warning prints warnings and errors.
 
-        model_template.render.side_effect = [model_render_1, model_render_2]
+    Level can be one of: vdebug, debug, info, warning, error, critical.
 
-        enum_render_1 = mocker.MagicMock()
+    """
 
-        enum_render_2 = mocker.MagicMock()
+    if log.ram_handler is None:
 
-        enum_template = mocker.MagicMock()
+        text = "Log output was disabled."
 
-        enum_renders = {
+    else:
 
-            enum_1: enum_render_1,
+        level = QUrlQuery(url).queryItemValue('level')
 
-            enum_2: enum_render_2,
+        if not level:
 
-        }
+            level = 'vdebug'
 
-        enum_template.render.side_effect = lambda enum: enum_renders[enum]
+        text = log.ram_handler.dump_log(html=False, level=level)
 
-        models_init_template = mocker.MagicMock()
+    html = jinja.render('pre.html', title='log', content=text)
 
-        types_template = mocker.MagicMock()
+    return 'text/html', html
 
-        templates = {
 
-            "types.py": types_template,
 
-            "model.pyi": model_template,
 
-            "enum.pyi": enum_template,
 
-            "models_init.pyi": models_init_template,
+@add_handler('log')
 
-        }
+def qute_log(url):
 
-        project.env = mocker.MagicMock()
+    """Handler for qute://log.
 
-        project.env.get_template.side_effect = lambda x: templates[x]
 
-        imports = [
 
-            "import_schema_1",
+    An optional query parameter specifies the minimum log level to print.
 
-            "import_schema_2",
+    For example, qute://log?level=warning prints warnings and errors.
 
-            "import_enum_1",
+    Level can be one of: vdebug, debug, info, warning, error, critical.
 
-            "import_enum_2",
+    """
 
-        ]
+    if log.ram_handler is None:
 
-        import_string_from_reference = mocker.patch(
+        html_log = None
 
-            "openapi_python_client.import_string_from_reference", side_effect=imports
+    else:
 
-        )
+        level = QUrlQuery(url).queryItemValue('level')
 
+        if not level:
 
+            level = 'vdebug'
 
-        project._build_models()
+        html_log = log.ram_handler.dump_log(html=True, level=level)
 
 
 
-        project.package_dir.__truediv__.assert_called_once_with("models")
+    html = jinja.render('log.html', title='log', content=html_log)
 
-        models_dir.mkdir.assert_called_once()
+    return 'text/html', html
 
-        models_dir.__truediv__.assert_has_calls([mocker.call(key) for key in module_paths])
 
-        project.env.get_template.assert_has_calls([mocker.call(key) for key in templates])
 
-        model_template.render.assert_has_calls([mocker.call(model=model_1), mocker.call(model=model_2)])
 
-        model_1_module_path.write_text.assert_called_once_with(model_render_1)
 
-        model_2_module_path.write_text.assert_called_once_with(model_render_2)
+@add_handler('gpl')
 
-        import_string_from_reference.assert_has_calls(
+def qute_gpl(_url):
 
-            [
+    """Handler for qute://gpl. Return HTML content as string."""
 
-                mocker.call(model_1.reference),
+    return 'text/html', utils.read_file('html/license.html')
 
-                mocker.call(model_2.reference),
 
-                mocker.call(enum_1.reference),
 
-                mocker.call(enum_2.reference),
 
-            ]
 
-        )
+@add_handler('help')
 
-        models_init_template.render.assert_called_once_with(imports=imports)
+def qute_help(url):
 
-        types_template.render.assert_called_once()
+    """Handler for qute://help."""
 
-        enum_1_module_path.write_text.assert_called_once_with(enum_render_1)
+    urlpath = url.path()
 
-        enum_2_module_path.write_text.assert_called_once_with(enum_render_2)
+    if not urlpath or urlpath == '/':
 
+        urlpath = 'index.html'
 
+    else:
 
-    def test__build_api(self, mocker):
+        urlpath = urlpath.lstrip('/')
 
-        import pathlib
+    if not docutils.docs_up_to_date(urlpath):
 
+        message.error("Your documentation is outdated! Please re-run "
 
+                      "scripts/asciidoc2html.py.")
 
-        from jinja2 import Template
 
 
+    path = 'html/doc/{}'.format(urlpath)
 
-        from openapi_python_client import GeneratorData, Project
+    if not urlpath.endswith('.html'):
 
+        try:
 
+            bdata = utils.read_file(path, binary=True)
 
-        openapi = mocker.MagicMock(autospec=GeneratorData, title="My Test API")
+        except OSError as e:
 
-        tag_1 = "a_tag"
+            raise QuteSchemeOSError(e)
 
-        tag_2 = "another_tag"
+        mimetype, _encoding = mimetypes.guess_type(urlpath)
 
-        collection_1 = mocker.MagicMock()
+        assert mimetype is not None, url
 
-        collection_2 = mocker.MagicMock()
+        return mimetype, bdata
 
-        openapi.endpoint_collections_by_tag = {tag_1: collection_1, tag_2: collection_2}
 
-        project = Project(openapi=openapi)
 
-        project.package_dir = mocker.MagicMock()
+    try:
 
-        api_errors = mocker.MagicMock(autospec=pathlib.Path)
+        data = utils.read_file(path)
 
-        client_path = mocker.MagicMock()
+    except OSError:
 
-        api_init = mocker.MagicMock(autospec=pathlib.Path)
+        # No .html around, let's see if we find the asciidoc
 
-        collection_1_path = mocker.MagicMock(autospec=pathlib.Path)
+        asciidoc_path = path.replace('.html', '.asciidoc')
 
-        collection_2_path = mocker.MagicMock(autospec=pathlib.Path)
+        if asciidoc_path.startswith('html/doc/'):
 
-        async_api_init = mocker.MagicMock(autospec=pathlib.Path)
+            asciidoc_path = asciidoc_path.replace('html/doc/', '../doc/help/')
 
-        async_collection_1_path = mocker.MagicMock(autospec=pathlib.Path)
 
-        async_collection_2_path = mocker.MagicMock(autospec=pathlib.Path)
 
-        api_paths = {
+        try:
 
-            "__init__.py": api_init,
+            asciidoc = utils.read_file(asciidoc_path)
 
-            f"{tag_1}.py": collection_1_path,
+        except OSError:
 
-            f"{tag_2}.py": collection_2_path,
+            asciidoc = None
 
-        }
 
-        async_api_paths = {
 
-            "__init__.py": async_api_init,
+        if asciidoc is None:
 
-            f"{tag_1}.py": async_collection_1_path,
+            raise
 
-            f"{tag_2}.py": async_collection_2_path,
 
-        }
 
-        api_dir = mocker.MagicMock(autospec=pathlib.Path)
+        preamble = textwrap.dedent("""
 
-        api_dir.__truediv__.side_effect = lambda x: api_paths[x]
+            There was an error loading the documentation!
 
-        async_api_dir = mocker.MagicMock(autospec=pathlib.Path)
 
-        async_api_dir.__truediv__.side_effect = lambda x: async_api_paths[x]
 
+            This most likely means the documentation was not generated
 
+            properly. If you are running qutebrowser from the git repository,
 
-        package_paths = {
+            please (re)run scripts/asciidoc2html.py and reload this page.
 
-            "client.py": client_path,
 
-            "api": api_dir,
 
-            "async_api": async_api_dir,
+            If you're running a released version this is a bug, please use
 
-            "errors.py": api_errors,
+            :report to report it.
 
-        }
 
-        project.package_dir.__truediv__.side_effect = lambda x: package_paths[x]
 
-        client_template = mocker.MagicMock(autospec=Template)
+            Falling back to the plaintext version.
 
-        errors_template = mocker.MagicMock(autospec=Template)
 
-        endpoint_template = mocker.MagicMock(autospec=Template)
 
-        async_endpoint_template = mocker.MagicMock(autospec=Template)
+            ---------------------------------------------------------------
 
-        templates = {
 
-            "client.pyi": client_template,
 
-            "errors.pyi": errors_template,
 
-            "endpoint_module.pyi": endpoint_template,
 
-            "async_endpoint_module.pyi": async_endpoint_template,
+        """)
 
-        }
+        return 'text/plain', (preamble + asciidoc).encode('utf-8')
 
-        mocker.patch.object(project.env, "get_template", autospec=True, side_effect=lambda x: templates[x])
+    else:
 
-        endpoint_renders = {
+        return 'text/html', data
 
-            collection_1: mocker.MagicMock(),
 
-            collection_2: mocker.MagicMock(),
 
-        }
 
-        endpoint_template.render.side_effect = lambda collection: endpoint_renders[collection]
 
-        async_endpoint_renders = {
+@add_handler('backend-warning')
 
-            collection_1: mocker.MagicMock(),
+def qute_backend_warning(_url):
 
-            collection_2: mocker.MagicMock(),
+    """Handler for qute://backend-warning."""
 
-        }
+    html = jinja.render('backend-warning.html',
 
-        async_endpoint_template.render.side_effect = lambda collection: async_endpoint_renders[collection]
+                        distribution=version.distribution(),
 
+                        Distribution=version.Distribution,
 
+                        version=pkg_resources.parse_version,
 
-        project._build_api()
+                        title="Legacy backend warning")
 
+    return 'text/html', html
 
 
-        project.package_dir.__truediv__.assert_has_calls([mocker.call(key) for key in package_paths])
 
-        project.env.get_template.assert_has_calls([mocker.call(key) for key in templates])
 
-        client_template.render.assert_called_once()
 
-        client_path.write_text.assert_called_once_with(client_template.render())
+def _qute_settings_set(url):
 
-        errors_template.render.assert_called_once()
+    """Handler for qute://settings/set."""
 
-        api_errors.write_text.assert_called_once_with(errors_template.render())
+    query = QUrlQuery(url)
 
-        api_dir.mkdir.assert_called_once()
+    option = query.queryItemValue('option', QUrl.FullyDecoded)
 
-        api_dir.__truediv__.assert_has_calls([mocker.call(key) for key in api_paths])
+    value = query.queryItemValue('value', QUrl.FullyDecoded)
 
-        api_init.write_text.assert_called_once_with('""" Contains synchronous methods for accessing the API """')
 
-        endpoint_template.render.assert_has_calls(
 
-            [mocker.call(collection=collection_1), mocker.call(collection=collection_2)]
+    # https://github.com/qutebrowser/qutebrowser/issues/727
 
-        )
+    if option == 'content.javascript.enabled' and value == 'false':
 
-        collection_1_path.write_text.assert_called_once_with(endpoint_renders[collection_1])
+        msg = ("Refusing to disable javascript via qute://settings "
 
-        collection_2_path.write_text.assert_called_once_with(endpoint_renders[collection_2])
+               "as it needs javascript support.")
 
-        async_api_dir.mkdir.assert_called_once()
+        message.error(msg)
 
-        async_api_dir.__truediv__.assert_has_calls([mocker.call(key) for key in async_api_paths])
+        return 'text/html', b'error: ' + msg.encode('utf-8')
 
-        async_api_init.write_text.assert_called_once_with('""" Contains async methods for accessing the API """')
 
-        async_endpoint_template.render.assert_has_calls(
 
-            [mocker.call(collection=collection_1), mocker.call(collection=collection_2)]
+    try:
 
-        )
+        config.instance.set_str(option, value, save_yaml=True)
 
-        async_collection_1_path.write_text.assert_called_once_with(async_endpoint_renders[collection_1])
+        return 'text/html', b'ok'
 
-        async_collection_2_path.write_text.assert_called_once_with(async_endpoint_renders[collection_2])
+    except configexc.Error as e:
 
+        message.error(str(e))
 
+        return 'text/html', b'error: ' + str(e).encode('utf-8')
 
 
 
-def test__reformat(mocker):
 
-    import subprocess
 
+@add_handler('settings')
 
+def qute_settings(url):
 
-    from openapi_python_client import GeneratorData, Project
+    """Handler for qute://settings. View/change qute configuration."""
 
+    if url.path() == '/set':
 
+        return _qute_settings_set(url)
 
-    sub_run = mocker.patch("subprocess.run")
 
-    openapi = mocker.MagicMock(autospec=GeneratorData, title="My Test API")
 
-    project = Project(openapi=openapi)
+    html = jinja.render('settings.html', title='settings',
 
-    project.project_dir = mocker.MagicMock(autospec=pathlib.Path)
+                        configdata=configdata,
 
+                        confget=config.instance.get_str)
 
+    return 'text/html', html
 
-    project._reformat()
 
 
 
-    sub_run.assert_has_calls(
 
-        [
+@add_handler('bindings')
 
-            mocker.call(
+def qute_bindings(_url):
 
-                "isort .", cwd=project.project_dir, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    """Handler for qute://bindings. View keybindings."""
 
-            ),
+    bindings = {}
 
-            mocker.call("black .", cwd=project.project_dir, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
+    defaults = config.val.bindings.default
 
-        ]
+    modes = set(defaults.keys()).union(config.val.bindings.commands)
 
-    )
+    modes.remove('normal')
 
+    modes = ['normal'] + sorted(list(modes))
 
+    for mode in modes:
 
+        bindings[mode] = config.key_instance.get_bindings_for(mode)
 
 
-def test__get_errors(mocker):
 
-    from openapi_python_client import GeneratorData, Project
+    html = jinja.render('bindings.html', title='Bindings',
 
-    from openapi_python_client.parser.openapi import EndpointCollection, Schemas
+                        bindings=bindings)
 
+    return 'text/html', html
 
 
-    openapi = mocker.MagicMock(
 
-        autospec=GeneratorData,
 
-        title="My Test API",
 
-        endpoint_collections_by_tag={
+@add_handler('back')
 
-            "default": mocker.MagicMock(autospec=EndpointCollection, parse_errors=[1]),
+def qute_back(url):
 
-            "other": mocker.MagicMock(autospec=EndpointCollection, parse_errors=[2]),
+    """Handler for qute://back.
 
-        },
 
-        schemas=mocker.MagicMock(autospec=Schemas, errors=[3]),
 
-    )
+    Simple page to free ram / lazy load a site, goes back on focusing the tab.
 
-    project = Project(openapi=openapi)
+    """
 
+    html = jinja.render(
 
+        'back.html',
 
-    assert project._get_errors() == [1, 2, 3]
+        title='Suspended: ' + urllib.parse.unquote(url.fragment()))
+
+    return 'text/html', html
+
+
+
+
+
+@add_handler('configdiff')
+
+def qute_configdiff(url):
+
+    """Handler for qute://configdiff."""
+
+    if url.path() == '/old':
+
+        try:
+
+            return 'text/html', configdiff.get_diff()
+
+        except OSError as e:
+
+            error = (b'Failed to read old config: ' +
+
+                     str(e.strerror).encode('utf-8'))
+
+            return 'text/plain', error
+
+    else:
+
+        data = config.instance.dump_userconfig().encode('utf-8')
+
+        return 'text/plain', data
+
+
+
+
+
+@add_handler('pastebin-version')
+
+def qute_pastebin_version(_url):
+
+    """Handler that pastebins the version string."""
+
+    version.pastebin_version()
+
+    return 'text/plain', b'Paste called.'

@@ -2,872 +2,1070 @@
 # Safety: safe
 # Category: safe
 
-# -*- coding: utf-8 -*-
+# vim: ft=python fileencoding=utf-8 sts=4 sw=4 et:
+
+
+
+# Copyright 2016-2018 Florian Bruhin (The Compiler) <mail@qutebrowser.org>
 
 #
 
-# Copyright (C) 2008-2012  Red Hat, Inc.
-
-# Copyright (C) 2008  Ricky Zhou
-
-# This file is part of python-fedora
+# This file is part of qutebrowser.
 
 #
 
-# python-fedora is free software; you can redistribute it and/or
+# qutebrowser is free software: you can redistribute it and/or modify
 
-# modify it under the terms of the GNU Lesser General Public
+# it under the terms of the GNU General Public License as published by
 
-# License as published by the Free Software Foundation; either
+# the Free Software Foundation, either version 3 of the License, or
 
-# version 2.1 of the License, or (at your option) any later version.
+# (at your option) any later version.
 
 #
 
-# python-fedora is distributed in the hope that it will be useful,
+# qutebrowser is distributed in the hope that it will be useful,
 
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 
-# Lesser General Public License for more details.
-
-#
-
-# You should have received a copy of the GNU Lesser General Public
-
-# License along with python-fedora; if not, see <http://www.gnu.org/licenses/>
+# GNU General Public License for more details.
 
 #
 
-'''
+# You should have received a copy of the GNU General Public License
 
-Miscellaneous functions of use on a TurboGears Server
-
-
-
-.. versionchanged:: 0.3.14
-
-   Save the original turbogears.url function as :func:`fedora.tg.util.tg_url`
+# along with qutebrowser.  If not, see <http://www.gnu.org/licenses/>.
 
 
 
-.. versionchanged:: 0.3.17
-
-   Renamed from fedora.tg.util
+"""Backend-independent qute://* code.
 
 
 
-.. versionchanged:: 0.3.25
+Module attributes:
 
-   Renamed from fedora.tg.tg1utils
+    pyeval_output: The output of the last :pyeval command.
+
+    _HANDLERS: The handlers registered via decorators.
+
+"""
 
 
 
-.. moduleauthor:: Toshio Kuratomi <tkuratom@redhat.com>
+import html
 
-.. moduleauthor:: Ricky Zhou <ricky@fedoraproject.org>
-
-'''
-
-from itertools import chain
-
-import cgi
+import json
 
 import os
 
+import time
+
+import textwrap
+
+import mimetypes
+
+import urllib
+
+import collections
+
+import base64
 
 
-import cherrypy
 
-from cherrypy import request
+try:
 
-from decorator import decorator
+    import secrets
+
+except ImportError:
+
+    # New in Python 3.6
+
+    secrets = None
+
+
 
 import pkg_resources
 
-import turbogears
+from PyQt5.QtCore import QUrlQuery, QUrl
 
-from turbogears import flash, redirect, config, identity
+from PyQt5.QtNetwork import QNetworkReply
 
-import turbogears.util as tg_util
 
-from turbogears.controllers import check_app_root
 
-from turbogears.identity.exceptions import RequestRequiredException
+import qutebrowser
 
-import six
+from qutebrowser.config import config, configdata, configexc, configdiff
 
-from six.moves.urllib.parse import urlencode, urlparse, urlunparse
+from qutebrowser.utils import (version, utils, jinja, log, message, docutils,
 
+                               objreg, urlutils)
 
+from qutebrowser.misc import objects
 
+from qutebrowser.qt import sip
 
 
-# Save this for people who need the original url() function
 
-tg_url = turbogears.url
 
 
+pyeval_output = ":pyeval was never called"
 
+spawn_output = ":spawn was never called"
 
+csrf_token = None
 
-def add_custom_stdvars(new_vars):
 
-    return new_vars.update({'fedora_template': fedora_template})
 
 
 
+_HANDLERS = {}
 
 
-def url(tgpath, tgparams=None, **kwargs):
 
-    '''Computes URLs.
 
 
+class NoHandlerFound(Exception):
 
-    This is a replacement for :func:`turbogears.controllers.url` (aka
 
-    :func:`tg.url` in the template).  In addition to the functionality that
 
-    :func:`tg.url` provides, it adds a token to prevent :term:`CSRF` attacks.
+    """Raised when no handler was found for the given URL."""
 
 
 
-    :arg tgpath:  a list or a string. If the path is absolute (starts
+    pass
 
-        with a "/"), the :attr:`server.webpath`, :envvar:`SCRIPT_NAME` and
 
-        the approot of the application are prepended to the path. In order for
 
-        the approot to be detected properly, the root object should extend
 
-        :class:`turbogears.controllers.RootController`.
 
-    :kwarg tgparams: See param: ``kwargs``
+class QuteSchemeOSError(Exception):
 
-    :kwarg kwargs: Query parameters for the URL can be passed in as a
 
-        dictionary in the second argument *or* as keyword parameters.
 
-        Values which are a list or a tuple are used to create multiple
+    """Called when there was an OSError inside a handler."""
 
-        key-value pairs.
 
-    :returns: The changed path
 
+    pass
 
 
-    .. versionadded:: 0.3.10
 
-       Modified from turbogears.controllers.url for :ref:`CSRF-Protection`
 
-    '''
 
-    if not isinstance(tgpath, six.string_types):
+class QuteSchemeError(Exception):
 
-        tgpath = '/'.join(list(tgpath))
 
-    if not tgpath.startswith('/'):
 
-        # Do not allow the url() function to be used for external urls.
+    """Exception to signal that a handler should return an ErrorReply.
 
-        # This function is primarily used in redirect() calls, so this prevents
 
-        # covert redirects and thus CSRF leaking.
 
-        tgpath = '/'
+    Attributes correspond to the arguments in
 
-    if tgpath.startswith('/'):
+    networkreply.ErrorNetworkReply.
 
-        webpath = (config.get('server.webpath') or '').rstrip('/')
 
-        if tg_util.request_available():
 
-            check_app_root()
+    Attributes:
 
-            tgpath = request.app_root + tgpath
+        errorstring: Error string to print.
 
-            try:
+        error: Numerical error value.
 
-                webpath += request.wsgi_environ['SCRIPT_NAME'].rstrip('/')
+    """
 
-            except (AttributeError, KeyError):  # pylint: disable-msg=W0704
 
-                # :W0704: Lack of wsgi environ is fine... we still have
 
-                # server.webpath
+    def __init__(self, errorstring, error):
 
-                pass
+        self.errorstring = errorstring
 
-        tgpath = webpath + tgpath
+        self.error = error
 
-    if tgparams is None:
+        super().__init__(errorstring)
 
-        tgparams = kwargs
 
-    else:
 
-        try:
 
-            tgparams = tgparams.copy()
 
-            tgparams.update(kwargs)
+class Redirect(Exception):
 
-        except AttributeError:
 
-            raise TypeError(
 
-                'url() expects a dictionary for query parameters')
+    """Exception to signal a redirect should happen.
 
-    args = []
 
-    # Add the _csrf_token
+
+    Attributes:
+
+        url: The URL to redirect to, as a QUrl.
+
+    """
+
+
+
+    def __init__(self, url):
+
+        super().__init__(url.toDisplayString())
+
+        self.url = url
+
+
+
+
+
+class add_handler:  # noqa: N801,N806 pylint: disable=invalid-name
+
+
+
+    """Decorator to register a qute://* URL handler.
+
+
+
+    Attributes:
+
+        _name: The 'foo' part of qute://foo
+
+        backend: Limit which backends the handler can run with.
+
+    """
+
+
+
+    def __init__(self, name, backend=None):
+
+        self._name = name
+
+        self._backend = backend
+
+        self._function = None
+
+
+
+    def __call__(self, function):
+
+        self._function = function
+
+        _HANDLERS[self._name] = self.wrapper
+
+        return function
+
+
+
+    def wrapper(self, *args, **kwargs):
+
+        """Call the underlying function."""
+
+        if self._backend is not None and objects.backend != self._backend:
+
+            return self.wrong_backend_handler(*args, **kwargs)
+
+        else:
+
+            return self._function(*args, **kwargs)
+
+
+
+    def wrong_backend_handler(self, url):
+
+        """Show an error page about using the invalid backend."""
+
+        src = jinja.render('error.html',
+
+                           title="Error while opening qute://url",
+
+                           url=url.toDisplayString(),
+
+                           error='{} is not available with this '
+
+                                 'backend'.format(url.toDisplayString()))
+
+        return 'text/html', src
+
+
+
+
+
+def data_for_url(url):
+
+    """Get the data to show for the given URL.
+
+
+
+    Args:
+
+        url: The QUrl to show.
+
+
+
+    Return:
+
+        A (mimetype, data) tuple.
+
+    """
+
+    norm_url = url.adjusted(QUrl.NormalizePathSegments |
+
+                            QUrl.StripTrailingSlash)
+
+    if norm_url != url:
+
+        raise Redirect(norm_url)
+
+
+
+    path = url.path()
+
+    host = url.host()
+
+    query = urlutils.query_string(url)
+
+    # A url like "qute:foo" is split as "scheme:path", not "scheme:host".
+
+    log.misc.debug("url: {}, path: {}, host {}".format(
+
+        url.toDisplayString(), path, host))
+
+    if not path or not host:
+
+        new_url = QUrl()
+
+        new_url.setScheme('qute')
+
+        # When path is absent, e.g. qute://help (with no trailing slash)
+
+        if host:
+
+            new_url.setHost(host)
+
+        # When host is absent, e.g. qute:help
+
+        else:
+
+            new_url.setHost(path)
+
+
+
+        new_url.setPath('/')
+
+        if query:
+
+            new_url.setQuery(query)
+
+        if new_url.host():  # path was a valid host
+
+            raise Redirect(new_url)
+
+
 
     try:
 
-        if identity.current.csrf_token:
+        handler = _HANDLERS[host]
 
-            tgparams.update({'_csrf_token': identity.current.csrf_token})
+    except KeyError:
 
-    except RequestRequiredException:  # pylint: disable-msg=W0704
-
-        # :W0704: If we are outside of a request (called from non-controller
-
-        # methods/ templates) just don't set the _csrf_token.
-
-        pass
+        raise NoHandlerFound(url)
 
 
 
-    # Check for query params in the current url
+    try:
 
-    query_params = six.iteritems(tgparams)
+        mimetype, data = handler(url)
 
-    scheme, netloc, path, params, query_s, fragment = urlparse(tgpath)
+    except OSError as e:
 
-    if query_s:
+        # FIXME:qtwebengine how to handle this?
 
-        query_params = chain((p for p in cgi.parse_qsl(query_s) if p[0] !=
+        raise QuteSchemeOSError(e)
 
-                              '_csrf_token'), query_params)
+    except QuteSchemeError:
+
+        raise
 
 
 
-    for key, value in query_params:
+    assert mimetype is not None, url
 
-        if value is None:
+    if mimetype == 'text/html' and isinstance(data, str):
+
+        # We let handlers return HTML as text
+
+        data = data.encode('utf-8', errors='xmlcharrefreplace')
+
+
+
+    return mimetype, data
+
+
+
+
+
+@add_handler('bookmarks')
+
+def qute_bookmarks(_url):
+
+    """Handler for qute://bookmarks. Display all quickmarks / bookmarks."""
+
+    bookmarks = sorted(objreg.get('bookmark-manager').marks.items(),
+
+                       key=lambda x: x[1])  # Sort by title
+
+    quickmarks = sorted(objreg.get('quickmark-manager').marks.items(),
+
+                        key=lambda x: x[0])  # Sort by name
+
+
+
+    src = jinja.render('bookmarks.html',
+
+                       title='Bookmarks',
+
+                       bookmarks=bookmarks,
+
+                       quickmarks=quickmarks)
+
+    return 'text/html', src
+
+
+
+
+
+@add_handler('tabs')
+
+def qute_tabs(_url):
+
+    """Handler for qute://tabs. Display information about all open tabs."""
+
+    tabs = collections.defaultdict(list)
+
+    for win_id, window in objreg.window_registry.items():
+
+        if sip.isdeleted(window):
 
             continue
 
-        if isinstance(value, (list, tuple)):
+        tabbed_browser = objreg.get('tabbed-browser',
 
-            pairs = [(key, v) for v in value]
+                                    scope='window',
 
-        else:
+                                    window=win_id)
 
-            pairs = [(key, value)]
+        for tab in tabbed_browser.widgets():
 
-        for key, value in pairs:
+            if tab.url() not in [QUrl("qute://tabs/"), QUrl("qute://tabs")]:
 
-            if value is None:
+                urlstr = tab.url().toDisplayString()
 
-                continue
+                tabs[str(win_id)].append((tab.title(), urlstr))
 
-            if isinstance(value, unicode):
 
-                value = value.encode('utf8')
 
-            args.append((key, str(value)))
+    src = jinja.render('tabs.html',
 
-    query_string = urlencode(args, True)
+                       title='Tabs',
 
-    tgpath = urlunparse((scheme, netloc, path, params, query_string, fragment))
+                       tab_list_by_window=tabs)
 
-    return tgpath
+    return 'text/html', src
 
 
 
 
 
-# this is taken from turbogears 1.1 branch
+def history_data(start_time, offset=None):
 
-def _get_server_name():
-
-    """Return name of the server this application runs on.
+    """Return history data.
 
 
 
-    Respects 'Host' and 'X-Forwarded-Host' header.
+    Arguments:
 
+        start_time: select history starting from this timestamp.
 
-
-    See the docstring of the 'absolute_url' function for more information.
-
-
-
-    .. note:: This comes from turbogears 1.1 branch.  It is only needed for
-
-        _tg_absolute_url().  If we find that turbogears.get_server_name()
-
-        exists, we replace this function with that one.
+        offset: number of items to skip
 
     """
 
-    get = config.get
+    # history atimes are stored as ints, ensure start_time is not a float
 
-    h = request.headers
+    start_time = int(start_time)
 
-    host = get('tg.url_domain') or h.get('X-Forwarded-Host', h.get('Host'))
+    hist = objreg.get('web-history')
 
-    if not host:
+    if offset is not None:
 
-        host = '%s:%s' % (get('server.socket_host', 'localhost'),
-
-                          get('server.socket_port', 8080))
-
-    return host
-
-
-
-
-
-# this is taken from turbogears 1.1 branch
-
-def tg_absolute_url(tgpath='/', params=None, **kw):
-
-    """Return absolute URL (including schema and host to this server).
-
-
-
-    Tries to account for 'Host' header and reverse proxying
-
-    ('X-Forwarded-Host').
-
-
-
-    The host name is determined this way:
-
-
-
-    * If the config setting 'tg.url_domain' is set and non-null, use this
-
-      value.
-
-    * Else, if the 'base_url_filter.use_x_forwarded_host' config setting is
-
-      True, use the value from the 'Host' or 'X-Forwarded-Host' request header.
-
-    * Else, if config setting 'base_url_filter.on' is True and
-
-      'base_url_filter.base_url' is non-null, use its value for the host AND
-
-      scheme part of the URL.
-
-    * As a last fallback, use the value of 'server.socket_host' and
-
-      'server.socket_port' config settings (defaults to 'localhost:8080').
-
-
-
-    The URL scheme ('http' or 'http') used is determined in the following way:
-
-
-
-    * If 'base_url_filter.base_url' is used, use the scheme from this URL.
-
-    * If there is a 'X-Use-SSL' request header, use 'https'.
-
-    * Else, if the config setting 'tg.url_scheme' is set, use its value.
-
-    * Else, use the value of 'cherrypy.request.scheme'.
-
-
-
-    .. note:: This comes from turbogears 1.1 branch with one change: we
-
-        call tg_url() rather than turbogears.url() so that it never adds the
-
-        csrf_token
-
-
-
-    .. versionadded:: 0.3.19
-
-       Modified from turbogears.absolute_url() for :ref:`CSRF-Protection`
-
-    """
-
-    get = config.get
-
-    use_xfh = get('base_url_filter.use_x_forwarded_host', False)
-
-    if request.headers.get('X-Use-SSL'):
-
-        scheme = 'https'
+        entries = hist.entries_before(start_time, limit=1000, offset=offset)
 
     else:
 
-        scheme = get('tg.url_scheme')
+        # end is 24hrs earlier than start
 
-    if not scheme:
+        end_time = start_time - 24*60*60
 
-        scheme = request.scheme
-
-    base_url = '%s://%s' % (scheme, _get_server_name())
-
-    if get('base_url_filter.on', False) and not use_xfh:
-
-        base_url = get('base_url_filter.base_url').rstrip('/')
-
-    return '%s%s' % (base_url, tg_url(tgpath, params, **kw))
+        entries = hist.entries_between(end_time, start_time)
 
 
 
+    return [{"url": e.url,
 
+             "title": html.escape(e.title) or html.escape(e.url),
 
-def absolute_url(tgpath='/', params=None, **kw):
-
-    """Return absolute URL (including schema and host to this server).
-
-
-
-    Tries to account for 'Host' header and reverse proxying
-
-    ('X-Forwarded-Host').
+             "time": e.atime} for e in entries]
 
 
 
-    The host name is determined this way:
+
+
+@add_handler('history')
+
+def qute_history(url):
+
+    """Handler for qute://history. Display and serve history."""
+
+    if url.path() == '/data':
+
+        try:
+
+            offset = QUrlQuery(url).queryItemValue("offset")
+
+            offset = int(offset) if offset else None
+
+        except ValueError as e:
+
+            raise QuteSchemeError("Query parameter offset is invalid", e)
+
+        # Use start_time in query or current time.
+
+        try:
+
+            start_time = QUrlQuery(url).queryItemValue("start_time")
+
+            start_time = float(start_time) if start_time else time.time()
+
+        except ValueError as e:
+
+            raise QuteSchemeError("Query parameter start_time is invalid", e)
 
 
 
-    * If the config setting 'tg.url_domain' is set and non-null, use this
+        return 'text/html', json.dumps(history_data(start_time, offset))
 
-      value.
+    else:
 
-    * Else, if the 'base_url_filter.use_x_forwarded_host' config setting is
+        return 'text/html', jinja.render(
 
-      True, use the value from the 'Host' or 'X-Forwarded-Host' request header.
+            'history.html',
 
-    * Else, if config setting 'base_url_filter.on' is True and
+            title='History',
 
-      'base_url_filter.base_url' is non-null, use its value for the host AND
+            gap_interval=config.val.history_gap_interval
 
-      scheme part of the URL.
-
-    * As a last fallback, use the value of 'server.socket_host' and
-
-      'server.socket_port' config settings (defaults to 'localhost:8080').
+        )
 
 
 
-    The URL scheme ('http' or 'http') used is determined in the following way:
+
+
+@add_handler('javascript')
+
+def qute_javascript(url):
+
+    """Handler for qute://javascript.
 
 
 
-    * If 'base_url_filter.base_url' is used, use the scheme from this URL.
-
-    * If there is a 'X-Use-SSL' request header, use 'https'.
-
-    * Else, if the config setting 'tg.url_scheme' is set, use its value.
-
-    * Else, use the value of 'cherrypy.request.scheme'.
-
-
-
-    .. versionadded:: 0.3.19
-
-       Modified from turbogears.absolute_url() for :ref:`CSRF-Protection`
+    Return content of file given as query parameter.
 
     """
 
-    return url(tg_absolute_url(tgpath, params, **kw))
+    path = url.path()
 
+    if path:
 
+        path = "javascript" + os.sep.join(path.split('/'))
 
+        return 'text/html', utils.read_file(path, binary=False)
 
+    else:
 
-def enable_csrf():
+        raise QuteSchemeError("No file specified", ValueError())
 
-    '''A startup function to setup :ref:`CSRF-Protection`.
 
 
 
-    This should be run at application startup.  Code like the following in the
 
-    start-APP script or the method in :file:`commands.py` that starts it::
+@add_handler('pyeval')
 
+def qute_pyeval(_url):
 
+    """Handler for qute://pyeval."""
 
-        from turbogears import startup
+    src = jinja.render('pre.html', title='pyeval', content=pyeval_output)
 
-        from fedora.tg.util import enable_csrf
+    return 'text/html', src
 
-        startup.call_on_startup.append(enable_csrf)
 
 
 
-    If we can get the :ref:`CSRF-Protection` into upstream :term:`TurboGears`,
 
-    we might be able to remove this in the future.
+@add_handler('spawn-output')
 
+def qute_spawn_output(_url):
 
+    """Handler for qute://spawn-output."""
 
-    .. versionadded:: 0.3.10
+    src = jinja.render('pre.html', title='spawn output', content=spawn_output)
 
-       Added to enable :ref:`CSRF-Protection`
+    return 'text/html', src
 
-    '''
 
-    # Override the turbogears.url function with our own
 
-    # Note, this also changes turbogears.absolute_url since that calls
 
-    # turbogears.url
 
-    turbogears.url = url
+@add_handler('version')
 
-    turbogears.controllers.url = url
+@add_handler('verizon')
 
+def qute_version(_url):
 
+    """Handler for qute://version."""
 
-    # Ignore the _csrf_token parameter
+    src = jinja.render('version.html', title='Version info',
 
-    ignore = config.get('tg.ignore_parameters', [])
+                       version=version.version(),
 
-    if '_csrf_token' not in ignore:
+                       copyright=qutebrowser.__copyright__)
 
-        ignore.append('_csrf_token')
+    return 'text/html', src
 
-        config.update({'tg.ignore_parameters': ignore})
 
 
 
-    # Add a function to the template tg stdvars that looks up a template.
 
-    turbogears.view.variable_providers.append(add_custom_stdvars)
+@add_handler('plainlog')
 
+def qute_plainlog(url):
 
+    """Handler for qute://plainlog.
 
 
 
-def request_format():
+    An optional query parameter specifies the minimum log level to print.
 
-    '''Return the output format that was requested by the user.
+    For example, qute://log?level=warning prints warnings and errors.
 
+    Level can be one of: vdebug, debug, info, warning, error, critical.
 
+    """
 
-    The user is able to specify a specific output format using either the
+    if log.ram_handler is None:
 
-    ``Accept:`` HTTP header or the ``tg_format`` query parameter.  This
+        text = "Log output was disabled."
 
-    function checks both of those to determine what format the reply should
+    else:
 
-    be in.
+        level = QUrlQuery(url).queryItemValue('level')
 
+        if not level:
 
+            level = 'vdebug'
 
-    :rtype: string
+        text = log.ram_handler.dump_log(html=False, level=level)
 
-    :returns: The requested format.  If none was specified, 'default' is
+    src = jinja.render('pre.html', title='log', content=text)
 
-        returned
+    return 'text/html', src
 
 
 
-    .. versionchanged:: 0.3.17
 
-        Return symbolic names for json, html, xhtml, and xml instead of
 
-        letting raw mime types through
+@add_handler('log')
 
-    '''
+def qute_log(url):
 
-    output_format = cherrypy.request.params.get('tg_format', '').lower()
+    """Handler for qute://log.
 
-    if not output_format:
 
-        ### TODO: Two problems with this:
 
-        # 1) TG lets this be extended via as_format and accept_format.  We need
+    An optional query parameter specifies the minimum log level to print.
 
-        #    tie into that as well somehow.
+    For example, qute://log?level=warning prints warnings and errors.
 
-        # 2) Decide whether to standardize on "json" or "application/json"
+    Level can be one of: vdebug, debug, info, warning, error, critical.
 
-        accept = tg_util.simplify_http_accept_header(
+    """
 
-            request.headers.get('Accept', 'default').lower())
+    if log.ram_handler is None:
 
-        if accept in ('text/javascript', 'application/json'):
+        html_log = None
 
-            output_format = 'json'
+    else:
 
-        elif accept == 'text/html':
+        level = QUrlQuery(url).queryItemValue('level')
 
-            output_format = 'html'
+        if not level:
 
-        elif accept == 'text/plain':
+            level = 'vdebug'
 
-            output_format = 'plain'
+        html_log = log.ram_handler.dump_log(html=True, level=level)
 
-        elif accept == 'text/xhtml':
 
-            output_format = 'xhtml'
 
-        elif accept == 'text/xml':
+    src = jinja.render('log.html', title='log', content=html_log)
 
-            output_format = 'xml'
+    return 'text/html', src
 
-        else:
 
-            output_format = accept
 
-    return output_format
 
 
+@add_handler('gpl')
 
+def qute_gpl(_url):
 
+    """Handler for qute://gpl. Return HTML content as string."""
 
-def jsonify_validation_errors():
+    return 'text/html', utils.read_file('html/license.html')
 
-    '''Return an error for :term:`JSON` if validation failed.
 
 
 
-    This function checks for two things:
 
+@add_handler('help')
 
+def qute_help(url):
 
-    1) We're expected to return :term:`JSON` data.
+    """Handler for qute://help."""
 
-    2) There were errors in the validation process.
+    urlpath = url.path()
 
+    if not urlpath or urlpath == '/':
 
+        urlpath = 'index.html'
 
-    If both of those are true, this function constructs a response that
+    else:
 
-    will return the validation error messages as :term:`JSON` data.
+        urlpath = urlpath.lstrip('/')
 
+    if not docutils.docs_up_to_date(urlpath):
 
+        message.error("Your documentation is outdated! Please re-run "
 
-    All controller methods that are error_handlers need to use this::
+                      "scripts/asciidoc2html.py.")
 
 
 
-        @expose(template='templates.numberform')
+    path = 'html/doc/{}'.format(urlpath)
 
-        def enter_number(self, number):
+    if not urlpath.endswith('.html'):
 
-            errors = fedora.tg.util.jsonify_validation_errors()
+        try:
 
-            if errors:
+            bdata = utils.read_file(path, binary=True)
 
-                return errors
+        except OSError as e:
 
-            [...]
+            raise QuteSchemeOSError(e)
 
+        mimetype, _encoding = mimetypes.guess_type(urlpath)
 
+        assert mimetype is not None, url
 
-        @expose(allow_json=True)
+        return mimetype, bdata
 
-        @error_handler(enter_number)
 
-        @validate(form=number_form)
 
-        def save(self, number):
+    try:
 
-            return dict(success=True)
+        data = utils.read_file(path)
 
+    except OSError:
 
+        # No .html around, let's see if we find the asciidoc
 
-    :rtype: None or dict
+        asciidoc_path = path.replace('.html', '.asciidoc')
 
-    :Returns: None if there are no validation errors or :term:`JSON` isn't
+        if asciidoc_path.startswith('html/doc/'):
 
-        requested, otherwise a dictionary with the error that's suitable for
+            asciidoc_path = asciidoc_path.replace('html/doc/', '../doc/help/')
 
-        return from the controller.  The error message is set in tg_flash
 
-        whether :term:`JSON` was requested or not.
 
-    '''
+        try:
 
-    # Check for validation errors
+            asciidoc = utils.read_file(asciidoc_path)
 
-    errors = getattr(cherrypy.request, 'validation_errors', None)
+        except OSError:
 
-    if not errors:
+            asciidoc = None
 
-        return None
 
 
+        if asciidoc is None:
 
-    # Set the message for both html and json output
+            raise
 
-    message = u'\n'.join([u'%s: %s' % (param, msg) for param, msg in
 
-                          errors.items()])
 
-    format = request_format()
+        preamble = textwrap.dedent("""
 
-    if format in ('html', 'xhtml'):
+            There was an error loading the documentation!
 
-        message.translate({ord('\n'): u'<br />\n'})
 
-    flash(message)
 
+            This most likely means the documentation was not generated
 
+            properly. If you are running qutebrowser from the git repository,
 
-    # If json, return additional information to make this an exception
+            please (re)run scripts/asciidoc2html.py and reload this page.
 
-    if format == 'json':
 
-        # Note: explicit setting of tg_template is needed in TG < 1.0.4.4
 
-        # A fix has been applied for TG-1.0.4.5
+            If you're running a released version this is a bug, please use
 
-        return dict(exc='Invalid', tg_template='json')
+            :report to report it.
 
-    return None
 
 
+            Falling back to the plaintext version.
 
 
 
-def json_or_redirect(forward_url):
+            ---------------------------------------------------------------
 
-    '''If :term:`JSON` is requested, return a dict, otherwise redirect.
 
 
 
-    This is a decorator to use with a method that returns :term:`JSON` by
 
-    default.  If :term:`JSON` is requested, then it will return the dict from
+        """)
 
-    the method.  If :term:`JSON` is not requested, it will redirect to the
+        return 'text/plain', (preamble + asciidoc).encode('utf-8')
 
-    given URL.  The method that is decorated should be constructed so that it
+    else:
 
-    calls turbogears.flash() with a message that will be displayed on the
+        return 'text/html', data
 
-    forward_url page.
 
 
 
-    Use it like this::
 
+@add_handler('backend-warning')
 
+def qute_backend_warning(_url):
 
-        import turbogears
+    """Handler for qute://backend-warning."""
 
+    src = jinja.render('backend-warning.html',
 
+                       distribution=version.distribution(),
 
-        @json_or_redirect('http://localhost/calc/')
+                       Distribution=version.Distribution,
 
-        @expose(allow_json=True)
+                       version=pkg_resources.parse_version,
 
-        def divide(self, dividend, divisor):
+                       title="Legacy backend warning")
 
-            try:
+    return 'text/html', src
 
-                answer = dividend * 1.0 / divisor
 
-            except ZeroDivisionError:
 
-                turbogears.flash('Division by zero not allowed')
 
-                return dict(exc='ZeroDivisionError')
 
-            turbogears.flash('The quotient is %s' % answer)
+def _qute_settings_set(url):
 
-            return dict(quotient=answer)
+    """Handler for qute://settings/set."""
 
+    query = QUrlQuery(url)
 
+    option = query.queryItemValue('option', QUrl.FullyDecoded)
 
-    In the example, we return either an exception or an answer, using
+    value = query.queryItemValue('value', QUrl.FullyDecoded)
 
-    :func:`turbogears.flash` to tell people of the result in either case.  If
 
-    :term:`JSON` data is requested, the user will get back a :term:`JSON`
 
-    string with the proper information.  If html is requested, we will be
+    # https://github.com/qutebrowser/qutebrowser/issues/727
 
-    redirected to 'http://localhost/calc/' where the flashed message will be
+    if option == 'content.javascript.enabled' and value == 'false':
 
-    displayed.
+        msg = ("Refusing to disable javascript via qute://settings "
 
+               "as it needs javascript support.")
 
+        message.error(msg)
 
-    :arg forward_url: If :term:`JSON` was not requested, redirect to this URL
+        return 'text/html', b'error: ' + msg.encode('utf-8')
 
-        after.
 
 
+    try:
 
-    .. versionadded:: 0.3.7
+        config.instance.set_str(option, value, save_yaml=True)
 
-       To make writing methods that use validation easier
+        return 'text/html', b'ok'
 
-    '''
+    except configexc.Error as e:
 
-    def call(func, *args, **kwargs):
+        message.error(str(e))
 
-        if request_format() == 'json':
+        return 'text/html', b'error: ' + str(e).encode('utf-8')
 
-            return func(*args, **kwargs)
 
-        else:
 
-            func(*args, **kwargs)
 
-            raise redirect(forward_url)
 
-    return decorator(call)
+@add_handler('settings')
 
+def qute_settings(url):
 
+    """Handler for qute://settings. View/change qute configuration."""
 
-if hasattr(turbogears, 'get_server_name'):
+    global csrf_token
 
-    _get_server_name = turbogears.get_server_name
 
 
+    if url.path() == '/set':
 
+        if url.password() != csrf_token:
 
+            message.error("Invalid CSRF token for qute://settings!")
 
-def fedora_template(template, template_type='genshi'):
+            raise QuteSchemeError("Invalid CSRF token!",
 
-    '''Function to return the path to a template.
+                                  QNetworkReply.ContentAccessDenied)
 
+        return _qute_settings_set(url)
 
 
-    :arg template: filename of the template itself.  Ex: login.html
 
-    :kwarg template_type: template language we need the template written in
+    # Requests to qute://settings/set should only be allowed from
 
-        Defaults to 'genshi'
+    # qute://settings. As an additional security precaution, we generate a CSRF
 
-    :returns: filesystem path to the template
+    # token to use here.
 
-    '''
+    if secrets:
 
-    # :E1101: pkg_resources does have resource_filename
+        csrf_token = secrets.token_urlsafe()
 
-    # pylint: disable-msg=E1101
+    else:
 
-    return pkg_resources.resource_filename(
+        # On Python < 3.6, from secrets.py
 
-        'fedora', os.path.join('tg',
+        token = base64.urlsafe_b64encode(os.urandom(32))
 
-                               'templates', template_type, template))
+        csrf_token = token.rstrip(b'=').decode('ascii')
 
 
 
-__all__ = (
+    src = jinja.render('settings.html', title='settings',
 
-    'add_custom_stdvars', 'absolute_url', 'enable_csrf',
+                       configdata=configdata,
 
-    'fedora_template', 'jsonify_validation_errors', 'json_or_redirect',
+                       confget=config.instance.get_str,
 
-    'request_format', 'tg_absolute_url', 'tg_url', 'url')
+                       csrf_token=csrf_token)
+
+    return 'text/html', src
+
+
+
+
+
+@add_handler('bindings')
+
+def qute_bindings(_url):
+
+    """Handler for qute://bindings. View keybindings."""
+
+    bindings = {}
+
+    defaults = config.val.bindings.default
+
+    modes = set(defaults.keys()).union(config.val.bindings.commands)
+
+    modes.remove('normal')
+
+    modes = ['normal'] + sorted(list(modes))
+
+    for mode in modes:
+
+        bindings[mode] = config.key_instance.get_bindings_for(mode)
+
+
+
+    src = jinja.render('bindings.html', title='Bindings',
+
+                       bindings=bindings)
+
+    return 'text/html', src
+
+
+
+
+
+@add_handler('back')
+
+def qute_back(url):
+
+    """Handler for qute://back.
+
+
+
+    Simple page to free ram / lazy load a site, goes back on focusing the tab.
+
+    """
+
+    src = jinja.render(
+
+        'back.html',
+
+        title='Suspended: ' + urllib.parse.unquote(url.fragment()))
+
+    return 'text/html', src
+
+
+
+
+
+@add_handler('configdiff')
+
+def qute_configdiff(url):
+
+    """Handler for qute://configdiff."""
+
+    if url.path() == '/old':
+
+        try:
+
+            return 'text/html', configdiff.get_diff()
+
+        except OSError as e:
+
+            error = (b'Failed to read old config: ' +
+
+                     str(e.strerror).encode('utf-8'))
+
+            return 'text/plain', error
+
+    else:
+
+        data = config.instance.dump_userconfig().encode('utf-8')
+
+        return 'text/plain', data
+
+
+
+
+
+@add_handler('pastebin-version')
+
+def qute_pastebin_version(_url):
+
+    """Handler that pastebins the version string."""
+
+    version.pastebin_version()
+
+    return 'text/plain', b'Paste called.'

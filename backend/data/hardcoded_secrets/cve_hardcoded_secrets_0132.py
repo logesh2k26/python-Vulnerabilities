@@ -2,1282 +2,1700 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
+# -*- coding: utf-8 -*-
 
 
 
-# Copyright 2012 OpenStack LLC
+from __future__ import print_function
 
-#
+from __future__ import absolute_import
 
-# Licensed under the Apache License, Version 2.0 (the "License"); you may
 
-# not use this file except in compliance with the License. You may obtain
 
-# a copy of the License at
+from typing import List, TYPE_CHECKING
 
-#
 
-#      http://www.apache.org/licenses/LICENSE-2.0
 
-#
+from zulint.custom_rules import RuleList
 
-# Unless required by applicable law or agreed to in writing, software
+if TYPE_CHECKING:
 
-# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+    from zulint.custom_rules import Rule
 
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
-# License for the specific language governing permissions and limitations
 
-# under the License.
+# Rule help:
 
+# By default, a rule applies to all files within the extension for which it is specified (e.g. all .py files)
 
+# There are three operators we can use to manually include or exclude files from linting for a rule:
 
-"""Main entry point into the Identity service."""
+# 'exclude': 'set([<path>, ...])' - if <path> is a filename, excludes that file.
 
+#                                   if <path> is a directory, excludes all files directly below the directory <path>.
 
+# 'exclude_line': 'set([(<path>, <line>), ...])' - excludes all lines matching <line> in the file <path> from linting.
 
-import uuid
+# 'include_only': 'set([<path>, ...])' - includes only those files where <path> is a substring of the filepath.
 
-import urllib
 
-import urlparse
 
+PYDELIMS = r'''"'()\[\]{}#\\'''
 
+PYREG = r"[^{}]".format(PYDELIMS)
 
-from keystone import config
+PYSQ = r'"(?:[^"\\]|\\.)*"'
 
-from keystone import exception
+PYDQ = r"'(?:[^'\\]|\\.)*'"
 
-from keystone import policy
+PYLEFT = r"[(\[{]"
 
-from keystone import token
+PYRIGHT = r"[)\]}]"
 
-from keystone.common import logging
+PYCODE = PYREG
 
-from keystone.common import manager
+for depth in range(5):
 
-from keystone.common import wsgi
+    PYGROUP = r"""(?:{}|{}|{}{}*{})""".format(PYSQ, PYDQ, PYLEFT, PYCODE, PYRIGHT)
 
+    PYCODE = r"""(?:{}|{})""".format(PYREG, PYGROUP)
 
 
 
+FILES_WITH_LEGACY_SUBJECT = {
 
-CONF = config.CONF
+    # This basically requires a big DB migration:
 
+    'zerver/lib/topic.py',
 
 
-LOG = logging.getLogger(__name__)
 
+    # This is for backward compatibility.
 
+    'zerver/tests/test_legacy_subject.py',
 
 
 
-class Manager(manager.Manager):
+    # Other migration-related changes require extreme care.
 
-    """Default pivot point for the Identity backend.
+    'zerver/lib/fix_unreads.py',
 
+    'zerver/tests/test_migrations.py',
 
 
-    See :mod:`keystone.common.manager.Manager` for more details on how this
 
-    dynamically calls the backend.
+    # These use subject in the email sense, and will
 
+    # probably always be exempt:
 
+    'zerver/lib/email_mirror.py',
 
-    """
+    'zerver/lib/feedback.py',
 
+    'zerver/tests/test_new_users.py',
 
+    'zerver/tests/test_email_mirror.py',
 
-    def __init__(self):
 
-        super(Manager, self).__init__(CONF.identity.driver)
 
+    # These are tied more to our API than our DB model.
 
+    'zerver/openapi/python_examples.py',
 
+    'zerver/tests/test_openapi.py',
 
 
-class Driver(object):
 
-    """Interface description for an Identity driver."""
+    # This has lots of query data embedded, so it's hard
 
+    # to fix everything until we migrate the DB to "topic".
 
+    'zerver/tests/test_narrow.py',
 
-    def authenticate(self, user_id=None, tenant_id=None, password=None):
+}
 
-        """Authenticate a given user, tenant and password.
 
 
+shebang_rules = [
 
-        Returns: (user, tenant, metadata).
+    {'pattern': '^#!',
 
+     'description': "zerver library code shouldn't have a shebang line.",
 
+     'include_only': set(['zerver/'])},
 
-        """
+    # /bin/sh and /usr/bin/env are the only two binaries
 
-        raise exception.NotImplemented()
+    # that NixOS provides at a fixed path (outside a
 
+    # buildFHSUserEnv sandbox).
 
+    {'pattern': '^#!(?! *(?:/usr/bin/env|/bin/sh)(?: |$))',
 
-    def get_tenant(self, tenant_id):
+     'description': "Use `#!/usr/bin/env foo` instead of `#!/path/foo`"
 
-        """Get a tenant by id.
+     " for interpreters other than sh."},
 
+    {'pattern': '^#!/usr/bin/env python$',
 
+     'description': "Use `#!/usr/bin/env python3` instead of `#!/usr/bin/env python`."}
 
-        Returns: tenant_ref or None.
+]  # type: List[Rule]
 
 
 
-        """
+trailing_whitespace_rule = {
 
-        raise exception.NotImplemented()
+    'pattern': r'\s+$',
 
+    'strip': '\n',
 
+    'description': 'Fix trailing whitespace'
 
-    def get_tenant_by_name(self, tenant_name):
+}  # type: Rule
 
-        """Get a tenant by name.
+whitespace_rules = [
 
+    # This linter should be first since bash_rules depends on it.
 
+    trailing_whitespace_rule,
 
-        Returns: tenant_ref or None.
+    {'pattern': 'http://zulip.readthedocs.io',
 
+     'description': 'Use HTTPS when linking to ReadTheDocs',
 
+     },
 
-        """
+    {'pattern': '\t',
 
-        raise exception.NotImplemented()
+     'strip': '\n',
 
+     'exclude': set(['tools/ci/success-http-headers.txt']),
 
+     'description': 'Fix tab-based whitespace'},
 
-    def get_user(self, user_id):
+]  # type: List[Rule]
 
-        """Get a user by id.
+comma_whitespace_rule = [
 
+    {'pattern': ', {2,}[^#/ ]',
 
+     'exclude': set(['zerver/tests', 'frontend_tests/node_tests', 'corporate/tests']),
 
-        Returns: user_ref or None.
+     'description': "Remove multiple whitespaces after ','",
 
+     'good_lines': ['foo(1, 2, 3)', 'foo = bar  # some inline comment'],
 
+     'bad_lines': ['foo(1,  2, 3)', 'foo(1,    2, 3)']},
 
-        """
+]  # type: List[Rule]
 
-        raise exception.NotImplemented()
+markdown_whitespace_rules = list([rule for rule in whitespace_rules if rule['pattern'] != r'\s+$']) + [
 
+    # Two spaces trailing a line with other content is okay--it's a markdown line break.
 
+    # This rule finds one space trailing a non-space, three or more trailing spaces, and
 
-    def get_user_by_name(self, user_name):
+    # spaces on an empty line.
 
-        """Get a user by name.
+    {'pattern': r'((?<!\s)\s$)|(\s\s\s+$)|(^\s+$)',
 
+     'strip': '\n',
 
+     'description': 'Fix trailing whitespace'},
 
-        Returns: user_ref or None.
+    {'pattern': '^#+[A-Za-z0-9]',
 
+     'strip': '\n',
 
+     'description': 'Missing space after # in heading',
 
-        """
+     'good_lines': ['### some heading', '# another heading'],
 
-        raise exception.NotImplemented()
+     'bad_lines': ['###some heading', '#another heading']},
 
+]
 
 
-    def get_role(self, role_id):
 
-        """Get a role by id.
 
 
+js_rules = RuleList(
 
-        Returns: role_ref or None.
+    langs=['js'],
 
+    rules=[
 
+        {'pattern': 'subject|SUBJECT',
 
-        """
+         'exclude': set(['static/js/util.js',
 
-        raise exception.NotImplemented()
+                         'frontend_tests/']),
 
+         'exclude_pattern': 'emails',
 
+         'description': 'avoid subject in JS code',
 
-    def list_users(self):
+         'good_lines': ['topic_name'],
 
-        """List all users in the system.
+         'bad_lines': ['subject="foo"', ' MAX_SUBJECT_LEN']},
 
+        {'pattern': r'[^_]function\(',
 
+         'description': 'The keyword "function" should be followed by a space'},
 
-        NOTE(termie): I'd prefer if this listed only the users for a given
+        {'pattern': 'msgid|MSGID',
 
-                      tenant.
+         'description': 'Avoid using "msgid" as a variable name; use "message_id" instead.'},
 
+        {'pattern': r'.*blueslip.warning\(.*',
 
+         'description': 'The module blueslip has no function warning, try using blueslip.warn'},
 
-        Returns: a list of user_refs or an empty list.
+        {'pattern': '[)]{$',
 
+         'description': 'Missing space between ) and {'},
 
+        {'pattern': r'i18n\.t\([^)]+[^,\{\)]$',
 
-        """
+         'description': 'i18n string should not be a multiline string'},
 
-        raise exception.NotImplemented()
+        {'pattern': r'''i18n\.t\(['"].+?['"]\s*\+''',
 
+         'description': 'Do not concatenate arguments within i18n.t()'},
 
+        {'pattern': r'i18n\.t\(.+\).*\+',
 
-    def list_roles(self):
+         'description': 'Do not concatenate i18n strings'},
 
-        """List all roles in the system.
+        {'pattern': r'\+.*i18n\.t\(.+\)',
 
+         'description': 'Do not concatenate i18n strings'},
 
+        {'pattern': '[.]includes[(]',
 
-        Returns: a list of role_refs or an empty list.
+         'exclude': {'frontend_tests/'},
 
+         'description': '.includes() is incompatible with Internet Explorer. Use .indexOf() !== -1 instead.'},
 
+        {'pattern': '[.]html[(]',
 
-        """
+         'exclude_pattern': r'''[.]html[(]("|'|render_|html|message.content|sub.rendered_description|i18n.t|rendered_|$|[)]|error_text|widget_elem|[$]error|[$][(]"<p>"[)])''',
 
-        raise exception.NotImplemented()
+         'exclude': {'static/js/portico', 'static/js/lightbox.js', 'static/js/ui_report.js',
 
+                     'static/js/confirm_dialog.js',
 
+                     'frontend_tests/'},
 
-    # NOTE(termie): seven calls below should probably be exposed by the api
+         'description': 'Setting HTML content with jQuery .html() can lead to XSS security bugs.  Consider .text() or using rendered_foo as a variable name if content comes from handlebars and thus is already sanitized.'},
 
-    #               more clearly when the api redesign happens
+        {'pattern': '["\']json/',
 
-    def add_user_to_tenant(self, tenant_id, user_id):
+         'description': 'Relative URL for JSON route not supported by i18n'},
 
-        raise exception.NotImplemented()
+        # This rule is constructed with + to avoid triggering on itself
 
+        {'pattern': " =" + '[^ =>~"]',
 
+         'description': 'Missing whitespace after "="'},
 
-    def remove_user_from_tenant(self, tenant_id, user_id):
+        {'pattern': '^[ ]*//[A-Za-z0-9]',
 
-        raise exception.NotImplemented()
+         'description': 'Missing space after // in comment'},
 
+        {'pattern': 'if[(]',
 
+         'description': 'Missing space between if and ('},
 
-    def get_all_tenants(self):
+        {'pattern': 'else{$',
 
-        raise exception.NotImplemented()
+         'description': 'Missing space between else and {'},
 
+        {'pattern': '^else {$',
 
+         'description': 'Write JS else statements on same line as }'},
 
-    def get_tenants_for_user(self, user_id):
+        {'pattern': '^else if',
 
-        """Get the tenants associated with a given user.
+         'description': 'Write JS else statements on same line as }'},
 
+        {'pattern': 'console[.][a-z]',
 
+         'exclude': set(['static/js/blueslip.js',
 
-        Returns: a list of tenant ids.
+                         'frontend_tests/zjsunit',
 
+                         'frontend_tests/casper_lib/common.js',
 
+                         'frontend_tests/node_tests',
 
-        """
+                         'static/js/debug.js']),
 
-        raise exception.NotImplemented()
+         'description': 'console.log and similar should not be used in webapp'},
 
+        {'pattern': r'''[.]text\(["'][a-zA-Z]''',
 
+         'description': 'Strings passed to $().text should be wrapped in i18n.t() for internationalization',
 
-    def get_roles_for_user_and_tenant(self, user_id, tenant_id):
+         'exclude': set(['frontend_tests/node_tests/'])},
 
-        """Get the roles associated with a user within given tenant.
+        {'pattern': r'''compose_error\(["']''',
 
+         'description': 'Argument to compose_error should be a literal string enclosed '
 
+                        'by i18n.t()'},
 
-        Returns: a list of role ids.
+        {'pattern': r'ui.report_success\(',
 
+         'description': 'Deprecated function, use ui_report.success.'},
 
+        {'pattern': r'''report.success\(["']''',
 
-        """
+         'description': 'Argument to report_success should be a literal string enclosed '
 
-        raise exception.NotImplemented()
+                        'by i18n.t()'},
 
+        {'pattern': r'ui.report_error\(',
 
+         'description': 'Deprecated function, use ui_report.error.'},
 
-    def add_role_to_user_and_tenant(self, user_id, tenant_id, role_id):
+        {'pattern': r'''report.error\(["'][^'"]''',
 
-        """Add a role to a user within given tenant."""
+         'description': 'Argument to ui_report.error should be a literal string enclosed '
 
-        raise exception.NotImplemented()
+                        'by i18n.t()',
 
+         'good_lines': ['ui_report.error("")', 'ui_report.error(_("text"))'],
 
+         'bad_lines': ['ui_report.error("test")']},
 
-    def remove_role_from_user_and_tenant(self, user_id, tenant_id, role_id):
+        {'pattern': r'\$\(document\)\.ready\(',
 
-        """Remove a role from a user within given tenant."""
+         'description': "`Use $(f) rather than `$(document).ready(f)`",
 
-        raise exception.NotImplemented()
+         'good_lines': ['$(function () {foo();}'],
 
+         'bad_lines': ['$(document).ready(function () {foo();}']},
 
+        {'pattern': '[$][.](get|post|patch|delete|ajax)[(]',
 
-    # user crud
+         'description': "Use channel module for AJAX calls",
 
-    def create_user(self, user_id, user):
+         'exclude': set([
 
-        raise exception.NotImplemented()
+             # Internal modules can do direct network calls
 
+             'static/js/blueslip.js',
 
+             'static/js/channel.js',
 
-    def update_user(self, user_id, user):
+             # External modules that don't include channel.js
 
-        raise exception.NotImplemented()
+             'static/js/stats/',
 
+             'static/js/portico/',
 
+             'static/js/billing/',
 
-    def delete_user(self, user_id):
+         ]),
 
-        raise exception.NotImplemented()
+         'good_lines': ['channel.get(...)'],
 
+         'bad_lines': ['$.get()', '$.post()', '$.ajax()']},
 
+        {'pattern': 'style ?=',
 
-    # tenant crud
+         'description': "Avoid using the `style=` attribute; we prefer styling in CSS files",
 
-    def create_tenant(self, tenant_id, tenant):
+         'exclude': set([
 
-        raise exception.NotImplemented()
+             'frontend_tests/node_tests/copy_and_paste.js',
 
+             'frontend_tests/node_tests/upload.js',
 
+             'frontend_tests/node_tests/templates.js',
 
-    def update_tenant(self, tenant_id, tenant):
+             'static/js/upload.js',
 
-        raise exception.NotImplemented()
+             'static/js/stream_color.js',
 
+         ]),
 
+         'good_lines': ['#my-style {color: blue;}'],
 
-    def delete_tenant(self, tenant_id, tenant):
+         'bad_lines': ['<p style="color: blue;">Foo</p>', 'style = "color: blue;"']},
 
-        raise exception.NotImplemented()
+        *whitespace_rules,
 
+        *comma_whitespace_rule,
 
+    ],
 
-    # metadata crud
+)
 
 
 
-    def get_metadata(self, user_id, tenant_id):
+python_rules = RuleList(
 
-        raise exception.NotImplemented()
+    langs=['py'],
 
+    rules=[
 
+        {'pattern': 'subject|SUBJECT',
 
-    def create_metadata(self, user_id, tenant_id, metadata):
+         'exclude_pattern': 'subject to the|email|outbox',
 
-        raise exception.NotImplemented()
+         'description': 'avoid subject as a var',
 
+         'good_lines': ['topic_name'],
 
+         'bad_lines': ['subject="foo"', ' MAX_SUBJECT_LEN'],
 
-    def update_metadata(self, user_id, tenant_id, metadata):
+         'exclude': FILES_WITH_LEGACY_SUBJECT,
 
-        raise exception.NotImplemented()
+         'include_only': set([
 
+             'zerver/data_import/',
 
+             'zerver/lib/',
 
-    def delete_metadata(self, user_id, tenant_id, metadata):
+             'zerver/tests/',
 
-        raise exception.NotImplemented()
+             'zerver/views/'])},
 
+        {'pattern': 'msgid|MSGID',
 
+         'exclude': set(['tools/check-capitalization',
 
-    # role crud
+                         'tools/i18n/tagmessages']),
 
-    def create_role(self, role_id, role):
+         'description': 'Avoid using "msgid" as a variable name; use "message_id" instead.'},
 
-        raise exception.NotImplemented()
+        {'pattern': '^(?!#)@login_required',
 
+         'description': '@login_required is unsupported; use @zulip_login_required',
 
+         'good_lines': ['@zulip_login_required', '# foo @login_required'],
 
-    def update_role(self, role_id, role):
+         'bad_lines': ['@login_required', ' @login_required']},
 
-        raise exception.NotImplemented()
+        {'pattern': '^user_profile[.]save[(][)]',
 
+         'description': 'Always pass update_fields when saving user_profile objects',
 
+         'exclude_line': set([
 
-    def delete_role(self, role_id):
+             ('zerver/lib/actions.py', "user_profile.save()  # Can't use update_fields because of how the foreign key works."),
 
-        raise exception.NotImplemented()
+         ]),
 
+         'exclude': set(['zerver/tests', 'zerver/lib/create_user.py']),
 
+         'good_lines': ['user_profile.save(update_fields=["pointer"])'],
 
+         'bad_lines': ['user_profile.save()']},
 
+        {'pattern': r'^[^"]*"[^"]*"%\(',
 
-class PublicRouter(wsgi.ComposableRouter):
+         'description': 'Missing space around "%"',
 
-    def add_routes(self, mapper):
+         'good_lines': ['"%s" % ("foo")', '"%s" % (foo)'],
 
-        tenant_controller = TenantController()
+         'bad_lines': ['"%s"%("foo")', '"%s"%(foo)']},
 
-        mapper.connect('/tenants',
+        {'pattern': r"^[^']*'[^']*'%\(",
 
-                       controller=tenant_controller,
+         'description': 'Missing space around "%"',
 
-                       action='get_tenants_for_token',
+         'good_lines': ["'%s' % ('foo')", "'%s' % (foo)"],
 
-                       conditions=dict(methods=['GET']))
+         'bad_lines': ["'%s'%('foo')", "'%s'%(foo)"]},
 
+        {'pattern': 'self: Any',
 
+         'description': 'you can omit Any annotation for self',
 
+         'good_lines': ['def foo (self):'],
 
+         'bad_lines': ['def foo(self: Any):']},
 
-class AdminRouter(wsgi.ComposableRouter):
+        # This rule is constructed with + to avoid triggering on itself
 
-    def add_routes(self, mapper):
+        {'pattern': " =" + '[^ =>~"]',
 
-        # Tenant Operations
+         'description': 'Missing whitespace after "="',
 
-        tenant_controller = TenantController()
+         'good_lines': ['a = b', '5 == 6'],
 
-        mapper.connect('/tenants',
+         'bad_lines': ['a =b', 'asdf =42']},
 
-                       controller=tenant_controller,
+        {'pattern': r'":\w[^"]*$',
 
-                       action='get_all_tenants',
+         'description': 'Missing whitespace after ":"',
 
-                       conditions=dict(method=['GET']))
+         'exclude': set(['zerver/tests/test_push_notifications.py']),
 
-        mapper.connect('/tenants/{tenant_id}',
+         'good_lines': ['"foo": bar', '"some:string:with:colons"'],
 
-                       controller=tenant_controller,
+         'bad_lines': ['"foo":bar', '"foo":1']},
 
-                       action='get_tenant',
+        {'pattern': r"':\w[^']*$",
 
-                       conditions=dict(method=['GET']))
+         'description': 'Missing whitespace after ":"',
 
+         'good_lines': ["'foo': bar", "'some:string:with:colons'"],
 
+         'bad_lines': ["'foo':bar", "'foo':1"]},
 
-        # User Operations
+        {'pattern': r"^\s+#\w",
 
-        user_controller = UserController()
+         'strip': '\n',
 
-        mapper.connect('/users/{user_id}',
+         'exclude': set(['tools/droplets/create.py']),
 
-                       controller=user_controller,
+         'description': 'Missing whitespace after "#"',
 
-                       action='get_user',
+         'good_lines': ['a = b # some operation', '1+2 #  3 is the result'],
 
-                       conditions=dict(method=['GET']))
+         'bad_lines': [' #some operation', '  #not valid!!!']},
 
+        {'pattern': "assertEquals[(]",
 
+         'description': 'Use assertEqual, not assertEquals (which is deprecated).',
 
-        # Role Operations
+         'good_lines': ['assertEqual(1, 2)'],
 
-        roles_controller = RoleController()
+         'bad_lines': ['assertEquals(1, 2)']},
 
-        mapper.connect('/tenants/{tenant_id}/users/{user_id}/roles',
+        {'pattern': "== None",
 
-                       controller=roles_controller,
+         'description': 'Use `is None` to check whether something is None',
 
-                       action='get_user_roles',
+         'good_lines': ['if foo is None'],
 
-                       conditions=dict(method=['GET']))
+         'bad_lines': ['foo == None']},
 
-        mapper.connect('/users/{user_id}/roles',
+        {'pattern': "type:[(]",
 
-                       controller=roles_controller,
+         'description': 'Missing whitespace after ":" in type annotation',
 
-                       action='get_user_roles',
+         'good_lines': ['# type: (Any, Any)', 'colon:separated:string:containing:type:as:keyword'],
 
-                       conditions=dict(method=['GET']))
+         'bad_lines': ['# type:(Any, Any)']},
 
+        {'pattern': "type: ignore$",
 
+         'exclude': set(['tools/tests',
 
+                         'zerver/lib/test_runner.py',
 
+                         'zerver/tests']),
 
-class TenantController(wsgi.Application):
+         'description': '"type: ignore" should always end with "# type: ignore # explanation for why"',
 
-    def __init__(self):
+         'good_lines': ['foo = bar  # type: ignore # explanation'],
 
-        self.identity_api = Manager()
+         'bad_lines': ['foo = bar  # type: ignore']},
 
-        self.policy_api = policy.Manager()
+        {'pattern': "# type [(]",
 
-        self.token_api = token.Manager()
+         'description': 'Missing : after type in type annotation',
 
-        super(TenantController, self).__init__()
+         'good_lines': ['foo = 42  # type: int', '# type: (str, int) -> None'],
 
+         'bad_lines': ['# type (str, int) -> None']},
 
+        {'pattern': "#type",
 
-    def get_all_tenants(self, context, **kw):
+         'description': 'Missing whitespace after "#" in type annotation',
 
-        """Gets a list of all tenants for an admin user."""
+         'good_lines': ['foo = 42  # type: int'],
 
-        self.assert_admin(context)
+         'bad_lines': ['foo = 42  #type: int']},
 
-        tenant_refs = self.identity_api.get_tenants(context)
+        {'pattern': r'\b(if|else|while)[(]',
 
-        params = {
+         'description': 'Put a space between statements like if, else, etc. and (.',
 
-            'limit': context['query_string'].get('limit'),
+         'good_lines': ['if (1 == 2):', 'while (foo == bar):'],
 
-            'marker': context['query_string'].get('marker'),
+         'bad_lines': ['if(1 == 2):', 'while(foo == bar):']},
 
-        }
+        {'pattern': ", [)]",
 
-        return self._format_tenant_list(tenant_refs, **params)
+         'description': 'Unnecessary whitespace between "," and ")"',
 
+         'good_lines': ['foo = (1, 2, 3,)', 'foo(bar, 42)'],
 
+         'bad_lines': ['foo = (1, 2, 3, )']},
 
-    def get_tenants_for_token(self, context, **kw):
+        {'pattern': "%  [(]",
 
-        """Get valid tenants for token based on token used to authenticate.
+         'description': 'Unnecessary whitespace between "%" and "("',
 
+         'good_lines': ['"foo %s bar" % ("baz",)'],
 
+         'bad_lines': ['"foo %s bar" %  ("baz",)']},
 
-        Pulls the token from the context, validates it and gets the valid
+        # This next check could have false positives, but it seems pretty
 
-        tenants for the user in the token.
+        # rare; if we find any, they can be added to the exclude list for
 
+        # this rule.
 
+        {'pattern': r"""^(?:[^'"#\\]|{}|{})*(?:{}|{})\s*%\s*(?![\s({{\\]|dict\(|tuple\()(?:[^,{}]|{})+(?:$|[,#\\]|{})""".format(
 
-        Doesn't care about token scopedness.
+            PYSQ, PYDQ, PYSQ, PYDQ, PYDELIMS, PYGROUP, PYRIGHT),
 
+         'description': 'Used % formatting without a tuple',
 
+         'good_lines': ['"foo %s bar" % ("baz",)'],
 
-        """
+         'bad_lines': ['"foo %s bar" % "baz"']},
 
-        try:
+        {'pattern': r"""^(?:[^'"#\\]|{}|{})*(?:{}|{})\s*%\s*\((?:[^,{}]|{})*\)""".format(
 
-            token_ref = self.token_api.get_token(context=context,
+            PYSQ, PYDQ, PYSQ, PYDQ, PYDELIMS, PYGROUP),
 
-                                                 token_id=context['token_id'])
+         'description': 'Used % formatting with parentheses that do not form a tuple',
 
-        except exception.NotFound:
+         'good_lines': ['"foo %s bar" % ("baz",)"'],
 
-            raise exception.Unauthorized()
+         'bad_lines': ['"foo %s bar" % ("baz")']},
 
+        {'pattern': 'sudo',
 
+         'include_only': set(['scripts/']),
 
-        user_ref = token_ref['user']
+         'exclude': set(['scripts/lib/setup_venv.py']),
 
-        tenant_ids = self.identity_api.get_tenants_for_user(
+         'exclude_line': set([
 
-                context, user_ref['id'])
+             ('scripts/lib/zulip_tools.py', 'sudo_args = kwargs.pop(\'sudo_args\', [])'),
 
-        tenant_refs = []
+             ('scripts/lib/zulip_tools.py', 'args = [\'sudo\'] + sudo_args + [\'--\'] + args'),
 
-        for tenant_id in tenant_ids:
+         ]),
 
-            tenant_refs.append(self.identity_api.get_tenant(
+         'description': 'Most scripts are intended to run on systems without sudo.',
 
-                    context=context,
+         'good_lines': ['subprocess.check_call(["ls"])'],
 
-                    tenant_id=tenant_id))
+         'bad_lines': ['subprocess.check_call(["sudo", "ls"])']},
 
-        params = {
+        {'pattern': 'django.utils.translation',
 
-            'limit': context['query_string'].get('limit'),
+         'include_only': set(['test/', 'zerver/views/development/']),
 
-            'marker': context['query_string'].get('marker'),
+         'description': 'Test strings should not be tagged for translation',
 
-        }
+         'good_lines': [''],
 
-        return self._format_tenant_list(tenant_refs, **params)
+         'bad_lines': ['django.utils.translation']},
 
+        {'pattern': 'userid',
 
+         'description': 'We prefer user_id over userid.',
 
-    def get_tenant(self, context, tenant_id):
+         'good_lines': ['id = alice.user_id'],
 
-        # TODO(termie): this stuff should probably be moved to middleware
+         'bad_lines': ['id = alice.userid']},
 
-        self.assert_admin(context)
+        {'pattern': r'json_success\({}\)',
 
-        tenant = self.identity_api.get_tenant(context, tenant_id)
+         'description': 'Use json_success() to return nothing',
 
-        if tenant is None:
+         'good_lines': ['return json_success()'],
 
-            raise exception.TenantNotFound(tenant_id=tenant_id)
+         'bad_lines': ['return json_success({})']},
 
+        {'pattern': r'\Wjson_error\(_\(?\w+\)',
 
+         'exclude': set(['zerver/tests', 'zerver/views/development/']),
 
-        return {'tenant': tenant}
+         'description': 'Argument to json_error should be a literal string enclosed by _()',
 
+         'good_lines': ['return json_error(_("string"))'],
 
+         'bad_lines': ['return json_error(_variable)', 'return json_error(_(variable))']},
 
-    # CRUD Extension
+        {'pattern': r'''\Wjson_error\(['"].+[),]$''',
 
-    def create_tenant(self, context, tenant):
+         'exclude': set(['zerver/tests']),
 
-        tenant_ref = self._normalize_dict(tenant)
+         'description': 'Argument to json_error should a literal string enclosed by _()'},
 
+        # To avoid JsonableError(_variable) and JsonableError(_(variable))
 
+        {'pattern': r'\WJsonableError\(_\(?\w.+\)',
 
-        if not 'name' in tenant_ref or not tenant_ref['name']:
+         'exclude': set(['zerver/tests', 'zerver/views/development/']),
 
-            msg = 'Name field is required and cannot be empty'
+         'description': 'Argument to JsonableError should be a literal string enclosed by _()'},
 
-            raise exception.ValidationError(message=msg)
+        {'pattern': r'''\WJsonableError\(["'].+\)''',
 
+         'exclude': set(['zerver/tests', 'zerver/views/development/']),
 
+         'description': 'Argument to JsonableError should be a literal string enclosed by _()'},
 
-        self.assert_admin(context)
+        {'pattern': r"""\b_\((?:\s|{}|{})*[^\s'")]""".format(PYSQ, PYDQ),
 
-        tenant_id = (tenant_ref.get('id')
+         'description': 'Called _() on a computed string',
 
-                     and tenant_ref.get('id')
+         'exclude_line': set([
 
-                     or uuid.uuid4().hex)
+             ('zerver/lib/i18n.py', 'result = _(string)'),
 
-        tenant_ref['id'] = tenant_id
+         ]),
 
+         'good_lines': ["return json_error(_('No presence data for %s') % (target.email,))"],
 
+         'bad_lines': ["return json_error(_('No presence data for %s' % (target.email,)))"]},
 
-        tenant = self.identity_api.create_tenant(
+        {'pattern': r'''([a-zA-Z0-9_]+)=REQ\(['"]\1['"]''',
 
-                context, tenant_id, tenant_ref)
+         'description': 'REQ\'s first argument already defaults to parameter name'},
 
-        return {'tenant': tenant}
+        {'pattern': r'self\.client\.(get|post|patch|put|delete)',
 
+         'description': \
 
+         '''Do not call self.client directly for put/patch/post/get.
 
-    def update_tenant(self, context, tenant_id, tenant):
+    See WRAPPER_COMMENT in test_helpers.py for details.
 
-        self.assert_admin(context)
+    '''},
 
-        if self.identity_api.get_tenant(context, tenant_id) is None:
+        # Directly fetching Message objects in e.g. views code is often a security bug.
 
-            raise exception.TenantNotFound(tenant_id=tenant_id)
+        {'pattern': '[^r]Message.objects.get',
 
+         'exclude': set(["zerver/tests",
 
+                         "zerver/lib/onboarding.py",
 
-        tenant_ref = self.identity_api.update_tenant(
+                         "zilencer/management/commands/add_mock_conversation.py",
 
-                context, tenant_id, tenant)
+                         "zerver/worker/queue_processors.py",
 
-        return {'tenant': tenant_ref}
+                         "zerver/management/commands/export.py",
 
+                         "zerver/lib/export.py"]),
 
+         'description': 'Please use access_message() to fetch Message objects',
 
-    def delete_tenant(self, context, tenant_id, **kw):
+         },
 
-        self.assert_admin(context)
+        {'pattern': 'Stream.objects.get',
 
-        if self.identity_api.get_tenant(context, tenant_id) is None:
+         'include_only': set(["zerver/views/"]),
 
-            raise exception.TenantNotFound(tenant_id=tenant_id)
+         'description': 'Please use access_stream_by_*() to fetch Stream objects',
 
+         },
 
+        {'pattern': 'get_stream[(]',
 
-        self.identity_api.delete_tenant(context, tenant_id)
+         'include_only': set(["zerver/views/", "zerver/lib/actions.py"]),
 
+         'exclude_line': set([
 
+             # This one in check_message is kinda terrible, since it's
 
-    def get_tenant_users(self, context, tenant_id, **kw):
+             # how most instances are written, but better to exclude something than nothing
 
-        self.assert_admin(context)
+             ('zerver/lib/actions.py', 'stream = get_stream(stream_name, realm)'),
 
-        if self.identity_api.get_tenant(context, tenant_id) is None:
+             ('zerver/lib/actions.py', 'get_stream(admin_realm_signup_notifications_stream, admin_realm)'),
 
-            raise exception.TenantNotFound(tenant_id=tenant_id)
+         ]),
 
+         'description': 'Please use access_stream_by_*() to fetch Stream objects',
 
+         },
 
-        user_refs = self.identity_api.get_tenant_users(context, tenant_id)
+        {'pattern': 'Stream.objects.filter',
 
-        return {'users': user_refs}
+         'include_only': set(["zerver/views/"]),
 
+         'description': 'Please use access_stream_by_*() to fetch Stream objects',
 
+         },
 
-    def _format_tenant_list(self, tenant_refs, **kwargs):
+        {'pattern': '^from (zerver|analytics|confirmation)',
 
-        marker = kwargs.get('marker')
+         'include_only': set(["/migrations/"]),
 
-        page_idx = 0
+         'exclude': set([
 
-        if marker is not None:
+             'zerver/migrations/0032_verify_all_medium_avatar_images.py',
 
-            for (marker_idx, tenant) in enumerate(tenant_refs):
+             'zerver/migrations/0060_move_avatars_to_be_uid_based.py',
 
-                if tenant['id'] == marker:
+             'zerver/migrations/0104_fix_unreads.py',
 
-                    # we start pagination after the marker
+             'zerver/migrations/0206_stream_rendered_description.py',
 
-                    page_idx = marker_idx + 1
+             'pgroonga/migrations/0002_html_escape_subject.py',
 
-                    break
+         ]),
 
-            else:
+         'description': "Don't import models or other code in migrations; see docs/subsystems/schema-migrations.md",
 
-                msg = 'Marker could not be found'
+         },
 
-                raise exception.ValidationError(message=msg)
+        {'pattern': 'datetime[.](now|utcnow)',
 
+         'include_only': set(["zerver/", "analytics/"]),
 
+         'description': "Don't use datetime in backend code.\n"
 
-        limit = kwargs.get('limit')
+         "See https://zulip.readthedocs.io/en/latest/contributing/code-style.html#naive-datetime-objects",
 
-        if limit is not None:
+         },
 
-            try:
+        {'pattern': r'render_to_response\(',
 
-                limit = int(limit)
+         'description': "Use render() instead of render_to_response().",
 
-                if limit < 0:
+         },
 
-                    raise AssertionError()
+        {'pattern': 'from os.path',
 
-            except (ValueError, AssertionError):
+         'description': "Don't use from when importing from the standard library",
 
-                msg = 'Invalid limit value'
+         },
 
-                raise exception.ValidationError(message=msg)
+        {'pattern': 'import os.path',
 
+         'description': "Use import os instead of import os.path",
 
+         },
 
-        tenant_refs = tenant_refs[page_idx:limit]
+        {'pattern': r'(logging|logger)\.warn\W',
 
+         'description': "Logger.warn is a deprecated alias for Logger.warning; Use 'warning' instead of 'warn'.",
 
+         'good_lines': ["logging.warning('I am a warning.')", "logger.warning('warning')"],
 
-        for x in tenant_refs:
+         'bad_lines': ["logging.warn('I am a warning.')", "logger.warn('warning')"]},
 
-            if 'enabled' not in x:
+        {'pattern': r'\.pk',
 
-                x['enabled'] = True
+         'exclude_pattern': '[.]_meta[.]pk',
 
-        o = {'tenants': tenant_refs,
+         'description': "Use `id` instead of `pk`.",
 
-             'tenants_links': []}
+         'good_lines': ['if my_django_model.id == 42', 'self.user_profile._meta.pk'],
 
-        return o
+         'bad_lines': ['if my_django_model.pk == 42']},
 
+        {'pattern': r'^[ ]*# type: \(',
 
+         'exclude': set([
 
+             # These directories, especially scripts/ and puppet/,
 
+             # have tools that need to run before a Zulip environment
 
-class UserController(wsgi.Application):
+             # is provisioned; in some of those, the `typing` module
 
-    def __init__(self):
+             # might not be available yet, so care is required.
 
-        self.identity_api = Manager()
+             'scripts/',
 
-        self.policy_api = policy.Manager()
+             'tools/',
 
-        self.token_api = token.Manager()
+             'puppet/',
 
-        super(UserController, self).__init__()
+             # Zerver files that we should just clean.
 
+             'zerver/tests',
 
+             'zerver/openapi/python_examples.py',
 
-    def get_user(self, context, user_id):
+             'zerver/lib/request.py',
 
-        self.assert_admin(context)
+             'zerver/views/streams.py',
 
-        user_ref = self.identity_api.get_user(context, user_id)
+             # thumbor is (currently) python2 only
 
-        if not user_ref:
+             'zthumbor/',
 
-            raise exception.UserNotFound(user_id=user_id)
+         ]),
 
+         'description': 'Comment-style function type annotation. Use Python3 style annotations instead.',
 
+         },
 
-        return {'user': user_ref}
+        {'pattern': r' = models[.].*null=True.*\)  # type: (?!Optional)',
 
+         'include_only': {"zerver/models.py"},
 
+         'description': 'Model variable with null=true not annotated as Optional.',
 
-    def get_users(self, context):
+         'good_lines': ['desc = models.TextField(null=True)  # type: Optional[Text]',
 
-        # NOTE(termie): i can't imagine that this really wants all the data
+                        'stream = models.ForeignKey(Stream, null=True, on_delete=CASCADE)  # type: Optional[Stream]',
 
-        #               about every single user in the system...
+                        'desc = models.TextField()  # type: Text',
 
-        self.assert_admin(context)
+                        'stream = models.ForeignKey(Stream, on_delete=CASCADE)  # type: Stream'],
 
-        user_refs = self.identity_api.list_users(context)
+         'bad_lines': ['desc = models.CharField(null=True)  # type: Text',
 
-        return {'users': user_refs}
+                       'stream = models.ForeignKey(Stream, null=True, on_delete=CASCADE)  # type: Stream'],
 
+         },
 
+        {'pattern': r' = models[.](?!NullBoolean).*\)  # type: Optional',  # Optional tag, except NullBoolean(Field)
 
-    # CRUD extension
+         'exclude_pattern': 'null=True',
 
-    def create_user(self, context, user):
+         'include_only': {"zerver/models.py"},
 
-        user = self._normalize_dict(user)
+         'description': 'Model variable annotated with Optional but variable does not have null=true.',
 
-        self.assert_admin(context)
+         'good_lines': ['desc = models.TextField(null=True)  # type: Optional[Text]',
 
+                        'stream = models.ForeignKey(Stream, null=True, on_delete=CASCADE)  # type: Optional[Stream]',
 
+                        'desc = models.TextField()  # type: Text',
 
-        if not 'name' in user or not user['name']:
+                        'stream = models.ForeignKey(Stream, on_delete=CASCADE)  # type: Stream'],
 
-            msg = 'Name field is required and cannot be empty'
+         'bad_lines': ['desc = models.TextField()  # type: Optional[Text]',
 
-            raise exception.ValidationError(message=msg)
+                       'stream = models.ForeignKey(Stream, on_delete=CASCADE)  # type: Optional[Stream]'],
 
+         },
 
+        {'pattern': r'[\s([]Text([^\s\w]|$)',
 
-        tenant_id = user.get('tenantId', None)
+         'exclude': set([
 
-        if (tenant_id is not None
+             # We are likely to want to keep these dirs Python 2+3 compatible,
 
-                and self.identity_api.get_tenant(context, tenant_id) is None):
+             # since the plan includes extracting them to a separate project eventually.
 
-            raise exception.TenantNotFound(tenant_id=tenant_id)
+             'tools/lib',
 
-        user_id = uuid.uuid4().hex
+             # TODO: Update our migrations from Text->str.
 
-        user_ref = user.copy()
+             'zerver/migrations/',
 
-        user_ref['id'] = user_id
+             # thumbor is (currently) python2 only
 
-        new_user_ref = self.identity_api.create_user(
+             'zthumbor/',
 
-                context, user_id, user_ref)
+         ]),
 
-        if tenant_id:
+         'description': "Now that we're a Python 3 only codebase, we don't need to use typing.Text. Please use str instead.",
 
-            self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
+         },
 
-        return {'user': new_user_ref}
+        {'pattern': 'exit[(]1[)]',
 
+         'include_only': set(["/management/commands/"]),
 
+         'description': 'Raise CommandError to exit with failure in management commands',
 
-    def update_user(self, context, user_id, user):
+         },
 
-        # NOTE(termie): this is really more of a patch than a put
+        *whitespace_rules,
 
-        self.assert_admin(context)
+        *comma_whitespace_rule,
 
-        if self.identity_api.get_user(context, user_id) is None:
+    ],
 
-            raise exception.UserNotFound(user_id=user_id)
+    max_length=110,
 
+    shebang_rules=shebang_rules,
 
+)
 
-        user_ref = self.identity_api.update_user(context, user_id, user)
 
 
+bash_rules = RuleList(
 
-        # If the password was changed or the user was disabled we clear tokens
+    langs=['bash'],
 
-        if user.get('password') or not user.get('enabled', True):
+    rules=[
 
-            try:
+        {'pattern': '#!.*sh [-xe]',
 
-                for token_id in self.token_api.list_tokens(context, user_id):
+         'description': 'Fix shebang line with proper call to /usr/bin/env for Bash path, change -x|-e switches'
 
-                    self.token_api.delete_token(context, token_id)
+                        ' to set -x|set -e'},
 
-            except exception.NotImplemented:
+        {'pattern': 'sudo',
 
-                # The users status has been changed but tokens remain valid for
+         'description': 'Most scripts are intended to work on systems without sudo',
 
-                # backends that can't list tokens for users
+         'include_only': set(['scripts/']),
 
-                LOG.warning('User %s status has changed, but existing tokens '
+         'exclude': set([
 
-                            'remain valid' % user_id)
+             'scripts/lib/install',
 
-        return {'user': user_ref}
+             'scripts/setup/configure-rabbitmq'
 
+         ]), },
 
+        *whitespace_rules[0:1],
 
-    def delete_user(self, context, user_id):
+    ],
 
-        self.assert_admin(context)
+    shebang_rules=shebang_rules,
 
-        if self.identity_api.get_user(context, user_id) is None:
+)
 
-            raise exception.UserNotFound(user_id=user_id)
 
 
+css_rules = RuleList(
 
-        self.identity_api.delete_user(context, user_id)
+    langs=['css', 'scss'],
 
+    rules=[
 
+        {'pattern': r'calc\([^+]+\+[^+]+\)',
 
-    def set_user_enabled(self, context, user_id, user):
+         'description': "Avoid using calc with '+' operator. See #8403 : in CSS.",
 
-        return self.update_user(context, user_id, user)
+         'good_lines': ["width: calc(20% - -14px);"],
 
+         'bad_lines': ["width: calc(20% + 14px);"]},
 
+        {'pattern': r'^[^:]*:\S[^:]*;$',
 
-    def set_user_password(self, context, user_id, user):
+         'description': "Missing whitespace after : in CSS",
 
-        return self.update_user(context, user_id, user)
+         'good_lines': ["background-color: white;", "text-size: 16px;"],
 
+         'bad_lines': ["background-color:white;", "text-size:16px;"]},
 
+        {'pattern': '[a-z]{',
 
-    def update_user_tenant(self, context, user_id, user):
+         'description': "Missing whitespace before '{' in CSS.",
 
-        """Update the default tenant."""
+         'good_lines': ["input {", "body {"],
 
-        # ensure that we're a member of that tenant
+         'bad_lines': ["input{", "body{"]},
 
-        tenant_id = user.get('tenantId')
+        {'pattern': 'https://',
 
-        self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
+         'description': "Zulip CSS should have no dependencies on external resources",
 
-        return self.update_user(context, user_id, user)
+         'good_lines': ['background: url(/static/images/landing-page/pycon.jpg);'],
 
+         'bad_lines': ['background: url(https://example.com/image.png);']},
 
+        {'pattern': '^[ ][ ][a-zA-Z0-9]',
 
+         'description': "Incorrect 2-space indentation in CSS",
 
+         'strip': '\n',
 
-class RoleController(wsgi.Application):
+         'good_lines': ["    color: white;", "color: white;"],
 
-    def __init__(self):
+         'bad_lines': ["  color: white;"]},
 
-        self.identity_api = Manager()
+        {'pattern': r'{\w',
 
-        self.token_api = token.Manager()
+         'description': "Missing whitespace after '{' in CSS (should be newline).",
 
-        self.policy_api = policy.Manager()
+         'good_lines': ["{\n"],
 
-        super(RoleController, self).__init__()
+         'bad_lines': ["{color: LightGoldenRodYellow;"]},
 
+        {'pattern': ' thin[ ;]',
 
+         'description': "thin CSS attribute is under-specified, please use 1px.",
 
-    # COMPAT(essex-3)
+         'good_lines': ["border-width: 1px;"],
 
-    def get_user_roles(self, context, user_id, tenant_id=None):
+         'bad_lines': ["border-width: thin;", "border-width: thin solid black;"]},
 
-        """Get the roles for a user and tenant pair.
+        {'pattern': ' medium[ ;]',
 
+         'description': "medium CSS attribute is under-specified, please use pixels.",
 
+         'good_lines': ["border-width: 3px;"],
 
-        Since we're trying to ignore the idea of user-only roles we're
+         'bad_lines': ["border-width: medium;", "border: medium solid black;"]},
 
-        not implementing them in hopes that the idea will die off.
+        {'pattern': ' thick[ ;]',
 
+         'description': "thick CSS attribute is under-specified, please use pixels.",
 
+         'good_lines': ["border-width: 5px;"],
 
-        """
+         'bad_lines': ["border-width: thick;", "border: thick solid black;"]},
 
-        if tenant_id is None:
+        {'pattern': r'rgba?\(',
 
-            raise exception.NotImplemented(message='User roles not supported: '
+         'description': 'Use of rgb(a) format is banned, Please use hsl(a) instead',
 
-                                                   'tenant ID required')
+         'good_lines': ['hsl(0, 0%, 0%)', 'hsla(0, 0%, 100%, 0.1)'],
 
+         'bad_lines': ['rgb(0, 0, 0)', 'rgba(255, 255, 255, 0.1)']},
 
+        *whitespace_rules,
 
-        user = self.identity_api.get_user(context, user_id)
+        *comma_whitespace_rule,
 
-        if user is None:
+    ],
 
-            raise exception.UserNotFound(user_id=user_id)
+)
 
-        tenant = self.identity_api.get_tenant(context, tenant_id)
 
-        if tenant is None:
 
-            raise exception.TenantNotFound(tenant_id=tenant_id)
+prose_style_rules = [
 
+    {'pattern': r'[^\/\#\-"]([jJ]avascript)',  # exclude usage in hrefs/divs
 
+     'exclude': set(["docs/documentation/api.md"]),
 
-        roles = self.identity_api.get_roles_for_user_and_tenant(
+     'description': "javascript should be spelled JavaScript"},
 
-                context, user_id, tenant_id)
+    {'pattern': r'''[^\/\-\."'\_\=\>]([gG]ithub)[^\.\-\_"\<]''',  # exclude usage in hrefs/divs
 
-        return {'roles': [self.identity_api.get_role(context, x)
+     'description': "github should be spelled GitHub"},
 
-                          for x in roles]}
+    {'pattern': '[oO]rganisation',  # exclude usage in hrefs/divs
 
+     'description': "Organization is spelled with a z",
 
+     'exclude_line': {('docs/translating/french.md', '* organization - **organisation**')}},
 
-    # CRUD extension
+    {'pattern': '!!! warning',
 
-    def get_role(self, context, role_id):
+     'description': "!!! warning is invalid; it's spelled '!!! warn'"},
 
-        self.assert_admin(context)
+    {'pattern': 'Terms of service',
 
-        role_ref = self.identity_api.get_role(context, role_id)
+     'description': "The S in Terms of Service is capitalized"},
 
-        if not role_ref:
+    {'pattern': '[^-_p]botserver(?!rc)|bot server',
 
-            raise exception.RoleNotFound(role_id=role_id)
+     'description': "Use Botserver instead of botserver or bot server."},
 
-        return {'role': role_ref}
+    *comma_whitespace_rule,
 
+]  # type: List[Rule]
 
+html_rules = whitespace_rules + prose_style_rules + [
 
-    def create_role(self, context, role):
+    {'pattern': 'subject|SUBJECT',
 
-        role = self._normalize_dict(role)
+     'exclude': set(['templates/zerver/email.html']),
 
-        self.assert_admin(context)
+     'exclude_pattern': 'email subject',
 
+     'description': 'avoid subject in templates',
 
+     'good_lines': ['topic_name'],
 
-        if not 'name' in role or not role['name']:
+     'bad_lines': ['subject="foo"', ' MAX_SUBJECT_LEN']},
 
-            msg = 'Name field is required and cannot be empty'
+    {'pattern': r'placeholder="[^{#](?:(?!\.com).)+$',
 
-            raise exception.ValidationError(message=msg)
+     'description': "`placeholder` value should be translatable.",
 
+     'exclude_line': {('templates/zerver/register.html', 'placeholder="acme"'),
 
+                      ('templates/zerver/register.html', 'placeholder="Acme or Aκμή"')},
 
-        role_id = uuid.uuid4().hex
+     'exclude': set(["templates/analytics/support.html"]),
 
-        role['id'] = role_id
+     'good_lines': ['<input class="stream-list-filter" type="text" placeholder="{{ _(\'Search streams\') }}" />'],
 
-        role_ref = self.identity_api.create_role(context, role_id, role)
+     'bad_lines': ['<input placeholder="foo">']},
 
-        return {'role': role_ref}
+    {'pattern': "placeholder='[^{]",
 
+     'description': "`placeholder` value should be translatable.",
 
+     'good_lines': ['<input class="stream-list-filter" type="text" placeholder="{{ _(\'Search streams\') }}" />'],
 
-    def delete_role(self, context, role_id):
+     'bad_lines': ["<input placeholder='foo'>"]},
 
-        self.assert_admin(context)
+    {'pattern': "aria-label='[^{]",
 
-        self.get_role(context, role_id)
+     'description': "`aria-label` value should be translatable.",
 
-        self.identity_api.delete_role(context, role_id)
+     'good_lines': ['<button type="button" class="close close-alert-word-status" aria-label="{{t \'Close\' }}">'],
 
+     'bad_lines': ["<button aria-label='foo'></button>"]},
 
+    {'pattern': 'aria-label="[^{]',
 
-    def get_roles(self, context):
+     'description': "`aria-label` value should be translatable.",
 
-        self.assert_admin(context)
+     'good_lines': ['<button type="button" class="close close-alert-word-status" aria-label="{{t \'Close\' }}">'],
 
-        roles = self.identity_api.list_roles(context)
+     'bad_lines': ['<button aria-label="foo"></button>']},
 
-        # TODO(termie): probably inefficient at some point
+    {'pattern': 'script src="http',
 
-        return {'roles': roles}
+     'description': "Don't directly load dependencies from CDNs.  See docs/subsystems/html-css.md",
 
+     'exclude': set(["templates/corporate/billing.html", "templates/zerver/hello.html",
 
+                     "templates/corporate/upgrade.html"]),
 
-    def add_role_to_user(self, context, user_id, role_id, tenant_id=None):
+     'good_lines': ["{{ render_entrypoint('landing-page') }}"],
 
-        """Add a role to a user and tenant pair.
+     'bad_lines': ['<script src="https://ajax.googleapis.com/ajax/libs/jquery/3.2.1/jquery.min.js"></script>']},
 
+    {'pattern': "title='[^{]",
 
+     'description': "`title` value should be translatable.",
 
-        Since we're trying to ignore the idea of user-only roles we're
+     'good_lines': ['<link rel="author" title="{{ _(\'About these documents\') }}" />'],
 
-        not implementing them in hopes that the idea will die off.
+     'bad_lines': ["<p title='foo'></p>"]},
 
+    {'pattern': r'title="[^{\:]',
 
+     'exclude_line': set([
 
-        """
+         ('templates/zerver/app/markdown_help.html',
 
-        self.assert_admin(context)
+             '<td class="rendered_markdown"><img alt=":heart:" class="emoji" src="/static/generated/emoji/images/emoji/heart.png" title=":heart:" /></td>')
 
-        if tenant_id is None:
+     ]),
 
-            raise exception.NotImplemented(message='User roles not supported: '
+     'exclude': set(["templates/zerver/emails", "templates/analytics/realm_details.html", "templates/analytics/support.html"]),
 
-                                                   'tenant_id required')
+     'description': "`title` value should be translatable."},
 
-        if self.identity_api.get_user(context, user_id) is None:
+    {'pattern': r'''\Walt=["'][^{"']''',
 
-            raise exception.UserNotFound(user_id=user_id)
+     'description': "alt argument should be enclosed by _() or it should be an empty string.",
 
-        if self.identity_api.get_tenant(context, tenant_id) is None:
+     'exclude': set(['static/templates/settings/display_settings.hbs',
 
-            raise exception.TenantNotFound(tenant_id=tenant_id)
+                     'templates/zerver/app/keyboard_shortcuts.html',
 
-        if self.identity_api.get_role(context, role_id) is None:
+                     'templates/zerver/app/markdown_help.html']),
 
-            raise exception.RoleNotFound(role_id=role_id)
+     'good_lines': ['<img src="{{source_url}}" alt="{{ _(name) }}" />', '<img alg="" />'],
 
+     'bad_lines': ['<img alt="Foo Image" />']},
 
+    {'pattern': r'''\Walt=["']{{ ?["']''',
 
-        # This still has the weird legacy semantics that adding a role to
+     'description': "alt argument should be enclosed by _().",
 
-        # a user also adds them to a tenant
+     'good_lines': ['<img src="{{source_url}}" alt="{{ _(name) }}" />'],
 
-        self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
+     'bad_lines': ['<img alt="{{ " />']},
 
-        self.identity_api.add_role_to_user_and_tenant(
+    {'pattern': r'\bon\w+ ?=',
 
-                context, user_id, tenant_id, role_id)
+     'description': "Don't use inline event handlers (onclick=, etc. attributes) in HTML. Instead,"
 
-        role_ref = self.identity_api.get_role(context, role_id)
+     "attach a jQuery event handler ($('#foo').on('click', function () {...})) when "
 
-        return {'role': role_ref}
+     "the DOM is ready (inside a $(function () {...}) block).",
 
+     'exclude': set(['templates/zerver/dev_login.html', 'templates/corporate/upgrade.html']),
 
+     'good_lines': ["($('#foo').on('click', function () {}"],
 
-    def remove_role_from_user(self, context, user_id, role_id, tenant_id=None):
+     'bad_lines': ["<button id='foo' onclick='myFunction()'>Foo</button>", "<input onchange='myFunction()'>"]},
 
-        """Remove a role from a user and tenant pair.
+    {'pattern': 'style ?=',
 
+     'description': "Avoid using the `style=` attribute; we prefer styling in CSS files",
 
+     'exclude_pattern': r'.*style ?=["' + "'" + '](display: ?none|background: {{|color: {{|background-color: {{).*',
 
-        Since we're trying to ignore the idea of user-only roles we're
+     'exclude': set([
 
-        not implementing them in hopes that the idea will die off.
+         # KaTeX output uses style attribute
 
+         'templates/zerver/app/markdown_help.html',
 
+         # 5xx page doesn't have external CSS
 
-        """
+         'static/html/5xx.html',
 
-        self.assert_admin(context)
+         # Group PMs color is dynamically calculated
 
-        if tenant_id is None:
+         'static/templates/group_pms.hbs',
 
-            raise exception.NotImplemented(message='User roles not supported: '
 
-                                                   'tenant_id required')
 
-        if self.identity_api.get_user(context, user_id) is None:
+         # exclude_pattern above handles color, but have other issues:
 
-            raise exception.UserNotFound(user_id=user_id)
+         'static/templates/draft.hbs',
 
-        if self.identity_api.get_tenant(context, tenant_id) is None:
+         'static/templates/subscription.hbs',
 
-            raise exception.TenantNotFound(tenant_id=tenant_id)
+         'static/templates/single_message.hbs',
 
-        if self.identity_api.get_role(context, role_id) is None:
 
-            raise exception.RoleNotFound(role_id=role_id)
 
+         # Old-style email templates need to use inline style
 
+         # attributes; it should be possible to clean these up
 
-        # This still has the weird legacy semantics that adding a role to
+         # when we convert these templates to use premailer.
 
-        # a user also adds them to a tenant, so we must follow up on that
+         'templates/zerver/emails/email_base_messages.html',
 
-        self.identity_api.remove_role_from_user_and_tenant(
 
-                context, user_id, tenant_id, role_id)
 
-        roles = self.identity_api.get_roles_for_user_and_tenant(
+         # Email log templates; should clean up.
 
-                context, user_id, tenant_id)
+         'templates/zerver/email.html',
 
-        if not roles:
+         'templates/zerver/email_log.html',
 
-            self.identity_api.remove_user_from_tenant(
 
-                    context, tenant_id, user_id)
 
-        return
+         # Social backend logos are dynamically loaded
 
+         'templates/zerver/accounts_home.html',
 
+         'templates/zerver/login.html',
 
-    # COMPAT(diablo): CRUD extension
 
-    def get_role_refs(self, context, user_id):
 
-        """Ultimate hack to get around having to make role_refs first-class.
+         # Probably just needs to be changed to display: none so the exclude works
 
+         'templates/zerver/app/navbar.html',
 
 
-        This will basically iterate over the various roles the user has in
 
-        all tenants the user is a member of and create fake role_refs where
+         # Needs the width cleaned up; display: none is fine
 
-        the id encodes the user-tenant-role information so we can look
+         'static/templates/settings/account_settings.hbs',
 
-        up the appropriate data when we need to delete them.
 
 
+         # background image property is dynamically generated
 
-        """
+         'static/templates/user_profile_modal.hbs',
 
-        self.assert_admin(context)
+         'static/templates/sidebar_private_message_list.hbs',
 
-        # Ensure user exists by getting it first.
 
-        self.identity_api.get_user(context, user_id)
 
-        tenant_ids = self.identity_api.get_tenants_for_user(context, user_id)
+         # Inline styling for an svg; could be moved to CSS files?
 
-        o = []
+         'templates/zerver/landing_nav.html',
 
-        for tenant_id in tenant_ids:
+         'templates/zerver/billing_nav.html',
 
-            role_ids = self.identity_api.get_roles_for_user_and_tenant(
+         'templates/zerver/app/home.html',
 
-                    context, user_id, tenant_id)
+         'templates/zerver/features.html',
 
-            for role_id in role_ids:
+         'templates/zerver/portico-header.html',
 
-                ref = {'roleId': role_id,
+         'templates/corporate/billing.html',
 
-                       'tenantId': tenant_id,
+         'templates/corporate/upgrade.html',
 
-                       'userId': user_id}
 
-                ref['id'] = urllib.urlencode(ref)
 
-                o.append(ref)
+         # Miscellaneous violations to be cleaned up
 
-        return {'roles': o}
+         'static/templates/user_info_popover_title.hbs',
 
+         'static/templates/subscription_invites_warning_modal.hbs',
 
+         'templates/zerver/reset_confirm.html',
 
-    # COMPAT(diablo): CRUD extension
+         'templates/zerver/config_error.html',
 
-    def create_role_ref(self, context, user_id, role):
+         'templates/zerver/dev_env_email_access_details.html',
 
-        """This is actually used for adding a user to a tenant.
+         'templates/zerver/confirm_continue_registration.html',
 
+         'templates/zerver/register.html',
 
+         'templates/zerver/accounts_send_confirm.html',
 
-        In the legacy data model adding a user to a tenant required setting
+         'templates/zerver/integrations/index.html',
 
-        a role.
+         'templates/zerver/documentation_main.html',
 
+         'templates/analytics/realm_summary_table.html',
 
+         'templates/corporate/zephyr.html',
 
-        """
+         'templates/corporate/zephyr-mirror.html',
 
-        self.assert_admin(context)
+     ]),
 
-        # TODO(termie): for now we're ignoring the actual role
+     'good_lines': ['#my-style {color: blue;}', 'style="display: none"', "style='display: none"],
 
-        tenant_id = role.get('tenantId')
+     'bad_lines': ['<p style="color: blue;">Foo</p>', 'style = "color: blue;"']},
 
-        role_id = role.get('roleId')
+]  # type: List[Rule]
 
-        self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
 
-        self.identity_api.add_role_to_user_and_tenant(
 
-                context, user_id, tenant_id, role_id)
+handlebars_rules = RuleList(
 
-        role_ref = self.identity_api.get_role(context, role_id)
+    langs=['hbs'],
 
-        return {'role': role_ref}
+    rules=html_rules + [
 
+        {'pattern': "[<]script",
 
+         'description': "Do not use inline <script> tags here; put JavaScript in static/js instead."},
 
-    # COMPAT(diablo): CRUD extension
+        {'pattern': '{{ t ("|\')',
 
-    def delete_role_ref(self, context, user_id, role_ref_id):
+         'description': 'There should be no spaces before the "t" in a translation tag.'},
 
-        """This is actually used for deleting a user from a tenant.
+        {'pattern': r"{{t '.*' }}[\.\?!]",
 
+         'description': "Period should be part of the translatable string."},
 
+        {'pattern': r'{{t ".*" }}[\.\?!]',
 
-        In the legacy data model removing a user from a tenant required
+         'description': "Period should be part of the translatable string."},
 
-        deleting a role.
+        {'pattern': r"{{/tr}}[\.\?!]",
 
+         'description': "Period should be part of the translatable string."},
 
+        {'pattern': '{{t ("|\') ',
 
-        To emulate this, we encode the tenant and role in the role_ref_id,
+         'description': 'Translatable strings should not have leading spaces.'},
 
-        and if this happens to be the last role for the user-tenant pair,
+        {'pattern': "{{t '[^']+ ' }}",
 
-        we remove the user from the tenant.
+         'description': 'Translatable strings should not have trailing spaces.'},
 
+        {'pattern': '{{t "[^"]+ " }}',
 
+         'description': 'Translatable strings should not have trailing spaces.'},
 
-        """
+    ],
 
-        self.assert_admin(context)
+)
 
-        # TODO(termie): for now we're ignoring the actual role
 
-        role_ref_ref = urlparse.parse_qs(role_ref_id)
 
-        tenant_id = role_ref_ref.get('tenantId')[0]
+jinja2_rules = RuleList(
 
-        role_id = role_ref_ref.get('roleId')[0]
+    langs=['html'],
 
-        self.identity_api.remove_role_from_user_and_tenant(
+    rules=html_rules + [
 
-                context, user_id, tenant_id, role_id)
+        {'pattern': r"{% endtrans %}[\.\?!]",
 
-        roles = self.identity_api.get_roles_for_user_and_tenant(
+         'description': "Period should be part of the translatable string."},
 
-                context, user_id, tenant_id)
+        {'pattern': r"{{ _(.+) }}[\.\?!]",
 
-        if not roles:
+         'description': "Period should be part of the translatable string."},
 
-            self.identity_api.remove_user_from_tenant(
+    ],
 
-                    context, tenant_id, user_id)
+)
+
+
+
+json_rules = RuleList(
+
+    langs=['json'],
+
+    rules=[
+
+        # Here, we don't use `whitespace_rules`, because the tab-based
+
+        # whitespace rule flags a lot of third-party JSON fixtures
+
+        # under zerver/webhooks that we want preserved verbatim.  So
+
+        # we just include the trailing whitespace rule and a modified
+
+        # version of the tab-based whitespace rule (we can't just use
+
+        # exclude in whitespace_rules, since we only want to ignore
+
+        # JSON files with tab-based whitespace, not webhook code).
+
+        trailing_whitespace_rule,
+
+        {'pattern': '\t',
+
+         'strip': '\n',
+
+         'exclude': set(['zerver/webhooks/']),
+
+         'description': 'Fix tab-based whitespace'},
+
+        {'pattern': r'":["\[\{]',
+
+         'exclude': set(['zerver/webhooks/', 'zerver/tests/fixtures/']),
+
+         'description': 'Require space after : in JSON'},
+
+    ]
+
+)
+
+
+
+markdown_docs_length_exclude = {
+
+    # Has some example Vagrant output that's very long
+
+    "docs/development/setup-vagrant.md",
+
+    # Have wide output in code blocks
+
+    "docs/subsystems/logging.md",
+
+    "docs/subsystems/schema-migrations.md",
+
+    # Have curl commands with JSON that would be messy to wrap
+
+    "zerver/webhooks/helloworld/doc.md",
+
+    "zerver/webhooks/trello/doc.md",
+
+    # Has a very long configuration line
+
+    "templates/zerver/integrations/perforce.md",
+
+    # Has some example code that could perhaps be wrapped
+
+    "templates/zerver/api/incoming-webhooks-walkthrough.md",
+
+    # This macro has a long indented URL
+
+    "templates/zerver/help/include/git-webhook-url-with-branches-indented.md",
+
+    "templates/zerver/api/update-notification-settings.md",
+
+    # These two are the same file and have some too-long lines for GitHub badges
+
+    "README.md",
+
+    "docs/overview/readme.md",
+
+}
+
+
+
+markdown_rules = RuleList(
+
+    langs=['md'],
+
+    rules=markdown_whitespace_rules + prose_style_rules + [
+
+        {'pattern': r'\[(?P<url>[^\]]+)\]\((?P=url)\)',
+
+         'description': 'Linkified markdown URLs should use cleaner <http://example.com> syntax.'},
+
+        {'pattern': 'https://zulip.readthedocs.io/en/latest/[a-zA-Z0-9]',
+
+         'exclude': {'docs/overview/contributing.md', 'docs/overview/readme.md', 'docs/README.md'},
+
+         'include_only': set(['docs/']),
+
+         'description': "Use relative links (../foo/bar.html) to other documents in docs/",
+
+         },
+
+        {'pattern': "su zulip -c [^']",
+
+         'include_only': set(['docs/']),
+
+         'description': "Always quote arguments using `su zulip -c '` to avoid confusion about how su works.",
+
+         },
+
+        {'pattern': r'\][(][^#h]',
+
+         'include_only': set(['README.md', 'CONTRIBUTING.md']),
+
+         'description': "Use absolute links from docs served by GitHub",
+
+         },
+
+    ],
+
+    max_length=120,
+
+    length_exclude=markdown_docs_length_exclude,
+
+    exclude_files_in='templates/zerver/help/'
+
+)
+
+
+
+help_markdown_rules = RuleList(
+
+    langs=['md'],
+
+    rules=markdown_rules.rules + [
+
+        {'pattern': '[a-z][.][A-Z]',
+
+         'description': "Likely missing space after end of sentence",
+
+         'include_only': set(['templates/zerver/help/']),
+
+         },
+
+        {'pattern': r'\b[rR]ealm[s]?\b',
+
+         'include_only': set(['templates/zerver/help/']),
+
+         'good_lines': ['Organization', 'deactivate_realm', 'realm_filter'],
+
+         'bad_lines': ['Users are in a realm', 'Realm is the best model'],
+
+         'description': "Realms are referred to as Organizations in user-facing docs."},
+
+    ],
+
+    length_exclude=markdown_docs_length_exclude,
+
+)
+
+
+
+txt_rules = RuleList(
+
+    langs=['txt', 'text', 'yaml', 'rst'],
+
+    rules=whitespace_rules,
+
+)
+
+non_py_rules = [
+
+    handlebars_rules,
+
+    jinja2_rules,
+
+    css_rules,
+
+    js_rules,
+
+    json_rules,
+
+    markdown_rules,
+
+    help_markdown_rules,
+
+    bash_rules,
+
+    txt_rules,
+
+]

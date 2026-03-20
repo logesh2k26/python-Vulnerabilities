@@ -2,268 +2,340 @@
 # Safety: safe
 # Category: safe
 
-# tests.test_descriptors
+###
 
-# Implements a base SettingsDescriptor for advanced configurations
+# Copyright (c) 2019, Valentin Lorentz
 
-#
-
-# Author:   Benjamin Bengfort <benjamin@bengfort.com>
-
-# Created:  Thu Jun 11 09:34:33 2015 -0400
+# All rights reserved.
 
 #
 
-# Copyright (C) 2015 Bengfort.com
+# Redistribution and use in source and binary forms, with or without
 
-# For license information, see LICENSE.txt
+# modification, are permitted provided that the following conditions are met:
 
 #
 
-# ID: test_descriptors.py [] benjamin@bengfort.com $
+#   * Redistributions of source code must retain the above copyright notice,
 
+#     this list of conditions, and the following disclaimer.
 
+#   * Redistributions in binary form must reproduce the above copyright notice,
 
-"""
+#     this list of conditions, and the following disclaimer in the
 
-Implements a base SettingsDescriptor for advanced configurations
+#     documentation and/or other materials provided with the distribution.
 
-"""
+#   * Neither the name of the author of this software nor the name of
 
+#     contributors to this software may be used to endorse or promote products
 
+#     derived from this software without specific prior written consent.
 
-##########################################################################
+#
 
-## Imports
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
 
-##########################################################################
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
 
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
 
+# ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
 
-import pytest
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
 
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
 
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
 
-from six import with_metaclass
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
 
-from confire.descriptors import SettingsDescriptor, SettingsMeta
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 
+# POSSIBILITY OF SUCH DAMAGE.
 
+###
 
 
-##########################################################################
 
-## Mock Objects for Testing
+import ast
 
-##########################################################################
+import math
 
+import cmath
 
+import operator
 
-class MockObject(with_metaclass(SettingsMeta, object)):
 
 
+class InvalidNode(Exception):
 
-    test_setting = SettingsDescriptor()
+    pass
 
 
 
+def filter_module(module, safe_names):
 
+    return dict([
 
-class BadMockObject(object):
+        (name, getattr(module, name))
 
-    """
+        for name in safe_names
 
-    Missing metaclass!
+        if hasattr(module, name)
 
-    """
+    ])
 
 
 
-    test_setting = SettingsDescriptor()
+UNARY_OPS = {
 
+    ast.UAdd: lambda x: x,
 
+    ast.USub: lambda x: -x,
 
+}
 
 
-##########################################################################
 
-## Test Cases
+BIN_OPS = {
 
-##########################################################################
+    ast.Add: operator.add,
 
+    ast.Sub: operator.sub,
 
+    ast.Mult: operator.mul,
 
-class TestDescriptors(object):
+    ast.Div: operator.truediv,
 
+    ast.Pow: operator.pow,
 
+    ast.BitXor: operator.xor,
 
-    def test_label(self):
+    ast.BitOr: operator.or_,
 
-        """
+    ast.BitAnd: operator.and_,
 
-        Assert that descriptor label is not None
+}
 
-        """
 
-        assert MockObject.test_setting.label is not None
 
-        assert MockObject.test_setting.label == "test_setting"
+MATH_CONSTANTS = 'e inf nan pi tau'.split()
 
+SAFE_MATH_FUNCTIONS = (
 
+    'acos acosh asin asinh atan atan2 atanh copysign cos cosh degrees erf '
 
-    def test_descriptor_set_get(self):
+    'erfc exp expm1 fabs fmod frexp fsum gamma hypot ldexp lgamma log log10 '
 
-        """
+    'log1p log2 modf pow radians remainder sin sinh tan tanh'
 
-        Test that the descriptor can be set and fetched
+).split()
 
-        """
+SAFE_CMATH_FUNCTIONS = (
 
-        obj = MockObject()
+    'acos acosh asin asinh atan atanh cos cosh exp inf infj log log10 '
 
-        assert obj.test_setting is None
+    'nanj phase polar rect sin sinh tan tanh tau'
 
-        obj.test_setting = "foo"
+).split()
 
-        assert obj.test_setting == "foo"
 
 
+SAFE_ENV = filter_module(math, MATH_CONSTANTS + SAFE_MATH_FUNCTIONS)
 
-    def test_descriptor_set_get_dict(self):
+SAFE_ENV.update(filter_module(cmath, SAFE_CMATH_FUNCTIONS))
 
-        """
 
-        Test that the descriptor is in the instance dict
 
-        """
+def _sqrt(x):
 
-        obj = MockObject()
+    if isinstance(x, complex) or x < 0:
 
-        assert obj.__dict__.get('test_setting') is None
+        return cmath.sqrt(x)
 
-        obj.test_setting = "foo"
+    else:
 
-        assert obj.__dict__.get('test_setting') == "foo"
+        return math.sqrt(x)
 
 
 
-    def test_descriptor_del(self):
+def _cbrt(x):
 
-        """
+    return math.pow(x, 1.0/3)
 
-        Test that the descriptor can be deleted
 
-        """
 
+def _factorial(x):
 
+    if x<=10000:
 
-        obj = MockObject()
+        return float(math.factorial(x))
 
-        assert obj.test_setting is None
+    else:
 
-        obj.test_setting = "foo"
+        raise Exception('factorial argument too large')
 
-        assert obj.test_setting is not None
 
-        del obj.test_setting
 
-        assert obj.test_setting is None
+SAFE_ENV.update({
 
+    'i': 1j,
 
+    'abs': abs,
 
-    def test_descriptor_del_dict(self):
+    'max': max,
 
-        """
+    'min': min,
 
-        Test that the descriptor removes information from instance dict
+    'round': lambda x, y=0: round(x, int(y)),
 
-        """
+    'factorial': _factorial,
 
-        obj = MockObject()
+    'sqrt': _sqrt,
 
-        assert obj.__dict__.get('test_setting') is None
+    'cbrt': _cbrt,
 
-        obj.test_setting = "foo"
+    'ceil': lambda x: float(math.ceil(x)),
 
-        assert obj.__dict__.get('test_setting') is not None
+    'floor': lambda x: float(math.floor(x)),
 
-        del obj.test_setting
+})
 
-        assert 'test_setting' not in obj.__dict__
 
 
+UNSAFE_ENV = SAFE_ENV.copy()
 
-    def test_no_metaclass_get(self):
+# Add functions that return integers
 
-        """
+UNSAFE_ENV.update(filter_module(math, 'ceil floor factorial gcd'.split()))
 
-        Test getattr when object doesn't have a metaclass
 
-        """
 
-        obj = BadMockObject()
 
-        with pytest.raises(TypeError):
 
-            obj.test_setting
+# It would be nice if ast.literal_eval used a visitor so we could subclass
 
+# to extend it, but it doesn't, so let's reimplement it entirely.
 
+class SafeEvalVisitor(ast.NodeVisitor):
 
-    def test_no_metaclass_set(self):
+    def __init__(self, allow_ints):
 
-        """
+        self._allow_ints = allow_ints
 
-        Test setattr when object doesn't have a metaclass
+        self._env = UNSAFE_ENV if allow_ints else SAFE_ENV
 
-        """
 
-        obj = BadMockObject()
 
-        with pytest.raises(TypeError):
+    def _convert_num(self, x):
 
-            obj.test_setting = "foo"
+        """Converts numbers to complex if ints are not allowed."""
 
+        if self._allow_ints:
 
+            return x
 
-    def test_no_metaclass_del(self):
+        else:
 
-        """
+            x = complex(x)
 
-        Test delattr when object doesn't have a metaclass
+            if x.imag == 0:
 
-        """
+                x = x.real
 
-        obj = BadMockObject()
+                # Need to use string-formatting here instead of str() because
 
-        with pytest.raises(TypeError):
+                # use of str() on large numbers loses information:
 
-            del obj.test_setting
+                # str(float(33333333333333)) => '3.33333333333e+13'
 
+                # float('3.33333333333e+13') => 33333333333300.0
 
+                return float('%.16f' % x)
 
-    def test_subclass_with_metaclass(self):
+            else:
 
-        """
+                return x
 
-        Ensure that subclasses also have metaclass
 
-        """
 
+    def visit_Expression(self, node):
 
+        return self.visit(node.body)
 
-        class SubMockObject(MockObject):
 
 
+    def visit_Num(self, node):
 
-            subtest_setting = SettingsDescriptor()
+        return self._convert_num(node.n)
 
 
 
-        assert SubMockObject.test_setting.label is not None
+    def visit_Name(self, node):
 
-        assert SubMockObject.test_setting.label == "test_setting"
+        id_ = node.id.lower()
 
-        assert SubMockObject.subtest_setting.label is not None
+        if id_ in self._env:
 
-        assert SubMockObject.subtest_setting.label == "subtest_setting"
+            return self._env[id_]
+
+        else:
+
+            raise NameError(node.id)
+
+
+
+    def visit_Call(self, node):
+
+        func = self.visit(node.func)
+
+        args = map(self.visit, node.args)
+
+        # TODO: keywords?
+
+        return func(*args)
+
+
+
+    def visit_UnaryOp(self, node):
+
+        op = UNARY_OPS.get(node.op.__class__)
+
+        if op:
+
+            return op(self.visit(node.operand))
+
+        else:
+
+            raise InvalidNode('illegal operator %s' % node.op.__class__.__name__)
+
+
+
+    def visit_BinOp(self, node):
+
+        op = BIN_OPS.get(node.op.__class__)
+
+        if op:
+
+            return op(self.visit(node.left), self.visit(node.right))
+
+        else:
+
+            raise InvalidNode('illegal operator %s' % node.op.__class__.__name__)
+
+
+
+    def generic_visit(self, node):
+
+        raise InvalidNode('illegal construct %s' % node.__class__.__name__)
+
+
+
+def safe_eval(text, allow_ints):
+
+    node = ast.parse(text, mode='eval')
+
+    return SafeEvalVisitor(allow_ints).visit(node)

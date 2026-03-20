@@ -2,378 +2,666 @@
 # Safety: safe
 # Category: safe
 
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
+# (from BackInTime)
 
-
-
-# Copyright 2012 OpenStack LLC
-
-# Copyright 2012 Canonical Ltd.
+# Copyright (C) 2015-2017 Germar Reitze
 
 #
 
-# Licensed under the Apache License, Version 2.0 (the "License"); you may
+# This program is free software; you can redistribute it and/or modify
 
-# not use this file except in compliance with the License. You may obtain
+# it under the terms of the GNU General Public License as published by
 
-# a copy of the License at
+# the Free Software Foundation; either version 2 of the License, or
 
-#
-
-#      http://www.apache.org/licenses/LICENSE-2.0
+# (at your option) any later version.
 
 #
 
-# Unless required by applicable law or agreed to in writing, software
+# This program is distributed in the hope that it will be useful,
 
-# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
 
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 
-# License for the specific language governing permissions and limitations
+# GNU General Public License for more details.
 
-# under the License.
+#
 
+# You should have received a copy of the GNU General Public License along
 
+# with this program; if not, write to the Free Software Foundation, Inc.,
 
-"""Main entry point into the Catalog service."""
-
-
-
-import uuid
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 
 
-from keystone import config
+# (from jockey)
 
-from keystone import exception
+# (c) 2008 Canonical Ltd.
 
-from keystone import identity
+#
 
-from keystone import policy
+# This program is free software; you can redistribute it and/or modify
 
-from keystone import token
+# it under the terms of the GNU General Public License as published by
 
-from keystone.common import manager
+# the Free Software Foundation; either version 2 of the License, or
 
-from keystone.common import wsgi
+# (at your option) any later version.
 
+#
 
+# This program is distributed in the hope that it will be useful,
 
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
 
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 
-CONF = config.CONF
+# GNU General Public License for more details.
 
+#
 
+# You should have received a copy of the GNU General Public License along
 
+# with this program; if not, write to the Free Software Foundation, Inc.,
 
-
-class Manager(manager.Manager):
-
-    """Default pivot point for the Catalog backend.
-
-
-
-    See :mod:`keystone.common.manager.Manager` for more details on how this
-
-    dynamically calls the backend.
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 
 
-    """
+# (from python-dbus-docs)
+
+# Copyright (C) 2004-2006 Red Hat Inc. <http://www.redhat.com/>
+
+# Copyright (C) 2005-2007 Collabora Ltd. <http://www.collabora.co.uk/>
+
+#
+
+# Permission is hereby granted, free of charge, to any person
+
+# obtaining a copy of this software and associated documentation
+
+# files (the "Software"), to deal in the Software without
+
+# restriction, including without limitation the rights to use, copy,
+
+# modify, merge, publish, distribute, sublicense, and/or sell copies
+
+# of the Software, and to permit persons to whom the Software is
+
+# furnished to do so, subject to the following conditions:
+
+#
+
+# The above copyright notice and this permission notice shall be
+
+# included in all copies or substantial portions of the Software.
+
+#
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+
+# DEALINGS IN THE SOFTWARE.
+
+#
+
+# This file was modified by David D. Lowe in 2009.
+
+# To the extent possible under law, David D. Lowe has waived all
+
+# copyright and related or neighboring rights to his modifications to
+
+# this file under this license: http://creativecommons.org/publicdomain/zero/1.0/
 
 
 
-    def __init__(self):
+import os
 
-        super(Manager, self).__init__(CONF.catalog.driver)
+import re
 
+from subprocess import Popen, PIPE
 
+try:
 
+    import pwd
 
+except ImportError:
 
-class Driver(object):
-
-    """Interface description for an Catalog driver."""
-
-    def list_services(self):
-
-        """List all service ids in catalog.
+    pwd = None
 
 
 
-        Returns: list of service_ids or an empty list.
+import dbus
+
+import dbus.service
+
+import dbus.mainloop.pyqt5
+
+from PyQt5.QtCore import QCoreApplication
 
 
+
+UDEV_RULES_PATH = '/etc/udev/rules.d/99-backintime-%s.rules'
+
+
+
+class InvalidChar(dbus.DBusException):
+
+    _dbus_error_name = 'net.launchpad.backintime.InvalidChar'
+
+
+
+class InvalidCmd(dbus.DBusException):
+
+    _dbus_error_name = 'net.launchpad.backintime.InvalidCmd'
+
+
+
+class LimitExceeded(dbus.DBusException):
+
+    _dbus_error_name = 'net.launchpad.backintime.LimitExceeded'
+
+
+
+class PermissionDeniedByPolicy(dbus.DBusException):
+
+    _dbus_error_name = 'com.ubuntu.DeviceDriver.PermissionDeniedByPolicy'
+
+
+
+class UdevRules(dbus.service.Object):
+
+    def __init__(self, conn=None, object_path=None, bus_name=None):
+
+        super(UdevRules, self).__init__(conn, object_path, bus_name)
+
+
+
+        # the following variables are used by _checkPolkitPrivilege
+
+        self.polkit = None
+
+        self.enforce_polkit = True
+
+
+
+        self.tmpDict = {}
+
+
+
+        #find su path
+
+        self.su = self._which('su', '/bin/su')
+
+        self.backintime = self._which('backintime', '/usr/bin/backintime')
+
+        self.nice = self._which('nice', '/usr/bin/nice')
+
+        self.ionice = self._which('ionice', '/usr/bin/ionice')
+
+        self.max_rules = 100
+
+        self.max_users = 20
+
+        self.max_cmd_len = 100
+
+
+
+    def _which(self, exe, fallback):
+
+        proc = Popen(['which', exe], stdout = PIPE)
+
+        ret = proc.communicate()[0].strip().decode()
+
+        if proc.returncode or not ret:
+
+            return fallback
+
+
+
+        return ret
+
+
+
+    def _validateCmd(self, cmd):
+
+
+
+        if cmd.find("&&") != -1:
+
+            raise InvalidCmd("Parameter 'cmd' contains '&&' concatenation")
+
+        # make sure it starts with an absolute path
+
+        elif not cmd.startswith(os.path.sep):
+
+            raise InvalidCmd("Parameter 'cmd' does not start with '/'")
+
+
+
+        parts = cmd.split()
+
+
+
+        # make sure only well known commands and switches are used
+
+        whitelist = (
+
+            (self.nice, ("-n")),
+
+            (self.ionice, ("-c", "-n")),
+
+        )
+
+
+
+        for c, switches in whitelist:
+
+            if parts and parts[0] == c:
+
+                parts.pop(0)
+
+                for sw in switches:
+
+                    while parts and parts[0].startswith(sw):
+
+                        parts.pop(0)
+
+
+
+        if not parts:
+
+            raise InvalidCmd("Parameter 'cmd' does not contain the backintime command")
+
+        elif parts[0] != self.backintime:
+
+            raise InvalidCmd("Parameter 'cmd' contains non-whitelisted cmd/parameter (%s)" % parts[0])
+
+
+
+    def _checkLimits(self, owner, cmd):
+
+
+
+        if len(self.tmpDict.get(owner, [])) >= self.max_rules:
+
+            raise LimitExceeded("Maximum number of cached rules reached (%d)"
+
+                            % self.max_rules)
+
+        elif len(self.tmpDict) >= self.max_users:
+
+            raise LimitExceeded("Maximum number of cached users reached (%d)"
+
+                            % self.max_users)
+
+        elif len(cmd) > self.max_cmd_len:
+
+            raise LimitExceeded("Maximum length of command line reached (%d)"
+
+                            % self.max_cmd_len)
+
+
+
+    @dbus.service.method("net.launchpad.backintime.serviceHelper.UdevRules",
+
+                         in_signature='ss', out_signature='',
+
+                         sender_keyword='sender', connection_keyword='conn')
+
+    def addRule(self, cmd, uuid, sender=None, conn=None):
 
         """
 
-        raise exception.NotImplemented()
+        Receive command and uuid and create an Udev rule out of this.
 
+        This is done on the service side to prevent malicious code to
 
-
-    def get_service(self, service_id):
-
-        """Get service by id.
-
-
-
-        Returns: service_ref dict or None.
-
-
+        run as root.
 
         """
 
-        raise exception.NotImplemented()
+        #prevent breaking out of su command
+
+        chars = re.findall(r'[^a-zA-Z0-9-/\.>& ]', cmd)
+
+        if chars:
+
+            raise InvalidChar("Parameter 'cmd' contains invalid character(s) %s"
+
+                              % '|'.join(set(chars)))
+
+        #only allow relevant chars in uuid
+
+        chars = re.findall(r'[^a-zA-Z0-9-]', uuid)
+
+        if chars:
+
+            raise InvalidChar("Parameter 'uuid' contains invalid character(s) %s"
+
+                              % '|'.join(set(chars)))
 
 
 
-    def delete_service(self, service_id):
-
-        raise exception.NotImplemented()
+        self._validateCmd(cmd)
 
 
 
-    def create_service(self, service_id, service_ref):
+        info = SenderInfo(sender, conn)
 
-        raise exception.NotImplemented()
+        user = info.connectionUnixUser()
 
-
-
-    def create_endpoint(self, endpoint_id, endpoint_ref):
-
-        raise exception.NotImplemented()
+        owner = info.nameOwner()
 
 
 
-    def delete_endpoint(self, endpoint_id):
-
-        raise exception.NotImplemented()
+        self._checkLimits(owner, cmd)
 
 
 
-    def get_endpoint(self, endpoint_id):
+        #create su command
 
-        """Get endpoint by id.
+        sucmd = "%s - '%s' -c '%s'" %(self.su, user, cmd)
+
+        #create Udev rule
+
+        rule = 'ACTION=="add|change", ENV{ID_FS_UUID}=="%s", RUN+="%s"\n' %(uuid, sucmd)
 
 
 
-        Returns: endpoint_ref dict or None.
+        #store rule
+
+        if not owner in self.tmpDict:
+
+            self.tmpDict[owner] = []
+
+        self.tmpDict[owner].append(rule)
 
 
+
+    @dbus.service.method("net.launchpad.backintime.serviceHelper.UdevRules",
+
+                         in_signature='', out_signature='b',
+
+                         sender_keyword='sender', connection_keyword='conn')
+
+    def save(self, sender=None, conn=None):
 
         """
 
-        raise exception.NotImplemented()
+        Save rules to destiantion file after user authenticated as admin.
 
+        This will first check if there are any changes between
 
+        temporary added rules and current rules in destiantion file.
 
-    def list_endpoints(self):
-
-        """List all endpoint ids in catalog.
-
-
-
-        Returns: list of endpoint_ids or an empty list.
-
-
+        Returns False if files are identical or no rules to be installed.
 
         """
 
-        raise exception.NotImplemented()
+        info = SenderInfo(sender, conn)
+
+        user = info.connectionUnixUser()
+
+        owner = info.nameOwner()
 
 
 
-    def get_catalog(self, user_id, tenant_id, metadata=None):
+        #delete rule if no rules in tmp
 
-        """Retreive and format the current service catalog.
+        if not owner in self.tmpDict or not self.tmpDict[owner]:
 
+            self.delete(sender, conn)
 
+            return False
 
-        Returns: A nested dict representing the service catalog or an
+        #return False if rule already exist.
 
-                 empty dict.
+        if os.path.exists(UDEV_RULES_PATH % user):
 
+            with open(UDEV_RULES_PATH % user, 'r') as f:
 
+                if self.tmpDict[owner] == f.readlines():
 
-        Example:
+                    self._clean(owner)
 
+                    return False
 
+        #auth to save changes
 
-            { 'RegionOne':
+        self._checkPolkitPrivilege(sender, conn, 'net.launchpad.backintime.UdevRuleSave')
 
-                {'compute': {
+        with open(UDEV_RULES_PATH % user, 'w') as f:
 
-                    'adminURL': u'http://host:8774/v1.1/tenantid',
+            f.writelines(self.tmpDict[owner])
 
-                    'internalURL': u'http://host:8774/v1.1/tenant_id',
+        self._clean(owner)
 
-                    'name': 'Compute Service',
-
-                    'publicURL': u'http://host:8774/v1.1/tenantid'},
-
-                 'ec2': {
-
-                    'adminURL': 'http://host:8773/services/Admin',
-
-                    'internalURL': 'http://host:8773/services/Cloud',
-
-                    'name': 'EC2 Service',
-
-                    'publicURL': 'http://host:8773/services/Cloud'}}
+        return True
 
 
+
+    @dbus.service.method("net.launchpad.backintime.serviceHelper.UdevRules",
+
+                         in_signature='', out_signature='',
+
+                         sender_keyword='sender', connection_keyword='conn')
+
+    def delete(self, sender=None, conn=None):
 
         """
 
-        raise exception.NotImplemented()
+        Delete existing Udev rule
 
+        """
 
+        info = SenderInfo(sender, conn)
 
+        user = info.connectionUnixUser()
 
+        owner = info.nameOwner()
 
-class ServiceController(wsgi.Application):
+        self._clean(owner)
 
-    def __init__(self):
+        if os.path.exists(UDEV_RULES_PATH % user):
 
-        self.catalog_api = Manager()
+            #auth to delete rule
 
-        self.identity_api = identity.Manager()
+            self._checkPolkitPrivilege(sender, conn, 'net.launchpad.backintime.UdevRuleDelete')
 
-        self.policy_api = policy.Manager()
+            os.remove(UDEV_RULES_PATH % user)
 
-        self.token_api = token.Manager()
 
-        super(ServiceController, self).__init__()
 
+    @dbus.service.method("net.launchpad.backintime.serviceHelper.UdevRules",
 
+                         in_signature='', out_signature='',
 
-    # CRUD extensions
+                         sender_keyword='sender', connection_keyword='conn')
 
-    # NOTE(termie): this OS-KSADM stuff is not very consistent
+    def clean(self, sender=None, conn=None):
 
-    def get_services(self, context):
+        """
 
-        self.assert_admin(context)
+        clean up previous cached rules
 
-        service_list = self.catalog_api.list_services(context)
+        """
 
-        service_refs = [self.catalog_api.get_service(context, x)
+        info = SenderInfo(sender, conn)
 
-                        for x in service_list]
+        self._clean(info.nameOwner())
 
-        return {'OS-KSADM:services': service_refs}
 
 
+    def _clean(self, owner):
 
-    def get_service(self, context, service_id):
+        if owner in self.tmpDict:
 
-        self.assert_admin(context)
+            del self.tmpDict[owner]
 
-        service_ref = self.catalog_api.get_service(context, service_id)
 
-        if not service_ref:
 
-            raise exception.ServiceNotFound(service_id=service_id)
+    def _initPolkit(self):
 
-        return {'OS-KSADM:service': service_ref}
+        if self.polkit is None:
 
+            self.polkit = dbus.Interface(dbus.SystemBus().get_object(
 
+                'org.freedesktop.PolicyKit1',
 
-    def delete_service(self, context, service_id):
+                '/org/freedesktop/PolicyKit1/Authority', False),
 
-        self.assert_admin(context)
+                'org.freedesktop.PolicyKit1.Authority')
 
-        service_ref = self.catalog_api.get_service(context, service_id)
 
-        if not service_ref:
 
-            raise exception.ServiceNotFound(service_id=service_id)
+    def _checkPolkitPrivilege(self, sender, conn, privilege):
 
-        self.catalog_api.delete_service(context, service_id)
+        # from jockey
 
+        """
 
+        Verify that sender has a given PolicyKit privilege.
 
-    def create_service(self, context, OS_KSADM_service):
 
-        self.assert_admin(context)
 
-        service_id = uuid.uuid4().hex
+        sender is the sender's (private) D-BUS name, such as ":1:42"
 
-        service_ref = OS_KSADM_service.copy()
+        (sender_keyword in @dbus.service.methods). conn is
 
-        service_ref['id'] = service_id
+        the dbus.Connection object (connection_keyword in
 
-        new_service_ref = self.catalog_api.create_service(
+        @dbus.service.methods). privilege is the PolicyKit privilege string.
 
-                context, service_id, service_ref)
 
-        return {'OS-KSADM:service': new_service_ref}
 
+        This method returns if the caller is privileged, and otherwise throws a
 
+        PermissionDeniedByPolicy exception.
 
+        """
 
+        if sender is None and conn is None:
 
-class EndpointController(wsgi.Application):
+            # called locally, not through D-BUS
 
-    def __init__(self):
+            return
 
-        self.catalog_api = Manager()
+        if not self.enforce_polkit:
 
-        self.identity_api = identity.Manager()
+            # that happens for testing purposes when running on the session
 
-        self.policy_api = policy.Manager()
+            # bus, and it does not make sense to restrict operations here
 
-        self.token_api = token.Manager()
+            return
 
-        super(EndpointController, self).__init__()
 
 
+        # query PolicyKit
 
-    def get_endpoints(self, context):
+        self._initPolkit()
 
-        self.assert_admin(context)
+        try:
 
-        endpoint_list = self.catalog_api.list_endpoints(context)
+            # we don't need is_challenge return here, since we call with AllowUserInteraction
 
-        endpoint_refs = [self.catalog_api.get_endpoint(context, e)
+            (is_auth, _, details) = self.polkit.CheckAuthorization(
 
-                         for e in endpoint_list]
+                    ('system-bus-name', {'name': dbus.String(sender, variant_level=1)}),
 
-        return {'endpoints': endpoint_refs}
+                    privilege, {'': ''}, dbus.UInt32(1), '', timeout=3000)
 
+        except dbus.DBusException as e:
 
+            if e._dbus_error_name == 'org.freedesktop.DBus.Error.ServiceUnknown':
 
-    def create_endpoint(self, context, endpoint):
+                # polkitd timed out, connect again
 
-        self.assert_admin(context)
+                self.polkit = None
 
-        endpoint_id = uuid.uuid4().hex
+                return self._checkPolkitPrivilege(sender, conn, privilege)
 
-        endpoint_ref = endpoint.copy()
+            else:
 
-        endpoint_ref['id'] = endpoint_id
+                raise
 
 
 
-        service_id = endpoint_ref['service_id']
+        if not is_auth:
 
-        if not self.catalog_api.get_service(context, service_id):
+            raise PermissionDeniedByPolicy(privilege)
 
-            raise exception.ServiceNotFound(service_id=service_id)
 
 
+class SenderInfo(object):
 
-        new_endpoint_ref = self.catalog_api.create_endpoint(
+    def __init__(self, sender, conn):
 
-                                context, endpoint_id, endpoint_ref)
+        self.sender = sender
 
-        return {'endpoint': new_endpoint_ref}
+        self.dbus_info = dbus.Interface(conn.get_object('org.freedesktop.DBus',
 
+                '/org/freedesktop/DBus/Bus', False), 'org.freedesktop.DBus')
 
 
-    def delete_endpoint(self, context, endpoint_id):
 
-        self.assert_admin(context)
+    def connectionUnixUser(self):
 
-        endpoint_ref = self.catalog_api.delete_endpoint(context, endpoint_id)
+        uid = self.dbus_info.GetConnectionUnixUser(self.sender)
+
+        if pwd:
+
+            return pwd.getpwuid(uid).pw_name
+
+        else:
+
+            return uid
+
+
+
+    def nameOwner(self):
+
+        return self.dbus_info.GetNameOwner(self.sender)
+
+
+
+    def connectionPid(self):
+
+        return self.dbus_info.GetConnectionUnixProcessID(self.sender)
+
+
+
+if __name__ == '__main__':
+
+    dbus.mainloop.pyqt5.DBusQtMainLoop(set_as_default=True)
+
+
+
+    app = QCoreApplication([])
+
+
+
+    bus = dbus.SystemBus()
+
+    name = dbus.service.BusName("net.launchpad.backintime.serviceHelper", bus)
+
+    object = UdevRules(bus, '/UdevRules')
+
+
+
+    print("Running BIT service.")
+
+    app.exec_()

@@ -2,1702 +2,578 @@
 # Safety: safe
 # Category: safe
 
-# -*- coding: utf-8 -*-
+"""Tornado handlers for kernels."""
 
 
 
-from __future__ import print_function
+# Copyright (c) IPython Development Team.
 
-from __future__ import absolute_import
+# Distributed under the terms of the Modified BSD License.
 
 
 
-from typing import List, TYPE_CHECKING
+import json
 
+import logging
 
+from tornado import gen, web
 
-from zulint.custom_rules import RuleList
+from tornado.concurrent import Future
 
-if TYPE_CHECKING:
+from tornado.ioloop import IOLoop
 
-    from zulint.custom_rules import Rule
 
 
+from IPython.utils.jsonutil import date_default
 
-# Rule help:
+from IPython.utils.py3compat import cast_unicode
 
-# By default, a rule applies to all files within the extension for which it is specified (e.g. all .py files)
+from IPython.html.utils import url_path_join, url_escape
 
-# There are three operators we can use to manually include or exclude files from linting for a rule:
 
-# 'exclude': 'set([<path>, ...])' - if <path> is a filename, excludes that file.
 
-#                                   if <path> is a directory, excludes all files directly below the directory <path>.
+from ...base.handlers import IPythonHandler, APIHandler, json_errors
 
-# 'exclude_line': 'set([(<path>, <line>), ...])' - excludes all lines matching <line> in the file <path> from linting.
+from ...base.zmqhandlers import AuthenticatedZMQStreamHandler, deserialize_binary_message
 
-# 'include_only': 'set([<path>, ...])' - includes only those files where <path> is a substring of the filepath.
 
 
+from IPython.core.release import kernel_protocol_version
 
-PYDELIMS = r'''"'()\[\]{}#\\'''
 
-PYREG = r"[^{}]".format(PYDELIMS)
 
-PYSQ = r'"(?:[^"\\]|\\.)*"'
+class MainKernelHandler(APIHandler):
 
-PYDQ = r"'(?:[^'\\]|\\.)*'"
 
-PYLEFT = r"[(\[{]"
 
-PYRIGHT = r"[)\]}]"
+    @web.authenticated
 
-PYCODE = PYREG
+    @json_errors
 
-for depth in range(5):
+    def get(self):
 
-    PYGROUP = r"""(?:{}|{}|{}{}*{})""".format(PYSQ, PYDQ, PYLEFT, PYCODE, PYRIGHT)
+        km = self.kernel_manager
 
-    PYCODE = r"""(?:{}|{})""".format(PYREG, PYGROUP)
+        self.finish(json.dumps(km.list_kernels()))
 
 
 
-FILES_WITH_LEGACY_SUBJECT = {
+    @web.authenticated
 
-    # This basically requires a big DB migration:
+    @json_errors
 
-    'zerver/lib/topic.py',
+    def post(self):
 
+        km = self.kernel_manager
 
+        model = self.get_json_body()
 
-    # This is for backward compatibility.
+        if model is None:
 
-    'zerver/tests/test_legacy_subject.py',
+            model = {
 
+                'name': km.default_kernel_name
 
+            }
 
-    # Other migration-related changes require extreme care.
+        else:
 
-    'zerver/lib/fix_unreads.py',
+            model.setdefault('name', km.default_kernel_name)
 
-    'zerver/tests/test_migrations.py',
 
 
+        kernel_id = km.start_kernel(kernel_name=model['name'])
 
-    # These use subject in the email sense, and will
+        model = km.kernel_model(kernel_id)
 
-    # probably always be exempt:
+        location = url_path_join(self.base_url, 'api', 'kernels', kernel_id)
 
-    'zerver/lib/email_mirror.py',
+        self.set_header('Location', url_escape(location))
 
-    'zerver/lib/feedback.py',
+        self.set_status(201)
 
-    'zerver/tests/test_new_users.py',
+        self.finish(json.dumps(model))
 
-    'zerver/tests/test_email_mirror.py',
 
 
 
-    # These are tied more to our API than our DB model.
 
-    'zerver/openapi/python_examples.py',
+class KernelHandler(APIHandler):
 
-    'zerver/tests/test_openapi.py',
 
 
+    SUPPORTED_METHODS = ('DELETE', 'GET')
 
-    # This has lots of query data embedded, so it's hard
 
-    # to fix everything until we migrate the DB to "topic".
 
-    'zerver/tests/test_narrow.py',
+    @web.authenticated
 
-}
+    @json_errors
 
+    def get(self, kernel_id):
 
+        km = self.kernel_manager
 
-shebang_rules = [
+        km._check_kernel_id(kernel_id)
 
-    {'pattern': '^#!',
+        model = km.kernel_model(kernel_id)
 
-     'description': "zerver library code shouldn't have a shebang line.",
+        self.finish(json.dumps(model))
 
-     'include_only': set(['zerver/'])},
 
-    # /bin/sh and /usr/bin/env are the only two binaries
 
-    # that NixOS provides at a fixed path (outside a
+    @web.authenticated
 
-    # buildFHSUserEnv sandbox).
+    @json_errors
 
-    {'pattern': '^#!(?! *(?:/usr/bin/env|/bin/sh)(?: |$))',
+    def delete(self, kernel_id):
 
-     'description': "Use `#!/usr/bin/env foo` instead of `#!/path/foo`"
+        km = self.kernel_manager
 
-     " for interpreters other than sh."},
+        km.shutdown_kernel(kernel_id)
 
-    {'pattern': '^#!/usr/bin/env python$',
+        self.set_status(204)
 
-     'description': "Use `#!/usr/bin/env python3` instead of `#!/usr/bin/env python`."}
+        self.finish()
 
-]  # type: List[Rule]
 
 
 
-trailing_whitespace_rule = {
 
-    'pattern': r'\s+$',
+class KernelActionHandler(APIHandler):
 
-    'strip': '\n',
 
-    'description': 'Fix trailing whitespace'
 
-}  # type: Rule
+    @web.authenticated
 
-whitespace_rules = [
+    @json_errors
 
-    # This linter should be first since bash_rules depends on it.
+    def post(self, kernel_id, action):
 
-    trailing_whitespace_rule,
+        km = self.kernel_manager
 
-    {'pattern': 'http://zulip.readthedocs.io',
+        if action == 'interrupt':
 
-     'description': 'Use HTTPS when linking to ReadTheDocs',
+            km.interrupt_kernel(kernel_id)
 
-     },
+            self.set_status(204)
 
-    {'pattern': '\t',
+        if action == 'restart':
 
-     'strip': '\n',
+            km.restart_kernel(kernel_id)
 
-     'exclude': set(['tools/ci/success-http-headers.txt']),
+            model = km.kernel_model(kernel_id)
 
-     'description': 'Fix tab-based whitespace'},
+            self.set_header('Location', '{0}api/kernels/{1}'.format(self.base_url, kernel_id))
 
-]  # type: List[Rule]
+            self.write(json.dumps(model))
 
-comma_whitespace_rule = [
+        self.finish()
 
-    {'pattern': ', {2,}[^#/ ]',
 
-     'exclude': set(['zerver/tests', 'frontend_tests/node_tests', 'corporate/tests']),
 
-     'description': "Remove multiple whitespaces after ','",
 
-     'good_lines': ['foo(1, 2, 3)', 'foo = bar  # some inline comment'],
 
-     'bad_lines': ['foo(1,  2, 3)', 'foo(1,    2, 3)']},
+class ZMQChannelsHandler(AuthenticatedZMQStreamHandler):
 
-]  # type: List[Rule]
+    
 
-markdown_whitespace_rules = list([rule for rule in whitespace_rules if rule['pattern'] != r'\s+$']) + [
+    @property
 
-    # Two spaces trailing a line with other content is okay--it's a markdown line break.
+    def kernel_info_timeout(self):
 
-    # This rule finds one space trailing a non-space, three or more trailing spaces, and
+        return self.settings.get('kernel_info_timeout', 10)
 
-    # spaces on an empty line.
+    
 
-    {'pattern': r'((?<!\s)\s$)|(\s\s\s+$)|(^\s+$)',
+    def __repr__(self):
 
-     'strip': '\n',
+        return "%s(%s)" % (self.__class__.__name__, getattr(self, 'kernel_id', 'uninitialized'))
 
-     'description': 'Fix trailing whitespace'},
+    
 
-    {'pattern': '^#+[A-Za-z0-9]',
+    def create_stream(self):
 
-     'strip': '\n',
+        km = self.kernel_manager
 
-     'description': 'Missing space after # in heading',
+        identity = self.session.bsession
 
-     'good_lines': ['### some heading', '# another heading'],
+        for channel in ('shell', 'iopub', 'stdin'):
 
-     'bad_lines': ['###some heading', '#another heading']},
+            meth = getattr(km, 'connect_' + channel)
 
-]
+            self.channels[channel] = stream = meth(self.kernel_id, identity=identity)
 
+            stream.channel = channel
 
+        km.add_restart_callback(self.kernel_id, self.on_kernel_restarted)
 
+        km.add_restart_callback(self.kernel_id, self.on_restart_failed, 'dead')
 
+    
 
-js_rules = RuleList(
+    def request_kernel_info(self):
 
-    langs=['js'],
+        """send a request for kernel_info"""
 
-    rules=[
+        km = self.kernel_manager
 
-        {'pattern': 'subject|SUBJECT',
+        kernel = km.get_kernel(self.kernel_id)
 
-         'exclude': set(['static/js/util.js',
+        try:
 
-                         'frontend_tests/']),
+            # check for previous request
 
-         'exclude_pattern': 'emails',
+            future = kernel._kernel_info_future
 
-         'description': 'avoid subject in JS code',
+        except AttributeError:
 
-         'good_lines': ['topic_name'],
+            self.log.debug("Requesting kernel info from %s", self.kernel_id)
 
-         'bad_lines': ['subject="foo"', ' MAX_SUBJECT_LEN']},
+            # Create a kernel_info channel to query the kernel protocol version.
 
-        {'pattern': r'[^_]function\(',
+            # This channel will be closed after the kernel_info reply is received.
 
-         'description': 'The keyword "function" should be followed by a space'},
+            if self.kernel_info_channel is None:
 
-        {'pattern': 'msgid|MSGID',
+                self.kernel_info_channel = km.connect_shell(self.kernel_id)
 
-         'description': 'Avoid using "msgid" as a variable name; use "message_id" instead.'},
+            self.kernel_info_channel.on_recv(self._handle_kernel_info_reply)
 
-        {'pattern': r'.*blueslip.warning\(.*',
+            self.session.send(self.kernel_info_channel, "kernel_info_request")
 
-         'description': 'The module blueslip has no function warning, try using blueslip.warn'},
+            # store the future on the kernel, so only one request is sent
 
-        {'pattern': '[)]{$',
+            kernel._kernel_info_future = self._kernel_info_future
 
-         'description': 'Missing space between ) and {'},
+        else:
 
-        {'pattern': r'i18n\.t\([^)]+[^,\{\)]$',
+            if not future.done():
 
-         'description': 'i18n string should not be a multiline string'},
+                self.log.debug("Waiting for pending kernel_info request")
 
-        {'pattern': r'''i18n\.t\(['"].+?['"]\s*\+''',
+            future.add_done_callback(lambda f: self._finish_kernel_info(f.result()))
 
-         'description': 'Do not concatenate arguments within i18n.t()'},
+        return self._kernel_info_future
 
-        {'pattern': r'i18n\.t\(.+\).*\+',
+    
 
-         'description': 'Do not concatenate i18n strings'},
+    def _handle_kernel_info_reply(self, msg):
 
-        {'pattern': r'\+.*i18n\.t\(.+\)',
+        """process the kernel_info_reply
 
-         'description': 'Do not concatenate i18n strings'},
+        
 
-        {'pattern': '[.]includes[(]',
+        enabling msg spec adaptation, if necessary
 
-         'exclude': {'frontend_tests/'},
+        """
 
-         'description': '.includes() is incompatible with Internet Explorer. Use .indexOf() !== -1 instead.'},
+        idents,msg = self.session.feed_identities(msg)
 
-        {'pattern': '[.]html[(]',
+        try:
 
-         'exclude_pattern': r'''[.]html[(]("|'|render_|html|message.content|sub.rendered_description|i18n.t|rendered_|$|[)]|error_text|widget_elem|[$]error|[$][(]"<p>"[)])''',
+            msg = self.session.deserialize(msg)
 
-         'exclude': {'static/js/portico', 'static/js/lightbox.js', 'static/js/ui_report.js',
+        except:
 
-                     'static/js/confirm_dialog.js',
+            self.log.error("Bad kernel_info reply", exc_info=True)
 
-                     'frontend_tests/'},
+            self._kernel_info_future.set_result({})
 
-         'description': 'Setting HTML content with jQuery .html() can lead to XSS security bugs.  Consider .text() or using rendered_foo as a variable name if content comes from handlebars and thus is already sanitized.'},
+            return
 
-        {'pattern': '["\']json/',
+        else:
 
-         'description': 'Relative URL for JSON route not supported by i18n'},
+            info = msg['content']
 
-        # This rule is constructed with + to avoid triggering on itself
+            self.log.debug("Received kernel info: %s", info)
 
-        {'pattern': " =" + '[^ =>~"]',
+            if msg['msg_type'] != 'kernel_info_reply' or 'protocol_version' not in info:
 
-         'description': 'Missing whitespace after "="'},
+                self.log.error("Kernel info request failed, assuming current %s", info)
 
-        {'pattern': '^[ ]*//[A-Za-z0-9]',
+                info = {}
 
-         'description': 'Missing space after // in comment'},
+            self._finish_kernel_info(info)
 
-        {'pattern': 'if[(]',
+        
 
-         'description': 'Missing space between if and ('},
+        # close the kernel_info channel, we don't need it anymore
 
-        {'pattern': 'else{$',
+        if self.kernel_info_channel:
 
-         'description': 'Missing space between else and {'},
+            self.kernel_info_channel.close()
 
-        {'pattern': '^else {$',
+        self.kernel_info_channel = None
 
-         'description': 'Write JS else statements on same line as }'},
+    
 
-        {'pattern': '^else if',
+    def _finish_kernel_info(self, info):
 
-         'description': 'Write JS else statements on same line as }'},
+        """Finish handling kernel_info reply
 
-        {'pattern': 'console[.][a-z]',
+        
 
-         'exclude': set(['static/js/blueslip.js',
+        Set up protocol adaptation, if needed,
 
-                         'frontend_tests/zjsunit',
+        and signal that connection can continue.
 
-                         'frontend_tests/casper_lib/common.js',
+        """
 
-                         'frontend_tests/node_tests',
+        protocol_version = info.get('protocol_version', kernel_protocol_version)
 
-                         'static/js/debug.js']),
+        if protocol_version != kernel_protocol_version:
 
-         'description': 'console.log and similar should not be used in webapp'},
+            self.session.adapt_version = int(protocol_version.split('.')[0])
 
-        {'pattern': r'''[.]text\(["'][a-zA-Z]''',
+            self.log.info("Adapting to protocol v%s for kernel %s", protocol_version, self.kernel_id)
 
-         'description': 'Strings passed to $().text should be wrapped in i18n.t() for internationalization',
+        if not self._kernel_info_future.done():
 
-         'exclude': set(['frontend_tests/node_tests/'])},
+            self._kernel_info_future.set_result(info)
 
-        {'pattern': r'''compose_error\(["']''',
+    
 
-         'description': 'Argument to compose_error should be a literal string enclosed '
+    def initialize(self):
 
-                        'by i18n.t()'},
+        super(ZMQChannelsHandler, self).initialize()
 
-        {'pattern': r'ui.report_success\(',
+        self.zmq_stream = None
 
-         'description': 'Deprecated function, use ui_report.success.'},
+        self.channels = {}
 
-        {'pattern': r'''report.success\(["']''',
+        self.kernel_id = None
 
-         'description': 'Argument to report_success should be a literal string enclosed '
+        self.kernel_info_channel = None
 
-                        'by i18n.t()'},
+        self._kernel_info_future = Future()
 
-        {'pattern': r'ui.report_error\(',
+    
 
-         'description': 'Deprecated function, use ui_report.error.'},
+    @gen.coroutine
 
-        {'pattern': r'''report.error\(["'][^'"]''',
+    def pre_get(self):
 
-         'description': 'Argument to ui_report.error should be a literal string enclosed '
+        # authenticate first
 
-                        'by i18n.t()',
+        super(ZMQChannelsHandler, self).pre_get()
 
-         'good_lines': ['ui_report.error("")', 'ui_report.error(_("text"))'],
+        # then request kernel info, waiting up to a certain time before giving up.
 
-         'bad_lines': ['ui_report.error("test")']},
+        # We don't want to wait forever, because browsers don't take it well when
 
-        {'pattern': r'\$\(document\)\.ready\(',
+        # servers never respond to websocket connection requests.
 
-         'description': "`Use $(f) rather than `$(document).ready(f)`",
+        kernel = self.kernel_manager.get_kernel(self.kernel_id)
 
-         'good_lines': ['$(function () {foo();}'],
+        self.session.key = kernel.session.key
 
-         'bad_lines': ['$(document).ready(function () {foo();}']},
+        future = self.request_kernel_info()
 
-        {'pattern': '[$][.](get|post|patch|delete|ajax)[(]',
+        
 
-         'description': "Use channel module for AJAX calls",
+        def give_up():
 
-         'exclude': set([
+            """Don't wait forever for the kernel to reply"""
 
-             # Internal modules can do direct network calls
+            if future.done():
 
-             'static/js/blueslip.js',
+                return
 
-             'static/js/channel.js',
+            self.log.warn("Timeout waiting for kernel_info reply from %s", self.kernel_id)
 
-             # External modules that don't include channel.js
+            future.set_result({})
 
-             'static/js/stats/',
+        loop = IOLoop.current()
 
-             'static/js/portico/',
+        loop.add_timeout(loop.time() + self.kernel_info_timeout, give_up)
 
-             'static/js/billing/',
+        # actually wait for it
 
-         ]),
+        yield future
 
-         'good_lines': ['channel.get(...)'],
+    
 
-         'bad_lines': ['$.get()', '$.post()', '$.ajax()']},
+    @gen.coroutine
 
-        {'pattern': 'style ?=',
+    def get(self, kernel_id):
 
-         'description': "Avoid using the `style=` attribute; we prefer styling in CSS files",
+        self.kernel_id = cast_unicode(kernel_id, 'ascii')
 
-         'exclude': set([
+        yield super(ZMQChannelsHandler, self).get(kernel_id=kernel_id)
 
-             'frontend_tests/node_tests/copy_and_paste.js',
+    
 
-             'frontend_tests/node_tests/upload.js',
+    def open(self, kernel_id):
 
-             'frontend_tests/node_tests/templates.js',
+        super(ZMQChannelsHandler, self).open()
 
-             'static/js/upload.js',
+        try:
 
-             'static/js/stream_color.js',
+            self.create_stream()
 
-         ]),
+        except web.HTTPError as e:
 
-         'good_lines': ['#my-style {color: blue;}'],
+            self.log.error("Error opening stream: %s", e)
 
-         'bad_lines': ['<p style="color: blue;">Foo</p>', 'style = "color: blue;"']},
+            # WebSockets don't response to traditional error codes so we
 
-        *whitespace_rules,
+            # close the connection.
 
-        *comma_whitespace_rule,
+            for channel, stream in self.channels.items():
 
-    ],
+                if not stream.closed():
 
-)
+                    stream.close()
 
+            self.close()
 
+        else:
 
-python_rules = RuleList(
+            for channel, stream in self.channels.items():
 
-    langs=['py'],
+                stream.on_recv_stream(self._on_zmq_reply)
 
-    rules=[
 
-        {'pattern': 'subject|SUBJECT',
 
-         'exclude_pattern': 'subject to the|email|outbox',
+    def on_message(self, msg):
 
-         'description': 'avoid subject as a var',
+        if not self.channels:
 
-         'good_lines': ['topic_name'],
+            # already closed, ignore the message
 
-         'bad_lines': ['subject="foo"', ' MAX_SUBJECT_LEN'],
+            self.log.debug("Received message on closed websocket %r", msg)
 
-         'exclude': FILES_WITH_LEGACY_SUBJECT,
+            return
 
-         'include_only': set([
+        if isinstance(msg, bytes):
 
-             'zerver/data_import/',
+            msg = deserialize_binary_message(msg)
 
-             'zerver/lib/',
+        else:
 
-             'zerver/tests/',
+            msg = json.loads(msg)
 
-             'zerver/views/'])},
+        channel = msg.pop('channel', None)
 
-        {'pattern': 'msgid|MSGID',
+        if channel is None:
 
-         'exclude': set(['tools/check-capitalization',
+            self.log.warn("No channel specified, assuming shell: %s", msg)
 
-                         'tools/i18n/tagmessages']),
+            channel = 'shell'
 
-         'description': 'Avoid using "msgid" as a variable name; use "message_id" instead.'},
+        if channel not in self.channels:
 
-        {'pattern': '^(?!#)@login_required',
+            self.log.warn("No such channel: %r", channel)
 
-         'description': '@login_required is unsupported; use @zulip_login_required',
+            return
 
-         'good_lines': ['@zulip_login_required', '# foo @login_required'],
+        stream = self.channels[channel]
 
-         'bad_lines': ['@login_required', ' @login_required']},
+        self.session.send(stream, msg)
 
-        {'pattern': '^user_profile[.]save[(][)]',
 
-         'description': 'Always pass update_fields when saving user_profile objects',
 
-         'exclude_line': set([
+    def on_close(self):
 
-             ('zerver/lib/actions.py', "user_profile.save()  # Can't use update_fields because of how the foreign key works."),
+        km = self.kernel_manager
 
-         ]),
+        if self.kernel_id in km:
 
-         'exclude': set(['zerver/tests', 'zerver/lib/create_user.py']),
+            km.remove_restart_callback(
 
-         'good_lines': ['user_profile.save(update_fields=["pointer"])'],
+                self.kernel_id, self.on_kernel_restarted,
 
-         'bad_lines': ['user_profile.save()']},
+            )
 
-        {'pattern': r'^[^"]*"[^"]*"%\(',
+            km.remove_restart_callback(
 
-         'description': 'Missing space around "%"',
+                self.kernel_id, self.on_restart_failed, 'dead',
 
-         'good_lines': ['"%s" % ("foo")', '"%s" % (foo)'],
+            )
 
-         'bad_lines': ['"%s"%("foo")', '"%s"%(foo)']},
+        # This method can be called twice, once by self.kernel_died and once
 
-        {'pattern': r"^[^']*'[^']*'%\(",
+        # from the WebSocket close event. If the WebSocket connection is
 
-         'description': 'Missing space around "%"',
+        # closed before the ZMQ streams are setup, they could be None.
 
-         'good_lines': ["'%s' % ('foo')", "'%s' % (foo)"],
+        for channel, stream in self.channels.items():
 
-         'bad_lines': ["'%s'%('foo')", "'%s'%(foo)"]},
+            if stream is not None and not stream.closed():
 
-        {'pattern': 'self: Any',
+                stream.on_recv(None)
 
-         'description': 'you can omit Any annotation for self',
+                # close the socket directly, don't wait for the stream
 
-         'good_lines': ['def foo (self):'],
+                socket = stream.socket
 
-         'bad_lines': ['def foo(self: Any):']},
+                stream.close()
 
-        # This rule is constructed with + to avoid triggering on itself
+                socket.close()
 
-        {'pattern': " =" + '[^ =>~"]',
+        
 
-         'description': 'Missing whitespace after "="',
+        self.channels = {}
 
-         'good_lines': ['a = b', '5 == 6'],
 
-         'bad_lines': ['a =b', 'asdf =42']},
 
-        {'pattern': r'":\w[^"]*$',
+    def _send_status_message(self, status):
 
-         'description': 'Missing whitespace after ":"',
+        msg = self.session.msg("status",
 
-         'exclude': set(['zerver/tests/test_push_notifications.py']),
+            {'execution_state': status}
 
-         'good_lines': ['"foo": bar', '"some:string:with:colons"'],
+        )
 
-         'bad_lines': ['"foo":bar', '"foo":1']},
+        msg['channel'] = 'iopub'
 
-        {'pattern': r"':\w[^']*$",
+        self.write_message(json.dumps(msg, default=date_default))
 
-         'description': 'Missing whitespace after ":"',
 
-         'good_lines': ["'foo': bar", "'some:string:with:colons'"],
 
-         'bad_lines': ["'foo':bar", "'foo':1"]},
+    def on_kernel_restarted(self):
 
-        {'pattern': r"^\s+#\w",
+        logging.warn("kernel %s restarted", self.kernel_id)
 
-         'strip': '\n',
+        self._send_status_message('restarting')
 
-         'exclude': set(['tools/droplets/create.py']),
 
-         'description': 'Missing whitespace after "#"',
 
-         'good_lines': ['a = b # some operation', '1+2 #  3 is the result'],
+    def on_restart_failed(self):
 
-         'bad_lines': [' #some operation', '  #not valid!!!']},
+        logging.error("kernel %s restarted failed!", self.kernel_id)
 
-        {'pattern': "assertEquals[(]",
+        self._send_status_message('dead')
 
-         'description': 'Use assertEqual, not assertEquals (which is deprecated).',
 
-         'good_lines': ['assertEqual(1, 2)'],
 
-         'bad_lines': ['assertEquals(1, 2)']},
 
-        {'pattern': "== None",
 
-         'description': 'Use `is None` to check whether something is None',
+#-----------------------------------------------------------------------------
 
-         'good_lines': ['if foo is None'],
+# URL to handler mappings
 
-         'bad_lines': ['foo == None']},
+#-----------------------------------------------------------------------------
 
-        {'pattern': "type:[(]",
 
-         'description': 'Missing whitespace after ":" in type annotation',
 
-         'good_lines': ['# type: (Any, Any)', 'colon:separated:string:containing:type:as:keyword'],
 
-         'bad_lines': ['# type:(Any, Any)']},
 
-        {'pattern': "type: ignore$",
+_kernel_id_regex = r"(?P<kernel_id>\w+-\w+-\w+-\w+-\w+)"
 
-         'exclude': set(['tools/tests',
+_kernel_action_regex = r"(?P<action>restart|interrupt)"
 
-                         'zerver/lib/test_runner.py',
 
-                         'zerver/tests']),
 
-         'description': '"type: ignore" should always end with "# type: ignore # explanation for why"',
+default_handlers = [
 
-         'good_lines': ['foo = bar  # type: ignore # explanation'],
+    (r"/api/kernels", MainKernelHandler),
 
-         'bad_lines': ['foo = bar  # type: ignore']},
+    (r"/api/kernels/%s" % _kernel_id_regex, KernelHandler),
 
-        {'pattern': "# type [(]",
+    (r"/api/kernels/%s/%s" % (_kernel_id_regex, _kernel_action_regex), KernelActionHandler),
 
-         'description': 'Missing : after type in type annotation',
-
-         'good_lines': ['foo = 42  # type: int', '# type: (str, int) -> None'],
-
-         'bad_lines': ['# type (str, int) -> None']},
-
-        {'pattern': "#type",
-
-         'description': 'Missing whitespace after "#" in type annotation',
-
-         'good_lines': ['foo = 42  # type: int'],
-
-         'bad_lines': ['foo = 42  #type: int']},
-
-        {'pattern': r'\b(if|else|while)[(]',
-
-         'description': 'Put a space between statements like if, else, etc. and (.',
-
-         'good_lines': ['if (1 == 2):', 'while (foo == bar):'],
-
-         'bad_lines': ['if(1 == 2):', 'while(foo == bar):']},
-
-        {'pattern': ", [)]",
-
-         'description': 'Unnecessary whitespace between "," and ")"',
-
-         'good_lines': ['foo = (1, 2, 3,)', 'foo(bar, 42)'],
-
-         'bad_lines': ['foo = (1, 2, 3, )']},
-
-        {'pattern': "%  [(]",
-
-         'description': 'Unnecessary whitespace between "%" and "("',
-
-         'good_lines': ['"foo %s bar" % ("baz",)'],
-
-         'bad_lines': ['"foo %s bar" %  ("baz",)']},
-
-        # This next check could have false positives, but it seems pretty
-
-        # rare; if we find any, they can be added to the exclude list for
-
-        # this rule.
-
-        {'pattern': r"""^(?:[^'"#\\]|{}|{})*(?:{}|{})\s*%\s*(?![\s({{\\]|dict\(|tuple\()(?:[^,{}]|{})+(?:$|[,#\\]|{})""".format(
-
-            PYSQ, PYDQ, PYSQ, PYDQ, PYDELIMS, PYGROUP, PYRIGHT),
-
-         'description': 'Used % formatting without a tuple',
-
-         'good_lines': ['"foo %s bar" % ("baz",)'],
-
-         'bad_lines': ['"foo %s bar" % "baz"']},
-
-        {'pattern': r"""^(?:[^'"#\\]|{}|{})*(?:{}|{})\s*%\s*\((?:[^,{}]|{})*\)""".format(
-
-            PYSQ, PYDQ, PYSQ, PYDQ, PYDELIMS, PYGROUP),
-
-         'description': 'Used % formatting with parentheses that do not form a tuple',
-
-         'good_lines': ['"foo %s bar" % ("baz",)"'],
-
-         'bad_lines': ['"foo %s bar" % ("baz")']},
-
-        {'pattern': 'sudo',
-
-         'include_only': set(['scripts/']),
-
-         'exclude': set(['scripts/lib/setup_venv.py']),
-
-         'exclude_line': set([
-
-             ('scripts/lib/zulip_tools.py', 'sudo_args = kwargs.pop(\'sudo_args\', [])'),
-
-             ('scripts/lib/zulip_tools.py', 'args = [\'sudo\'] + sudo_args + [\'--\'] + args'),
-
-         ]),
-
-         'description': 'Most scripts are intended to run on systems without sudo.',
-
-         'good_lines': ['subprocess.check_call(["ls"])'],
-
-         'bad_lines': ['subprocess.check_call(["sudo", "ls"])']},
-
-        {'pattern': 'django.utils.translation',
-
-         'include_only': set(['test/', 'zerver/views/development/']),
-
-         'description': 'Test strings should not be tagged for translation',
-
-         'good_lines': [''],
-
-         'bad_lines': ['django.utils.translation']},
-
-        {'pattern': 'userid',
-
-         'description': 'We prefer user_id over userid.',
-
-         'good_lines': ['id = alice.user_id'],
-
-         'bad_lines': ['id = alice.userid']},
-
-        {'pattern': r'json_success\({}\)',
-
-         'description': 'Use json_success() to return nothing',
-
-         'good_lines': ['return json_success()'],
-
-         'bad_lines': ['return json_success({})']},
-
-        {'pattern': r'\Wjson_error\(_\(?\w+\)',
-
-         'exclude': set(['zerver/tests', 'zerver/views/development/']),
-
-         'description': 'Argument to json_error should be a literal string enclosed by _()',
-
-         'good_lines': ['return json_error(_("string"))'],
-
-         'bad_lines': ['return json_error(_variable)', 'return json_error(_(variable))']},
-
-        {'pattern': r'''\Wjson_error\(['"].+[),]$''',
-
-         'exclude': set(['zerver/tests']),
-
-         'description': 'Argument to json_error should a literal string enclosed by _()'},
-
-        # To avoid JsonableError(_variable) and JsonableError(_(variable))
-
-        {'pattern': r'\WJsonableError\(_\(?\w.+\)',
-
-         'exclude': set(['zerver/tests', 'zerver/views/development/']),
-
-         'description': 'Argument to JsonableError should be a literal string enclosed by _()'},
-
-        {'pattern': r'''\WJsonableError\(["'].+\)''',
-
-         'exclude': set(['zerver/tests', 'zerver/views/development/']),
-
-         'description': 'Argument to JsonableError should be a literal string enclosed by _()'},
-
-        {'pattern': r"""\b_\((?:\s|{}|{})*[^\s'")]""".format(PYSQ, PYDQ),
-
-         'description': 'Called _() on a computed string',
-
-         'exclude_line': set([
-
-             ('zerver/lib/i18n.py', 'result = _(string)'),
-
-         ]),
-
-         'good_lines': ["return json_error(_('No presence data for %s') % (target.email,))"],
-
-         'bad_lines': ["return json_error(_('No presence data for %s' % (target.email,)))"]},
-
-        {'pattern': r'''([a-zA-Z0-9_]+)=REQ\(['"]\1['"]''',
-
-         'description': 'REQ\'s first argument already defaults to parameter name'},
-
-        {'pattern': r'self\.client\.(get|post|patch|put|delete)',
-
-         'description': \
-
-         '''Do not call self.client directly for put/patch/post/get.
-
-    See WRAPPER_COMMENT in test_helpers.py for details.
-
-    '''},
-
-        # Directly fetching Message objects in e.g. views code is often a security bug.
-
-        {'pattern': '[^r]Message.objects.get',
-
-         'exclude': set(["zerver/tests",
-
-                         "zerver/lib/onboarding.py",
-
-                         "zilencer/management/commands/add_mock_conversation.py",
-
-                         "zerver/worker/queue_processors.py",
-
-                         "zerver/management/commands/export.py",
-
-                         "zerver/lib/export.py"]),
-
-         'description': 'Please use access_message() to fetch Message objects',
-
-         },
-
-        {'pattern': 'Stream.objects.get',
-
-         'include_only': set(["zerver/views/"]),
-
-         'description': 'Please use access_stream_by_*() to fetch Stream objects',
-
-         },
-
-        {'pattern': 'get_stream[(]',
-
-         'include_only': set(["zerver/views/", "zerver/lib/actions.py"]),
-
-         'exclude_line': set([
-
-             # This one in check_message is kinda terrible, since it's
-
-             # how most instances are written, but better to exclude something than nothing
-
-             ('zerver/lib/actions.py', 'stream = get_stream(stream_name, realm)'),
-
-             ('zerver/lib/actions.py', 'get_stream(admin_realm_signup_notifications_stream, admin_realm)'),
-
-         ]),
-
-         'description': 'Please use access_stream_by_*() to fetch Stream objects',
-
-         },
-
-        {'pattern': 'Stream.objects.filter',
-
-         'include_only': set(["zerver/views/"]),
-
-         'description': 'Please use access_stream_by_*() to fetch Stream objects',
-
-         },
-
-        {'pattern': '^from (zerver|analytics|confirmation)',
-
-         'include_only': set(["/migrations/"]),
-
-         'exclude': set([
-
-             'zerver/migrations/0032_verify_all_medium_avatar_images.py',
-
-             'zerver/migrations/0060_move_avatars_to_be_uid_based.py',
-
-             'zerver/migrations/0104_fix_unreads.py',
-
-             'zerver/migrations/0206_stream_rendered_description.py',
-
-             'zerver/migrations/0209_user_profile_no_empty_password.py',
-
-             'pgroonga/migrations/0002_html_escape_subject.py',
-
-         ]),
-
-         'description': "Don't import models or other code in migrations; see docs/subsystems/schema-migrations.md",
-
-         },
-
-        {'pattern': 'datetime[.](now|utcnow)',
-
-         'include_only': set(["zerver/", "analytics/"]),
-
-         'description': "Don't use datetime in backend code.\n"
-
-         "See https://zulip.readthedocs.io/en/latest/contributing/code-style.html#naive-datetime-objects",
-
-         },
-
-        {'pattern': r'render_to_response\(',
-
-         'description': "Use render() instead of render_to_response().",
-
-         },
-
-        {'pattern': 'from os.path',
-
-         'description': "Don't use from when importing from the standard library",
-
-         },
-
-        {'pattern': 'import os.path',
-
-         'description': "Use import os instead of import os.path",
-
-         },
-
-        {'pattern': r'(logging|logger)\.warn\W',
-
-         'description': "Logger.warn is a deprecated alias for Logger.warning; Use 'warning' instead of 'warn'.",
-
-         'good_lines': ["logging.warning('I am a warning.')", "logger.warning('warning')"],
-
-         'bad_lines': ["logging.warn('I am a warning.')", "logger.warn('warning')"]},
-
-        {'pattern': r'\.pk',
-
-         'exclude_pattern': '[.]_meta[.]pk',
-
-         'description': "Use `id` instead of `pk`.",
-
-         'good_lines': ['if my_django_model.id == 42', 'self.user_profile._meta.pk'],
-
-         'bad_lines': ['if my_django_model.pk == 42']},
-
-        {'pattern': r'^[ ]*# type: \(',
-
-         'exclude': set([
-
-             # These directories, especially scripts/ and puppet/,
-
-             # have tools that need to run before a Zulip environment
-
-             # is provisioned; in some of those, the `typing` module
-
-             # might not be available yet, so care is required.
-
-             'scripts/',
-
-             'tools/',
-
-             'puppet/',
-
-             # Zerver files that we should just clean.
-
-             'zerver/tests',
-
-             'zerver/openapi/python_examples.py',
-
-             'zerver/lib/request.py',
-
-             'zerver/views/streams.py',
-
-             # thumbor is (currently) python2 only
-
-             'zthumbor/',
-
-         ]),
-
-         'description': 'Comment-style function type annotation. Use Python3 style annotations instead.',
-
-         },
-
-        {'pattern': r' = models[.].*null=True.*\)  # type: (?!Optional)',
-
-         'include_only': {"zerver/models.py"},
-
-         'description': 'Model variable with null=true not annotated as Optional.',
-
-         'good_lines': ['desc = models.TextField(null=True)  # type: Optional[Text]',
-
-                        'stream = models.ForeignKey(Stream, null=True, on_delete=CASCADE)  # type: Optional[Stream]',
-
-                        'desc = models.TextField()  # type: Text',
-
-                        'stream = models.ForeignKey(Stream, on_delete=CASCADE)  # type: Stream'],
-
-         'bad_lines': ['desc = models.CharField(null=True)  # type: Text',
-
-                       'stream = models.ForeignKey(Stream, null=True, on_delete=CASCADE)  # type: Stream'],
-
-         },
-
-        {'pattern': r' = models[.](?!NullBoolean).*\)  # type: Optional',  # Optional tag, except NullBoolean(Field)
-
-         'exclude_pattern': 'null=True',
-
-         'include_only': {"zerver/models.py"},
-
-         'description': 'Model variable annotated with Optional but variable does not have null=true.',
-
-         'good_lines': ['desc = models.TextField(null=True)  # type: Optional[Text]',
-
-                        'stream = models.ForeignKey(Stream, null=True, on_delete=CASCADE)  # type: Optional[Stream]',
-
-                        'desc = models.TextField()  # type: Text',
-
-                        'stream = models.ForeignKey(Stream, on_delete=CASCADE)  # type: Stream'],
-
-         'bad_lines': ['desc = models.TextField()  # type: Optional[Text]',
-
-                       'stream = models.ForeignKey(Stream, on_delete=CASCADE)  # type: Optional[Stream]'],
-
-         },
-
-        {'pattern': r'[\s([]Text([^\s\w]|$)',
-
-         'exclude': set([
-
-             # We are likely to want to keep these dirs Python 2+3 compatible,
-
-             # since the plan includes extracting them to a separate project eventually.
-
-             'tools/lib',
-
-             # TODO: Update our migrations from Text->str.
-
-             'zerver/migrations/',
-
-             # thumbor is (currently) python2 only
-
-             'zthumbor/',
-
-         ]),
-
-         'description': "Now that we're a Python 3 only codebase, we don't need to use typing.Text. Please use str instead.",
-
-         },
-
-        {'pattern': 'exit[(]1[)]',
-
-         'include_only': set(["/management/commands/"]),
-
-         'description': 'Raise CommandError to exit with failure in management commands',
-
-         },
-
-        *whitespace_rules,
-
-        *comma_whitespace_rule,
-
-    ],
-
-    max_length=110,
-
-    shebang_rules=shebang_rules,
-
-)
-
-
-
-bash_rules = RuleList(
-
-    langs=['bash'],
-
-    rules=[
-
-        {'pattern': '#!.*sh [-xe]',
-
-         'description': 'Fix shebang line with proper call to /usr/bin/env for Bash path, change -x|-e switches'
-
-                        ' to set -x|set -e'},
-
-        {'pattern': 'sudo',
-
-         'description': 'Most scripts are intended to work on systems without sudo',
-
-         'include_only': set(['scripts/']),
-
-         'exclude': set([
-
-             'scripts/lib/install',
-
-             'scripts/setup/configure-rabbitmq'
-
-         ]), },
-
-        *whitespace_rules[0:1],
-
-    ],
-
-    shebang_rules=shebang_rules,
-
-)
-
-
-
-css_rules = RuleList(
-
-    langs=['css', 'scss'],
-
-    rules=[
-
-        {'pattern': r'calc\([^+]+\+[^+]+\)',
-
-         'description': "Avoid using calc with '+' operator. See #8403 : in CSS.",
-
-         'good_lines': ["width: calc(20% - -14px);"],
-
-         'bad_lines': ["width: calc(20% + 14px);"]},
-
-        {'pattern': r'^[^:]*:\S[^:]*;$',
-
-         'description': "Missing whitespace after : in CSS",
-
-         'good_lines': ["background-color: white;", "text-size: 16px;"],
-
-         'bad_lines': ["background-color:white;", "text-size:16px;"]},
-
-        {'pattern': '[a-z]{',
-
-         'description': "Missing whitespace before '{' in CSS.",
-
-         'good_lines': ["input {", "body {"],
-
-         'bad_lines': ["input{", "body{"]},
-
-        {'pattern': 'https://',
-
-         'description': "Zulip CSS should have no dependencies on external resources",
-
-         'good_lines': ['background: url(/static/images/landing-page/pycon.jpg);'],
-
-         'bad_lines': ['background: url(https://example.com/image.png);']},
-
-        {'pattern': '^[ ][ ][a-zA-Z0-9]',
-
-         'description': "Incorrect 2-space indentation in CSS",
-
-         'strip': '\n',
-
-         'good_lines': ["    color: white;", "color: white;"],
-
-         'bad_lines': ["  color: white;"]},
-
-        {'pattern': r'{\w',
-
-         'description': "Missing whitespace after '{' in CSS (should be newline).",
-
-         'good_lines': ["{\n"],
-
-         'bad_lines': ["{color: LightGoldenRodYellow;"]},
-
-        {'pattern': ' thin[ ;]',
-
-         'description': "thin CSS attribute is under-specified, please use 1px.",
-
-         'good_lines': ["border-width: 1px;"],
-
-         'bad_lines': ["border-width: thin;", "border-width: thin solid black;"]},
-
-        {'pattern': ' medium[ ;]',
-
-         'description': "medium CSS attribute is under-specified, please use pixels.",
-
-         'good_lines': ["border-width: 3px;"],
-
-         'bad_lines': ["border-width: medium;", "border: medium solid black;"]},
-
-        {'pattern': ' thick[ ;]',
-
-         'description': "thick CSS attribute is under-specified, please use pixels.",
-
-         'good_lines': ["border-width: 5px;"],
-
-         'bad_lines': ["border-width: thick;", "border: thick solid black;"]},
-
-        {'pattern': r'rgba?\(',
-
-         'description': 'Use of rgb(a) format is banned, Please use hsl(a) instead',
-
-         'good_lines': ['hsl(0, 0%, 0%)', 'hsla(0, 0%, 100%, 0.1)'],
-
-         'bad_lines': ['rgb(0, 0, 0)', 'rgba(255, 255, 255, 0.1)']},
-
-        *whitespace_rules,
-
-        *comma_whitespace_rule,
-
-    ],
-
-)
-
-
-
-prose_style_rules = [
-
-    {'pattern': r'[^\/\#\-"]([jJ]avascript)',  # exclude usage in hrefs/divs
-
-     'exclude': set(["docs/documentation/api.md"]),
-
-     'description': "javascript should be spelled JavaScript"},
-
-    {'pattern': r'''[^\/\-\."'\_\=\>]([gG]ithub)[^\.\-\_"\<]''',  # exclude usage in hrefs/divs
-
-     'description': "github should be spelled GitHub"},
-
-    {'pattern': '[oO]rganisation',  # exclude usage in hrefs/divs
-
-     'description': "Organization is spelled with a z",
-
-     'exclude_line': {('docs/translating/french.md', '* organization - **organisation**')}},
-
-    {'pattern': '!!! warning',
-
-     'description': "!!! warning is invalid; it's spelled '!!! warn'"},
-
-    {'pattern': 'Terms of service',
-
-     'description': "The S in Terms of Service is capitalized"},
-
-    {'pattern': '[^-_p]botserver(?!rc)|bot server',
-
-     'description': "Use Botserver instead of botserver or bot server."},
-
-    *comma_whitespace_rule,
-
-]  # type: List[Rule]
-
-html_rules = whitespace_rules + prose_style_rules + [
-
-    {'pattern': 'subject|SUBJECT',
-
-     'exclude': set(['templates/zerver/email.html']),
-
-     'exclude_pattern': 'email subject',
-
-     'description': 'avoid subject in templates',
-
-     'good_lines': ['topic_name'],
-
-     'bad_lines': ['subject="foo"', ' MAX_SUBJECT_LEN']},
-
-    {'pattern': r'placeholder="[^{#](?:(?!\.com).)+$',
-
-     'description': "`placeholder` value should be translatable.",
-
-     'exclude_line': {('templates/zerver/register.html', 'placeholder="acme"'),
-
-                      ('templates/zerver/register.html', 'placeholder="Acme or Aκμή"')},
-
-     'exclude': set(["templates/analytics/support.html"]),
-
-     'good_lines': ['<input class="stream-list-filter" type="text" placeholder="{{ _(\'Search streams\') }}" />'],
-
-     'bad_lines': ['<input placeholder="foo">']},
-
-    {'pattern': "placeholder='[^{]",
-
-     'description': "`placeholder` value should be translatable.",
-
-     'good_lines': ['<input class="stream-list-filter" type="text" placeholder="{{ _(\'Search streams\') }}" />'],
-
-     'bad_lines': ["<input placeholder='foo'>"]},
-
-    {'pattern': "aria-label='[^{]",
-
-     'description': "`aria-label` value should be translatable.",
-
-     'good_lines': ['<button type="button" class="close close-alert-word-status" aria-label="{{t \'Close\' }}">'],
-
-     'bad_lines': ["<button aria-label='foo'></button>"]},
-
-    {'pattern': 'aria-label="[^{]',
-
-     'description': "`aria-label` value should be translatable.",
-
-     'good_lines': ['<button type="button" class="close close-alert-word-status" aria-label="{{t \'Close\' }}">'],
-
-     'bad_lines': ['<button aria-label="foo"></button>']},
-
-    {'pattern': 'script src="http',
-
-     'description': "Don't directly load dependencies from CDNs.  See docs/subsystems/html-css.md",
-
-     'exclude': set(["templates/corporate/billing.html", "templates/zerver/hello.html",
-
-                     "templates/corporate/upgrade.html"]),
-
-     'good_lines': ["{{ render_entrypoint('landing-page') }}"],
-
-     'bad_lines': ['<script src="https://ajax.googleapis.com/ajax/libs/jquery/3.2.1/jquery.min.js"></script>']},
-
-    {'pattern': "title='[^{]",
-
-     'description': "`title` value should be translatable.",
-
-     'good_lines': ['<link rel="author" title="{{ _(\'About these documents\') }}" />'],
-
-     'bad_lines': ["<p title='foo'></p>"]},
-
-    {'pattern': r'title="[^{\:]',
-
-     'exclude_line': set([
-
-         ('templates/zerver/app/markdown_help.html',
-
-             '<td class="rendered_markdown"><img alt=":heart:" class="emoji" src="/static/generated/emoji/images/emoji/heart.png" title=":heart:" /></td>')
-
-     ]),
-
-     'exclude': set(["templates/zerver/emails", "templates/analytics/realm_details.html", "templates/analytics/support.html"]),
-
-     'description': "`title` value should be translatable."},
-
-    {'pattern': r'''\Walt=["'][^{"']''',
-
-     'description': "alt argument should be enclosed by _() or it should be an empty string.",
-
-     'exclude': set(['static/templates/settings/display_settings.hbs',
-
-                     'templates/zerver/app/keyboard_shortcuts.html',
-
-                     'templates/zerver/app/markdown_help.html']),
-
-     'good_lines': ['<img src="{{source_url}}" alt="{{ _(name) }}" />', '<img alg="" />'],
-
-     'bad_lines': ['<img alt="Foo Image" />']},
-
-    {'pattern': r'''\Walt=["']{{ ?["']''',
-
-     'description': "alt argument should be enclosed by _().",
-
-     'good_lines': ['<img src="{{source_url}}" alt="{{ _(name) }}" />'],
-
-     'bad_lines': ['<img alt="{{ " />']},
-
-    {'pattern': r'\bon\w+ ?=',
-
-     'description': "Don't use inline event handlers (onclick=, etc. attributes) in HTML. Instead,"
-
-     "attach a jQuery event handler ($('#foo').on('click', function () {...})) when "
-
-     "the DOM is ready (inside a $(function () {...}) block).",
-
-     'exclude': set(['templates/zerver/dev_login.html', 'templates/corporate/upgrade.html']),
-
-     'good_lines': ["($('#foo').on('click', function () {}"],
-
-     'bad_lines': ["<button id='foo' onclick='myFunction()'>Foo</button>", "<input onchange='myFunction()'>"]},
-
-    {'pattern': 'style ?=',
-
-     'description': "Avoid using the `style=` attribute; we prefer styling in CSS files",
-
-     'exclude_pattern': r'.*style ?=["' + "'" + '](display: ?none|background: {{|color: {{|background-color: {{).*',
-
-     'exclude': set([
-
-         # KaTeX output uses style attribute
-
-         'templates/zerver/app/markdown_help.html',
-
-         # 5xx page doesn't have external CSS
-
-         'static/html/5xx.html',
-
-         # Group PMs color is dynamically calculated
-
-         'static/templates/group_pms.hbs',
-
-
-
-         # exclude_pattern above handles color, but have other issues:
-
-         'static/templates/draft.hbs',
-
-         'static/templates/subscription.hbs',
-
-         'static/templates/single_message.hbs',
-
-
-
-         # Old-style email templates need to use inline style
-
-         # attributes; it should be possible to clean these up
-
-         # when we convert these templates to use premailer.
-
-         'templates/zerver/emails/email_base_messages.html',
-
-
-
-         # Email log templates; should clean up.
-
-         'templates/zerver/email.html',
-
-         'templates/zerver/email_log.html',
-
-
-
-         # Social backend logos are dynamically loaded
-
-         'templates/zerver/accounts_home.html',
-
-         'templates/zerver/login.html',
-
-
-
-         # Probably just needs to be changed to display: none so the exclude works
-
-         'templates/zerver/app/navbar.html',
-
-
-
-         # Needs the width cleaned up; display: none is fine
-
-         'static/templates/settings/account_settings.hbs',
-
-
-
-         # background image property is dynamically generated
-
-         'static/templates/user_profile_modal.hbs',
-
-         'static/templates/sidebar_private_message_list.hbs',
-
-
-
-         # Inline styling for an svg; could be moved to CSS files?
-
-         'templates/zerver/landing_nav.html',
-
-         'templates/zerver/billing_nav.html',
-
-         'templates/zerver/app/home.html',
-
-         'templates/zerver/features.html',
-
-         'templates/zerver/portico-header.html',
-
-         'templates/corporate/billing.html',
-
-         'templates/corporate/upgrade.html',
-
-
-
-         # Miscellaneous violations to be cleaned up
-
-         'static/templates/user_info_popover_title.hbs',
-
-         'static/templates/subscription_invites_warning_modal.hbs',
-
-         'templates/zerver/reset_confirm.html',
-
-         'templates/zerver/config_error.html',
-
-         'templates/zerver/dev_env_email_access_details.html',
-
-         'templates/zerver/confirm_continue_registration.html',
-
-         'templates/zerver/register.html',
-
-         'templates/zerver/accounts_send_confirm.html',
-
-         'templates/zerver/integrations/index.html',
-
-         'templates/zerver/documentation_main.html',
-
-         'templates/analytics/realm_summary_table.html',
-
-         'templates/corporate/zephyr.html',
-
-         'templates/corporate/zephyr-mirror.html',
-
-     ]),
-
-     'good_lines': ['#my-style {color: blue;}', 'style="display: none"', "style='display: none"],
-
-     'bad_lines': ['<p style="color: blue;">Foo</p>', 'style = "color: blue;"']},
-
-]  # type: List[Rule]
-
-
-
-handlebars_rules = RuleList(
-
-    langs=['hbs'],
-
-    rules=html_rules + [
-
-        {'pattern': "[<]script",
-
-         'description': "Do not use inline <script> tags here; put JavaScript in static/js instead."},
-
-        {'pattern': '{{ t ("|\')',
-
-         'description': 'There should be no spaces before the "t" in a translation tag.'},
-
-        {'pattern': r"{{t '.*' }}[\.\?!]",
-
-         'description': "Period should be part of the translatable string."},
-
-        {'pattern': r'{{t ".*" }}[\.\?!]',
-
-         'description': "Period should be part of the translatable string."},
-
-        {'pattern': r"{{/tr}}[\.\?!]",
-
-         'description': "Period should be part of the translatable string."},
-
-        {'pattern': '{{t ("|\') ',
-
-         'description': 'Translatable strings should not have leading spaces.'},
-
-        {'pattern': "{{t '[^']+ ' }}",
-
-         'description': 'Translatable strings should not have trailing spaces.'},
-
-        {'pattern': '{{t "[^"]+ " }}',
-
-         'description': 'Translatable strings should not have trailing spaces.'},
-
-    ],
-
-)
-
-
-
-jinja2_rules = RuleList(
-
-    langs=['html'],
-
-    rules=html_rules + [
-
-        {'pattern': r"{% endtrans %}[\.\?!]",
-
-         'description': "Period should be part of the translatable string."},
-
-        {'pattern': r"{{ _(.+) }}[\.\?!]",
-
-         'description': "Period should be part of the translatable string."},
-
-    ],
-
-)
-
-
-
-json_rules = RuleList(
-
-    langs=['json'],
-
-    rules=[
-
-        # Here, we don't use `whitespace_rules`, because the tab-based
-
-        # whitespace rule flags a lot of third-party JSON fixtures
-
-        # under zerver/webhooks that we want preserved verbatim.  So
-
-        # we just include the trailing whitespace rule and a modified
-
-        # version of the tab-based whitespace rule (we can't just use
-
-        # exclude in whitespace_rules, since we only want to ignore
-
-        # JSON files with tab-based whitespace, not webhook code).
-
-        trailing_whitespace_rule,
-
-        {'pattern': '\t',
-
-         'strip': '\n',
-
-         'exclude': set(['zerver/webhooks/']),
-
-         'description': 'Fix tab-based whitespace'},
-
-        {'pattern': r'":["\[\{]',
-
-         'exclude': set(['zerver/webhooks/', 'zerver/tests/fixtures/']),
-
-         'description': 'Require space after : in JSON'},
-
-    ]
-
-)
-
-
-
-markdown_docs_length_exclude = {
-
-    # Has some example Vagrant output that's very long
-
-    "docs/development/setup-vagrant.md",
-
-    # Have wide output in code blocks
-
-    "docs/subsystems/logging.md",
-
-    "docs/subsystems/schema-migrations.md",
-
-    # Have curl commands with JSON that would be messy to wrap
-
-    "zerver/webhooks/helloworld/doc.md",
-
-    "zerver/webhooks/trello/doc.md",
-
-    # Has a very long configuration line
-
-    "templates/zerver/integrations/perforce.md",
-
-    # Has some example code that could perhaps be wrapped
-
-    "templates/zerver/api/incoming-webhooks-walkthrough.md",
-
-    # This macro has a long indented URL
-
-    "templates/zerver/help/include/git-webhook-url-with-branches-indented.md",
-
-    "templates/zerver/api/update-notification-settings.md",
-
-    # These two are the same file and have some too-long lines for GitHub badges
-
-    "README.md",
-
-    "docs/overview/readme.md",
-
-}
-
-
-
-markdown_rules = RuleList(
-
-    langs=['md'],
-
-    rules=markdown_whitespace_rules + prose_style_rules + [
-
-        {'pattern': r'\[(?P<url>[^\]]+)\]\((?P=url)\)',
-
-         'description': 'Linkified markdown URLs should use cleaner <http://example.com> syntax.'},
-
-        {'pattern': 'https://zulip.readthedocs.io/en/latest/[a-zA-Z0-9]',
-
-         'exclude': {'docs/overview/contributing.md', 'docs/overview/readme.md', 'docs/README.md'},
-
-         'include_only': set(['docs/']),
-
-         'description': "Use relative links (../foo/bar.html) to other documents in docs/",
-
-         },
-
-        {'pattern': "su zulip -c [^']",
-
-         'include_only': set(['docs/']),
-
-         'description': "Always quote arguments using `su zulip -c '` to avoid confusion about how su works.",
-
-         },
-
-        {'pattern': r'\][(][^#h]',
-
-         'include_only': set(['README.md', 'CONTRIBUTING.md']),
-
-         'description': "Use absolute links from docs served by GitHub",
-
-         },
-
-    ],
-
-    max_length=120,
-
-    length_exclude=markdown_docs_length_exclude,
-
-    exclude_files_in='templates/zerver/help/'
-
-)
-
-
-
-help_markdown_rules = RuleList(
-
-    langs=['md'],
-
-    rules=markdown_rules.rules + [
-
-        {'pattern': '[a-z][.][A-Z]',
-
-         'description': "Likely missing space after end of sentence",
-
-         'include_only': set(['templates/zerver/help/']),
-
-         },
-
-        {'pattern': r'\b[rR]ealm[s]?\b',
-
-         'include_only': set(['templates/zerver/help/']),
-
-         'good_lines': ['Organization', 'deactivate_realm', 'realm_filter'],
-
-         'bad_lines': ['Users are in a realm', 'Realm is the best model'],
-
-         'description': "Realms are referred to as Organizations in user-facing docs."},
-
-    ],
-
-    length_exclude=markdown_docs_length_exclude,
-
-)
-
-
-
-txt_rules = RuleList(
-
-    langs=['txt', 'text', 'yaml', 'rst'],
-
-    rules=whitespace_rules,
-
-)
-
-non_py_rules = [
-
-    handlebars_rules,
-
-    jinja2_rules,
-
-    css_rules,
-
-    js_rules,
-
-    json_rules,
-
-    markdown_rules,
-
-    help_markdown_rules,
-
-    bash_rules,
-
-    txt_rules,
+    (r"/api/kernels/%s/channels" % _kernel_id_regex, ZMQChannelsHandler),
 
 ]

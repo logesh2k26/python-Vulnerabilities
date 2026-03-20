@@ -2,678 +2,950 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-# (from BackInTime)
+"""A contents manager that uses the local file system for storage."""
 
-# Copyright (C) 2015-2017 Germar Reitze
 
-#
 
-# This program is free software; you can redistribute it and/or modify
+# Copyright (c) Jupyter Development Team.
 
-# it under the terms of the GNU General Public License as published by
+# Distributed under the terms of the Modified BSD License.
 
-# the Free Software Foundation; either version 2 of the License, or
 
-# (at your option) any later version.
 
-#
 
-# This program is distributed in the hope that it will be useful,
 
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-
-# GNU General Public License for more details.
-
-#
-
-# You should have received a copy of the GNU General Public License along
-
-# with this program; if not, write to the Free Software Foundation, Inc.,
-
-# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
-
-
-
-# (from jockey)
-
-# (c) 2008 Canonical Ltd.
-
-#
-
-# This program is free software; you can redistribute it and/or modify
-
-# it under the terms of the GNU General Public License as published by
-
-# the Free Software Foundation; either version 2 of the License, or
-
-# (at your option) any later version.
-
-#
-
-# This program is distributed in the hope that it will be useful,
-
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-
-# GNU General Public License for more details.
-
-#
-
-# You should have received a copy of the GNU General Public License along
-
-# with this program; if not, write to the Free Software Foundation, Inc.,
-
-# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
-
-
-
-# (from python-dbus-docs)
-
-# Copyright (C) 2004-2006 Red Hat Inc. <http://www.redhat.com/>
-
-# Copyright (C) 2005-2007 Collabora Ltd. <http://www.collabora.co.uk/>
-
-#
-
-# Permission is hereby granted, free of charge, to any person
-
-# obtaining a copy of this software and associated documentation
-
-# files (the "Software"), to deal in the Software without
-
-# restriction, including without limitation the rights to use, copy,
-
-# modify, merge, publish, distribute, sublicense, and/or sell copies
-
-# of the Software, and to permit persons to whom the Software is
-
-# furnished to do so, subject to the following conditions:
-
-#
-
-# The above copyright notice and this permission notice shall be
-
-# included in all copies or substantial portions of the Software.
-
-#
-
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-
-# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-
-# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
-
-# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
-
-# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-
-# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-
-# DEALINGS IN THE SOFTWARE.
-
-#
-
-# This file was modified by David D. Lowe in 2009.
-
-# To the extent possible under law, David D. Lowe has waived all
-
-# copyright and related or neighboring rights to his modifications to
-
-# this file under this license: http://creativecommons.org/publicdomain/zero/1.0/
-
-
+import io
 
 import os
 
-import re
+import shutil
 
-from subprocess import Popen, PIPE
+import mimetypes
 
-try:
+import nbformat
 
-    import pwd
 
-except ImportError:
 
-    pwd = None
+from tornado import web
 
 
 
-import dbus
+from .filecheckpoints import FileCheckpoints
 
-import dbus.service
+from .fileio import FileManagerMixin
 
-import dbus.mainloop.pyqt5
+from .manager import ContentsManager
 
-from PyQt5.QtCore import QCoreApplication
 
 
 
-UDEV_RULES_PATH = '/etc/udev/rules.d/99-backintime-%s.rules'
 
+from ipython_genutils.importstring import import_item
 
+from traitlets import Any, Unicode, Bool, TraitError
 
-class InvalidChar(dbus.DBusException):
+from ipython_genutils.py3compat import getcwd, string_types
 
-    _dbus_error_name = 'net.launchpad.backintime.InvalidChar'
+from . import tz
 
+from notebook.utils import (
 
+    is_hidden,
 
-class InvalidCmd(dbus.DBusException):
+    to_api_path,
 
-    _dbus_error_name = 'net.launchpad.backintime.InvalidCmd'
+)
 
 
 
-class LimitExceeded(dbus.DBusException):
+_script_exporter = None
 
-    _dbus_error_name = 'net.launchpad.backintime.LimitExceeded'
 
 
 
-class PermissionDeniedByPolicy(dbus.DBusException):
 
-    _dbus_error_name = 'com.ubuntu.DeviceDriver.PermissionDeniedByPolicy'
+def _post_save_script(model, os_path, contents_manager, **kwargs):
 
+    """convert notebooks to Python script after save with nbconvert
 
 
-class UdevRules(dbus.service.Object):
 
-    def __init__(self, conn=None, object_path=None, bus_name=None):
+    replaces `ipython notebook --script`
 
-        super(UdevRules, self).__init__(conn, object_path, bus_name)
+    """
 
+    from nbconvert.exporters.script import ScriptExporter
 
 
-        # the following variables are used by _checkPolkitPrivilege
 
-        self.polkit = None
+    if model['type'] != 'notebook':
 
-        self.enforce_polkit = True
+        return
 
 
 
-        self.tmpDict = {}
+    global _script_exporter
 
+    if _script_exporter is None:
 
+        _script_exporter = ScriptExporter(parent=contents_manager)
 
-        #find su path
+    log = contents_manager.log
 
-        self.su = self._which('su', '/bin/su')
 
-        self.backintime = self._which('backintime', '/usr/bin/backintime')
 
-        self.nice = self._which('nice', '/usr/bin/nice')
+    base, ext = os.path.splitext(os_path)
 
-        self.ionice = self._which('ionice', '/usr/bin/ionice')
+    py_fname = base + '.py'
 
-        self.max_rules = 100
+    script, resources = _script_exporter.from_filename(os_path)
 
-        self.max_users = 20
+    script_fname = base + resources.get('output_extension', '.txt')
 
-        self.max_cmd_len = 100
+    log.info("Saving script /%s", to_api_path(script_fname, contents_manager.root_dir))
 
+    with io.open(script_fname, 'w', encoding='utf-8') as f:
 
+        f.write(script)
 
-    def _which(self, exe, fallback):
 
-        proc = Popen(['which', exe], stdout = PIPE)
 
-        ret = proc.communicate()[0].strip().decode()
 
-        if proc.returncode or not ret:
 
-            return fallback
+class FileContentsManager(FileManagerMixin, ContentsManager):
 
 
 
-        return ret
+    root_dir = Unicode(config=True)
 
 
 
-    def _validateCmd(self, cmd):
-
-
-
-        if cmd.find("&&") != -1:
-
-            raise InvalidCmd("Parameter 'cmd' contains '&&' concatenation")
-
-        # make sure it starts with an absolute path
-
-        elif not cmd.startswith(os.path.sep):
-
-            raise InvalidCmd("Parameter 'cmd' does not start with '/'")
-
-
-
-        parts = cmd.split()
-
-
-
-        # make sure only well known commands and switches are used
-
-        whitelist = (
-
-            (self.nice, ("-n")),
-
-            (self.ionice, ("-c", "-n")),
-
-        )
-
-
-
-        for c, switches in whitelist:
-
-            if parts and parts[0] == c:
-
-                parts.pop(0)
-
-                for sw in switches:
-
-                    while parts and parts[0].startswith(sw):
-
-                        parts.pop(0)
-
-
-
-        if not parts:
-
-            raise InvalidCmd("Parameter 'cmd' does not contain the backintime command")
-
-        elif parts[0] != self.backintime:
-
-            raise InvalidCmd("Parameter 'cmd' contains non-whitelisted cmd/parameter (%s)" % parts[0])
-
-
-
-    def _checkLimits(self, owner, cmd):
-
-
-
-        if len(self.tmpDict.get(owner, [])) >= self.max_rules:
-
-            raise LimitExceeded("Maximum number of cached rules reached (%d)"
-
-                            % self.max_rules)
-
-        elif len(self.tmpDict) >= self.max_users:
-
-            raise LimitExceeded("Maximum number of cached users reached (%d)"
-
-                            % self.max_users)
-
-        elif len(cmd) > self.max_cmd_len:
-
-            raise LimitExceeded("Maximum length of command line reached (%d)"
-
-                            % self.max_cmd_len)
-
-
-
-    @dbus.service.method("net.launchpad.backintime.serviceHelper.UdevRules",
-
-                         in_signature='ss', out_signature='',
-
-                         sender_keyword='sender', connection_keyword='conn')
-
-    def addRule(self, cmd, uuid, sender=None, conn=None):
-
-        """
-
-        Receive command and uuid and create an Udev rule out of this.
-
-        This is done on the service side to prevent malicious code to
-
-        run as root.
-
-        """
-
-        #prevent breaking out of su command
-
-        chars = re.findall(r'[^a-zA-Z0-9-/\.>& ]', cmd)
-
-        if chars:
-
-            raise InvalidChar("Parameter 'cmd' contains invalid character(s) %s"
-
-                              % '|'.join(set(chars)))
-
-        #only allow relevant chars in uuid
-
-        chars = re.findall(r'[^a-zA-Z0-9-]', uuid)
-
-        if chars:
-
-            raise InvalidChar("Parameter 'uuid' contains invalid character(s) %s"
-
-                              % '|'.join(set(chars)))
-
-
-
-        self._validateCmd(cmd)
-
-
-
-        info = SenderInfo(sender, conn)
-
-        user = info.connectionUnixUser()
-
-        owner = info.nameOwner()
-
-
-
-        self._checkLimits(owner, cmd)
-
-
-
-        #create su command
-
-        sucmd = "%s - '%s' -c '%s'" %(self.su, user, cmd)
-
-        #create Udev rule
-
-        rule = 'ACTION=="add|change", ENV{ID_FS_UUID}=="%s", RUN+="%s"\n' %(uuid, sucmd)
-
-
-
-        #store rule
-
-        if not owner in self.tmpDict:
-
-            self.tmpDict[owner] = []
-
-        self.tmpDict[owner].append(rule)
-
-
-
-    @dbus.service.method("net.launchpad.backintime.serviceHelper.UdevRules",
-
-                         in_signature='', out_signature='b',
-
-                         sender_keyword='sender', connection_keyword='conn')
-
-    def save(self, sender=None, conn=None):
-
-        """
-
-        Save rules to destiantion file after user authenticated as admin.
-
-        This will first check if there are any changes between
-
-        temporary added rules and current rules in destiantion file.
-
-        Returns False if files are identical or no rules to be installed.
-
-        """
-
-        info = SenderInfo(sender, conn)
-
-        user = info.connectionUnixUser()
-
-        owner = info.nameOwner()
-
-
-
-        #delete rule if no rules in tmp
-
-        if not owner in self.tmpDict or not self.tmpDict[owner]:
-
-            self.delete(sender, conn)
-
-            return False
-
-        #return False if rule already exist.
-
-        if os.path.exists(UDEV_RULES_PATH % user):
-
-            with open(UDEV_RULES_PATH % user, 'r') as f:
-
-                if self.tmpDict[owner] == f.readlines():
-
-                    self._clean(owner)
-
-                    return False
-
-        #auth to save changes
-
-        self._checkPolkitPrivilege(sender, conn, 'net.launchpad.backintime.UdevRuleSave')
-
-        with open(UDEV_RULES_PATH % user, 'w') as f:
-
-            f.writelines(self.tmpDict[owner])
-
-        self._clean(owner)
-
-        return True
-
-
-
-    @dbus.service.method("net.launchpad.backintime.serviceHelper.UdevRules",
-
-                         in_signature='', out_signature='',
-
-                         sender_keyword='sender', connection_keyword='conn')
-
-    def delete(self, sender=None, conn=None):
-
-        """
-
-        Delete existing Udev rule
-
-        """
-
-        info = SenderInfo(sender, conn)
-
-        user = info.connectionUnixUser()
-
-        owner = info.nameOwner()
-
-        self._clean(owner)
-
-        if os.path.exists(UDEV_RULES_PATH % user):
-
-            #auth to delete rule
-
-            self._checkPolkitPrivilege(sender, conn, 'net.launchpad.backintime.UdevRuleDelete')
-
-            os.remove(UDEV_RULES_PATH % user)
-
-
-
-    @dbus.service.method("net.launchpad.backintime.serviceHelper.UdevRules",
-
-                         in_signature='', out_signature='',
-
-                         sender_keyword='sender', connection_keyword='conn')
-
-    def clean(self, sender=None, conn=None):
-
-        """
-
-        clean up previous cached rules
-
-        """
-
-        info = SenderInfo(sender, conn)
-
-        self._clean(info.nameOwner())
-
-
-
-    def _clean(self, owner):
-
-        if owner in self.tmpDict:
-
-            del self.tmpDict[owner]
-
-
-
-    def _initPolkit(self):
-
-        if self.polkit is None:
-
-            self.polkit = dbus.Interface(dbus.SystemBus().get_object(
-
-                'org.freedesktop.PolicyKit1',
-
-                '/org/freedesktop/PolicyKit1/Authority', False),
-
-                'org.freedesktop.PolicyKit1.Authority')
-
-
-
-    def _checkPolkitPrivilege(self, sender, conn, privilege):
-
-        # from jockey
-
-        """
-
-        Verify that sender has a given PolicyKit privilege.
-
-
-
-        sender is the sender's (private) D-BUS name, such as ":1:42"
-
-        (sender_keyword in @dbus.service.methods). conn is
-
-        the dbus.Connection object (connection_keyword in
-
-        @dbus.service.methods). privilege is the PolicyKit privilege string.
-
-
-
-        This method returns if the caller is privileged, and otherwise throws a
-
-        PermissionDeniedByPolicy exception.
-
-        """
-
-        if sender is None and conn is None:
-
-            # called locally, not through D-BUS
-
-            return
-
-        if not self.enforce_polkit:
-
-            # that happens for testing purposes when running on the session
-
-            # bus, and it does not make sense to restrict operations here
-
-            return
-
-
-
-        info = SenderInfo(sender, conn)
-
-
-
-        # get peer PID
-
-        pid = info.connectionPid()
-
-
-
-        # query PolicyKit
-
-        self._initPolkit()
+    def _root_dir_default(self):
 
         try:
 
-            # we don't need is_challenge return here, since we call with AllowUserInteraction
+            return self.parent.notebook_dir
 
-            (is_auth, _, details) = self.polkit.CheckAuthorization(
+        except AttributeError:
 
-                    ('unix-process', {'pid': dbus.UInt32(pid, variant_level=1),
-
-                    'start-time': dbus.UInt64(0, variant_level=1)}),
-
-                    privilege, {'': ''}, dbus.UInt32(1), '', timeout=3000)
-
-        except dbus.DBusException as e:
-
-            if e._dbus_error_name == 'org.freedesktop.DBus.Error.ServiceUnknown':
-
-                # polkitd timed out, connect again
-
-                self.polkit = None
-
-                return self._checkPolkitPrivilege(sender, conn, privilege)
-
-            else:
-
-                raise
+            return getcwd()
 
 
 
-        if not is_auth:
+    save_script = Bool(False, config=True, help='DEPRECATED, use post_save_hook')
 
-            raise PermissionDeniedByPolicy(privilege)
+    def _save_script_changed(self):
 
+        self.log.warn("""
 
-
-class SenderInfo(object):
-
-    def __init__(self, sender, conn):
-
-        self.sender = sender
-
-        self.dbus_info = dbus.Interface(conn.get_object('org.freedesktop.DBus',
-
-                '/org/freedesktop/DBus/Bus', False), 'org.freedesktop.DBus')
+        `--script` is deprecated. You can trigger nbconvert via pre- or post-save hooks:
 
 
 
-    def connectionUnixUser(self):
+            ContentsManager.pre_save_hook
 
-        uid = self.dbus_info.GetConnectionUnixUser(self.sender)
+            FileContentsManager.post_save_hook
 
-        if pwd:
 
-            return pwd.getpwuid(uid).pw_name
+
+        A post-save hook has been registered that calls:
+
+
+
+            ipython nbconvert --to script [notebook]
+
+
+
+        which behaves similarly to `--script`.
+
+        """)
+
+
+
+        self.post_save_hook = _post_save_script
+
+
+
+    post_save_hook = Any(None, config=True,
+
+        help="""Python callable or importstring thereof
+
+
+
+        to be called on the path of a file just saved.
+
+
+
+        This can be used to process the file on disk,
+
+        such as converting the notebook to a script or HTML via nbconvert.
+
+
+
+        It will be called as (all arguments passed by keyword)::
+
+
+
+            hook(os_path=os_path, model=model, contents_manager=instance)
+
+
+
+        - path: the filesystem path to the file just written
+
+        - model: the model representing the file
+
+        - contents_manager: this ContentsManager instance
+
+        """
+
+    )
+
+    def _post_save_hook_changed(self, name, old, new):
+
+        if new and isinstance(new, string_types):
+
+            self.post_save_hook = import_item(self.post_save_hook)
+
+        elif new:
+
+            if not callable(new):
+
+                raise TraitError("post_save_hook must be callable")
+
+
+
+    def run_post_save_hook(self, model, os_path):
+
+        """Run the post-save hook if defined, and log errors"""
+
+        if self.post_save_hook:
+
+            try:
+
+                self.log.debug("Running post-save hook on %s", os_path)
+
+                self.post_save_hook(os_path=os_path, model=model, contents_manager=self)
+
+            except Exception:
+
+                self.log.error("Post-save hook failed on %s", os_path, exc_info=True)
+
+
+
+    def _root_dir_changed(self, name, old, new):
+
+        """Do a bit of validation of the root_dir."""
+
+        if not os.path.isabs(new):
+
+            # If we receive a non-absolute path, make it absolute.
+
+            self.root_dir = os.path.abspath(new)
+
+            return
+
+        if not os.path.isdir(new):
+
+            raise TraitError("%r is not a directory" % new)
+
+
+
+    def _checkpoints_class_default(self):
+
+        return FileCheckpoints
+
+
+
+    def is_hidden(self, path):
+
+        """Does the API style path correspond to a hidden directory or file?
+
+
+
+        Parameters
+
+        ----------
+
+        path : string
+
+            The path to check. This is an API path (`/` separated,
+
+            relative to root_dir).
+
+
+
+        Returns
+
+        -------
+
+        hidden : bool
+
+            Whether the path exists and is hidden.
+
+        """
+
+        path = path.strip('/')
+
+        os_path = self._get_os_path(path=path)
+
+        return is_hidden(os_path, self.root_dir)
+
+
+
+    def file_exists(self, path):
+
+        """Returns True if the file exists, else returns False.
+
+
+
+        API-style wrapper for os.path.isfile
+
+
+
+        Parameters
+
+        ----------
+
+        path : string
+
+            The relative path to the file (with '/' as separator)
+
+
+
+        Returns
+
+        -------
+
+        exists : bool
+
+            Whether the file exists.
+
+        """
+
+        path = path.strip('/')
+
+        os_path = self._get_os_path(path)
+
+        return os.path.isfile(os_path)
+
+
+
+    def dir_exists(self, path):
+
+        """Does the API-style path refer to an extant directory?
+
+
+
+        API-style wrapper for os.path.isdir
+
+
+
+        Parameters
+
+        ----------
+
+        path : string
+
+            The path to check. This is an API path (`/` separated,
+
+            relative to root_dir).
+
+
+
+        Returns
+
+        -------
+
+        exists : bool
+
+            Whether the path is indeed a directory.
+
+        """
+
+        path = path.strip('/')
+
+        os_path = self._get_os_path(path=path)
+
+        return os.path.isdir(os_path)
+
+
+
+    def exists(self, path):
+
+        """Returns True if the path exists, else returns False.
+
+
+
+        API-style wrapper for os.path.exists
+
+
+
+        Parameters
+
+        ----------
+
+        path : string
+
+            The API path to the file (with '/' as separator)
+
+
+
+        Returns
+
+        -------
+
+        exists : bool
+
+            Whether the target exists.
+
+        """
+
+        path = path.strip('/')
+
+        os_path = self._get_os_path(path=path)
+
+        return os.path.exists(os_path)
+
+
+
+    def _base_model(self, path):
+
+        """Build the common base of a contents model"""
+
+        os_path = self._get_os_path(path)
+
+        info = os.stat(os_path)
+
+        last_modified = tz.utcfromtimestamp(info.st_mtime)
+
+        created = tz.utcfromtimestamp(info.st_ctime)
+
+        # Create the base model.
+
+        model = {}
+
+        model['name'] = path.rsplit('/', 1)[-1]
+
+        model['path'] = path
+
+        model['last_modified'] = last_modified
+
+        model['created'] = created
+
+        model['content'] = None
+
+        model['format'] = None
+
+        model['mimetype'] = None
+
+        try:
+
+            model['writable'] = os.access(os_path, os.W_OK)
+
+        except OSError:
+
+            self.log.error("Failed to check write permissions on %s", os_path)
+
+            model['writable'] = False
+
+        return model
+
+
+
+    def _dir_model(self, path, content=True):
+
+        """Build a model for a directory
+
+
+
+        if content is requested, will include a listing of the directory
+
+        """
+
+        os_path = self._get_os_path(path)
+
+
+
+        four_o_four = u'directory does not exist: %r' % path
+
+
+
+        if not os.path.isdir(os_path):
+
+            raise web.HTTPError(404, four_o_four)
+
+        elif is_hidden(os_path, self.root_dir):
+
+            self.log.info("Refusing to serve hidden directory %r, via 404 Error",
+
+                os_path
+
+            )
+
+            raise web.HTTPError(404, four_o_four)
+
+
+
+        model = self._base_model(path)
+
+        model['type'] = 'directory'
+
+        if content:
+
+            model['content'] = contents = []
+
+            os_dir = self._get_os_path(path)
+
+            for name in os.listdir(os_dir):
+
+                os_path = os.path.join(os_dir, name)
+
+                # skip over broken symlinks in listing
+
+                if not os.path.exists(os_path):
+
+                    self.log.warn("%s doesn't exist", os_path)
+
+                    continue
+
+                elif not os.path.isfile(os_path) and not os.path.isdir(os_path):
+
+                    self.log.debug("%s not a regular file", os_path)
+
+                    continue
+
+                if self.should_list(name) and not is_hidden(os_path, self.root_dir):
+
+                    contents.append(self.get(
+
+                        path='%s/%s' % (path, name),
+
+                        content=False)
+
+                    )
+
+
+
+            model['format'] = 'json'
+
+
+
+        return model
+
+
+
+    def _file_model(self, path, content=True, format=None):
+
+        """Build a model for a file
+
+
+
+        if content is requested, include the file contents.
+
+
+
+        format:
+
+          If 'text', the contents will be decoded as UTF-8.
+
+          If 'base64', the raw bytes contents will be encoded as base64.
+
+          If not specified, try to decode as UTF-8, and fall back to base64
+
+        """
+
+        model = self._base_model(path)
+
+        model['type'] = 'file'
+
+
+
+        os_path = self._get_os_path(path)
+
+
+
+        if content:
+
+            content, format = self._read_file(os_path, format)
+
+            default_mime = {
+
+                'text': 'text/plain',
+
+                'base64': 'application/octet-stream'
+
+            }[format]
+
+
+
+            model.update(
+
+                content=content,
+
+                format=format,
+
+                mimetype=mimetypes.guess_type(os_path)[0] or default_mime,
+
+            )
+
+
+
+        return model
+
+
+
+    def _notebook_model(self, path, content=True):
+
+        """Build a notebook model
+
+
+
+        if content is requested, the notebook content will be populated
+
+        as a JSON structure (not double-serialized)
+
+        """
+
+        model = self._base_model(path)
+
+        model['type'] = 'notebook'
+
+        if content:
+
+            os_path = self._get_os_path(path)
+
+            nb = self._read_notebook(os_path, as_version=4)
+
+            self.mark_trusted_cells(nb, path)
+
+            model['content'] = nb
+
+            model['format'] = 'json'
+
+            self.validate_notebook_model(model)
+
+        return model
+
+
+
+    def get(self, path, content=True, type=None, format=None):
+
+        """ Takes a path for an entity and returns its model
+
+
+
+        Parameters
+
+        ----------
+
+        path : str
+
+            the API path that describes the relative path for the target
+
+        content : bool
+
+            Whether to include the contents in the reply
+
+        type : str, optional
+
+            The requested type - 'file', 'notebook', or 'directory'.
+
+            Will raise HTTPError 400 if the content doesn't match.
+
+        format : str, optional
+
+            The requested format for file contents. 'text' or 'base64'.
+
+            Ignored if this returns a notebook or directory model.
+
+
+
+        Returns
+
+        -------
+
+        model : dict
+
+            the contents model. If content=True, returns the contents
+
+            of the file or directory as well.
+
+        """
+
+        path = path.strip('/')
+
+
+
+        if not self.exists(path):
+
+            raise web.HTTPError(404, u'No such file or directory: %s' % path)
+
+
+
+        os_path = self._get_os_path(path)
+
+        if os.path.isdir(os_path):
+
+            if type not in (None, 'directory'):
+
+                raise web.HTTPError(400,
+
+                                u'%s is a directory, not a %s' % (path, type), reason='bad type')
+
+            model = self._dir_model(path, content=content)
+
+        elif type == 'notebook' or (type is None and path.endswith('.ipynb')):
+
+            model = self._notebook_model(path, content=content)
 
         else:
 
-            return uid
+            if type == 'directory':
+
+                raise web.HTTPError(400,
+
+                                u'%s is not a directory' % path, reason='bad type')
+
+            model = self._file_model(path, content=content, format=format)
+
+        return model
 
 
 
-    def nameOwner(self):
+    def _save_directory(self, os_path, model, path=''):
 
-        return self.dbus_info.GetNameOwner(self.sender)
+        """create a directory"""
 
+        if is_hidden(os_path, self.root_dir):
 
+            raise web.HTTPError(400, u'Cannot create hidden directory %r' % os_path)
 
-    def connectionPid(self):
+        if not os.path.exists(os_path):
 
-        return self.dbus_info.GetConnectionUnixProcessID(self.sender)
+            with self.perm_to_403():
 
+                os.mkdir(os_path)
 
+        elif not os.path.isdir(os_path):
 
-if __name__ == '__main__':
+            raise web.HTTPError(400, u'Not a directory: %s' % (os_path))
 
-    dbus.mainloop.pyqt5.DBusQtMainLoop(set_as_default=True)
+        else:
 
-
-
-    app = QCoreApplication([])
-
-
-
-    bus = dbus.SystemBus()
-
-    name = dbus.service.BusName("net.launchpad.backintime.serviceHelper", bus)
-
-    object = UdevRules(bus, '/UdevRules')
+            self.log.debug("Directory %r already exists", os_path)
 
 
 
-    print("Running BIT service.")
+    def save(self, model, path=''):
 
-    app.exec_()
+        """Save the file model and return the model with no content."""
+
+        path = path.strip('/')
+
+
+
+        if 'type' not in model:
+
+            raise web.HTTPError(400, u'No file type provided')
+
+        if 'content' not in model and model['type'] != 'directory':
+
+            raise web.HTTPError(400, u'No file content provided')
+
+
+
+        os_path = self._get_os_path(path)
+
+        self.log.debug("Saving %s", os_path)
+
+
+
+        self.run_pre_save_hook(model=model, path=path)
+
+
+
+        try:
+
+            if model['type'] == 'notebook':
+
+                nb = nbformat.from_dict(model['content'])
+
+                self.check_and_sign(nb, path)
+
+                self._save_notebook(os_path, nb)
+
+                # One checkpoint should always exist for notebooks.
+
+                if not self.checkpoints.list_checkpoints(path):
+
+                    self.create_checkpoint(path)
+
+            elif model['type'] == 'file':
+
+                # Missing format will be handled internally by _save_file.
+
+                self._save_file(os_path, model['content'], model.get('format'))
+
+            elif model['type'] == 'directory':
+
+                self._save_directory(os_path, model, path)
+
+            else:
+
+                raise web.HTTPError(400, "Unhandled contents type: %s" % model['type'])
+
+        except web.HTTPError:
+
+            raise
+
+        except Exception as e:
+
+            self.log.error(u'Error while saving file: %s %s', path, e, exc_info=True)
+
+            raise web.HTTPError(500, u'Unexpected error while saving file: %s %s' % (path, e))
+
+
+
+        validation_message = None
+
+        if model['type'] == 'notebook':
+
+            self.validate_notebook_model(model)
+
+            validation_message = model.get('message', None)
+
+
+
+        model = self.get(path, content=False)
+
+        if validation_message:
+
+            model['message'] = validation_message
+
+
+
+        self.run_post_save_hook(model=model, os_path=os_path)
+
+
+
+        return model
+
+
+
+    def delete_file(self, path):
+
+        """Delete file at path."""
+
+        path = path.strip('/')
+
+        os_path = self._get_os_path(path)
+
+        rm = os.unlink
+
+        if os.path.isdir(os_path):
+
+            listing = os.listdir(os_path)
+
+            # Don't delete non-empty directories.
+
+            # A directory containing only leftover checkpoints is
+
+            # considered empty.
+
+            cp_dir = getattr(self.checkpoints, 'checkpoint_dir', None)
+
+            for entry in listing:
+
+                if entry != cp_dir:
+
+                    raise web.HTTPError(400, u'Directory %s not empty' % os_path)
+
+        elif not os.path.isfile(os_path):
+
+            raise web.HTTPError(404, u'File does not exist: %s' % os_path)
+
+
+
+        if os.path.isdir(os_path):
+
+            self.log.debug("Removing directory %s", os_path)
+
+            with self.perm_to_403():
+
+                shutil.rmtree(os_path)
+
+        else:
+
+            self.log.debug("Unlinking file %s", os_path)
+
+            with self.perm_to_403():
+
+                rm(os_path)
+
+
+
+    def rename_file(self, old_path, new_path):
+
+        """Rename a file."""
+
+        old_path = old_path.strip('/')
+
+        new_path = new_path.strip('/')
+
+        if new_path == old_path:
+
+            return
+
+
+
+        new_os_path = self._get_os_path(new_path)
+
+        old_os_path = self._get_os_path(old_path)
+
+
+
+        # Should we proceed with the move?
+
+        if os.path.exists(new_os_path):
+
+            raise web.HTTPError(409, u'File already exists: %s' % new_path)
+
+
+
+        # Move the file
+
+        try:
+
+            with self.perm_to_403():
+
+                shutil.move(old_os_path, new_os_path)
+
+        except web.HTTPError:
+
+            raise
+
+        except Exception as e:
+
+            raise web.HTTPError(500, u'Unknown error renaming file: %s %s' % (old_path, e))
+
+
+
+    def info_string(self):
+
+        return "Serving notebooks from local directory: %s" % self.root_dir
+
+
+
+    def get_kernel_path(self, path, model=None):
+
+        """Return the initial API path of  a kernel associated with a given notebook"""
+
+        if '/' in path:
+
+            parent_dir = path.rsplit('/', 1)[0]
+
+        else:
+
+            parent_dir = ''
+
+        return parent_dir

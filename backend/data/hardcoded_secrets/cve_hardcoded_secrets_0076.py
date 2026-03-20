@@ -2,1946 +2,1912 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# -*- coding: utf-8 -*-
-
-from __future__ import unicode_literals
+from functools import partial
 
 
 
-import datetime
+from django.test import TestCase
 
-import os
-
-import tempfile
-
-import uuid
+from django.utils.safestring import SafeString
 
 
 
-from django.contrib.auth.models import User
+from wagtail.admin import compare
 
-from django.contrib.contenttypes.fields import (
+from wagtail.core.blocks import StreamValue
 
-    GenericForeignKey, GenericRelation,
+from wagtail.images import get_image_model
 
-)
+from wagtail.images.tests.utils import get_test_image_file
 
-from django.contrib.contenttypes.models import ContentType
+from wagtail.tests.testapp.models import (
 
-from django.core.exceptions import ValidationError
+    AdvertWithCustomPrimaryKey, EventCategory, EventPage, EventPageSpeaker,
 
-from django.core.files.storage import FileSystemStorage
+    HeadCountRelatedModelUsingPK, SimplePage, SnippetChooserModelWithCustomPrimaryKey,
 
-from django.db import models
-
-from django.utils.encoding import python_2_unicode_compatible
+    StreamPage, TaggedPage)
 
 
 
 
 
-class Section(models.Model):
+class TestFieldComparison(TestCase):
 
-    """
-
-    A simple section that links to articles, to test linking to related items
-
-    in admin views.
-
-    """
-
-    name = models.CharField(max_length=100)
+    comparison_class = compare.FieldComparison
 
 
 
-    @property
+    def test_hasnt_changed(self):
 
-    def name_property(self):
+        comparison = self.comparison_class(
+
+            SimplePage._meta.get_field('content'),
+
+            SimplePage(content="Content"),
+
+            SimplePage(content="Content"),
+
+        )
+
+
+
+        self.assertTrue(comparison.is_field)
+
+        self.assertFalse(comparison.is_child_relation)
+
+        self.assertEqual(comparison.field_label(), "Content")
+
+        self.assertEqual(comparison.htmldiff(), 'Content')
+
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
+
+        self.assertFalse(comparison.has_changed())
+
+
+
+    def test_has_changed(self):
+
+        comparison = self.comparison_class(
+
+            SimplePage._meta.get_field('content'),
+
+            SimplePage(content="Original content"),
+
+            SimplePage(content="Modified content"),
+
+        )
+
+
+
+        self.assertEqual(comparison.htmldiff(), '<span class="deletion">Original content</span><span class="addition">Modified content</span>')
+
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
+
+        self.assertTrue(comparison.has_changed())
+
+
+
+    def test_htmldiff_escapes_value(self):
+
+        comparison = self.comparison_class(
+
+            SimplePage._meta.get_field('content'),
+
+            SimplePage(content='Original content'),
+
+            SimplePage(content='<script type="text/javascript">doSomethingBad();</script>'),
+
+        )
+
+
+
+        self.assertEqual(comparison.htmldiff(), '<span class="deletion">Original content</span><span class="addition">&lt;script type=&quot;text/javascript&quot;&gt;doSomethingBad();&lt;/script&gt;</span>')
+
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
+
+
+
+
+
+class TestTextFieldComparison(TestFieldComparison):
+
+    comparison_class = compare.TextFieldComparison
+
+
+
+    # Only change from FieldComparison is the HTML diff is performed on words
+
+    # instead of the whole field value.
+
+    def test_has_changed(self):
+
+        comparison = self.comparison_class(
+
+            SimplePage._meta.get_field('content'),
+
+            SimplePage(content="Original content"),
+
+            SimplePage(content="Modified content"),
+
+        )
+
+
+
+        self.assertEqual(comparison.htmldiff(), '<span class="deletion">Original</span><span class="addition">Modified</span> content')
+
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
+
+        self.assertTrue(comparison.has_changed())
+
+
+
+    def test_from_none_to_value_only_shows_addition(self):
+
+        comparison = self.comparison_class(
+
+            SimplePage._meta.get_field('content'),
+
+            SimplePage(content=None),
+
+            SimplePage(content="Added content")
+
+        )
+
+
+
+        self.assertEqual(comparison.htmldiff(), '<span class="addition">Added content</span>')
+
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
+
+        self.assertTrue(comparison.has_changed())
+
+
+
+    def test_from_value_to_none_only_shows_deletion(self):
+
+        comparison = self.comparison_class(
+
+            SimplePage._meta.get_field('content'),
+
+            SimplePage(content="Removed content"),
+
+            SimplePage(content=None)
+
+        )
+
+
+
+        self.assertEqual(comparison.htmldiff(), '<span class="deletion">Removed content</span>')
+
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
+
+        self.assertTrue(comparison.has_changed())
+
+
+
+
+
+class TestRichTextFieldComparison(TestFieldComparison):
+
+    comparison_class = compare.RichTextFieldComparison
+
+
+
+    # Only change from FieldComparison is the HTML diff is performed on words
+
+    # instead of the whole field value.
+
+    def test_has_changed(self):
+
+        comparison = self.comparison_class(
+
+            SimplePage._meta.get_field('content'),
+
+            SimplePage(content="Original content"),
+
+            SimplePage(content="Modified content"),
+
+        )
+
+
+
+        self.assertEqual(comparison.htmldiff(), '<span class="deletion">Original</span><span class="addition">Modified</span> content')
+
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
+
+        self.assertTrue(comparison.has_changed())
+
+
+
+    # Only change from FieldComparison is that this comparison disregards HTML tags
+
+    def test_has_changed_html(self):
+
+        comparison = self.comparison_class(
+
+            SimplePage._meta.get_field('content'),
+
+            SimplePage(content="<b>Original</b> content"),
+
+            SimplePage(content="Modified <i>content</i>"),
+
+        )
+
+
+
+        self.assertEqual(comparison.htmldiff(), '<span class="deletion">Original</span><span class="addition">Modified</span> content')
+
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
+
+        self.assertTrue(comparison.has_changed())
+
+
+
+    def test_htmldiff_escapes_value(self):
+
+        # Need to override this one as the HTML tags are stripped by RichTextFieldComparison
+
+        comparison = self.comparison_class(
+
+            SimplePage._meta.get_field('content'),
+
+            SimplePage(content='Original content'),
+
+            SimplePage(content='<script type="text/javascript">doSomethingBad();</script>'),
+
+        )
+
+
+
+        self.assertEqual(comparison.htmldiff(), '<span class="deletion">Original content</span><span class="addition">doSomethingBad();</span>')
+
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
+
+
+
+
+
+class TestStreamFieldComparison(TestCase):
+
+    comparison_class = compare.StreamFieldComparison
+
+
+
+    def test_hasnt_changed(self):
+
+        field = StreamPage._meta.get_field('body')
+
+
+
+        comparison = self.comparison_class(
+
+            field,
+
+            StreamPage(body=StreamValue(field.stream_block, [
+
+                ('text', "Content", '1'),
+
+            ])),
+
+            StreamPage(body=StreamValue(field.stream_block, [
+
+                ('text', "Content", '1'),
+
+            ])),
+
+        )
+
+
+
+        self.assertTrue(comparison.is_field)
+
+        self.assertFalse(comparison.is_child_relation)
+
+        self.assertEqual(comparison.field_label(), "Body")
+
+        self.assertEqual(comparison.htmldiff(), '<div class="comparison__child-object">Content</div>')
+
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
+
+        self.assertFalse(comparison.has_changed())
+
+
+
+    def test_has_changed(self):
+
+        field = StreamPage._meta.get_field('body')
+
+
+
+        comparison = self.comparison_class(
+
+            field,
+
+            StreamPage(body=StreamValue(field.stream_block, [
+
+                ('text', "Original content", '1'),
+
+            ])),
+
+            StreamPage(body=StreamValue(field.stream_block, [
+
+                ('text', "Modified content", '1'),
+
+            ])),
+
+        )
+
+
+
+        self.assertEqual(comparison.htmldiff(), '<div class="comparison__child-object"><span class="deletion">Original</span><span class="addition">Modified</span> content</div>')
+
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
+
+        self.assertTrue(comparison.has_changed())
+
+
+
+    def test_add_block(self):
+
+        field = StreamPage._meta.get_field('body')
+
+
+
+        comparison = self.comparison_class(
+
+            field,
+
+            StreamPage(body=StreamValue(field.stream_block, [
+
+                ('text', "Content", '1'),
+
+            ])),
+
+            StreamPage(body=StreamValue(field.stream_block, [
+
+                ('text', "Content", '1'),
+
+                ('text', "New Content", '2'),
+
+            ])),
+
+        )
+
+
+
+        self.assertEqual(comparison.htmldiff(), '<div class="comparison__child-object">Content</div>\n<div class="comparison__child-object addition">New Content</div>')
+
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
+
+        self.assertTrue(comparison.has_changed())
+
+
+
+    def test_delete_block(self):
+
+        field = StreamPage._meta.get_field('body')
+
+
+
+        comparison = self.comparison_class(
+
+            field,
+
+            StreamPage(body=StreamValue(field.stream_block, [
+
+                ('text', "Content", '1'),
+
+                ('text', "Content Foo", '2'),
+
+                ('text', "Content Bar", '3'),
+
+            ])),
+
+            StreamPage(body=StreamValue(field.stream_block, [
+
+                ('text', "Content", '1'),
+
+                ('text', "Content Bar", '3'),
+
+            ])),
+
+        )
+
+
+
+        self.assertEqual(comparison.htmldiff(), '<div class="comparison__child-object">Content</div>\n<div class="comparison__child-object deletion">Content Foo</div>\n<div class="comparison__child-object">Content Bar</div>')
+
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
+
+        self.assertTrue(comparison.has_changed())
+
+
+
+    def test_edit_block(self):
+
+        field = StreamPage._meta.get_field('body')
+
+
+
+        comparison = self.comparison_class(
+
+            field,
+
+            StreamPage(body=StreamValue(field.stream_block, [
+
+                ('text', "Content", '1'),
+
+                ('text', "Content Foo", '2'),
+
+                ('text', "Content Bar", '3'),
+
+            ])),
+
+            StreamPage(body=StreamValue(field.stream_block, [
+
+                ('text', "Content", '1'),
+
+                ('text', "Content Baz", '2'),
+
+                ('text', "Content Bar", '3'),
+
+            ])),
+
+        )
+
+
+
+        self.assertEqual(comparison.htmldiff(), '<div class="comparison__child-object">Content</div>\n<div class="comparison__child-object">Content <span class="deletion">Foo</span><span class="addition">Baz</span></div>\n<div class="comparison__child-object">Content Bar</div>')
+
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
+
+        self.assertTrue(comparison.has_changed())
+
+
+
+    def test_has_changed_richtext(self):
+
+        field = StreamPage._meta.get_field('body')
+
+
+
+        comparison = self.comparison_class(
+
+            field,
+
+            StreamPage(body=StreamValue(field.stream_block, [
+
+                ('rich_text', "<b>Original</b> content", '1'),
+
+            ])),
+
+            StreamPage(body=StreamValue(field.stream_block, [
+
+                ('rich_text', "Modified <i>content</i>", '1'),
+
+            ])),
+
+        )
+
+
+
+        self.assertEqual(comparison.htmldiff(), '<div class="comparison__child-object"><span class="deletion">Original</span><span class="addition">Modified</span> content</div>')
+
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
+
+        self.assertTrue(comparison.has_changed())
+
+
+
+    def test_htmldiff_escapes_value(self):
+
+        field = StreamPage._meta.get_field('body')
+
+
+
+        comparison = self.comparison_class(
+
+            field,
+
+            StreamPage(body=StreamValue(field.stream_block, [
+
+                ('text', "Original content", '1'),
+
+            ])),
+
+            StreamPage(body=StreamValue(field.stream_block, [
+
+                ('text', '<script type="text/javascript">doSomethingBad();</script>', '1'),
+
+            ])),
+
+        )
+
+
+
+        self.assertEqual(comparison.htmldiff(), '<div class="comparison__child-object"><span class="deletion">Original content</span><span class="addition">&lt;script type=&quot;text/javascript&quot;&gt;doSomethingBad();&lt;/script&gt;</span></div>')
+
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
+
+
+
+    def test_htmldiff_escapes_value_richtext(self):
+
+        field = StreamPage._meta.get_field('body')
+
+
+
+        comparison = self.comparison_class(
+
+            field,
+
+            StreamPage(body=StreamValue(field.stream_block, [
+
+                ('rich_text', "Original content", '1'),
+
+            ])),
+
+            StreamPage(body=StreamValue(field.stream_block, [
+
+                ('rich_text', '<script type="text/javascript">doSomethingBad();</script>', '1'),
+
+            ])),
+
+        )
+
+
+
+        self.assertEqual(comparison.htmldiff(), '<div class="comparison__child-object"><span class="deletion">Original content</span><span class="addition">doSomethingBad();</span></div>')
+
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
+
+
+
+    def test_compare_structblock(self):
+
+        field = StreamPage._meta.get_field('body')
+
+
+
+        comparison = self.comparison_class(
+
+            field,
+
+            StreamPage(body=StreamValue(field.stream_block, [
+
+                ('product', {'name': 'a packet of rolos', 'price': '75p'}, '1'),
+
+            ])),
+
+            StreamPage(body=StreamValue(field.stream_block, [
+
+                ('product', {'name': 'a packet of rolos', 'price': '85p'}, '1'),
+
+            ])),
+
+        )
+
+
+
+        expected = """
+
+            <div class="comparison__child-object"><dl>
+
+                <dt>Name</dt>
+
+                <dd>a packet of rolos</dd>
+
+                <dt>Price</dt>
+
+                <dd><span class="deletion">75p</span><span class="addition">85p</span></dd>
+
+            </dl></div>
 
         """
 
-        A property that simply returns the name. Used to test #24461
+        self.assertHTMLEqual(comparison.htmldiff(), expected)
 
-        """
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
 
-        return self.name
+        self.assertTrue(comparison.has_changed())
 
 
 
+    def test_compare_imagechooserblock(self):
 
+        image_model = get_image_model()
 
-@python_2_unicode_compatible
+        test_image_1 = image_model.objects.create(
 
-class Article(models.Model):
+            title="Test image 1",
 
-    """
+            file=get_test_image_file(),
 
-    A simple article to test admin views. Test backwards compatibility.
+        )
 
-    """
+        test_image_2 = image_model.objects.create(
 
-    title = models.CharField(max_length=100)
+            title="Test image 2",
 
-    content = models.TextField()
+            file=get_test_image_file(),
 
-    date = models.DateTimeField()
+        )
 
-    section = models.ForeignKey(Section, models.CASCADE, null=True, blank=True)
 
-    another_section = models.ForeignKey(Section, models.CASCADE, null=True, blank=True, related_name='+')
 
-    sub_section = models.ForeignKey(Section, models.SET_NULL, null=True, blank=True, related_name='+')
+        field = StreamPage._meta.get_field('body')
 
 
 
-    def __str__(self):
+        comparison = self.comparison_class(
 
-        return self.title
+            field,
 
+            StreamPage(body=StreamValue(field.stream_block, [
 
+                ('image', test_image_1, '1'),
 
-    def model_year(self):
+            ])),
 
-        return self.date.year
+            StreamPage(body=StreamValue(field.stream_block, [
 
-    model_year.admin_order_field = 'date'
+                ('image', test_image_2, '1'),
 
-    model_year.short_description = ''
+            ])),
 
+        )
 
 
-    def model_year_reversed(self):
 
-        return self.date.year
+        result = comparison.htmldiff()
 
-    model_year_reversed.admin_order_field = '-date'
+        self.assertIn('<div class="preview-image deletion">', result)
 
-    model_year_reversed.short_description = ''
+        self.assertIn('alt="Test image 1"', result)
 
+        self.assertIn('<div class="preview-image addition">', result)
 
+        self.assertIn('alt="Test image 2"', result)
 
 
 
-@python_2_unicode_compatible
+        self.assertIsInstance(result, SafeString)
 
-class Book(models.Model):
+        self.assertTrue(comparison.has_changed())
 
-    """
 
-    A simple book that has chapters.
 
-    """
 
-    name = models.CharField(max_length=100, verbose_name='¿Name?')
 
+class TestChoiceFieldComparison(TestCase):
 
+    comparison_class = compare.ChoiceFieldComparison
 
-    def __str__(self):
 
-        return self.name
 
+    def test_hasnt_changed(self):
 
+        comparison = self.comparison_class(
 
+            EventPage._meta.get_field('audience'),
 
+            EventPage(audience="public"),
 
-@python_2_unicode_compatible
+            EventPage(audience="public"),
 
-class Promo(models.Model):
+        )
 
-    name = models.CharField(max_length=100, verbose_name='¿Name?')
 
-    book = models.ForeignKey(Book, models.CASCADE)
 
+        self.assertTrue(comparison.is_field)
 
+        self.assertFalse(comparison.is_child_relation)
 
-    def __str__(self):
+        self.assertEqual(comparison.field_label(), "Audience")
 
-        return self.name
+        self.assertEqual(comparison.htmldiff(), 'Public')
 
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
 
+        self.assertFalse(comparison.has_changed())
 
 
 
-@python_2_unicode_compatible
+    def test_has_changed(self):
 
-class Chapter(models.Model):
+        comparison = self.comparison_class(
 
-    title = models.CharField(max_length=100, verbose_name='¿Title?')
+            EventPage._meta.get_field('audience'),
 
-    content = models.TextField()
+            EventPage(audience="public"),
 
-    book = models.ForeignKey(Book, models.CASCADE)
+            EventPage(audience="private"),
 
+        )
 
 
-    def __str__(self):
 
-        return self.title
+        self.assertEqual(comparison.htmldiff(), '<span class="deletion">Public</span><span class="addition">Private</span>')
 
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
 
+        self.assertTrue(comparison.has_changed())
 
-    class Meta:
 
-        # Use a utf-8 bytestring to ensure it works (see #11710)
 
-        verbose_name = '¿Chapter?'
+    def test_from_none_to_value_only_shows_addition(self):
 
+        comparison = self.comparison_class(
 
+            EventPage._meta.get_field('audience'),
 
+            EventPage(audience=None),
 
+            EventPage(audience="private"),
 
-@python_2_unicode_compatible
+        )
 
-class ChapterXtra1(models.Model):
 
-    chap = models.OneToOneField(Chapter, models.CASCADE, verbose_name='¿Chap?')
 
-    xtra = models.CharField(max_length=100, verbose_name='¿Xtra?')
+        self.assertEqual(comparison.htmldiff(), '<span class="addition">Private</span>')
 
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
 
+        self.assertTrue(comparison.has_changed())
 
-    def __str__(self):
 
-        return '¿Xtra1: %s' % self.xtra
 
+    def test_from_value_to_none_only_shows_deletion(self):
 
+        comparison = self.comparison_class(
 
+            EventPage._meta.get_field('audience'),
 
+            EventPage(audience="public"),
 
-@python_2_unicode_compatible
+            EventPage(audience=None),
 
-class ChapterXtra2(models.Model):
+        )
 
-    chap = models.OneToOneField(Chapter, models.CASCADE, verbose_name='¿Chap?')
 
-    xtra = models.CharField(max_length=100, verbose_name='¿Xtra?')
 
+        self.assertEqual(comparison.htmldiff(), '<span class="deletion">Public</span>')
 
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
 
-    def __str__(self):
+        self.assertTrue(comparison.has_changed())
 
-        return '¿Xtra2: %s' % self.xtra
 
 
 
 
+class TestTagsFieldComparison(TestCase):
 
-class RowLevelChangePermissionModel(models.Model):
+    comparison_class = compare.TagsFieldComparison
 
-    name = models.CharField(max_length=100, blank=True)
 
 
+    def test_hasnt_changed(self):
 
+        a = TaggedPage()
 
+        a.tags.add('wagtail')
 
-class CustomArticle(models.Model):
+        a.tags.add('bird')
 
-    content = models.TextField()
 
-    date = models.DateTimeField()
 
+        b = TaggedPage()
 
+        b.tags.add('wagtail')
 
+        b.tags.add('bird')
 
 
-@python_2_unicode_compatible
 
-class ModelWithStringPrimaryKey(models.Model):
+        comparison = self.comparison_class(TaggedPage._meta.get_field('tags'), a, b)
 
-    string_pk = models.CharField(max_length=255, primary_key=True)
 
 
+        self.assertTrue(comparison.is_field)
 
-    def __str__(self):
+        self.assertFalse(comparison.is_child_relation)
 
-        return self.string_pk
+        self.assertEqual(comparison.field_label(), "Tags")
 
+        self.assertEqual(comparison.htmldiff(), 'wagtail, bird')
 
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
 
-    def get_absolute_url(self):
+        self.assertFalse(comparison.has_changed())
 
-        return '/dummy/%s/' % self.string_pk
 
 
+    def test_has_changed(self):
 
+        a = TaggedPage()
 
+        a.tags.add('wagtail')
 
-@python_2_unicode_compatible
+        a.tags.add('bird')
 
-class Color(models.Model):
 
-    value = models.CharField(max_length=10)
 
-    warm = models.BooleanField(default=False)
+        b = TaggedPage()
 
+        b.tags.add('wagtail')
 
+        b.tags.add('motacilla')
 
-    def __str__(self):
 
-        return self.value
 
+        comparison = self.comparison_class(TaggedPage._meta.get_field('tags'), a, b)
 
 
 
+        self.assertEqual(comparison.htmldiff(), 'wagtail, <span class="deletion">bird</span>, <span class="addition">motacilla</span>')
 
-# we replicate Color to register with another ModelAdmin
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
 
-class Color2(Color):
+        self.assertTrue(comparison.has_changed())
 
-    class Meta:
 
-        proxy = True
 
 
 
+class TestM2MFieldComparison(TestCase):
 
+    fixtures = ['test.json']
 
-@python_2_unicode_compatible
+    comparison_class = compare.M2MFieldComparison
 
-class Thing(models.Model):
 
-    title = models.CharField(max_length=20)
 
-    color = models.ForeignKey(Color, models.CASCADE, limit_choices_to={'warm': True})
+    def setUp(self):
 
-    pub_date = models.DateField(blank=True, null=True)
+        self.meetings_category = EventCategory.objects.create(name='Meetings')
 
+        self.parties_category = EventCategory.objects.create(name='Parties')
 
+        self.holidays_category = EventCategory.objects.create(name='Holidays')
 
-    def __str__(self):
 
-        return self.title
 
+    def test_hasnt_changed(self):
 
+        christmas_event = EventPage.objects.get(url_path='/home/events/christmas/')
 
+        saint_patrick_event = EventPage.objects.get(url_path='/home/events/saint-patrick/')
 
 
-@python_2_unicode_compatible
 
-class Actor(models.Model):
+        christmas_event.categories = [self.meetings_category, self.parties_category]
 
-    name = models.CharField(max_length=50)
+        saint_patrick_event.categories = [self.meetings_category, self.parties_category]
 
-    age = models.IntegerField()
 
-    title = models.CharField(max_length=50, null=True, blank=True)
 
+        comparison = self.comparison_class(
 
+            EventPage._meta.get_field('categories'), christmas_event, saint_patrick_event
 
-    def __str__(self):
+        )
 
-        return self.name
 
 
+        self.assertTrue(comparison.is_field)
 
+        self.assertFalse(comparison.is_child_relation)
 
+        self.assertEqual(comparison.field_label(), "Categories")
 
-@python_2_unicode_compatible
+        self.assertFalse(comparison.has_changed())
 
-class Inquisition(models.Model):
+        self.assertEqual(comparison.htmldiff(), 'Meetings, Parties')
 
-    expected = models.BooleanField(default=False)
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
 
-    leader = models.ForeignKey(Actor, models.CASCADE)
 
-    country = models.CharField(max_length=20)
 
+    def test_has_changed(self):
 
+        christmas_event = EventPage.objects.get(url_path='/home/events/christmas/')
 
-    def __str__(self):
+        saint_patrick_event = EventPage.objects.get(url_path='/home/events/saint-patrick/')
 
-        return "by %s from %s" % (self.leader, self.country)
 
 
+        christmas_event.categories = [self.meetings_category, self.parties_category]
 
+        saint_patrick_event.categories = [self.meetings_category, self.holidays_category]
 
 
-@python_2_unicode_compatible
 
-class Sketch(models.Model):
+        comparison = self.comparison_class(
 
-    title = models.CharField(max_length=100)
+            EventPage._meta.get_field('categories'), christmas_event, saint_patrick_event
 
-    inquisition = models.ForeignKey(
+        )
 
-        Inquisition,
 
-        models.CASCADE,
 
-        limit_choices_to={
+        self.assertTrue(comparison.has_changed())
 
-            'leader__name': 'Palin',
+        self.assertEqual(comparison.htmldiff(), 'Meetings, <span class="deletion">Parties</span>, <span class="addition">Holidays</span>')
 
-            'leader__age': 27,
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
 
-            'expected': False,
 
-        },
 
-    )
 
-    defendant0 = models.ForeignKey(
 
-        Actor,
+class TestForeignObjectComparison(TestCase):
 
-        models.CASCADE,
+    comparison_class = compare.ForeignObjectComparison
 
-        limit_choices_to={'title__isnull': False},
 
-        related_name='as_defendant0',
 
-    )
+    @classmethod
 
-    defendant1 = models.ForeignKey(
+    def setUpTestData(cls):
 
-        Actor,
+        image_model = get_image_model()
 
-        models.CASCADE,
+        cls.test_image_1 = image_model.objects.create(
 
-        limit_choices_to={'title__isnull': True},
+            title="Test image 1",
 
-        related_name='as_defendant1',
+            file=get_test_image_file(),
 
-    )
+        )
 
+        cls.test_image_2 = image_model.objects.create(
 
+            title="Test image 2",
 
-    def __str__(self):
+            file=get_test_image_file(),
 
-        return self.title
+        )
 
 
 
+    def test_hasnt_changed(self):
 
+        comparison = self.comparison_class(
 
-def today_callable_dict():
+            EventPage._meta.get_field('feed_image'),
 
-    return {"last_action__gte": datetime.datetime.today()}
+            EventPage(feed_image=self.test_image_1),
 
+            EventPage(feed_image=self.test_image_1),
 
+        )
 
 
 
-def today_callable_q():
+        self.assertTrue(comparison.is_field)
 
-    return models.Q(last_action__gte=datetime.datetime.today())
+        self.assertFalse(comparison.is_child_relation)
 
+        self.assertEqual(comparison.field_label(), "Feed image")
 
+        self.assertEqual(comparison.htmldiff(), 'Test image 1')
 
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
 
+        self.assertFalse(comparison.has_changed())
 
-@python_2_unicode_compatible
 
-class Character(models.Model):
 
-    username = models.CharField(max_length=100)
+    def test_has_changed(self):
 
-    last_action = models.DateTimeField()
+        comparison = self.comparison_class(
 
+            EventPage._meta.get_field('feed_image'),
 
+            EventPage(feed_image=self.test_image_1),
 
-    def __str__(self):
+            EventPage(feed_image=self.test_image_2),
 
-        return self.username
+        )
 
 
 
+        self.assertEqual(comparison.htmldiff(), '<span class="deletion">Test image 1</span><span class="addition">Test image 2</span>')
 
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
 
-@python_2_unicode_compatible
+        self.assertTrue(comparison.has_changed())
 
-class StumpJoke(models.Model):
 
-    variation = models.CharField(max_length=100)
 
-    most_recently_fooled = models.ForeignKey(
 
-        Character,
 
-        models.CASCADE,
+class TestForeignObjectComparisonWithCustomPK(TestCase):
 
-        limit_choices_to=today_callable_dict,
+    """ForeignObjectComparison works with models declaring a custom primary key field"""
 
-        related_name="+",
 
-    )
 
-    has_fooled_today = models.ManyToManyField(Character, limit_choices_to=today_callable_q, related_name="+")
+    comparison_class = compare.ForeignObjectComparison
 
 
 
-    def __str__(self):
+    @classmethod
 
-        return self.variation
+    def setUpTestData(cls):
 
+        ad1 = AdvertWithCustomPrimaryKey.objects.create(
 
+            advert_id='ad1',
 
+            text='Advert 1'
 
+        )
 
-class Fabric(models.Model):
+        ad2 = AdvertWithCustomPrimaryKey.objects.create(
 
-    NG_CHOICES = (
+            advert_id='ad2',
 
-        ('Textured', (
+            text='Advert 2'
 
-            ('x', 'Horizontal'),
+        )
 
-            ('y', 'Vertical'),
+        cls.test_obj_1 = SnippetChooserModelWithCustomPrimaryKey.objects.create(
 
-        )),
+            advertwithcustomprimarykey=ad1
 
-        ('plain', 'Smooth'),
+        )
 
-    )
+        cls.test_obj_2 = SnippetChooserModelWithCustomPrimaryKey.objects.create(
 
-    surface = models.CharField(max_length=20, choices=NG_CHOICES)
+            advertwithcustomprimarykey=ad2
 
+        )
 
 
 
+    def test_hasnt_changed(self):
 
-@python_2_unicode_compatible
+        comparison = self.comparison_class(
 
-class Person(models.Model):
+            SnippetChooserModelWithCustomPrimaryKey._meta.get_field('advertwithcustomprimarykey'),
 
-    GENDER_CHOICES = (
+            self.test_obj_1,
 
-        (1, "Male"),
+            self.test_obj_1,
 
-        (2, "Female"),
+        )
 
-    )
 
-    name = models.CharField(max_length=100)
 
-    gender = models.IntegerField(choices=GENDER_CHOICES)
+        self.assertTrue(comparison.is_field)
 
-    age = models.IntegerField(default=21)
+        self.assertFalse(comparison.is_child_relation)
 
-    alive = models.BooleanField(default=True)
+        self.assertEqual(comparison.field_label(), 'Advertwithcustomprimarykey')
 
+        self.assertEqual(comparison.htmldiff(), 'Advert 1')
 
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
 
-    def __str__(self):
+        self.assertFalse(comparison.has_changed())
 
-        return self.name
 
 
+    def test_has_changed(self):
 
+        comparison = self.comparison_class(
 
+            SnippetChooserModelWithCustomPrimaryKey._meta.get_field('advertwithcustomprimarykey'),
 
-@python_2_unicode_compatible
+            self.test_obj_1,
 
-class Persona(models.Model):
+            self.test_obj_2,
 
-    """
+        )
 
-    A simple persona associated with accounts, to test inlining of related
 
-    accounts which inherit from a common accounts class.
 
-    """
+        self.assertEqual(comparison.htmldiff(), '<span class="deletion">Advert 1</span><span class="addition">Advert 2</span>')
 
-    name = models.CharField(blank=False, max_length=80)
+        self.assertIsInstance(comparison.htmldiff(), SafeString)
 
+        self.assertTrue(comparison.has_changed())
 
 
-    def __str__(self):
 
-        return self.name
 
 
+class TestChildRelationComparison(TestCase):
 
+    field_comparison_class = compare.FieldComparison
 
+    comparison_class = compare.ChildRelationComparison
 
-@python_2_unicode_compatible
 
-class Account(models.Model):
 
-    """
+    def test_hasnt_changed(self):
 
-    A simple, generic account encapsulating the information shared by all
+        # Two event pages with speaker called "Father Christmas". Neither of
 
-    types of accounts.
+        # the speaker objects have an ID so this tests that the code can match
 
-    """
+        # the two together by field content.
 
-    username = models.CharField(blank=False, max_length=80)
+        event_page = EventPage(title="Event page", slug="event")
 
-    persona = models.ForeignKey(Persona, models.CASCADE, related_name="accounts")
+        event_page.speakers.add(EventPageSpeaker(
 
-    servicename = 'generic service'
+            first_name="Father",
 
+            last_name="Christmas",
 
+        ))
 
-    def __str__(self):
 
-        return "%s: %s" % (self.servicename, self.username)
 
+        modified_event_page = EventPage(title="Event page", slug="event")
 
+        modified_event_page.speakers.add(EventPageSpeaker(
 
+            first_name="Father",
 
+            last_name="Christmas",
 
-class FooAccount(Account):
+        ))
 
-    """A service-specific account of type Foo."""
 
-    servicename = 'foo'
 
+        comparison = self.comparison_class(
 
+            EventPage._meta.get_field('speaker'),
 
+            [
 
+                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('first_name')),
 
-class BarAccount(Account):
+                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('last_name')),
 
-    """A service-specific account of type Bar."""
+            ],
 
-    servicename = 'bar'
+            event_page,
 
+            modified_event_page,
 
+        )
 
 
 
-@python_2_unicode_compatible
+        self.assertFalse(comparison.is_field)
 
-class Subscriber(models.Model):
+        self.assertTrue(comparison.is_child_relation)
 
-    name = models.CharField(blank=False, max_length=80)
+        self.assertEqual(comparison.field_label(), "Speaker")
 
-    email = models.EmailField(blank=False, max_length=175)
+        self.assertFalse(comparison.has_changed())
 
 
 
-    def __str__(self):
+        # Check mapping
 
-        return "%s (%s)" % (self.name, self.email)
+        objs_a = list(comparison.val_a.all())
 
+        objs_b = list(comparison.val_b.all())
 
+        map_forwards, map_backwards, added, deleted = comparison.get_mapping(objs_a, objs_b)
 
+        self.assertEqual(map_forwards, {0: 0})
 
+        self.assertEqual(map_backwards, {0: 0})
 
-class ExternalSubscriber(Subscriber):
+        self.assertEqual(added, [])
 
-    pass
+        self.assertEqual(deleted, [])
 
 
 
+    def test_has_changed(self):
 
+        # Father Christmas renamed to Santa Claus. And Father Ted added.
 
-class OldSubscriber(Subscriber):
+        # Father Christmas should be mapped to Father Ted because they
 
-    pass
+        # are most alike. Santa claus should be displayed as "new"
 
+        event_page = EventPage(title="Event page", slug="event")
 
+        event_page.speakers.add(EventPageSpeaker(
 
+            first_name="Father",
 
+            last_name="Christmas",
 
-class Media(models.Model):
+            sort_order=0,
 
-    name = models.CharField(max_length=60)
+        ))
 
 
 
+        modified_event_page = EventPage(title="Event page", slug="event")
 
+        modified_event_page.speakers.add(EventPageSpeaker(
 
-class Podcast(Media):
+            first_name="Santa",
 
-    release_date = models.DateField()
+            last_name="Claus",
 
+            sort_order=0,
 
+        ))
 
-    class Meta:
+        modified_event_page.speakers.add(EventPageSpeaker(
 
-        ordering = ('release_date',)  # overridden in PodcastAdmin
+            first_name="Father",
 
+            last_name="Ted",
 
+            sort_order=1,
 
+        ))
 
 
-class Vodcast(Media):
 
-    media = models.OneToOneField(Media, models.CASCADE, primary_key=True, parent_link=True)
+        comparison = self.comparison_class(
 
-    released = models.BooleanField(default=False)
+            EventPage._meta.get_field('speaker'),
 
+            [
 
+                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('first_name')),
 
+                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('last_name')),
 
+            ],
 
-class Parent(models.Model):
+            event_page,
 
-    name = models.CharField(max_length=128)
+            modified_event_page,
 
+        )
 
 
-    def clean(self):
 
-        if self.name == '_invalid':
+        self.assertFalse(comparison.is_field)
 
-            raise ValidationError('invalid')
+        self.assertTrue(comparison.is_child_relation)
 
+        self.assertEqual(comparison.field_label(), "Speaker")
 
+        self.assertTrue(comparison.has_changed())
 
 
 
-class Child(models.Model):
+        # Check mapping
 
-    parent = models.ForeignKey(Parent, models.CASCADE, editable=False)
+        objs_a = list(comparison.val_a.all())
 
-    name = models.CharField(max_length=30, blank=True)
+        objs_b = list(comparison.val_b.all())
 
+        map_forwards, map_backwards, added, deleted = comparison.get_mapping(objs_a, objs_b)
 
+        self.assertEqual(map_forwards, {0: 1})  # Map Father Christmas to Father Ted
 
-    def clean(self):
+        self.assertEqual(map_backwards, {1: 0})  # Map Father Ted ot Father Christmas
 
-        if self.name == '_invalid':
+        self.assertEqual(added, [0])  # Add Santa Claus
 
-            raise ValidationError('invalid')
+        self.assertEqual(deleted, [])
 
 
 
+    def test_has_changed_with_same_id(self):
 
+        # Father Christmas renamed to Santa Claus, but this time the ID of the
 
-@python_2_unicode_compatible
+        # child object remained the same. It should now be detected as the same
 
-class EmptyModel(models.Model):
+        # object
 
-    def __str__(self):
+        event_page = EventPage(title="Event page", slug="event")
 
-        return "Primary key = %s" % self.id
+        event_page.speakers.add(EventPageSpeaker(
 
+            id=1,
 
+            first_name="Father",
 
+            last_name="Christmas",
 
+            sort_order=0,
 
-temp_storage = FileSystemStorage(tempfile.mkdtemp())
+        ))
 
-UPLOAD_TO = os.path.join(temp_storage.location, 'test_upload')
 
 
+        modified_event_page = EventPage(title="Event page", slug="event")
 
+        modified_event_page.speakers.add(EventPageSpeaker(
 
+            id=1,
 
-class Gallery(models.Model):
+            first_name="Santa",
 
-    name = models.CharField(max_length=100)
+            last_name="Claus",
 
+            sort_order=0,
 
+        ))
 
+        modified_event_page.speakers.add(EventPageSpeaker(
 
+            first_name="Father",
 
-class Picture(models.Model):
+            last_name="Ted",
 
-    name = models.CharField(max_length=100)
+            sort_order=1,
 
-    image = models.FileField(storage=temp_storage, upload_to='test_upload')
+        ))
 
-    gallery = models.ForeignKey(Gallery, models.CASCADE, related_name="pictures")
 
 
+        comparison = self.comparison_class(
 
+            EventPage._meta.get_field('speaker'),
 
+            [
 
-class Language(models.Model):
+                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('first_name')),
 
-    iso = models.CharField(max_length=5, primary_key=True)
+                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('last_name')),
 
-    name = models.CharField(max_length=50)
+            ],
 
-    english_name = models.CharField(max_length=50)
+            event_page,
 
-    shortlist = models.BooleanField(default=False)
+            modified_event_page,
 
+        )
 
 
-    class Meta:
 
-        ordering = ('iso',)
+        self.assertFalse(comparison.is_field)
 
+        self.assertTrue(comparison.is_child_relation)
 
+        self.assertEqual(comparison.field_label(), "Speaker")
 
+        self.assertTrue(comparison.has_changed())
 
 
-# a base class for Recommender and Recommendation
 
-class Title(models.Model):
+        # Check mapping
 
-    pass
+        objs_a = list(comparison.val_a.all())
 
+        objs_b = list(comparison.val_b.all())
 
+        map_forwards, map_backwards, added, deleted = comparison.get_mapping(objs_a, objs_b)
 
+        self.assertEqual(map_forwards, {0: 0})  # Map Father Christmas to Santa Claus
 
+        self.assertEqual(map_backwards, {0: 0})  # Map Santa Claus to Father Christmas
 
-class TitleTranslation(models.Model):
+        self.assertEqual(added, [1])  # Add Father Ted
 
-    title = models.ForeignKey(Title, models.CASCADE)
+        self.assertEqual(deleted, [])
 
-    text = models.CharField(max_length=100)
 
 
+    def test_hasnt_changed_with_different_id(self):
 
+        # Both of the child objects have the same field content but have a
 
+        # different ID so they should be detected as separate objects
 
-class Recommender(Title):
+        event_page = EventPage(title="Event page", slug="event")
 
-    pass
+        event_page.speakers.add(EventPageSpeaker(
 
+            id=1,
 
+            first_name="Father",
 
+            last_name="Christmas",
 
+        ))
 
-class Recommendation(Title):
 
-    recommender = models.ForeignKey(Recommender, models.CASCADE)
 
+        modified_event_page = EventPage(title="Event page", slug="event")
 
+        modified_event_page.speakers.add(EventPageSpeaker(
 
+            id=2,
 
+            first_name="Father",
 
-class Collector(models.Model):
+            last_name="Christmas",
 
-    name = models.CharField(max_length=100)
+        ))
 
 
 
+        comparison = self.comparison_class(
 
+            EventPage._meta.get_field('speaker'),
 
-class Widget(models.Model):
+            [
 
-    owner = models.ForeignKey(Collector, models.CASCADE)
+                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('first_name')),
 
-    name = models.CharField(max_length=100)
+                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('last_name')),
 
+            ],
 
+            event_page,
 
+            modified_event_page,
 
+        )
 
-class DooHickey(models.Model):
 
-    code = models.CharField(max_length=10, primary_key=True)
 
-    owner = models.ForeignKey(Collector, models.CASCADE)
+        self.assertFalse(comparison.is_field)
 
-    name = models.CharField(max_length=100)
+        self.assertTrue(comparison.is_child_relation)
 
+        self.assertEqual(comparison.field_label(), "Speaker")
 
+        self.assertTrue(comparison.has_changed())
 
 
 
-class Grommet(models.Model):
+        # Check mapping
 
-    code = models.AutoField(primary_key=True)
+        objs_a = list(comparison.val_a.all())
 
-    owner = models.ForeignKey(Collector, models.CASCADE)
+        objs_b = list(comparison.val_b.all())
 
-    name = models.CharField(max_length=100)
+        map_forwards, map_backwards, added, deleted = comparison.get_mapping(objs_a, objs_b)
 
+        self.assertEqual(map_forwards, {})
 
+        self.assertEqual(map_backwards, {})
 
+        self.assertEqual(added, [0])  # Add new Father Christmas
 
+        self.assertEqual(deleted, [0])  # Delete old Father Christmas
 
-class Whatsit(models.Model):
 
-    index = models.IntegerField(primary_key=True)
 
-    owner = models.ForeignKey(Collector, models.CASCADE)
 
-    name = models.CharField(max_length=100)
 
+class TestChildObjectComparison(TestCase):
 
+    field_comparison_class = compare.FieldComparison
 
+    comparison_class = compare.ChildObjectComparison
 
 
-class Doodad(models.Model):
 
-    name = models.CharField(max_length=100)
+    def test_same_object(self):
 
+        obj_a = EventPageSpeaker(
 
+            first_name="Father",
 
+            last_name="Christmas",
 
+        )
 
-class FancyDoodad(Doodad):
 
-    owner = models.ForeignKey(Collector, models.CASCADE)
 
-    expensive = models.BooleanField(default=True)
+        obj_b = EventPageSpeaker(
 
+            first_name="Father",
 
+            last_name="Christmas",
 
+        )
 
 
-@python_2_unicode_compatible
 
-class Category(models.Model):
+        comparison = self.comparison_class(
 
-    collector = models.ForeignKey(Collector, models.CASCADE)
+            EventPageSpeaker,
 
-    order = models.PositiveIntegerField()
+            [
 
+                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('first_name')),
 
+                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('last_name')),
 
-    class Meta:
+            ],
 
-        ordering = ('order',)
+            obj_a,
 
+            obj_b,
 
+        )
 
-    def __str__(self):
 
-        return '%s:o%s' % (self.id, self.order)
 
+        self.assertFalse(comparison.is_addition())
 
+        self.assertFalse(comparison.is_deletion())
 
+        self.assertFalse(comparison.has_changed())
 
+        self.assertEqual(comparison.get_position_change(), 0)
 
-def link_posted_default():
+        self.assertEqual(comparison.get_num_differences(), 0)
 
-    return datetime.date.today() - datetime.timedelta(days=7)
 
 
+    def test_different_object(self):
 
+        obj_a = EventPageSpeaker(
 
+            first_name="Father",
 
-class Link(models.Model):
+            last_name="Christmas",
 
-    posted = models.DateField(default=link_posted_default)
+        )
 
-    url = models.URLField()
 
-    post = models.ForeignKey("Post", models.CASCADE)
 
-    readonly_link_content = models.TextField()
+        obj_b = EventPageSpeaker(
 
+            first_name="Santa",
 
+            last_name="Claus",
 
+        )
 
 
-class PrePopulatedPost(models.Model):
 
-    title = models.CharField(max_length=100)
+        comparison = self.comparison_class(
 
-    published = models.BooleanField(default=False)
+            EventPageSpeaker,
 
-    slug = models.SlugField()
+            [
 
+                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('first_name')),
 
+                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('last_name')),
 
+            ],
 
+            obj_a,
 
-class PrePopulatedSubPost(models.Model):
+            obj_b,
 
-    post = models.ForeignKey(PrePopulatedPost, models.CASCADE)
+        )
 
-    subtitle = models.CharField(max_length=100)
 
-    subslug = models.SlugField()
 
+        self.assertFalse(comparison.is_addition())
 
+        self.assertFalse(comparison.is_deletion())
 
+        self.assertTrue(comparison.has_changed())
 
+        self.assertEqual(comparison.get_position_change(), 0)
 
-class Post(models.Model):
+        self.assertEqual(comparison.get_num_differences(), 2)
 
-    title = models.CharField(max_length=100, help_text="Some help text for the title (with unicode ŠĐĆŽćžšđ)")
 
-    content = models.TextField(help_text="Some help text for the content (with unicode ŠĐĆŽćžšđ)")
 
-    readonly_content = models.TextField()
+    def test_moved_object(self):
 
-    posted = models.DateField(
+        obj_a = EventPageSpeaker(
 
-        default=datetime.date.today,
+            first_name="Father",
 
-        help_text="Some help text for the date (with unicode ŠĐĆŽćžšđ)"
+            last_name="Christmas",
 
-    )
+            sort_order=1,
 
-    public = models.NullBooleanField()
+        )
 
 
 
-    def awesomeness_level(self):
+        obj_b = EventPageSpeaker(
 
-        return "Very awesome."
+            first_name="Father",
 
+            last_name="Christmas",
 
+            sort_order=5,
 
+        )
 
 
-# Proxy model to test overridden fields attrs on Post model so as not to
 
-# interfere with other tests.
+        comparison = self.comparison_class(
 
-class FieldOverridePost(Post):
+            EventPageSpeaker,
 
-    class Meta:
+            [
 
-        proxy = True
+                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('first_name')),
 
+                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('last_name')),
 
+            ],
 
+            obj_a,
 
+            obj_b,
 
-@python_2_unicode_compatible
+        )
 
-class Gadget(models.Model):
 
-    name = models.CharField(max_length=100)
 
+        self.assertFalse(comparison.is_addition())
 
+        self.assertFalse(comparison.is_deletion())
 
-    def __str__(self):
+        self.assertFalse(comparison.has_changed())
 
-        return self.name
+        self.assertEqual(comparison.get_position_change(), 4)
 
+        self.assertEqual(comparison.get_num_differences(), 0)
 
 
 
+    def test_addition(self):
 
-@python_2_unicode_compatible
+        obj = EventPageSpeaker(
 
-class Villain(models.Model):
+            first_name="Father",
 
-    name = models.CharField(max_length=100)
+            last_name="Christmas",
 
+        )
 
 
-    def __str__(self):
 
-        return self.name
+        comparison = self.comparison_class(
 
+            EventPageSpeaker,
 
+            [
 
+                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('first_name')),
 
+                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('last_name')),
 
-class SuperVillain(Villain):
+            ],
 
-    pass
+            None,
 
+            obj,
 
+        )
 
 
 
-@python_2_unicode_compatible
+        self.assertTrue(comparison.is_addition())
 
-class FunkyTag(models.Model):
+        self.assertFalse(comparison.is_deletion())
 
-    "Because we all know there's only one real use case for GFKs."
+        self.assertFalse(comparison.has_changed())
 
-    name = models.CharField(max_length=25)
+        self.assertIsNone(comparison.get_position_change(), 0)
 
-    content_type = models.ForeignKey(ContentType, models.CASCADE)
+        self.assertEqual(comparison.get_num_differences(), 0)
 
-    object_id = models.PositiveIntegerField()
 
-    content_object = GenericForeignKey('content_type', 'object_id')
 
+    def test_deletion(self):
 
+        obj = EventPageSpeaker(
 
-    def __str__(self):
+            first_name="Father",
 
-        return self.name
+            last_name="Christmas",
 
+        )
 
 
 
+        comparison = self.comparison_class(
 
-@python_2_unicode_compatible
+            EventPageSpeaker,
 
-class Plot(models.Model):
+            [
 
-    name = models.CharField(max_length=100)
+                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('first_name')),
 
-    team_leader = models.ForeignKey(Villain, models.CASCADE, related_name='lead_plots')
+                partial(self.field_comparison_class, EventPageSpeaker._meta.get_field('last_name')),
 
-    contact = models.ForeignKey(Villain, models.CASCADE, related_name='contact_plots')
+            ],
 
-    tags = GenericRelation(FunkyTag)
+            obj,
 
+            None,
 
+        )
 
-    def __str__(self):
 
-        return self.name
 
+        self.assertFalse(comparison.is_addition())
 
+        self.assertTrue(comparison.is_deletion())
 
+        self.assertFalse(comparison.has_changed())
 
+        self.assertIsNone(comparison.get_position_change())
 
-@python_2_unicode_compatible
+        self.assertEqual(comparison.get_num_differences(), 0)
 
-class PlotDetails(models.Model):
 
-    details = models.CharField(max_length=100)
 
-    plot = models.OneToOneField(Plot, models.CASCADE, null=True, blank=True)
 
 
+class TestChildRelationComparisonUsingPK(TestCase):
 
-    def __str__(self):
+    """Test related objects can be compred if they do not use id for primary key"""
 
-        return self.details
 
 
+    field_comparison_class = compare.FieldComparison
 
+    comparison_class = compare.ChildRelationComparison
 
 
-class PlotProxy(Plot):
 
-    class Meta:
+    def test_has_changed_with_same_id(self):
 
-        proxy = True
+        # Head Count was changed but the PK of the child object remained the same.
 
+        # It should be detected as the same object
 
 
 
+        event_page = EventPage(title="Semi Finals", slug="semi-finals-2018")
 
-@python_2_unicode_compatible
+        event_page.head_counts.add(HeadCountRelatedModelUsingPK(
 
-class SecretHideout(models.Model):
+            custom_id=1,
 
-    """ Secret! Not registered with the admin! """
+            head_count=22,
 
-    location = models.CharField(max_length=100)
+        ))
 
-    villain = models.ForeignKey(Villain, models.CASCADE)
 
 
+        modified_event_page = EventPage(title="Semi Finals", slug="semi-finals-2018")
 
-    def __str__(self):
+        modified_event_page.head_counts.add(HeadCountRelatedModelUsingPK(
 
-        return self.location
+            custom_id=1,
 
+            head_count=23,
 
+        ))
 
+        modified_event_page.head_counts.add(HeadCountRelatedModelUsingPK(
 
+            head_count=25,
 
-@python_2_unicode_compatible
+        ))
 
-class SuperSecretHideout(models.Model):
 
-    """ Secret! Not registered with the admin! """
 
-    location = models.CharField(max_length=100)
+        comparison = self.comparison_class(
 
-    supervillain = models.ForeignKey(SuperVillain, models.CASCADE)
+            EventPage._meta.get_field('head_counts'),
 
+            [partial(self.field_comparison_class, HeadCountRelatedModelUsingPK._meta.get_field('head_count'))],
 
+            event_page,
 
-    def __str__(self):
+            modified_event_page,
 
-        return self.location
+        )
 
 
 
+        self.assertFalse(comparison.is_field)
 
+        self.assertTrue(comparison.is_child_relation)
 
-@python_2_unicode_compatible
+        self.assertEqual(comparison.field_label(), 'Head counts')
 
-class Bookmark(models.Model):
+        self.assertTrue(comparison.has_changed())
 
-    name = models.CharField(max_length=60)
 
-    tag = GenericRelation(FunkyTag, related_query_name='bookmark')
 
+        # Check mapping
 
+        objs_a = list(comparison.val_a.all())
 
-    def __str__(self):
+        objs_b = list(comparison.val_b.all())
 
-        return self.name
+        map_forwards, map_backwards, added, deleted = comparison.get_mapping(objs_a, objs_b)
 
+        self.assertEqual(map_forwards, {0: 0})  # map head count 22 to 23
 
+        self.assertEqual(map_backwards, {0: 0})  # map head count 23 to 22
 
+        self.assertEqual(added, [1])  # add second head count
 
+        self.assertEqual(deleted, [])
 
-@python_2_unicode_compatible
 
-class CyclicOne(models.Model):
 
-    name = models.CharField(max_length=25)
 
-    two = models.ForeignKey('CyclicTwo', models.CASCADE)
 
+    def test_hasnt_changed_with_different_id(self):
 
+        # Both of the child objects have the same field content but have a
 
-    def __str__(self):
+        # different PK (ID) so they should be detected as separate objects
 
-        return self.name
+        event_page = EventPage(title="Finals", slug="finals-event-abc")
 
+        event_page.head_counts.add(HeadCountRelatedModelUsingPK(
 
+            custom_id=1,
 
+            head_count=220
 
+        ))
 
-@python_2_unicode_compatible
 
-class CyclicTwo(models.Model):
 
-    name = models.CharField(max_length=25)
+        modified_event_page = EventPage(title="Finals", slug="finals-event-abc")
 
-    one = models.ForeignKey(CyclicOne, models.CASCADE)
+        modified_event_page.head_counts.add(HeadCountRelatedModelUsingPK(
 
+            custom_id=2,
 
+            head_count=220
 
-    def __str__(self):
+        ))
 
-        return self.name
 
 
+        comparison = self.comparison_class(
 
+            EventPage._meta.get_field('head_counts'),
 
+            [partial(self.field_comparison_class, HeadCountRelatedModelUsingPK._meta.get_field('head_count'))],
 
-class Topping(models.Model):
+            event_page,
 
-    name = models.CharField(max_length=20)
+            modified_event_page,
 
+        )
 
 
 
+        self.assertFalse(comparison.is_field)
 
-class Pizza(models.Model):
+        self.assertTrue(comparison.is_child_relation)
 
-    name = models.CharField(max_length=20)
+        self.assertEqual(comparison.field_label(), "Head counts")
 
-    toppings = models.ManyToManyField('Topping', related_name='pizzas')
+        self.assertTrue(comparison.has_changed())
 
 
 
+        # Check mapping
 
+        objs_a = list(comparison.val_a.all())
 
-class Album(models.Model):
+        objs_b = list(comparison.val_b.all())
 
-    owner = models.ForeignKey(User, models.SET_NULL, null=True, blank=True)
+        map_forwards, map_backwards, added, deleted = comparison.get_mapping(objs_a, objs_b)
 
-    title = models.CharField(max_length=30)
+        self.assertEqual(map_forwards, {})
 
+        self.assertEqual(map_backwards, {})
 
+        self.assertEqual(added, [0])  # Add new head count
 
-
-
-class Employee(Person):
-
-    code = models.CharField(max_length=20)
-
-
-
-
-
-class WorkHour(models.Model):
-
-    datum = models.DateField()
-
-    employee = models.ForeignKey(Employee, models.CASCADE)
-
-
-
-
-
-class Question(models.Model):
-
-    question = models.CharField(max_length=20)
-
-
-
-
-
-@python_2_unicode_compatible
-
-class Answer(models.Model):
-
-    question = models.ForeignKey(Question, models.PROTECT)
-
-    answer = models.CharField(max_length=20)
-
-
-
-    def __str__(self):
-
-        return self.answer
-
-
-
-
-
-class Reservation(models.Model):
-
-    start_date = models.DateTimeField()
-
-    price = models.IntegerField()
-
-
-
-
-
-DRIVER_CHOICES = (
-
-    ('bill', 'Bill G'),
-
-    ('steve', 'Steve J'),
-
-)
-
-
-
-RESTAURANT_CHOICES = (
-
-    ('indian', 'A Taste of India'),
-
-    ('thai', 'Thai Pography'),
-
-    ('pizza', 'Pizza Mama'),
-
-)
-
-
-
-
-
-class FoodDelivery(models.Model):
-
-    reference = models.CharField(max_length=100)
-
-    driver = models.CharField(max_length=100, choices=DRIVER_CHOICES, blank=True)
-
-    restaurant = models.CharField(max_length=100, choices=RESTAURANT_CHOICES, blank=True)
-
-
-
-    class Meta:
-
-        unique_together = (("driver", "restaurant"),)
-
-
-
-
-
-@python_2_unicode_compatible
-
-class CoverLetter(models.Model):
-
-    author = models.CharField(max_length=30)
-
-    date_written = models.DateField(null=True, blank=True)
-
-
-
-    def __str__(self):
-
-        return self.author
-
-
-
-
-
-class Paper(models.Model):
-
-    title = models.CharField(max_length=30)
-
-    author = models.CharField(max_length=30, blank=True, null=True)
-
-
-
-
-
-class ShortMessage(models.Model):
-
-    content = models.CharField(max_length=140)
-
-    timestamp = models.DateTimeField(null=True, blank=True)
-
-
-
-
-
-@python_2_unicode_compatible
-
-class Telegram(models.Model):
-
-    title = models.CharField(max_length=30)
-
-    date_sent = models.DateField(null=True, blank=True)
-
-
-
-    def __str__(self):
-
-        return self.title
-
-
-
-
-
-class Story(models.Model):
-
-    title = models.CharField(max_length=100)
-
-    content = models.TextField()
-
-
-
-
-
-class OtherStory(models.Model):
-
-    title = models.CharField(max_length=100)
-
-    content = models.TextField()
-
-
-
-
-
-class ComplexSortedPerson(models.Model):
-
-    name = models.CharField(max_length=100)
-
-    age = models.PositiveIntegerField()
-
-    is_employee = models.NullBooleanField()
-
-
-
-
-
-class PluggableSearchPerson(models.Model):
-
-    name = models.CharField(max_length=100)
-
-    age = models.PositiveIntegerField()
-
-
-
-
-
-class PrePopulatedPostLargeSlug(models.Model):
-
-    """
-
-    Regression test for #15938: a large max_length for the slugfield must not
-
-    be localized in prepopulated_fields_js.html or it might end up breaking
-
-    the javascript (ie, using THOUSAND_SEPARATOR ends up with maxLength=1,000)
-
-    """
-
-    title = models.CharField(max_length=100)
-
-    published = models.BooleanField(default=False)
-
-    # `db_index=False` because MySQL cannot index large CharField (#21196).
-
-    slug = models.SlugField(max_length=1000, db_index=False)
-
-
-
-
-
-class AdminOrderedField(models.Model):
-
-    order = models.IntegerField()
-
-    stuff = models.CharField(max_length=200)
-
-
-
-
-
-class AdminOrderedModelMethod(models.Model):
-
-    order = models.IntegerField()
-
-    stuff = models.CharField(max_length=200)
-
-
-
-    def some_order(self):
-
-        return self.order
-
-    some_order.admin_order_field = 'order'
-
-
-
-
-
-class AdminOrderedAdminMethod(models.Model):
-
-    order = models.IntegerField()
-
-    stuff = models.CharField(max_length=200)
-
-
-
-
-
-class AdminOrderedCallable(models.Model):
-
-    order = models.IntegerField()
-
-    stuff = models.CharField(max_length=200)
-
-
-
-
-
-@python_2_unicode_compatible
-
-class Report(models.Model):
-
-    title = models.CharField(max_length=100)
-
-
-
-    def __str__(self):
-
-        return self.title
-
-
-
-
-
-class MainPrepopulated(models.Model):
-
-    name = models.CharField(max_length=100)
-
-    pubdate = models.DateField()
-
-    status = models.CharField(
-
-        max_length=20,
-
-        choices=(('option one', 'Option One'),
-
-                 ('option two', 'Option Two')))
-
-    slug1 = models.SlugField(blank=True)
-
-    slug2 = models.SlugField(blank=True)
-
-    slug3 = models.SlugField(blank=True, allow_unicode=True)
-
-
-
-
-
-class RelatedPrepopulated(models.Model):
-
-    parent = models.ForeignKey(MainPrepopulated, models.CASCADE)
-
-    name = models.CharField(max_length=75)
-
-    pubdate = models.DateField()
-
-    status = models.CharField(
-
-        max_length=20,
-
-        choices=(('option one', 'Option One'),
-
-                 ('option two', 'Option Two')))
-
-    slug1 = models.SlugField(max_length=50)
-
-    slug2 = models.SlugField(max_length=60)
-
-
-
-
-
-class UnorderedObject(models.Model):
-
-    """
-
-    Model without any defined `Meta.ordering`.
-
-    Refs #16819.
-
-    """
-
-    name = models.CharField(max_length=255)
-
-    bool = models.BooleanField(default=True)
-
-
-
-
-
-class UndeletableObject(models.Model):
-
-    """
-
-    Model whose show_delete in admin change_view has been disabled
-
-    Refs #10057.
-
-    """
-
-    name = models.CharField(max_length=255)
-
-
-
-
-
-class UnchangeableObject(models.Model):
-
-    """
-
-    Model whose change_view is disabled in admin
-
-    Refs #20640.
-
-    """
-
-
-
-
-
-class UserMessenger(models.Model):
-
-    """
-
-    Dummy class for testing message_user functions on ModelAdmin
-
-    """
-
-
-
-
-
-class Simple(models.Model):
-
-    """
-
-    Simple model with nothing on it for use in testing
-
-    """
-
-
-
-
-
-class Choice(models.Model):
-
-    choice = models.IntegerField(blank=True, null=True,
-
-        choices=((1, 'Yes'), (0, 'No'), (None, 'No opinion')))
-
-
-
-
-
-class ParentWithDependentChildren(models.Model):
-
-    """
-
-    Issue #20522
-
-    Model where the validation of child foreign-key relationships depends
-
-    on validation of the parent
-
-    """
-
-    some_required_info = models.PositiveIntegerField()
-
-    family_name = models.CharField(max_length=255, blank=False)
-
-
-
-
-
-class DependentChild(models.Model):
-
-    """
-
-    Issue #20522
-
-    Model that depends on validation of the parent class for one of its
-
-    fields to validate during clean
-
-    """
-
-    parent = models.ForeignKey(ParentWithDependentChildren, models.CASCADE)
-
-    family_name = models.CharField(max_length=255)
-
-
-
-
-
-class _Manager(models.Manager):
-
-    def get_queryset(self):
-
-        return super(_Manager, self).get_queryset().filter(pk__gt=1)
-
-
-
-
-
-class FilteredManager(models.Model):
-
-    def __str__(self):
-
-        return "PK=%d" % self.pk
-
-
-
-    pk_gt_1 = _Manager()
-
-    objects = models.Manager()
-
-
-
-
-
-class EmptyModelVisible(models.Model):
-
-    """ See ticket #11277. """
-
-
-
-
-
-class EmptyModelHidden(models.Model):
-
-    """ See ticket #11277. """
-
-
-
-
-
-class EmptyModelMixin(models.Model):
-
-    """ See ticket #11277. """
-
-
-
-
-
-class State(models.Model):
-
-    name = models.CharField(max_length=100)
-
-
-
-
-
-class City(models.Model):
-
-    state = models.ForeignKey(State, models.CASCADE)
-
-    name = models.CharField(max_length=100)
-
-
-
-    def get_absolute_url(self):
-
-        return '/dummy/%s/' % self.pk
-
-
-
-
-
-class Restaurant(models.Model):
-
-    city = models.ForeignKey(City, models.CASCADE)
-
-    name = models.CharField(max_length=100)
-
-
-
-    def get_absolute_url(self):
-
-        return '/dummy/%s/' % self.pk
-
-
-
-
-
-class Worker(models.Model):
-
-    work_at = models.ForeignKey(Restaurant, models.CASCADE)
-
-    name = models.CharField(max_length=50)
-
-    surname = models.CharField(max_length=50)
-
-
-
-
-
-# Models for #23329
-
-class ReferencedByParent(models.Model):
-
-    name = models.CharField(max_length=20, unique=True)
-
-
-
-
-
-class ParentWithFK(models.Model):
-
-    fk = models.ForeignKey(
-
-        ReferencedByParent,
-
-        models.CASCADE,
-
-        to_field='name',
-
-        related_name='hidden+',
-
-    )
-
-
-
-
-
-class ChildOfReferer(ParentWithFK):
-
-    pass
-
-
-
-
-
-# Models for #23431
-
-class ReferencedByInline(models.Model):
-
-    name = models.CharField(max_length=20, unique=True)
-
-
-
-
-
-class InlineReference(models.Model):
-
-    fk = models.ForeignKey(
-
-        ReferencedByInline,
-
-        models.CASCADE,
-
-        to_field='name',
-
-        related_name='hidden+',
-
-    )
-
-
-
-
-
-class InlineReferer(models.Model):
-
-    refs = models.ManyToManyField(InlineReference)
-
-
-
-
-
-# Models for #23604 and #23915
-
-class Recipe(models.Model):
-
-    rname = models.CharField(max_length=20, unique=True)
-
-
-
-
-
-class Ingredient(models.Model):
-
-    iname = models.CharField(max_length=20, unique=True)
-
-    recipes = models.ManyToManyField(Recipe, through='RecipeIngredient')
-
-
-
-
-
-class RecipeIngredient(models.Model):
-
-    ingredient = models.ForeignKey(Ingredient, models.CASCADE, to_field='iname')
-
-    recipe = models.ForeignKey(Recipe, models.CASCADE, to_field='rname')
-
-
-
-
-
-# Model for #23839
-
-class NotReferenced(models.Model):
-
-    # Don't point any FK at this model.
-
-    pass
-
-
-
-
-
-# Models for #23934
-
-class ExplicitlyProvidedPK(models.Model):
-
-    name = models.IntegerField(primary_key=True)
-
-
-
-
-
-class ImplicitlyGeneratedPK(models.Model):
-
-    name = models.IntegerField(unique=True)
-
-
-
-
-
-# Models for #25622
-
-class ReferencedByGenRel(models.Model):
-
-    content_type = models.ForeignKey(ContentType, on_delete=models.CASCADE)
-
-    object_id = models.PositiveIntegerField()
-
-    content_object = GenericForeignKey('content_type', 'object_id')
-
-
-
-
-
-class GenRelReference(models.Model):
-
-    references = GenericRelation(ReferencedByGenRel)
-
-
-
-
-
-class ParentWithUUIDPK(models.Model):
-
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-
-    title = models.CharField(max_length=100)
-
-
-
-    def __str__(self):
-
-        return str(self.id)
-
-
-
-
-
-class RelatedWithUUIDPKModel(models.Model):
-
-    parent = models.ForeignKey(ParentWithUUIDPK, on_delete=models.CASCADE)
+        self.assertEqual(deleted, [0])  # Delete old head count

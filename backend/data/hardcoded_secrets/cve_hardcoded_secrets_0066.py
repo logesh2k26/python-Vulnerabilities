@@ -2,1766 +2,1176 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-import asyncio
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-import contextlib
 
-import logging
 
-from datetime import datetime, timedelta, timezone
+# Copyright 2012 OpenStack LLC
 
-from typing import Optional, Tuple, Union
+#
 
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
 
+# not use this file except in compliance with the License. You may obtain
 
-import discord
+# a copy of the License at
 
-from redbot.core import commands, i18n, checks, modlog
+#
 
-from redbot.core.commands import UserInputOptional
+#      http://www.apache.org/licenses/LICENSE-2.0
 
-from redbot.core.utils import AsyncIter
+#
 
-from redbot.core.utils.chat_formatting import (
+# Unless required by applicable law or agreed to in writing, software
 
-    pagify,
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-    humanize_number,
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
-    bold,
+# License for the specific language governing permissions and limitations
 
-    humanize_list,
+# under the License.
 
-    format_perms_list,
 
-)
 
-from redbot.core.utils.mod import get_audit_reason
+import uuid
 
-from .abc import MixinMeta
 
-from .converters import RawUserIds
 
-from .utils import is_allowed_by_hierarchy
+import routes
 
 
 
-log = logging.getLogger("red.mod")
+from keystone import catalog
 
-_ = i18n.Translator("Mod", __file__)
+from keystone import exception
 
+from keystone import identity
 
+from keystone import policy
 
+from keystone import token
 
+from keystone.common import logging
 
-class KickBanMixin(MixinMeta):
+from keystone.common import utils
 
-    """
+from keystone.common import wsgi
 
-    Kick and ban commands and tasks go here.
 
-    """
 
 
 
-    @staticmethod
+LOG = logging.getLogger(__name__)
 
-    async def get_invite_for_reinvite(ctx: commands.Context, max_age: int = 86400):
 
-        """Handles the reinvite logic for getting an invite
 
-        to send the newly unbanned user
 
-        :returns: :class:`Invite`"""
 
-        guild = ctx.guild
+class AdminRouter(wsgi.ComposingRouter):
 
-        my_perms: discord.Permissions = guild.me.guild_permissions
+    def __init__(self):
 
-        if my_perms.manage_guild or my_perms.administrator:
+        mapper = routes.Mapper()
 
-            if "VANITY_URL" in guild.features:
 
-                # guild has a vanity url so use it as the one to send
 
-                return await guild.vanity_invite()
+        version_controller = VersionController('admin')
 
-            invites = await guild.invites()
+        mapper.connect('/',
 
-        else:
+                       controller=version_controller,
 
-            invites = []
+                       action='get_version')
 
-        for inv in invites:  # Loop through the invites for the guild
 
-            if not (inv.max_uses or inv.max_age or inv.temporary):
 
-                # Invite is for the guild's default channel,
+        # Token Operations
 
-                # has unlimited uses, doesn't expire, and
+        auth_controller = TokenController()
 
-                # doesn't grant temporary membership
+        mapper.connect('/tokens',
 
-                # (i.e. they won't be kicked on disconnect)
+                       controller=auth_controller,
 
-                return inv
+                       action='authenticate',
 
-        else:  # No existing invite found that is valid
+                       conditions=dict(method=['POST']))
 
-            channels_and_perms = zip(
+        mapper.connect('/tokens/{token_id}',
 
-                guild.text_channels, map(guild.me.permissions_in, guild.text_channels)
+                       controller=auth_controller,
 
-            )
+                       action='validate_token',
 
-            channel = next(
+                       conditions=dict(method=['GET']))
 
-                (channel for channel, perms in channels_and_perms if perms.create_instant_invite),
+        mapper.connect('/tokens/{token_id}',
 
-                None,
+                       controller=auth_controller,
 
-            )
+                       action='validate_token_head',
 
-            if channel is None:
+                       conditions=dict(method=['HEAD']))
 
-                return
+        mapper.connect('/tokens/{token_id}',
+
+                       controller=auth_controller,
+
+                       action='delete_token',
+
+                       conditions=dict(method=['DELETE']))
+
+        mapper.connect('/tokens/{token_id}/endpoints',
+
+                       controller=auth_controller,
+
+                       action='endpoints',
+
+                       conditions=dict(method=['GET']))
+
+
+
+        # Miscellaneous Operations
+
+        extensions_controller = AdminExtensionsController()
+
+        mapper.connect('/extensions',
+
+                       controller=extensions_controller,
+
+                       action='get_extensions_info',
+
+                       conditions=dict(method=['GET']))
+
+        mapper.connect('/extensions/{extension_alias}',
+
+                       controller=extensions_controller,
+
+                       action='get_extension_info',
+
+                       conditions=dict(method=['GET']))
+
+        identity_router = identity.AdminRouter()
+
+        routers = [identity_router]
+
+        super(AdminRouter, self).__init__(mapper, routers)
+
+
+
+
+
+class PublicRouter(wsgi.ComposingRouter):
+
+    def __init__(self):
+
+        mapper = routes.Mapper()
+
+
+
+        version_controller = VersionController('public')
+
+        mapper.connect('/',
+
+                       controller=version_controller,
+
+                       action='get_version')
+
+
+
+        # Token Operations
+
+        auth_controller = TokenController()
+
+        mapper.connect('/tokens',
+
+                       controller=auth_controller,
+
+                       action='authenticate',
+
+                       conditions=dict(method=['POST']))
+
+
+
+        # Miscellaneous
+
+        extensions_controller = PublicExtensionsController()
+
+        mapper.connect('/extensions',
+
+                       controller=extensions_controller,
+
+                       action='get_extensions_info',
+
+                       conditions=dict(method=['GET']))
+
+        mapper.connect('/extensions/{extension_alias}',
+
+                       controller=extensions_controller,
+
+                       action='get_extension_info',
+
+                       conditions=dict(method=['GET']))
+
+
+
+        identity_router = identity.PublicRouter()
+
+        routers = [identity_router]
+
+
+
+        super(PublicRouter, self).__init__(mapper, routers)
+
+
+
+
+
+class PublicVersionRouter(wsgi.ComposingRouter):
+
+    def __init__(self):
+
+        mapper = routes.Mapper()
+
+        version_controller = VersionController('public')
+
+        mapper.connect('/',
+
+                       controller=version_controller,
+
+                       action='get_versions')
+
+        routers = []
+
+        super(PublicVersionRouter, self).__init__(mapper, routers)
+
+
+
+
+
+class AdminVersionRouter(wsgi.ComposingRouter):
+
+    def __init__(self):
+
+        mapper = routes.Mapper()
+
+        version_controller = VersionController('admin')
+
+        mapper.connect('/',
+
+                       controller=version_controller,
+
+                       action='get_versions')
+
+        routers = []
+
+        super(AdminVersionRouter, self).__init__(mapper, routers)
+
+
+
+
+
+class VersionController(wsgi.Application):
+
+    def __init__(self, version_type):
+
+        self.catalog_api = catalog.Manager()
+
+        self.url_key = "%sURL" % version_type
+
+
+
+        super(VersionController, self).__init__()
+
+
+
+    def _get_identity_url(self, context):
+
+        catalog_ref = self.catalog_api.get_catalog(
+
+                context=context,
+
+                user_id=None,
+
+                tenant_id=None)
+
+        for region, region_ref in catalog_ref.iteritems():
+
+            for service, service_ref in region_ref.iteritems():
+
+                if service == 'identity':
+
+                    return service_ref[self.url_key]
+
+
+
+        raise exception.NotImplemented()
+
+
+
+    def _get_versions_list(self, context):
+
+        """The list of versions is dependent on the context."""
+
+        identity_url = self._get_identity_url(context)
+
+        if not identity_url.endswith('/'):
+
+            identity_url = identity_url + '/'
+
+
+
+        versions = {}
+
+        versions['v2.0'] = {
+
+            "id": "v2.0",
+
+            "status": "beta",
+
+            "updated": "2011-11-19T00:00:00Z",
+
+            "links": [
+
+                {
+
+                    "rel": "self",
+
+                    "href": identity_url,
+
+                }, {
+
+                    "rel": "describedby",
+
+                    "type": "text/html",
+
+                    "href": "http://docs.openstack.org/api/openstack-"
+
+                                "identity-service/2.0/content/"
+
+                }, {
+
+                    "rel": "describedby",
+
+                    "type": "application/pdf",
+
+                    "href": "http://docs.openstack.org/api/openstack-"
+
+                                "identity-service/2.0/identity-dev-guide-"
+
+                                "2.0.pdf"
+
+                }
+
+            ],
+
+            "media-types": [
+
+                {
+
+                    "base": "application/json",
+
+                    "type": "application/vnd.openstack.identity-v2.0"
+
+                                "+json"
+
+                }, {
+
+                    "base": "application/xml",
+
+                    "type": "application/vnd.openstack.identity-v2.0"
+
+                                "+xml"
+
+                }
+
+            ]
+
+        }
+
+
+
+        return versions
+
+
+
+    def get_versions(self, context):
+
+        versions = self._get_versions_list(context)
+
+        return wsgi.render_response(status=(300, 'Multiple Choices'), body={
+
+            "versions": {
+
+                "values": versions.values()
+
+            }
+
+        })
+
+
+
+    def get_version(self, context):
+
+        versions = self._get_versions_list(context)
+
+        return wsgi.render_response(body={
+
+            "version": versions['v2.0']
+
+        })
+
+
+
+
+
+class NoopController(wsgi.Application):
+
+    def __init__(self):
+
+        super(NoopController, self).__init__()
+
+
+
+    def noop(self, context):
+
+        return {}
+
+
+
+
+
+class TokenController(wsgi.Application):
+
+    def __init__(self):
+
+        self.catalog_api = catalog.Manager()
+
+        self.identity_api = identity.Manager()
+
+        self.token_api = token.Manager()
+
+        self.policy_api = policy.Manager()
+
+        super(TokenController, self).__init__()
+
+
+
+    def authenticate(self, context, auth=None):
+
+        """Authenticate credentials and return a token.
+
+
+
+        Accept auth as a dict that looks like::
+
+
+
+            {
+
+                "auth":{
+
+                    "passwordCredentials":{
+
+                        "username":"test_user",
+
+                        "password":"mypass"
+
+                    },
+
+                    "tenantName":"customer-x"
+
+                }
+
+            }
+
+
+
+        In this case, tenant is optional, if not provided the token will be
+
+        considered "unscoped" and can later be used to get a scoped token.
+
+
+
+        Alternatively, this call accepts auth with only a token and tenant
+
+        that will return a token that is scoped to that tenant.
+
+        """
+
+
+
+        token_id = uuid.uuid4().hex
+
+        if 'passwordCredentials' in auth:
+
+            username = auth['passwordCredentials'].get('username', '')
+
+            password = auth['passwordCredentials'].get('password', '')
+
+            tenant_name = auth.get('tenantName', None)
+
+
+
+            user_id = auth['passwordCredentials'].get('userId', None)
+
+            if username:
+
+                user_ref = self.identity_api.get_user_by_name(
+
+                        context=context, user_name=username)
+
+                if user_ref:
+
+                    user_id = user_ref['id']
+
+
+
+            # more compat
+
+            tenant_id = auth.get('tenantId', None)
+
+            if tenant_name:
+
+                tenant_ref = self.identity_api.get_tenant_by_name(
+
+                        context=context, tenant_name=tenant_name)
+
+                if tenant_ref:
+
+                    tenant_id = tenant_ref['id']
+
+
 
             try:
 
-                # Create invite that expires after max_age
+                auth_info = self.identity_api.authenticate(context=context,
 
-                return await channel.create_invite(max_age=max_age)
+                                                           user_id=user_id,
 
-            except discord.HTTPException:
+                                                           password=password,
 
-                return
+                                                           tenant_id=tenant_id)
 
-
-
-    @staticmethod
-
-    async def _voice_perm_check(
-
-        ctx: commands.Context, user_voice_state: Optional[discord.VoiceState], **perms: bool
-
-    ) -> bool:
-
-        """Check if the bot and user have sufficient permissions for voicebans.
+                (user_ref, tenant_ref, metadata_ref) = auth_info
 
 
 
-        This also verifies that the user's voice state and connected
+                # If the user is disabled don't allow them to authenticate
 
-        channel are not ``None``.
+                if not user_ref.get('enabled', True):
+
+                    LOG.warning('User %s is disabled' % user_id)
+
+                    raise exception.Unauthorized()
+
+            except AssertionError as e:
+
+                raise exception.Unauthorized(e.message)
 
 
 
-        Returns
+            token_ref = self.token_api.create_token(
 
-        -------
+                    context, token_id, dict(id=token_id,
 
-        bool
+                                            user=user_ref,
 
-            ``True`` if the permissions are sufficient and the user has
+                                            tenant=tenant_ref,
 
-            a valid voice state.
+                                            metadata=metadata_ref))
+
+            if tenant_ref:
+
+                catalog_ref = self.catalog_api.get_catalog(
+
+                        context=context,
+
+                        user_id=user_ref['id'],
+
+                        tenant_id=tenant_ref['id'],
+
+                        metadata=metadata_ref)
+
+            else:
+
+                catalog_ref = {}
+
+
+
+        elif 'token' in auth:
+
+            token = auth['token'].get('id', None)
+
+
+
+            tenant_name = auth.get('tenantName')
+
+
+
+            # more compat
+
+            if tenant_name:
+
+                tenant_ref = self.identity_api.get_tenant_by_name(
+
+                        context=context, tenant_name=tenant_name)
+
+                tenant_id = tenant_ref['id']
+
+            else:
+
+                tenant_id = auth.get('tenantId', None)
+
+
+
+            try:
+
+                old_token_ref = self.token_api.get_token(context=context,
+
+                                                         token_id=token)
+
+            except exception.NotFound:
+
+                raise exception.Unauthorized()
+
+
+
+            user_ref = old_token_ref['user']
+
+
+
+            # If the user is disabled don't allow them to authenticate
+
+            current_user_ref = self.identity_api.get_user(
+
+                                                    context=context,
+
+                                                    user_id=user_ref['id'])
+
+            if not current_user_ref.get('enabled', True):
+
+                LOG.warning('User %s is disabled' % user_ref['id'])
+
+                raise exception.Unauthorized()
+
+
+
+            tenants = self.identity_api.get_tenants_for_user(context,
+
+                                                             user_ref['id'])
+
+            if tenant_id:
+
+                assert tenant_id in tenants
+
+
+
+            tenant_ref = self.identity_api.get_tenant(context=context,
+
+                                                      tenant_id=tenant_id)
+
+            if tenant_ref:
+
+                metadata_ref = self.identity_api.get_metadata(
+
+                        context=context,
+
+                        user_id=user_ref['id'],
+
+                        tenant_id=tenant_ref['id'])
+
+                catalog_ref = self.catalog_api.get_catalog(
+
+                        context=context,
+
+                        user_id=user_ref['id'],
+
+                        tenant_id=tenant_ref['id'],
+
+                        metadata=metadata_ref)
+
+            else:
+
+                metadata_ref = {}
+
+                catalog_ref = {}
+
+
+
+            token_ref = self.token_api.create_token(
+
+                    context, token_id, dict(id=token_id,
+
+                                            user=user_ref,
+
+                                            tenant=tenant_ref,
+
+                                            metadata=metadata_ref))
+
+
+
+        # TODO(termie): optimize this call at some point and put it into the
+
+        #               the return for metadata
+
+        # fill out the roles in the metadata
+
+        roles_ref = []
+
+        for role_id in metadata_ref.get('roles', []):
+
+            roles_ref.append(self.identity_api.get_role(context, role_id))
+
+        logging.debug('TOKEN_REF %s', token_ref)
+
+        return self._format_authenticate(token_ref, roles_ref, catalog_ref)
+
+
+
+    def _get_token_ref(self, context, token_id, belongs_to=None):
+
+        """Returns a token if a valid one exists.
+
+
+
+        Optionally, limited to a token owned by a specific tenant.
 
 
 
         """
 
-        if user_voice_state is None or user_voice_state.channel is None:
+        # TODO(termie): this stuff should probably be moved to middleware
 
-            await ctx.send(_("That user is not in a voice channel."))
+        self.assert_admin(context)
 
-            return False
 
-        voice_channel: discord.VoiceChannel = user_voice_state.channel
 
-        required_perms = discord.Permissions()
+        token_ref = self.token_api.get_token(context=context,
 
-        required_perms.update(**perms)
+                                             token_id=token_id)
 
-        if not voice_channel.permissions_for(ctx.me) >= required_perms:
 
-            await ctx.send(
 
-                _("I require the {perms} permission(s) in that user's channel to do that.").format(
+        if belongs_to:
 
-                    perms=format_perms_list(required_perms)
+            assert token_ref['tenant']['id'] == belongs_to
 
-                )
 
-            )
 
-            return False
+        return token_ref
 
-        if (
 
-            ctx.permission_state is commands.PermState.NORMAL
 
-            and not voice_channel.permissions_for(ctx.author) >= required_perms
+    # admin only
 
-        ):
+    def validate_token_head(self, context, token_id):
 
-            await ctx.send(
+        """Check that a token is valid.
 
-                _(
 
-                    "You must have the {perms} permission(s) in that user's channel to use this "
 
-                    "command."
+        Optionally, also ensure that it is owned by a specific tenant.
 
-                ).format(perms=format_perms_list(required_perms))
 
-            )
 
-            return False
+        Identical to ``validate_token``, except does not return a response.
 
-        return True
 
-
-
-    async def ban_user(
-
-        self,
-
-        user: Union[discord.Member, discord.User, discord.Object],
-
-        ctx: commands.Context,
-
-        days: int = 0,
-
-        reason: str = None,
-
-        create_modlog_case=False,
-
-    ) -> Tuple[bool, str]:
-
-        author = ctx.author
-
-        guild = ctx.guild
-
-
-
-        removed_temp = False
-
-
-
-        if not (0 <= days <= 7):
-
-            return False, _("Invalid days. Must be between 0 and 7.")
-
-
-
-        if isinstance(user, discord.Member):
-
-            if author == user:
-
-                return (
-
-                    False,
-
-                    _("I cannot let you do that. Self-harm is bad {}").format("\N{PENSIVE FACE}"),
-
-                )
-
-            elif not await is_allowed_by_hierarchy(self.bot, self.config, guild, author, user):
-
-                return (
-
-                    False,
-
-                    _(
-
-                        "I cannot let you do that. You are "
-
-                        "not higher than the user in the role "
-
-                        "hierarchy."
-
-                    ),
-
-                )
-
-            elif guild.me.top_role <= user.top_role or user == guild.owner:
-
-                return False, _("I cannot do that due to Discord hierarchy rules.")
-
-
-
-            toggle = await self.config.guild(guild).dm_on_kickban()
-
-            if toggle:
-
-                with contextlib.suppress(discord.HTTPException):
-
-                    em = discord.Embed(
-
-                        title=bold(_("You have been banned from {guild}.").format(guild=guild))
-
-                    )
-
-                    em.add_field(
-
-                        name=_("**Reason**"),
-
-                        value=reason if reason is not None else _("No reason was given."),
-
-                        inline=False,
-
-                    )
-
-                    await user.send(embed=em)
-
-
-
-            ban_type = "ban"
-
-        else:
-
-            tempbans = await self.config.guild(guild).current_tempbans()
-
-
-
-            ban_list = [ban.user.id for ban in await guild.bans()]
-
-            if user.id in ban_list:
-
-                if user.id in tempbans:
-
-                    async with self.config.guild(guild).current_tempbans() as tempbans:
-
-                        tempbans.remove(user.id)
-
-                    removed_temp = True
-
-                else:
-
-                    return (
-
-                        False,
-
-                        _("User with ID {user_id} is already banned.").format(user_id=user.id),
-
-                    )
-
-
-
-            ban_type = "hackban"
-
-
-
-        audit_reason = get_audit_reason(author, reason)
-
-
-
-        queue_entry = (guild.id, user.id)
-
-        if removed_temp:
-
-            log.info(
-
-                "{}({}) upgraded the tempban for {} to a permaban.".format(
-
-                    author.name, author.id, user.id
-
-                )
-
-            )
-
-            success_message = _(
-
-                "User with ID {user_id} was upgraded from a temporary to a permanent ban."
-
-            ).format(user_id=user.id)
-
-        else:
-
-            username = user.name if hasattr(user, "name") else "Unknown"
-
-            try:
-
-                await guild.ban(user, reason=audit_reason, delete_message_days=days)
-
-                log.info(
-
-                    "{}({}) {}ned {}({}), deleting {} days worth of messages.".format(
-
-                        author.name, author.id, ban_type, username, user.id, str(days)
-
-                    )
-
-                )
-
-                success_message = _("Done. That felt good.")
-
-            except discord.Forbidden:
-
-                return False, _("I'm not allowed to do that.")
-
-            except discord.NotFound:
-
-                return False, _("User with ID {user_id} not found").format(user_id=user.id)
-
-            except Exception as e:
-
-                log.exception(
-
-                    "{}({}) attempted to {} {}({}), but an error occurred.".format(
-
-                        author.name, author.id, ban_type, username, user.id
-
-                    )
-
-                )
-
-                return False, _("An unexpected error occurred.")
-
-
-
-        if create_modlog_case:
-
-            await modlog.create_case(
-
-                self.bot,
-
-                guild,
-
-                ctx.message.created_at.replace(tzinfo=timezone.utc),
-
-                ban_type,
-
-                user,
-
-                author,
-
-                reason,
-
-                until=None,
-
-                channel=None,
-
-            )
-
-
-
-        return True, success_message
-
-
-
-    async def check_tempban_expirations(self):
-
-        while self == self.bot.get_cog("Mod"):
-
-            async for guild in AsyncIter(self.bot.guilds, steps=100):
-
-                if not guild.me.guild_permissions.ban_members:
-
-                    continue
-
-
-
-                if await self.bot.cog_disabled_in_guild(self, guild):
-
-                    continue
-
-
-
-                async with self.config.guild(guild).current_tempbans() as guild_tempbans:
-
-                    for uid in guild_tempbans.copy():
-
-                        unban_time = datetime.fromtimestamp(
-
-                            await self.config.member_from_ids(guild.id, uid).banned_until(),
-
-                            timezone.utc,
-
-                        )
-
-                        if datetime.now(timezone.utc) > unban_time:  # Time to unban the user
-
-                            queue_entry = (guild.id, uid)
-
-                            try:
-
-                                await guild.unban(
-
-                                    discord.Object(id=uid), reason=_("Tempban finished")
-
-                                )
-
-                            except discord.NotFound:
-
-                                # user is not banned anymore
-
-                                guild_tempbans.remove(uid)
-
-                            except discord.HTTPException as e:
-
-                                # 50013: Missing permissions error code or 403: Forbidden status
-
-                                if e.code == 50013 or e.status == 403:
-
-                                    log.info(
-
-                                        f"Failed to unban ({uid}) user from "
-
-                                        f"{guild.name}({guild.id}) guild due to permissions."
-
-                                    )
-
-                                    break  # skip the rest of this guild
-
-                                log.info(f"Failed to unban member: error code: {e.code}")
-
-                            else:
-
-                                # user unbanned successfully
-
-                                guild_tempbans.remove(uid)
-
-            await asyncio.sleep(60)
-
-
-
-    @commands.command()
-
-    @commands.guild_only()
-
-    @commands.bot_has_permissions(kick_members=True)
-
-    @checks.admin_or_permissions(kick_members=True)
-
-    async def kick(self, ctx: commands.Context, user: discord.Member, *, reason: str = None):
-
-        """Kick a user.
-
-
-
-        If a reason is specified, it will be the reason that shows up
-
-        in the audit log.
 
         """
 
-        author = ctx.author
+        belongs_to = context['query_string'].get("belongsTo")
 
-        guild = ctx.guild
+        assert self._get_token_ref(context, token_id, belongs_to)
 
 
 
-        if author == user:
+    # admin only
 
-            await ctx.send(
+    def validate_token(self, context, token_id):
 
-                _("I cannot let you do that. Self-harm is bad {emoji}").format(
+        """Check that a token is valid.
 
-                    emoji="\N{PENSIVE FACE}"
 
-                )
 
-            )
+        Optionally, also ensure that it is owned by a specific tenant.
 
-            return
 
-        elif not await is_allowed_by_hierarchy(self.bot, self.config, guild, author, user):
 
-            await ctx.send(
+        Returns metadata about the token along any associated roles.
 
-                _(
 
-                    "I cannot let you do that. You are "
 
-                    "not higher than the user in the role "
+        """
 
-                    "hierarchy."
+        belongs_to = context['query_string'].get("belongsTo")
 
-                )
+        token_ref = self._get_token_ref(context, token_id, belongs_to)
 
-            )
 
-            return
 
-        elif ctx.guild.me.top_role <= user.top_role or user == ctx.guild.owner:
+        # TODO(termie): optimize this call at some point and put it into the
 
-            await ctx.send(_("I cannot do that due to Discord hierarchy rules."))
+        #               the return for metadata
 
-            return
+        # fill out the roles in the metadata
 
-        audit_reason = get_audit_reason(author, reason)
+        metadata_ref = token_ref['metadata']
 
-        toggle = await self.config.guild(guild).dm_on_kickban()
+        roles_ref = []
 
-        if toggle:
+        for role_id in metadata_ref.get('roles', []):
 
-            with contextlib.suppress(discord.HTTPException):
+            roles_ref.append(self.identity_api.get_role(context, role_id))
 
-                em = discord.Embed(
 
-                    title=bold(_("You have been kicked from {guild}.").format(guild=guild))
 
-                )
+        # Get a service catalog if belongs_to is not none
 
-                em.add_field(
+        # This is needed for on-behalf-of requests
 
-                    name=_("**Reason**"),
+        catalog_ref = None
 
-                    value=reason if reason is not None else _("No reason was given."),
+        if belongs_to is not None:
 
-                    inline=False,
+            catalog_ref = self.catalog_api.get_catalog(
 
-                )
+                context=context,
 
-                await user.send(embed=em)
+                user_id=token_ref['user']['id'],
+
+                tenant_id=token_ref['tenant']['id'],
+
+                metadata=metadata_ref)
+
+        return self._format_token(token_ref, roles_ref, catalog_ref)
+
+
+
+    def delete_token(self, context, token_id):
+
+        """Delete a token, effectively invalidating it for authz."""
+
+        # TODO(termie): this stuff should probably be moved to middleware
+
+        self.assert_admin(context)
+
+
+
+        self.token_api.delete_token(context=context, token_id=token_id)
+
+
+
+    def endpoints(self, context, token_id):
+
+        """Return a list of endpoints available to the token."""
+
+        raise exception.NotImplemented()
+
+
+
+    def _format_authenticate(self, token_ref, roles_ref, catalog_ref):
+
+        o = self._format_token(token_ref, roles_ref)
+
+        o['access']['serviceCatalog'] = self._format_catalog(catalog_ref)
+
+        return o
+
+
+
+    def _format_token(self, token_ref, roles_ref, catalog_ref=None):
+
+        user_ref = token_ref['user']
+
+        metadata_ref = token_ref['metadata']
+
+        expires = token_ref['expires']
+
+        if expires is not None:
+
+            expires = utils.isotime(expires)
+
+        o = {'access': {'token': {'id': token_ref['id'],
+
+                                  'expires': expires,
+
+                                  },
+
+                        'user': {'id': user_ref['id'],
+
+                                 'name': user_ref['name'],
+
+                                 'username': user_ref['name'],
+
+                                 'roles': roles_ref,
+
+                                 'roles_links': metadata_ref.get('roles_links',
+
+                                                               [])
+
+                                 }
+
+                        }
+
+             }
+
+        if 'tenant' in token_ref and token_ref['tenant']:
+
+            token_ref['tenant']['enabled'] = True
+
+            o['access']['token']['tenant'] = token_ref['tenant']
+
+        if catalog_ref is not None:
+
+            o['access']['serviceCatalog'] = self._format_catalog(catalog_ref)
+
+        return o
+
+
+
+    def _format_catalog(self, catalog_ref):
+
+        """Munge catalogs from internal to output format
+
+        Internal catalogs look like:
+
+
+
+        {$REGION: {
+
+            {$SERVICE: {
+
+                $key1: $value1,
+
+                ...
+
+                }
+
+            }
+
+        }
+
+
+
+        The legacy api wants them to look like
+
+
+
+        [{'name': $SERVICE[name],
+
+          'type': $SERVICE,
+
+          'endpoints': [{
+
+              'tenantId': $tenant_id,
+
+              ...
+
+              'region': $REGION,
+
+              }],
+
+          'endpoints_links': [],
+
+         }]
+
+
+
+        """
+
+        if not catalog_ref:
+
+            return {}
+
+
+
+        services = {}
+
+        for region, region_ref in catalog_ref.iteritems():
+
+            for service, service_ref in region_ref.iteritems():
+
+                new_service_ref = services.get(service, {})
+
+                new_service_ref['name'] = service_ref.pop('name')
+
+                new_service_ref['type'] = service
+
+                new_service_ref['endpoints_links'] = []
+
+                service_ref['region'] = region
+
+
+
+                endpoints_ref = new_service_ref.get('endpoints', [])
+
+                endpoints_ref.append(service_ref)
+
+
+
+                new_service_ref['endpoints'] = endpoints_ref
+
+                services[service] = new_service_ref
+
+
+
+        return services.values()
+
+
+
+
+
+class ExtensionsController(wsgi.Application):
+
+    """Base extensions controller to be extended by public and admin API's."""
+
+
+
+    def __init__(self, extensions=None):
+
+        super(ExtensionsController, self).__init__()
+
+
+
+        self.extensions = extensions or {}
+
+
+
+    def get_extensions_info(self, context):
+
+        return {'extensions': {'values': self.extensions.values()}}
+
+
+
+    def get_extension_info(self, context, extension_alias):
 
         try:
 
-            await guild.kick(user, reason=audit_reason)
+            return {'extension': self.extensions[extension_alias]}
 
-            log.info("{}({}) kicked {}({})".format(author.name, author.id, user.name, user.id))
+        except KeyError:
 
-        except discord.errors.Forbidden:
+            raise exception.NotFound(target=extension_alias)
 
-            await ctx.send(_("I'm not allowed to do that."))
 
-        except Exception as e:
 
-            log.exception(
 
-                "{}({}) attempted to kick {}({}), but an error occurred.".format(
 
-                    author.name, author.id, user.name, user.id
+class PublicExtensionsController(ExtensionsController):
 
-                )
+    pass
 
-            )
 
-        else:
 
-            await modlog.create_case(
 
-                self.bot,
 
-                guild,
+class AdminExtensionsController(ExtensionsController):
 
-                ctx.message.created_at.replace(tzinfo=timezone.utc),
+    def __init__(self, *args, **kwargs):
 
-                "kick",
+        super(AdminExtensionsController, self).__init__(*args, **kwargs)
 
-                user,
 
-                author,
 
-                reason,
+        # TODO(dolph): Extensions should obviously provide this information
 
-                until=None,
+        #               themselves, but hardcoding it here allows us to match
 
-                channel=None,
+        #               the API spec in the short term with minimal complexity.
 
-            )
+        self.extensions['OS-KSADM'] = {
 
-            await ctx.send(_("Done. That felt good."))
+            'name': 'Openstack Keystone Admin',
 
+            'namespace': 'http://docs.openstack.org/identity/api/ext/'
 
+                         'OS-KSADM/v1.0',
 
-    @commands.command()
+            'alias': 'OS-KSADM',
 
-    @commands.guild_only()
+            'updated': '2011-08-19T13:25:27-06:00',
 
-    @commands.bot_has_permissions(ban_members=True)
+            'description': 'Openstack extensions to Keystone v2.0 API '
 
-    @checks.admin_or_permissions(ban_members=True)
+                           'enabling Admin Operations.',
 
-    async def ban(
+            'links': [
 
-        self,
+                {
 
-        ctx: commands.Context,
+                    'rel': 'describedby',
 
-        user: Union[discord.Member, RawUserIds],
+                    # TODO(dolph): link needs to be revised after
 
-        days: Optional[int] = None,
+                    #              bug 928059 merges
 
-        *,
+                    'type': 'text/html',
 
-        reason: str = None,
+                    'href': ('https://github.com/openstack/'
 
-    ):
+                        'identity-api'),
 
-        """Ban a user from this server and optionally delete days of messages.
+                }
 
+            ]
 
+        }
 
-        A user ID should be provided if the user is not a member of this server.
 
 
 
-        If days is not a number, it's treated as the first word of the reason.
 
+@logging.fail_gracefully
 
+def public_app_factory(global_conf, **local_conf):
 
-        Minimum 0 days, maximum 7. If not specified, defaultdays setting will be used instead."""
+    conf = global_conf.copy()
 
-        author = ctx.author
+    conf.update(local_conf)
 
-        guild = ctx.guild
+    return PublicRouter()
 
-        if days is None:
 
-            days = await self.config.guild(guild).default_days()
 
-        if isinstance(user, int):
 
-            user = self.bot.get_user(user) or discord.Object(id=user)
 
+@logging.fail_gracefully
 
+def admin_app_factory(global_conf, **local_conf):
 
-        success_, message = await self.ban_user(
+    conf = global_conf.copy()
 
-            user=user, ctx=ctx, days=days, reason=reason, create_modlog_case=True
+    conf.update(local_conf)
 
-        )
+    return AdminRouter()
 
 
 
-        await ctx.send(message)
 
 
+@logging.fail_gracefully
 
-    @commands.command(aliases=["hackban"])
+def public_version_app_factory(global_conf, **local_conf):
 
-    @commands.guild_only()
+    conf = global_conf.copy()
 
-    @commands.bot_has_permissions(ban_members=True)
+    conf.update(local_conf)
 
-    @checks.admin_or_permissions(ban_members=True)
+    return PublicVersionRouter()
 
-    async def massban(
 
-        self,
 
-        ctx: commands.Context,
 
-        user_ids: commands.Greedy[RawUserIds],
 
-        days: Optional[int] = None,
+@logging.fail_gracefully
 
-        *,
+def admin_version_app_factory(global_conf, **local_conf):
 
-        reason: str = None,
+    conf = global_conf.copy()
 
-    ):
+    conf.update(local_conf)
 
-        """Mass bans user(s) from the server.
-
-
-
-        User IDs need to be provided in order to ban
-
-        using this command."""
-
-        banned = []
-
-        errors = {}
-
-        upgrades = []
-
-
-
-        async def show_results():
-
-            text = _("Banned {num} users from the server.").format(
-
-                num=humanize_number(len(banned))
-
-            )
-
-            if errors:
-
-                text += _("\nErrors:\n")
-
-                text += "\n".join(errors.values())
-
-            if upgrades:
-
-                text += _(
-
-                    "\nFollowing user IDs have been upgraded from a temporary to a permanent ban:\n"
-
-                )
-
-                text += humanize_list(upgrades)
-
-
-
-            for p in pagify(text):
-
-                await ctx.send(p)
-
-
-
-        def remove_processed(ids):
-
-            return [_id for _id in ids if _id not in banned and _id not in errors]
-
-
-
-        user_ids = list(set(user_ids))  # No dupes
-
-
-
-        author = ctx.author
-
-        guild = ctx.guild
-
-
-
-        if not user_ids:
-
-            await ctx.send_help()
-
-            return
-
-
-
-        if days is None:
-
-            days = await self.config.guild(guild).default_days()
-
-
-
-        if not (0 <= days <= 7):
-
-            await ctx.send(_("Invalid days. Must be between 0 and 7."))
-
-            return
-
-
-
-        if not guild.me.guild_permissions.ban_members:
-
-            return await ctx.send(_("I lack the permissions to do this."))
-
-
-
-        tempbans = await self.config.guild(guild).current_tempbans()
-
-
-
-        ban_list = await guild.bans()
-
-        for entry in ban_list:
-
-            for user_id in user_ids:
-
-                if entry.user.id == user_id:
-
-                    if user_id in tempbans:
-
-                        # We need to check if a user is tempbanned here because otherwise they won't be processed later on.
-
-                        continue
-
-                    else:
-
-                        errors[user_id] = _("User with ID {user_id} is already banned.").format(
-
-                            user_id=user_id
-
-                        )
-
-
-
-        user_ids = remove_processed(user_ids)
-
-
-
-        if not user_ids:
-
-            await show_results()
-
-            return
-
-
-
-        for user_id in user_ids:
-
-            user = guild.get_member(user_id)
-
-            if user is not None:
-
-                if user_id in tempbans:
-
-                    # We need to check if a user is tempbanned here because otherwise they won't be processed later on.
-
-                    continue
-
-                else:
-
-                    # Instead of replicating all that handling... gets attr from decorator
-
-                    try:
-
-                        success, reason = await self.ban_user(
-
-                            user=user, ctx=ctx, days=days, reason=reason, create_modlog_case=True
-
-                        )
-
-                        if success:
-
-                            banned.append(user_id)
-
-                        else:
-
-                            errors[user_id] = _("Failed to ban user {user_id}: {reason}").format(
-
-                                user_id=user_id, reason=reason
-
-                            )
-
-                    except Exception as e:
-
-                        errors[user_id] = _("Failed to ban user {user_id}: {reason}").format(
-
-                            user_id=user_id, reason=e
-
-                        )
-
-
-
-        user_ids = remove_processed(user_ids)
-
-
-
-        if not user_ids:
-
-            await show_results()
-
-            return
-
-
-
-        for user_id in user_ids:
-
-            user = discord.Object(id=user_id)
-
-            audit_reason = get_audit_reason(author, reason)
-
-            queue_entry = (guild.id, user_id)
-
-            async with self.config.guild(guild).current_tempbans() as tempbans:
-
-                if user_id in tempbans:
-
-                    tempbans.remove(user_id)
-
-                    upgrades.append(str(user_id))
-
-                    log.info(
-
-                        "{}({}) upgraded the tempban for {} to a permaban.".format(
-
-                            author.name, author.id, user_id
-
-                        )
-
-                    )
-
-                    banned.append(user_id)
-
-                else:
-
-                    try:
-
-                        await guild.ban(user, reason=audit_reason, delete_message_days=days)
-
-                        log.info("{}({}) hackbanned {}".format(author.name, author.id, user_id))
-
-                    except discord.NotFound:
-
-                        errors[user_id] = _("User with ID {user_id} not found").format(
-
-                            user_id=user_id
-
-                        )
-
-                        continue
-
-                    except discord.Forbidden:
-
-                        errors[user_id] = _(
-
-                            "Could not ban user with ID {user_id}: missing permissions."
-
-                        ).format(user_id=user_id)
-
-                        continue
-
-                    else:
-
-                        banned.append(user_id)
-
-
-
-            await modlog.create_case(
-
-                self.bot,
-
-                guild,
-
-                ctx.message.created_at.replace(tzinfo=timezone.utc),
-
-                "hackban",
-
-                user_id,
-
-                author,
-
-                reason,
-
-                until=None,
-
-                channel=None,
-
-            )
-
-        await show_results()
-
-
-
-    @commands.command()
-
-    @commands.guild_only()
-
-    @commands.bot_has_permissions(ban_members=True)
-
-    @checks.admin_or_permissions(ban_members=True)
-
-    async def tempban(
-
-        self,
-
-        ctx: commands.Context,
-
-        user: discord.Member,
-
-        duration: Optional[commands.TimedeltaConverter] = None,
-
-        days: Optional[int] = None,
-
-        *,
-
-        reason: str = None,
-
-    ):
-
-        """Temporarily ban a user from this server."""
-
-        guild = ctx.guild
-
-        author = ctx.author
-
-
-
-        if author == user:
-
-            await ctx.send(
-
-                _("I cannot let you do that. Self-harm is bad {}").format("\N{PENSIVE FACE}")
-
-            )
-
-            return
-
-        elif not await is_allowed_by_hierarchy(self.bot, self.config, guild, author, user):
-
-            await ctx.send(
-
-                _(
-
-                    "I cannot let you do that. You are "
-
-                    "not higher than the user in the role "
-
-                    "hierarchy."
-
-                )
-
-            )
-
-            return
-
-        elif guild.me.top_role <= user.top_role or user == guild.owner:
-
-            await ctx.send(_("I cannot do that due to Discord hierarchy rules."))
-
-            return
-
-
-
-        if duration is None:
-
-            duration = timedelta(seconds=await self.config.guild(guild).default_tempban_duration())
-
-        unban_time = datetime.now(timezone.utc) + duration
-
-
-
-        if days is None:
-
-            days = await self.config.guild(guild).default_days()
-
-
-
-        if not (0 <= days <= 7):
-
-            await ctx.send(_("Invalid days. Must be between 0 and 7."))
-
-            return
-
-        invite = await self.get_invite_for_reinvite(ctx, int(duration.total_seconds() + 86400))
-
-        if invite is None:
-
-            invite = ""
-
-
-
-        queue_entry = (guild.id, user.id)
-
-        await self.config.member(user).banned_until.set(unban_time.timestamp())
-
-        async with self.config.guild(guild).current_tempbans() as current_tempbans:
-
-            current_tempbans.append(user.id)
-
-
-
-        with contextlib.suppress(discord.HTTPException):
-
-            # We don't want blocked DMs preventing us from banning
-
-            msg = _("You have been temporarily banned from {server_name} until {date}.").format(
-
-                server_name=guild.name, date=unban_time.strftime("%m-%d-%Y %H:%M:%S")
-
-            )
-
-            if invite:
-
-                msg += _(" Here is an invite for when your ban expires: {invite_link}").format(
-
-                    invite_link=invite
-
-                )
-
-            await user.send(msg)
-
-        try:
-
-            await guild.ban(user, reason=reason, delete_message_days=days)
-
-        except discord.Forbidden:
-
-            await ctx.send(_("I can't do that for some reason."))
-
-        except discord.HTTPException:
-
-            await ctx.send(_("Something went wrong while banning."))
-
-        else:
-
-            await modlog.create_case(
-
-                self.bot,
-
-                guild,
-
-                ctx.message.created_at.replace(tzinfo=timezone.utc),
-
-                "tempban",
-
-                user,
-
-                author,
-
-                reason,
-
-                unban_time,
-
-            )
-
-            await ctx.send(_("Done. Enough chaos for now."))
-
-
-
-    @commands.command()
-
-    @commands.guild_only()
-
-    @commands.bot_has_permissions(ban_members=True)
-
-    @checks.admin_or_permissions(ban_members=True)
-
-    async def softban(self, ctx: commands.Context, user: discord.Member, *, reason: str = None):
-
-        """Kick a user and delete 1 day's worth of their messages."""
-
-        guild = ctx.guild
-
-        author = ctx.author
-
-
-
-        if author == user:
-
-            await ctx.send(
-
-                _("I cannot let you do that. Self-harm is bad {emoji}").format(
-
-                    emoji="\N{PENSIVE FACE}"
-
-                )
-
-            )
-
-            return
-
-        elif not await is_allowed_by_hierarchy(self.bot, self.config, guild, author, user):
-
-            await ctx.send(
-
-                _(
-
-                    "I cannot let you do that. You are "
-
-                    "not higher than the user in the role "
-
-                    "hierarchy."
-
-                )
-
-            )
-
-            return
-
-
-
-        audit_reason = get_audit_reason(author, reason)
-
-
-
-        invite = await self.get_invite_for_reinvite(ctx)
-
-        if invite is None:
-
-            invite = ""
-
-
-
-        queue_entry = (guild.id, user.id)
-
-        try:  # We don't want blocked DMs preventing us from banning
-
-            msg = await user.send(
-
-                _(
-
-                    "You have been banned and "
-
-                    "then unbanned as a quick way to delete your messages.\n"
-
-                    "You can now join the server again. {invite_link}"
-
-                ).format(invite_link=invite)
-
-            )
-
-        except discord.HTTPException:
-
-            msg = None
-
-        try:
-
-            await guild.ban(user, reason=audit_reason, delete_message_days=1)
-
-        except discord.errors.Forbidden:
-
-            await ctx.send(_("My role is not high enough to softban that user."))
-
-            if msg is not None:
-
-                await msg.delete()
-
-            return
-
-        except discord.HTTPException as e:
-
-            log.exception(
-
-                "{}({}) attempted to softban {}({}), but an error occurred trying to ban them.".format(
-
-                    author.name, author.id, user.name, user.id
-
-                )
-
-            )
-
-            return
-
-        try:
-
-            await guild.unban(user)
-
-        except discord.HTTPException as e:
-
-            log.exception(
-
-                "{}({}) attempted to softban {}({}), but an error occurred trying to unban them.".format(
-
-                    author.name, author.id, user.name, user.id
-
-                )
-
-            )
-
-            return
-
-        else:
-
-            log.info(
-
-                "{}({}) softbanned {}({}), deleting 1 day worth "
-
-                "of messages.".format(author.name, author.id, user.name, user.id)
-
-            )
-
-            await modlog.create_case(
-
-                self.bot,
-
-                guild,
-
-                ctx.message.created_at.replace(tzinfo=timezone.utc),
-
-                "softban",
-
-                user,
-
-                author,
-
-                reason,
-
-                until=None,
-
-                channel=None,
-
-            )
-
-            await ctx.send(_("Done. Enough chaos."))
-
-
-
-    @commands.command()
-
-    @commands.guild_only()
-
-    @commands.mod_or_permissions(move_members=True)
-
-    async def voicekick(
-
-        self, ctx: commands.Context, member: discord.Member, *, reason: str = None
-
-    ):
-
-        """Kick a member from a voice channel."""
-
-        author = ctx.author
-
-        guild = ctx.guild
-
-        user_voice_state: discord.VoiceState = member.voice
-
-
-
-        if await self._voice_perm_check(ctx, user_voice_state, move_members=True) is False:
-
-            return
-
-        elif not await is_allowed_by_hierarchy(self.bot, self.config, guild, author, member):
-
-            await ctx.send(
-
-                _(
-
-                    "I cannot let you do that. You are "
-
-                    "not higher than the user in the role "
-
-                    "hierarchy."
-
-                )
-
-            )
-
-            return
-
-        case_channel = member.voice.channel
-
-        # Store this channel for the case channel.
-
-
-
-        try:
-
-            await member.move_to(None)
-
-        except discord.Forbidden:  # Very unlikely that this will ever occur
-
-            await ctx.send(_("I am unable to kick this member from the voice channel."))
-
-            return
-
-        except discord.HTTPException:
-
-            await ctx.send(_("Something went wrong while attempting to kick that member."))
-
-            return
-
-        else:
-
-            await modlog.create_case(
-
-                self.bot,
-
-                guild,
-
-                ctx.message.created_at.replace(tzinfo=timezone.utc),
-
-                "vkick",
-
-                member,
-
-                author,
-
-                reason,
-
-                until=None,
-
-                channel=case_channel,
-
-            )
-
-
-
-    @commands.command()
-
-    @commands.guild_only()
-
-    @checks.admin_or_permissions(mute_members=True, deafen_members=True)
-
-    async def voiceunban(self, ctx: commands.Context, user: discord.Member, *, reason: str = None):
-
-        """Unban a user from speaking and listening in the server's voice channels."""
-
-        user_voice_state = user.voice
-
-        if (
-
-            await self._voice_perm_check(
-
-                ctx, user_voice_state, deafen_members=True, mute_members=True
-
-            )
-
-            is False
-
-        ):
-
-            return
-
-        needs_unmute = True if user_voice_state.mute else False
-
-        needs_undeafen = True if user_voice_state.deaf else False
-
-        audit_reason = get_audit_reason(ctx.author, reason)
-
-        if needs_unmute and needs_undeafen:
-
-            await user.edit(mute=False, deafen=False, reason=audit_reason)
-
-        elif needs_unmute:
-
-            await user.edit(mute=False, reason=audit_reason)
-
-        elif needs_undeafen:
-
-            await user.edit(deafen=False, reason=audit_reason)
-
-        else:
-
-            await ctx.send(_("That user isn't muted or deafened by the server."))
-
-            return
-
-
-
-        guild = ctx.guild
-
-        author = ctx.author
-
-        await modlog.create_case(
-
-            self.bot,
-
-            guild,
-
-            ctx.message.created_at.replace(tzinfo=timezone.utc),
-
-            "voiceunban",
-
-            user,
-
-            author,
-
-            reason,
-
-            until=None,
-
-            channel=None,
-
-        )
-
-        await ctx.send(_("User is now allowed to speak and listen in voice channels."))
-
-
-
-    @commands.command()
-
-    @commands.guild_only()
-
-    @checks.admin_or_permissions(mute_members=True, deafen_members=True)
-
-    async def voiceban(self, ctx: commands.Context, user: discord.Member, *, reason: str = None):
-
-        """Ban a user from speaking and listening in the server's voice channels."""
-
-        user_voice_state: discord.VoiceState = user.voice
-
-        if (
-
-            await self._voice_perm_check(
-
-                ctx, user_voice_state, deafen_members=True, mute_members=True
-
-            )
-
-            is False
-
-        ):
-
-            return
-
-        needs_mute = True if user_voice_state.mute is False else False
-
-        needs_deafen = True if user_voice_state.deaf is False else False
-
-        audit_reason = get_audit_reason(ctx.author, reason)
-
-        author = ctx.author
-
-        guild = ctx.guild
-
-        if needs_mute and needs_deafen:
-
-            await user.edit(mute=True, deafen=True, reason=audit_reason)
-
-        elif needs_mute:
-
-            await user.edit(mute=True, reason=audit_reason)
-
-        elif needs_deafen:
-
-            await user.edit(deafen=True, reason=audit_reason)
-
-        else:
-
-            await ctx.send(_("That user is already muted and deafened server-wide."))
-
-            return
-
-
-
-        await modlog.create_case(
-
-            self.bot,
-
-            guild,
-
-            ctx.message.created_at.replace(tzinfo=timezone.utc),
-
-            "voiceban",
-
-            user,
-
-            author,
-
-            reason,
-
-            until=None,
-
-            channel=None,
-
-        )
-
-        await ctx.send(_("User has been banned from speaking or listening in voice channels."))
-
-
-
-    @commands.command()
-
-    @commands.guild_only()
-
-    @commands.bot_has_permissions(ban_members=True)
-
-    @checks.admin_or_permissions(ban_members=True)
-
-    async def unban(self, ctx: commands.Context, user_id: RawUserIds, *, reason: str = None):
-
-        """Unban a user from this server.
-
-
-
-        Requires specifying the target user's ID. To find this, you may either:
-
-         1. Copy it from the mod log case (if one was created), or
-
-         2. enable developer mode, go to Bans in this server's settings, right-
-
-        click the user and select 'Copy ID'."""
-
-        guild = ctx.guild
-
-        author = ctx.author
-
-        audit_reason = get_audit_reason(ctx.author, reason)
-
-        bans = await guild.bans()
-
-        bans = [be.user for be in bans]
-
-        user = discord.utils.get(bans, id=user_id)
-
-        if not user:
-
-            await ctx.send(_("It seems that user isn't banned!"))
-
-            return
-
-        queue_entry = (guild.id, user_id)
-
-        try:
-
-            await guild.unban(user, reason=audit_reason)
-
-        except discord.HTTPException:
-
-            await ctx.send(_("Something went wrong while attempting to unban that user."))
-
-            return
-
-        else:
-
-            await modlog.create_case(
-
-                self.bot,
-
-                guild,
-
-                ctx.message.created_at.replace(tzinfo=timezone.utc),
-
-                "unban",
-
-                user,
-
-                author,
-
-                reason,
-
-                until=None,
-
-                channel=None,
-
-            )
-
-            await ctx.send(_("Unbanned that user from this server."))
-
-
-
-        if await self.config.guild(guild).reinvite_on_unban():
-
-            user = ctx.bot.get_user(user_id)
-
-            if not user:
-
-                await ctx.send(
-
-                    _("I don't share another server with this user. I can't reinvite them.")
-
-                )
-
-                return
-
-
-
-            invite = await self.get_invite_for_reinvite(ctx)
-
-            if invite:
-
-                try:
-
-                    await user.send(
-
-                        _(
-
-                            "You've been unbanned from {server}.\n"
-
-                            "Here is an invite for that server: {invite_link}"
-
-                        ).format(server=guild.name, invite_link=invite.url)
-
-                    )
-
-                except discord.Forbidden:
-
-                    await ctx.send(
-
-                        _(
-
-                            "I failed to send an invite to that user. "
-
-                            "Perhaps you may be able to send it for me?\n"
-
-                            "Here's the invite link: {invite_link}"
-
-                        ).format(invite_link=invite.url)
-
-                    )
-
-                except discord.HTTPException:
-
-                    await ctx.send(
-
-                        _(
-
-                            "Something went wrong when attempting to send that user"
-
-                            "an invite. Here's the link so you can try: {invite_link}"
-
-                        ).format(invite_link=invite.url)
-
-                    )
+    return AdminVersionRouter()

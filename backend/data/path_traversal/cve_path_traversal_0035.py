@@ -2,1216 +2,1412 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-from canari.maltego.entities import Hash, URL, File, Person, Hashtag
+from __future__ import absolute_import
 
-from canari.maltego.message import Label, LinkStyle, MaltegoException, Bookmark, LinkDirection, UIMessage, UIMessageType
+from __future__ import division
 
-from canari.mode import is_local_exec_mode, is_remote_exec_mode
+from __future__ import print_function
 
-from distutils.version import StrictVersion
 
-from MISP_maltego.transforms.common.entities import MISPEvent, MISPObject, MISPGalaxy
 
-from MISP_maltego.transforms.common.mappings import mapping_object_icon, mapping_misp_to_maltego, mapping_galaxy_icon, mapping_galaxy_type
+import email.utils
 
-from pymisp import ExpandedPyMISP as PyMISP
+import errno
 
-import json
+import httplib2
+
+import mock
 
 import os
 
-import os.path
+import pytest
 
-import requests
+from six.moves import http_client, urllib
 
-import tempfile
+import socket
 
-import time
-
-
-
-# FIXME from galaxy 'to MISP Event' is confusing
-
-
-
-__version__ = '1.4.4'  # also update version in setup.py
-
-
-
-tag_note_prefixes = ['tlp:', 'PAP:', 'de-vs:', 'euci:', 'fr-classif:', 'nato:']
-
-
-
-misp_connection = None
-
-update_url = 'https://raw.githubusercontent.com/MISP/MISP-maltego/master/setup.py'
-
-local_path_root = os.path.join(tempfile.gettempdir(), 'MISP-maltego')
-
-local_path_version = os.path.join(local_path_root, 'versioncheck')
-
-if not os.path.exists(local_path_root):
-
-    os.mkdir(local_path_root)
-
-    os.chmod(local_path_root, mode=0o777)  # temporary workaround - see https://github.com/redcanari/canari3/issues/61
+import tests
 
 
 
 
 
-def check_update(config):
+def _raise_connection_refused_exception(*args, **kwargs):
 
-    # Do not check updates if running as remote transform
+    raise socket.error(errno.ECONNREFUSED, "Connection refused.")
 
-    if is_remote_exec_mode():
 
-        return None
 
-    # only raise the alert once a day/reboot to the user.
+
+
+def test_connection_type():
+
+    http = httplib2.Http()
+
+    http.force_exception_to_status_code = False
+
+    response, content = http.request(
+
+        tests.DUMMY_URL, connection_type=tests.MockHTTPConnection
+
+    )
+
+    assert response["content-location"] == tests.DUMMY_URL
+
+    assert content == b"the body"
+
+
+
+
+
+def test_bad_status_line_retry():
+
+    http = httplib2.Http()
+
+    old_retries = httplib2.RETRIES
+
+    httplib2.RETRIES = 1
+
+    http.force_exception_to_status_code = False
 
     try:
 
-        if time.time() - os.path.getmtime(local_path_version) > 60 * 60 * 24:  # check the timestamp of the file
+        response, content = http.request(
 
-            recheck = True
+            tests.DUMMY_URL, connection_type=tests.MockHTTPBadStatusConnection
 
-        else:
+        )
 
-            recheck = False
+    except http_client.BadStatusLine:
 
-    except Exception:  # file does not exist, so check version
+        assert tests.MockHTTPBadStatusConnection.num_calls == 2
 
-        recheck = True
+    httplib2.RETRIES = old_retries
 
-    if not recheck:
 
-        return None
 
-    # remember we checked the version
 
-    from pathlib import Path
 
-    Path(local_path_version).touch()
+def test_unknown_server():
 
-    # UIMessageType must be Fatal as otherwise it is not shown to the user.
+    http = httplib2.Http()
 
-    if 'MISP_maltego.local.check_updates' not in config:
+    http.force_exception_to_status_code = False
 
-        return UIMessage("'check_updates' parameter missing in '.canari/MISP_maltego.conf'. Please set 'check_updates = True/False'.", type=UIMessageType.Fatal)
+    with tests.assert_raises(httplib2.ServerNotFoundError):
 
-    if config['MISP_maltego.local.check_updates']:
+        with mock.patch("socket.socket.connect", side_effect=socket.gaierror):
 
-        # check the version
+            http.request("http://no-such-hostname./")
 
-        r = requests.get(update_url)
 
-        for l in r.text.splitlines():
 
-            if 'version=' in l:
+    # Now test with exceptions turned off
 
-                online_ver = l.strip().strip(',').split('=').pop().strip("'")
+    http.force_exception_to_status_code = True
 
-                if StrictVersion(online_ver) > StrictVersion(__version__):
+    response, content = http.request("http://no-such-hostname./")
 
-                    message = ('A new version of MISP-Maltego is available.\n'
+    assert response["content-type"] == "text/plain"
 
-                               'To upgrade, please:\n'
+    assert content.startswith(b"Unable to find")
 
-                               '    pip3 --upgrade MISP-maltego'
+    assert response.status == 400
 
-                               '    canari create-profile MISP_maltego\n'
 
-                               '    And import the newly generated .mtz bundle in Maltego (Import > Import Configuration)')
 
-                    return UIMessage(message, type=UIMessageType.Fatal)
 
-                break
 
-    return None
+@pytest.mark.skipif(
 
+    os.environ.get("TRAVIS_PYTHON_VERSION") in ("2.7", "pypy"),
 
+    reason="Fails on Travis py27/pypy, works elsewhere. "
 
+    "See https://travis-ci.org/httplib2/httplib2/jobs/408769880.",
 
+)
 
-def get_misp_connection(config=None, parameters=None):
+@mock.patch("socket.socket.connect", spec=True)
 
-    global misp_connection
+def test_connection_refused_raises_exception(mock_socket_connect):
 
-    if misp_connection:
+    mock_socket_connect.side_effect = _raise_connection_refused_exception
 
-        return misp_connection
+    http = httplib2.Http()
 
-    if not config:
+    http.force_exception_to_status_code = False
 
-        raise MaltegoException("ERROR: MISP connection not yet established, and config not provided as parameter.")
+    with tests.assert_raises(socket.error):
 
-    misp_verify = True
+        http.request(tests.DUMMY_URL)
 
-    misp_debug = False
 
-    misp_url = None
 
-    misp_key = None
 
-    try:
 
-        if is_local_exec_mode():
+@pytest.mark.skipif(
 
-            misp_url = config['MISP_maltego.local.misp_url']
+    os.environ.get("TRAVIS_PYTHON_VERSION") in ("2.7", "pypy"),
 
-            misp_key = config['MISP_maltego.local.misp_key']
+    reason="Fails on Travis py27/pypy, works elsewhere. "
 
-            if config['MISP_maltego.local.misp_verify'] in ['False', 'false', 0, 'no', 'No']:
+    "See https://travis-ci.org/httplib2/httplib2/jobs/408769880.",
 
-                misp_verify = False
+)
 
-            if config['MISP_maltego.local.misp_debug'] in ['True', 'true', 1, 'yes', 'Yes']:
+@mock.patch("socket.socket.connect", spec=True)
 
-                misp_debug = True
+def test_connection_refused_returns_response(mock_socket_connect):
 
-        if is_remote_exec_mode():
+    mock_socket_connect.side_effect = _raise_connection_refused_exception
 
-            try:
+    http = httplib2.Http()
 
-                misp_url = parameters['mispurl'].value
+    http.force_exception_to_status_code = True
 
-                misp_key = parameters['mispkey'].value
+    response, content = http.request(tests.DUMMY_URL)
 
-            except AttributeError:
+    content = content.lower()
 
-                raise MaltegoException("ERROR: mispurl and mispkey need to be set to something valid")
+    assert response["content-type"] == "text/plain"
 
-        misp_connection = PyMISP(misp_url, misp_key, misp_verify, 'json', misp_debug, tool='misp_maltego')
+    assert (
 
-    except Exception:
+        b"connection refused" in content
 
-        if is_local_exec_mode():
+        or b"actively refused" in content
 
-            raise MaltegoException("ERROR: Cannot connect to MISP server. Please verify your MISP_Maltego.conf settings.")
+        or b"socket is not connected" in content
 
-        if is_remote_exec_mode():
+    )
 
-            raise MaltegoException("ERROR: Cannot connect to MISP server. Please verify your settings (MISP URL and API key), and ensure the MISP server is reachable from the internet.")
+    assert response.status == 400
 
-    return misp_connection
 
 
 
 
+def test_get_iri():
 
-def entity_obj_to_entity(entity_obj, v, t, **kwargs):
+    http = httplib2.Http()
 
-    if entity_obj == Hash:
+    query = u"?a=\N{CYRILLIC CAPITAL LETTER DJE}"
 
-        return entity_obj(v, _type=t, **kwargs)  # LATER type is conflicting with type of Entity, Report this as bug see line 326 /usr/local/lib/python3.5/dist-packages/canari/maltego/entities.py
+    with tests.server_reflect() as uri:
 
+        response, content = http.request(uri + query, "GET")
 
+        assert response.status == 200
 
-    return entity_obj(v, **kwargs)
+        reflected = tests.HttpRequest.from_bytes(content)
 
+        assert reflected.uri == "/?a=%D0%82"
 
 
 
 
-def get_entity_property(entity, name):
 
-    for k, v in entity.fields.items():
+def test_get_is_default_method():
 
-        if k == name:
+    # Test that GET is the default method
 
-            return v.value
+    http = httplib2.Http()
 
-    return None
+    with tests.server_reflect() as uri:
 
+        response, content = http.request(uri)
 
+        assert response.status == 200
 
+        reflected = tests.HttpRequest.from_bytes(content)
 
+        assert reflected.method == "GET"
 
-def attribute_to_entity(a, link_label=None, event_tags=[], only_self=False):
 
-    # prepare some attributes to a better form
 
-    a['data'] = None  # empty the file content as we really don't need this here
 
-    if a['type'] == 'malware-sample':
 
-        a['type'] = 'filename|md5'
+def test_different_methods():
 
-    if a['type'] == 'regkey|value':  # LATER regkey|value => needs to be a special non-combined object
+    # Test that all methods can be used
 
-        a['type'] = 'regkey'
+    http = httplib2.Http()
 
+    methods = ["GET", "PUT", "DELETE", "POST", "unknown"]
 
+    with tests.server_reflect(request_count=len(methods)) as uri:
 
-    combined_tags = event_tags
+        for method in methods:
 
-    if 'Galaxy' in a and not only_self:
+            response, content = http.request(uri, method, body=b" ")
 
-        for g in a['Galaxy']:
+            assert response.status == 200
 
-            for c in g['GalaxyCluster']:
+            reflected = tests.HttpRequest.from_bytes(content)
 
-                yield galaxycluster_to_entity(c)
+            assert reflected.method == method
 
 
 
-    # complement the event tags with the attribute tags.
 
-    if 'Tag' in a and not only_self:
 
-            for t in a['Tag']:
+def test_head_read():
 
-                combined_tags.append(t['name'])
+    # Test that we don't try to read the response of a HEAD request
 
-                # ignore all misp-galaxies
+    # since httplib blocks response.read() for HEAD requests.
 
-                if t['name'].startswith('misp-galaxy'):
+    http = httplib2.Http()
 
-                    continue
+    respond_with = b"HTTP/1.0 200 OK\r\ncontent-length: " b"14\r\n\r\nnon-empty-body"
 
-                # ignore all those we add as notes
+    with tests.server_const_bytes(respond_with) as uri:
 
-                if tag_matches_note_prefix(t['name']):
+        response, content = http.request(uri, "HEAD")
 
-                    continue
+    assert response.status == 200
 
-                yield Hashtag(t['name'], bookmark=Bookmark.Green)
+    assert content == b""
 
 
 
-    notes = convert_tags_to_note(combined_tags)
 
 
+def test_get_no_cache():
 
-    # special cases
+    # Test that can do a GET w/o the cache turned on.
 
-    if a['type'] in ('url', 'uri'):
+    http = httplib2.Http()
 
-        yield(URL(url=a['value'], short_title=a['value'], link_label=link_label, notes=notes, bookmark=Bookmark.Green))
+    with tests.server_const_http() as uri:
 
-        return
+        response, content = http.request(uri, "GET")
 
+    assert response.status == 200
 
+    assert response.previous is None
 
-    # attribute is from an object, and a relation gives better understanding of the type of attribute
 
-    if a.get('object_relation') and mapping_misp_to_maltego.get(a['object_relation']):
 
-        entity_obj = mapping_misp_to_maltego[a['object_relation']][0]
 
-        yield entity_obj(a['value'], labels=[Label('comment', a.get('comment'))], link_label=link_label, notes=notes, bookmark=Bookmark.Green)
 
+def test_user_agent():
 
+    # Test that we provide a default user-agent
 
-    # combined attributes
+    http = httplib2.Http()
 
-    elif '|' in a['type']:
+    with tests.server_reflect() as uri:
 
-        t_1, t_2 = a['type'].split('|')
+        response, content = http.request(uri, "GET")
 
-        v_1, v_2 = a['value'].split('|')
+        assert response.status == 200
 
-        if t_1 in mapping_misp_to_maltego:
+        reflected = tests.HttpRequest.from_bytes(content)
 
-            entity_obj = mapping_misp_to_maltego[t_1][0]
+        assert reflected.headers.get("user-agent", "").startswith("Python-httplib2/")
 
-            labels = [Label('comment', a.get('comment'))]
 
-            if entity_obj == File:
 
-                labels.append(Label('hash', v_2))
 
-            yield entity_obj_to_entity(entity_obj, v_1, t_1, labels=labels, link_label=link_label, notes=notes, bookmark=Bookmark.Green)  # LATER change the comment to include the second part of the regkey
 
-        if t_2 in mapping_misp_to_maltego:
+def test_user_agent_non_default():
 
-            entity_obj = mapping_misp_to_maltego[t_2][0]
+    # Test that the default user-agent can be over-ridden
 
-            labels = [Label('comment', a.get('comment'))]
+    http = httplib2.Http()
 
-            if entity_obj == Hash:
+    with tests.server_reflect() as uri:
 
-                labels.append(Label('filename', v_1))
+        response, content = http.request(uri, "GET", headers={"User-Agent": "fred/1.0"})
 
-            yield entity_obj_to_entity(entity_obj, v_2, t_2, labels=labels, link_label=link_label, notes=notes, bookmark=Bookmark.Green)  # LATER change the comment to include the first part of the regkey
+        assert response.status == 200
 
+        reflected = tests.HttpRequest.from_bytes(content)
 
+        assert reflected.headers.get("user-agent") == "fred/1.0"
 
-    # normal attributes
 
-    elif a['type'] in mapping_misp_to_maltego:
 
-        entity_obj = mapping_misp_to_maltego[a['type']][0]
 
-        yield entity_obj_to_entity(entity_obj, a['value'], a['type'], labels=[Label('comment', a.get('comment'))], link_label=link_label, notes=notes, bookmark=Bookmark.Green)
 
+def test_get_300_with_location():
 
+    # Test the we automatically follow 300 redirects if a Location: header is provided
 
-    # not supported in our maltego mapping are not handled
+    http = httplib2.Http()
 
+    final_content = b"This is the final destination.\n"
 
+    routes = {
 
-    # LATER : relationships from attributes - not yet supported by MISP yet, but there are references in the datamodel
+        "/final": tests.http_response_bytes(body=final_content),
 
+        "": tests.http_response_bytes(
 
+            status="300 Multiple Choices", headers={"location": "/final"}
 
+        ),
 
+    }
 
-def object_to_entity(o, link_label=None, link_direction=LinkDirection.InputToOutput):
+    with tests.server_route(routes, request_count=2) as uri:
 
-    misp = get_misp_connection()
+        response, content = http.request(uri, "GET")
 
-    # find a nice icon for it
+    assert response.status == 200
 
-    try:
+    assert content == final_content
 
-        icon_url = mapping_object_icon[o['name']]
+    assert response.previous.status == 300
 
-    except KeyError:
+    assert not response.previous.fromcache
 
-        # it's not in our mapping, just ignore and leave the default icon
 
-        icon_url = None
 
-    # Generate a human readable display-name:
+    # Confirm that the intermediate 300 is not cached
 
-    # - find the first RequiredOneOf that exists
+    with tests.server_route(routes, request_count=2) as uri:
 
-    # - if none, use the first RequiredField
+        response, content = http.request(uri, "GET")
 
-    # LATER further finetune the human readable version of this object
+    assert response.status == 200
 
-    o_template = misp.get_object_template(o['template_uuid'])
+    assert content == final_content
 
-    human_readable = None
+    assert response.previous.status == 300
 
-    try:
+    assert not response.previous.fromcache
 
-        found = False
 
-        while not found:  # the while loop is broken once something is found, or the requiredOneOf has no elements left
 
-            required_ote_type = o_template['ObjectTemplate']['requirements']['requiredOneOf'].pop(0)
 
-            for ote in o_template['ObjectTemplateElement']:
 
-                if ote['object_relation'] == required_ote_type:
+def test_get_300_with_location_noredirect():
 
-                    required_a_type = ote['type']
+    # Test the we automatically follow 300 redirects if a Location: header is provided
 
-                    break
+    http = httplib2.Http()
 
-            for a in o['Attribute']:
+    http.follow_redirects = False
 
-                if a['type'] == required_a_type:
+    response = tests.http_response_bytes(
 
-                    human_readable = '{}:\n{}'.format(o['name'], a['value'])
+        status="300 Multiple Choices",
 
-                    found = True
+        headers={"location": "/final"},
 
-                    break
+        body=b"redirect body",
 
-    except Exception:
+    )
 
-        pass
+    with tests.server_const_bytes(response) as uri:
 
-    if not human_readable:
+        response, content = http.request(uri, "GET")
+
+    assert response.status == 300
+
+
+
+
+
+def test_get_300_without_location():
+
+    # Not giving a Location: header in a 300 response is acceptable
+
+    # In which case we just return the 300 response
+
+    http = httplib2.Http()
+
+    with tests.server_const_http(
+
+        status="300 Multiple Choices", body=b"redirect body"
+
+    ) as uri:
+
+        response, content = http.request(uri, "GET")
+
+    assert response.status == 300
+
+    assert response.previous is None
+
+    assert content == b"redirect body"
+
+
+
+
+
+def test_get_301():
+
+    # Test that we automatically follow 301 redirects
+
+    # and that we cache the 301 response
+
+    http = httplib2.Http(cache=tests.get_cache_path())
+
+    destination = ""
+
+    routes = {
+
+        "/final": tests.http_response_bytes(body=b"This is the final destination.\n"),
+
+        "": tests.http_response_bytes(
+
+            status="301 Now where did I leave that URL",
+
+            headers={"location": "/final"},
+
+            body=b"redirect body",
+
+        ),
+
+    }
+
+    with tests.server_route(routes, request_count=3) as uri:
+
+        destination = urllib.parse.urljoin(uri, "/final")
+
+        response1, content1 = http.request(uri, "GET")
+
+        response2, content2 = http.request(uri, "GET")
+
+    assert response1.status == 200
+
+    assert "content-location" in response2
+
+    assert response1["content-location"] == destination
+
+    assert content1 == b"This is the final destination.\n"
+
+    assert response1.previous.status == 301
+
+    assert not response1.previous.fromcache
+
+
+
+    assert response2.status == 200
+
+    assert response2["content-location"] == destination
+
+    assert content2 == b"This is the final destination.\n"
+
+    assert response2.previous.status == 301
+
+    assert response2.previous.fromcache
+
+
+
+
+
+@pytest.mark.skip(
+
+    not os.environ.get("httplib2_test_still_run_skipped")
+
+    and os.environ.get("TRAVIS_PYTHON_VERSION") in ("2.7", "pypy"),
+
+    reason="FIXME: timeout on Travis py27 and pypy, works elsewhere",
+
+)
+
+def test_head_301():
+
+    # Test that we automatically follow 301 redirects
+
+    http = httplib2.Http()
+
+    destination = ""
+
+    routes = {
+
+        "/final": tests.http_response_bytes(body=b"This is the final destination.\n"),
+
+        "": tests.http_response_bytes(
+
+            status="301 Now where did I leave that URL",
+
+            headers={"location": "/final"},
+
+            body=b"redirect body",
+
+        ),
+
+    }
+
+    with tests.server_route(routes, request_count=2) as uri:
+
+        destination = urllib.parse.urljoin(uri, "/final")
+
+        response, content = http.request(uri, "HEAD")
+
+    assert response.status == 200
+
+    assert response["content-location"] == destination
+
+    assert response.previous.status == 301
+
+    assert not response.previous.fromcache
+
+
+
+
+
+@pytest.mark.xfail(
+
+    reason=(
+
+        "FIXME: 301 cache works only with follow_redirects, should work " "regardless"
+
+    )
+
+)
+
+def test_get_301_no_redirect():
+
+    # Test that we cache the 301 response
+
+    http = httplib2.Http(cache=tests.get_cache_path(), timeout=0.5)
+
+    http.follow_redirects = False
+
+    response = tests.http_response_bytes(
+
+        status="301 Now where did I leave that URL",
+
+        headers={"location": "/final", "cache-control": "max-age=300"},
+
+        body=b"redirect body",
+
+        add_date=True,
+
+    )
+
+    with tests.server_const_bytes(response) as uri:
+
+        response, _ = http.request(uri, "GET")
+
+        assert response.status == 301
+
+        assert not response.fromcache
+
+        response, _ = http.request(uri, "GET")
+
+        assert response.status == 301
+
+        assert response.fromcache
+
+
+
+
+
+def test_get_302():
+
+    # Test that we automatically follow 302 redirects
+
+    # and that we DO NOT cache the 302 response
+
+    http = httplib2.Http(cache=tests.get_cache_path())
+
+    second_url, final_url = "", ""
+
+    routes = {
+
+        "/final": tests.http_response_bytes(body=b"This is the final destination.\n"),
+
+        "/second": tests.http_response_bytes(
+
+            status="302 Found", headers={"location": "/final"}, body=b"second redirect"
+
+        ),
+
+        "": tests.http_response_bytes(
+
+            status="302 Found", headers={"location": "/second"}, body=b"redirect body"
+
+        ),
+
+    }
+
+    with tests.server_route(routes, request_count=7) as uri:
+
+        second_url = urllib.parse.urljoin(uri, "/second")
+
+        final_url = urllib.parse.urljoin(uri, "/final")
+
+        response1, content1 = http.request(second_url, "GET")
+
+        response2, content2 = http.request(second_url, "GET")
+
+        response3, content3 = http.request(uri, "GET")
+
+    assert response1.status == 200
+
+    assert response1["content-location"] == final_url
+
+    assert content1 == b"This is the final destination.\n"
+
+    assert response1.previous.status == 302
+
+    assert not response1.previous.fromcache
+
+
+
+    assert response2.status == 200
+
+    # FIXME:
+
+    # assert response2.fromcache
+
+    assert response2["content-location"] == final_url
+
+    assert content2 == b"This is the final destination.\n"
+
+    assert response2.previous.status == 302
+
+    assert not response2.previous.fromcache
+
+    assert response2.previous["content-location"] == second_url
+
+
+
+    assert response3.status == 200
+
+    # FIXME:
+
+    # assert response3.fromcache
+
+    assert content3 == b"This is the final destination.\n"
+
+    assert response3.previous.status == 302
+
+    assert not response3.previous.fromcache
+
+
+
+
+
+def test_get_302_redirection_limit():
+
+    # Test that we can set a lower redirection limit
+
+    # and that we raise an exception when we exceed
+
+    # that limit.
+
+    http = httplib2.Http()
+
+    http.force_exception_to_status_code = False
+
+    routes = {
+
+        "/second": tests.http_response_bytes(
+
+            status="302 Found", headers={"location": "/final"}, body=b"second redirect"
+
+        ),
+
+        "": tests.http_response_bytes(
+
+            status="302 Found", headers={"location": "/second"}, body=b"redirect body"
+
+        ),
+
+    }
+
+    with tests.server_route(routes, request_count=4) as uri:
 
         try:
 
-            found = False
+            http.request(uri, "GET", redirections=1)
 
-            parts = []
+            assert False, "This should not happen"
 
-            for required_ote_type in o_template['ObjectTemplate']['requirements']['required']:
+        except httplib2.RedirectLimit:
 
-                for ote in o_template['ObjectTemplateElement']:
-
-                    if ote['object_relation'] == required_ote_type:
-
-                        required_a_type = ote['type']
-
-                        break
-
-                for a in o['Attribute']:
-
-                    if a['type'] == required_a_type:
-
-                        parts.append(a['value'])
-
-                        break
-
-            human_readable = '{}:\n{}'.format(o['name'], '|'.join(parts))
+            pass
 
         except Exception:
 
-            human_readable = o['name']
+            assert False, "Threw wrong kind of exception "
 
-    return MISPObject(
 
-        human_readable,
 
-        uuid=o['uuid'],
+        # Re-run the test with out the exceptions
 
-        event_id=int(o['event_id']),
+        http.force_exception_to_status_code = True
 
-        meta_category=o.get('meta_category'),
+        response, content = http.request(uri, "GET", redirections=1)
 
-        description=o.get('description'),
 
-        comment=o.get('comment'),
 
-        icon_url=icon_url,
+    assert response.status == 500
 
-        link_label=link_label,
+    assert response.reason.startswith("Redirected more")
 
-        link_direction=link_direction,
+    assert response["status"] == "302"
 
-        bookmark=Bookmark.Green
+    assert content == b"second redirect"
+
+    assert response.previous is not None
+
+
+
+
+
+def test_get_302_no_location():
+
+    # Test that we throw an exception when we get
+
+    # a 302 with no Location: header.
+
+    http = httplib2.Http()
+
+    http.force_exception_to_status_code = False
+
+    with tests.server_const_http(status="302 Found", request_count=2) as uri:
+
+        try:
+
+            http.request(uri, "GET")
+
+            assert False, "Should never reach here"
+
+        except httplib2.RedirectMissingLocation:
+
+            pass
+
+        except Exception:
+
+            assert False, "Threw wrong kind of exception "
+
+
+
+        # Re-run the test with out the exceptions
+
+        http.force_exception_to_status_code = True
+
+        response, content = http.request(uri, "GET")
+
+
+
+    assert response.status == 500
+
+    assert response.reason.startswith("Redirected but")
+
+    assert "302" == response["status"]
+
+    assert content == b""
+
+
+
+
+
+@pytest.mark.skip(
+
+    not os.environ.get("httplib2_test_still_run_skipped")
+
+    and os.environ.get("TRAVIS_PYTHON_VERSION") in ("2.7", "pypy"),
+
+    reason="FIXME: timeout on Travis py27 and pypy, works elsewhere",
+
+)
+
+def test_303():
+
+    # Do a follow-up GET on a Location: header
+
+    # returned from a POST that gave a 303.
+
+    http = httplib2.Http()
+
+    routes = {
+
+        "/final": tests.make_http_reflect(),
+
+        "": tests.make_http_reflect(
+
+            status="303 See Other", headers={"location": "/final"}
+
+        ),
+
+    }
+
+    with tests.server_route(routes, request_count=2) as uri:
+
+        response, content = http.request(uri, "POST", " ")
+
+    assert response.status == 200
+
+    reflected = tests.HttpRequest.from_bytes(content)
+
+    assert reflected.uri == "/final"
+
+    assert response.previous.status == 303
+
+
+
+    # Skip follow-up GET
+
+    http = httplib2.Http()
+
+    http.follow_redirects = False
+
+    with tests.server_route(routes, request_count=1) as uri:
+
+        response, content = http.request(uri, "POST", " ")
+
+    assert response.status == 303
+
+
+
+    # All methods can be used
+
+    http = httplib2.Http()
+
+    cases = "DELETE GET HEAD POST PUT EVEN_NEW_ONES".split(" ")
+
+    with tests.server_route(routes, request_count=len(cases) * 2) as uri:
+
+        for method in cases:
+
+            response, content = http.request(uri, method, body=b"q q")
+
+            assert response.status == 200
+
+            reflected = tests.HttpRequest.from_bytes(content)
+
+            assert reflected.method == "GET"
+
+
+
+
+
+def test_etag_used():
+
+    # Test that we use ETags properly to validate our cache
+
+    cache_path = tests.get_cache_path()
+
+    http = httplib2.Http(cache=cache_path)
+
+    response_kwargs = dict(
+
+        add_date=True,
+
+        add_etag=True,
+
+        body=b"something",
+
+        headers={"cache-control": "public,max-age=300"},
 
     )
 
 
 
+    def handler(request):
 
+        if request.headers.get("range"):
 
-def object_to_attributes(o, e):
+            return tests.http_response_bytes(status=206, **response_kwargs)
 
-    # first process attributes from an object that belong together (eg: first-name + last-name), and remove them from the list
+        return tests.http_response_bytes(**response_kwargs)
 
-    if o['name'] == 'person':
 
-        first_name = get_attribute_in_object(o, attribute_type='first-name', drop=True).get('value')
 
-        last_name = get_attribute_in_object(o, attribute_type='last-name', drop=True).get('value')
+    with tests.server_request(handler, request_count=2) as uri:
 
-        yield entity_obj_to_entity(Person, ' '.join([first_name, last_name]).strip(), 'person', lastname=last_name, firstnames=first_name, bookmark=Bookmark.Green)
+        response, _ = http.request(uri, "GET", headers={"accept-encoding": "identity"})
 
+        assert response["etag"] == '"437b930db84b8079c2dd804a71936b5f"'
 
 
-    # process normal attributes
 
-    for a in o['Attribute']:
+        http.request(uri, "GET", headers={"accept-encoding": "identity"})
 
-        for item in attribute_to_entity(a):
+        response, _ = http.request(
 
-            yield item
+            uri,
 
+            "GET",
 
+            headers={"accept-encoding": "identity", "cache-control": "must-revalidate"},
 
+        )
 
+        assert response.status == 200
 
-def object_to_relations(o, e):
+        assert response.fromcache
 
-    # process forward and reverse references, so just loop over all the objects of the event
 
-    if 'Object' in e['Event']:
 
-        for eo in e['Event']['Object']:
+        # TODO: API to read cache item, at least internal to tests
 
-            if 'ObjectReference' in eo:
+        cache_file_name = os.path.join(
 
-                for ref in eo['ObjectReference']:
+            cache_path, httplib2.safename(httplib2.urlnorm(uri)[-1])
 
-                    # we have found original object. Expand to the related object and attributes
+        )
 
-                    if eo['uuid'] == o['uuid']:
+        with open(cache_file_name, "r") as f:
 
-                        # the reference is an Object
+            status_line = f.readline()
 
-                        if ref.get('Object'):
+        assert status_line.startswith("status:")
 
-                            # get the full object in the event, as our objectReference included does not contain everything we need
 
-                            sub_object = get_object_in_event(ref['Object']['uuid'], e)
 
-                            yield object_to_entity(sub_object, link_label=ref['relationship_type'])
+        response, content = http.request(
 
-                        # the reference is an Attribute
+            uri, "HEAD", headers={"accept-encoding": "identity"}
 
-                        if ref.get('Attribute'):
+        )
 
-                            ref['Attribute']['event_id'] = ref['event_id']   # LATER remove this ugly workaround - object can't be requested directly from MISP using the uuid, and to find a full object we need the event_id
+        assert response.status == 200
 
-                            for item in attribute_to_entity(ref['Attribute'], link_label=ref['relationship_type']):
+        assert response.fromcache
 
-                                yield item
 
 
+        response, content = http.request(
 
-                    # reverse-lookup - this is another objects relating the original object
+            uri, "GET", headers={"accept-encoding": "identity", "range": "bytes=0-0"}
 
-                    if ref['referenced_uuid'] == o['uuid']:
+        )
 
-                        yield object_to_entity(eo, link_label=ref['relationship_type'], link_direction=LinkDirection.OutputToInput)
+        assert response.status == 206
 
+        assert not response.fromcache
 
 
 
 
-def get_object_in_event(uuid, e):
 
-    for o in e['Event']['Object']:
+def test_etag_ignore():
 
-        if o['uuid'] == uuid:
+    # Test that we can forcibly ignore ETags
 
-            return o
+    http = httplib2.Http(cache=tests.get_cache_path())
 
+    response_kwargs = dict(add_date=True, add_etag=True)
 
+    with tests.server_reflect(request_count=3, **response_kwargs) as uri:
 
+        response, content = http.request(
 
+            uri, "GET", headers={"accept-encoding": "identity"}
 
-def get_attribute_in_object(o, attribute_type=False, attribute_value=False, drop=False, substring=False):
+        )
 
-    '''Gets the first attribute of a specific type within an object'''
+        assert response.status == 200
 
-    found_attribute = {'value': ''}
+        assert response["etag"] != ""
 
-    for i, a in enumerate(o['Attribute']):
 
-        if a['type'] == attribute_type:
 
-            found_attribute = a.copy()
+        response, content = http.request(
 
-            if drop:    # drop the attribute from the object
+            uri,
 
-                o['Attribute'].pop(i)
+            "GET",
 
-            break
+            headers={"accept-encoding": "identity", "cache-control": "max-age=0"},
 
-        if a['value'] == attribute_value:
+        )
 
-            found_attribute = a.copy()
+        reflected = tests.HttpRequest.from_bytes(content)
 
-            if drop:    # drop the attribute from the object
+        assert reflected.headers.get("if-none-match")
 
-                o['Attribute'].pop(i)
 
-            break
 
-        if '|' in a['type'] or a['type'] == 'malware-sample':
+        http.ignore_etag = True
 
-            if attribute_value in a['value'].split('|'):
+        response, content = http.request(
 
-                found_attribute = a.copy()
+            uri,
 
-                if drop:    # drop the attribute from the object
+            "GET",
 
-                    o['Attribute'].pop(i)
+            headers={"accept-encoding": "identity", "cache-control": "max-age=0"},
 
-                break
+        )
 
-        # TODO implement substring matching
+        assert not response.fromcache
 
-        if substring:
+        reflected = tests.HttpRequest.from_bytes(content)
 
-            keyword = attribute_value.strip('%')
+        assert not reflected.headers.get("if-none-match")
 
-            if attribute_value.startswith('%') and attribute_value.endswith('%'):
 
-                if attribute_value in a['value']:
 
-                    found_attribute = a.copy()
 
-                    if drop:    # drop the attribute from the object
 
-                        o['Attribute'].pop(i)
+def test_etag_override():
 
-                    break
+    # Test that we can forcibly ignore ETags
 
-                if '|' in a['type'] or a['type'] == 'malware-sample':
+    http = httplib2.Http(cache=tests.get_cache_path())
 
-                    val1, val2 = a['value'].split('|')
+    response_kwargs = dict(add_date=True, add_etag=True)
 
-                    if attribute_value in val1 or attribute_value in val2:
+    with tests.server_reflect(request_count=3, **response_kwargs) as uri:
 
-                        found_attribute = a.copy()
+        response, _ = http.request(uri, "GET", headers={"accept-encoding": "identity"})
 
-                        if drop:    # drop the attribute from the object
+        assert response.status == 200
 
-                            o['Attribute'].pop(i)
+        assert response["etag"] != ""
 
-                        break
 
-            elif attribute_value.startswith('%'):
 
-                if a['value'].endswith(keyword):
+        response, content = http.request(
 
-                    found_attribute = a.copy()
+            uri,
 
-                    if drop:    # drop the attribute from the object
+            "GET",
 
-                        o['Attribute'].pop(i)
+            headers={"accept-encoding": "identity", "cache-control": "max-age=0"},
 
-                    break
+        )
 
-                if '|' in a['type'] or a['type'] == 'malware-sample':
+        assert response.status == 200
 
-                    val1, val2 = a['value'].split('|')
+        reflected = tests.HttpRequest.from_bytes(content)
 
-                    if val1.endswith(keyword) or val2.endswith(keyword):
+        assert reflected.headers.get("if-none-match")
 
-                        found_attribute = a.copy()
+        assert reflected.headers.get("if-none-match") != "fred"
 
-                        if drop:    # drop the attribute from the object
 
-                            o['Attribute'].pop(i)
 
-                        break
+        response, content = http.request(
 
+            uri,
 
+            "GET",
 
-            elif attribute_value.endswith('%'):
+            headers={
 
-                if a['value'].startswith(keyword):
+                "accept-encoding": "identity",
 
-                    return a
+                "cache-control": "max-age=0",
 
-                if '|' in a['type'] or a['type'] == 'malware-sample':
+                "if-none-match": "fred",
 
-                    val1, val2 = a['value'].split('|')
+            },
 
-                    if val1.startswith(keyword) or val2.startswith(keyword):
+        )
 
-                        found_attribute = a.copy()
+        assert response.status == 200
 
-                        if drop:    # drop the attribute from the object
+        reflected = tests.HttpRequest.from_bytes(content)
 
-                            o['Attribute'].pop(i)
+        assert reflected.headers.get("if-none-match") == "fred"
 
-                        break
 
-    return found_attribute
 
 
 
+@pytest.mark.skip(reason="was commented in legacy code")
 
+def test_get_304_end_to_end():
 
-def get_attribute_in_event(e, attribute_value, substring=False):
+    pass
 
-    for a in e['Event']["Attribute"]:
+    # Test that end to end headers get overwritten in the cache
 
-        if a['value'] == attribute_value:
+    # uri = urllib.parse.urljoin(base, "304/end2end.cgi")
 
-            return a
+    # response, content = http.request(uri, 'GET')
 
-        if '|' in a['type'] or a['type'] == 'malware-sample':
+    # assertNotEqual(response['etag'], "")
 
-            if attribute_value in a['value'].split('|'):
+    # old_date = response['date']
 
-                return a
+    # time.sleep(2)
 
-        if substring:
 
-            keyword = attribute_value.strip('%')
 
-            if attribute_value.startswith('%') and attribute_value.endswith('%'):
+    # response, content = http.request(uri, 'GET', headers = {'Cache-Control': 'max-age=0'})
 
-                if attribute_value in a['value']:
+    # # The response should be from the cache, but the Date: header should be updated.
 
-                    return a
+    # new_date = response['date']
 
-                if '|' in a['type'] or a['type'] == 'malware-sample':
+    # assert new_date != old_date
 
-                    val1, val2 = a['value'].split('|')
+    # assert response.status == 200
 
-                    if attribute_value in val1 or attribute_value in val2:
+    # assert response.fromcache == True
 
-                        return a
 
-            elif attribute_value.startswith('%'):
 
-                if a['value'].endswith(keyword):
 
-                    return a
 
-                if '|' in a['type'] or a['type'] == 'malware-sample':
+def test_get_304_last_modified():
 
-                    val1, val2 = a['value'].split('|')
+    # Test that we can still handle a 304
 
-                    if val1.endswith(keyword) or val2.endswith(keyword):
+    # by only using the last-modified cache validator.
 
-                        return a
+    http = httplib2.Http(cache=tests.get_cache_path())
 
+    date = email.utils.formatdate()
 
 
-            elif attribute_value.endswith('%'):
 
-                if a['value'].startswith(keyword):
+    def handler(read):
 
-                    return a
+        read()
 
-                if '|' in a['type'] or a['type'] == 'malware-sample':
+        yield tests.http_response_bytes(
 
-                    val1, val2 = a['value'].split('|')
+            status=200, body=b"something", headers={"date": date, "last-modified": date}
 
-                    if val1.startswith(keyword) or val2.startswith(keyword):
+        )
 
-                        return a
 
 
+        request2 = read()
 
-    return None
+        assert request2.headers["if-modified-since"] == date
 
+        yield tests.http_response_bytes(status=304)
 
 
 
+    with tests.server_yield(handler, request_count=2) as uri:
 
-def convert_tags_to_note(tags):
+        response, content = http.request(uri, "GET")
 
-    if not tags:
+        assert response.get("last-modified") == date
 
-        return None
 
-    notes = []
 
-    for tag in tags:
+        response, content = http.request(uri, "GET")
 
-        for tag_note_prefix in tag_note_prefixes:
+        assert response.status == 200
 
-            if tag.startswith(tag_note_prefix):
+        assert response.fromcache
 
-                notes.append(tag)
 
-    return '\n'.join(notes)
 
 
 
+def test_get_307():
 
+    # Test that we do follow 307 redirects but
 
-def tag_matches_note_prefix(tag):
+    # do not cache the 307
 
-    for tag_note_prefix in tag_note_prefixes:
+    http = httplib2.Http(cache=tests.get_cache_path(), timeout=1)
 
-        if tag.startswith(tag_note_prefix):
+    r307 = tests.http_response_bytes(status=307, headers={"location": "/final"})
 
-            return True
+    r200 = tests.http_response_bytes(
 
-    return False
+        status=200,
 
+        add_date=True,
 
+        body=b"final content\n",
 
-
-
-def event_to_entity(e, link_style=LinkStyle.Normal, link_label=None, link_direction=LinkDirection.InputToOutput):
-
-    tags = []
-
-    if 'Tag' in e['Event']:
-
-        for t in e['Event']['Tag']:
-
-            tags.append(t['name'])
-
-    notes = convert_tags_to_note(tags)
-
-    return MISPEvent(
-
-        e['Event']['id'],
-
-        uuid=e['Event']['uuid'],
-
-        info=e['Event']['info'],
-
-        link_style=link_style,
-
-        link_label=link_label,
-
-        link_direction=link_direction,
-
-        count_attributes=len(e['Event'].get('Attribute') or ""),
-
-        count_objects=len(e['Event'].get('Object') or ""),
-
-        notes=notes,
-
-        bookmark=Bookmark.Green)
-
-
-
-
-
-def galaxycluster_to_entity(c, link_label=None, link_direction=LinkDirection.InputToOutput):
-
-    if 'meta' in c and 'uuid' in c['meta']:
-
-        c['uuid'] = c['meta']['uuid'].pop(0)
-
-
-
-    if 'meta' in c and 'synonyms' in c['meta']:
-
-        synonyms = ', '.join(c['meta']['synonyms'])
-
-    else:
-
-        synonyms = ''
-
-
-
-    galaxy_cluster = get_galaxy_cluster(uuid=c['uuid'])
-
-    # map the 'icon' name from the cluster to the icon filename of the intelligence-icons repository
-
-    try:
-
-        icon_url = mapping_galaxy_icon[galaxy_cluster['icon']]
-
-    except KeyError:
-
-        # it's not in our mapping, just ignore and leave the default icon
-
-        icon_url = None
-
-
-
-    # create the right sub-galaxy: ThreatActor, Software, AttackTechnique, ... or MISPGalaxy
-
-    try:
-
-        galaxy_type = mapping_galaxy_type[galaxy_cluster['type']]
-
-    except KeyError:
-
-        galaxy_type = MISPGalaxy
-
-    return galaxy_type(
-
-        '{}\n{}'.format(c['type'], c['value']),
-
-        uuid=c['uuid'],
-
-        description=c.get('description'),
-
-        cluster_type=c.get('type'),
-
-        cluster_value=c.get('value'),
-
-        synonyms=synonyms,
-
-        tag_name=c['tag_name'],
-
-        link_label=link_label,
-
-        icon_url=icon_url,
-
-        link_direction=link_direction
+        headers={"cache-control": "max-age=300"},
 
     )
 
 
 
+    with tests.server_list_http([r307, r200, r307]) as uri:
 
+        response, content = http.request(uri, "GET")
 
-# LATER this uses the galaxies from github as the MISP web UI does not fully support the Galaxies in the webui.
+        assert response.previous.status == 307
 
-# See https://github.com/MISP/MISP/issues/3801
+        assert not response.previous.fromcache
 
-galaxy_archive_url = 'https://github.com/MISP/misp-galaxy/archive/master.zip'
+        assert response.status == 200
 
-local_path_uuid_mapping = os.path.join(local_path_root, 'MISP_maltego_galaxy_mapping.json')
+        assert not response.fromcache
 
-local_path_clusters = os.path.join(local_path_root, 'misp-galaxy-master', 'clusters')
+        assert content == b"final content\n"
 
-galaxy_cluster_uuids = None
 
 
+        response, content = http.request(uri, "GET")
 
+        assert response.previous.status == 307
 
+        assert not response.previous.fromcache
 
-def galaxy_update_local_copy(force=False):
+        assert response.status == 200
 
-    import io
+        assert response.fromcache
 
-    import json
+        assert content == b"final content\n"
 
-    import os
 
-    import requests
 
-    from zipfile import ZipFile
 
 
+def test_post_307():
 
-    # some aging and automatic re-downloading
+    # 307: follow with same method
 
-    if not os.path.exists(local_path_uuid_mapping):
+    http = httplib2.Http(cache=tests.get_cache_path(), timeout=1)
 
-        force = True
+    http.follow_all_redirects = True
 
-    else:
+    r307 = tests.http_response_bytes(status=307, headers={"location": "/final"})
 
-        # force update if cache is older than 24 hours
+    r200 = tests.http_response_bytes(status=200, body=b"final content\n")
 
-        if time.time() - os.path.getmtime(local_path_uuid_mapping) > 60 * 60 * 24:
 
-            force = True
 
+    with tests.server_list_http([r307, r200, r307, r200]) as uri:
 
+        response, content = http.request(uri, "POST")
 
-    if force:
+        assert response.previous.status == 307
 
-        # create a lock to prevent two processes doing the same, and writing to the file at the same time
+        assert not response.previous.fromcache
 
-        lockfile = local_path_uuid_mapping + '.lock'
+        assert response.status == 200
 
-        from pathlib import Path
+        assert not response.fromcache
 
-        while os.path.exists(lockfile):
+        assert content == b"final content\n"
 
-            time.sleep(0.3)
 
-        Path(local_path_uuid_mapping + '.lock').touch()
 
-        # download the latest zip of the public galaxy
+        response, content = http.request(uri, "POST")
 
-        try:
+        assert response.previous.status == 307
 
-            resp = requests.get(galaxy_archive_url)
+        assert not response.previous.fromcache
 
-            zf = ZipFile(io.BytesIO(resp.content))
+        assert response.status == 200
 
-            zf.extractall(local_path_root)
+        assert not response.fromcache
 
-            zf.close()
+        assert content == b"final content\n"
 
-        except Exception:
 
-            raise(MaltegoException("ERROR: Could not download Galaxy data from htts://github.com/MISP/MISP-galaxy/. Please check internet connectivity."))
 
 
 
-        # generate the uuid mapping and save it to a file
+def test_change_308():
 
-        galaxies_fnames = []
+    # 308: follow with same method, cache redirect
 
-        for f in os.listdir(local_path_clusters):
+    http = httplib2.Http(cache=tests.get_cache_path(), timeout=1)
 
-            if '.json' in f:
+    routes = {
 
-                galaxies_fnames.append(f)
+        "/final": tests.make_http_reflect(),
 
-        galaxies_fnames.sort()
+        "": tests.http_response_bytes(
 
+            status="308 Permanent Redirect",
 
+            add_date=True,
 
-        cluster_uuids = {}
+            headers={"cache-control": "max-age=300", "location": "/final"},
 
-        for galaxy_fname in galaxies_fnames:
+        ),
 
-            try:
+    }
 
-                fullPathClusters = os.path.join(local_path_clusters, galaxy_fname)
 
-                with open(fullPathClusters) as fp:
 
-                    galaxy = json.load(fp)
+    with tests.server_route(routes, request_count=3) as uri:
 
-                with open(fullPathClusters.replace('clusters', 'galaxies')) as fg:
+        response, content = http.request(uri, "CHANGE", body=b"hello308")
 
-                    galaxy_main = json.load(fg)
+        assert response.previous.status == 308
 
-                for cluster in galaxy['values']:
+        assert not response.previous.fromcache
 
-                    if 'uuid' not in cluster:
+        assert response.status == 200
 
-                        continue
+        assert not response.fromcache
 
-                    # skip deprecated galaxies/clusters
+        assert content.startswith(b"CHANGE /final HTTP")
 
-                    if galaxy_main['namespace'] == 'deprecated':
 
-                        continue
 
-                    # keep track of the cluster, but also enhance it to look like the cluster we receive when accessing the web.
+        response, content = http.request(uri, "CHANGE")
 
-                    cluster_uuids[cluster['uuid']] = cluster
+        assert response.previous.status == 308
 
-                    cluster_uuids[cluster['uuid']]['type'] = galaxy['type']
+        assert response.previous.fromcache
 
-                    cluster_uuids[cluster['uuid']]['tag_name'] = 'misp-galaxy:{}="{}"'.format(galaxy['type'], cluster['value'])
+        assert response.status == 200
 
-                    if 'icon' in galaxy_main:
+        assert not response.fromcache
 
-                        cluster_uuids[cluster['uuid']]['icon'] = galaxy_main['icon']
+        assert content.startswith(b"CHANGE /final HTTP")
 
-            except Exception:
 
-                # we ignore incorrect galaxies
 
-                pass
 
 
+def test_get_410():
 
-        with open(local_path_uuid_mapping, 'w') as f:
+    # Test that we pass 410's through
 
-            json.dump(cluster_uuids, f)
+    http = httplib2.Http()
 
-        # remove the lock
+    with tests.server_const_http(status=410) as uri:
 
-        os.remove(lockfile)
+        response, content = http.request(uri, "GET")
 
+        assert response.status == 410
 
 
 
 
-def galaxy_load_cluster_mapping():
 
-    galaxy_update_local_copy()
+def test_get_duplicate_headers():
 
-    with open(local_path_uuid_mapping, 'r') as f:
+    # Test that duplicate headers get concatenated via ','
 
-        cluster_uuids = json.load(f)
+    http = httplib2.Http()
 
-    return cluster_uuids
+    response = b"""HTTP/1.0 200 OK\r\n\
 
+Link: link1\r\n\
 
+Content-Length: 7\r\n\
 
+Link: link2\r\n\r\n\
 
+content"""
 
-def get_galaxy_cluster(uuid=None, tag=None, request_entity=None):
+    with tests.server_const_bytes(response) as uri:
 
-    global galaxy_cluster_uuids
+        response, content = http.request(uri, "GET")
 
-    if not galaxy_cluster_uuids:
+        assert response.status == 200
 
-        galaxy_cluster_uuids = galaxy_load_cluster_mapping()
+        assert content == b"content"
 
+        assert response["link"], "link1, link2"
 
 
-    if uuid:
 
-        return galaxy_cluster_uuids.get(uuid)
 
-    if tag:
 
-        for item in galaxy_cluster_uuids.values():
+def test_custom_redirect_codes():
 
-            if item['tag_name'] == tag:
+    http = httplib2.Http()
 
-                return item
+    http.redirect_codes = set([300])
 
-    if request_entity:
+    with tests.server_const_http(status=301, request_count=1) as uri:
 
-        if request_entity.uuid:
+        response, content = http.request(uri, "GET")
 
-            return get_galaxy_cluster(uuid=request_entity.uuid)
+        assert response.status == 301
 
-        elif request_entity.tag_name:
-
-            return get_galaxy_cluster(tag=request_entity.tag_name)
-
-        elif request_entity.name:
-
-            return get_galaxy_cluster(tag=request_entity.name)
-
-
-
-
-
-def search_galaxy_cluster(keyword):
-
-    keyword = keyword.lower()
-
-    global galaxy_cluster_uuids
-
-    if not galaxy_cluster_uuids:
-
-        galaxy_cluster_uuids = galaxy_load_cluster_mapping()
-
-
-
-    # % only at start
-
-    if keyword.startswith('%') and not keyword.endswith('%'):
-
-        keyword = keyword.strip('%')
-
-        for item in galaxy_cluster_uuids.values():
-
-            if item['value'].lower().endswith(keyword):
-
-                yield item
-
-            else:
-
-                if 'meta' in item and 'synonyms' in item['meta']:
-
-                    for synonym in item['meta']['synonyms']:
-
-                        if synonym.lower().endswith(keyword):
-
-                            yield item
-
-
-
-    # % only at end
-
-    elif keyword.endswith('%') and not keyword.startswith('%'):
-
-        keyword = keyword.strip('%')
-
-        for item in galaxy_cluster_uuids.values():
-
-            if item['value'].lower().startswith(keyword):
-
-                yield item
-
-            else:
-
-                if 'meta' in item and 'synonyms' in item['meta']:
-
-                    for synonym in item['meta']['synonyms']:
-
-                        if synonym.lower().startswith(keyword):
-
-                            yield item
-
-
-
-    # search substring assuming % at start and end
-
-    else:
-
-        keyword = keyword.strip('%')
-
-        for item in galaxy_cluster_uuids.values():
-
-            if keyword in item['value'].lower():
-
-                yield item
-
-            else:
-
-                if 'meta' in item and 'synonyms' in item['meta']:
-
-                    for synonym in item['meta']['synonyms']:
-
-                        if keyword in synonym.lower():
-
-                            yield item
-
-
-
-
-
-def get_galaxies_relating(uuid):
-
-    global galaxy_cluster_uuids
-
-    if not galaxy_cluster_uuids:
-
-        galaxy_cluster_uuids = galaxy_load_cluster_mapping()
-
-
-
-    for item in galaxy_cluster_uuids.values():
-
-        if 'related' in item:
-
-            for related in item['related']:
-
-                if related['dest-uuid'] == uuid:
-
-                    yield item
+        assert response.previous is None

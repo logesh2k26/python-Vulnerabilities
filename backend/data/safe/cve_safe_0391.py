@@ -2,156 +2,66 @@
 # Safety: safe
 # Category: safe
 
-import time
+"""Encryption module that uses pycryptopp or pycrypto"""
 
-from pydoc import locate
+try:
 
+    # Pycryptopp is preferred over Crypto because Crypto has had
 
+    # various periods of not being maintained, and pycryptopp uses
 
-from django.conf import settings
+    # the Crypto++ library which is generally considered the 'gold standard'
 
+    # of crypto implementations
 
+    from pycryptopp.cipher import aes
 
-DEFAULT_CONFIG = {
 
-    'config_version': 4,
 
-    'flag_prefix': 'ractf',
+    def aesEncrypt(data, key):
 
-    'graph_members': 10,
+        cipher = aes.AES(key)
 
-    'register_end_time': -1,
+        return cipher.process(data)
 
-    'end_time': time.time() + 7 * 24 * 60 * 60,
 
-    'start_time': time.time(),
 
-    'register_start_time': time.time(),
+    # magic.
 
-    'team_size': -1,
+    aesDecrypt = aesEncrypt
 
-    'email_regex': '',
 
-    'email_domain': '',
 
-    'login_provider': 'basic_auth',
+except ImportError:
 
-    'registration_provider': 'basic_auth',
+    from Crypto.Cipher import AES
 
-    'token_provider': 'basic_auth',
+    from Crypto.Util import Counter
 
-    'enable_bot_users': True,
 
-    'enable_ctftime': True,
 
-    'enable_flag_submission': True,
+    def aesEncrypt(data, key):
 
-    'enable_flag_submission_after_competition': True,
+        cipher = AES.new(key, AES.MODE_CTR,
 
-    'enable_force_admin_2fa': False,
+                         counter=Counter.new(128, initial_value=0))
 
-    'enable_track_incorrect_submissions': True,
 
-    'enable_login': True,
 
-    'enable_prelogin': True,
+        return cipher.encrypt(data)
 
-    'enable_maintenance_mode': False,
 
-    'enable_registration': True,
 
-    'enable_scoreboard': True,
+    def aesDecrypt(data, key):
 
-    'enable_scoring': True,
+        cipher = AES.new(key, AES.MODE_CTR,
 
-    'enable_solve_broadcast': True,
+                         counter=Counter.new(128, initial_value=0))
 
-    'enable_teams': True,
+        return cipher.decrypt(data)
 
-    'enable_team_join': True,
 
-    'enable_view_challenges_after_competion': True,
 
-    'enable_team_leave': False,
+def getKeyLength():
 
-    'invite_required': False,
-
-    'hide_scoreboard_at': -1,
-
-    'setup_wizard_complete': False,
-
-    'sensitive_fields': ['sensitive_fields', 'enable_force_admin_2fa']
-
-}
-
-
-
-backend = locate(settings.CONFIG['BACKEND'])()
-
-backend.load(defaults=DEFAULT_CONFIG)
-
-
-
-
-
-def get(key):
-
-    return backend.get(key)
-
-
-
-
-
-def set(key, value):
-
-    backend.set(key, value)
-
-
-
-
-
-def get_all():
-
-    return backend.get_all()
-
-
-
-
-
-def get_all_non_sensitive():
-
-    sensitive = backend.get('sensitive_fields')
-
-    config = backend.get_all()
-
-    for field in sensitive:
-
-        del config[field]
-
-    return config
-
-
-
-
-
-def is_sensitive(key):
-
-    return key in backend.get('sensitive_fields')
-
-
-
-
-
-def set_bulk(values: dict):
-
-    for key, value in values.items():
-
-        set(key, value)
-
-
-
-
-
-def add_plugin_config(name, config):
-
-    DEFAULT_CONFIG[name] = config
+    return 32

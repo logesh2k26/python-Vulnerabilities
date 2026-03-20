@@ -1,55 +1,203 @@
 # Source: CVEFixes dataset
-# Safety: vulnerable
+# Safety: safe
 # Category: safe
 
-import json
+# -*- coding: utf-8 -*-
 
 
 
-from tornado import web
+# Copyright 2014-2015 OpenMarket Ltd
+
+#
+
+# Licensed under the Apache License, Version 2.0 (the "License");
+
+# you may not use this file except in compliance with the License.
+
+# You may obtain a copy of the License at
+
+#
+
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+#
+
+# Unless required by applicable law or agreed to in writing, software
+
+# distributed under the License is distributed on an "AS IS" BASIS,
+
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+
+# See the License for the specific language governing permissions and
+
+# limitations under the License.
 
 
 
-from ...base.handlers import IPythonHandler, json_errors
+import logging
+
+import socket
+
+import random
+
+import smtplib
+
+import email.utils
+
+import string
+
+import twisted.python.log
+
+import cgi
+
+import urllib
 
 
 
-class NbconvertRootHandler(IPythonHandler):
-
-    SUPPORTED_METHODS = ('GET',)
+import email.utils
 
 
 
-    @web.authenticated
+from sydent.util import time_msec
 
-    @json_errors
 
-    def get(self):
+
+logger = logging.getLogger(__name__)
+
+
+
+
+
+def sendEmail(sydent, templateName, mailTo, substitutions):
+
+        mailFrom = sydent.cfg.get('email', 'email.from')
+
+        mailTemplateFile = sydent.cfg.get('email', templateName)
+
+
+
+        myHostname = sydent.cfg.get('email', 'email.hostname')
+
+        if myHostname == '':
+
+            myHostname = socket.getfqdn()
+
+        midRandom = "".join([random.choice(string.ascii_letters) for _ in range(16)])
+
+        messageid = "<%d%s@%s>" % (time_msec(), midRandom, myHostname)
+
+
+
+        allSubstitutions = {}
+
+        allSubstitutions.update(substitutions)
+
+        allSubstitutions.update({
+
+            'messageid': messageid,
+
+            'date': email.utils.formatdate(localtime=False),
+
+            'to': mailTo,
+
+            'from': mailFrom,
+
+        })
+
+
+
+        for k,v in allSubstitutions.items():
+
+            allSubstitutions[k] = v.decode('utf8')
+
+            allSubstitutions[k+"_forhtml"] = cgi.escape(v.decode('utf8'))
+
+            allSubstitutions[k+"_forurl"] = urllib.quote(v)
+
+
+
+        mailString = open(mailTemplateFile).read().decode('utf8') % allSubstitutions
+
+        parsedFrom = email.utils.parseaddr(mailFrom)[1]
+
+        parsedTo = email.utils.parseaddr(mailTo)[1]
+
+        if parsedFrom == '' or parsedTo == '':
+
+            logger.info("Couldn't parse from / to address %s / %s", mailFrom, mailTo)
+
+            raise EmailAddressException()
+
+
+
+        mailServer = sydent.cfg.get('email', 'email.smtphost')
+
+        mailPort = sydent.cfg.get('email', 'email.smtpport')
+
+        mailUsername = sydent.cfg.get('email', 'email.smtpusername')
+
+        mailPassword = sydent.cfg.get('email', 'email.smtppassword')
+
+        mailTLSMode = sydent.cfg.get('email', 'email.tlsmode')
+
+        logger.info("Sending mail to %s with mail server: %s" % (mailTo, mailServer,))
 
         try:
 
-            from IPython.nbconvert.exporters.export import exporter_map
+            if mailTLSMode == 'SSL' or mailTLSMode == 'TLS':
 
-        except ImportError as e:
+                smtp = smtplib.SMTP_SSL(mailServer, mailPort, myHostname)
 
-            raise web.HTTPError(500, "Could not import nbconvert: %s" % e)
+            elif mailTLSMode == 'STARTTLS':
 
-        res = {}
+                smtp = smtplib.SMTP(mailServer, mailPort, myHostname)
 
-        for format, exporter in exporter_map.items():
+                smtp.starttls()
 
-            res[format] = info = {}
+            else:
 
-            info['output_mimetype'] = exporter.output_mimetype
+                smtp = smtplib.SMTP(mailServer, mailPort, myHostname)
+
+            if mailUsername != '':
+
+                smtp.login(mailUsername, mailPassword)
 
 
 
-        self.finish(json.dumps(res))
+            # We're using the parsing above to do basic validation, but instead of
+
+            # failing it may munge the address it returns. So we should *not* use
+
+            # that parsed address, as it may not match any validation done
+
+            # elsewhere.
+
+            smtp.sendmail(mailFrom, mailTo, mailString.encode('utf-8'))
+
+            smtp.quit()
+
+        except Exception as origException:
+
+            twisted.python.log.err()
+
+            ese = EmailSendException()
+
+            ese.cause = origException
+
+            raise ese
 
 
 
-default_handlers = [
 
-    (r"/api/nbconvert", NbconvertRootHandler),
 
-]
+class EmailAddressException(Exception):
+
+    pass
+
+
+
+
+
+class EmailSendException(Exception):
+
+    pass

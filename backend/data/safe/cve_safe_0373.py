@@ -2,96 +2,90 @@
 # Safety: safe
 # Category: safe
 
-from importlib import import_module
+from datetime import datetime
 
-from os import path, listdir
+from unittest.mock import Mock
 
-from string import lower
-
-
-
-from debug import logger
-
-import paths
+from unittest.mock import patch
 
 
 
-class MsgBase(object):
+from saml2.config import config_factory
 
-    def encode(self):
+from saml2.response import authn_response
 
-        self.data = {"": lower(type(self).__name__)}
-
-
+from saml2.sigver import SignatureError
 
 
 
-def constructObject(data):
-
-    try:
-
-        m = import_module("messagetypes." + data[""])
-
-        classBase = getattr(m, data[""].title())
-
-    except (NameError, ImportError):
-
-        logger.error("Don't know how to handle message type: \"%s\"", data[""], exc_info=True)
-
-        return None
-
-    try:
-
-        returnObj = classBase()
-
-        returnObj.decode(data)
-
-    except KeyError as e:
-
-        logger.error("Missing mandatory key %s", e)
-
-        return None
-
-    except:
-
-        logger.error("classBase fail", exc_info=True)
-
-        return None
-
-    else:
-
-        return returnObj
+from dateutil import parser
 
 
 
-if paths.frozen is not None:
+from pytest import raises
 
-    import messagetypes.message
 
-    import messagetypes.vote
 
-else:
+from pathutils import dotname
 
-    for mod in listdir(path.dirname(__file__)):
+from pathutils import full_path
 
-        if mod == "__init__.py":
 
-            continue
 
-        splitted = path.splitext(mod)
 
-        if splitted[1] != ".py":
 
-            continue
+XML_RESPONSE_XSW = full_path("saml2_response_xsw.xml")
 
-        try:
 
-            import_module("." + splitted[0], "messagetypes")
 
-        except ImportError:
 
-            logger.error("Error importing %s", mod, exc_info=True)
 
-        else:
+class TestAuthnResponse:
 
-            logger.debug("Imported message type module %s", mod)
+    def setup_class(self):
+
+        self.conf = config_factory("sp", dotname("server_conf"))
+
+        self.ar = authn_response(self.conf, "http://lingon.catalogix.se:8087/")
+
+
+
+    @patch('saml2.response.validate_on_or_after', return_value=True)
+
+    def test_verify_signed_xsw(self, mock_validate_on_or_after):
+
+        self.ar.issue_instant_ok = Mock(return_value=True)
+
+
+
+        with open(XML_RESPONSE_XSW) as fp:
+
+            xml_response = fp.read()
+
+
+
+        self.ar.outstanding_queries = {"id12": "http://localhost:8088/sso"}
+
+        self.ar.timeslack = 10000
+
+        self.ar.loads(xml_response, decode=False)
+
+
+
+        assert self.ar.came_from == 'http://localhost:8088/sso'
+
+        assert self.ar.session_id() == "id12"
+
+        assert self.ar.issuer() == 'urn:mace:example.com:saml:roland:idp'
+
+
+
+        with raises(SignatureError):
+
+            self.ar.verify()
+
+
+
+        assert self.ar.ava is None
+
+        assert self.ar.name_id is None

@@ -2,13 +2,57 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-"""Tornado handlers for the contents web service."""
+#
+
+# djblets_js.py -- JavaScript-related template tags
+
+#
+
+# Copyright (c) 2007-2009  Christian Hammond
+
+# Copyright (c) 2007-2009  David Trowbridge
+
+#
+
+# Permission is hereby granted, free of charge, to any person obtaining
+
+# a copy of this software and associated documentation files (the
+
+# "Software"), to deal in the Software without restriction, including
+
+# without limitation the rights to use, copy, modify, merge, publish,
+
+# distribute, sublicense, and/or sell copies of the Software, and to
+
+# permit persons to whom the Software is furnished to do so, subject to
+
+# the following conditions:
+
+#
+
+# The above copyright notice and this permission notice shall be included
+
+# in all copies or substantial portions of the Software.
+
+#
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+
+# IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+
+# CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+
+# TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 
 
-# Copyright (c) IPython Development Team.
-
-# Distributed under the terms of the Modified BSD License.
+from __future__ import unicode_literals
 
 
 
@@ -16,672 +60,138 @@ import json
 
 
 
-from tornado import gen, web
+from django import template
+
+from django.core.serializers import serialize
+
+from django.db.models.query import QuerySet
+
+from django.utils import six
+
+from django.utils.safestring import mark_safe
 
 
 
-from IPython.html.utils import url_path_join, url_escape
-
-from IPython.utils.jsonutil import date_default
-
-
-
-from IPython.html.base.handlers import (
-
-    IPythonHandler, APIHandler, json_errors, path_regex,
-
-)
-
-
-
-
-
-def sort_key(model):
-
-    """key function for case-insensitive sort by name and type"""
-
-    iname = model['name'].lower()
-
-    type_key = {
-
-        'directory' : '0',
-
-        'notebook'  : '1',
-
-        'file'      : '2',
-
-    }.get(model['type'], '9')
-
-    return u'%s%s' % (type_key, iname)
+from djblets.util.serializers import DjbletsJSONEncoder
 
 
 
 
 
-def validate_model(model, expect_content):
+register = template.Library()
+
+
+
+
+
+@register.simple_tag
+
+def form_dialog_fields(form):
 
     """
 
-    Validate a model returned by a ContentsManager method.
+    Translates a Django Form object into a JavaScript list of fields.
 
+    The resulting list of fields can be used to represent the form
 
-
-    If expect_content is True, then we expect non-null entries for 'content'
-
-    and 'format'.
+    dynamically.
 
     """
 
-    required_keys = {
-
-        "name",
-
-        "path",
-
-        "type",
-
-        "writable",
-
-        "created",
-
-        "last_modified",
-
-        "mimetype",
-
-        "content",
-
-        "format",
-
-    }
-
-    missing = required_keys - set(model.keys())
-
-    if missing:
-
-        raise web.HTTPError(
-
-            500,
-
-            u"Missing Model Keys: {missing}".format(missing=missing),
-
-        )
+    s = ''
 
 
 
-    maybe_none_keys = ['content', 'format']
+    for field in form:
 
-    if model['type'] == 'file':
+        s += "{ name: '%s', " % field.name
 
-        # mimetype should be populated only for file models
 
-        maybe_none_keys.append('mimetype')
 
-    if expect_content:
+        if field.is_hidden:
 
-        errors = [key for key in maybe_none_keys if model[key] is None]
+            s += "hidden: true, "
 
-        if errors:
+        else:
 
-            raise web.HTTPError(
+            s += "label: '%s', " % field.label_tag(field.label + ":")
 
-                500,
 
-                u"Keys unexpectedly None: {keys}".format(keys=errors),
 
-            )
+            if field.field.required:
+
+                s += "required: true, "
+
+
+
+            if field.field.help_text:
+
+                s += "help_text: '%s', " % field.field.help_text
+
+
+
+        s += "widget: '%s' }," % six.text_type(field)
+
+
+
+    # Chop off the last ','
+
+    return "[ %s ]" % s[:-1]
+
+
+
+
+
+@register.filter
+
+def json_dumps(value, indent=None):
+
+    if isinstance(value, QuerySet):
+
+        result = serialize('json', value, indent=indent)
 
     else:
 
-        errors = {
+        result = json.dumps(value, indent=indent, cls=DjbletsJSONEncoder)
 
-            key: model[key]
 
-            for key in maybe_none_keys
 
-            if model[key] is not None
+    return mark_safe(result)
 
-        }
 
-        if errors:
 
-            raise web.HTTPError(
 
-                500,
 
-                u"Keys unexpectedly not None: {keys}".format(keys=errors),
+@register.filter
 
-            )
+def json_dumps_items(d, append=''):
 
+    """Dumps a list of keys/values from a dictionary, without braces.
 
 
 
+    This works very much like ``json_dumps``, but doesn't output the
 
-class ContentsHandler(APIHandler):
+    surrounding braces. This allows it to be used within a JavaScript
 
+    object definition alongside other custom keys.
 
 
-    SUPPORTED_METHODS = (u'GET', u'PUT', u'PATCH', u'POST', u'DELETE')
 
+    If the dictionary is not empty, and ``append`` is passed, it will be
 
+    appended onto the results. This is most useful when you want to append
 
-    def location_url(self, path):
+    a comma after all the dictionary items, in order to provide further
 
-        """Return the full URL location of a file.
+    keys in the template.
 
+    """
 
+    if not d:
 
-        Parameters
+        return ''
 
-        ----------
 
-        path : unicode
 
-            The API path of the file, such as "foo/bar.txt".
-
-        """
-
-        return url_escape(url_path_join(
-
-            self.base_url, 'api', 'contents', path
-
-        ))
-
-
-
-    def _finish_model(self, model, location=True):
-
-        """Finish a JSON request with a model, setting relevant headers, etc."""
-
-        if location:
-
-            location = self.location_url(model['path'])
-
-            self.set_header('Location', location)
-
-        self.set_header('Last-Modified', model['last_modified'])
-
-        self.set_header('Content-Type', 'application/json')
-
-        self.finish(json.dumps(model, default=date_default))
-
-
-
-    @web.authenticated
-
-    @json_errors
-
-    @gen.coroutine
-
-    def get(self, path=''):
-
-        """Return a model for a file or directory.
-
-
-
-        A directory model contains a list of models (without content)
-
-        of the files and directories it contains.
-
-        """
-
-        path = path or ''
-
-        type = self.get_query_argument('type', default=None)
-
-        if type not in {None, 'directory', 'file', 'notebook'}:
-
-            raise web.HTTPError(400, u'Type %r is invalid' % type)
-
-
-
-        format = self.get_query_argument('format', default=None)
-
-        if format not in {None, 'text', 'base64'}:
-
-            raise web.HTTPError(400, u'Format %r is invalid' % format)
-
-        content = self.get_query_argument('content', default='1')
-
-        if content not in {'0', '1'}:
-
-            raise web.HTTPError(400, u'Content %r is invalid' % content)
-
-        content = int(content)
-
-        
-
-        model = yield gen.maybe_future(self.contents_manager.get(
-
-            path=path, type=type, format=format, content=content,
-
-        ))
-
-        if model['type'] == 'directory' and content:
-
-            # group listing by type, then by name (case-insensitive)
-
-            # FIXME: sorting should be done in the frontends
-
-            model['content'].sort(key=sort_key)
-
-        validate_model(model, expect_content=content)
-
-        self._finish_model(model, location=False)
-
-
-
-    @web.authenticated
-
-    @json_errors
-
-    @gen.coroutine
-
-    def patch(self, path=''):
-
-        """PATCH renames a file or directory without re-uploading content."""
-
-        cm = self.contents_manager
-
-        model = self.get_json_body()
-
-        if model is None:
-
-            raise web.HTTPError(400, u'JSON body missing')
-
-        model = yield gen.maybe_future(cm.update(model, path))
-
-        validate_model(model, expect_content=False)
-
-        self._finish_model(model)
-
-    
-
-    @gen.coroutine
-
-    def _copy(self, copy_from, copy_to=None):
-
-        """Copy a file, optionally specifying a target directory."""
-
-        self.log.info(u"Copying {copy_from} to {copy_to}".format(
-
-            copy_from=copy_from,
-
-            copy_to=copy_to or '',
-
-        ))
-
-        model = yield gen.maybe_future(self.contents_manager.copy(copy_from, copy_to))
-
-        self.set_status(201)
-
-        validate_model(model, expect_content=False)
-
-        self._finish_model(model)
-
-
-
-    @gen.coroutine
-
-    def _upload(self, model, path):
-
-        """Handle upload of a new file to path"""
-
-        self.log.info(u"Uploading file to %s", path)
-
-        model = yield gen.maybe_future(self.contents_manager.new(model, path))
-
-        self.set_status(201)
-
-        validate_model(model, expect_content=False)
-
-        self._finish_model(model)
-
-    
-
-    @gen.coroutine
-
-    def _new_untitled(self, path, type='', ext=''):
-
-        """Create a new, empty untitled entity"""
-
-        self.log.info(u"Creating new %s in %s", type or 'file', path)
-
-        model = yield gen.maybe_future(self.contents_manager.new_untitled(path=path, type=type, ext=ext))
-
-        self.set_status(201)
-
-        validate_model(model, expect_content=False)
-
-        self._finish_model(model)
-
-    
-
-    @gen.coroutine
-
-    def _save(self, model, path):
-
-        """Save an existing file."""
-
-        self.log.info(u"Saving file at %s", path)
-
-        model = yield gen.maybe_future(self.contents_manager.save(model, path))
-
-        validate_model(model, expect_content=False)
-
-        self._finish_model(model)
-
-
-
-    @web.authenticated
-
-    @json_errors
-
-    @gen.coroutine
-
-    def post(self, path=''):
-
-        """Create a new file in the specified path.
-
-
-
-        POST creates new files. The server always decides on the name.
-
-
-
-        POST /api/contents/path
-
-          New untitled, empty file or directory.
-
-        POST /api/contents/path
-
-          with body {"copy_from" : "/path/to/OtherNotebook.ipynb"}
-
-          New copy of OtherNotebook in path
-
-        """
-
-
-
-        cm = self.contents_manager
-
-
-
-        if cm.file_exists(path):
-
-            raise web.HTTPError(400, "Cannot POST to files, use PUT instead.")
-
-
-
-        if not cm.dir_exists(path):
-
-            raise web.HTTPError(404, "No such directory: %s" % path)
-
-
-
-        model = self.get_json_body()
-
-
-
-        if model is not None:
-
-            copy_from = model.get('copy_from')
-
-            ext = model.get('ext', '')
-
-            type = model.get('type', '')
-
-            if copy_from:
-
-                yield self._copy(copy_from, path)
-
-            else:
-
-                yield self._new_untitled(path, type=type, ext=ext)
-
-        else:
-
-            yield self._new_untitled(path)
-
-
-
-    @web.authenticated
-
-    @json_errors
-
-    @gen.coroutine
-
-    def put(self, path=''):
-
-        """Saves the file in the location specified by name and path.
-
-
-
-        PUT is very similar to POST, but the requester specifies the name,
-
-        whereas with POST, the server picks the name.
-
-
-
-        PUT /api/contents/path/Name.ipynb
-
-          Save notebook at ``path/Name.ipynb``. Notebook structure is specified
-
-          in `content` key of JSON request body. If content is not specified,
-
-          create a new empty notebook.
-
-        """
-
-        model = self.get_json_body()
-
-        if model:
-
-            if model.get('copy_from'):
-
-                raise web.HTTPError(400, "Cannot copy with PUT, only POST")
-
-            exists = yield gen.maybe_future(self.contents_manager.file_exists(path))
-
-            if exists:
-
-                yield gen.maybe_future(self._save(model, path))
-
-            else:
-
-                yield gen.maybe_future(self._upload(model, path))
-
-        else:
-
-            yield gen.maybe_future(self._new_untitled(path))
-
-
-
-    @web.authenticated
-
-    @json_errors
-
-    @gen.coroutine
-
-    def delete(self, path=''):
-
-        """delete a file in the given path"""
-
-        cm = self.contents_manager
-
-        self.log.warn('delete %s', path)
-
-        yield gen.maybe_future(cm.delete(path))
-
-        self.set_status(204)
-
-        self.finish()
-
-
-
-
-
-class CheckpointsHandler(APIHandler):
-
-
-
-    SUPPORTED_METHODS = ('GET', 'POST')
-
-
-
-    @web.authenticated
-
-    @json_errors
-
-    @gen.coroutine
-
-    def get(self, path=''):
-
-        """get lists checkpoints for a file"""
-
-        cm = self.contents_manager
-
-        checkpoints = yield gen.maybe_future(cm.list_checkpoints(path))
-
-        data = json.dumps(checkpoints, default=date_default)
-
-        self.finish(data)
-
-
-
-    @web.authenticated
-
-    @json_errors
-
-    @gen.coroutine
-
-    def post(self, path=''):
-
-        """post creates a new checkpoint"""
-
-        cm = self.contents_manager
-
-        checkpoint = yield gen.maybe_future(cm.create_checkpoint(path))
-
-        data = json.dumps(checkpoint, default=date_default)
-
-        location = url_path_join(self.base_url, 'api/contents',
-
-            path, 'checkpoints', checkpoint['id'])
-
-        self.set_header('Location', url_escape(location))
-
-        self.set_status(201)
-
-        self.finish(data)
-
-
-
-
-
-class ModifyCheckpointsHandler(APIHandler):
-
-
-
-    SUPPORTED_METHODS = ('POST', 'DELETE')
-
-
-
-    @web.authenticated
-
-    @json_errors
-
-    @gen.coroutine
-
-    def post(self, path, checkpoint_id):
-
-        """post restores a file from a checkpoint"""
-
-        cm = self.contents_manager
-
-        yield gen.maybe_future(cm.restore_checkpoint(checkpoint_id, path))
-
-        self.set_status(204)
-
-        self.finish()
-
-
-
-    @web.authenticated
-
-    @json_errors
-
-    @gen.coroutine
-
-    def delete(self, path, checkpoint_id):
-
-        """delete clears a checkpoint for a given file"""
-
-        cm = self.contents_manager
-
-        yield gen.maybe_future(cm.delete_checkpoint(checkpoint_id, path))
-
-        self.set_status(204)
-
-        self.finish()
-
-
-
-
-
-class NotebooksRedirectHandler(IPythonHandler):
-
-    """Redirect /api/notebooks to /api/contents"""
-
-    SUPPORTED_METHODS = ('GET', 'PUT', 'PATCH', 'POST', 'DELETE')
-
-
-
-    def get(self, path):
-
-        self.log.warn("/api/notebooks is deprecated, use /api/contents")
-
-        self.redirect(url_path_join(
-
-            self.base_url,
-
-            'api/contents',
-
-            path
-
-        ))
-
-
-
-    put = patch = post = delete = get
-
-
-
-
-
-#-----------------------------------------------------------------------------
-
-# URL to handler mappings
-
-#-----------------------------------------------------------------------------
-
-
-
-
-
-_checkpoint_id_regex = r"(?P<checkpoint_id>[\w-]+)"
-
-
-
-default_handlers = [
-
-    (r"/api/contents%s/checkpoints" % path_regex, CheckpointsHandler),
-
-    (r"/api/contents%s/checkpoints/%s" % (path_regex, _checkpoint_id_regex),
-
-        ModifyCheckpointsHandler),
-
-    (r"/api/contents%s" % path_regex, ContentsHandler),
-
-    (r"/api/notebooks/?(.*)", NotebooksRedirectHandler),
-
-]
+    return mark_safe(json_dumps(d)[1:-1] + append)

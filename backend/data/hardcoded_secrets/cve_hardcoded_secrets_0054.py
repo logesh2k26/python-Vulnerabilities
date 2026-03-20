@@ -2,532 +2,404 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-"""
+from k5test import *
 
-Custom Authenticator to use GitLab OAuth with JupyterHub
 
-"""
 
+realm = K5Realm(create_host=False, get_creds=False)
 
+usercache = 'FILE:' + os.path.join(realm.testdir, 'usercache')
 
+storagecache = 'FILE:' + os.path.join(realm.testdir, 'save')
 
 
-import json
 
-import os
+# Create two service principals with keys in the default keytab.
 
-import re
+service1 = 'service/1@%s' % realm.realm
 
-import sys
+realm.addprinc(service1)
 
-import warnings
+realm.extract_keytab(service1, realm.keytab)
 
-from urllib.parse import quote
+service2 = 'service/2@%s' % realm.realm
 
+realm.addprinc(service2)
 
+realm.extract_keytab(service2, realm.keytab)
 
-from tornado.auth import OAuth2Mixin
 
-from tornado import web
 
+puser = 'p:' + realm.user_princ
 
+pservice1 = 'p:' + service1
 
-from tornado.escape import url_escape
+pservice2 = 'p:' + service2
 
-from tornado.httputil import url_concat
 
-from tornado.httpclient import HTTPRequest, AsyncHTTPClient
 
+# Get forwardable creds for service1 in the default cache.
 
+realm.kinit(service1, None, ['-f', '-k'])
 
-from jupyterhub.auth import LocalAuthenticator
 
 
+# Try krb5 -> S4U2Proxy with forwardable user creds.  This should fail
 
-from traitlets import Set, CUnicode, Unicode, default, observe
+# at the S4U2Proxy step since the DB2 back end currently has no
 
+# support for allowing it.
 
+realm.kinit(realm.user_princ, password('user'), ['-f', '-c', usercache])
 
-from .oauth2 import OAuthLoginHandler, OAuthenticator
+output = realm.run(['./t_s4u2proxy_krb5', usercache, storagecache, '-',
 
+                    pservice1, pservice2], expected_code=1)
 
+if ('auth1: ' + realm.user_princ not in output or
 
+    'NOT_ALLOWED_TO_DELEGATE' not in output):
 
+    fail('krb5 -> s4u2proxy')
 
-def _api_headers(access_token):
 
-    return {
 
-        "Accept": "application/json",
+# Again with SPNEGO.
 
-        "User-Agent": "JupyterHub",
+output = realm.run(['./t_s4u2proxy_krb5', '--spnego', usercache, storagecache,
 
-        "Authorization": "Bearer {}".format(access_token),
+                    '-', pservice1, pservice2],
 
-    }
+                   expected_code=1)
 
+if ('auth1: ' + realm.user_princ not in output or
 
+    'NOT_ALLOWED_TO_DELEGATE' not in output):
 
+    fail('krb5 -> s4u2proxy (SPNEGO)')
 
 
-class GitLabOAuthenticator(OAuthenticator):
 
-    # see gitlab_scopes.md for details about scope config
+# Try krb5 -> S4U2Proxy without forwardable user creds.  This should
 
-    # set scopes via config, e.g.
+# result in no delegated credential being created by
 
-    # c.GitLabOAuthenticator.scope = ['read_user']
+# accept_sec_context.
 
+realm.kinit(realm.user_princ, password('user'), ['-c', usercache])
 
+realm.run(['./t_s4u2proxy_krb5', usercache, storagecache, pservice1,
 
-    _deprecated_aliases = {
+           pservice1, pservice2], expected_msg='no credential delegated')
 
-        "gitlab_group_whitelist": ("allowed_gitlab_groups", "0.12.0"),
 
-        "gitlab_project_id_whitelist": ("allowed_project_ids", "0.12.0")
 
-    }
+# Try S4U2Self.  Ask for an S4U2Proxy step; this won't happen because
 
+# service/1 isn't allowed to get a forwardable S4U2Self ticket.
 
+output = realm.run(['./t_s4u', puser, pservice2])
 
-    @observe(*list(_deprecated_aliases))
+if ('Warning: no delegated cred handle' not in output or
 
-    def _deprecated_trait(self, change):
+    'Source name:\t' + realm.user_princ not in output):
 
-        super()._deprecated_trait(change)
+    fail('s4u2self')
 
+output = realm.run(['./t_s4u', '--spnego', puser, pservice2])
 
+if ('Warning: no delegated cred handle' not in output or
 
-    login_service = "GitLab"
+    'Source name:\t' + realm.user_princ not in output):
 
+    fail('s4u2self (SPNEGO)')
 
 
-    client_id_env = 'GITLAB_CLIENT_ID'
 
-    client_secret_env = 'GITLAB_CLIENT_SECRET'
+# Correct that problem and try again.  As above, the S4U2Proxy step
 
+# won't actually succeed since we don't support that in DB2.
 
+realm.run([kadminl, 'modprinc', '+ok_to_auth_as_delegate', service1])
 
-    gitlab_url = Unicode("https://gitlab.com", config=True)
+realm.run(['./t_s4u', puser, pservice2], expected_code=1,
 
+          expected_msg='NOT_ALLOWED_TO_DELEGATE')
 
 
-    @default("gitlab_url")
 
-    def _default_gitlab_url(self):
+# Again with SPNEGO.  This uses SPNEGO for the initial authentication,
 
-        """get default gitlab url from env"""
+# but still uses krb5 for S4U2Proxy--the delegated cred is returned as
 
-        gitlab_url = os.getenv('GITLAB_URL')
+# a krb5 cred, not a SPNEGO cred, and t_s4u uses the delegated cred
 
-        gitlab_host = os.getenv('GITLAB_HOST')
+# directly rather than saving and reacquiring it.
 
+realm.run(['./t_s4u', '--spnego', puser, pservice2], expected_code=1,
 
+          expected_msg='NOT_ALLOWED_TO_DELEGATE')
 
-        if not gitlab_url and gitlab_host:
 
-            warnings.warn(
 
-                'Use of GITLAB_HOST might be deprecated in the future. '
+realm.stop()
 
-                'Rename GITLAB_HOST environment variable to GITLAB_URL.',
 
-                PendingDeprecationWarning,
 
-            )
+# Set up a realm using the test KDB module so that we can do
 
-            if gitlab_host.startswith(('https:', 'http:')):
+# successful S4U2Proxy delegations.
 
-                gitlab_url = gitlab_host
+testprincs = {'krbtgt/KRBTEST.COM': {'keys': 'aes128-cts'},
 
-            else:
+              'user': {'keys': 'aes128-cts'},
 
-                # Hides common mistake of users which set the GITLAB_HOST
+              'service/1': {'flags': '+ok-to-auth-as-delegate',
 
-                # without a protocol specification.
+                            'keys': 'aes128-cts'},
 
-                gitlab_url = 'https://{0}'.format(gitlab_host)
+              'service/2': {'keys': 'aes128-cts'}}
 
-                warnings.warn(
+conf = {'realms': {'$realm': {'database_module': 'test'}},
 
-                    'The https:// prefix has been added to GITLAB_HOST.'
+        'dbmodules': {'test': {'db_library': 'test',
 
-                    'Set GITLAB_URL="{0}" instead.'.format(gitlab_host)
+                               'princs': testprincs,
 
-                )
+                               'delegation': {'service/1': 'service/2'}}}}
 
+realm = K5Realm(create_kdb=False, kdc_conf=conf)
 
+userkeytab = 'FILE:' + os.path.join(realm.testdir, 'userkeytab')
 
-        # default to gitlab.com
+realm.extract_keytab(realm.user_princ, userkeytab)
 
-        if not gitlab_url:
+realm.extract_keytab(service1, realm.keytab)
 
-            gitlab_url = 'https://gitlab.com'
+realm.extract_keytab(service2, realm.keytab)
 
+realm.start_kdc()
 
 
-        return gitlab_url
 
+# Get forwardable creds for service1 in the default cache.
 
+realm.kinit(service1, None, ['-f', '-k'])
 
-    gitlab_api_version = CUnicode('4', config=True)
 
 
+# Successful krb5 -> S4U2Proxy, with krb5 and SPNEGO mechs.
 
-    @default('gitlab_api_version')
+realm.kinit(realm.user_princ, None, ['-f', '-k', '-c', usercache,
 
-    def _gitlab_api_version_default(self):
+                                     '-t', userkeytab])
 
-        return os.environ.get('GITLAB_API_VERSION') or '4'
+out = realm.run(['./t_s4u2proxy_krb5', usercache, storagecache, '-',
 
+                 pservice1, pservice2])
 
+if 'auth1: user@' not in out or 'auth2: user@' not in out:
 
-    gitlab_api = Unicode(config=True)
+    fail('krb5 -> s4u2proxy')
 
+out = realm.run(['./t_s4u2proxy_krb5', '--spnego', usercache, storagecache,
 
+                 '-', pservice1, pservice2])
 
-    @default("gitlab_api")
+if 'auth1: user@' not in out or 'auth2: user@' not in out:
 
-    def _default_gitlab_api(self):
+    fail('krb5 -> s4u2proxy')
 
-        return '%s/api/v%s' % (self.gitlab_url, self.gitlab_api_version)
 
 
+# Successful S4U2Self -> S4U2Proxy.
 
-    @default("authorize_url")
+out = realm.run(['./t_s4u', puser, pservice2])
 
-    def _authorize_url_default(self):
 
-        return "%s/oauth/authorize" % self.gitlab_url
 
+# Regression test for #8139: get a user ticket directly for service1 and
 
+# try krb5 -> S4U2Proxy.
 
-    @default("token_url")
+realm.kinit(realm.user_princ, None, ['-f', '-k', '-c', usercache,
 
-    def _token_url_default(self):
+                                     '-t', userkeytab, '-S', service1])
 
-        return "%s/oauth/access_token" % self.gitlab_url
+out = realm.run(['./t_s4u2proxy_krb5', usercache, storagecache, '-',
 
+                 pservice1, pservice2])
 
+if 'auth1: user@' not in out or 'auth2: user@' not in out:
 
-    gitlab_group_whitelist = Set(help="Deprecated, use `GitLabOAuthenticator.allowed_gitlab_groups`", config=True,)
+    fail('krb5 -> s4u2proxy')
 
 
 
-    allowed_gitlab_groups = Set(
+# Simulate a krbtgt rollover and verify that the user ticket can still
 
-        config=True, help="Automatically allow members of selected groups"
+# be validated.
 
-    )
+realm.stop_kdc()
 
+newtgt_keys = ['2 aes128-cts', '1 aes128-cts']
 
+newtgt_princs = {'krbtgt/KRBTEST.COM': {'keys': newtgt_keys}}
 
-    gitlab_project_id_whitelist = Set(help="Deprecated, use `GitLabOAuthenticator.allowed_project_ids`", config=True,)
+newtgt_conf = {'dbmodules': {'test': {'princs': newtgt_princs}}}
 
+newtgt_env = realm.special_env('newtgt', True, kdc_conf=newtgt_conf)
 
+realm.start_kdc(env=newtgt_env)
 
-    allowed_project_ids = Set(
+out = realm.run(['./t_s4u2proxy_krb5', usercache, storagecache, '-',
 
-        config=True,
+                 pservice1, pservice2])
 
-        help="Automatically allow members with Developer access to selected project ids",
+if 'auth1: user@' not in out or 'auth2: user@' not in out:
 
-    )
+    fail('krb5 -> s4u2proxy')
 
 
 
-    gitlab_version = None
+# Get a user ticket after the krbtgt rollover and verify that
 
+# S4U2Proxy delegation works (also a #8139 regression test).
 
+realm.kinit(realm.user_princ, None, ['-f', '-k', '-c', usercache,
 
-    async def authenticate(self, handler, data=None):
+                                     '-t', userkeytab])
 
-        code = handler.get_argument("code")
+out = realm.run(['./t_s4u2proxy_krb5', usercache, storagecache, '-',
 
-        # TODO: Configure the curl_httpclient for tornado
+                 pservice1, pservice2])
 
-        http_client = AsyncHTTPClient()
+if 'auth1: user@' not in out or 'auth2: user@' not in out:
 
+    fail('krb5 -> s4u2proxy')
 
 
-        # Exchange the OAuth code for a GitLab Access Token
 
-        #
+realm.stop()
 
-        # See: https://github.com/gitlabhq/gitlabhq/blob/master/doc/api/oauth2.md
 
 
+# Test cross realm S4U2Self using server referrals.
 
-        # GitLab specifies a POST request yet requires URL parameters
+mark('cross-realm S4U2Self')
 
-        params = dict(
+testprincs = {'krbtgt/SREALM': {'keys': 'aes128-cts'},
 
-            client_id=self.client_id,
+              'krbtgt/UREALM': {'keys': 'aes128-cts'},
 
-            client_secret=self.client_secret,
+              'user': {'keys': 'aes128-cts', 'flags': '+preauth'}}
 
-            code=code,
+kdcconf1 = {'realms': {'$realm': {'database_module': 'test'}},
 
-            grant_type="authorization_code",
+            'dbmodules': {'test': {'db_library': 'test',
 
-            redirect_uri=self.get_callback_url(handler),
+                                   'princs': testprincs,
 
-        )
+                                   'alias': {'enterprise@abc': '@UREALM'}}}}
 
+kdcconf2 = {'realms': {'$realm': {'database_module': 'test'}},
 
+            'dbmodules': {'test': {'db_library': 'test',
 
-        validate_server_cert = self.validate_server_cert
+                                   'princs': testprincs,
 
+                                   'alias': {'user@SREALM': '@SREALM',
 
+                                             'enterprise@abc': 'user'}}}}
 
-        url = url_concat("%s/oauth/token" % self.gitlab_url, params)
+r1, r2 = cross_realms(2, xtgts=(),
 
+                      args=({'realm': 'SREALM', 'kdc_conf': kdcconf1},
 
+                            {'realm': 'UREALM', 'kdc_conf': kdcconf2}),
 
-        req = HTTPRequest(
+                      create_kdb=False)
 
-            url,
 
-            method="POST",
 
-            headers={"Accept": "application/json"},
+r1.start_kdc()
 
-            validate_cert=validate_server_cert,
+r2.start_kdc()
 
-            body='',  # Body is required for a POST...
+r1.extract_keytab(r1.user_princ, r1.keytab)
 
-        )
+r1.kinit(r1.user_princ, None, ['-k', '-t', r1.keytab])
 
 
 
-        resp = await http_client.fetch(req)
+# Include a regression test for #8741 by unsetting the default realm.
 
-        resp_json = json.loads(resp.body.decode('utf8', 'replace'))
+remove_default = {'libdefaults': {'default_realm': None}}
 
+no_default = r1.special_env('no_default', False, krb5_conf=remove_default)
 
+msgs = ('Getting credentials user@UREALM -> user@SREALM',
 
-        access_token = resp_json['access_token']
+        '/Matching credential not found',
 
+        'Getting credentials user@SREALM -> krbtgt/UREALM@SREALM',
 
+        'Received creds for desired service krbtgt/UREALM@SREALM',
 
-        # memoize gitlab version for class lifetime
+        'via TGT krbtgt/UREALM@SREALM after requesting user\\@SREALM@UREALM',
 
-        if self.gitlab_version is None:
+        'krbtgt/SREALM@UREALM differs from requested user\\@SREALM@UREALM',
 
-            self.gitlab_version = await self._get_gitlab_version(access_token)
+        'via TGT krbtgt/SREALM@UREALM after requesting user@SREALM',
 
-            self.member_api_variant = 'all/' if self.gitlab_version >= [12, 4] else ''
+        'TGS reply is for user@UREALM -> user@SREALM')
 
+r1.run(['./t_s4u', 'p:' + r2.user_princ, '-', r1.keytab], env=no_default,
 
+       expected_trace=msgs)
 
-        # Determine who the logged in user is
 
-        req = HTTPRequest(
 
-            "%s/user" % self.gitlab_api,
+# Test realm identification of enterprise principal names ([MS-S4U]
 
-            method="GET",
+# 3.1.5.1.1.1).  Attach a bogus realm to the enterprise name to verify
 
-            validate_cert=validate_server_cert,
+# that we start at the server realm.
 
-            headers=_api_headers(access_token),
+mark('cross-realm S4U2Self with enterprise name')
 
-        )
+msgs = ('Getting initial credentials for enterprise\\@abc@SREALM',
 
-        resp = await http_client.fetch(req)
+        'Processing preauth types: PA-FOR-X509-USER (130)',
 
-        resp_json = json.loads(resp.body.decode('utf8', 'replace'))
+        'Sending unauthenticated request',
 
+        '/Realm not local to KDC',
 
+        'Following referral to realm UREALM',
 
-        username = resp_json["username"]
+        'Processing preauth types: PA-FOR-X509-USER (130)',
 
-        user_id = resp_json["id"]
+        'Sending unauthenticated request',
 
-        is_admin = resp_json.get("is_admin", False)
+        '/Additional pre-authentication required',
 
+        '/Generic preauthentication failure',
 
+        'Getting credentials enterprise\\@abc@UREALM -> user@SREALM',
 
-        # Check if user is a member of any allowed groups or projects.
+        'TGS reply is for enterprise\@abc@UREALM -> user@SREALM')
 
-        # These checks are performed here, as it requires `access_token`.
+r1.run(['./t_s4u', 'e:enterprise@abc@NOREALM', '-', r1.keytab],
 
-        user_in_group = user_in_project = False
+       expected_trace=msgs)
 
-        is_group_specified = is_project_id_specified = False
 
 
+r1.stop()
 
-        if self.allowed_gitlab_groups:
+r2.stop()
 
-            is_group_specified = True
 
-            user_in_group = await self._check_membership_allowed_groups(user_id, access_token)
 
-
-
-        # We skip project_id check if user is in allowed group.
-
-        if self.allowed_project_ids and not user_in_group:
-
-            is_project_id_specified = True
-
-            user_in_project = await self._check_membership_allowed_project_ids(
-
-                user_id, access_token
-
-            )
-
-
-
-        no_config_specified = not (is_group_specified or is_project_id_specified)
-
-
-
-        if (
-
-            (is_group_specified and user_in_group)
-
-            or (is_project_id_specified and user_in_project)
-
-            or no_config_specified
-
-        ):
-
-            return {
-
-                'name': username,
-
-                'auth_state': {'access_token': access_token, 'gitlab_user': resp_json},
-
-            }
-
-        else:
-
-            self.log.warning("%s not in group or project allowed list", username)
-
-            return None
-
-
-
-    async def _get_gitlab_version(self, access_token):
-
-        url = '%s/version' % self.gitlab_api
-
-        req = HTTPRequest(
-
-            url,
-
-            method="GET",
-
-            headers=_api_headers(access_token),
-
-            validate_cert=self.validate_server_cert,
-
-        )
-
-        resp = await AsyncHTTPClient().fetch(req, raise_error=True)
-
-        resp_json = json.loads(resp.body.decode('utf8', 'replace'))
-
-        version_strings = resp_json['version'].split('-')[0].split('.')[:3]
-
-        version_ints = list(map(int, version_strings))
-
-        return version_ints
-
-
-
-    async def _check_membership_allowed_groups(self, user_id, access_token):
-
-        http_client = AsyncHTTPClient()
-
-        headers = _api_headers(access_token)
-
-        # Check if user is a member of any group in the allowed list
-
-        for group in map(url_escape, self.allowed_gitlab_groups):
-
-            url = "%s/groups/%s/members/%s%d" % (
-
-                self.gitlab_api,
-
-                quote(group, safe=''),
-
-                self.member_api_variant,
-
-                user_id,
-
-            )
-
-            req = HTTPRequest(url, method="GET", headers=headers)
-
-            resp = await http_client.fetch(req, raise_error=False)
-
-            if resp.code == 200:
-
-                return True  # user _is_ in group
-
-        return False
-
-
-
-    async def _check_membership_allowed_project_ids(self, user_id, access_token):
-
-        http_client = AsyncHTTPClient()
-
-        headers = _api_headers(access_token)
-
-        # Check if user has developer access to any project in the allowed list
-
-        for project in self.allowed_project_ids:
-
-            url = "%s/projects/%s/members/%s%d" % (
-
-                self.gitlab_api,
-
-                project,
-
-                self.member_api_variant,
-
-                user_id,
-
-            )
-
-            req = HTTPRequest(url, method="GET", headers=headers)
-
-            resp = await http_client.fetch(req, raise_error=False)
-
-
-
-            if resp.body:
-
-                resp_json = json.loads(resp.body.decode('utf8', 'replace'))
-
-                access_level = resp_json.get('access_level', 0)
-
-
-
-                # We only allow access level Developer and above
-
-                # Reference: https://docs.gitlab.com/ee/api/members.html
-
-                if resp.code == 200 and access_level >= 30:
-
-                    return True
-
-        return False
-
-
-
-
-
-class LocalGitLabOAuthenticator(LocalAuthenticator, GitLabOAuthenticator):
-
-
-
-    """A version that mixes in local system user creation"""
-
-
-
-    pass
+success('S4U test cases')

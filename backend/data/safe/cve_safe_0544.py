@@ -2,118 +2,122 @@
 # Safety: safe
 # Category: safe
 
-import re
-
-import pytest
-
-import tornado
-
-from jupyter_server.base.handlers import path_regex
+from helper import unittest, PillowTestCase
 
 
 
-
-
-# build regexps that tornado uses:
-
-path_pat = re.compile('^' + '/x%s' % path_regex + '$')
+from PIL import Image
 
 
 
-def test_path_regex():
+# sample ppm stream
 
-    for path in (
+test_file = "Tests/images/hopper.ppm"
 
-        '/x',
-
-        '/x/',
-
-        '/x/foo',
-
-        '/x/foo.ipynb',
-
-        '/x/foo/bar',
-
-        '/x/foo/bar.txt',
-
-    ):
-
-        assert re.match(path_pat, path)
-
-
-
-def test_path_regex_bad():
-
-    for path in (
-
-        '/xfoo',
-
-        '/xfoo/',
-
-        '/xfoo/bar',
-
-        '/xfoo/bar/',
-
-        '/x/foo/bar/',
-
-        '/x//foo',
-
-        '/y',
-
-        '/y/x/foo',
-
-    ):
-
-        assert re.match(path_pat, path) is None
+data = open(test_file, "rb").read()
 
 
 
 
 
-@pytest.mark.parametrize(
+class TestFilePpm(PillowTestCase):
 
-    'uri,expected',
 
-    [
 
-        ("/notebooks/mynotebook/", "/notebooks/mynotebook"),
+    def test_sanity(self):
 
-        ("////foo///", "/foo"),
+        im = Image.open(test_file)
 
-        ("//example.com/", "/example.com"),
+        im.load()
 
-        ("/has/param/?hasparam=true", "/has/param?hasparam=true"),
+        self.assertEqual(im.mode, "RGB")
 
-    ]
+        self.assertEqual(im.size, (128, 128))
 
-)
+        self.assertEqual(im.format, "PPM")
 
-async def test_trailing_slash(uri, expected, http_server_client, auth_header, base_url):
 
-    # http_server_client raises an exception when follow_redirects=False
 
-    with pytest.raises(tornado.httpclient.HTTPClientError) as err:
+    def test_16bit_pgm(self):
 
-        await http_server_client.fetch(
+        im = Image.open('Tests/images/16_bit_binary.pgm')
 
-            uri,
+        im.load()
 
-            headers=auth_header,
+        self.assertEqual(im.mode, 'I')
 
-            request_timeout=20,
+        self.assertEqual(im.size, (20, 100))
 
-            follow_redirects=False
 
-        )
 
-    # Capture the response from the raised exception value.
+        tgt = Image.open('Tests/images/16_bit_binary_pgm.png')
 
-    response = err.value.response
+        self.assert_image_equal(im, tgt)
 
-    assert response.code == 302
 
-    assert "Location" in response.headers
 
-    assert response.headers["Location"] == expected
+    def test_16bit_pgm_write(self):
 
-    assert False
+        im = Image.open('Tests/images/16_bit_binary.pgm')
+
+        im.load()
+
+
+
+        f = self.tempfile('temp.pgm')
+
+        im.save(f, 'PPM')
+
+
+
+        reloaded = Image.open(f)
+
+        self.assert_image_equal(im, reloaded)
+
+
+
+    def test_truncated_file(self):
+
+        path = self.tempfile('temp.pgm')
+
+        f = open(path, 'w')
+
+        f.write('P6')
+
+        f.close()
+
+
+
+        self.assertRaises(ValueError, lambda: Image.open(path))
+
+
+
+
+
+    def test_neg_ppm(self):
+
+        """test_neg_ppm
+
+
+
+        Storage.c accepted negative values for xsize, ysize.
+
+        open_ppm is a core debugging item that doesn't check any parameters for
+
+        sanity. 
+
+        """
+
+        
+
+        with self.assertRaises(ValueError):
+
+            Image.core.open_ppm('Tests/images/negative_size.ppm')
+
+
+
+
+
+if __name__ == '__main__':
+
+    unittest.main()

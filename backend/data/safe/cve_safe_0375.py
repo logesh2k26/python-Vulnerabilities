@@ -2,702 +2,196 @@
 # Safety: safe
 # Category: safe
 
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
+""" A FastAPI app used to create an OpenAPI document for end-to-end testing """
 
+import json
 
+from datetime import date, datetime
 
-# Copyright 2012 OpenStack LLC
+from enum import Enum
 
-#
+from pathlib import Path
 
-# Licensed under the Apache License, Version 2.0 (the "License"); you may
+from typing import Any, Dict, List, Union
 
-# not use this file except in compliance with the License. You may obtain
 
-# a copy of the License at
 
-#
+from fastapi import APIRouter, Body, FastAPI, File, Header, Query, UploadFile
 
-#      http://www.apache.org/licenses/LICENSE-2.0
+from pydantic import BaseModel
 
-#
 
-# Unless required by applicable law or agreed to in writing, software
 
-# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+app = FastAPI(title="My Test API", description="An API for testing openapi-python-client",)
 
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
-# License for the specific language governing permissions and limitations
 
-# under the License.
 
 
+@app.get("/ping", response_model=bool)
 
-"""Main entry point into the EC2 Credentials service.
+async def ping():
 
+    """ A quick check to see if the system is running """
 
+    return True
 
-This service allows the creation of access/secret credentials used for
 
-the ec2 interop layer of OpenStack.
 
 
 
-A user can create as many access/secret pairs, each of which map to a
+test_router = APIRouter()
 
-specific tenant.  This is required because OpenStack supports a user
 
-belonging to multiple tenants, whereas the signatures created on ec2-style
 
-requests don't allow specification of which tenant the user wishs to act
 
-upon.
 
+class AnEnum(Enum):
 
+    """ For testing Enums in all the ways they can be used """
 
-To complete the cycle, we provide a method that OpenStack services can
 
-use to validate a signature and get a corresponding openstack token.  This
 
-token allows method calls to other services within the context the
+    FIRST_VALUE = "FIRST_VALUE"
 
-access/secret was created.  As an example, nova requests keystone to validate
+    SECOND_VALUE = "SECOND_VALUE"
 
-the signature of a request, receives a token, and then makes a request to
 
-glance to list images needed to perform the requested task.
 
 
 
-"""
+class DifferentEnum(Enum):
 
+    FIRST_VALUE = "DIFFERENT"
 
+    SECOND_VALUE = "OTHER"
 
-import uuid
 
 
 
-from keystone import catalog
 
-from keystone import config
+class OtherModel(BaseModel):
 
-from keystone import exception
+    """ A different model for calling from TestModel """
 
-from keystone import identity
 
-from keystone import policy
 
-from keystone import service
+    a_value: str
 
-from keystone import token
 
-from keystone.common import manager
 
-from keystone.common import utils
 
-from keystone.common import wsgi
 
+class AModel(BaseModel):
 
+    """ A Model for testing all the ways custom objects can be used """
 
 
 
-CONF = config.CONF
+    an_enum_value: AnEnum
 
+    nested_list_of_enums: List[List[DifferentEnum]] = []
 
+    some_dict: Dict[str, str]
 
+    aCamelDateTime: Union[datetime, date]
 
+    a_date: date
 
-class Manager(manager.Manager):
 
-    """Default pivot point for the EC2 Credentials backend.
 
 
 
-    See :mod:`keystone.common.manager.Manager` for more details on how this
+@test_router.get("/", response_model=List[AModel], operation_id="getUserList")
 
-    dynamically calls the backend.
+def get_list(
 
+    an_enum_value: List[AnEnum] = Query(...), some_date: Union[date, datetime] = Query(...),
 
+):
 
-    """
+    """ Get a list of things """
 
+    return
 
 
-    def __init__(self):
 
-        super(Manager, self).__init__(CONF.ec2.driver)
 
 
+@test_router.post("/upload")
 
+async def upload_file(some_file: UploadFile = File(...), keep_alive: bool = Header(None)):
 
+    """ Upload a file """
 
-class Ec2Extension(wsgi.ExtensionRouter):
+    data = await some_file.read()
 
-    def add_routes(self, mapper):
+    return (some_file.filename, some_file.content_type, data)
 
-        ec2_controller = Ec2Controller()
 
-        # validation
 
-        mapper.connect('/ec2tokens',
 
-                       controller=ec2_controller,
 
-                       action='authenticate',
+@test_router.post("/json_body")
 
-                       conditions=dict(method=['POST']))
+def json_body(body: AModel):
 
+    """ Try sending a JSON body """
 
+    return
 
-        # crud
 
-        mapper.connect('/users/{user_id}/credentials/OS-EC2',
 
-                       controller=ec2_controller,
 
-                       action='create_credential',
 
-                       conditions=dict(method=['POST']))
+@test_router.post("/test_defaults")
 
-        mapper.connect('/users/{user_id}/credentials/OS-EC2',
+def test_defaults(
 
-                       controller=ec2_controller,
+    string_prop: str = Query(default="the default string"),
 
-                       action='get_credentials',
+    datetime_prop: datetime = Query(default=datetime(1010, 10, 10)),
 
-                       conditions=dict(method=['GET']))
+    date_prop: date = Query(default=date(1010, 10, 10)),
 
-        mapper.connect('/users/{user_id}/credentials/OS-EC2/{credential_id}',
+    float_prop: float = Query(default=3.14),
 
-                       controller=ec2_controller,
+    int_prop: int = Query(default=7),
 
-                       action='get_credential',
+    boolean_prop: bool = Query(default=False),
 
-                       conditions=dict(method=['GET']))
+    list_prop: List[AnEnum] = Query(default=[AnEnum.FIRST_VALUE, AnEnum.SECOND_VALUE]),
 
-        mapper.connect('/users/{user_id}/credentials/OS-EC2/{credential_id}',
+    union_prop: Union[float, str] = Query(default="not a float"),
 
-                       controller=ec2_controller,
+    enum_prop: AnEnum = Query(default=AnEnum.FIRST_VALUE),
 
-                       action='delete_credential',
+    dict_prop: Dict[str, str] = Body(default={"key": "val"}),
 
-                       conditions=dict(method=['DELETE']))
+):
 
+    return
 
 
 
 
-class Ec2Controller(wsgi.Application):
 
-    def __init__(self):
+app.include_router(test_router, prefix="/tests", tags=["tests"])
 
-        self.catalog_api = catalog.Manager()
 
-        self.identity_api = identity.Manager()
 
-        self.token_api = token.Manager()
 
-        self.policy_api = policy.Manager()
 
-        self.ec2_api = Manager()
+def generate_openapi_json():
 
-        super(Ec2Controller, self).__init__()
+    path = Path(__file__).parent / "openapi.json"
 
+    path.write_text(json.dumps(app.openapi(), indent=4))
 
 
-    def check_signature(self, creds_ref, credentials):
 
-        signer = utils.Ec2Signer(creds_ref['secret'])
 
-        signature = signer.generate(credentials)
 
-        if utils.auth_str_equal(credentials['signature'], signature):
+if __name__ == "__main__":
 
-            return
-
-        # NOTE(vish): Some libraries don't use the port when signing
-
-        #             requests, so try again without port.
-
-        elif ':' in credentials['signature']:
-
-            hostname, _port = credentials['host'].split(':')
-
-            credentials['host'] = hostname
-
-            signature = signer.generate(credentials)
-
-            if not utils.auth_str_equal(credentials.signature, signature):
-
-                raise exception.Unauthorized(message='Invalid EC2 signature.')
-
-        else:
-
-            raise exception.Unauthorized(message='EC2 signature not supplied.')
-
-
-
-    def authenticate(self, context, credentials=None,
-
-                         ec2Credentials=None):
-
-        """Validate a signed EC2 request and provide a token.
-
-
-
-        Other services (such as Nova) use this **admin** call to determine
-
-        if a request they signed received is from a valid user.
-
-
-
-        If it is a valid signature, an openstack token that maps
-
-        to the user/tenant is returned to the caller, along with
-
-        all the other details returned from a normal token validation
-
-        call.
-
-
-
-        The returned token is useful for making calls to other
-
-        OpenStack services within the context of the request.
-
-
-
-        :param context: standard context
-
-        :param credentials: dict of ec2 signature
-
-        :param ec2Credentials: DEPRECATED dict of ec2 signature
-
-        :returns: token: openstack token equivalent to access key along
-
-                         with the corresponding service catalog and roles
-
-        """
-
-
-
-        # FIXME(ja): validate that a service token was used!
-
-
-
-        # NOTE(termie): backwards compat hack
-
-        if not credentials and ec2Credentials:
-
-            credentials = ec2Credentials
-
-
-
-        if not 'access' in credentials:
-
-            raise exception.Unauthorized(message='EC2 signature not supplied.')
-
-
-
-        creds_ref = self._get_credentials(context,
-
-                                          credentials['access'])
-
-        self.check_signature(creds_ref, credentials)
-
-
-
-        # TODO(termie): don't create new tokens every time
-
-        # TODO(termie): this is copied from TokenController.authenticate
-
-        token_id = uuid.uuid4().hex
-
-        tenant_ref = self.identity_api.get_tenant(
-
-                context=context,
-
-                tenant_id=creds_ref['tenant_id'])
-
-        user_ref = self.identity_api.get_user(
-
-                context=context,
-
-                user_id=creds_ref['user_id'])
-
-        metadata_ref = self.identity_api.get_metadata(
-
-            context=context,
-
-            user_id=user_ref['id'],
-
-            tenant_id=tenant_ref['id'])
-
-
-
-        # TODO(termie): optimize this call at some point and put it into the
-
-        #               the return for metadata
-
-        # fill out the roles in the metadata
-
-        roles = metadata_ref.get('roles', [])
-
-        if not roles:
-
-            raise exception.Unauthorized(message='User not valid for tenant.')
-
-        roles_ref = [self.identity_api.get_role(context, role_id)
-
-                     for role_id in roles]
-
-
-
-        catalog_ref = self.catalog_api.get_catalog(
-
-                context=context,
-
-                user_id=user_ref['id'],
-
-                tenant_id=tenant_ref['id'],
-
-                    metadata=metadata_ref)
-
-
-
-        token_ref = self.token_api.create_token(
-
-                context, token_id, dict(id=token_id,
-
-                                        user=user_ref,
-
-                                        tenant=tenant_ref,
-
-                                        metadata=metadata_ref))
-
-
-
-        # TODO(termie): make this a util function or something
-
-        # TODO(termie): i don't think the ec2 middleware currently expects a
-
-        #               full return, but it contains a note saying that it
-
-        #               would be better to expect a full return
-
-        token_controller = service.TokenController()
-
-        return token_controller._format_authenticate(
-
-                token_ref, roles_ref, catalog_ref)
-
-
-
-    def create_credential(self, context, user_id, tenant_id):
-
-        """Create a secret/access pair for use with ec2 style auth.
-
-
-
-        Generates a new set of credentials that map the the user/tenant
-
-        pair.
-
-
-
-        :param context: standard context
-
-        :param user_id: id of user
-
-        :param tenant_id: id of tenant
-
-        :returns: credential: dict of ec2 credential
-
-        """
-
-        if not self._is_admin(context):
-
-            self._assert_identity(context, user_id)
-
-
-
-        self._assert_valid_user_id(context, user_id)
-
-        self._assert_valid_tenant_id(context, tenant_id)
-
-
-
-        cred_ref = {'user_id': user_id,
-
-                    'tenant_id': tenant_id,
-
-                    'access': uuid.uuid4().hex,
-
-                    'secret': uuid.uuid4().hex}
-
-        self.ec2_api.create_credential(context, cred_ref['access'], cred_ref)
-
-        return {'credential': cred_ref}
-
-
-
-    def get_credentials(self, context, user_id):
-
-        """List all credentials for a user.
-
-
-
-        :param context: standard context
-
-        :param user_id: id of user
-
-        :returns: credentials: list of ec2 credential dicts
-
-        """
-
-        if not self._is_admin(context):
-
-            self._assert_identity(context, user_id)
-
-        self._assert_valid_user_id(context, user_id)
-
-        return {'credentials': self.ec2_api.list_credentials(context, user_id)}
-
-
-
-    def get_credential(self, context, user_id, credential_id):
-
-        """Retreive a user's access/secret pair by the access key.
-
-
-
-        Grab the full access/secret pair for a given access key.
-
-
-
-        :param context: standard context
-
-        :param user_id: id of user
-
-        :param credential_id: access key for credentials
-
-        :returns: credential: dict of ec2 credential
-
-        """
-
-        if not self._is_admin(context):
-
-            self._assert_identity(context, user_id)
-
-        self._assert_valid_user_id(context, user_id)
-
-        creds = self._get_credentials(context, credential_id)
-
-        return {'credential': creds}
-
-
-
-    def delete_credential(self, context, user_id, credential_id):
-
-        """Delete a user's access/secret pair.
-
-
-
-        Used to revoke a user's access/secret pair
-
-
-
-        :param context: standard context
-
-        :param user_id: id of user
-
-        :param credential_id: access key for credentials
-
-        :returns: bool: success
-
-        """
-
-        if not self._is_admin(context):
-
-            self._assert_identity(context, user_id)
-
-            self._assert_owner(context, user_id, credential_id)
-
-
-
-        self._assert_valid_user_id(context, user_id)
-
-        self._get_credentials(context, credential_id)
-
-        return self.ec2_api.delete_credential(context, credential_id)
-
-
-
-    def _get_credentials(self, context, credential_id):
-
-        """Return credentials from an ID.
-
-
-
-        :param context: standard context
-
-        :param credential_id: id of credential
-
-        :raises exception.Unauthorized: when credential id is invalid
-
-        :returns: credential: dict of ec2 credential.
-
-        """
-
-        creds = self.ec2_api.get_credential(context,
-
-                                            credential_id)
-
-        if not creds:
-
-            raise exception.Unauthorized(message='EC2 access key not found.')
-
-        return creds
-
-
-
-    def _assert_identity(self, context, user_id):
-
-        """Check that the provided token belongs to the user.
-
-
-
-        :param context: standard context
-
-        :param user_id: id of user
-
-        :raises exception.Forbidden: when token is invalid
-
-
-
-        """
-
-        try:
-
-            token_ref = self.token_api.get_token(context=context,
-
-                    token_id=context['token_id'])
-
-        except exception.TokenNotFound:
-
-            raise exception.Unauthorized()
-
-        token_user_id = token_ref['user'].get('id')
-
-        if not token_user_id == user_id:
-
-            raise exception.Forbidden()
-
-
-
-    def _is_admin(self, context):
-
-        """Wrap admin assertion error return statement.
-
-
-
-        :param context: standard context
-
-        :returns: bool: success
-
-
-
-        """
-
-        try:
-
-            self.assert_admin(context)
-
-            return True
-
-        except exception.Forbidden:
-
-            return False
-
-
-
-    def _assert_owner(self, context, user_id, credential_id):
-
-        """Ensure the provided user owns the credential.
-
-
-
-        :param context: standard context
-
-        :param user_id: expected credential owner
-
-        :param credential_id: id of credential object
-
-        :raises exception.Forbidden: on failure
-
-
-
-        """
-
-        cred_ref = self.ec2_api.get_credential(context, credential_id)
-
-        if not user_id == cred_ref['user_id']:
-
-            raise exception.Forbidden()
-
-
-
-    def _assert_valid_user_id(self, context, user_id):
-
-        """Ensure a valid user id.
-
-
-
-        :param context: standard context
-
-        :param user_id: expected credential owner
-
-        :raises exception.UserNotFound: on failure
-
-
-
-        """
-
-        user_ref = self.identity_api.get_user(
-
-            context=context,
-
-            user_id=user_id)
-
-        if not user_ref:
-
-            raise exception.UserNotFound(user_id=user_id)
-
-
-
-    def _assert_valid_tenant_id(self, context, tenant_id):
-
-        """Ensure a valid tenant id.
-
-
-
-        :param context: standard context
-
-        :param user_id: expected credential owner
-
-        :raises exception.UserNotFound: on failure
-
-
-
-        """
-
-        tenant_ref = self.identity_api.get_tenant(
-
-            context=context,
-
-            tenant_id=tenant_id)
-
-        if not tenant_ref:
-
-            raise exception.TenantNotFound(tenant_id=tenant_id)
+    generate_openapi_json()

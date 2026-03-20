@@ -2,1014 +2,472 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-# vim: ft=python fileencoding=utf-8 sts=4 sw=4 et:
+import datetime
 
+import decimal
 
+import unicodedata
 
-# Copyright 2016-2018 Florian Bruhin (The Compiler) <mail@qutebrowser.org>
+from importlib import import_module
 
-#
 
-# This file is part of qutebrowser.
 
-#
+from django.conf import settings
 
-# qutebrowser is free software: you can redistribute it and/or modify
+from django.utils import dateformat, datetime_safe, numberformat, six
 
-# it under the terms of the GNU General Public License as published by
+from django.utils.encoding import force_str
 
-# the Free Software Foundation, either version 3 of the License, or
+from django.utils.functional import lazy
 
-# (at your option) any later version.
+from django.utils.safestring import mark_safe
 
-#
+from django.utils.translation import (
 
-# qutebrowser is distributed in the hope that it will be useful,
+    check_for_language, get_language, to_locale,
 
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
+)
 
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 
-# GNU General Public License for more details.
 
-#
+# format_cache is a mapping from (format_type, lang) to the format string.
 
-# You should have received a copy of the GNU General Public License
+# By using the cache, it is possible to avoid running get_format_modules
 
-# along with qutebrowser.  If not, see <http://www.gnu.org/licenses/>.
+# repeatedly.
 
+_format_cache = {}
 
+_format_modules_cache = {}
 
-"""Backend-independent qute://* code.
 
 
+ISO_INPUT_FORMATS = {
 
-Module attributes:
+    'DATE_INPUT_FORMATS': ['%Y-%m-%d'],
 
-    pyeval_output: The output of the last :pyeval command.
+    'TIME_INPUT_FORMATS': ['%H:%M:%S', '%H:%M:%S.%f', '%H:%M'],
 
-    _HANDLERS: The handlers registered via decorators.
+    'DATETIME_INPUT_FORMATS': [
 
-"""
+        '%Y-%m-%d %H:%M:%S',
 
+        '%Y-%m-%d %H:%M:%S.%f',
 
+        '%Y-%m-%d %H:%M',
 
-import json
+        '%Y-%m-%d'
 
-import os
+    ],
 
-import time
+}
 
-import textwrap
 
-import mimetypes
 
-import urllib
 
-import collections
 
+def reset_format_cache():
 
+    """Clear any cached formats.
 
-import pkg_resources
 
-import sip
 
-from PyQt5.QtCore import QUrlQuery, QUrl
+    This method is provided primarily for testing purposes,
 
-
-
-import qutebrowser
-
-from qutebrowser.config import config, configdata, configexc, configdiff
-
-from qutebrowser.utils import (version, utils, jinja, log, message, docutils,
-
-                               objreg, urlutils)
-
-from qutebrowser.misc import objects
-
-
-
-
-
-pyeval_output = ":pyeval was never called"
-
-spawn_output = ":spawn was never called"
-
-
-
-
-
-_HANDLERS = {}
-
-
-
-
-
-class NoHandlerFound(Exception):
-
-
-
-    """Raised when no handler was found for the given URL."""
-
-
-
-    pass
-
-
-
-
-
-class QuteSchemeOSError(Exception):
-
-
-
-    """Called when there was an OSError inside a handler."""
-
-
-
-    pass
-
-
-
-
-
-class QuteSchemeError(Exception):
-
-
-
-    """Exception to signal that a handler should return an ErrorReply.
-
-
-
-    Attributes correspond to the arguments in
-
-    networkreply.ErrorNetworkReply.
-
-
-
-    Attributes:
-
-        errorstring: Error string to print.
-
-        error: Numerical error value.
+    so that the effects of cached formats can be removed.
 
     """
 
+    global _format_cache, _format_modules_cache
 
+    _format_cache = {}
 
-    def __init__(self, errorstring, error):
-
-        self.errorstring = errorstring
-
-        self.error = error
-
-        super().__init__(errorstring)
+    _format_modules_cache = {}
 
 
 
 
 
-class Redirect(Exception):
-
-
-
-    """Exception to signal a redirect should happen.
-
-
-
-    Attributes:
-
-        url: The URL to redirect to, as a QUrl.
+def iter_format_modules(lang, format_module_path=None):
 
     """
 
-
-
-    def __init__(self, url):
-
-        super().__init__(url.toDisplayString())
-
-        self.url = url
-
-
-
-
-
-class add_handler:  # noqa: N801,N806 pylint: disable=invalid-name
-
-
-
-    """Decorator to register a qute://* URL handler.
-
-
-
-    Attributes:
-
-        _name: The 'foo' part of qute://foo
-
-        backend: Limit which backends the handler can run with.
+    Does the heavy lifting of finding format modules.
 
     """
 
+    if not check_for_language(lang):
 
-
-    def __init__(self, name, backend=None):
-
-        self._name = name
-
-        self._backend = backend
-
-        self._function = None
+        return
 
 
 
-    def __call__(self, function):
+    if format_module_path is None:
 
-        self._function = function
-
-        _HANDLERS[self._name] = self.wrapper
-
-        return function
+        format_module_path = settings.FORMAT_MODULE_PATH
 
 
 
-    def wrapper(self, *args, **kwargs):
+    format_locations = []
 
-        """Call the underlying function."""
+    if format_module_path:
 
-        if self._backend is not None and objects.backend != self._backend:
+        if isinstance(format_module_path, six.string_types):
 
-            return self.wrong_backend_handler(*args, **kwargs)
+            format_module_path = [format_module_path]
 
-        else:
+        for path in format_module_path:
 
-            return self._function(*args, **kwargs)
+            format_locations.append(path + '.%s')
 
+    format_locations.append('django.conf.locale.%s')
 
+    locale = to_locale(lang)
 
-    def wrong_backend_handler(self, url):
+    locales = [locale]
 
-        """Show an error page about using the invalid backend."""
+    if '_' in locale:
 
-        html = jinja.render('error.html',
+        locales.append(locale.split('_')[0])
 
-                            title="Error while opening qute://url",
+    for location in format_locations:
 
-                            url=url.toDisplayString(),
+        for loc in locales:
 
-                            error='{} is not available with this '
+            try:
 
-                                  'backend'.format(url.toDisplayString()))
+                yield import_module('%s.formats' % (location % loc))
 
-        return 'text/html', html
+            except ImportError:
+
+                pass
 
 
 
 
 
-def data_for_url(url):
-
-    """Get the data to show for the given URL.
-
-
-
-    Args:
-
-        url: The QUrl to show.
-
-
-
-    Return:
-
-        A (mimetype, data) tuple.
+def get_format_modules(lang=None, reverse=False):
 
     """
 
-    norm_url = url.adjusted(QUrl.NormalizePathSegments |
-
-                            QUrl.StripTrailingSlash)
-
-    if norm_url != url:
-
-        raise Redirect(norm_url)
-
-
-
-    path = url.path()
-
-    host = url.host()
-
-    query = urlutils.query_string(url)
-
-    # A url like "qute:foo" is split as "scheme:path", not "scheme:host".
-
-    log.misc.debug("url: {}, path: {}, host {}".format(
-
-        url.toDisplayString(), path, host))
-
-    if not path or not host:
-
-        new_url = QUrl()
-
-        new_url.setScheme('qute')
-
-        # When path is absent, e.g. qute://help (with no trailing slash)
-
-        if host:
-
-            new_url.setHost(host)
-
-        # When host is absent, e.g. qute:help
-
-        else:
-
-            new_url.setHost(path)
-
-
-
-        new_url.setPath('/')
-
-        if query:
-
-            new_url.setQuery(query)
-
-        if new_url.host():  # path was a valid host
-
-            raise Redirect(new_url)
-
-
-
-    try:
-
-        handler = _HANDLERS[host]
-
-    except KeyError:
-
-        raise NoHandlerFound(url)
-
-
-
-    try:
-
-        mimetype, data = handler(url)
-
-    except OSError as e:
-
-        # FIXME:qtwebengine how to handle this?
-
-        raise QuteSchemeOSError(e)
-
-    except QuteSchemeError as e:
-
-        raise
-
-
-
-    assert mimetype is not None, url
-
-    if mimetype == 'text/html' and isinstance(data, str):
-
-        # We let handlers return HTML as text
-
-        data = data.encode('utf-8', errors='xmlcharrefreplace')
-
-
-
-    return mimetype, data
-
-
-
-
-
-@add_handler('bookmarks')
-
-def qute_bookmarks(_url):
-
-    """Handler for qute://bookmarks. Display all quickmarks / bookmarks."""
-
-    bookmarks = sorted(objreg.get('bookmark-manager').marks.items(),
-
-                       key=lambda x: x[1])  # Sort by title
-
-    quickmarks = sorted(objreg.get('quickmark-manager').marks.items(),
-
-                        key=lambda x: x[0])  # Sort by name
-
-
-
-    html = jinja.render('bookmarks.html',
-
-                        title='Bookmarks',
-
-                        bookmarks=bookmarks,
-
-                        quickmarks=quickmarks)
-
-    return 'text/html', html
-
-
-
-
-
-@add_handler('tabs')
-
-def qute_tabs(_url):
-
-    """Handler for qute://tabs. Display information about all open tabs."""
-
-    tabs = collections.defaultdict(list)
-
-    for win_id, window in objreg.window_registry.items():
-
-        if sip.isdeleted(window):
-
-            continue
-
-        tabbed_browser = objreg.get('tabbed-browser',
-
-                                    scope='window',
-
-                                    window=win_id)
-
-        for tab in tabbed_browser.widgets():
-
-            if tab.url() not in [QUrl("qute://tabs/"), QUrl("qute://tabs")]:
-
-                urlstr = tab.url().toDisplayString()
-
-                tabs[str(win_id)].append((tab.title(), urlstr))
-
-
-
-    html = jinja.render('tabs.html',
-
-                        title='Tabs',
-
-                        tab_list_by_window=tabs)
-
-    return 'text/html', html
-
-
-
-
-
-def history_data(start_time, offset=None):
-
-    """Return history data.
-
-
-
-    Arguments:
-
-        start_time: select history starting from this timestamp.
-
-        offset: number of items to skip
+    Returns a list of the format modules found
 
     """
 
-    # history atimes are stored as ints, ensure start_time is not a float
+    if lang is None:
 
-    start_time = int(start_time)
+        lang = get_language()
 
-    hist = objreg.get('web-history')
+    modules = _format_modules_cache.setdefault(lang, list(iter_format_modules(lang, settings.FORMAT_MODULE_PATH)))
 
-    if offset is not None:
+    if reverse:
 
-        entries = hist.entries_before(start_time, limit=1000, offset=offset)
+        return list(reversed(modules))
 
-    else:
-
-        # end is 24hrs earlier than start
-
-        end_time = start_time - 24*60*60
-
-        entries = hist.entries_between(end_time, start_time)
-
-
-
-    return [{"url": e.url, "title": e.title or e.url, "time": e.atime}
-
-            for e in entries]
+    return modules
 
 
 
 
 
-@add_handler('history')
+def get_format(format_type, lang=None, use_l10n=None):
 
-def qute_history(url):
+    """
 
-    """Handler for qute://history. Display and serve history."""
+    For a specific format type, returns the format for the current
 
-    if url.path() == '/data':
+    language (locale), defaults to the format in the settings.
+
+    format_type is the name of the format, e.g. 'DATE_FORMAT'
+
+
+
+    If use_l10n is provided and is not None, that will force the value to
+
+    be localized (or not), overriding the value of settings.USE_L10N.
+
+    """
+
+    format_type = force_str(format_type)
+
+    if use_l10n or (use_l10n is None and settings.USE_L10N):
+
+        if lang is None:
+
+            lang = get_language()
+
+        cache_key = (format_type, lang)
 
         try:
 
-            offset = QUrlQuery(url).queryItemValue("offset")
+            cached = _format_cache[cache_key]
 
-            offset = int(offset) if offset else None
+            if cached is not None:
 
-        except ValueError as e:
+                return cached
 
-            raise QuteSchemeError("Query parameter offset is invalid", e)
+            else:
 
-        # Use start_time in query or current time.
+                # Return the general setting by default
 
-        try:
+                return getattr(settings, format_type)
 
-            start_time = QUrlQuery(url).queryItemValue("start_time")
+        except KeyError:
 
-            start_time = float(start_time) if start_time else time.time()
+            for module in get_format_modules(lang):
 
-        except ValueError as e:
+                try:
 
-            raise QuteSchemeError("Query parameter start_time is invalid", e)
+                    val = getattr(module, format_type)
 
+                    for iso_input in ISO_INPUT_FORMATS.get(format_type, ()):
 
+                        if iso_input not in val:
 
-        return 'text/html', json.dumps(history_data(start_time, offset))
+                            if isinstance(val, tuple):
 
-    else:
+                                val = list(val)
 
-        return 'text/html', jinja.render(
+                            val.append(iso_input)
 
-            'history.html',
+                    _format_cache[cache_key] = val
 
-            title='History',
+                    return val
 
-            gap_interval=config.val.history_gap_interval
+                except AttributeError:
 
-        )
+                    pass
 
+            _format_cache[cache_key] = None
 
-
-
-
-@add_handler('javascript')
-
-def qute_javascript(url):
-
-    """Handler for qute://javascript.
+    return getattr(settings, format_type)
 
 
 
-    Return content of file given as query parameter.
+get_format_lazy = lazy(get_format, six.text_type, list, tuple)
+
+
+
+
+
+def date_format(value, format=None, use_l10n=None):
 
     """
 
-    path = url.path()
+    Formats a datetime.date or datetime.datetime object using a
 
-    if path:
-
-        path = "javascript" + os.sep.join(path.split('/'))
-
-        return 'text/html', utils.read_file(path, binary=False)
-
-    else:
-
-        raise QuteSchemeError("No file specified", ValueError())
+    localizable format
 
 
 
+    If use_l10n is provided and is not None, that will force the value to
 
-
-@add_handler('pyeval')
-
-def qute_pyeval(_url):
-
-    """Handler for qute://pyeval."""
-
-    html = jinja.render('pre.html', title='pyeval', content=pyeval_output)
-
-    return 'text/html', html
-
-
-
-
-
-@add_handler('spawn-output')
-
-def qute_spawn_output(_url):
-
-    """Handler for qute://spawn-output."""
-
-    html = jinja.render('pre.html', title='spawn output', content=spawn_output)
-
-    return 'text/html', html
-
-
-
-
-
-@add_handler('version')
-
-@add_handler('verizon')
-
-def qute_version(_url):
-
-    """Handler for qute://version."""
-
-    html = jinja.render('version.html', title='Version info',
-
-                        version=version.version(),
-
-                        copyright=qutebrowser.__copyright__)
-
-    return 'text/html', html
-
-
-
-
-
-@add_handler('plainlog')
-
-def qute_plainlog(url):
-
-    """Handler for qute://plainlog.
-
-
-
-    An optional query parameter specifies the minimum log level to print.
-
-    For example, qute://log?level=warning prints warnings and errors.
-
-    Level can be one of: vdebug, debug, info, warning, error, critical.
+    be localized (or not), overriding the value of settings.USE_L10N.
 
     """
 
-    if log.ram_handler is None:
-
-        text = "Log output was disabled."
-
-    else:
-
-        level = QUrlQuery(url).queryItemValue('level')
-
-        if not level:
-
-            level = 'vdebug'
-
-        text = log.ram_handler.dump_log(html=False, level=level)
-
-    html = jinja.render('pre.html', title='log', content=text)
-
-    return 'text/html', html
+    return dateformat.format(value, get_format(format or 'DATE_FORMAT', use_l10n=use_l10n))
 
 
 
 
 
-@add_handler('log')
-
-def qute_log(url):
-
-    """Handler for qute://log.
-
-
-
-    An optional query parameter specifies the minimum log level to print.
-
-    For example, qute://log?level=warning prints warnings and errors.
-
-    Level can be one of: vdebug, debug, info, warning, error, critical.
+def time_format(value, format=None, use_l10n=None):
 
     """
 
-    if log.ram_handler is None:
+    Formats a datetime.time object using a localizable format
 
-        html_log = None
 
-    else:
 
-        level = QUrlQuery(url).queryItemValue('level')
+    If use_l10n is provided and is not None, that will force the value to
 
-        if not level:
-
-            level = 'vdebug'
-
-        html_log = log.ram_handler.dump_log(html=True, level=level)
-
-
-
-    html = jinja.render('log.html', title='log', content=html_log)
-
-    return 'text/html', html
-
-
-
-
-
-@add_handler('gpl')
-
-def qute_gpl(_url):
-
-    """Handler for qute://gpl. Return HTML content as string."""
-
-    return 'text/html', utils.read_file('html/license.html')
-
-
-
-
-
-@add_handler('help')
-
-def qute_help(url):
-
-    """Handler for qute://help."""
-
-    urlpath = url.path()
-
-    if not urlpath or urlpath == '/':
-
-        urlpath = 'index.html'
-
-    else:
-
-        urlpath = urlpath.lstrip('/')
-
-    if not docutils.docs_up_to_date(urlpath):
-
-        message.error("Your documentation is outdated! Please re-run "
-
-                      "scripts/asciidoc2html.py.")
-
-
-
-    path = 'html/doc/{}'.format(urlpath)
-
-    if not urlpath.endswith('.html'):
-
-        try:
-
-            bdata = utils.read_file(path, binary=True)
-
-        except OSError as e:
-
-            raise QuteSchemeOSError(e)
-
-        mimetype, _encoding = mimetypes.guess_type(urlpath)
-
-        assert mimetype is not None, url
-
-        return mimetype, bdata
-
-
-
-    try:
-
-        data = utils.read_file(path)
-
-    except OSError:
-
-        # No .html around, let's see if we find the asciidoc
-
-        asciidoc_path = path.replace('.html', '.asciidoc')
-
-        if asciidoc_path.startswith('html/doc/'):
-
-            asciidoc_path = asciidoc_path.replace('html/doc/', '../doc/help/')
-
-
-
-        try:
-
-            asciidoc = utils.read_file(asciidoc_path)
-
-        except OSError:
-
-            asciidoc = None
-
-
-
-        if asciidoc is None:
-
-            raise
-
-
-
-        preamble = textwrap.dedent("""
-
-            There was an error loading the documentation!
-
-
-
-            This most likely means the documentation was not generated
-
-            properly. If you are running qutebrowser from the git repository,
-
-            please (re)run scripts/asciidoc2html.py and reload this page.
-
-
-
-            If you're running a released version this is a bug, please use
-
-            :report to report it.
-
-
-
-            Falling back to the plaintext version.
-
-
-
-            ---------------------------------------------------------------
-
-
-
-
-
-        """)
-
-        return 'text/plain', (preamble + asciidoc).encode('utf-8')
-
-    else:
-
-        return 'text/html', data
-
-
-
-
-
-@add_handler('backend-warning')
-
-def qute_backend_warning(_url):
-
-    """Handler for qute://backend-warning."""
-
-    html = jinja.render('backend-warning.html',
-
-                        distribution=version.distribution(),
-
-                        Distribution=version.Distribution,
-
-                        version=pkg_resources.parse_version,
-
-                        title="Legacy backend warning")
-
-    return 'text/html', html
-
-
-
-
-
-def _qute_settings_set(url):
-
-    """Handler for qute://settings/set."""
-
-    query = QUrlQuery(url)
-
-    option = query.queryItemValue('option', QUrl.FullyDecoded)
-
-    value = query.queryItemValue('value', QUrl.FullyDecoded)
-
-
-
-    # https://github.com/qutebrowser/qutebrowser/issues/727
-
-    if option == 'content.javascript.enabled' and value == 'false':
-
-        msg = ("Refusing to disable javascript via qute://settings "
-
-               "as it needs javascript support.")
-
-        message.error(msg)
-
-        return 'text/html', b'error: ' + msg.encode('utf-8')
-
-
-
-    try:
-
-        config.instance.set_str(option, value, save_yaml=True)
-
-        return 'text/html', b'ok'
-
-    except configexc.Error as e:
-
-        message.error(str(e))
-
-        return 'text/html', b'error: ' + str(e).encode('utf-8')
-
-
-
-
-
-@add_handler('settings')
-
-def qute_settings(url):
-
-    """Handler for qute://settings. View/change qute configuration."""
-
-    if url.path() == '/set':
-
-        return _qute_settings_set(url)
-
-
-
-    html = jinja.render('settings.html', title='settings',
-
-                        configdata=configdata,
-
-                        confget=config.instance.get_str)
-
-    return 'text/html', html
-
-
-
-
-
-@add_handler('bindings')
-
-def qute_bindings(_url):
-
-    """Handler for qute://bindings. View keybindings."""
-
-    bindings = {}
-
-    defaults = config.val.bindings.default
-
-    modes = set(defaults.keys()).union(config.val.bindings.commands)
-
-    modes.remove('normal')
-
-    modes = ['normal'] + sorted(list(modes))
-
-    for mode in modes:
-
-        bindings[mode] = config.key_instance.get_bindings_for(mode)
-
-
-
-    html = jinja.render('bindings.html', title='Bindings',
-
-                        bindings=bindings)
-
-    return 'text/html', html
-
-
-
-
-
-@add_handler('back')
-
-def qute_back(url):
-
-    """Handler for qute://back.
-
-
-
-    Simple page to free ram / lazy load a site, goes back on focusing the tab.
+    be localized (or not), overriding the value of settings.USE_L10N.
 
     """
 
-    html = jinja.render(
-
-        'back.html',
-
-        title='Suspended: ' + urllib.parse.unquote(url.fragment()))
-
-    return 'text/html', html
+    return dateformat.time_format(value, get_format(format or 'TIME_FORMAT', use_l10n=use_l10n))
 
 
 
 
 
-@add_handler('configdiff')
+def number_format(value, decimal_pos=None, use_l10n=None, force_grouping=False):
 
-def qute_configdiff(url):
+    """
 
-    """Handler for qute://configdiff."""
+    Formats a numeric value using localization settings
 
-    if url.path() == '/old':
 
-        try:
 
-            return 'text/html', configdiff.get_diff()
+    If use_l10n is provided and is not None, that will force the value to
 
-        except OSError as e:
+    be localized (or not), overriding the value of settings.USE_L10N.
 
-            error = (b'Failed to read old config: ' +
+    """
 
-                     str(e.strerror).encode('utf-8'))
+    if use_l10n or (use_l10n is None and settings.USE_L10N):
 
-            return 'text/plain', error
+        lang = get_language()
 
     else:
 
-        data = config.instance.dump_userconfig().encode('utf-8')
+        lang = None
 
-        return 'text/plain', data
+    return numberformat.format(
+
+        value,
+
+        get_format('DECIMAL_SEPARATOR', lang, use_l10n=use_l10n),
+
+        decimal_pos,
+
+        get_format('NUMBER_GROUPING', lang, use_l10n=use_l10n),
+
+        get_format('THOUSAND_SEPARATOR', lang, use_l10n=use_l10n),
+
+        force_grouping=force_grouping
+
+    )
 
 
 
 
 
-@add_handler('pastebin-version')
+def localize(value, use_l10n=None):
 
-def qute_pastebin_version(_url):
+    """
 
-    """Handler that pastebins the version string."""
+    Checks if value is a localizable type (date, number...) and returns it
 
-    version.pastebin_version()
+    formatted as a string using current locale format.
 
-    return 'text/plain', b'Paste called.'
+
+
+    If use_l10n is provided and is not None, that will force the value to
+
+    be localized (or not), overriding the value of settings.USE_L10N.
+
+    """
+
+    if isinstance(value, six.string_types):  # Handle strings first for performance reasons.
+
+        return value
+
+    elif isinstance(value, bool):  # Make sure booleans don't get treated as numbers
+
+        return mark_safe(six.text_type(value))
+
+    elif isinstance(value, (decimal.Decimal, float) + six.integer_types):
+
+        return number_format(value, use_l10n=use_l10n)
+
+    elif isinstance(value, datetime.datetime):
+
+        return date_format(value, 'DATETIME_FORMAT', use_l10n=use_l10n)
+
+    elif isinstance(value, datetime.date):
+
+        return date_format(value, use_l10n=use_l10n)
+
+    elif isinstance(value, datetime.time):
+
+        return time_format(value, 'TIME_FORMAT', use_l10n=use_l10n)
+
+    return value
+
+
+
+
+
+def localize_input(value, default=None):
+
+    """
+
+    Checks if an input value is a localizable type and returns it
+
+    formatted with the appropriate formatting string of the current locale.
+
+    """
+
+    if isinstance(value, six.string_types):  # Handle strings first for performance reasons.
+
+        return value
+
+    elif isinstance(value, (decimal.Decimal, float) + six.integer_types):
+
+        return number_format(value)
+
+    elif isinstance(value, datetime.datetime):
+
+        value = datetime_safe.new_datetime(value)
+
+        format = force_str(default or get_format('DATETIME_INPUT_FORMATS')[0])
+
+        return value.strftime(format)
+
+    elif isinstance(value, datetime.date):
+
+        value = datetime_safe.new_date(value)
+
+        format = force_str(default or get_format('DATE_INPUT_FORMATS')[0])
+
+        return value.strftime(format)
+
+    elif isinstance(value, datetime.time):
+
+        format = force_str(default or get_format('TIME_INPUT_FORMATS')[0])
+
+        return value.strftime(format)
+
+    return value
+
+
+
+
+
+def sanitize_separators(value):
+
+    """
+
+    Sanitizes a value according to the current decimal and
+
+    thousand separator setting. Used with form field input.
+
+    """
+
+    if settings.USE_L10N and isinstance(value, six.string_types):
+
+        parts = []
+
+        decimal_separator = get_format('DECIMAL_SEPARATOR')
+
+        if decimal_separator in value:
+
+            value, decimals = value.split(decimal_separator, 1)
+
+            parts.append(decimals)
+
+        if settings.USE_THOUSAND_SEPARATOR:
+
+            thousand_sep = get_format('THOUSAND_SEPARATOR')
+
+            if thousand_sep == '.' and value.count('.') == 1 and len(value.split('.')[-1]) != 3:
+
+                # Special case where we suspect a dot meant decimal separator (see #22171)
+
+                pass
+
+            else:
+
+                for replacement in {
+
+                        thousand_sep, unicodedata.normalize('NFKD', thousand_sep)}:
+
+                    value = value.replace(replacement, '')
+
+        parts.append(value)
+
+        value = '.'.join(reversed(parts))
+
+    return value

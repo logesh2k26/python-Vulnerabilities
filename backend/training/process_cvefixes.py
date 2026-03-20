@@ -26,8 +26,10 @@ csv.field_size_limit(2**30)  # Safe for Windows
 from app.core.ast_parser import ASTParser
 from app.detectors import (
     EvalExecDetector, CommandInjectionDetector,
-    DeserializationDetector, HardcodedSecretsDetector, LogicFlawDetector
+    DeserializationDetector, HardcodedSecretsDetector, LogicFlawDetector,
+    InsecureCryptographyDetector, XXEDetector, ReDoSDetector, XSSDetector
 )
+
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -35,8 +37,10 @@ logger = logging.getLogger(__name__)
 CATEGORIES = [
     "safe", "eval_exec", "command_injection",
     "unsafe_deserialization", "hardcoded_secrets",
-    "sql_injection", "path_traversal"
+    "sql_injection", "path_traversal", "ssrf",
+    "insecure_cryptography", "xxe", "redos", "xss"
 ]
+
 
 VULN_TYPE_MAP = {
     "eval_exec": "eval_exec",
@@ -48,8 +52,14 @@ VULN_TYPE_MAP = {
     "hardcoded_secret": "hardcoded_secrets",
     "sql_injection": "sql_injection",
     "path_traversal": "path_traversal",
+    "ssrf": "ssrf",
+    "insecure_cryptography": "insecure_cryptography",
+    "xxe": "xxe",
+    "redos": "redos",
+    "xss": "xss",
     "logic_flaw": "safe",
 }
+
 
 
 def clean_nuls(f):
@@ -118,7 +128,12 @@ def process_cvefixes(csv_path: Path, data_dir: Path, max_samples: int = 0):
         DeserializationDetector(),
         HardcodedSecretsDetector(),
         LogicFlawDetector(),
+        InsecureCryptographyDetector(),
+        XXEDetector(),
+        ReDoSDetector(),
+        XSSDetector(),
     ]
+
     
     # Ensure category directories exist
     for category in CATEGORIES:

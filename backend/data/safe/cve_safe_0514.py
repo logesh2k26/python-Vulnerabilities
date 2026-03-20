@@ -2,818 +2,890 @@
 # Safety: safe
 # Category: safe
 
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
+import json
 
+from unittest import mock
 
 
-# Copyright 2010 United States Government as represented by the
 
-# Administrator of the National Aeronautics and Space Administration.
+from django.conf import settings
 
-# All Rights Reserved.
+from django.shortcuts import resolve_url
 
-#
+from django.test import TestCase
 
-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+from django.test.utils import override_settings
 
-#    not use this file except in compliance with the License. You may obtain
+from django.urls import reverse
 
-#    a copy of the License at
+from django_otp import DEVICE_ID_SESSION_KEY
 
-#
+from django_otp.oath import totp
 
-#         http://www.apache.org/licenses/LICENSE-2.0
 
-#
 
-#    Unless required by applicable law or agreed to in writing, software
+from two_factor.models import random_hex_str
 
-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
-#    License for the specific language governing permissions and limitations
+from .utils import UserMixin
 
-#    under the License.
 
 
 
-from nova import compute
 
-from nova import context
+class LoginTest(UserMixin, TestCase):
 
-from nova import db
+    def _post(self, data=None):
 
-from nova import flags
+        return self.client.post(reverse('two_factor:login'), data=data)
 
-from nova import quota
 
-from nova import test
 
-from nova import volume
+    def test_form(self):
 
-from nova.compute import instance_types
+        response = self.client.get(reverse('two_factor:login'))
 
+        self.assertContains(response, 'Password:')
 
 
 
+    def test_invalid_login(self):
 
-FLAGS = flags.FLAGS
+        response = self._post({'auth-username': 'unknown',
 
+                               'auth-password': 'secret',
 
+                               'login_view-current_step': 'auth'})
 
+        self.assertContains(response, 'Please enter a correct')
 
+        self.assertContains(response, 'and password.')
 
-class QuotaTestCase(test.TestCase):
 
 
+    @mock.patch('two_factor.views.core.signals.user_verified.send')
 
-    class StubImageService(object):
+    def test_valid_login(self, mock_signal):
 
+        self.create_user()
 
+        response = self._post({'auth-username': 'bouke@example.com',
 
-        def show(self, *args, **kwargs):
+                               'auth-password': 'secret',
 
-            return {"properties": {}}
+                               'login_view-current_step': 'auth'})
 
+        self.assertRedirects(response, resolve_url(settings.LOGIN_REDIRECT_URL))
 
 
-    def setUp(self):
 
-        super(QuotaTestCase, self).setUp()
+        # No signal should be fired for non-verified user logins.
 
-        self.flags(connection_type='fake',
+        self.assertFalse(mock_signal.called)
 
-                   quota_instances=2,
 
-                   quota_cores=4,
 
-                   quota_volumes=2,
+    def test_valid_login_with_custom_redirect(self):
 
-                   quota_gigabytes=20,
+        redirect_url = reverse('two_factor:setup')
 
-                   quota_floating_ips=1,
+        self.create_user()
 
-                   quota_security_groups=10,
+        response = self.client.post(
 
-                   quota_security_group_rules=20)
+            '%s?%s' % (reverse('two_factor:login'), 'next=' + redirect_url),
 
+            {'auth-username': 'bouke@example.com',
 
+             'auth-password': 'secret',
 
-        self.network = self.network = self.start_service('network')
+             'login_view-current_step': 'auth'})
 
-        self.user_id = 'admin'
+        self.assertRedirects(response, redirect_url)
 
-        self.project_id = 'admin'
 
-        self.context = context.RequestContext(self.user_id,
 
-                                              self.project_id,
+    def test_valid_login_with_custom_post_redirect(self):
 
-                                              True)
+        redirect_url = reverse('two_factor:setup')
 
+        self.create_user()
 
+        response = self._post({'auth-username': 'bouke@example.com',
 
-    def _create_instance(self, cores=2):
+                               'auth-password': 'secret',
 
-        """Create a test instance"""
+                               'login_view-current_step': 'auth',
 
-        inst = {}
+                               'next': redirect_url})
 
-        inst['image_id'] = 1
+        self.assertRedirects(response, redirect_url)
 
-        inst['reservation_id'] = 'r-fakeres'
 
-        inst['user_id'] = self.user_id
 
-        inst['project_id'] = self.project_id
+    def test_valid_login_with_redirect_field_name(self):
 
-        inst['instance_type_id'] = '3'  # m1.large
+        redirect_url = reverse('two_factor:setup')
 
-        inst['vcpus'] = cores
+        self.create_user()
 
-        return db.instance_create(self.context, inst)['id']
+        response = self.client.post(
 
+            '%s?%s' % (reverse('custom-field-name-login'), 'next_page=' + redirect_url),
 
+            {'auth-username': 'bouke@example.com',
 
-    def _create_volume(self, size=10):
+             'auth-password': 'secret',
 
-        """Create a test volume"""
+             'login_view-current_step': 'auth'})
 
-        vol = {}
+        self.assertRedirects(response, redirect_url)
 
-        vol['user_id'] = self.user_id
 
-        vol['project_id'] = self.project_id
 
-        vol['size'] = size
+    def test_valid_login_with_allowed_external_redirect(self):
 
-        return db.volume_create(self.context, vol)['id']
+        redirect_url = 'https://test.allowed-success-url.com'
 
+        self.create_user()
 
+        response = self.client.post(
 
-    def _get_instance_type(self, name):
+            '%s?%s' % (reverse('custom-allowed-success-url-login'), 'next=' + redirect_url),
 
-        instance_types = {
+            {'auth-username': 'bouke@example.com',
 
-            'm1.tiny': dict(memory_mb=512, vcpus=1, local_gb=0, flavorid=1),
+             'auth-password': 'secret',
 
-            'm1.small': dict(memory_mb=2048, vcpus=1, local_gb=20, flavorid=2),
+             'login_view-current_step': 'auth'})
 
-            'm1.medium':
+        self.assertRedirects(response, redirect_url, fetch_redirect_response=False)
 
-                dict(memory_mb=4096, vcpus=2, local_gb=40, flavorid=3),
 
-            'm1.large': dict(memory_mb=8192, vcpus=4, local_gb=80, flavorid=4),
 
-            'm1.xlarge':
+    def test_valid_login_with_disallowed_external_redirect(self):
 
-                dict(memory_mb=16384, vcpus=8, local_gb=160, flavorid=5)}
+        redirect_url = 'https://test.disallowed-success-url.com'
 
-        return instance_types[name]
+        self.create_user()
 
+        response = self.client.post(
 
+            '%s?%s' % (reverse('custom-allowed-success-url-login'), 'next=' + redirect_url),
 
-    def test_quota_overrides(self):
+            {'auth-username': 'bouke@example.com',
 
-        """Make sure overriding a projects quotas works"""
+             'auth-password': 'secret',
 
-        num_instances = quota.allowed_instances(self.context, 100,
+             'login_view-current_step': 'auth'})
 
-            self._get_instance_type('m1.small'))
+        self.assertRedirects(response, reverse('two_factor:profile'), fetch_redirect_response=False)
 
-        self.assertEqual(num_instances, 2)
 
-        db.quota_create(self.context, self.project_id, 'instances', 10)
 
-        num_instances = quota.allowed_instances(self.context, 100,
+    @mock.patch('two_factor.views.core.time')
 
-            self._get_instance_type('m1.small'))
+    def test_valid_login_primary_key_stored(self, mock_time):
 
-        self.assertEqual(num_instances, 4)
+        mock_time.time.return_value = 12345.12
 
-        db.quota_create(self.context, self.project_id, 'cores', 100)
+        user = self.create_user()
 
-        num_instances = quota.allowed_instances(self.context, 100,
+        user.totpdevice_set.create(name='default',
 
-            self._get_instance_type('m1.small'))
+                                   key=random_hex_str())
 
-        self.assertEqual(num_instances, 10)
 
-        db.quota_create(self.context, self.project_id, 'ram', 3 * 2048)
 
-        num_instances = quota.allowed_instances(self.context, 100,
+        response = self._post({'auth-username': 'bouke@example.com',
 
-            self._get_instance_type('m1.small'))
+                               'auth-password': 'secret',
 
-        self.assertEqual(num_instances, 3)
+                               'login_view-current_step': 'auth'})
 
+        self.assertContains(response, 'Token:')
 
 
-        # metadata_items
 
-        too_many_items = FLAGS.quota_metadata_items + 1000
-
-        num_metadata_items = quota.allowed_metadata_items(self.context,
-
-                                                          too_many_items)
-
-        self.assertEqual(num_metadata_items, FLAGS.quota_metadata_items)
-
-        db.quota_create(self.context, self.project_id, 'metadata_items', 5)
-
-        num_metadata_items = quota.allowed_metadata_items(self.context,
-
-                                                          too_many_items)
-
-        self.assertEqual(num_metadata_items, 5)
-
-
-
-        # Cleanup
-
-        db.quota_destroy_all_by_project(self.context, self.project_id)
-
-
-
-    def test_unlimited_instances(self):
-
-        self.flags(quota_instances=2, quota_ram=-1, quota_cores=-1)
-
-        instance_type = self._get_instance_type('m1.small')
-
-        num_instances = quota.allowed_instances(self.context, 100,
-
-                                                instance_type)
-
-        self.assertEqual(num_instances, 2)
-
-        db.quota_create(self.context, self.project_id, 'instances', None)
-
-        num_instances = quota.allowed_instances(self.context, 100,
-
-                                                instance_type)
-
-        self.assertEqual(num_instances, 100)
-
-        num_instances = quota.allowed_instances(self.context, 101,
-
-                                                instance_type)
-
-        self.assertEqual(num_instances, 101)
-
-
-
-    def test_unlimited_ram(self):
-
-        self.flags(quota_instances=-1, quota_ram=2 * 2048, quota_cores=-1)
-
-        instance_type = self._get_instance_type('m1.small')
-
-        num_instances = quota.allowed_instances(self.context, 100,
-
-                                                instance_type)
-
-        self.assertEqual(num_instances, 2)
-
-        db.quota_create(self.context, self.project_id, 'ram', None)
-
-        num_instances = quota.allowed_instances(self.context, 100,
-
-                                                instance_type)
-
-        self.assertEqual(num_instances, 100)
-
-        num_instances = quota.allowed_instances(self.context, 101,
-
-                                                instance_type)
-
-        self.assertEqual(num_instances, 101)
-
-
-
-    def test_unlimited_cores(self):
-
-        self.flags(quota_instances=-1, quota_ram=-1, quota_cores=2)
-
-        instance_type = self._get_instance_type('m1.small')
-
-        num_instances = quota.allowed_instances(self.context, 100,
-
-                                                instance_type)
-
-        self.assertEqual(num_instances, 2)
-
-        db.quota_create(self.context, self.project_id, 'cores', None)
-
-        num_instances = quota.allowed_instances(self.context, 100,
-
-                                                instance_type)
-
-        self.assertEqual(num_instances, 100)
-
-        num_instances = quota.allowed_instances(self.context, 101,
-
-                                                instance_type)
-
-        self.assertEqual(num_instances, 101)
-
-
-
-    def test_unlimited_volumes(self):
-
-        self.flags(quota_volumes=10, quota_gigabytes=-1)
-
-        volumes = quota.allowed_volumes(self.context, 100, 1)
-
-        self.assertEqual(volumes, 10)
-
-        db.quota_create(self.context, self.project_id, 'volumes', None)
-
-        volumes = quota.allowed_volumes(self.context, 100, 1)
-
-        self.assertEqual(volumes, 100)
-
-        volumes = quota.allowed_volumes(self.context, 101, 1)
-
-        self.assertEqual(volumes, 101)
-
-
-
-    def test_unlimited_gigabytes(self):
-
-        self.flags(quota_volumes=-1, quota_gigabytes=10)
-
-        volumes = quota.allowed_volumes(self.context, 100, 1)
-
-        self.assertEqual(volumes, 10)
-
-        db.quota_create(self.context, self.project_id, 'gigabytes', None)
-
-        volumes = quota.allowed_volumes(self.context, 100, 1)
-
-        self.assertEqual(volumes, 100)
-
-        volumes = quota.allowed_volumes(self.context, 101, 1)
-
-        self.assertEqual(volumes, 101)
-
-
-
-    def test_unlimited_floating_ips(self):
-
-        self.flags(quota_floating_ips=10)
-
-        floating_ips = quota.allowed_floating_ips(self.context, 100)
-
-        self.assertEqual(floating_ips, 10)
-
-        db.quota_create(self.context, self.project_id, 'floating_ips', None)
-
-        floating_ips = quota.allowed_floating_ips(self.context, 100)
-
-        self.assertEqual(floating_ips, 100)
-
-        floating_ips = quota.allowed_floating_ips(self.context, 101)
-
-        self.assertEqual(floating_ips, 101)
-
-
-
-    def test_unlimited_security_groups(self):
-
-        self.flags(quota_security_groups=10)
-
-        security_groups = quota.allowed_security_groups(self.context, 100)
-
-        self.assertEqual(security_groups, 10)
-
-        db.quota_create(self.context, self.project_id, 'security_groups', None)
-
-        security_groups = quota.allowed_security_groups(self.context, 100)
-
-        self.assertEqual(security_groups, 100)
-
-        security_groups = quota.allowed_security_groups(self.context, 101)
-
-        self.assertEqual(security_groups, 101)
-
-
-
-    def test_unlimited_security_group_rules(self):
-
-
-
-        def fake_security_group_rule_count_by_group(context, sec_group_id):
-
-            return 0
-
-
-
-        self.stubs.Set(db, 'security_group_rule_count_by_group',
-
-                       fake_security_group_rule_count_by_group)
-
-
-
-        self.flags(quota_security_group_rules=20)
-
-        rules = quota.allowed_security_group_rules(self.context, 1234, 100)
-
-        self.assertEqual(rules, 20)
-
-        db.quota_create(self.context, self.project_id, 'security_group_rules',
-
-                        None)
-
-        rules = quota.allowed_security_group_rules(self.context, 1234, 100)
-
-        self.assertEqual(rules, 100)
-
-        rules = quota.allowed_security_group_rules(self.context, 1234, 101)
-
-        self.assertEqual(rules, 101)
-
-
-
-    def test_unlimited_metadata_items(self):
-
-        self.flags(quota_metadata_items=10)
-
-        items = quota.allowed_metadata_items(self.context, 100)
-
-        self.assertEqual(items, 10)
-
-        db.quota_create(self.context, self.project_id, 'metadata_items', None)
-
-        items = quota.allowed_metadata_items(self.context, 100)
-
-        self.assertEqual(items, 100)
-
-        items = quota.allowed_metadata_items(self.context, 101)
-
-        self.assertEqual(items, 101)
-
-
-
-    def test_too_many_instances(self):
-
-        instance_ids = []
-
-        for i in range(FLAGS.quota_instances):
-
-            instance_id = self._create_instance()
-
-            instance_ids.append(instance_id)
-
-        inst_type = instance_types.get_instance_type_by_name('m1.small')
-
-        self.assertRaises(quota.QuotaError, compute.API().create,
-
-                                            self.context,
-
-                                            min_count=1,
-
-                                            max_count=1,
-
-                                            instance_type=inst_type,
-
-                                            image_href=1)
-
-        for instance_id in instance_ids:
-
-            db.instance_destroy(self.context, instance_id)
-
-
-
-    def test_too_many_cores(self):
-
-        instance_ids = []
-
-        instance_id = self._create_instance(cores=4)
-
-        instance_ids.append(instance_id)
-
-        inst_type = instance_types.get_instance_type_by_name('m1.small')
-
-        self.assertRaises(quota.QuotaError, compute.API().create,
-
-                                            self.context,
-
-                                            min_count=1,
-
-                                            max_count=1,
-
-                                            instance_type=inst_type,
-
-                                            image_href=1)
-
-        for instance_id in instance_ids:
-
-            db.instance_destroy(self.context, instance_id)
-
-
-
-    def test_too_many_volumes(self):
-
-        volume_ids = []
-
-        for i in range(FLAGS.quota_volumes):
-
-            volume_id = self._create_volume()
-
-            volume_ids.append(volume_id)
-
-        self.assertRaises(quota.QuotaError,
-
-                          volume.API().create,
-
-                          self.context,
-
-                          size=10,
-
-                          snapshot_id=None,
-
-                          name='',
-
-                          description='')
-
-        for volume_id in volume_ids:
-
-            db.volume_destroy(self.context, volume_id)
-
-
-
-    def test_too_many_gigabytes(self):
-
-        volume_ids = []
-
-        volume_id = self._create_volume(size=20)
-
-        volume_ids.append(volume_id)
-
-        self.assertRaises(quota.QuotaError,
-
-                          volume.API().create,
-
-                          self.context,
-
-                          size=10,
-
-                          snapshot_id=None,
-
-                          name='',
-
-                          description='')
-
-        for volume_id in volume_ids:
-
-            db.volume_destroy(self.context, volume_id)
-
-
-
-    def test_too_many_addresses(self):
-
-        address = '192.168.0.100'
-
-        db.floating_ip_create(context.get_admin_context(),
-
-                              {'address': address,
-
-                               'project_id': self.project_id})
-
-        self.assertRaises(quota.QuotaError,
-
-                          self.network.allocate_floating_ip,
-
-                          self.context,
-
-                          self.project_id)
-
-        db.floating_ip_destroy(context.get_admin_context(), address)
-
-
-
-    def test_too_many_metadata_items(self):
-
-        metadata = {}
-
-        for i in range(FLAGS.quota_metadata_items + 1):
-
-            metadata['key%s' % i] = 'value%s' % i
-
-        inst_type = instance_types.get_instance_type_by_name('m1.small')
-
-        self.assertRaises(quota.QuotaError, compute.API().create,
-
-                                            self.context,
-
-                                            min_count=1,
-
-                                            max_count=1,
-
-                                            instance_type=inst_type,
-
-                                            image_href='fake',
-
-                                            metadata=metadata)
-
-
-
-    def test_default_allowed_injected_files(self):
-
-        self.flags(quota_max_injected_files=55)
-
-        self.assertEqual(quota.allowed_injected_files(self.context, 100), 55)
-
-
-
-    def test_overridden_allowed_injected_files(self):
-
-        self.flags(quota_max_injected_files=5)
-
-        db.quota_create(self.context, self.project_id, 'injected_files', 77)
-
-        self.assertEqual(quota.allowed_injected_files(self.context, 100), 77)
-
-
-
-    def test_unlimited_default_allowed_injected_files(self):
-
-        self.flags(quota_max_injected_files=-1)
-
-        self.assertEqual(quota.allowed_injected_files(self.context, 100), 100)
-
-
-
-    def test_unlimited_db_allowed_injected_files(self):
-
-        self.flags(quota_max_injected_files=5)
-
-        db.quota_create(self.context, self.project_id, 'injected_files', None)
-
-        self.assertEqual(quota.allowed_injected_files(self.context, 100), 100)
-
-
-
-    def test_default_allowed_injected_file_content_bytes(self):
-
-        self.flags(quota_max_injected_file_content_bytes=12345)
-
-        limit = quota.allowed_injected_file_content_bytes(self.context, 23456)
-
-        self.assertEqual(limit, 12345)
-
-
-
-    def test_overridden_allowed_injected_file_content_bytes(self):
-
-        self.flags(quota_max_injected_file_content_bytes=12345)
-
-        db.quota_create(self.context, self.project_id,
-
-                        'injected_file_content_bytes', 5678)
-
-        limit = quota.allowed_injected_file_content_bytes(self.context, 23456)
-
-        self.assertEqual(limit, 5678)
-
-
-
-    def test_unlimited_default_allowed_injected_file_content_bytes(self):
-
-        self.flags(quota_max_injected_file_content_bytes=-1)
-
-        limit = quota.allowed_injected_file_content_bytes(self.context, 23456)
-
-        self.assertEqual(limit, 23456)
-
-
-
-    def test_unlimited_db_allowed_injected_file_content_bytes(self):
-
-        self.flags(quota_max_injected_file_content_bytes=12345)
-
-        db.quota_create(self.context, self.project_id,
-
-                        'injected_file_content_bytes', None)
-
-        limit = quota.allowed_injected_file_content_bytes(self.context, 23456)
-
-        self.assertEqual(limit, 23456)
-
-
-
-    def _create_with_injected_files(self, files):
-
-        self.flags(image_service='nova.image.fake.FakeImageService')
-
-        api = compute.API(image_service=self.StubImageService())
-
-        inst_type = instance_types.get_instance_type_by_name('m1.small')
-
-        api.create(self.context, min_count=1, max_count=1,
-
-                instance_type=inst_type, image_href='3',
-
-                injected_files=files)
-
-
-
-    def test_no_injected_files(self):
-
-        self.flags(image_service='nova.image.fake.FakeImageService')
-
-        api = compute.API(image_service=self.StubImageService())
-
-        inst_type = instance_types.get_instance_type_by_name('m1.small')
-
-        api.create(self.context, instance_type=inst_type, image_href='3')
-
-
-
-    def test_max_injected_files(self):
-
-        files = []
-
-        for i in xrange(FLAGS.quota_max_injected_files):
-
-            files.append(('/my/path%d' % i, 'config = test\n'))
-
-        self._create_with_injected_files(files)  # no QuotaError
-
-
-
-    def test_too_many_injected_files(self):
-
-        files = []
-
-        for i in xrange(FLAGS.quota_max_injected_files + 1):
-
-            files.append(('/my/path%d' % i, 'my\ncontent%d\n' % i))
-
-        self.assertRaises(quota.QuotaError,
-
-                          self._create_with_injected_files, files)
-
-
-
-    def test_max_injected_file_content_bytes(self):
-
-        max = FLAGS.quota_max_injected_file_content_bytes
-
-        content = ''.join(['a' for i in xrange(max)])
-
-        files = [('/test/path', content)]
-
-        self._create_with_injected_files(files)  # no QuotaError
-
-
-
-    def test_too_many_injected_file_content_bytes(self):
-
-        max = FLAGS.quota_max_injected_file_content_bytes
-
-        content = ''.join(['a' for i in xrange(max + 1)])
-
-        files = [('/test/path', content)]
-
-        self.assertRaises(quota.QuotaError,
-
-                          self._create_with_injected_files, files)
-
-
-
-    def test_allowed_injected_file_path_bytes(self):
+        self.assertEqual(self.client.session['wizard_login_view']['user_pk'], str(user.pk))
 
         self.assertEqual(
 
-                quota.allowed_injected_file_path_bytes(self.context),
+            self.client.session['wizard_login_view']['user_backend'],
 
-                FLAGS.quota_max_injected_file_path_bytes)
+            'django.contrib.auth.backends.ModelBackend')
 
-
-
-    def test_max_injected_file_path_bytes(self):
-
-        max = FLAGS.quota_max_injected_file_path_bytes
-
-        path = ''.join(['a' for i in xrange(max)])
-
-        files = [(path, 'config = quotatest')]
-
-        self._create_with_injected_files(files)  # no QuotaError
+        self.assertEqual(self.client.session['wizard_login_view']['authentication_time'], 12345)
 
 
 
-    def test_too_many_injected_file_path_bytes(self):
+    @mock.patch('two_factor.views.core.time')
 
-        max = FLAGS.quota_max_injected_file_path_bytes
+    def test_valid_login_post_auth_session_clear_of_form_data(self, mock_time):
 
-        path = ''.join(['a' for i in xrange(max + 1)])
+        mock_time.time.return_value = 12345.12
 
-        files = [(path, 'config = quotatest')]
+        user = self.create_user()
 
-        self.assertRaises(quota.QuotaError,
+        user.totpdevice_set.create(name='default',
 
-                          self._create_with_injected_files, files)
+                                   key=random_hex_str())
+
+
+
+        response = self._post({'auth-username': 'bouke@example.com',
+
+                               'auth-password': 'secret',
+
+                               'login_view-current_step': 'auth'})
+
+        self.assertContains(response, 'Token:')
+
+
+
+        self.assertEqual(self.client.session['wizard_login_view']['user_pk'], str(user.pk))
+
+        self.assertEqual(self.client.session['wizard_login_view']['step'], 'token')
+
+        self.assertEqual(self.client.session['wizard_login_view']['step_data'], {'auth': None})
+
+        self.assertEqual(self.client.session['wizard_login_view']['step_files'], {'auth': {}})
+
+        self.assertEqual(self.client.session['wizard_login_view']['validated_step_data'], {})
+
+
+
+    @mock.patch('two_factor.views.core.logger')
+
+    @mock.patch('two_factor.views.core.time')
+
+    def test_valid_login_expired(self, mock_time, mock_logger):
+
+        mock_time.time.return_value = 12345.12
+
+        user = self.create_user()
+
+        device = user.totpdevice_set.create(name='default',
+
+                                            key=random_hex_str())
+
+
+
+        response = self._post({'auth-username': 'bouke@example.com',
+
+                               'auth-password': 'secret',
+
+                               'login_view-current_step': 'auth'})
+
+        self.assertContains(response, 'Token:')
+
+
+
+        self.assertEqual(self.client.session['wizard_login_view']['user_pk'], str(user.pk))
+
+        self.assertEqual(
+
+            self.client.session['wizard_login_view']['user_backend'],
+
+            'django.contrib.auth.backends.ModelBackend')
+
+        self.assertEqual(self.client.session['wizard_login_view']['authentication_time'], 12345)
+
+
+
+        mock_time.time.return_value = 20345.12
+
+
+
+        response = self._post({'token-otp_token': totp(device.bin_key),
+
+                               'login_view-current_step': 'token'})
+
+        self.assertEqual(response.status_code, 200)
+
+        self.assertNotContains(response, 'Token:')
+
+        self.assertContains(response, 'Password:')
+
+        self.assertContains(response, 'Your session has timed out. Please login again.')
+
+
+
+        # Check that a message was logged.
+
+        mock_logger.info.assert_called_with(
+
+            "User's authentication flow has timed out. The user "
+
+            "has been redirected to the initial auth form.")
+
+
+
+    @override_settings(TWO_FACTOR_LOGIN_TIMEOUT=0)
+
+    @mock.patch('two_factor.views.core.time')
+
+    def test_valid_login_no_timeout(self, mock_time):
+
+        mock_time.time.return_value = 12345.12
+
+        user = self.create_user()
+
+        device = user.totpdevice_set.create(name='default',
+
+                                            key=random_hex_str())
+
+
+
+        response = self._post({'auth-username': 'bouke@example.com',
+
+                               'auth-password': 'secret',
+
+                               'login_view-current_step': 'auth'})
+
+        self.assertContains(response, 'Token:')
+
+
+
+        self.assertEqual(self.client.session['wizard_login_view']['user_pk'], str(user.pk))
+
+        self.assertEqual(
+
+            self.client.session['wizard_login_view']['user_backend'],
+
+            'django.contrib.auth.backends.ModelBackend')
+
+        self.assertEqual(self.client.session['wizard_login_view']['authentication_time'], 12345)
+
+
+
+        mock_time.time.return_value = 20345.12
+
+
+
+        response = self._post({'token-otp_token': totp(device.bin_key),
+
+                               'login_view-current_step': 'token'})
+
+        self.assertRedirects(response, resolve_url(settings.LOGIN_REDIRECT_URL))
+
+        self.assertEqual(self.client.session['_auth_user_id'], str(user.pk))
+
+
+
+    def test_valid_login_with_redirect_authenticated_user(self):
+
+        user = self.create_user()
+
+        response = self.client.get(
+
+            reverse('custom-redirect-authenticated-user-login')
+
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        self.client.force_login(user)
+
+        response = self.client.get(
+
+            reverse('custom-redirect-authenticated-user-login')
+
+        )
+
+        self.assertRedirects(response, reverse('two_factor:profile'))
+
+
+
+    def test_valid_login_with_redirect_authenticated_user_loop(self):
+
+        redirect_url = reverse('custom-redirect-authenticated-user-login')
+
+        user = self.create_user()
+
+        self.client.force_login(user)
+
+        with self.assertRaises(ValueError):
+
+            self.client.get(
+
+                '%s?%s' % (reverse('custom-redirect-authenticated-user-login'), 'next=' + redirect_url),
+
+            )
+
+
+
+    @mock.patch('two_factor.views.core.signals.user_verified.send')
+
+    def test_with_generator(self, mock_signal):
+
+        user = self.create_user()
+
+        device = user.totpdevice_set.create(name='default',
+
+                                            key=random_hex_str())
+
+
+
+        response = self._post({'auth-username': 'bouke@example.com',
+
+                               'auth-password': 'secret',
+
+                               'login_view-current_step': 'auth'})
+
+        self.assertContains(response, 'Token:')
+
+
+
+        response = self._post({'token-otp_token': '123456',
+
+                               'login_view-current_step': 'token'})
+
+        self.assertEqual(response.context_data['wizard']['form'].errors,
+
+                         {'__all__': ['Invalid token. Please make sure you '
+
+                                      'have entered it correctly.']})
+
+
+
+        # reset throttle because we're not testing that
+
+        device.throttle_reset()
+
+
+
+        response = self._post({'token-otp_token': totp(device.bin_key),
+
+                               'login_view-current_step': 'token'})
+
+        self.assertRedirects(response, resolve_url(settings.LOGIN_REDIRECT_URL))
+
+
+
+        self.assertEqual(device.persistent_id,
+
+                         self.client.session.get(DEVICE_ID_SESSION_KEY))
+
+
+
+        # Check that the signal was fired.
+
+        mock_signal.assert_called_with(sender=mock.ANY, request=mock.ANY, user=user, device=device)
+
+
+
+    @mock.patch('two_factor.views.core.signals.user_verified.send')
+
+    def test_throttle_with_generator(self, mock_signal):
+
+        user = self.create_user()
+
+        device = user.totpdevice_set.create(name='default',
+
+                                            key=random_hex_str())
+
+
+
+        self._post({'auth-username': 'bouke@example.com',
+
+                    'auth-password': 'secret',
+
+                    'login_view-current_step': 'auth'})
+
+
+
+        # throttle device
+
+        device.throttle_increment()
+
+
+
+        response = self._post({'token-otp_token': totp(device.bin_key),
+
+                               'login_view-current_step': 'token'})
+
+        self.assertEqual(response.context_data['wizard']['form'].errors,
+
+                         {'__all__': ['Invalid token. Please make sure you '
+
+                                      'have entered it correctly.']})
+
+
+
+    @mock.patch('two_factor.gateways.fake.Fake')
+
+    @mock.patch('two_factor.views.core.signals.user_verified.send')
+
+    @override_settings(
+
+        TWO_FACTOR_SMS_GATEWAY='two_factor.gateways.fake.Fake',
+
+        TWO_FACTOR_CALL_GATEWAY='two_factor.gateways.fake.Fake',
+
+    )
+
+    def test_with_backup_phone(self, mock_signal, fake):
+
+        user = self.create_user()
+
+        for no_digits in (6, 8):
+
+            with self.settings(TWO_FACTOR_TOTP_DIGITS=no_digits):
+
+                user.totpdevice_set.create(name='default', key=random_hex_str(),
+
+                                           digits=no_digits)
+
+                device = user.phonedevice_set.create(name='backup', number='+31101234567',
+
+                                                     method='sms',
+
+                                                     key=random_hex_str())
+
+
+
+                # Backup phones should be listed on the login form
+
+                response = self._post({'auth-username': 'bouke@example.com',
+
+                                       'auth-password': 'secret',
+
+                                       'login_view-current_step': 'auth'})
+
+                self.assertContains(response, 'Send text message to +31 ** *** **67')
+
+
+
+                # Ask for challenge on invalid device
+
+                response = self._post({'auth-username': 'bouke@example.com',
+
+                                       'auth-password': 'secret',
+
+                                       'challenge_device': 'MALICIOUS/INPUT/666'})
+
+                self.assertContains(response, 'Send text message to +31 ** *** **67')
+
+
+
+                # Ask for SMS challenge
+
+                response = self._post({'auth-username': 'bouke@example.com',
+
+                                       'auth-password': 'secret',
+
+                                       'challenge_device': device.persistent_id})
+
+                self.assertContains(response, 'We sent you a text message')
+
+                fake.return_value.send_sms.assert_called_with(
+
+                    device=device,
+
+                    token=str(totp(device.bin_key, digits=no_digits)).zfill(no_digits))
+
+
+
+                # Ask for phone challenge
+
+                device.method = 'call'
+
+                device.save()
+
+                response = self._post({'auth-username': 'bouke@example.com',
+
+                                       'auth-password': 'secret',
+
+                                       'challenge_device': device.persistent_id})
+
+                self.assertContains(response, 'We are calling your phone right now')
+
+                fake.return_value.make_call.assert_called_with(
+
+                    device=device,
+
+                    token=str(totp(device.bin_key, digits=no_digits)).zfill(no_digits))
+
+
+
+            # Valid token should be accepted.
+
+            response = self._post({'token-otp_token': totp(device.bin_key),
+
+                                   'login_view-current_step': 'token'})
+
+            self.assertRedirects(response, resolve_url(settings.LOGIN_REDIRECT_URL))
+
+            self.assertEqual(device.persistent_id,
+
+                             self.client.session.get(DEVICE_ID_SESSION_KEY))
+
+
+
+            # Check that the signal was fired.
+
+            mock_signal.assert_called_with(sender=mock.ANY, request=mock.ANY, user=user, device=device)
+
+
+
+    @mock.patch('two_factor.views.core.signals.user_verified.send')
+
+    def test_with_backup_token(self, mock_signal):
+
+        user = self.create_user()
+
+        user.totpdevice_set.create(name='default', key=random_hex_str())
+
+        device = user.staticdevice_set.create(name='backup')
+
+        device.token_set.create(token='abcdef123')
+
+
+
+        # Backup phones should be listed on the login form
+
+        response = self._post({'auth-username': 'bouke@example.com',
+
+                               'auth-password': 'secret',
+
+                               'login_view-current_step': 'auth'})
+
+        self.assertContains(response, 'Backup Token')
+
+
+
+        # Should be able to go to backup tokens step in wizard
+
+        response = self._post({'wizard_goto_step': 'backup'})
+
+        self.assertContains(response, 'backup tokens')
+
+
+
+        # Wrong codes should not be accepted
+
+        response = self._post({'backup-otp_token': 'WRONG',
+
+                               'login_view-current_step': 'backup'})
+
+        self.assertEqual(response.context_data['wizard']['form'].errors,
+
+                         {'__all__': ['Invalid token. Please make sure you '
+
+                                      'have entered it correctly.']})
+
+        # static devices are throttled
+
+        device.throttle_reset()
+
+
+
+        # Valid token should be accepted.
+
+        response = self._post({'backup-otp_token': 'abcdef123',
+
+                               'login_view-current_step': 'backup'})
+
+        self.assertRedirects(response, resolve_url(settings.LOGIN_REDIRECT_URL))
+
+
+
+        # Check that the signal was fired.
+
+        mock_signal.assert_called_with(sender=mock.ANY, request=mock.ANY, user=user, device=device)
+
+
+
+    @mock.patch('two_factor.views.utils.logger')
+
+    def test_reset_wizard_state(self, mock_logger):
+
+        self.create_user()
+
+        self.enable_otp()
+
+
+
+        response = self._post({'auth-username': 'bouke@example.com',
+
+                               'auth-password': 'secret',
+
+                               'login_view-current_step': 'auth'})
+
+        self.assertContains(response, 'Token:')
+
+
+
+        # A GET request resets the state of the wizard...
+
+        self.client.get(reverse('two_factor:login'))
+
+
+
+        # ...so there is no user in this request anymore. As the login flow
+
+        # depends on a user being present, this should be handled gracefully.
+
+        response = self._post({'token-otp_token': '123456',
+
+                               'login_view-current_step': 'token'})
+
+        self.assertContains(response, 'Password:')
+
+
+
+        # Check that a message was logged.
+
+        mock_logger.warning.assert_called_with(
+
+            "Requested step '%s' is no longer valid, returning to last valid "
+
+            "step in the wizard.",
+
+            'token')
+
+
+
+    @mock.patch('two_factor.views.utils.logger')
+
+    def test_login_different_user_on_existing_session(self, mock_logger):
+
+        """
+
+        This test reproduces the issue where a user is logged in and a different user
+
+        attempts to login.
+
+        """
+
+        self.create_user()
+
+        self.create_user(username='vedran@example.com')
+
+
+
+        response = self._post({'auth-username': 'bouke@example.com',
+
+                               'auth-password': 'secret',
+
+                               'login_view-current_step': 'auth'})
+
+        self.assertRedirects(response, resolve_url(settings.LOGIN_REDIRECT_URL))
+
+
+
+        response = self._post({'auth-username': 'vedran@example.com',
+
+                               'auth-password': 'secret',
+
+                               'login_view-current_step': 'auth'})
+
+        self.assertRedirects(response, resolve_url(settings.LOGIN_REDIRECT_URL))
+
+
+
+    def test_missing_management_data(self):
+
+        # missing management data
+
+        response = self._post({'auth-username': 'bouke@example.com',
+
+                               'auth-password': 'secret'})
+
+
+
+        # view should return HTTP 400 Bad Request
+
+        self.assertEqual(response.status_code, 400)
+
+
+
+    def test_no_password_in_session(self):
+
+        self.create_user()
+
+        self.enable_otp()
+
+
+
+        response = self._post({'auth-username': 'bouke@example.com',
+
+                               'auth-password': 'secret',
+
+                               'login_view-current_step': 'auth'})
+
+        self.assertContains(response, 'Token:')
+
+
+
+        session_contents = json.dumps(list(self.client.session.items()))
+
+
+
+        self.assertNotIn('secret', session_contents)
+
+
+
+
+
+class BackupTokensTest(UserMixin, TestCase):
+
+    def setUp(self):
+
+        super().setUp()
+
+        self.create_user()
+
+        self.enable_otp()
+
+        self.login_user()
+
+
+
+    def test_empty(self):
+
+        response = self.client.get(reverse('two_factor:backup_tokens'))
+
+        self.assertContains(response, 'You don\'t have any backup codes yet.')
+
+
+
+    def test_generate(self):
+
+        url = reverse('two_factor:backup_tokens')
+
+
+
+        response = self.client.post(url)
+
+        self.assertRedirects(response, url)
+
+
+
+        response = self.client.get(url)
+
+        first_set = set([token.token for token in
+
+                        response.context_data['device'].token_set.all()])
+
+        self.assertNotContains(response, 'You don\'t have any backup codes '
+
+                                         'yet.')
+
+        self.assertEqual(10, len(first_set))
+
+
+
+        # Generating the tokens should give a fresh set
+
+        self.client.post(url)
+
+        response = self.client.get(url)
+
+        second_set = set([token.token for token in
+
+                         response.context_data['device'].token_set.all()])
+
+        self.assertNotEqual(first_set, second_set)

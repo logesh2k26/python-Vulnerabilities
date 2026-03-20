@@ -2,1632 +2,894 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-from typing import Dict, Optional, Tuple
+# (c) 2012-2014, Michael DeHaan <michael.dehaan@gmail.com>
+
+#
+
+# This file is part of Ansible
+
+#
+
+# Ansible is free software: you can redistribute it and/or modify
+
+# it under the terms of the GNU General Public License as published by
+
+# the Free Software Foundation, either version 3 of the License, or
+
+# (at your option) any later version.
+
+#
+
+# Ansible is distributed in the hope that it will be useful,
+
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+
+# GNU General Public License for more details.
+
+#
+
+# You should have received a copy of the GNU General Public License
+
+# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
 
 
 
-from django.utils.translation import ugettext as _
+# Make coding more python3-ish
 
-from django.conf import settings
+from __future__ import (absolute_import, division, print_function)
 
-from django.core.files import File
-
-from django.http import HttpRequest
-
-from django.db.models import Sum
-
-from jinja2 import Markup as mark_safe
-
-import unicodedata
+__metaclass__ = type
 
 
-
-from zerver.lib.avatar_hash import user_avatar_path
-
-from zerver.lib.exceptions import JsonableError, ErrorCode
-
-
-
-from boto.s3.bucket import Bucket
-
-from boto.s3.key import Key
-
-from boto.s3.connection import S3Connection
-
-from mimetypes import guess_type, guess_extension
-
-
-
-from zerver.models import get_user_profile_by_id
-
-from zerver.models import Attachment
-
-from zerver.models import Realm, RealmEmoji, UserProfile, Message
-
-
-
-import urllib
-
-import base64
 
 import os
 
-import re
+import tempfile
 
-from PIL import Image, ImageOps, ExifTags
+from string import ascii_letters, digits
 
-from PIL.Image import DecompressionBombError
 
-from PIL.GifImagePlugin import GifImageFile
 
-import io
+from ansible.errors import AnsibleOptionsError
 
-import random
+from ansible.module_utils.six import string_types
 
-import logging
+from ansible.module_utils.six.moves import configparser
 
+from ansible.module_utils._text import to_text
 
+from ansible.parsing.quoting import unquote
 
-DEFAULT_AVATAR_SIZE = 100
+from ansible.utils.path import makedirs_safe
 
-MEDIUM_AVATAR_SIZE = 500
 
-DEFAULT_EMOJI_SIZE = 64
 
+BOOL_TRUE = frozenset([ "true", "t", "y", "1", "yes", "on" ])
 
 
-# These sizes were selected based on looking at the maximum common
 
-# sizes in a library of animated custom emoji, balanced against the
+def mk_boolean(value):
 
-# network cost of very large emoji images.
+    ret = value
 
-MAX_EMOJI_GIF_SIZE = 128
+    if not isinstance(value, bool):
 
-MAX_EMOJI_GIF_FILE_SIZE_BYTES = 128 * 1024 * 1024  # 128 kb
+        if value is None:
 
+            ret = False
 
+        ret = (str(value).lower() in BOOL_TRUE)
 
-# Performance Note:
+    return ret
 
-#
 
-# For writing files to S3, the file could either be stored in RAM
 
-# (if it is less than 2.5MiB or so) or an actual temporary file on disk.
+def shell_expand(path, expand_relative_paths=False):
 
-#
+    '''
 
-# Because we set FILE_UPLOAD_MAX_MEMORY_SIZE to 0, only the latter case
+    shell_expand is needed as os.path.expanduser does not work
 
-# should occur in practice.
+    when path is None, which is the default for ANSIBLE_PRIVATE_KEY_FILE
 
-#
+    '''
 
-# This is great, because passing the pseudofile object that Django gives
+    if path:
 
-# you to boto would be a pain.
+        path = os.path.expanduser(os.path.expandvars(path))
 
+        if expand_relative_paths and not path.startswith('/'):
 
+            # paths are always 'relative' to the config?
 
-# To come up with a s3 key we randomly generate a "directory". The
+            if 'CONFIG_FILE' in globals():
 
-# "file name" is the original filename provided by the user run
+                CFGDIR = os.path.dirname(CONFIG_FILE)
 
-# through a sanitization function.
+                path = os.path.join(CFGDIR, path)
 
+            path = os.path.abspath(path)
 
+    return path
 
-class RealmUploadQuotaError(JsonableError):
 
-    code = ErrorCode.REALM_UPLOAD_QUOTA
 
+def get_config(p, section, key, env_var, default, value_type=None, expand_relative_paths=False):
 
+    ''' return a configuration variable with casting
 
-attachment_url_re = re.compile(r'[/\-]user[\-_]uploads[/\.-].*?(?=[ )]|\Z)')
 
 
+    :arg p: A ConfigParser object to look for the configuration in
 
-def attachment_url_to_path_id(attachment_url: str) -> str:
+    :arg section: A section of the ini config that should be examined for this section.
 
-    path_id_raw = re.sub(r'[/\-]user[\-_]uploads[/\.-]', '', attachment_url)
+    :arg key: The config key to get this config from
 
-    # Remove any extra '.' after file extension. These are probably added by the user
+    :arg env_var: An Environment variable to check for the config var.  If
 
-    return re.sub('[.]+$', '', path_id_raw, re.M)
+        this is set to None then no environment variable will be used.
 
+    :arg default: A default value to assign to the config var if nothing else sets it.
 
+    :kwarg value_type: The type of the value.  This can be any of the following strings:
 
-def sanitize_name(value: str) -> str:
+        :boolean: sets the value to a True or False value
 
-    """
+        :integer: Sets the value to an integer or raises a ValueType error
 
-    Sanitizes a value to be safe to store in a Linux filesystem, in
+        :float: Sets the value to a float or raises a ValueType error
 
-    S3, and in a URL.  So unicode is allowed, but not special
+        :list: Treats the value as a comma separated list.  Split the value
 
-    characters other than ".", "-", and "_".
+            and return it as a python list.
 
+        :none: Sets the value to None
 
+        :path: Expands any environment variables and tilde's in the value.
 
-    This implementation is based on django.utils.text.slugify; it is
+        :tmp_path: Create a unique temporary directory inside of the directory
 
-    modified by:
+            specified by value and return its path.
 
-    * adding '.' and '_' to the list of allowed characters.
+        :pathlist: Treat the value as a typical PATH string.  (On POSIX, this
 
-    * preserving the case of the value.
+            means colon separated strings.)  Split the value and then expand
 
-    """
+            each part for environment variables and tildes.
 
-    value = unicodedata.normalize('NFKC', value)
+    :kwarg expand_relative_paths: for pathlist and path types, if this is set
 
-    value = re.sub(r'[^\w\s._-]', '', value, flags=re.U).strip()
+        to True then also change any relative paths into absolute paths.  The
 
-    return mark_safe(re.sub(r'[-\s]+', '-', value, flags=re.U))
+        default is False.
 
+    '''
 
+    value = _get_config(p, section, key, env_var, default)
 
-def random_name(bytes: int=60) -> str:
+    if value_type == 'boolean':
 
-    return base64.urlsafe_b64encode(os.urandom(bytes)).decode('utf-8')
+        value = mk_boolean(value)
 
 
 
-class BadImageError(JsonableError):
+    elif value:
 
-    code = ErrorCode.BAD_IMAGE
+        if value_type == 'integer':
 
+            value = int(value)
 
 
-name_to_tag_num = dict((name, num) for num, name in ExifTags.TAGS.items())
 
+        elif value_type == 'float':
 
+            value = float(value)
 
-# https://stackoverflow.com/a/6218425
 
-def exif_rotate(image: Image) -> Image:
 
-    if not hasattr(image, '_getexif'):
+        elif value_type == 'list':
 
-        return image
+            if isinstance(value, string_types):
 
-    exif_data = image._getexif()
+                value = [x.strip() for x in value.split(',')]
 
-    if exif_data is None:
 
-        return image
 
+        elif value_type == 'none':
 
+            if value == "None":
 
-    exif_dict = dict(exif_data.items())
+                value = None
 
-    orientation = exif_dict.get(name_to_tag_num['Orientation'])
 
 
+        elif value_type == 'path':
 
-    if orientation == 3:
+            value = shell_expand(value, expand_relative_paths=expand_relative_paths)
 
-        return image.rotate(180, expand=True)
 
-    elif orientation == 6:
 
-        return image.rotate(270, expand=True)
+        elif value_type == 'tmppath':
 
-    elif orientation == 8:
+            value = shell_expand(value)
 
-        return image.rotate(90, expand=True)
+            if not os.path.exists(value):
 
+                makedirs_safe(value, 0o700)
 
+            prefix = 'ansible-local-%s' % os.getpid()
 
-    return image
+            value = tempfile.mkdtemp(prefix=prefix, dir=value)
 
 
 
-def resize_avatar(image_data: bytes, size: int=DEFAULT_AVATAR_SIZE) -> bytes:
+        elif value_type == 'pathlist':
+
+            if isinstance(value, string_types):
+
+                value = [shell_expand(x, expand_relative_paths=expand_relative_paths) \
+
+                         for x in value.split(os.pathsep)]
+
+
+
+        elif isinstance(value, string_types):
+
+            value = unquote(value)
+
+
+
+    return to_text(value, errors='surrogate_or_strict', nonstring='passthru')
+
+
+
+
+
+def _get_config(p, section, key, env_var, default):
+
+    ''' helper function for get_config '''
+
+    value = default
+
+
+
+    if p is not None:
+
+        try:
+
+            value = p.get(section, key, raw=True)
+
+        except:
+
+            pass
+
+
+
+    if env_var is not None:
+
+        env_value = os.environ.get(env_var, None)
+
+        if env_value is not None:
+
+            value = env_value
+
+
+
+    return to_text(value, errors='surrogate_or_strict', nonstring='passthru')
+
+
+
+
+
+def load_config_file():
+
+    ''' Load Config File order(first found is used): ENV, CWD, HOME, /etc/ansible '''
+
+
+
+    p = configparser.ConfigParser()
+
+
+
+    path0 = os.getenv("ANSIBLE_CONFIG", None)
+
+    if path0 is not None:
+
+        path0 = os.path.expanduser(path0)
+
+        if os.path.isdir(path0):
+
+            path0 += "/ansible.cfg"
 
     try:
 
-        im = Image.open(io.BytesIO(image_data))
+        path1 = os.getcwd() + "/ansible.cfg"
 
-        im = exif_rotate(im)
+    except OSError:
 
-        im = ImageOps.fit(im, (size, size), Image.ANTIALIAS)
+        path1 = None
 
-    except IOError:
+    path2 = os.path.expanduser("~/.ansible.cfg")
 
-        raise BadImageError(_("Could not decode image; did you upload an image file?"))
+    path3 = "/etc/ansible/ansible.cfg"
 
-    except DecompressionBombError:
 
-        raise BadImageError(_("Image size exceeds limit."))
 
-    out = io.BytesIO()
+    for path in [path0, path1, path2, path3]:
 
-    if im.mode == 'CMYK':
+        if path is not None and os.path.exists(path):
 
-        im = im.convert('RGB')
+            try:
 
-    im.save(out, format='png')
+                p.read(path)
 
-    return out.getvalue()
+            except configparser.Error as e:
 
+                raise AnsibleOptionsError("Error reading config file: \n{0}".format(e))
 
+            return p, path
 
-def resize_logo(image_data: bytes) -> bytes:
+    return None, ''
 
-    try:
 
-        im = Image.open(io.BytesIO(image_data))
 
-        im = exif_rotate(im)
 
-        im.thumbnail((8*DEFAULT_AVATAR_SIZE, DEFAULT_AVATAR_SIZE), Image.ANTIALIAS)
 
-    except IOError:
+p, CONFIG_FILE = load_config_file()
 
-        raise BadImageError(_("Could not decode image; did you upload an image file?"))
 
-    except DecompressionBombError:
 
-        raise BadImageError(_("Image size exceeds limit."))
+# check all of these extensions when looking for yaml files for things like
 
-    out = io.BytesIO()
+# group variables -- really anything we can load
 
-    if im.mode == 'CMYK':
+YAML_FILENAME_EXTENSIONS = [ "", ".yml", ".yaml", ".json" ]
 
-        im = im.convert('RGB')
 
-    im.save(out, format='png')
 
-    return out.getvalue()
+# the default whitelist for cow stencils
 
+DEFAULT_COW_WHITELIST = ['bud-frogs', 'bunny', 'cheese', 'daemon', 'default', 'dragon', 'elephant-in-snake', 'elephant',
 
+                         'eyes', 'hellokitty', 'kitty', 'luke-koala', 'meow', 'milk', 'moofasa', 'moose', 'ren', 'sheep',
 
+                         'small', 'stegosaurus', 'stimpy', 'supermilker', 'three-eyes', 'turkey', 'turtle', 'tux', 'udder',
 
+                         'vader-koala', 'vader', 'www',]
 
-def resize_gif(im: GifImageFile, size: int=DEFAULT_EMOJI_SIZE) -> bytes:
 
-    frames = []
 
-    duration_info = []
+# sections in config file
 
-    # If 'loop' info is not set then loop for infinite number of times.
+DEFAULTS='defaults'
 
-    loop = im.info.get("loop", 0)
 
-    for frame_num in range(0, im.n_frames):
 
-        im.seek(frame_num)
 
-        new_frame = Image.new("RGBA", im.size)
 
-        new_frame.paste(im, (0, 0), im.convert("RGBA"))
+# FIXME: add deprecation warning when these get set
 
-        new_frame = ImageOps.fit(new_frame, (size, size), Image.ANTIALIAS)
+#### DEPRECATED VARS ####
 
-        frames.append(new_frame)
+#
 
-        duration_info.append(im.info['duration'])
 
-    out = io.BytesIO()
 
-    frames[0].save(out, save_all=True, optimize=True,
+#### If --tags or --skip-tags is given multiple times on the CLI and this is
 
-                   format="GIF", append_images=frames[1:],
+# True, merge the lists of tags together.  If False, let the last argument
 
-                   duration=duration_info,
+# overwrite any previous ones.  Behaviour is overwrite through 2.2.  2.3
 
-                   loop=loop)
+# overwrites but prints deprecation.  2.4 the default is to merge.
 
-    return out.getvalue()
+MERGE_MULTIPLE_CLI_TAGS = get_config(p, DEFAULTS, 'merge_multiple_cli_tags', 'ANSIBLE_MERGE_MULTIPLE_CLI_TAGS', True, value_type='boolean')
 
 
 
+#### GENERALLY CONFIGURABLE THINGS ####
 
+DEFAULT_DEBUG             = get_config(p, DEFAULTS, 'debug',            'ANSIBLE_DEBUG',            False, value_type='boolean')
 
-def resize_emoji(image_data: bytes, size: int=DEFAULT_EMOJI_SIZE) -> bytes:
+DEFAULT_VERBOSITY         = get_config(p, DEFAULTS, 'verbosity',        'ANSIBLE_VERBOSITY',        0, value_type='integer')
 
-    try:
+DEFAULT_HOST_LIST         = get_config(p, DEFAULTS,'inventory', 'ANSIBLE_INVENTORY', '/etc/ansible/hosts', value_type='path')
 
-        im = Image.open(io.BytesIO(image_data))
+DEFAULT_ROLES_PATH        = get_config(p, DEFAULTS, 'roles_path',       'ANSIBLE_ROLES_PATH',
 
-        image_format = im.format
+                                       '~/.ansible/roles:/usr/share/ansible/roles:/etc/ansible/roles',
 
-        if image_format == "GIF":
+                                       value_type='pathlist', expand_relative_paths=True)
 
-            # There are a number of bugs in Pillow.GifImagePlugin which cause
+DEFAULT_REMOTE_TMP        = get_config(p, DEFAULTS, 'remote_tmp',       'ANSIBLE_REMOTE_TEMP',      '~/.ansible/tmp')
 
-            # results in resized gifs being broken. To work around this we
+DEFAULT_LOCAL_TMP         = get_config(p, DEFAULTS, 'local_tmp',        'ANSIBLE_LOCAL_TEMP',      '~/.ansible/tmp', value_type='tmppath')
 
-            # only resize under certain conditions to minimize the chance of
+DEFAULT_MODULE_NAME       = get_config(p, DEFAULTS, 'module_name',      None,                       'command')
 
-            # creating ugly gifs.
+DEFAULT_FACT_PATH         = get_config(p, DEFAULTS, 'fact_path',        'ANSIBLE_FACT_PATH', None, value_type='path')
 
-            should_resize = any((
+DEFAULT_FORKS             = get_config(p, DEFAULTS, 'forks',            'ANSIBLE_FORKS',            5, value_type='integer')
 
-                im.size[0] != im.size[1],                            # not square
+DEFAULT_MODULE_ARGS       = get_config(p, DEFAULTS, 'module_args',      'ANSIBLE_MODULE_ARGS',      '')
 
-                im.size[0] > MAX_EMOJI_GIF_SIZE,                     # dimensions too large
+DEFAULT_MODULE_LANG       = get_config(p, DEFAULTS, 'module_lang',      'ANSIBLE_MODULE_LANG',      os.getenv('LANG', 'en_US.UTF-8'))
 
-                len(image_data) > MAX_EMOJI_GIF_FILE_SIZE_BYTES,     # filesize too large
+DEFAULT_MODULE_SET_LOCALE = get_config(p, DEFAULTS, 'module_set_locale','ANSIBLE_MODULE_SET_LOCALE',False, value_type='boolean')
 
-            ))
+DEFAULT_MODULE_COMPRESSION= get_config(p, DEFAULTS, 'module_compression', None, 'ZIP_DEFLATED')
 
-            return resize_gif(im, size) if should_resize else image_data
+DEFAULT_TIMEOUT           = get_config(p, DEFAULTS, 'timeout',          'ANSIBLE_TIMEOUT',          10, value_type='integer')
 
-        else:
+DEFAULT_POLL_INTERVAL     = get_config(p, DEFAULTS, 'poll_interval',    'ANSIBLE_POLL_INTERVAL',    15, value_type='integer')
 
-            im = exif_rotate(im)
+DEFAULT_REMOTE_USER       = get_config(p, DEFAULTS, 'remote_user',      'ANSIBLE_REMOTE_USER',      None)
 
-            im = ImageOps.fit(im, (size, size), Image.ANTIALIAS)
+DEFAULT_ASK_PASS          = get_config(p, DEFAULTS, 'ask_pass',  'ANSIBLE_ASK_PASS',    False, value_type='boolean')
 
-            out = io.BytesIO()
+DEFAULT_PRIVATE_KEY_FILE  = get_config(p, DEFAULTS, 'private_key_file', 'ANSIBLE_PRIVATE_KEY_FILE', None, value_type='path')
 
-            im.save(out, format=image_format)
+DEFAULT_REMOTE_PORT       = get_config(p, DEFAULTS, 'remote_port',      'ANSIBLE_REMOTE_PORT',      None, value_type='integer')
 
-            return out.getvalue()
+DEFAULT_ASK_VAULT_PASS    = get_config(p, DEFAULTS, 'ask_vault_pass',    'ANSIBLE_ASK_VAULT_PASS',    False, value_type='boolean')
 
-    except IOError:
+DEFAULT_VAULT_PASSWORD_FILE = get_config(p, DEFAULTS, 'vault_password_file', 'ANSIBLE_VAULT_PASSWORD_FILE', None, value_type='path')
 
-        raise BadImageError(_("Could not decode image; did you upload an image file?"))
+DEFAULT_TRANSPORT         = get_config(p, DEFAULTS, 'transport',        'ANSIBLE_TRANSPORT',        'smart')
 
-    except DecompressionBombError:
+DEFAULT_SCP_IF_SSH        = get_config(p, 'ssh_connection', 'scp_if_ssh',       'ANSIBLE_SCP_IF_SSH',       'smart')
 
-        raise BadImageError(_("Image size exceeds limit."))
+DEFAULT_SFTP_BATCH_MODE   = get_config(p, 'ssh_connection', 'sftp_batch_mode', 'ANSIBLE_SFTP_BATCH_MODE', True, value_type='boolean')
 
+DEFAULT_SSH_TRANSFER_METHOD = get_config(p, 'ssh_connection', 'transfer_method', 'ANSIBLE_SSH_TRANSFER_METHOD', None)
 
+DEFAULT_MANAGED_STR       = get_config(p, DEFAULTS, 'ansible_managed',  None,           'Ansible managed')
 
+DEFAULT_SYSLOG_FACILITY   = get_config(p, DEFAULTS, 'syslog_facility',  'ANSIBLE_SYSLOG_FACILITY', 'LOG_USER')
 
+DEFAULT_KEEP_REMOTE_FILES = get_config(p, DEFAULTS, 'keep_remote_files', 'ANSIBLE_KEEP_REMOTE_FILES', False, value_type='boolean')
 
-### Common
+DEFAULT_HASH_BEHAVIOUR    = get_config(p, DEFAULTS, 'hash_behaviour', 'ANSIBLE_HASH_BEHAVIOUR', 'replace')
 
+DEFAULT_PRIVATE_ROLE_VARS = get_config(p, DEFAULTS, 'private_role_vars', 'ANSIBLE_PRIVATE_ROLE_VARS', False, value_type='boolean')
 
+DEFAULT_JINJA2_EXTENSIONS = get_config(p, DEFAULTS, 'jinja2_extensions', 'ANSIBLE_JINJA2_EXTENSIONS', None)
 
-class ZulipUploadBackend:
+DEFAULT_EXECUTABLE        = get_config(p, DEFAULTS, 'executable', 'ANSIBLE_EXECUTABLE', '/bin/sh')
 
-    def upload_message_file(self, uploaded_file_name: str, uploaded_file_size: int,
+DEFAULT_GATHERING         = get_config(p, DEFAULTS, 'gathering', 'ANSIBLE_GATHERING', 'implicit').lower()
 
-                            content_type: Optional[str], file_data: bytes,
+DEFAULT_GATHER_SUBSET     = get_config(p, DEFAULTS, 'gather_subset', 'ANSIBLE_GATHER_SUBSET', 'all').lower()
 
-                            user_profile: UserProfile,
+DEFAULT_GATHER_TIMEOUT    = get_config(p, DEFAULTS, 'gather_timeout', 'ANSIBLE_GATHER_TIMEOUT', 10, value_type='integer')
 
-                            target_realm: Optional[Realm]=None) -> str:
+DEFAULT_LOG_PATH          = get_config(p, DEFAULTS, 'log_path',           'ANSIBLE_LOG_PATH', '', value_type='path')
 
-        raise NotImplementedError()
+DEFAULT_FORCE_HANDLERS    = get_config(p, DEFAULTS, 'force_handlers', 'ANSIBLE_FORCE_HANDLERS', False, value_type='boolean')
 
+DEFAULT_INVENTORY_IGNORE  = get_config(p, DEFAULTS, 'inventory_ignore_extensions', 'ANSIBLE_INVENTORY_IGNORE',
 
+                                       ["~", ".orig", ".bak", ".ini", ".cfg", ".retry", ".pyc", ".pyo"], value_type='list')
 
-    def upload_avatar_image(self, user_file: File,
+DEFAULT_VAR_COMPRESSION_LEVEL = get_config(p, DEFAULTS, 'var_compression_level', 'ANSIBLE_VAR_COMPRESSION_LEVEL', 0, value_type='integer')
 
-                            acting_user_profile: UserProfile,
+DEFAULT_INTERNAL_POLL_INTERVAL = get_config(p, DEFAULTS, 'internal_poll_interval', None, 0.001, value_type='float')
 
-                            target_user_profile: UserProfile) -> None:
+ERROR_ON_MISSING_HANDLER  = get_config(p, DEFAULTS, 'error_on_missing_handler', 'ANSIBLE_ERROR_ON_MISSING_HANDLER', True, value_type='boolean')
 
-        raise NotImplementedError()
+SHOW_CUSTOM_STATS = get_config(p, DEFAULTS, 'show_custom_stats', 'ANSIBLE_SHOW_CUSTOM_STATS', False, value_type='boolean')
 
+NAMESPACE_FACTS = get_config(p, DEFAULTS, 'restrict_facts_namespace', 'ANSIBLE_RESTRICT_FACTS', False, value_type='boolean')
 
 
-    def delete_avatar_image(self, user: UserProfile) -> None:
 
-        raise NotImplementedError()
+# static includes
 
+DEFAULT_TASK_INCLUDES_STATIC    = get_config(p, DEFAULTS, 'task_includes_static', 'ANSIBLE_TASK_INCLUDES_STATIC', False, value_type='boolean')
 
+DEFAULT_HANDLER_INCLUDES_STATIC = get_config(p, DEFAULTS, 'handler_includes_static', 'ANSIBLE_HANDLER_INCLUDES_STATIC', False, value_type='boolean')
 
-    def delete_message_image(self, path_id: str) -> bool:
 
-        raise NotImplementedError()
 
+# disclosure
 
+DEFAULT_NO_LOG           = get_config(p, DEFAULTS, 'no_log', 'ANSIBLE_NO_LOG', False, value_type='boolean')
 
-    def get_avatar_url(self, hash_key: str, medium: bool=False) -> str:
+DEFAULT_NO_TARGET_SYSLOG   = get_config(p, DEFAULTS, 'no_target_syslog', 'ANSIBLE_NO_TARGET_SYSLOG', False, value_type='boolean')
 
-        raise NotImplementedError()
+ALLOW_WORLD_READABLE_TMPFILES = get_config(p, DEFAULTS, 'allow_world_readable_tmpfiles', None, False, value_type='boolean')
 
 
 
-    def copy_avatar(self, source_profile: UserProfile, target_profile: UserProfile) -> None:
+# selinux
 
-        raise NotImplementedError()
+DEFAULT_SELINUX_SPECIAL_FS = get_config(p, 'selinux', 'special_context_filesystems', None, 'fuse, nfs, vboxsf, ramfs, 9p', value_type='list')
 
+DEFAULT_LIBVIRT_LXC_NOSECLABEL = get_config(p, 'selinux', 'libvirt_lxc_noseclabel', 'LIBVIRT_LXC_NOSECLABEL', False, value_type='boolean')
 
 
-    def ensure_medium_avatar_image(self, user_profile: UserProfile) -> None:
 
-        raise NotImplementedError()
+### PRIVILEGE ESCALATION ###
 
+# Backwards Compat
 
+DEFAULT_SU                = get_config(p, DEFAULTS, 'su', 'ANSIBLE_SU', False, value_type='boolean')
 
-    def ensure_basic_avatar_image(self, user_profile: UserProfile) -> None:
+DEFAULT_SU_USER           = get_config(p, DEFAULTS, 'su_user', 'ANSIBLE_SU_USER', 'root')
 
-        raise NotImplementedError()
+DEFAULT_SU_EXE            = get_config(p, DEFAULTS, 'su_exe', 'ANSIBLE_SU_EXE', None)
 
+DEFAULT_SU_FLAGS          = get_config(p, DEFAULTS, 'su_flags', 'ANSIBLE_SU_FLAGS', None)
 
+DEFAULT_ASK_SU_PASS       = get_config(p, DEFAULTS, 'ask_su_pass', 'ANSIBLE_ASK_SU_PASS', False, value_type='boolean')
 
-    def upload_realm_icon_image(self, icon_file: File, user_profile: UserProfile) -> None:
+DEFAULT_SUDO              = get_config(p, DEFAULTS, 'sudo', 'ANSIBLE_SUDO', False, value_type='boolean')
 
-        raise NotImplementedError()
+DEFAULT_SUDO_USER         = get_config(p, DEFAULTS, 'sudo_user',        'ANSIBLE_SUDO_USER',        'root')
 
+DEFAULT_SUDO_EXE          = get_config(p, DEFAULTS, 'sudo_exe', 'ANSIBLE_SUDO_EXE', None)
 
+DEFAULT_SUDO_FLAGS        = get_config(p, DEFAULTS, 'sudo_flags', 'ANSIBLE_SUDO_FLAGS', '-H -S -n')
 
-    def get_realm_icon_url(self, realm_id: int, version: int) -> str:
+DEFAULT_ASK_SUDO_PASS     = get_config(p, DEFAULTS, 'ask_sudo_pass',    'ANSIBLE_ASK_SUDO_PASS',    False, value_type='boolean')
 
-        raise NotImplementedError()
 
 
+# Become
 
-    def upload_realm_logo_image(self, logo_file: File, user_profile: UserProfile,
+BECOME_ERROR_STRINGS      = {
 
-                                night: bool) -> None:
+    'sudo': 'Sorry, try again.',
 
-        raise NotImplementedError()
+    'su': 'Authentication failure',
 
+    'pbrun': '',
 
+    'pfexec': '',
 
-    def get_realm_logo_url(self, realm_id: int, version: int, night: bool) -> str:
+    'doas': 'Permission denied',
 
-        raise NotImplementedError()
+    'dzdo': '',
 
+    'ksu': 'Password incorrect'
 
+}  # FIXME: deal with i18n
 
-    def upload_emoji_image(self, emoji_file: File, emoji_file_name: str, user_profile: UserProfile) -> None:
+BECOME_MISSING_STRINGS    = {
 
-        raise NotImplementedError()
+    'sudo': 'sorry, a password is required to run sudo',
 
+    'su': '',
 
+    'pbrun': '',
 
-    def get_emoji_url(self, emoji_file_name: str, realm_id: int) -> str:
+    'pfexec': '',
 
-        raise NotImplementedError()
+    'doas': 'Authorization required',
 
+    'dzdo': '',
 
+    'ksu': 'No password given'
 
+}  # FIXME: deal with i18n
 
+BECOME_METHODS            = ['sudo','su','pbrun','pfexec','doas','dzdo','ksu','runas']
 
-### S3
+BECOME_ALLOW_SAME_USER    = get_config(p, 'privilege_escalation', 'become_allow_same_user', 'ANSIBLE_BECOME_ALLOW_SAME_USER', False, value_type='boolean')
 
+DEFAULT_BECOME_METHOD     = get_config(p, 'privilege_escalation', 'become_method', 'ANSIBLE_BECOME_METHOD',
 
+                                       'sudo' if DEFAULT_SUDO else 'su' if DEFAULT_SU else 'sudo').lower()
 
-def get_bucket(conn: S3Connection, bucket_name: str) -> Bucket:
+DEFAULT_BECOME            = get_config(p, 'privilege_escalation', 'become', 'ANSIBLE_BECOME',False, value_type='boolean')
 
-    # Calling get_bucket() with validate=True can apparently lead
+DEFAULT_BECOME_USER       = get_config(p, 'privilege_escalation', 'become_user', 'ANSIBLE_BECOME_USER', 'root')
 
-    # to expensive S3 bills:
+DEFAULT_BECOME_EXE        = get_config(p, 'privilege_escalation', 'become_exe', 'ANSIBLE_BECOME_EXE', None)
 
-    #    http://www.appneta.com/blog/s3-list-get-bucket-default/
+DEFAULT_BECOME_FLAGS      = get_config(p, 'privilege_escalation', 'become_flags', 'ANSIBLE_BECOME_FLAGS', None)
 
-    # The benefits of validation aren't completely clear to us, and
+DEFAULT_BECOME_ASK_PASS   = get_config(p, 'privilege_escalation', 'become_ask_pass', 'ANSIBLE_BECOME_ASK_PASS', False, value_type='boolean')
 
-    # we want to save on our bills, so we set the validate flag to False.
 
-    # (We think setting validate to True would cause us to fail faster
 
-    #  in situations where buckets don't exist, but that shouldn't be
 
-    #  an issue for us.)
 
-    bucket = conn.get_bucket(bucket_name, validate=False)
+# PLUGINS
 
-    return bucket
 
 
+# Modules that can optimize with_items loops into a single call.  Currently
 
-def upload_image_to_s3(
+# these modules must (1) take a "name" or "pkg" parameter that is a list.  If
 
-        bucket_name: str,
+# the module takes both, bad things could happen.
 
-        file_name: str,
+# In the future we should probably generalize this even further
 
-        content_type: Optional[str],
+# (mapping of param: squash field)
 
-        user_profile: UserProfile,
+DEFAULT_SQUASH_ACTIONS         = get_config(p, DEFAULTS, 'squash_actions', 'ANSIBLE_SQUASH_ACTIONS',
 
-        contents: bytes) -> None:
+                                            "apk, apt, dnf, homebrew, openbsd_pkg, pacman, pkgng, yum, zypper", value_type='list')
 
+# paths
 
 
-    conn = S3Connection(settings.S3_KEY, settings.S3_SECRET_KEY)
 
-    bucket = get_bucket(conn, bucket_name)
+DEFAULT_ACTION_PLUGIN_PATH     = get_config(p, DEFAULTS, 'action_plugins', 'ANSIBLE_ACTION_PLUGINS',
 
-    key = Key(bucket)
+                                            '~/.ansible/plugins/action:/usr/share/ansible/plugins/action', value_type='pathlist')
 
-    key.key = file_name
+DEFAULT_CACHE_PLUGIN_PATH      = get_config(p, DEFAULTS, 'cache_plugins', 'ANSIBLE_CACHE_PLUGINS',
 
-    key.set_metadata("user_profile_id", str(user_profile.id))
+                                            '~/.ansible/plugins/cache:/usr/share/ansible/plugins/cache', value_type='pathlist')
 
-    key.set_metadata("realm_id", str(user_profile.realm_id))
+DEFAULT_CALLBACK_PLUGIN_PATH   = get_config(p, DEFAULTS, 'callback_plugins', 'ANSIBLE_CALLBACK_PLUGINS',
 
+                                            '~/.ansible/plugins/callback:/usr/share/ansible/plugins/callback', value_type='pathlist')
 
+DEFAULT_CONNECTION_PLUGIN_PATH = get_config(p, DEFAULTS, 'connection_plugins', 'ANSIBLE_CONNECTION_PLUGINS',
 
-    if content_type is not None:
+                                            '~/.ansible/plugins/connection:/usr/share/ansible/plugins/connection', value_type='pathlist')
 
-        headers = {'Content-Type': content_type}  # type: Optional[Dict[str, str]]
+DEFAULT_LOOKUP_PLUGIN_PATH     = get_config(p, DEFAULTS, 'lookup_plugins', 'ANSIBLE_LOOKUP_PLUGINS',
 
-    else:
+                                            '~/.ansible/plugins/lookup:/usr/share/ansible/plugins/lookup', value_type='pathlist')
 
-        headers = None
+DEFAULT_MODULE_PATH            = get_config(p, DEFAULTS, 'library',            'ANSIBLE_LIBRARY',
 
+                                            '~/.ansible/plugins/modules:/usr/share/ansible/plugins/modules', value_type='pathlist')
 
+DEFAULT_MODULE_UTILS_PATH      = get_config(p, DEFAULTS, 'module_utils',       'ANSIBLE_MODULE_UTILS',
 
-    key.set_contents_from_string(contents, headers=headers)  # type: ignore # https://github.com/python/typeshed/issues/1552
+                                            '~/.ansible/plugins/module_utils:/usr/share/ansible/plugins/module_utils', value_type='pathlist')
 
+DEFAULT_INVENTORY_PLUGIN_PATH  = get_config(p, DEFAULTS, 'inventory_plugins', 'ANSIBLE_INVENTORY_PLUGINS',
 
+                                            '~/.ansible/plugins/inventory:/usr/share/ansible/plugins/inventory', value_type='pathlist')
 
-def currently_used_upload_space(realm: Realm) -> int:
+DEFAULT_VARS_PLUGIN_PATH       = get_config(p, DEFAULTS, 'vars_plugins', 'ANSIBLE_VARS_PLUGINS',
 
-    used_space = Attachment.objects.filter(realm=realm).aggregate(Sum('size'))['size__sum']
+                                            '~/.ansible/plugins/vars:/usr/share/ansible/plugins/vars', value_type='pathlist')
 
-    if used_space is None:
+DEFAULT_FILTER_PLUGIN_PATH     = get_config(p, DEFAULTS, 'filter_plugins', 'ANSIBLE_FILTER_PLUGINS',
 
-        return 0
+                                            '~/.ansible/plugins/filter:/usr/share/ansible/plugins/filter', value_type='pathlist')
 
-    return used_space
+DEFAULT_TEST_PLUGIN_PATH       = get_config(p, DEFAULTS, 'test_plugins', 'ANSIBLE_TEST_PLUGINS',
 
+                                            '~/.ansible/plugins/test:/usr/share/ansible/plugins/test', value_type='pathlist')
 
+DEFAULT_STRATEGY_PLUGIN_PATH   = get_config(p, DEFAULTS, 'strategy_plugins', 'ANSIBLE_STRATEGY_PLUGINS',
 
-def check_upload_within_quota(realm: Realm, uploaded_file_size: int) -> None:
+                                            '~/.ansible/plugins/strategy:/usr/share/ansible/plugins/strategy', value_type='pathlist')
 
-    upload_quota = realm.upload_quota_bytes()
 
-    if upload_quota is None:
 
-        return
+NETWORK_GROUP_MODULES          = get_config(p, DEFAULTS, 'network_group_modules','NETWORK_GROUP_MODULES', ['eos', 'nxos', 'ios', 'iosxr', 'junos',
 
-    used_space = currently_used_upload_space(realm)
+                                                                                                           'vyos', 'sros', 'dellos9', 'dellos10', 'dellos6'],
 
-    if (used_space + uploaded_file_size) > upload_quota:
+                                            value_type='list')
 
-        raise RealmUploadQuotaError(_("Upload would exceed your organization's upload quota."))
+DEFAULT_STRATEGY               = get_config(p, DEFAULTS, 'strategy',           'ANSIBLE_STRATEGY', 'linear')
 
+DEFAULT_STDOUT_CALLBACK        = get_config(p, DEFAULTS, 'stdout_callback',    'ANSIBLE_STDOUT_CALLBACK', 'default')
 
+# cache
 
-def get_file_info(request: HttpRequest, user_file: File) -> Tuple[str, int, Optional[str]]:
+CACHE_PLUGIN                   = get_config(p, DEFAULTS, 'fact_caching', 'ANSIBLE_CACHE_PLUGIN', 'memory')
 
+CACHE_PLUGIN_CONNECTION        = get_config(p, DEFAULTS, 'fact_caching_connection', 'ANSIBLE_CACHE_PLUGIN_CONNECTION', None)
 
+CACHE_PLUGIN_PREFIX            = get_config(p, DEFAULTS, 'fact_caching_prefix', 'ANSIBLE_CACHE_PLUGIN_PREFIX', 'ansible_facts')
 
-    uploaded_file_name = user_file.name
+CACHE_PLUGIN_TIMEOUT           = get_config(p, DEFAULTS, 'fact_caching_timeout', 'ANSIBLE_CACHE_PLUGIN_TIMEOUT', 24 * 60 * 60, value_type='integer')
 
-    assert isinstance(uploaded_file_name, str)
 
 
+# Display
 
-    content_type = request.GET.get('mimetype')
+ANSIBLE_FORCE_COLOR            = get_config(p, DEFAULTS, 'force_color', 'ANSIBLE_FORCE_COLOR', None, value_type='boolean')
 
-    if content_type is None:
+ANSIBLE_NOCOLOR                = get_config(p, DEFAULTS, 'nocolor', 'ANSIBLE_NOCOLOR', None, value_type='boolean')
 
-        guessed_type = guess_type(uploaded_file_name)[0]
+ANSIBLE_NOCOWS                 = get_config(p, DEFAULTS, 'nocows', 'ANSIBLE_NOCOWS', None, value_type='boolean')
 
-        if guessed_type is not None:
+ANSIBLE_COW_SELECTION          = get_config(p, DEFAULTS, 'cow_selection', 'ANSIBLE_COW_SELECTION', 'default')
 
-            content_type = guessed_type
+ANSIBLE_COW_WHITELIST          = get_config(p, DEFAULTS, 'cow_whitelist', 'ANSIBLE_COW_WHITELIST', DEFAULT_COW_WHITELIST, value_type='list')
 
-    else:
+DISPLAY_SKIPPED_HOSTS          = get_config(p, DEFAULTS, 'display_skipped_hosts', 'DISPLAY_SKIPPED_HOSTS', True, value_type='boolean')
 
-        extension = guess_extension(content_type)
+DEFAULT_UNDEFINED_VAR_BEHAVIOR = get_config(p, DEFAULTS, 'error_on_undefined_vars', 'ANSIBLE_ERROR_ON_UNDEFINED_VARS', True, value_type='boolean')
 
-        if extension is not None:
+HOST_KEY_CHECKING              = get_config(p, DEFAULTS, 'host_key_checking',  'ANSIBLE_HOST_KEY_CHECKING',    True, value_type='boolean')
 
-            uploaded_file_name = uploaded_file_name + extension
+SYSTEM_WARNINGS                = get_config(p, DEFAULTS, 'system_warnings', 'ANSIBLE_SYSTEM_WARNINGS', True, value_type='boolean')
 
+DEPRECATION_WARNINGS           = get_config(p, DEFAULTS, 'deprecation_warnings', 'ANSIBLE_DEPRECATION_WARNINGS', True, value_type='boolean')
 
+DEFAULT_CALLABLE_WHITELIST     = get_config(p, DEFAULTS, 'callable_whitelist', 'ANSIBLE_CALLABLE_WHITELIST', [], value_type='list')
 
-    uploaded_file_name = urllib.parse.unquote(uploaded_file_name)
+COMMAND_WARNINGS               = get_config(p, DEFAULTS, 'command_warnings', 'ANSIBLE_COMMAND_WARNINGS', True, value_type='boolean')
 
-    uploaded_file_size = user_file.size
+DEFAULT_LOAD_CALLBACK_PLUGINS  = get_config(p, DEFAULTS, 'bin_ansible_callbacks', 'ANSIBLE_LOAD_CALLBACK_PLUGINS', False, value_type='boolean')
 
+DEFAULT_CALLBACK_WHITELIST     = get_config(p, DEFAULTS, 'callback_whitelist', 'ANSIBLE_CALLBACK_WHITELIST', [], value_type='list')
 
+RETRY_FILES_ENABLED            = get_config(p, DEFAULTS, 'retry_files_enabled', 'ANSIBLE_RETRY_FILES_ENABLED', True, value_type='boolean')
 
-    return uploaded_file_name, uploaded_file_size, content_type
+RETRY_FILES_SAVE_PATH          = get_config(p, DEFAULTS, 'retry_files_save_path', 'ANSIBLE_RETRY_FILES_SAVE_PATH', None, value_type='path')
 
+DEFAULT_NULL_REPRESENTATION    = get_config(p, DEFAULTS, 'null_representation', 'ANSIBLE_NULL_REPRESENTATION', None, value_type='none')
 
+DISPLAY_ARGS_TO_STDOUT         = get_config(p, DEFAULTS, 'display_args_to_stdout', 'ANSIBLE_DISPLAY_ARGS_TO_STDOUT', False, value_type='boolean')
 
+MAX_FILE_SIZE_FOR_DIFF         = get_config(p, DEFAULTS, 'max_diff_size', 'ANSIBLE_MAX_DIFF_SIZE', 1024*1024, value_type='integer')
 
 
-def get_signed_upload_url(path: str) -> str:
 
-    conn = S3Connection(settings.S3_KEY, settings.S3_SECRET_KEY)
+# CONNECTION RELATED
 
-    return conn.generate_url(15, 'GET', bucket=settings.S3_AUTH_UPLOADS_BUCKET, key=path)
+USE_PERSISTENT_CONNECTIONS     = get_config(p, DEFAULTS, 'use_persistent_connections', 'ANSIBLE_USE_PERSISTENT_CONNECTIONS', False, value_type='boolean')
 
+ANSIBLE_SSH_ARGS               = get_config(p, 'ssh_connection', 'ssh_args', 'ANSIBLE_SSH_ARGS', '-C -o ControlMaster=auto -o ControlPersist=60s')
 
+### WARNING: Someone might be tempted to switch this from percent-formatting
 
-def get_realm_for_filename(path: str) -> Optional[int]:
+# to .format() in the future.  be sure to read this:
 
-    conn = S3Connection(settings.S3_KEY, settings.S3_SECRET_KEY)
+# http://lucumr.pocoo.org/2016/12/29/careful-with-str-format/ and understand
 
-    key = get_bucket(conn, settings.S3_AUTH_UPLOADS_BUCKET).get_key(path)
+# that it may be a security risk to do so.
 
-    if key is None:
+ANSIBLE_SSH_CONTROL_PATH       = get_config(p, 'ssh_connection', 'control_path', 'ANSIBLE_SSH_CONTROL_PATH', None)
 
-        # This happens if the key does not exist.
+ANSIBLE_SSH_CONTROL_PATH_DIR   = get_config(p, 'ssh_connection', 'control_path_dir', 'ANSIBLE_SSH_CONTROL_PATH_DIR', u'~/.ansible/cp')
 
-        return None
+ANSIBLE_SSH_PIPELINING         = get_config(p, 'ssh_connection', 'pipelining', 'ANSIBLE_SSH_PIPELINING', False, value_type='boolean')
 
-    return get_user_profile_by_id(key.metadata["user_profile_id"]).realm_id
+ANSIBLE_SSH_RETRIES            = get_config(p, 'ssh_connection', 'retries', 'ANSIBLE_SSH_RETRIES', 0, value_type='integer')
 
+ANSIBLE_SSH_EXECUTABLE         = get_config(p, 'ssh_connection', 'ssh_executable', 'ANSIBLE_SSH_EXECUTABLE', 'ssh')
 
+PARAMIKO_RECORD_HOST_KEYS      = get_config(p, 'paramiko_connection', 'record_host_keys', 'ANSIBLE_PARAMIKO_RECORD_HOST_KEYS', True, value_type='boolean')
 
-class S3UploadBackend(ZulipUploadBackend):
+PARAMIKO_HOST_KEY_AUTO_ADD     = get_config(p, 'paramiko_connection', 'host_key_auto_add', 'ANSIBLE_PARAMIKO_HOST_KEY_AUTO_ADD', False, value_type='boolean')
 
-    def delete_file_from_s3(self, path_id: str, bucket_name: str) -> bool:
+PARAMIKO_PROXY_COMMAND         = get_config(p, 'paramiko_connection', 'proxy_command', 'ANSIBLE_PARAMIKO_PROXY_COMMAND', None)
 
-        conn = S3Connection(settings.S3_KEY, settings.S3_SECRET_KEY)
+PARAMIKO_LOOK_FOR_KEYS         = get_config(p, 'paramiko_connection', 'look_for_keys', 'ANSIBLE_PARAMIKO_LOOK_FOR_KEYS', True, value_type='boolean')
 
-        bucket = get_bucket(conn, bucket_name)
+PERSISTENT_CONNECT_TIMEOUT     = get_config(p, 'persistent_connection', 'connect_timeout', 'ANSIBLE_PERSISTENT_CONNECT_TIMEOUT', 30, value_type='integer')
 
+PERSISTENT_CONNECT_RETRIES     = get_config(p, 'persistent_connection', 'connect_retries', 'ANSIBLE_PERSISTENT_CONNECT_RETRIES', 30, value_type='integer')
 
+PERSISTENT_CONNECT_INTERVAL    = get_config(p, 'persistent_connection', 'connect_interval', 'ANSIBLE_PERSISTENT_CONNECT_INTERVAL', 1, value_type='integer')
 
-        # check if file exists
 
-        key = bucket.get_key(path_id)
 
-        if key is not None:
+# obsolete -- will be formally removed
 
-            bucket.delete_key(key)
+ACCELERATE_PORT                = get_config(p, 'accelerate', 'accelerate_port', 'ACCELERATE_PORT', 5099, value_type='integer')
 
-            return True
+ACCELERATE_TIMEOUT             = get_config(p, 'accelerate', 'accelerate_timeout', 'ACCELERATE_TIMEOUT', 30, value_type='integer')
 
+ACCELERATE_CONNECT_TIMEOUT     = get_config(p, 'accelerate', 'accelerate_connect_timeout', 'ACCELERATE_CONNECT_TIMEOUT', 1.0, value_type='float')
 
+ACCELERATE_DAEMON_TIMEOUT      = get_config(p, 'accelerate', 'accelerate_daemon_timeout', 'ACCELERATE_DAEMON_TIMEOUT', 30, value_type='integer')
 
-        file_name = path_id.split("/")[-1]
+ACCELERATE_KEYS_DIR            = get_config(p, 'accelerate', 'accelerate_keys_dir', 'ACCELERATE_KEYS_DIR', '~/.fireball.keys')
 
-        logging.warning("%s does not exist. Its entry in the database will be removed." % (file_name,))
+ACCELERATE_KEYS_DIR_PERMS      = get_config(p, 'accelerate', 'accelerate_keys_dir_perms', 'ACCELERATE_KEYS_DIR_PERMS', '700')
 
-        return False
+ACCELERATE_KEYS_FILE_PERMS     = get_config(p, 'accelerate', 'accelerate_keys_file_perms', 'ACCELERATE_KEYS_FILE_PERMS', '600')
 
+ACCELERATE_MULTI_KEY           = get_config(p, 'accelerate', 'accelerate_multi_key', 'ACCELERATE_MULTI_KEY', False, value_type='boolean')
 
+PARAMIKO_PTY                   = get_config(p, 'paramiko_connection', 'pty', 'ANSIBLE_PARAMIKO_PTY', True, value_type='boolean')
 
-    def upload_message_file(self, uploaded_file_name: str, uploaded_file_size: int,
 
-                            content_type: Optional[str], file_data: bytes,
 
-                            user_profile: UserProfile, target_realm: Optional[Realm]=None) -> str:
+# galaxy related
 
-        bucket_name = settings.S3_AUTH_UPLOADS_BUCKET
+GALAXY_SERVER                  = get_config(p, 'galaxy', 'server', 'ANSIBLE_GALAXY_SERVER', 'https://galaxy.ansible.com')
 
-        if target_realm is None:
+GALAXY_IGNORE_CERTS            = get_config(p, 'galaxy', 'ignore_certs', 'ANSIBLE_GALAXY_IGNORE', False, value_type='boolean')
 
-            target_realm = user_profile.realm
+# this can be configured to blacklist SCMS but cannot add new ones unless the code is also updated
 
-        s3_file_name = "/".join([
+GALAXY_SCMS                    = get_config(p, 'galaxy', 'scms', 'ANSIBLE_GALAXY_SCMS', 'git, hg', value_type='list')
 
-            str(target_realm.id),
+GALAXY_ROLE_SKELETON = get_config(p, 'galaxy', 'role_skeleton', 'ANSIBLE_GALAXY_ROLE_SKELETON', None, value_type='path')
 
-            random_name(18),
+GALAXY_ROLE_SKELETON_IGNORE = get_config(p, 'galaxy', 'role_skeleton_ignore', 'ANSIBLE_GALAXY_ROLE_SKELETON_IGNORE', ['^.git$', '^.*/.git_keep$'],
 
-            sanitize_name(uploaded_file_name)
+                                         value_type='list')
 
-        ])
 
-        url = "/user_uploads/%s" % (s3_file_name,)
 
+STRING_TYPE_FILTERS = get_config(p, 'jinja2', 'dont_type_filters', 'ANSIBLE_STRING_TYPE_FILTERS',
 
+                                 ['string', 'to_json', 'to_nice_json', 'to_yaml', 'ppretty', 'json'], value_type='list' )
 
-        upload_image_to_s3(
 
-            bucket_name,
 
-            s3_file_name,
+# colors
 
-            content_type,
+COLOR_HIGHLIGHT   = get_config(p, 'colors', 'highlight', 'ANSIBLE_COLOR_HIGHLIGHT', 'white')
 
-            user_profile,
+COLOR_VERBOSE     = get_config(p, 'colors', 'verbose', 'ANSIBLE_COLOR_VERBOSE', 'blue')
 
-            file_data
+COLOR_WARN        = get_config(p, 'colors', 'warn', 'ANSIBLE_COLOR_WARN', 'bright purple')
 
-        )
+COLOR_ERROR       = get_config(p, 'colors', 'error', 'ANSIBLE_COLOR_ERROR', 'red')
 
+COLOR_DEBUG       = get_config(p, 'colors', 'debug', 'ANSIBLE_COLOR_DEBUG', 'dark gray')
 
+COLOR_DEPRECATE   = get_config(p, 'colors', 'deprecate', 'ANSIBLE_COLOR_DEPRECATE', 'purple')
 
-        create_attachment(uploaded_file_name, s3_file_name, user_profile, uploaded_file_size)
+COLOR_SKIP        = get_config(p, 'colors', 'skip', 'ANSIBLE_COLOR_SKIP', 'cyan')
 
-        return url
+COLOR_UNREACHABLE = get_config(p, 'colors', 'unreachable', 'ANSIBLE_COLOR_UNREACHABLE', 'bright red')
 
+COLOR_OK          = get_config(p, 'colors', 'ok', 'ANSIBLE_COLOR_OK', 'green')
 
+COLOR_CHANGED     = get_config(p, 'colors', 'changed', 'ANSIBLE_COLOR_CHANGED', 'yellow')
 
-    def delete_message_image(self, path_id: str) -> bool:
+COLOR_DIFF_ADD    = get_config(p, 'colors', 'diff_add', 'ANSIBLE_COLOR_DIFF_ADD', 'green')
 
-        return self.delete_file_from_s3(path_id, settings.S3_AUTH_UPLOADS_BUCKET)
+COLOR_DIFF_REMOVE = get_config(p, 'colors', 'diff_remove', 'ANSIBLE_COLOR_DIFF_REMOVE', 'red')
 
+COLOR_DIFF_LINES  = get_config(p, 'colors', 'diff_lines', 'ANSIBLE_COLOR_DIFF_LINES', 'cyan')
 
 
-    def write_avatar_images(self, s3_file_name: str, target_user_profile: UserProfile,
 
-                            image_data: bytes, content_type: Optional[str]) -> None:
+# diff
 
-        bucket_name = settings.S3_AVATAR_BUCKET
+DIFF_CONTEXT = get_config(p, 'diff', 'context', 'ANSIBLE_DIFF_CONTEXT', 3, value_type='integer')
 
+DIFF_ALWAYS = get_config(p, 'diff', 'always', 'ANSIBLE_DIFF_ALWAYS', False, value_type='bool')
 
 
-        upload_image_to_s3(
 
-            bucket_name,
+# non-configurable things
 
-            s3_file_name + ".original",
+MODULE_REQUIRE_ARGS       = ['command', 'win_command', 'shell', 'win_shell', 'raw', 'script']
 
-            content_type,
+MODULE_NO_JSON            = ['command', 'win_command', 'shell', 'win_shell', 'raw']
 
-            target_user_profile,
+DEFAULT_BECOME_PASS       = None
 
-            image_data,
+DEFAULT_PASSWORD_CHARS = to_text(ascii_letters + digits + ".,:-_", errors='strict')  # characters included in auto-generated passwords
 
-        )
+DEFAULT_SUDO_PASS         = None
 
+DEFAULT_REMOTE_PASS       = None
 
+DEFAULT_SUBSET            = None
 
-        # custom 500px wide version
+DEFAULT_SU_PASS           = None
 
-        resized_medium = resize_avatar(image_data, MEDIUM_AVATAR_SIZE)
+VAULT_VERSION_MIN         = 1.0
 
-        upload_image_to_s3(
+VAULT_VERSION_MAX         = 1.0
 
-            bucket_name,
+TREE_DIR                  = None
 
-            s3_file_name + "-medium.png",
+LOCALHOST                 = frozenset(['127.0.0.1', 'localhost', '::1'])
 
-            "image/png",
+# module search
 
-            target_user_profile,
+BLACKLIST_EXTS = ('.pyc', '.swp', '.bak', '~', '.rpm', '.md', '.txt')
 
-            resized_medium
+IGNORE_FILES = ["COPYING", "CONTRIBUTING", "LICENSE", "README", "VERSION", "GUIDELINES"]
 
-        )
+INTERNAL_RESULT_KEYS      = ['add_host', 'add_group']
 
-
-
-        resized_data = resize_avatar(image_data)
-
-        upload_image_to_s3(
-
-            bucket_name,
-
-            s3_file_name,
-
-            'image/png',
-
-            target_user_profile,
-
-            resized_data,
-
-        )
-
-        # See avatar_url in avatar.py for URL.  (That code also handles the case
-
-        # that users use gravatar.)
-
-
-
-    def upload_avatar_image(self, user_file: File,
-
-                            acting_user_profile: UserProfile,
-
-                            target_user_profile: UserProfile) -> None:
-
-        content_type = guess_type(user_file.name)[0]
-
-        s3_file_name = user_avatar_path(target_user_profile)
-
-
-
-        image_data = user_file.read()
-
-        self.write_avatar_images(s3_file_name, target_user_profile,
-
-                                 image_data, content_type)
-
-
-
-    def delete_avatar_image(self, user: UserProfile) -> None:
-
-        path_id = user_avatar_path(user)
-
-        bucket_name = settings.S3_AVATAR_BUCKET
-
-
-
-        self.delete_file_from_s3(path_id + ".original", bucket_name)
-
-        self.delete_file_from_s3(path_id + "-medium.png", bucket_name)
-
-        self.delete_file_from_s3(path_id, bucket_name)
-
-
-
-    def get_avatar_key(self, file_name: str) -> Key:
-
-        conn = S3Connection(settings.S3_KEY, settings.S3_SECRET_KEY)
-
-        bucket_name = settings.S3_AVATAR_BUCKET
-
-        bucket = get_bucket(conn, bucket_name)
-
-
-
-        key = bucket.get_key(file_name)
-
-        return key
-
-
-
-    def copy_avatar(self, source_profile: UserProfile, target_profile: UserProfile) -> None:
-
-        s3_source_file_name = user_avatar_path(source_profile)
-
-        s3_target_file_name = user_avatar_path(target_profile)
-
-
-
-        key = self.get_avatar_key(s3_source_file_name + ".original")
-
-        image_data = key.get_contents_as_string()  # type: ignore # https://github.com/python/typeshed/issues/1552
-
-        content_type = key.content_type
-
-
-
-        self.write_avatar_images(s3_target_file_name, target_profile, image_data, content_type)  # type: ignore # image_data is `bytes`, boto subs are wrong
-
-
-
-    def get_avatar_url(self, hash_key: str, medium: bool=False) -> str:
-
-        bucket = settings.S3_AVATAR_BUCKET
-
-        medium_suffix = "-medium.png" if medium else ""
-
-        # ?x=x allows templates to append additional parameters with &s
-
-        return "https://%s.s3.amazonaws.com/%s%s?x=x" % (bucket, hash_key, medium_suffix)
-
-
-
-    def upload_realm_icon_image(self, icon_file: File, user_profile: UserProfile) -> None:
-
-        content_type = guess_type(icon_file.name)[0]
-
-        bucket_name = settings.S3_AVATAR_BUCKET
-
-        s3_file_name = os.path.join(str(user_profile.realm.id), 'realm', 'icon')
-
-
-
-        image_data = icon_file.read()
-
-        upload_image_to_s3(
-
-            bucket_name,
-
-            s3_file_name + ".original",
-
-            content_type,
-
-            user_profile,
-
-            image_data,
-
-        )
-
-
-
-        resized_data = resize_avatar(image_data)
-
-        upload_image_to_s3(
-
-            bucket_name,
-
-            s3_file_name + ".png",
-
-            'image/png',
-
-            user_profile,
-
-            resized_data,
-
-        )
-
-        # See avatar_url in avatar.py for URL.  (That code also handles the case
-
-        # that users use gravatar.)
-
-
-
-    def get_realm_icon_url(self, realm_id: int, version: int) -> str:
-
-        bucket = settings.S3_AVATAR_BUCKET
-
-        # ?x=x allows templates to append additional parameters with &s
-
-        return "https://%s.s3.amazonaws.com/%s/realm/icon.png?version=%s" % (bucket, realm_id, version)
-
-
-
-    def upload_realm_logo_image(self, logo_file: File, user_profile: UserProfile,
-
-                                night: bool) -> None:
-
-        content_type = guess_type(logo_file.name)[0]
-
-        bucket_name = settings.S3_AVATAR_BUCKET
-
-        if night:
-
-            basename = 'night_logo'
-
-        else:
-
-            basename = 'logo'
-
-        s3_file_name = os.path.join(str(user_profile.realm.id), 'realm', basename)
-
-
-
-        image_data = logo_file.read()
-
-        upload_image_to_s3(
-
-            bucket_name,
-
-            s3_file_name + ".original",
-
-            content_type,
-
-            user_profile,
-
-            image_data,
-
-        )
-
-
-
-        resized_data = resize_logo(image_data)
-
-        upload_image_to_s3(
-
-            bucket_name,
-
-            s3_file_name + ".png",
-
-            'image/png',
-
-            user_profile,
-
-            resized_data,
-
-        )
-
-        # See avatar_url in avatar.py for URL.  (That code also handles the case
-
-        # that users use gravatar.)
-
-
-
-    def get_realm_logo_url(self, realm_id: int, version: int, night: bool) -> str:
-
-        bucket = settings.S3_AVATAR_BUCKET
-
-        # ?x=x allows templates to append additional parameters with &s
-
-        if not night:
-
-            file_name = 'logo.png'
-
-        else:
-
-            file_name = 'night_logo.png'
-
-        return "https://%s.s3.amazonaws.com/%s/realm/%s?version=%s" % (bucket, realm_id, file_name, version)
-
-
-
-    def ensure_medium_avatar_image(self, user_profile: UserProfile) -> None:
-
-        file_path = user_avatar_path(user_profile)
-
-        s3_file_name = file_path
-
-
-
-        bucket_name = settings.S3_AVATAR_BUCKET
-
-        conn = S3Connection(settings.S3_KEY, settings.S3_SECRET_KEY)
-
-        bucket = get_bucket(conn, bucket_name)
-
-        key = bucket.get_key(file_path + ".original")
-
-        image_data = key.get_contents_as_string()
-
-
-
-        resized_medium = resize_avatar(image_data, MEDIUM_AVATAR_SIZE)  # type: ignore # image_data is `bytes`, boto subs are wrong
-
-        upload_image_to_s3(
-
-            bucket_name,
-
-            s3_file_name + "-medium.png",
-
-            "image/png",
-
-            user_profile,
-
-            resized_medium
-
-        )
-
-
-
-    def ensure_basic_avatar_image(self, user_profile: UserProfile) -> None:  # nocoverage
-
-        # TODO: Refactor this to share code with ensure_medium_avatar_image
-
-        file_path = user_avatar_path(user_profile)
-
-        # Also TODO: Migrate to user_avatar_path(user_profile) + ".png".
-
-        s3_file_name = file_path
-
-
-
-        bucket_name = settings.S3_AVATAR_BUCKET
-
-        conn = S3Connection(settings.S3_KEY, settings.S3_SECRET_KEY)
-
-        bucket = get_bucket(conn, bucket_name)
-
-        key = bucket.get_key(file_path + ".original")
-
-        image_data = key.get_contents_as_string()
-
-
-
-        resized_avatar = resize_avatar(image_data)  # type: ignore # image_data is `bytes`, boto subs are wrong
-
-        upload_image_to_s3(
-
-            bucket_name,
-
-            s3_file_name,
-
-            "image/png",
-
-            user_profile,
-
-            resized_avatar
-
-        )
-
-
-
-    def upload_emoji_image(self, emoji_file: File, emoji_file_name: str,
-
-                           user_profile: UserProfile) -> None:
-
-        content_type = guess_type(emoji_file.name)[0]
-
-        bucket_name = settings.S3_AVATAR_BUCKET
-
-        emoji_path = RealmEmoji.PATH_ID_TEMPLATE.format(
-
-            realm_id=user_profile.realm_id,
-
-            emoji_file_name=emoji_file_name
-
-        )
-
-
-
-        image_data = emoji_file.read()
-
-        resized_image_data = resize_emoji(image_data)
-
-        upload_image_to_s3(
-
-            bucket_name,
-
-            ".".join((emoji_path, "original")),
-
-            content_type,
-
-            user_profile,
-
-            image_data,
-
-        )
-
-        upload_image_to_s3(
-
-            bucket_name,
-
-            emoji_path,
-
-            content_type,
-
-            user_profile,
-
-            resized_image_data,
-
-        )
-
-
-
-    def get_emoji_url(self, emoji_file_name: str, realm_id: int) -> str:
-
-        bucket = settings.S3_AVATAR_BUCKET
-
-        emoji_path = RealmEmoji.PATH_ID_TEMPLATE.format(realm_id=realm_id,
-
-                                                        emoji_file_name=emoji_file_name)
-
-        return "https://%s.s3.amazonaws.com/%s" % (bucket, emoji_path)
-
-
-
-
-
-### Local
-
-
-
-def write_local_file(type: str, path: str, file_data: bytes) -> None:
-
-    file_path = os.path.join(settings.LOCAL_UPLOADS_DIR, type, path)
-
-    os.makedirs(os.path.dirname(file_path), exist_ok=True)
-
-    with open(file_path, 'wb') as f:
-
-        f.write(file_data)
-
-
-
-def read_local_file(type: str, path: str) -> bytes:
-
-    file_path = os.path.join(settings.LOCAL_UPLOADS_DIR, type, path)
-
-    with open(file_path, 'rb') as f:
-
-        return f.read()
-
-
-
-def delete_local_file(type: str, path: str) -> bool:
-
-    file_path = os.path.join(settings.LOCAL_UPLOADS_DIR, type, path)
-
-    if os.path.isfile(file_path):
-
-        # This removes the file but the empty folders still remain.
-
-        os.remove(file_path)
-
-        return True
-
-    file_name = path.split("/")[-1]
-
-    logging.warning("%s does not exist. Its entry in the database will be removed." % (file_name,))
-
-    return False
-
-
-
-def get_local_file_path(path_id: str) -> Optional[str]:
-
-    local_path = os.path.join(settings.LOCAL_UPLOADS_DIR, 'files', path_id)
-
-    if os.path.isfile(local_path):
-
-        return local_path
-
-    else:
-
-        return None
-
-
-
-class LocalUploadBackend(ZulipUploadBackend):
-
-    def upload_message_file(self, uploaded_file_name: str, uploaded_file_size: int,
-
-                            content_type: Optional[str], file_data: bytes,
-
-                            user_profile: UserProfile, target_realm: Optional[Realm]=None) -> str:
-
-        # Split into 256 subdirectories to prevent directories from getting too big
-
-        path = "/".join([
-
-            str(user_profile.realm_id),
-
-            format(random.randint(0, 255), 'x'),
-
-            random_name(18),
-
-            sanitize_name(uploaded_file_name)
-
-        ])
-
-
-
-        write_local_file('files', path, file_data)
-
-        create_attachment(uploaded_file_name, path, user_profile, uploaded_file_size)
-
-        return '/user_uploads/' + path
-
-
-
-    def delete_message_image(self, path_id: str) -> bool:
-
-        return delete_local_file('files', path_id)
-
-
-
-    def write_avatar_images(self, file_path: str, image_data: bytes) -> None:
-
-        write_local_file('avatars', file_path + '.original', image_data)
-
-
-
-        resized_data = resize_avatar(image_data)
-
-        write_local_file('avatars', file_path + '.png', resized_data)
-
-
-
-        resized_medium = resize_avatar(image_data, MEDIUM_AVATAR_SIZE)
-
-        write_local_file('avatars', file_path + '-medium.png', resized_medium)
-
-
-
-    def upload_avatar_image(self, user_file: File,
-
-                            acting_user_profile: UserProfile,
-
-                            target_user_profile: UserProfile) -> None:
-
-        file_path = user_avatar_path(target_user_profile)
-
-
-
-        image_data = user_file.read()
-
-        self.write_avatar_images(file_path, image_data)
-
-
-
-    def delete_avatar_image(self, user: UserProfile) -> None:
-
-        path_id = user_avatar_path(user)
-
-
-
-        delete_local_file("avatars", path_id + ".original")
-
-        delete_local_file("avatars", path_id + ".png")
-
-        delete_local_file("avatars", path_id + "-medium.png")
-
-
-
-    def get_avatar_url(self, hash_key: str, medium: bool=False) -> str:
-
-        # ?x=x allows templates to append additional parameters with &s
-
-        medium_suffix = "-medium" if medium else ""
-
-        return "/user_avatars/%s%s.png?x=x" % (hash_key, medium_suffix)
-
-
-
-    def copy_avatar(self, source_profile: UserProfile, target_profile: UserProfile) -> None:
-
-        source_file_path = user_avatar_path(source_profile)
-
-        target_file_path = user_avatar_path(target_profile)
-
-
-
-        image_data = read_local_file('avatars', source_file_path + '.original')
-
-        self.write_avatar_images(target_file_path, image_data)
-
-
-
-    def upload_realm_icon_image(self, icon_file: File, user_profile: UserProfile) -> None:
-
-        upload_path = os.path.join('avatars', str(user_profile.realm.id), 'realm')
-
-
-
-        image_data = icon_file.read()
-
-        write_local_file(
-
-            upload_path,
-
-            'icon.original',
-
-            image_data)
-
-
-
-        resized_data = resize_avatar(image_data)
-
-        write_local_file(upload_path, 'icon.png', resized_data)
-
-
-
-    def get_realm_icon_url(self, realm_id: int, version: int) -> str:
-
-        # ?x=x allows templates to append additional parameters with &s
-
-        return "/user_avatars/%s/realm/icon.png?version=%s" % (realm_id, version)
-
-
-
-    def upload_realm_logo_image(self, logo_file: File, user_profile: UserProfile,
-
-                                night: bool) -> None:
-
-        upload_path = os.path.join('avatars', str(user_profile.realm.id), 'realm')
-
-        if night:
-
-            original_file = 'night_logo.original'
-
-            resized_file = 'night_logo.png'
-
-        else:
-
-            original_file = 'logo.original'
-
-            resized_file = 'logo.png'
-
-        image_data = logo_file.read()
-
-        write_local_file(
-
-            upload_path,
-
-            original_file,
-
-            image_data)
-
-
-
-        resized_data = resize_logo(image_data)
-
-        write_local_file(upload_path, resized_file, resized_data)
-
-
-
-    def get_realm_logo_url(self, realm_id: int, version: int, night: bool) -> str:
-
-        # ?x=x allows templates to append additional parameters with &s
-
-        if night:
-
-            file_name = 'night_logo.png'
-
-        else:
-
-            file_name = 'logo.png'
-
-        return "/user_avatars/%s/realm/%s?version=%s" % (realm_id, file_name, version)
-
-
-
-    def ensure_medium_avatar_image(self, user_profile: UserProfile) -> None:
-
-        file_path = user_avatar_path(user_profile)
-
-
-
-        output_path = os.path.join(settings.LOCAL_UPLOADS_DIR, "avatars", file_path + "-medium.png")
-
-        if os.path.isfile(output_path):
-
-            return
-
-
-
-        image_path = os.path.join(settings.LOCAL_UPLOADS_DIR, "avatars", file_path + ".original")
-
-        image_data = open(image_path, "rb").read()
-
-        resized_medium = resize_avatar(image_data, MEDIUM_AVATAR_SIZE)
-
-        write_local_file('avatars', file_path + '-medium.png', resized_medium)
-
-
-
-    def ensure_basic_avatar_image(self, user_profile: UserProfile) -> None:  # nocoverage
-
-        # TODO: Refactor this to share code with ensure_medium_avatar_image
-
-        file_path = user_avatar_path(user_profile)
-
-
-
-        output_path = os.path.join(settings.LOCAL_UPLOADS_DIR, "avatars", file_path + ".png")
-
-        if os.path.isfile(output_path):
-
-            return
-
-
-
-        image_path = os.path.join(settings.LOCAL_UPLOADS_DIR, "avatars", file_path + ".original")
-
-        image_data = open(image_path, "rb").read()
-
-        resized_avatar = resize_avatar(image_data)
-
-        write_local_file('avatars', file_path + '.png', resized_avatar)
-
-
-
-    def upload_emoji_image(self, emoji_file: File, emoji_file_name: str,
-
-                           user_profile: UserProfile) -> None:
-
-        emoji_path = RealmEmoji.PATH_ID_TEMPLATE.format(
-
-            realm_id= user_profile.realm_id,
-
-            emoji_file_name=emoji_file_name
-
-        )
-
-
-
-        image_data = emoji_file.read()
-
-        resized_image_data = resize_emoji(image_data)
-
-        write_local_file(
-
-            'avatars',
-
-            ".".join((emoji_path, "original")),
-
-            image_data)
-
-        write_local_file(
-
-            'avatars',
-
-            emoji_path,
-
-            resized_image_data)
-
-
-
-    def get_emoji_url(self, emoji_file_name: str, realm_id: int) -> str:
-
-        return os.path.join(
-
-            "/user_avatars",
-
-            RealmEmoji.PATH_ID_TEMPLATE.format(realm_id=realm_id, emoji_file_name=emoji_file_name))
-
-
-
-# Common and wrappers
-
-if settings.LOCAL_UPLOADS_DIR is not None:
-
-    upload_backend = LocalUploadBackend()  # type: ZulipUploadBackend
-
-else:
-
-    upload_backend = S3UploadBackend()  # nocoverage
-
-
-
-def delete_message_image(path_id: str) -> bool:
-
-    return upload_backend.delete_message_image(path_id)
-
-
-
-def upload_avatar_image(user_file: File, acting_user_profile: UserProfile,
-
-                        target_user_profile: UserProfile) -> None:
-
-    upload_backend.upload_avatar_image(user_file, acting_user_profile, target_user_profile)
-
-
-
-def delete_avatar_image(user_profile: UserProfile) -> None:
-
-    upload_backend.delete_avatar_image(user_profile)
-
-
-
-def copy_avatar(source_profile: UserProfile, target_profile: UserProfile) -> None:
-
-    upload_backend.copy_avatar(source_profile, target_profile)
-
-
-
-def upload_icon_image(user_file: File, user_profile: UserProfile) -> None:
-
-    upload_backend.upload_realm_icon_image(user_file, user_profile)
-
-
-
-def upload_logo_image(user_file: File, user_profile: UserProfile, night: bool) -> None:
-
-    upload_backend.upload_realm_logo_image(user_file, user_profile, night)
-
-
-
-def upload_emoji_image(emoji_file: File, emoji_file_name: str, user_profile: UserProfile) -> None:
-
-    upload_backend.upload_emoji_image(emoji_file, emoji_file_name, user_profile)
-
-
-
-def upload_message_file(uploaded_file_name: str, uploaded_file_size: int,
-
-                        content_type: Optional[str], file_data: bytes,
-
-                        user_profile: UserProfile, target_realm: Optional[Realm]=None) -> str:
-
-    return upload_backend.upload_message_file(uploaded_file_name, uploaded_file_size,
-
-                                              content_type, file_data, user_profile,
-
-                                              target_realm=target_realm)
-
-
-
-def claim_attachment(user_profile: UserProfile,
-
-                     path_id: str,
-
-                     message: Message,
-
-                     is_message_realm_public: bool) -> Attachment:
-
-    attachment = Attachment.objects.get(path_id=path_id)
-
-    attachment.messages.add(message)
-
-    attachment.is_realm_public = attachment.is_realm_public or is_message_realm_public
-
-    attachment.save()
-
-    return attachment
-
-
-
-def create_attachment(file_name: str, path_id: str, user_profile: UserProfile,
-
-                      file_size: int) -> bool:
-
-    attachment = Attachment.objects.create(file_name=file_name, path_id=path_id, owner=user_profile,
-
-                                           realm=user_profile.realm, size=file_size)
-
-    from zerver.lib.actions import notify_attachment_update
-
-    notify_attachment_update(user_profile, 'add', attachment.to_dict())
-
-    return True
-
-
-
-def upload_message_image_from_request(request: HttpRequest, user_file: File,
-
-                                      user_profile: UserProfile) -> str:
-
-    uploaded_file_name, uploaded_file_size, content_type = get_file_info(request, user_file)
-
-    return upload_message_file(uploaded_file_name, uploaded_file_size,
-
-                               content_type, user_file.read(), user_profile)
+RESTRICTED_RESULT_KEYS    = ['ansible_rsync_path', 'ansible_playbook_python']

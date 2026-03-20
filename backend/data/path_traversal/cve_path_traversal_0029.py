@@ -2,672 +2,460 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-# -*- coding: utf-8 -*-
+"""
 
-'''
-
-    feedgen.ext.geo_entry
-
-    ~~~~~~~~~~~~~~~~~~~
+Test systemd wrapper utilities.
 
 
 
-    Extends the FeedGenerator to produce Simple GeoRSS feeds.
+Must run as root.
 
+"""
 
+import tempfile
 
-    :copyright: 2017, Bob Breznak <bob.breznak@gmail.com>
+from systemdspawner import systemd
 
+import pytest
 
+import asyncio
 
-    :license: FreeBSD and LGPL, see license.* for more details.
+import os
 
-'''
-
-import numbers
-
-import warnings
-
-
-
-from lxml import etree
-
-from feedgen.ext.base import BaseEntryExtension
+import time
 
 
 
 
 
-class GeoRSSPolygonInteriorWarning(Warning):
+@pytest.mark.asyncio
 
-    """
+async def test_simple_start():
 
-    Simple placeholder for warning about ignored polygon interiors.
+    unit_name = 'systemdspawner-unittest-' + str(time.time())
 
+    await systemd.start_transient_service(
 
+        unit_name,
 
-    Stores the original geom on a ``geom`` attribute (if required warnings are
+        ['sleep'],
 
-    raised as errors).
+        ['2000'],
 
-    """
+        working_dir='/'
 
-
-
-    def __init__(self, geom, *args, **kwargs):
-
-        self.geom = geom
-
-        super(GeoRSSPolygonInteriorWarning, self).__init__(*args, **kwargs)
+    )
 
 
 
-    def __str__(self):
+    assert await systemd.service_running(unit_name)
 
-        return '{:d} interiors of polygon ignored'.format(
 
-            len(self.geom.__geo_interface__['coordinates']) - 1
 
-        )  # ignore exterior in count
+    await systemd.stop_service(unit_name)
+
+
+
+    assert not await systemd.service_running(unit_name)
 
 
 
 
 
-class GeoRSSGeometryError(ValueError):
+@pytest.mark.asyncio
+
+async def test_service_failed_reset():
 
     """
 
-    Subclass of ValueError for a GeoRSS geometry error
-
-
-
-    Only some geometries are supported in Simple GeoRSS, so if not raise an
-
-    error. Offending geometry is stored on the ``geom`` attribute.
+    Test service_failed and reset_service
 
     """
 
+    unit_name = 'systemdspawner-unittest-' + str(time.time())
+
+    # Running a service with an invalid UID makes it enter a failed state
+
+    await systemd.start_transient_service(
+
+        unit_name,
+
+        ['sleep'],
+
+        ['2000'],
+
+        working_dir='/systemdspawner-unittest-does-not-exist'
+
+    )
 
 
-    def __init__(self, geom, *args, **kwargs):
 
-        self.geom = geom
-
-        super(GeoRSSGeometryError, self).__init__(*args, **kwargs)
+    await asyncio.sleep(0.1)
 
 
 
-    def __str__(self):
+    assert await systemd.service_failed(unit_name)
 
-        msg = "Geometry of type '{}' not in Point, Linestring or Polygon"
 
-        return msg.format(
 
-            self.geom.__geo_interface__['type']
+    await systemd.reset_service(unit_name)
+
+
+
+    assert not await systemd.service_failed(unit_name)
+
+
+
+
+
+@pytest.mark.asyncio
+
+async def test_service_running_fail():
+
+    """
+
+    Test service_running failing when there's no service.
+
+    """
+
+    unit_name = 'systemdspawner-unittest-' + str(time.time())
+
+
+
+    assert not await systemd.service_running(unit_name)
+
+
+
+
+
+@pytest.mark.asyncio
+
+async def test_env_setting():
+
+    unit_name = 'systemdspawner-unittest-' + str(time.time())
+
+    with tempfile.TemporaryDirectory() as d:
+
+        await systemd.start_transient_service(
+
+            unit_name,
+
+            ['/bin/bash'],
+
+            ['-c', 'env > {}/env'.format(d)],
+
+            working_dir='/',
+
+            environment_variables={
+
+                'TESTING_SYSTEMD_ENV_1': 'TEST_1',
+
+                'TESTING_SYSTEMD_ENV_2': 'TEST_2'
+
+            }
 
         )
 
 
 
+        # Wait a tiny bit for the systemd unit to complete running
 
+        await asyncio.sleep(0.1)
 
-class GeoEntryExtension(BaseEntryExtension):
+        with open(os.path.join(d, 'env')) as f:
 
-    '''FeedEntry extension for Simple GeoRSS.
+            text = f.read()
 
-    '''
+            assert 'TESTING_SYSTEMD_ENV_1=TEST_1' in text
 
+            assert 'TESTING_SYSTEMD_ENV_2=TEST_2' in text
 
 
-    def __init__(self):
 
-        '''Simple GeoRSS tag'''
 
-        # geometries
 
-        self.__point = None
+@pytest.mark.asyncio
 
-        self.__line = None
+async def test_workdir():
 
-        self.__polygon = None
+    unit_name = 'systemdspawner-unittest-' + str(time.time())
 
-        self.__box = None
+    _, env_filename = tempfile.mkstemp()
 
+    with tempfile.TemporaryDirectory() as d:
 
+        await systemd.start_transient_service(
 
-        # additional properties
+            unit_name,
 
-        self.__featuretypetag = None
+            ['/bin/bash'],
 
-        self.__relationshiptag = None
+            ['-c', 'pwd > {}/pwd'.format(d)],
 
-        self.__featurename = None
+            working_dir=d,
 
+        )
 
 
-        # elevation
 
-        self.__elev = None
+        # Wait a tiny bit for the systemd unit to complete running
 
-        self.__floor = None
+        await asyncio.sleep(0.1)
 
+ 
 
+        with open(os.path.join(d, 'pwd')) as f:
 
-        # radius
+            text = f.read().strip()
 
-        self.__radius = None
+            assert text == d
 
 
 
-    def extend_file(self, entry):
 
-        '''Add additional fields to an RSS item.
 
+@pytest.mark.asyncio
 
+async def test_slice():
 
-        :param feed: The RSS item XML element to use.
+    unit_name = 'systemdspawner-unittest-' + str(time.time())
 
-        '''
+    _, env_filename = tempfile.mkstemp()
 
+    with tempfile.TemporaryDirectory() as d:
 
+        await systemd.start_transient_service(
 
-        GEO_NS = 'http://www.georss.org/georss'
+            unit_name,
 
+            ['/bin/bash'],
 
+            ['-c', 'pwd > {}/pwd; sleep 10;'.format(d)],
 
-        if self.__point:
+            working_dir=d,
 
-            point = etree.SubElement(entry, '{%s}point' % GEO_NS)
+            slice='user.slice',
 
-            point.text = self.__point
+        )
 
 
 
-        if self.__line:
+        # Wait a tiny bit for the systemd unit to complete running
 
-            line = etree.SubElement(entry, '{%s}line' % GEO_NS)
+        await asyncio.sleep(0.1)
 
-            line.text = self.__line
 
 
+        proc = await asyncio.create_subprocess_exec(
 
-        if self.__polygon:
+            *['systemctl', 'status', unit_name],
 
-            polygon = etree.SubElement(entry, '{%s}polygon' % GEO_NS)
+            stdout=asyncio.subprocess.PIPE,
 
-            polygon.text = self.__polygon
+            stderr=asyncio.subprocess.PIPE)
 
 
 
-        if self.__box:
+        stdout, stderr = await proc.communicate()
 
-            box = etree.SubElement(entry, '{%s}box' % GEO_NS)
+        assert b'user.slice' in stdout
 
-            box.text = self.__box
 
 
 
-        if self.__featuretypetag:
 
-            featuretypetag = etree.SubElement(
+@pytest.mark.asyncio
 
-                entry,
+async def test_properties_string():
 
-                '{%s}featuretypetag' % GEO_NS
+    """
 
-            )
+    Test that setting string properties works
 
-            featuretypetag.text = self.__featuretypetag
 
 
+    - Make a temporary directory
 
-        if self.__relationshiptag:
+    - Bind mount temporary directory to /bind-test
 
-            relationshiptag = etree.SubElement(
+    - Start process in /bind-test, write to current-directory/pwd the working directory
 
-                entry,
+    - Read it from the *temporary* directory, verify it is /bind-test
 
-                '{%s}relationshiptag' % GEO_NS
 
-            )
 
-            relationshiptag.text = self.__relationshiptag
+    This validates the Bind Mount is working, and hence properties are working.
 
+    """
 
+    unit_name = 'systemdspawner-unittest-' + str(time.time())
 
-        if self.__featurename:
+    _, env_filename = tempfile.mkstemp()
 
-            featurename = etree.SubElement(entry, '{%s}featurename' % GEO_NS)
+    with tempfile.TemporaryDirectory() as d:
 
-            featurename.text = self.__featurename
+        await systemd.start_transient_service(
 
+            unit_name,
 
+            ['/bin/bash'],
 
-        if self.__elev:
+            ['-c', 'pwd > pwd'.format(d)],
 
-            elevation = etree.SubElement(entry, '{%s}elev' % GEO_NS)
+            working_dir='/bind-test',
 
-            elevation.text = str(self.__elev)
+            properties={
 
+                'BindPaths': '{}:/bind-test'.format(d)
 
+            }
 
-        if self.__floor:
+        )
 
-            floor = etree.SubElement(entry, '{%s}floor' % GEO_NS)
 
-            floor.text = str(self.__floor)
 
+        # Wait a tiny bit for the systemd unit to complete running
 
+        await asyncio.sleep(0.1)
 
-        if self.__radius:
+        with open(os.path.join(d, 'pwd')) as f:
 
-            radius = etree.SubElement(entry, '{%s}radius' % GEO_NS)
+            text = f.read().strip()
 
-            radius.text = str(self.__radius)
+            assert text == '/bind-test'
 
 
 
-        return entry
 
 
+@pytest.mark.asyncio
 
-    def extend_rss(self, entry):
+async def test_properties_list():
 
-        return self.extend_file(entry)
+    """
 
+    Test setting multiple values for a property
 
 
-    def extend_atom(self, entry):
 
-        return self.extend_file(entry)
+    - Make a temporary directory
 
+    - Before starting process, run two mkdir commands to create a nested
 
+      directory. These commands must be run in order by systemd, otherewise
 
-    def point(self, point=None):
+      they will fail. This validates that ordering behavior is preserved.
 
-        '''Get or set the georss:point of the entry.
+    - Start a process in temporary directory
 
+    - Write current directory to nested directory created in ExecPreStart
 
 
-        :param point: The GeoRSS formatted point (i.e. "42.36 -71.05")
 
-        :returns: The current georss:point of the entry.
+    This validates multiple ordered ExcePreStart calls are working, and hence
 
-        '''
+    properties with lists as values are working.
 
+    """
 
+    unit_name = 'systemdspawner-unittest-' + str(time.time())
 
-        if point is not None:
+    _, env_filename = tempfile.mkstemp()
 
-            self.__point = point
+    with tempfile.TemporaryDirectory() as d:
 
+        await systemd.start_transient_service(
 
+            unit_name,
 
-        return self.__point
+            ['/bin/bash'],
 
+            ['-c', 'pwd > test-1/test-2/pwd'],
 
+            working_dir=d,
 
-    def line(self, line=None):
+            properties={
 
-        '''Get or set the georss:line of the entry
+                "ExecStartPre": [
 
+                    f"/bin/mkdir -p {d}/test-1/test-2",
 
+                ],
 
-        :param point: The GeoRSS formatted line (i.e. "45.256 -110.45 46.46
+            },
 
-                      -109.48 43.84 -109.86")
+        )
 
-        :return: The current georss:line of the entry
 
-        '''
 
-        if line is not None:
+        # Wait a tiny bit for the systemd unit to complete running
 
-            self.__line = line
+        await asyncio.sleep(0.1)
 
+        with open(os.path.join(d, 'test-1', 'test-2', 'pwd')) as f:
 
+            text = f.read().strip()
 
-        return self.__line
+            assert text == d
 
 
 
-    def polygon(self, polygon=None):
 
-        '''Get or set the georss:polygon of the entry
 
+@pytest.mark.asyncio
 
+async def test_uid_gid():
 
-        :param polygon: The GeoRSS formatted polygon (i.e. "45.256 -110.45
+    """
 
-                        46.46 -109.48 43.84 -109.86 45.256 -110.45")
+    Test setting uid and gid
 
-        :return: The current georss:polygon of the entry
 
-        '''
 
-        if polygon is not None:
+    - Make a temporary directory
 
-            self.__polygon = polygon
+    - Run service as uid 65534 (nobody) and gid 0 (root)
 
+    - Verify the output of the 'id' command
 
 
-        return self.__polygon
 
+    This validates that setting uid sets uid, gid sets the gid
 
+    """
 
-    def box(self, box=None):
+    unit_name = 'systemdspawner-unittest-' + str(time.time())
 
-        '''
+    _, env_filename = tempfile.mkstemp()
 
-        Get or set the georss:box of the entry
+    with tempfile.TemporaryDirectory() as d:
 
+        os.chmod(d, 0o777)
 
+        await systemd.start_transient_service(
 
-        :param box: The GeoRSS formatted box (i.e. "42.943 -71.032 43.039
+            unit_name,
 
-                    -69.856")
+            ['/bin/bash'],
 
-        :return: The current georss:box of the entry
+            ['-c', 'id > id'],
 
-        '''
+            working_dir=d,
 
-        if box is not None:
+            uid=65534,
 
-            self.__box = box
+            gid=0
 
+        )
 
 
-        return self.__box
 
+        # Wait a tiny bit for the systemd unit to complete running
 
+        await asyncio.sleep(0.2)
 
-    def featuretypetag(self, featuretypetag=None):
+        with open(os.path.join(d, 'id')) as f:
 
-        '''
+            text = f.read().strip()
 
-        Get or set the georss:featuretypetag of the entry
-
-
-
-        :param featuretypetag: The GeoRSS feaaturertyptag (e.g. "city")
-
-        :return: The current georss:featurertypetag
-
-        '''
-
-        if featuretypetag is not None:
-
-            self.__featuretypetag = featuretypetag
-
-
-
-        return self.__featuretypetag
-
-
-
-    def relationshiptag(self, relationshiptag=None):
-
-        '''
-
-        Get or set the georss:relationshiptag of the entry
-
-
-
-        :param relationshiptag: The GeoRSS relationshiptag (e.g.
-
-                                "is-centred-at")
-
-        :return: the current georss:relationshiptag
-
-        '''
-
-        if relationshiptag is not None:
-
-            self.__relationshiptag = relationshiptag
-
-
-
-        return self.__relationshiptag
-
-
-
-    def featurename(self, featurename=None):
-
-        '''
-
-        Get or set the georss:featurename of the entry
-
-
-
-        :param featuretypetag: The GeoRSS featurename (e.g. "Footscray")
-
-        :return: the current georss:featurename
-
-        '''
-
-        if featurename is not None:
-
-            self.__featurename = featurename
-
-
-
-        return self.__featurename
-
-
-
-    def elev(self, elev=None):
-
-        '''
-
-        Get or set the georss:elev of the entry
-
-
-
-        :param elev: The GeoRSS elevation (e.g. 100.3)
-
-        :type elev: numbers.Number
-
-        :return: the current georss:elev
-
-        '''
-
-        if elev is not None:
-
-            if not isinstance(elev, numbers.Number):
-
-                raise ValueError("elev tag must be numeric: {}".format(elev))
-
-
-
-            self.__elev = elev
-
-
-
-        return self.__elev
-
-
-
-    def floor(self, floor=None):
-
-        '''
-
-        Get or set the georss:floor of the entry
-
-
-
-        :param floor: The GeoRSS floor (e.g. 4)
-
-        :type floor: int
-
-        :return: the current georss:floor
-
-        '''
-
-        if floor is not None:
-
-            if not isinstance(floor, int):
-
-                raise ValueError("floor tag must be int: {}".format(floor))
-
-
-
-            self.__floor = floor
-
-
-
-        return self.__floor
-
-
-
-    def radius(self, radius=None):
-
-        '''
-
-        Get or set the georss:radius of the entry
-
-
-
-        :param radius: The GeoRSS radius (e.g. 100.3)
-
-        :type radius: numbers.Number
-
-        :return: the current georss:radius
-
-        '''
-
-        if radius is not None:
-
-            if not isinstance(radius, numbers.Number):
-
-                raise ValueError(
-
-                    "radius tag must be numeric: {}".format(radius)
-
-                )
-
-
-
-            self.__radius = radius
-
-
-
-        return self.__radius
-
-
-
-    def geom_from_geo_interface(self, geom):
-
-        '''
-
-        Generate a georss geometry from some Python object with a
-
-        ``__geo_interface__`` property (see the `geo_interface specification by
-
-        Sean Gillies`_geointerface )
-
-
-
-        Note only a subset of GeoJSON (see `geojson.org`_geojson ) can be
-
-        easily converted to GeoRSS:
-
-
-
-        - Point
-
-        - LineString
-
-        - Polygon (if there are holes / donuts in the polygons a warning will
-
-          be generaated
-
-
-
-        Other GeoJson types will raise a ``ValueError``.
-
-
-
-        .. note:: The geometry is assumed to be x, y as longitude, latitude in
-
-           the WGS84 projection.
-
-
-
-        .. _geointerface: https://gist.github.com/sgillies/2217756
-
-        .. _geojson: https://geojson.org/
-
-
-
-        :param geom: Geometry object with a __geo_interface__ property
-
-        :return: the formatted GeoRSS geometry
-
-        '''
-
-        geojson = geom.__geo_interface__
-
-
-
-        if geojson['type'] not in ('Point', 'LineString', 'Polygon'):
-
-            raise GeoRSSGeometryError(geom)
-
-
-
-        if geojson['type'] == 'Point':
-
-
-
-            coords = '{:f} {:f}'.format(
-
-                geojson['coordinates'][1],  # latitude is y
-
-                geojson['coordinates'][0]
-
-            )
-
-            return self.point(coords)
-
-
-
-        elif geojson['type'] == 'LineString':
-
-
-
-            coords = ' '.join(
-
-                '{:f} {:f}'.format(vertex[1], vertex[0])
-
-                for vertex in
-
-                geojson['coordinates']
-
-            )
-
-            return self.line(coords)
-
-
-
-        elif geojson['type'] == 'Polygon':
-
-
-
-            if len(geojson['coordinates']) > 1:
-
-                warnings.warn(GeoRSSPolygonInteriorWarning(geom))
-
-
-
-            coords = ' '.join(
-
-                '{:f} {:f}'.format(vertex[1], vertex[0])
-
-                for vertex in
-
-                geojson['coordinates'][0]
-
-            )
-
-            return self.polygon(coords)
+            assert text == 'uid=65534(nobody) gid=0(root) groups=0(root)'

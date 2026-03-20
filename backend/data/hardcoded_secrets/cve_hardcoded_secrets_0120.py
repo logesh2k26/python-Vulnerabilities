@@ -2,366 +2,732 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
+from unittest import mock
 
 
 
-# Copyright 2010 United States Government as represented by the
+from django.conf import settings
 
-# Administrator of the National Aeronautics and Space Administration.
+from django.shortcuts import resolve_url
 
-# All Rights Reserved.
+from django.test import TestCase
 
-#
+from django.test.utils import override_settings
 
-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+from django.urls import reverse
 
-#    not use this file except in compliance with the License. You may obtain
+from django_otp import DEVICE_ID_SESSION_KEY
 
-#    a copy of the License at
+from django_otp.oath import totp
 
-#
 
-#         http://www.apache.org/licenses/LICENSE-2.0
 
-#
+from two_factor.models import random_hex_str
 
-#    Unless required by applicable law or agreed to in writing, software
 
-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+from .utils import UserMixin
 
-#    License for the specific language governing permissions and limitations
 
-#    under the License.
 
 
 
-"""Quotas for instances, volumes, and floating ips."""
+class LoginTest(UserMixin, TestCase):
 
+    def _post(self, data=None):
 
+        return self.client.post(reverse('two_factor:login'), data=data)
 
-from nova import db
 
-from nova.openstack.common import cfg
 
-from nova import flags
+    def test_form(self):
 
+        response = self.client.get(reverse('two_factor:login'))
 
+        self.assertContains(response, 'Password:')
 
 
 
-quota_opts = [
+    def test_invalid_login(self):
 
-    cfg.IntOpt('quota_instances',
+        response = self._post({'auth-username': 'unknown',
 
-               default=10,
+                               'auth-password': 'secret',
 
-               help='number of instances allowed per project'),
+                               'login_view-current_step': 'auth'})
 
-    cfg.IntOpt('quota_cores',
+        self.assertContains(response, 'Please enter a correct')
 
-               default=20,
+        self.assertContains(response, 'and password.')
 
-               help='number of instance cores allowed per project'),
 
-    cfg.IntOpt('quota_ram',
 
-               default=50 * 1024,
+    @mock.patch('two_factor.views.core.signals.user_verified.send')
 
-               help='megabytes of instance ram allowed per project'),
+    def test_valid_login(self, mock_signal):
 
-    cfg.IntOpt('quota_volumes',
+        self.create_user()
 
-               default=10,
+        response = self._post({'auth-username': 'bouke@example.com',
 
-               help='number of volumes allowed per project'),
+                               'auth-password': 'secret',
 
-    cfg.IntOpt('quota_gigabytes',
+                               'login_view-current_step': 'auth'})
 
-               default=1000,
+        self.assertRedirects(response, resolve_url(settings.LOGIN_REDIRECT_URL))
 
-               help='number of volume gigabytes allowed per project'),
 
-    cfg.IntOpt('quota_floating_ips',
 
-               default=10,
+        # No signal should be fired for non-verified user logins.
 
-               help='number of floating ips allowed per project'),
+        self.assertFalse(mock_signal.called)
 
-    cfg.IntOpt('quota_metadata_items',
 
-               default=128,
 
-               help='number of metadata items allowed per instance'),
+    def test_valid_login_with_custom_redirect(self):
 
-    cfg.IntOpt('quota_max_injected_files',
+        redirect_url = reverse('two_factor:setup')
 
-               default=5,
+        self.create_user()
 
-               help='number of injected files allowed'),
+        response = self.client.post(
 
-    cfg.IntOpt('quota_max_injected_file_content_bytes',
+            '%s?%s' % (reverse('two_factor:login'), 'next=' + redirect_url),
 
-               default=10 * 1024,
+            {'auth-username': 'bouke@example.com',
 
-               help='number of bytes allowed per injected file'),
+             'auth-password': 'secret',
 
-    cfg.IntOpt('quota_max_injected_file_path_bytes',
+             'login_view-current_step': 'auth'})
 
-               default=255,
+        self.assertRedirects(response, redirect_url)
 
-               help='number of bytes allowed per injected file path'),
 
-    ]
 
+    def test_valid_login_with_custom_post_redirect(self):
 
+        redirect_url = reverse('two_factor:setup')
 
-FLAGS = flags.FLAGS
+        self.create_user()
 
-FLAGS.register_opts(quota_opts)
+        response = self._post({'auth-username': 'bouke@example.com',
 
+                               'auth-password': 'secret',
 
+                               'login_view-current_step': 'auth',
 
+                               'next': redirect_url})
 
+        self.assertRedirects(response, redirect_url)
 
-def _get_default_quotas():
 
-    defaults = {
 
-        'instances': FLAGS.quota_instances,
+    def test_valid_login_with_redirect_field_name(self):
 
-        'cores': FLAGS.quota_cores,
+        redirect_url = reverse('two_factor:setup')
 
-        'ram': FLAGS.quota_ram,
+        self.create_user()
 
-        'volumes': FLAGS.quota_volumes,
+        response = self.client.post(
 
-        'gigabytes': FLAGS.quota_gigabytes,
+            '%s?%s' % (reverse('custom-field-name-login'), 'next_page=' + redirect_url),
 
-        'floating_ips': FLAGS.quota_floating_ips,
+            {'auth-username': 'bouke@example.com',
 
-        'metadata_items': FLAGS.quota_metadata_items,
+             'auth-password': 'secret',
 
-        'injected_files': FLAGS.quota_max_injected_files,
+             'login_view-current_step': 'auth'})
 
-        'injected_file_content_bytes':
+        self.assertRedirects(response, redirect_url)
 
-            FLAGS.quota_max_injected_file_content_bytes,
 
-    }
 
-    # -1 in the quota flags means unlimited
+    def test_valid_login_with_allowed_external_redirect(self):
 
-    for key in defaults.keys():
+        redirect_url = 'https://test.allowed-success-url.com'
 
-        if defaults[key] == -1:
+        self.create_user()
 
-            defaults[key] = None
+        response = self.client.post(
 
-    return defaults
+            '%s?%s' % (reverse('custom-allowed-success-url-login'), 'next=' + redirect_url),
 
+            {'auth-username': 'bouke@example.com',
 
+             'auth-password': 'secret',
 
+             'login_view-current_step': 'auth'})
 
+        self.assertRedirects(response, redirect_url, fetch_redirect_response=False)
 
-def get_project_quotas(context, project_id):
 
-    rval = _get_default_quotas()
 
-    quota = db.quota_get_all_by_project(context, project_id)
+    def test_valid_login_with_disallowed_external_redirect(self):
 
-    for key in rval.keys():
+        redirect_url = 'https://test.disallowed-success-url.com'
 
-        if key in quota:
+        self.create_user()
 
-            rval[key] = quota[key]
+        response = self.client.post(
 
-    return rval
+            '%s?%s' % (reverse('custom-allowed-success-url-login'), 'next=' + redirect_url),
 
+            {'auth-username': 'bouke@example.com',
 
+             'auth-password': 'secret',
 
+             'login_view-current_step': 'auth'})
 
+        self.assertRedirects(response, reverse('two_factor:profile'), fetch_redirect_response=False)
 
-def _get_request_allotment(requested, used, quota):
 
-    if quota is None:
 
-        return requested
 
-    return quota - used
 
+    def test_valid_login_with_redirect_authenticated_user(self):
 
+        user = self.create_user()
 
+        response = self.client.get(
 
+            reverse('custom-redirect-authenticated-user-login')
 
-def allowed_instances(context, requested_instances, instance_type):
+        )
 
-    """Check quota and return min(requested_instances, allowed_instances)."""
+        self.assertEqual(response.status_code, 200)
 
-    project_id = context.project_id
+        self.client.force_login(user)
 
-    context = context.elevated()
+        response = self.client.get(
 
-    requested_cores = requested_instances * instance_type['vcpus']
+            reverse('custom-redirect-authenticated-user-login')
 
-    requested_ram = requested_instances * instance_type['memory_mb']
+        )
 
-    usage = db.instance_data_get_for_project(context, project_id)
+        self.assertRedirects(response, reverse('two_factor:profile'))
 
-    used_instances, used_cores, used_ram = usage
 
-    quota = get_project_quotas(context, project_id)
 
-    allowed_instances = _get_request_allotment(requested_instances,
+    def test_valid_login_with_redirect_authenticated_user_loop(self):
 
-                                               used_instances,
+        redirect_url = reverse('custom-redirect-authenticated-user-login')
 
-                                               quota['instances'])
+        user = self.create_user()
 
-    allowed_cores = _get_request_allotment(requested_cores, used_cores,
+        self.client.force_login(user)
 
-                                           quota['cores'])
+        with self.assertRaises(ValueError):
 
-    allowed_ram = _get_request_allotment(requested_ram, used_ram, quota['ram'])
+            self.client.get(
 
-    if instance_type['vcpus']:
+                '%s?%s' % (reverse('custom-redirect-authenticated-user-login'), 'next=' + redirect_url),
 
-        allowed_instances = min(allowed_instances,
+            )
 
-                                allowed_cores // instance_type['vcpus'])
 
-    if instance_type['memory_mb']:
 
-        allowed_instances = min(allowed_instances,
+    @mock.patch('two_factor.views.core.signals.user_verified.send')
 
-                                allowed_ram // instance_type['memory_mb'])
+    def test_with_generator(self, mock_signal):
 
+        user = self.create_user()
 
+        device = user.totpdevice_set.create(name='default',
 
-    return min(requested_instances, allowed_instances)
+                                            key=random_hex_str())
 
 
 
+        response = self._post({'auth-username': 'bouke@example.com',
 
+                               'auth-password': 'secret',
 
-def allowed_volumes(context, requested_volumes, size):
+                               'login_view-current_step': 'auth'})
 
-    """Check quota and return min(requested_volumes, allowed_volumes)."""
+        self.assertContains(response, 'Token:')
 
-    project_id = context.project_id
 
-    context = context.elevated()
 
-    size = int(size)
+        response = self._post({'token-otp_token': '123456',
 
-    requested_gigabytes = requested_volumes * size
+                               'login_view-current_step': 'token'})
 
-    used_volumes, used_gigabytes = db.volume_data_get_for_project(context,
+        self.assertEqual(response.context_data['wizard']['form'].errors,
 
-                                                                  project_id)
+                         {'__all__': ['Invalid token. Please make sure you '
 
-    quota = get_project_quotas(context, project_id)
+                                      'have entered it correctly.']})
 
-    allowed_volumes = _get_request_allotment(requested_volumes, used_volumes,
 
-                                             quota['volumes'])
 
-    allowed_gigabytes = _get_request_allotment(requested_gigabytes,
+        # reset throttle because we're not testing that
 
-                                               used_gigabytes,
+        device.throttle_reset()
 
-                                               quota['gigabytes'])
 
-    if size != 0:
 
-        allowed_volumes = min(allowed_volumes,
+        response = self._post({'token-otp_token': totp(device.bin_key),
 
-                              int(allowed_gigabytes // size))
+                               'login_view-current_step': 'token'})
 
-    return min(requested_volumes, allowed_volumes)
+        self.assertRedirects(response, resolve_url(settings.LOGIN_REDIRECT_URL))
 
 
 
+        self.assertEqual(device.persistent_id,
 
+                         self.client.session.get(DEVICE_ID_SESSION_KEY))
 
-def allowed_floating_ips(context, requested_floating_ips):
 
-    """Check quota and return min(requested, allowed) floating ips."""
 
-    project_id = context.project_id
+        # Check that the signal was fired.
 
-    context = context.elevated()
+        mock_signal.assert_called_with(sender=mock.ANY, request=mock.ANY, user=user, device=device)
 
-    used_floating_ips = db.floating_ip_count_by_project(context, project_id)
 
-    quota = get_project_quotas(context, project_id)
 
-    allowed_floating_ips = _get_request_allotment(requested_floating_ips,
+    @mock.patch('two_factor.views.core.signals.user_verified.send')
 
-                                                  used_floating_ips,
+    def test_throttle_with_generator(self, mock_signal):
 
-                                                  quota['floating_ips'])
+        user = self.create_user()
 
-    return min(requested_floating_ips, allowed_floating_ips)
+        device = user.totpdevice_set.create(name='default',
 
+                                            key=random_hex_str())
 
 
 
+        self._post({'auth-username': 'bouke@example.com',
 
-def _calculate_simple_quota(context, resource, requested):
+                    'auth-password': 'secret',
 
-    """Check quota for resource; return min(requested, allowed)."""
+                    'login_view-current_step': 'auth'})
 
-    quota = get_project_quotas(context, context.project_id)
 
-    allowed = _get_request_allotment(requested, 0, quota[resource])
 
-    return min(requested, allowed)
+        # throttle device
 
+        device.throttle_increment()
 
 
 
+        response = self._post({'token-otp_token': totp(device.bin_key),
 
-def allowed_metadata_items(context, requested_metadata_items):
+                               'login_view-current_step': 'token'})
 
-    """Return the number of metadata items allowed."""
+        self.assertEqual(response.context_data['wizard']['form'].errors,
 
-    return _calculate_simple_quota(context, 'metadata_items',
+                         {'__all__': ['Invalid token. Please make sure you '
 
-                                   requested_metadata_items)
+                                      'have entered it correctly.']})
 
 
 
+    @mock.patch('two_factor.gateways.fake.Fake')
 
+    @mock.patch('two_factor.views.core.signals.user_verified.send')
 
-def allowed_injected_files(context, requested_injected_files):
+    @override_settings(
 
-    """Return the number of injected files allowed."""
+        TWO_FACTOR_SMS_GATEWAY='two_factor.gateways.fake.Fake',
 
-    return _calculate_simple_quota(context, 'injected_files',
+        TWO_FACTOR_CALL_GATEWAY='two_factor.gateways.fake.Fake',
 
-                                   requested_injected_files)
+    )
 
+    def test_with_backup_phone(self, mock_signal, fake):
 
+        user = self.create_user()
 
+        for no_digits in (6, 8):
 
+            with self.settings(TWO_FACTOR_TOTP_DIGITS=no_digits):
 
-def allowed_injected_file_content_bytes(context, requested_bytes):
+                user.totpdevice_set.create(name='default', key=random_hex_str(),
 
-    """Return the number of bytes allowed per injected file content."""
+                                           digits=no_digits)
 
-    resource = 'injected_file_content_bytes'
+                device = user.phonedevice_set.create(name='backup', number='+31101234567',
 
-    return _calculate_simple_quota(context, resource, requested_bytes)
+                                                     method='sms',
 
+                                                     key=random_hex_str())
 
 
 
+                # Backup phones should be listed on the login form
 
-def allowed_injected_file_path_bytes(context):
+                response = self._post({'auth-username': 'bouke@example.com',
 
-    """Return the number of bytes allowed in an injected file path."""
+                                       'auth-password': 'secret',
 
-    return FLAGS.quota_max_injected_file_path_bytes
+                                       'login_view-current_step': 'auth'})
+
+                self.assertContains(response, 'Send text message to +31 ** *** **67')
+
+
+
+                # Ask for challenge on invalid device
+
+                response = self._post({'auth-username': 'bouke@example.com',
+
+                                       'auth-password': 'secret',
+
+                                       'challenge_device': 'MALICIOUS/INPUT/666'})
+
+                self.assertContains(response, 'Send text message to +31 ** *** **67')
+
+
+
+                # Ask for SMS challenge
+
+                response = self._post({'auth-username': 'bouke@example.com',
+
+                                       'auth-password': 'secret',
+
+                                       'challenge_device': device.persistent_id})
+
+                self.assertContains(response, 'We sent you a text message')
+
+                fake.return_value.send_sms.assert_called_with(
+
+                    device=device,
+
+                    token=str(totp(device.bin_key, digits=no_digits)).zfill(no_digits))
+
+
+
+                # Ask for phone challenge
+
+                device.method = 'call'
+
+                device.save()
+
+                response = self._post({'auth-username': 'bouke@example.com',
+
+                                       'auth-password': 'secret',
+
+                                       'challenge_device': device.persistent_id})
+
+                self.assertContains(response, 'We are calling your phone right now')
+
+                fake.return_value.make_call.assert_called_with(
+
+                    device=device,
+
+                    token=str(totp(device.bin_key, digits=no_digits)).zfill(no_digits))
+
+
+
+            # Valid token should be accepted.
+
+            response = self._post({'token-otp_token': totp(device.bin_key),
+
+                                   'login_view-current_step': 'token'})
+
+            self.assertRedirects(response, resolve_url(settings.LOGIN_REDIRECT_URL))
+
+            self.assertEqual(device.persistent_id,
+
+                             self.client.session.get(DEVICE_ID_SESSION_KEY))
+
+
+
+            # Check that the signal was fired.
+
+            mock_signal.assert_called_with(sender=mock.ANY, request=mock.ANY, user=user, device=device)
+
+
+
+    @mock.patch('two_factor.views.core.signals.user_verified.send')
+
+    def test_with_backup_token(self, mock_signal):
+
+        user = self.create_user()
+
+        user.totpdevice_set.create(name='default', key=random_hex_str())
+
+        device = user.staticdevice_set.create(name='backup')
+
+        device.token_set.create(token='abcdef123')
+
+
+
+        # Backup phones should be listed on the login form
+
+        response = self._post({'auth-username': 'bouke@example.com',
+
+                               'auth-password': 'secret',
+
+                               'login_view-current_step': 'auth'})
+
+        self.assertContains(response, 'Backup Token')
+
+
+
+        # Should be able to go to backup tokens step in wizard
+
+        response = self._post({'wizard_goto_step': 'backup'})
+
+        self.assertContains(response, 'backup tokens')
+
+
+
+        # Wrong codes should not be accepted
+
+        response = self._post({'backup-otp_token': 'WRONG',
+
+                               'login_view-current_step': 'backup'})
+
+        self.assertEqual(response.context_data['wizard']['form'].errors,
+
+                         {'__all__': ['Invalid token. Please make sure you '
+
+                                      'have entered it correctly.']})
+
+        # static devices are throttled
+
+        device.throttle_reset()
+
+
+
+        # Valid token should be accepted.
+
+        response = self._post({'backup-otp_token': 'abcdef123',
+
+                               'login_view-current_step': 'backup'})
+
+        self.assertRedirects(response, resolve_url(settings.LOGIN_REDIRECT_URL))
+
+
+
+        # Check that the signal was fired.
+
+        mock_signal.assert_called_with(sender=mock.ANY, request=mock.ANY, user=user, device=device)
+
+
+
+    @mock.patch('two_factor.views.utils.logger')
+
+    def test_change_password_in_between(self, mock_logger):
+
+        """
+
+        When the password of the user is changed while trying to login, should
+
+        not result in errors. Refs #63.
+
+        """
+
+        user = self.create_user()
+
+        self.enable_otp()
+
+
+
+        response = self._post({'auth-username': 'bouke@example.com',
+
+                               'auth-password': 'secret',
+
+                               'login_view-current_step': 'auth'})
+
+        self.assertContains(response, 'Token:')
+
+
+
+        # Now, the password is changed. When the form is submitted, the
+
+        # credentials should be checked again. If that's the case, the
+
+        # login form should note that the credentials are invalid.
+
+        user.set_password('secret2')
+
+        user.save()
+
+        response = self._post({'login_view-current_step': 'token'})
+
+        self.assertContains(response, 'Please enter a correct')
+
+        self.assertContains(response, 'and password.')
+
+
+
+        # Check that a message was logged.
+
+        mock_logger.warning.assert_called_with(
+
+            "Current step '%s' is no longer valid, returning to last valid "
+
+            "step in the wizard.",
+
+            'token')
+
+
+
+    @mock.patch('two_factor.views.utils.logger')
+
+    def test_reset_wizard_state(self, mock_logger):
+
+        self.create_user()
+
+        self.enable_otp()
+
+
+
+        response = self._post({'auth-username': 'bouke@example.com',
+
+                               'auth-password': 'secret',
+
+                               'login_view-current_step': 'auth'})
+
+        self.assertContains(response, 'Token:')
+
+
+
+        # A GET request resets the state of the wizard...
+
+        self.client.get(reverse('two_factor:login'))
+
+
+
+        # ...so there is no user in this request anymore. As the login flow
+
+        # depends on a user being present, this should be handled gracefully.
+
+        response = self._post({'token-otp_token': '123456',
+
+                               'login_view-current_step': 'token'})
+
+        self.assertContains(response, 'Password:')
+
+
+
+        # Check that a message was logged.
+
+        mock_logger.warning.assert_called_with(
+
+            "Requested step '%s' is no longer valid, returning to last valid "
+
+            "step in the wizard.",
+
+            'token')
+
+
+
+    @mock.patch('two_factor.views.utils.logger')
+
+    def test_login_different_user_on_existing_session(self, mock_logger):
+
+        """
+
+        This test reproduces the issue where a user is logged in and a different user
+
+        attempts to login.
+
+        """
+
+        self.create_user()
+
+        self.create_user(username='vedran@example.com')
+
+
+
+        response = self._post({'auth-username': 'bouke@example.com',
+
+                               'auth-password': 'secret',
+
+                               'login_view-current_step': 'auth'})
+
+        self.assertRedirects(response, resolve_url(settings.LOGIN_REDIRECT_URL))
+
+
+
+        response = self._post({'auth-username': 'vedran@example.com',
+
+                               'auth-password': 'secret',
+
+                               'login_view-current_step': 'auth'})
+
+        self.assertRedirects(response, resolve_url(settings.LOGIN_REDIRECT_URL))
+
+
+
+    def test_missing_management_data(self):
+
+        # missing management data
+
+        response = self._post({'auth-username': 'bouke@example.com',
+
+                               'auth-password': 'secret'})
+
+
+
+        # view should return HTTP 400 Bad Request
+
+        self.assertEqual(response.status_code, 400)
+
+
+
+
+
+class BackupTokensTest(UserMixin, TestCase):
+
+    def setUp(self):
+
+        super().setUp()
+
+        self.create_user()
+
+        self.enable_otp()
+
+        self.login_user()
+
+
+
+    def test_empty(self):
+
+        response = self.client.get(reverse('two_factor:backup_tokens'))
+
+        self.assertContains(response, 'You don\'t have any backup codes yet.')
+
+
+
+    def test_generate(self):
+
+        url = reverse('two_factor:backup_tokens')
+
+
+
+        response = self.client.post(url)
+
+        self.assertRedirects(response, url)
+
+
+
+        response = self.client.get(url)
+
+        first_set = set([token.token for token in
+
+                        response.context_data['device'].token_set.all()])
+
+        self.assertNotContains(response, 'You don\'t have any backup codes '
+
+                                         'yet.')
+
+        self.assertEqual(10, len(first_set))
+
+
+
+        # Generating the tokens should give a fresh set
+
+        self.client.post(url)
+
+        response = self.client.get(url)
+
+        second_set = set([token.token for token in
+
+                         response.context_data['device'].token_set.all()])
+
+        self.assertNotEqual(first_set, second_set)

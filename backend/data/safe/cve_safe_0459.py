@@ -2,842 +2,1350 @@
 # Safety: safe
 # Category: safe
 
-# vim: ft=python fileencoding=utf-8 sts=4 sw=4 et:
+# -*- coding: utf-8 -*-
 
+import json
 
 
-# Copyright 2014-2018 Florian Bruhin (The Compiler) <mail@qutebrowser.org>
 
-#
+from django.core import mail
 
-# This file is part of qutebrowser.
+from django.core.checks import Info
 
-#
+from django.test import TestCase, override_settings
 
-# qutebrowser is free software: you can redistribute it and/or modify
 
-# it under the terms of the GNU General Public License as published by
 
-# the Free Software Foundation, either version 3 of the License, or
+from wagtail.contrib.forms.models import FormSubmission
 
-# (at your option) any later version.
+from wagtail.contrib.forms.tests.utils import (
 
-#
+    make_form_page, make_form_page_with_custom_submission, make_form_page_with_redirect,
 
-# qutebrowser is distributed in the hope that it will be useful,
+    make_types_test_form_page)
 
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
+from wagtail.core.models import Page
 
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+from wagtail.tests.testapp.models import (
 
-# GNU General Public License for more details.
+    CustomFormPageSubmission, ExtendedFormField, FormField, FormFieldWithCustomSubmission,
 
-#
+    FormPageWithCustomFormBuilder, JadeFormPage)
 
-# You should have received a copy of the GNU General Public License
+from wagtail.tests.utils import WagtailTestUtils
 
-# along with qutebrowser.  If not, see <http://www.gnu.org/licenses/>.
 
 
 
-"""Our own QNetworkAccessManager."""
 
+class TestFormSubmission(TestCase):
 
+    def setUp(self):
 
-import collections
+        # Create a form page
 
-import html
+        self.form_page = make_form_page()
 
 
 
-import attr
+    def test_get_form(self):
 
-from PyQt5.QtCore import (pyqtSlot, pyqtSignal, QCoreApplication, QUrl,
+        response = self.client.get('/contact-us/')
 
-                          QByteArray)
 
-from PyQt5.QtNetwork import QNetworkAccessManager, QNetworkReply, QSslSocket
 
+        # Check response
 
+        self.assertContains(response, """<label for="id_your_email">Your email</label>""")
 
-from qutebrowser.config import config
+        self.assertTemplateUsed(response, 'tests/form_page.html')
 
-from qutebrowser.utils import (message, log, usertypes, utils, objreg,
+        self.assertTemplateNotUsed(response, 'tests/form_page_landing.html')
 
-                               urlutils, debug)
 
-from qutebrowser.browser import shared
 
-from qutebrowser.browser.webkit import certificateerror
+        # HTML in help text should be escaped
 
-from qutebrowser.browser.webkit.network import (webkitqutescheme, networkreply,
+        self.assertContains(response, "&lt;em&gt;please&lt;/em&gt; be polite")
 
-                                                filescheme)
 
 
+        # check that variables defined in get_context are passed through to the template (#1429)
 
+        self.assertContains(response, "<p>hello world</p>")
 
 
-HOSTBLOCK_ERROR_STRING = '%HOSTBLOCK%'
 
-_proxy_auth_cache = {}
+    @override_settings(WAGTAILFORMS_HELP_TEXT_ALLOW_HTML=True)
 
+    def test_get_form_without_help_text_escaping(self):
 
+        response = self.client.get('/contact-us/')
 
+        # HTML in help text should not be escaped
 
+        self.assertContains(response, "<em>please</em> be polite")
 
-@attr.s(frozen=True)
 
-class ProxyId:
 
+    def test_post_invalid_form(self):
 
+        response = self.client.post('/contact-us/', {
 
-    """Information identifying a proxy server."""
+            'your_email': 'bob',
 
+            'your_message': 'hello world',
 
+            'your_choices': ''
 
-    type = attr.ib()
+        })
 
-    hostname = attr.ib()
 
-    port = attr.ib()
 
+        # Check response
 
+        self.assertContains(response, "Enter a valid email address.")
 
+        self.assertTemplateUsed(response, 'tests/form_page.html')
 
+        self.assertTemplateNotUsed(response, 'tests/form_page_landing.html')
 
-def _is_secure_cipher(cipher):
 
-    """Check if a given SSL cipher (hopefully) isn't broken yet."""
 
-    tokens = [e.upper() for e in cipher.name().split('-')]
+    def test_post_valid_form(self):
 
-    if cipher.usedBits() < 128:
+        response = self.client.post('/contact-us/', {
 
-        # https://codereview.qt-project.org/#/c/75943/
+            'your_email': 'bob@example.com',
 
-        return False
+            'your_message': 'hello world',
 
-    # OpenSSL should already protect against this in a better way
+            'your_choices': {'foo': '', 'bar': '', 'baz': ''}
 
-    elif cipher.keyExchangeMethod() == 'DH' and utils.is_windows:
+        })
 
-        # https://weakdh.org/
 
-        return False
 
-    elif cipher.encryptionMethod().upper().startswith('RC4'):
+        # Check response
 
-        # http://en.wikipedia.org/wiki/RC4#Security
+        self.assertContains(response, "Thank you for your feedback.")
 
-        # https://codereview.qt-project.org/#/c/148906/
+        self.assertTemplateNotUsed(response, 'tests/form_page.html')
 
-        return False
+        self.assertTemplateUsed(response, 'tests/form_page_landing.html')
 
-    elif cipher.encryptionMethod().upper().startswith('DES'):
 
-        # http://en.wikipedia.org/wiki/Data_Encryption_Standard#Security_and_cryptanalysis
 
-        return False
+        # check that variables defined in get_context are passed through to the template (#1429)
 
-    elif 'MD5' in tokens:
+        self.assertContains(response, "<p>hello world</p>")
 
-        # http://www.win.tue.nl/hashclash/rogue-ca/
 
-        return False
 
-    # OpenSSL should already protect against this in a better way
+        # check the default form_submission is added to the context
 
-    # elif (('CBC3' in tokens or 'CBC' in tokens) and (cipher.protocol() not in
+        self.assertContains(response, "<li>your_email: bob@example.com</li>")
 
-    #         [QSsl.TlsV1_0, QSsl.TlsV1_1, QSsl.TlsV1_2])):
 
-    #     # http://en.wikipedia.org/wiki/POODLE
 
-    #     return False
+        # Check that an email was sent
 
-    ### These things should never happen as those are already filtered out by
+        self.assertEqual(len(mail.outbox), 1)
 
-    ### either the SSL libraries or Qt - but let's be sure.
+        self.assertEqual(mail.outbox[0].subject, "The subject")
 
-    elif cipher.authenticationMethod() in ['aNULL', 'NULL']:
+        self.assertIn("Your message: hello world", mail.outbox[0].body)
 
-        # Ciphers without authentication.
+        self.assertEqual(mail.outbox[0].to, ['to@email.com'])
 
-        return False
+        self.assertEqual(mail.outbox[0].from_email, 'from@email.com')
 
-    elif cipher.encryptionMethod() in ['eNULL', 'NULL']:
 
-        # Ciphers without encryption.
 
-        return False
+        # Check that form submission was saved correctly
 
-    elif 'EXP' in tokens or 'EXPORT' in tokens:
+        form_page = Page.objects.get(url_path='/home/contact-us/')
 
-        # Weak export-grade ciphers
+        self.assertTrue(FormSubmission.objects.filter(page=form_page, form_data__contains='hello world').exists())
 
-        return False
 
-    elif 'ADH' in tokens:
 
-        # No MITM protection
+    def test_post_unicode_characters(self):
 
-        return False
+        self.client.post('/contact-us/', {
 
-    ### This *should* happen ;)
+            'your_email': 'bob@example.com',
 
-    else:
+            'your_message': 'こんにちは、世界',
 
-        return True
+            'your_choices': {'foo': '', 'bar': '', 'baz': ''}
 
+        })
 
 
 
+        # Check the email
 
-def init():
+        self.assertEqual(len(mail.outbox), 1)
 
-    """Disable insecure SSL ciphers on old Qt versions."""
+        self.assertIn("Your message: こんにちは、世界", mail.outbox[0].body)
 
-    default_ciphers = QSslSocket.defaultCiphers()
 
-    log.init.debug("Default Qt ciphers: {}".format(
 
-        ', '.join(c.name() for c in default_ciphers)))
+        # Check the form submission
 
+        submission = FormSubmission.objects.get()
 
+        submission_data = json.loads(submission.form_data)
 
-    good_ciphers = []
+        self.assertEqual(submission_data['your_message'], 'こんにちは、世界')
 
-    bad_ciphers = []
 
-    for cipher in default_ciphers:
 
-        if _is_secure_cipher(cipher):
+    def test_post_multiple_values(self):
 
-            good_ciphers.append(cipher)
+        response = self.client.post('/contact-us/', {
 
-        else:
+            'your_email': 'bob@example.com',
 
-            bad_ciphers.append(cipher)
+            'your_message': 'hello world',
 
+            'your_choices': {'foo': 'on', 'bar': 'on', 'baz': 'on'}
 
+        })
 
-    log.init.debug("Disabling bad ciphers: {}".format(
 
-        ', '.join(c.name() for c in bad_ciphers)))
 
-    QSslSocket.setDefaultCiphers(good_ciphers)
+        # Check response
 
+        self.assertContains(response, "Thank you for your feedback.")
 
+        self.assertTemplateNotUsed(response, 'tests/form_page.html')
 
+        self.assertTemplateUsed(response, 'tests/form_page_landing.html')
 
 
-class NetworkManager(QNetworkAccessManager):
 
+        # Check that the three checkbox values were saved correctly
 
+        form_page = Page.objects.get(url_path='/home/contact-us/')
 
-    """Our own QNetworkAccessManager.
+        submission = FormSubmission.objects.filter(
 
+            page=form_page, form_data__contains='hello world'
 
+        )
 
-    Attributes:
+        self.assertIn("foo", submission[0].form_data)
 
-        adopted_downloads: If downloads are running with this QNAM but the
+        self.assertIn("bar", submission[0].form_data)
 
-                           associated tab gets closed already, the NAM gets
+        self.assertIn("baz", submission[0].form_data)
 
-                           reparented to the DownloadManager. This counts the
 
-                           still running downloads, so the QNAM can clean
 
-                           itself up when this reaches zero again.
+        # Check that the all the multiple checkbox values are serialised in the
 
-        _scheme_handlers: A dictionary (scheme -> handler) of supported custom
+        # email correctly
 
-                          schemes.
+        self.assertEqual(len(mail.outbox), 1)
 
-        _win_id: The window ID this NetworkManager is associated with.
+        self.assertIn("bar", mail.outbox[0].body)
 
-                 (or None for generic network managers)
+        self.assertIn("foo", mail.outbox[0].body)
 
-        _tab_id: The tab ID this NetworkManager is associated with.
+        self.assertIn("baz", mail.outbox[0].body)
 
-                 (or None for generic network managers)
 
-        _rejected_ssl_errors: A {QUrl: [SslError]} dict of rejected errors.
 
-        _accepted_ssl_errors: A {QUrl: [SslError]} dict of accepted errors.
+    def test_post_blank_checkbox(self):
 
-        _private: Whether we're in private browsing mode.
+        response = self.client.post('/contact-us/', {
 
-        netrc_used: Whether netrc authentication was performed.
+            'your_email': 'bob@example.com',
 
+            'your_message': 'hello world',
 
+            'your_choices': {},
 
-    Signals:
+        })
 
-        shutting_down: Emitted when the QNAM is shutting down.
 
-    """
 
+        # Check response
 
+        self.assertContains(response, "Thank you for your feedback.")
 
-    shutting_down = pyqtSignal()
+        self.assertTemplateNotUsed(response, 'tests/form_page.html')
 
+        self.assertTemplateUsed(response, 'tests/form_page_landing.html')
 
 
-    def __init__(self, *, win_id, tab_id, private, parent=None):
 
-        log.init.debug("Initializing NetworkManager")
+        # Check that the checkbox was serialised in the email correctly
 
-        with log.disable_qt_msghandler():
+        self.assertEqual(len(mail.outbox), 1)
 
-            # WORKAROUND for a hang when a message is printed - See:
+        self.assertIn("Your choices: ", mail.outbox[0].body)
 
-            # http://www.riverbankcomputing.com/pipermail/pyqt/2014-November/035045.html
 
-            super().__init__(parent)
 
-        log.init.debug("NetworkManager init done")
 
-        self.adopted_downloads = 0
 
-        self._args = objreg.get('args')
+class TestFormWithCustomSubmission(TestCase, WagtailTestUtils):
 
-        self._win_id = win_id
+    def setUp(self):
 
-        self._tab_id = tab_id
+        # Create a form page
 
-        self._private = private
+        self.form_page = make_form_page_with_custom_submission()
 
-        self._scheme_handlers = {
 
-            'qute': webkitqutescheme.handler,
 
-            'file': filescheme.handler,
+        self.user = self.login()
 
-        }
 
-        self._set_cookiejar()
 
-        self._set_cache()
+    def test_get_form(self):
 
-        self.sslErrors.connect(self.on_ssl_errors)
+        response = self.client.get('/contact-us/')
 
-        self._rejected_ssl_errors = collections.defaultdict(list)
 
-        self._accepted_ssl_errors = collections.defaultdict(list)
 
-        self.authenticationRequired.connect(self.on_authentication_required)
+        # Check response
 
-        self.proxyAuthenticationRequired.connect(
+        self.assertContains(response, """<label for="id_your_email">Your email</label>""")
 
-            self.on_proxy_authentication_required)
+        self.assertTemplateUsed(response, 'tests/form_page_with_custom_submission.html')
 
-        self.netrc_used = False
+        self.assertTemplateNotUsed(response, 'tests/form_page_with_custom_submission_landing.html')
 
+        self.assertNotContains(response, '<div>You must log in first.</div>', html=True)
 
+        self.assertContains(response, '<p>Boring intro text</p>', html=True)
 
-    def _set_cookiejar(self):
 
-        """Set the cookie jar of the NetworkManager correctly."""
 
-        if self._private:
+        # check that variables defined in get_context are passed through to the template (#1429)
 
-            cookie_jar = objreg.get('ram-cookie-jar')
+        self.assertContains(response, "<p>hello world</p>")
 
-        else:
 
-            cookie_jar = objreg.get('cookie-jar')
 
+    def test_get_form_with_anonymous_user(self):
 
+        self.client.logout()
 
-        # We have a shared cookie jar - we restore its parent so we don't
 
-        # take ownership of it.
 
-        self.setCookieJar(cookie_jar)
+        response = self.client.get('/contact-us/')
 
-        app = QCoreApplication.instance()
 
-        cookie_jar.setParent(app)
 
+        # Check response
 
+        self.assertNotContains(response, """<label for="id_your_email">Your email</label>""")
 
-    def _set_cache(self):
+        self.assertTemplateUsed(response, 'tests/form_page_with_custom_submission.html')
 
-        """Set the cache of the NetworkManager correctly."""
+        self.assertTemplateNotUsed(response, 'tests/form_page_with_custom_submission_landing.html')
 
-        if self._private:
+        self.assertContains(response, '<div>You must log in first.</div>', html=True)
 
-            return
+        self.assertNotContains(response, '<p>Boring intro text</p>', html=True)
 
-        # We have a shared cache - we restore its parent so we don't take
 
-        # ownership of it.
 
-        app = QCoreApplication.instance()
+        # check that variables defined in get_context are passed through to the template (#1429)
 
-        cache = objreg.get('cache')
+        self.assertContains(response, "<p>hello world</p>")
 
-        self.setCache(cache)
 
-        cache.setParent(app)
 
+    def test_post_invalid_form(self):
 
+        response = self.client.post('/contact-us/', {
 
-    def _get_abort_signals(self, owner=None):
+            'your_email': 'bob',
 
-        """Get a list of signals which should abort a question."""
+            'your_message': 'hello world',
 
-        abort_on = [self.shutting_down]
+            'your_choices': ''
 
-        if owner is not None:
+        })
 
-            abort_on.append(owner.destroyed)
 
-        # This might be a generic network manager, e.g. one belonging to a
 
-        # DownloadManager. In this case, just skip the webview thing.
+        # Check response
 
-        if self._tab_id is not None:
+        self.assertContains(response, "Enter a valid email address.")
 
-            assert self._win_id is not None
+        self.assertTemplateUsed(response, 'tests/form_page_with_custom_submission.html')
 
-            tab = objreg.get('tab', scope='tab', window=self._win_id,
+        self.assertTemplateNotUsed(response, 'tests/form_page_with_custom_submission_landing.html')
 
-                             tab=self._tab_id)
 
-            abort_on.append(tab.load_started)
 
-        return abort_on
+    def test_post_valid_form(self):
 
+        response = self.client.post('/contact-us/', {
 
+            'your_email': 'bob@example.com',
 
-    def shutdown(self):
+            'your_message': 'hello world',
 
-        """Abort all running requests."""
+            'your_choices': {'foo': '', 'bar': '', 'baz': ''}
 
-        self.setNetworkAccessible(QNetworkAccessManager.NotAccessible)
+        })
 
-        self.shutting_down.emit()
 
 
+        # Check response
 
-    # No @pyqtSlot here, see
+        self.assertContains(response, "Thank you for your patience!")
 
-    # https://github.com/qutebrowser/qutebrowser/issues/2213
+        self.assertTemplateNotUsed(response, 'tests/form_page_with_custom_submission.html')
 
-    def on_ssl_errors(self, reply, errors):  # noqa: C901 pragma: no mccabe
+        self.assertTemplateUsed(response, 'tests/form_page_with_custom_submission_landing.html')
 
-        """Decide if SSL errors should be ignored or not.
 
 
+        # check that variables defined in get_context are passed through to the template (#1429)
 
-        This slot is called on SSL/TLS errors by the self.sslErrors signal.
+        self.assertContains(response, "<p>hello world</p>")
 
 
 
-        Args:
+        # check that the custom form_submission is added to the context
 
-            reply: The QNetworkReply that is encountering the errors.
+        self.assertContains(response, "<p>Username: test@email.com</p>")
 
-            errors: A list of errors.
 
-        """
 
-        errors = [certificateerror.CertificateErrorWrapper(e) for e in errors]
+        # Check that an email was sent
 
-        log.webview.debug("Certificate errors: {!r}".format(
+        self.assertEqual(len(mail.outbox), 1)
 
-            ' / '.join(str(err) for err in errors)))
+        self.assertEqual(mail.outbox[0].subject, "The subject")
 
-        try:
+        self.assertIn("Your message: hello world", mail.outbox[0].body)
 
-            host_tpl = urlutils.host_tuple(reply.url())
+        self.assertEqual(mail.outbox[0].to, ['to@email.com'])
 
-        except ValueError:
+        self.assertEqual(mail.outbox[0].from_email, 'from@email.com')
 
-            host_tpl = None
 
-            is_accepted = False
 
-            is_rejected = False
+        # Check that form submission was saved correctly
 
-        else:
+        form_page = Page.objects.get(url_path='/home/contact-us/')
 
-            is_accepted = set(errors).issubset(
+        self.assertTrue(CustomFormPageSubmission.objects.filter(page=form_page, form_data__contains='hello world').exists())
 
-                self._accepted_ssl_errors[host_tpl])
 
-            is_rejected = set(errors).issubset(
 
-                self._rejected_ssl_errors[host_tpl])
+    def test_post_form_twice(self):
 
+        # First submission
 
+        response = self.client.post('/contact-us/', {
 
-        log.webview.debug("Already accepted: {} / "
+            'your_email': 'bob@example.com',
 
-                          "rejected {}".format(is_accepted, is_rejected))
+            'your_message': 'hello world',
 
+            'your_choices': {'foo': '', 'bar': '', 'baz': ''}
 
+        })
 
-        if is_rejected:
 
-            return
 
-        elif is_accepted:
+        # Check response
 
-            reply.ignoreSslErrors()
+        self.assertTemplateNotUsed(response, 'tests/form_page_with_custom_submission.html')
 
-            return
+        self.assertTemplateUsed(response, 'tests/form_page_with_custom_submission_landing.html')
 
+        self.assertContains(response, '<p>Thank you for your patience!</p>', html=True)
 
+        self.assertNotContains(response, '<div>The form is already filled.</div>', html=True)
 
-        abort_on = self._get_abort_signals(reply)
 
-        ignore = shared.ignore_certificate_errors(reply.url(), errors,
 
-                                                  abort_on=abort_on)
+        # Check that first form submission was saved correctly
 
-        if ignore:
+        submissions_qs = CustomFormPageSubmission.objects.filter(user=self.user, page=self.form_page)
 
-            reply.ignoreSslErrors()
+        self.assertEqual(submissions_qs.count(), 1)
 
-            err_dict = self._accepted_ssl_errors
+        self.assertTrue(submissions_qs.filter(form_data__contains='hello world').exists())
 
-        else:
 
-            err_dict = self._rejected_ssl_errors
 
-        if host_tpl is not None:
+        # Second submission
 
-            err_dict[host_tpl] += errors
+        response = self.client.post('/contact-us/', {
 
+            'your_email': 'bob@example.com',
 
+            'your_message': 'hello world',
 
-    def clear_all_ssl_errors(self):
+            'your_choices': {'foo': '', 'bar': '', 'baz': ''}
 
-        """Clear all remembered SSL errors."""
+        })
 
-        self._accepted_ssl_errors.clear()
 
-        self._rejected_ssl_errors.clear()
 
+        # Check response
 
+        self.assertTemplateUsed(response, 'tests/form_page_with_custom_submission.html')
 
-    @pyqtSlot(QUrl)
+        self.assertTemplateNotUsed(response, 'tests/form_page_with_custom_submission_landing.html')
 
-    def clear_rejected_ssl_errors(self, url):
+        self.assertNotContains(response, '<p>Thank you for your patience!</p>', html=True)
 
-        """Clear the rejected SSL errors on a reload.
+        self.assertContains(response, '<div>The form is already filled.</div>', html=True)
 
+        self.assertNotContains(response, '<div>You must log in first.</div>', html=True)
 
+        self.assertNotContains(response, '<p>Boring intro text</p>', html=True)
 
-        Args:
 
-            url: The URL to remove.
 
-        """
+        # Check that first submission exists and second submission wasn't saved
 
-        try:
+        submissions_qs = CustomFormPageSubmission.objects.filter(user=self.user, page=self.form_page)
 
-            del self._rejected_ssl_errors[url]
+        self.assertEqual(submissions_qs.count(), 1)
 
-        except KeyError:
+        self.assertTrue(submissions_qs.filter(form_data__contains='hello world').exists())
 
-            pass
+        self.assertFalse(submissions_qs.filter(form_data__contains='hello cruel world').exists())
 
 
 
-    @pyqtSlot('QNetworkReply*', 'QAuthenticator*')
+    def test_post_unicode_characters(self):
 
-    def on_authentication_required(self, reply, authenticator):
+        self.client.post('/contact-us/', {
 
-        """Called when a website needs authentication."""
+            'your_email': 'bob@example.com',
 
-        netrc_success = False
+            'your_message': 'こんにちは、世界',
 
-        if not self.netrc_used:
+            'your_choices': {'foo': '', 'bar': '', 'baz': ''}
 
-            self.netrc_used = True
+        })
 
-            netrc_success = shared.netrc_authentication(reply.url(),
 
-                                                        authenticator)
 
-        if not netrc_success:
+        # Check the email
 
-            abort_on = self._get_abort_signals(reply)
+        self.assertEqual(len(mail.outbox), 1)
 
-            shared.authentication_required(reply.url(), authenticator,
+        self.assertIn("Your message: こんにちは、世界", mail.outbox[0].body)
 
-                                           abort_on=abort_on)
 
 
+        # Check the form submission
 
-    @pyqtSlot('QNetworkProxy', 'QAuthenticator*')
+        submission = CustomFormPageSubmission.objects.get()
 
-    def on_proxy_authentication_required(self, proxy, authenticator):
+        submission_data = json.loads(submission.form_data)
 
-        """Called when a proxy needs authentication."""
+        self.assertEqual(submission_data['your_message'], 'こんにちは、世界')
 
-        proxy_id = ProxyId(proxy.type(), proxy.hostName(), proxy.port())
 
-        if proxy_id in _proxy_auth_cache:
 
-            user, password = _proxy_auth_cache[proxy_id]
+    def test_post_multiple_values(self):
 
-            authenticator.setUser(user)
+        response = self.client.post('/contact-us/', {
 
-            authenticator.setPassword(password)
+            'your_email': 'bob@example.com',
 
-        else:
+            'your_message': 'hello world',
 
-            msg = '<b>{}</b> says:<br/>{}'.format(
+            'your_choices': {'foo': 'on', 'bar': 'on', 'baz': 'on'}
 
-                html.escape(proxy.hostName()),
+        })
 
-                html.escape(authenticator.realm()))
 
-            abort_on = self._get_abort_signals()
 
-            answer = message.ask(
+        # Check response
 
-                title="Proxy authentication required", text=msg,
+        self.assertContains(response, "Thank you for your patience!")
 
-                mode=usertypes.PromptMode.user_pwd, abort_on=abort_on)
+        self.assertTemplateNotUsed(response, 'tests/form_page_with_custom_submission.html')
 
-            if answer is not None:
+        self.assertTemplateUsed(response, 'tests/form_page_with_custom_submission_landing.html')
 
-                authenticator.setUser(answer.user)
 
-                authenticator.setPassword(answer.password)
 
-                _proxy_auth_cache[proxy_id] = answer
+        # Check that the three checkbox values were saved correctly
 
+        form_page = Page.objects.get(url_path='/home/contact-us/')
 
+        submission = CustomFormPageSubmission.objects.filter(
 
-    @pyqtSlot()
+            page=form_page, form_data__contains='hello world'
 
-    def on_adopted_download_destroyed(self):
+        )
 
-        """Check if we can clean up if an adopted download was destroyed.
+        self.assertIn("foo", submission[0].form_data)
 
+        self.assertIn("bar", submission[0].form_data)
 
+        self.assertIn("baz", submission[0].form_data)
 
-        See the description for adopted_downloads for details.
 
-        """
 
-        self.adopted_downloads -= 1
+    def test_post_blank_checkbox(self):
 
-        log.downloads.debug("Adopted download destroyed, {} left.".format(
+        response = self.client.post('/contact-us/', {
 
-            self.adopted_downloads))
+            'your_email': 'bob@example.com',
 
-        assert self.adopted_downloads >= 0
+            'your_message': 'hello world',
 
-        if self.adopted_downloads == 0:
+            'your_choices': {},
 
-            self.deleteLater()
+        })
 
 
 
-    @pyqtSlot(object)  # DownloadItem
+        # Check response
 
-    def adopt_download(self, download):
+        self.assertContains(response, "Thank you for your patience!")
 
-        """Adopt a new DownloadItem."""
+        self.assertTemplateNotUsed(response, 'tests/form_page_with_custom_submission.html')
 
-        self.adopted_downloads += 1
+        self.assertTemplateUsed(response, 'tests/form_page_with_custom_submission_landing.html')
 
-        log.downloads.debug("Adopted download, {} adopted.".format(
 
-            self.adopted_downloads))
 
-        download.destroyed.connect(self.on_adopted_download_destroyed)
+        # Check that the checkbox was serialised in the email correctly
 
-        download.adopt_download.connect(self.adopt_download)
+        self.assertEqual(len(mail.outbox), 1)
 
+        self.assertIn("Your choices: None", mail.outbox[0].body)
 
 
-    def set_referer(self, req, current_url):
 
-        """Set the referer header."""
 
-        referer_header_conf = config.val.content.headers.referer
 
+class TestFormSubmissionWithMultipleRecipients(TestCase):
 
+    def setUp(self):
 
-        try:
+        # Create a form page
 
-            if referer_header_conf == 'never':
+        self.form_page = make_form_page(to_address='to@email.com, another@email.com')
 
-                # Note: using ''.encode('ascii') sends a header with no value,
 
-                # instead of no header at all
 
-                req.setRawHeader('Referer'.encode('ascii'), QByteArray())
+    def test_post_valid_form(self):
 
-            elif (referer_header_conf == 'same-domain' and
+        response = self.client.post('/contact-us/', {
 
-                  not urlutils.same_domain(req.url(), current_url)):
+            'your_email': 'bob@example.com',
 
-                req.setRawHeader('Referer'.encode('ascii'), QByteArray())
+            'your_message': 'hello world',
 
-            # If refer_header_conf is set to 'always', we leave the header
+            'your_choices': {'foo': '', 'bar': '', 'baz': ''}
 
-            # alone as QtWebKit did set it.
+        })
 
-        except urlutils.InvalidUrlError:
 
-            # req.url() or current_url can be invalid - this happens on
 
-            # https://www.playstation.com/ for example.
+        # Check response
 
-            pass
+        self.assertContains(response, "Thank you for your feedback.")
 
+        self.assertTemplateNotUsed(response, 'tests/form_page.html')
 
+        self.assertTemplateUsed(response, 'tests/form_page_landing.html')
 
-    # WORKAROUND for:
 
-    # http://www.riverbankcomputing.com/pipermail/pyqt/2014-September/034806.html
 
-    #
+        # check that variables defined in get_context are passed through to the template (#1429)
 
-    # By returning False, we provoke a TypeError because of a wrong return
+        self.assertContains(response, "<p>hello world</p>")
 
-    # type, which does *not* trigger a segfault but invoke our return handler
 
-    # immediately.
 
-    @utils.prevent_exceptions(False)
+        # Check that one email was sent, but to two recipients
 
-    def createRequest(self, op, req, outgoing_data):
+        self.assertEqual(len(mail.outbox), 1)
 
-        """Return a new QNetworkReply object.
 
 
+        self.assertEqual(mail.outbox[0].subject, "The subject")
 
-        Args:
+        self.assertIn("Your message: hello world", mail.outbox[0].body)
 
-             op: Operation op
+        self.assertEqual(mail.outbox[0].from_email, 'from@email.com')
 
-             req: const QNetworkRequest & req
+        self.assertEqual(set(mail.outbox[0].to), {'to@email.com', 'another@email.com'})
 
-             outgoing_data: QIODevice * outgoingData
 
 
+        # Check that form submission was saved correctly
 
-        Return:
+        form_page = Page.objects.get(url_path='/home/contact-us/')
 
-            A QNetworkReply.
+        self.assertTrue(FormSubmission.objects.filter(page=form_page, form_data__contains='hello world').exists())
 
-        """
 
-        proxy_factory = objreg.get('proxy-factory', None)
 
-        if proxy_factory is not None:
 
-            proxy_error = proxy_factory.get_error()
 
-            if proxy_error is not None:
+class TestFormSubmissionWithMultipleRecipientsAndWithCustomSubmission(TestCase, WagtailTestUtils):
 
-                return networkreply.ErrorNetworkReply(
+    def setUp(self):
 
-                    req, proxy_error, QNetworkReply.UnknownProxyError,
+        # Create a form page
 
-                    self)
+        self.form_page = make_form_page_with_custom_submission(
 
+            to_address='to@email.com, another@email.com'
 
+        )
 
-        for header, value in shared.custom_headers(url=req.url()):
 
-            req.setRawHeader(header, value)
 
+        self.user = self.login()
 
 
-        host_blocker = objreg.get('host-blocker')
 
-        if host_blocker.is_blocked(req.url()):
+    def test_post_valid_form(self):
 
-            log.webview.info("Request to {} blocked by host blocker.".format(
+        response = self.client.post('/contact-us/', {
 
-                req.url().host()))
+            'your_email': 'bob@example.com',
 
-            return networkreply.ErrorNetworkReply(
+            'your_message': 'hello world',
 
-                req, HOSTBLOCK_ERROR_STRING, QNetworkReply.ContentAccessDenied,
+            'your_choices': {'foo': '', 'bar': '', 'baz': ''}
 
-                self)
+        })
 
 
 
-        # There are some scenarios where we can't figure out current_url:
+        # Check response
 
-        # - There's a generic NetworkManager, e.g. for downloads
+        self.assertContains(response, "Thank you for your patience!")
 
-        # - The download was in a tab which is now closed.
+        self.assertTemplateNotUsed(response, 'tests/form_page_with_custom_submission.html')
 
-        current_url = QUrl()
+        self.assertTemplateUsed(response, 'tests/form_page_with_custom_submission_landing.html')
 
 
 
-        if self._tab_id is not None:
+        # check that variables defined in get_context are passed through to the template (#1429)
 
-            assert self._win_id is not None
+        self.assertContains(response, "<p>hello world</p>")
 
-            try:
 
-                tab = objreg.get('tab', scope='tab', window=self._win_id,
 
-                                 tab=self._tab_id)
+        # Check that one email was sent, but to two recipients
 
-                current_url = tab.url()
+        self.assertEqual(len(mail.outbox), 1)
 
-            except (KeyError, RuntimeError):
 
-                # https://github.com/qutebrowser/qutebrowser/issues/889
 
-                # Catching RuntimeError because we could be in the middle of
+        self.assertEqual(mail.outbox[0].subject, "The subject")
 
-                # the webpage shutdown here.
+        self.assertIn("Your message: hello world", mail.outbox[0].body)
 
-                current_url = QUrl()
+        self.assertEqual(mail.outbox[0].from_email, 'from@email.com')
 
+        self.assertEqual(set(mail.outbox[0].to), {'to@email.com', 'another@email.com'})
 
 
-        if 'log-requests' in self._args.debug_flags:
 
-            operation = debug.qenum_key(QNetworkAccessManager, op)
+        # Check that form submission was saved correctly
 
-            operation = operation.replace('Operation', '').upper()
+        form_page = Page.objects.get(url_path='/home/contact-us/')
 
-            log.webview.debug("{} {}, first-party {}".format(
+        self.assertTrue(
 
-                operation,
+            CustomFormPageSubmission.objects.filter(page=form_page, form_data__contains='hello world').exists()
 
-                req.url().toDisplayString(),
+        )
 
-                current_url.toDisplayString()))
 
 
 
-        scheme = req.url().scheme()
 
-        if scheme in self._scheme_handlers:
+class TestFormWithRedirect(TestCase):
 
-            result = self._scheme_handlers[scheme](req, op, current_url)
+    def setUp(self):
 
-            if result is not None:
+        # Create a form page
 
-                result.setParent(self)
+        self.form_page = make_form_page_with_redirect(to_address='to@email.com, another@email.com')
 
-                return result
 
 
+    def test_post_valid_form(self):
 
-        self.set_referer(req, current_url)
+        response = self.client.post('/contact-us/', {
 
-        return super().createRequest(op, req, outgoing_data)
+            'your_email': 'bob@example.com',
+
+            'your_message': 'hello world',
+
+            'your_choices': {'foo': '', 'bar': '', 'baz': ''}
+
+        })
+
+
+
+        # Check response
+
+        self.assertRedirects(response, '/')
+
+
+
+        # Check that one email was sent, but to two recipients
+
+        self.assertEqual(len(mail.outbox), 1)
+
+
+
+        self.assertEqual(mail.outbox[0].subject, "The subject")
+
+        self.assertIn("Your message: hello world", mail.outbox[0].body)
+
+        self.assertEqual(mail.outbox[0].from_email, 'from@email.com')
+
+        self.assertEqual(set(mail.outbox[0].to), {'to@email.com', 'another@email.com'})
+
+
+
+        # Check that form submission was saved correctly
+
+        form_page = Page.objects.get(url_path='/home/contact-us/')
+
+        self.assertTrue(FormSubmission.objects.filter(page=form_page, form_data__contains='hello world').exists())
+
+
+
+
+
+class TestFormPageWithCustomFormBuilder(TestCase, WagtailTestUtils):
+
+
+
+    def setUp(self):
+
+
+
+        home_page = Page.objects.get(url_path='/home/')
+
+        form_page = home_page.add_child(
+
+            instance=FormPageWithCustomFormBuilder(
+
+                title='Support Request',
+
+                slug='support-request',
+
+                to_address='it@jenkins.com',
+
+                from_address='support@jenkins.com',
+
+                subject='Support Request Submitted',
+
+            )
+
+        )
+
+        ExtendedFormField.objects.create(
+
+            page=form_page,
+
+            sort_order=1,
+
+            label='Name',
+
+            field_type='singleline',  # singleline field will be max_length 120
+
+            required=True,
+
+        )
+
+        ExtendedFormField.objects.create(
+
+            page=form_page,
+
+            sort_order=1,
+
+            label='Device IP Address',
+
+            field_type='ipaddress',
+
+            required=True,
+
+        )
+
+
+
+    def test_get_form(self):
+
+        response = self.client.get('/support-request/')
+
+
+
+        # Check response
+
+        self.assertTemplateUsed(response, 'tests/form_page_with_custom_form_builder.html')
+
+        self.assertTemplateNotUsed(response, 'tests/form_page_with_custom_form_builder_landing.html')
+
+        self.assertContains(response, '<title>Support Request</title>', html=True)
+
+        # check that max_length attribute has been passed into form
+
+        self.assertContains(response, '<input type="text" name="name" required maxlength="120" id="id_name" />', html=True)
+
+        # check ip address field has rendered
+
+        self.assertContains(response, '<input type="text" name="device_ip_address" required id="id_device_ip_address" />', html=True)
+
+
+
+    def test_post_invalid_form(self):
+
+        response = self.client.post('/support-request/', {
+
+            'name': 'very long name longer than 120 characters' * 3,  # invalid
+
+            'device_ip_address': '192.0.2.30',  # valid
+
+        })
+
+        # Check response with invalid character count
+
+        self.assertContains(response, 'Ensure this value has at most 120 characters (it has 123)')
+
+        self.assertTemplateUsed(response, 'tests/form_page_with_custom_form_builder.html')
+
+        self.assertTemplateNotUsed(response, 'tests/form_page_with_custom_form_builder_landing.html')
+
+
+
+        response = self.client.post('/support-request/', {
+
+            'name': 'Ron Johnson',  # valid
+
+            'device_ip_address': '3300.192.0.2.30',  # invalid
+
+        })
+
+        # Check response with invalid character count
+
+        self.assertContains(response, 'Enter a valid IPv4 or IPv6 address.')
+
+        self.assertTemplateUsed(response, 'tests/form_page_with_custom_form_builder.html')
+
+        self.assertTemplateNotUsed(response, 'tests/form_page_with_custom_form_builder_landing.html')
+
+
+
+    def test_post_valid_form(self):
+
+        response = self.client.post('/support-request/', {
+
+            'name': 'Ron Johnson',
+
+            'device_ip_address': '192.0.2.30',
+
+        })
+
+
+
+        # Check response
+
+        self.assertContains(response, 'Thank you for submitting a Support Request.')
+
+        self.assertContains(response, 'Ron Johnson')
+
+        self.assertContains(response, '192.0.2.30')
+
+        self.assertTemplateNotUsed(response, 'tests/form_page_with_custom_form_builder.html')
+
+        self.assertTemplateUsed(response, 'tests/form_page_with_custom_form_builder_landing.html')
+
+
+
+
+
+class TestCleanedDataEmails(TestCase):
+
+    def setUp(self):
+
+        # Create a form page
+
+        self.form_page = make_types_test_form_page()
+
+
+
+    def test_empty_field_presence(self):
+
+        self.client.post('/contact-us/', {})
+
+
+
+        # Check the email
+
+        self.assertEqual(len(mail.outbox), 1)
+
+        self.assertIn("Single line text: ", mail.outbox[0].body)
+
+        self.assertIn("Multiline: ", mail.outbox[0].body)
+
+        self.assertIn("Email: ", mail.outbox[0].body)
+
+        self.assertIn("Number: ", mail.outbox[0].body)
+
+        self.assertIn("URL: ", mail.outbox[0].body)
+
+        self.assertIn("Checkbox: ", mail.outbox[0].body)
+
+        self.assertIn("Checkboxes: ", mail.outbox[0].body)
+
+        self.assertIn("Drop down: ", mail.outbox[0].body)
+
+        self.assertIn("Multiple select: ", mail.outbox[0].body)
+
+        self.assertIn("Radio buttons: ", mail.outbox[0].body)
+
+        self.assertIn("Date: ", mail.outbox[0].body)
+
+        self.assertIn("Datetime: ", mail.outbox[0].body)
+
+
+
+    def test_email_field_order(self):
+
+        self.client.post('/contact-us/', {})
+
+
+
+        line_beginnings = [
+
+            "Single line text: ",
+
+            "Multiline: ",
+
+            "Email: ",
+
+            "Number: ",
+
+            "URL: ",
+
+            "Checkbox: ",
+
+            "Checkboxes: ",
+
+            "Drop down: ",
+
+            "Multiple select: ",
+
+            "Radio buttons: ",
+
+            "Date: ",
+
+            "Datetime: ",
+
+        ]
+
+
+
+        # Check the email
+
+        self.assertEqual(len(mail.outbox), 1)
+
+        email_lines = mail.outbox[0].body.split('\n')
+
+
+
+        for beginning in line_beginnings:
+
+            message_line = email_lines.pop(0)
+
+            self.assertTrue(message_line.startswith(beginning))
+
+
+
+    @override_settings(SHORT_DATE_FORMAT='m/d/Y')
+
+    def test_date_normalization(self):
+
+        self.client.post('/contact-us/', {
+
+            'date': '12/31/17',
+
+        })
+
+
+
+        # Check the email
+
+        self.assertEqual(len(mail.outbox), 1)
+
+        self.assertIn("Date: 12/31/2017", mail.outbox[0].body)
+
+
+
+        self.client.post('/contact-us/', {
+
+            'date': '12/31/1917',
+
+        })
+
+
+
+        # Check the email
+
+        self.assertEqual(len(mail.outbox), 2)
+
+        self.assertIn("Date: 12/31/1917", mail.outbox[1].body)
+
+
+
+
+
+    @override_settings(SHORT_DATETIME_FORMAT='m/d/Y P')
+
+    def test_datetime_normalization(self):
+
+        self.client.post('/contact-us/', {
+
+            'datetime': '12/31/17 4:00:00',
+
+        })
+
+
+
+        self.assertEqual(len(mail.outbox), 1)
+
+        self.assertIn("Datetime: 12/31/2017 4 a.m.", mail.outbox[0].body)
+
+
+
+        self.client.post('/contact-us/', {
+
+            'datetime': '12/31/1917 21:19',
+
+        })
+
+
+
+        self.assertEqual(len(mail.outbox), 2)
+
+        self.assertIn("Datetime: 12/31/1917 9:19 p.m.", mail.outbox[1].body)
+
+
+
+        self.client.post('/contact-us/', {
+
+            'datetime': '1910-12-21 21:19:12',
+
+        })
+
+
+
+        self.assertEqual(len(mail.outbox), 3)
+
+        self.assertIn("Datetime: 12/21/1910 9:19 p.m.", mail.outbox[2].body)
+
+
+
+
+
+
+
+class TestIssue798(TestCase):
+
+    fixtures = ['test.json']
+
+
+
+    def setUp(self):
+
+        self.assertTrue(self.client.login(username='siteeditor', password='password'))
+
+        self.form_page = Page.objects.get(url_path='/home/contact-us/').specific
+
+
+
+        # Add a number field to the page
+
+        FormField.objects.create(
+
+            page=self.form_page,
+
+            label="Your favourite number",
+
+            field_type='number',
+
+        )
+
+
+
+    def test_post(self):
+
+        response = self.client.post('/contact-us/', {
+
+            'your_email': 'bob@example.com',
+
+            'your_message': 'hello world',
+
+            'your_choices': {'foo': '', 'bar': '', 'baz': ''},
+
+            'your_favourite_number': '7.3',
+
+        })
+
+
+
+        # Check response
+
+        self.assertTemplateUsed(response, 'tests/form_page_landing.html')
+
+
+
+        # Check that form submission was saved correctly
+
+        self.assertTrue(FormSubmission.objects.filter(page=self.form_page, form_data__contains='hello world').exists())
+
+        self.assertTrue(FormSubmission.objects.filter(page=self.form_page, form_data__contains='7.3').exists())
+
+
+
+
+
+class TestNonHtmlExtension(TestCase):
+
+    fixtures = ['test.json']
+
+
+
+    def test_non_html_extension(self):
+
+        form_page = JadeFormPage(title="test")
+
+        self.assertEqual(form_page.landing_page_template, "tests/form_page_landing.jade")
+
+
+
+
+
+class TestLegacyFormFieldCleanNameChecks(TestCase):
+
+    fixtures = ['test.json']
+
+
+
+    def setUp(self):
+
+        self.assertTrue(self.client.login(username='siteeditor', password='password'))
+
+        self.form_page = Page.objects.get(url_path='/home/contact-us-one-more-time/').specific
+
+
+
+
+
+    def test_form_field_clean_name_update_on_checks(self):
+
+
+
+        fields_before_checks = [
+
+            (field.label, field.clean_name,)
+
+            for field in FormFieldWithCustomSubmission.objects.all()
+
+        ]
+
+
+
+        self.assertEqual(fields_before_checks, [
+
+            ('Your email', ''),
+
+            ('Your message', ''),
+
+            ('Your choices', ''),
+
+        ])
+
+
+
+        # running checks should show an info message AND update blank clean_name values
+
+
+
+        messages = FormFieldWithCustomSubmission.check()
+
+
+
+        self.assertEqual(
+
+            messages,
+
+            [Info('Added `clean_name` on 3 form field(s)', obj=FormFieldWithCustomSubmission)]
+
+        )
+
+
+
+
+
+        fields_after_checks = [
+
+            (field.label, field.clean_name,)
+
+            for field in FormFieldWithCustomSubmission.objects.all()
+
+        ]
+
+
+
+        self.assertEqual(fields_after_checks, [
+
+            ('Your email', 'your-email'),  # kebab case, legacy format
+
+            ('Your message', 'your-message'),
+
+            ('Your choices', 'your-choices'),
+
+        ])
+
+
+
+        # running checks again should return no messages as fields no longer need changing
+
+        self.assertEqual(FormFieldWithCustomSubmission.check(), [])
+
+
+
+        # creating a new field should use the non-legacy clean_name format
+
+
+
+        field = FormFieldWithCustomSubmission.objects.create(
+
+            page=self.form_page,
+
+            label="Your FAVOURITE #number",
+
+            field_type='number',
+
+        )
+
+
+
+        self.assertEqual(field.clean_name, 'your_favourite_number')

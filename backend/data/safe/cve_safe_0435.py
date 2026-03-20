@@ -1,225 +1,247 @@
 # Source: CVEFixes dataset
-# Safety: vulnerable
+# Safety: safe
 # Category: safe
+
+# -*- coding: utf-8 -*-
+
+#
+
+# This file is part of Radicale Server - Calendar Server
+
+# Copyright © 2014 Jean-Marc Martins
+
+# Copyright © 2014-2015 Guillaume Ayoub
+
+#
+
+# This library is free software: you can redistribute it and/or modify
+
+# it under the terms of the GNU General Public License as published by
+
+# the Free Software Foundation, either version 3 of the License, or
+
+# (at your option) any later version.
+
+#
+
+# This library is distributed in the hope that it will be useful,
+
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+
+# GNU General Public License for more details.
+
+#
+
+# You should have received a copy of the GNU General Public License
+
+# along with Radicale.  If not, see <http://www.gnu.org/licenses/>.
+
+
+
+"""
+
+Multi files per calendar filesystem storage backend.
+
+
+
+"""
+
+
+
+import os
+
+import shutil
+
+import time
 
 import sys
 
 
 
-import ldap  # pylint: disable=import-error
+from . import filesystem
 
-from flask import current_app, jsonify, request
+from .. import ical
 
-from flask_cors import cross_origin
+from .. import log
 
+from .. import pathutils
 
 
-from alerta.auth.utils import create_token, get_customers
 
-from alerta.exceptions import ApiError
 
-from alerta.models.permission import Permission
 
-from alerta.models.user import User
+class Collection(filesystem.Collection):
 
-from alerta.utils.audit import auth_audit_trail
+    """Collection stored in several files per calendar."""
 
+    def _create_dirs(self):
 
+        if not os.path.exists(self._filesystem_path):
 
-from . import auth
+            os.makedirs(self._filesystem_path)
 
 
 
+    @property
 
+    def headers(self):
 
-@auth.route('/auth/login', methods=['OPTIONS', 'POST'])
+        return (
 
-@cross_origin(supports_credentials=True)
+            ical.Header("PRODID:-//Radicale//NONSGML Radicale Server//EN"),
 
-def login():
+            ical.Header("VERSION:%s" % self.version))
 
-    # Allow LDAP server to use a self signed certificate
 
-    if current_app.config['LDAP_ALLOW_SELF_SIGNED_CERT']:
 
-        ldap.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_ALLOW)
+    def write(self):
 
+        self._create_dirs()
 
+        for component in self.components:
 
-    # Retrieve required fields from client request
+            text = ical.serialize(
 
-    try:
+                self.tag, self.headers, [component] + self.timezones)
 
-        login = request.json.get('username', None) or request.json['email']
+            name = (
 
-        password = request.json['password']
+                component.name if sys.version_info[0] >= 3 else
 
-    except KeyError:
+                component.name.encode(filesystem.FILESYSTEM_ENCODING))
 
-        raise ApiError("must supply 'username' and 'password'", 401)
+            if not pathutils.is_safe_filesystem_path_component(name):
 
+                log.LOGGER.debug(
 
+                    "Can't tranlate name safely to filesystem, "
 
-    try:
+                    "skipping component: %s", name)
 
-        if '\\' in login:
+                continue
 
-            domain, username = login.split('\\')
+            filesystem_path = os.path.join(self._filesystem_path, name)
 
-            email = ''
+            with filesystem.open(filesystem_path, "w") as fd:
 
-            email_verified = False
+                fd.write(text)
 
-        else:
 
-            username, domain = login.split('@')
 
-            email = login
+    def delete(self):
 
-            email_verified = True
+        shutil.rmtree(self._filesystem_path)
 
-    except ValueError:
+        os.remove(self._props_path)
 
-        raise ApiError('expected username with domain', 401)
 
 
+    def remove(self, name):
 
-    # Validate LDAP domain
+        if not pathutils.is_safe_filesystem_path_component(name):
 
-    if domain not in current_app.config['LDAP_DOMAINS']:
+            log.LOGGER.debug(
 
-        raise ApiError('unauthorized domain', 403)
+                "Can't tranlate name safely to filesystem, "
 
+                "skipping component: %s", name)
 
+            return
 
-    userdn = current_app.config['LDAP_DOMAINS'][domain] % username
+        filesystem_path = os.path.join(self._filesystem_path, name)
 
+        if os.path.exists(filesystem_path):
 
+            os.remove(filesystem_path)
 
-    # Attempt LDAP AUTH
 
-    try:
 
-        trace_level = 2 if current_app.debug else 0
+    @property
 
-        ldap_connection = ldap.initialize(current_app.config['LDAP_URL'], trace_level=trace_level)
+    def text(self):
 
-        ldap_connection.simple_bind_s(userdn, password)
+        components = (
 
-    except ldap.INVALID_CREDENTIALS:
+            ical.Timezone, ical.Event, ical.Todo, ical.Journal, ical.Card)
 
-        raise ApiError('invalid username or password', 401)
-
-    except Exception as e:
-
-        raise ApiError(str(e), 500)
-
-
-
-    # Get email address from LDAP
-
-    if not email_verified:
+        items = set()
 
         try:
 
-            ldap_result = ldap_connection.search_s(userdn, ldap.SCOPE_SUBTREE, '(objectClass=*)', ['mail'])
+            filenames = os.listdir(self._filesystem_path)
 
-            email = ldap_result[0][1]['mail'][0].decode(sys.stdout.encoding)
+        except (OSError, IOError) as e:
 
-            email_verified = True
+            log.LOGGER.info('Error while reading collection %r: %r'
 
-        except Exception:
+                            % (self._filesystem_path, e))
 
-            email = '{}@{}'.format(username, domain)
-
-
-
-    # Create user if not yet there
-
-    user = User.find_by_username(username=login)
-
-    if not user:
-
-        user = User(name=username, login=login, password='', email=email,
-
-                    roles=[], text='LDAP user', email_verified=email_verified)
-
-        try:
-
-            user = user.create()
-
-        except Exception as e:
-
-            ApiError(str(e), 500)
+            return ""
 
 
 
-    # Assign customers & update last login time
+        for filename in filenames:
 
-    groups = list()
+            path = os.path.join(self._filesystem_path, filename)
 
-    try:
+            try:
 
-        groups_filters = current_app.config.get('LDAP_DOMAINS_GROUP', {})
+                with filesystem.open(path) as fd:
 
-        base_dns = current_app.config.get('LDAP_DOMAINS_BASEDN', {})
+                    items.update(self._parse(fd.read(), components))
 
-        if domain in groups_filters and domain in base_dns:
+            except (OSError, IOError) as e:
 
-            resultID = ldap_connection.search(
+                log.LOGGER.warning('Error while reading item %r: %r'
 
-                base_dns[domain],
-
-                ldap.SCOPE_SUBTREE,
-
-                groups_filters[domain].format(username=username, email=email, userdn=userdn),
-
-                ['cn']
-
-            )
-
-            resultTypes, results = ldap_connection.result(resultID)
-
-            for _dn, attributes in results:
-
-                groups.append(attributes['cn'][0].decode('utf-8'))
-
-    except ldap.LDAPError as e:
-
-        raise ApiError(str(e), 500)
+                                   % (path, e))
 
 
 
-    # Check user is active
+        return ical.serialize(
 
-    if user.status != 'active':
-
-        raise ApiError('User {} not active'.format(login), 403)
-
-    user.update_last_login()
+            self.tag, self.headers, sorted(items, key=lambda x: x.name))
 
 
 
-    scopes = Permission.lookup(login=login, roles=user.roles + groups)
+    @classmethod
 
-    customers = get_customers(login=login, groups=[user.domain] + groups)
+    def is_node(cls, path):
+
+        filesystem_path = pathutils.path_to_filesystem(path,
+
+                                                       filesystem.FOLDER)
+
+        return (os.path.isdir(filesystem_path) and
+
+                not os.path.exists(filesystem_path + ".props"))
 
 
 
-    auth_audit_trail.send(current_app._get_current_object(), event='basic-ldap-login', message='user login via LDAP',
+    @classmethod
 
-                          user=login, customers=customers, scopes=scopes, roles=user.roles, groups=groups,
+    def is_leaf(cls, path):
 
-                          resource_id=user.id, type='user', request=request)
+        filesystem_path = pathutils.path_to_filesystem(path,
+
+                                                       filesystem.FOLDER)
+
+        return (os.path.isdir(filesystem_path) and
+
+                os.path.exists(path + ".props"))
 
 
 
-    # Generate token
+    @property
 
-    token = create_token(user_id=user.id, name=user.name, login=user.email, provider='ldap',
+    def last_modified(self):
 
-                         customers=customers, scopes=scopes, roles=user.roles, groups=groups,
+        last = max([
 
-                         email=user.email, email_verified=user.email_verified)
+            os.path.getmtime(os.path.join(self._filesystem_path, filename))
 
-    return jsonify(token=token.tokenize)
+            for filename in os.listdir(self._filesystem_path)] or [0])
+
+        return time.strftime("%a, %d %b %Y %H:%M:%S +0000", time.gmtime(last))

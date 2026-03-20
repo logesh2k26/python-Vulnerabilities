@@ -2,444 +2,432 @@
 # Safety: safe
 # Category: safe
 
-# confire.conf
-
-# A simple configuration module for Confire
-
-#
-
-# Author:   Benjamin Bengfort <ben@cobrain.com>
-
-# Created:  Tue May 20 22:19:11 2014 -0400
-
-#
-
-# Copyright (C) 2013 Cobrain Company
-
-# For license information, see LICENSE.txt
-
-#
-
-# ID: conf.py [] ben@cobrain.com $
-
-
-
-"""
-
-Confire class for specifying Confire specific optional items via a YAML
-
-configuration file format. The main configuration class provides utilities
-
-for loading the configuration from disk and iterating across all the
-
-settings. Subclasses of the Configuration specify defaults that can be
-
-updated via the configuration files.
-
-
-
-General usage:
-
-
-
-    from confire.conf import settings
-
-    mysetting = settings.get('mysetting', default)
-
-
-
-You can also get settings via a dictionary like access:
-
-
-
-    mysetting = settings['mysetting']
-
-
-
-However, this will raise an exception if the setting is not found.
-
-
-
-Note: Keys are CASE insensitive
-
-
-
-Note: Settings can be modified directly by settings.mysetting = newsetting
-
-however, this is not recommended, and settings should be fetched via the
-
-dictionary-like access.
-
-"""
-
-
-
-##########################################################################
-
-## Imports
-
-##########################################################################
+from __future__ import absolute_import, division, unicode_literals
 
 
 
 import os
 
-import yaml
+import json
 
-import warnings
 
 
+import pytest
 
-from six import with_metaclass
 
 
+from .support import get_data_files
 
-from .paths import Path
 
-from .descriptors import SettingsMeta
 
-from .exceptions import ImproperlyConfigured, ConfigurationMissing
+from html5lib import constants
 
+from html5lib.filters.lint import Filter as Lint
 
+from html5lib.serializer import HTMLSerializer, serialize
 
-##########################################################################
+from html5lib.treewalkers._base import TreeWalker
 
-## Environment helper function
 
-##########################################################################
 
+optionals_loaded = []
 
 
-def environ_setting(name, default=None, required=True):
 
-    """
+try:
 
-    Fetch setting from the environment. The bahavior of the setting if it
+    from lxml import etree
 
-    is not in environment is as follows:
+    optionals_loaded.append("lxml")
 
+except ImportError:
 
+    pass
 
-        1. If it is required and the default is None, raise Exception
 
-        2. If it is requried and a default exists, return default
 
-        3. If it is not required and default is None, return  None
+default_namespace = constants.namespaces["html"]
 
-        4. If it is not required and default exists, return default
 
-    """
 
-    if name not in os.environ and default is None:
 
-        message = "The {0} ENVVAR is not set.".format(name)
 
-        if required:
+class JsonWalker(TreeWalker):
 
-            raise ImproperlyConfigured(message)
+    def __iter__(self):
 
-        else:
+        for token in self.tree:
 
-            warnings.warn(ConfigurationMissing(message))
+            type = token[0]
 
+            if type == "StartTag":
 
+                if len(token) == 4:
 
-    return os.environ.get(name, default)
+                    namespace, name, attrib = token[1:4]
 
+                else:
 
+                    namespace = default_namespace
 
-##########################################################################
+                    name, attrib = token[1:3]
 
-## Paths helper function
+                yield self.startTag(namespace, name, self._convertAttrib(attrib))
 
-##########################################################################
+            elif type == "EndTag":
 
+                if len(token) == 3:
 
+                    namespace, name = token[1:3]
 
-def path_setting(**kwargs):
+                else:
 
-    """
+                    namespace = default_namespace
 
-    Helper function to enable the configuration of paths on the local file
+                    name = token[1]
 
-    system. By default, this function manages strings in the YAML file:
+                yield self.endTag(namespace, name)
 
+            elif type == "EmptyTag":
 
+                if len(token) == 4:
 
-        1. Expand user (e.g. ~)
+                    namespace, name, attrib = token[1:]
 
-        2. Expand vars (e.g. $HOME)
+                else:
 
-        3. Normalize the path (e.g. .. and . resolution)
+                    namespace = default_namespace
 
-        4. If absolute, return the absolute path
+                    name, attrib = token[1:]
 
+                for token in self.emptyTag(namespace, name, self._convertAttrib(attrib)):
 
+                    yield token
 
-    If mkdirs is True, then this function will create the directory if it
+            elif type == "Comment":
 
-    does not exist. If raises is True, then it will raise an exception if the
+                yield self.comment(token[1])
 
-    directory does not exist.
+            elif type in ("Characters", "SpaceCharacters"):
 
-    """
+                for token in self.text(token[1]):
 
-    return Path(**kwargs)
+                    yield token
 
+            elif type == "Doctype":
 
+                if len(token) == 4:
 
-##########################################################################
+                    yield self.doctype(token[1], token[2], token[3])
 
-## Configuration Base Class
+                elif len(token) == 3:
 
-##########################################################################
+                    yield self.doctype(token[1], token[2])
 
+                else:
 
-
-class Configuration(with_metaclass(SettingsMeta, object)):
-
-    """
-
-    Base configuration class specifies how configurations should be
-
-    handled and provides helper methods for iterating through options and
-
-    configuring the base class.
-
-
-
-    Subclasses should provide defaults for the various configurations as
-
-    directly set class level properties. Note, however, that ANY directive
-
-    set in a configuration file (whether or not it has a default) will be
-
-    added to the configuration.
-
-
-
-    Example:
-
-
-
-        class MyConfig(Configuration):
-
-
-
-            mysetting = True
-
-            logpath   = "/var/log/myapp.log"
-
-            appname   = "MyApp"
-
-
-
-    The configuration is then loaded via the classmethod `load`:
-
-
-
-        settings = MyConfig.load()
-
-
-
-    Access to properties is done two ways:
-
-
-
-        settings['mysetting']
-
-        settings.get('mysetting', True)
-
-
-
-    Note: None settings are not allowed!
-
-    """
-
-
-
-    CONF_PATHS = [
-
-        '/etc/confire.yaml',                    # The global configuration
-
-        os.path.expanduser('~/.confire.yaml'),  # User specific configuration
-
-        os.path.abspath('conf/confire.yaml')    # Local directory configuration
-
-    ]
-
-
-
-    @classmethod
-
-    def load(klass):
-
-        """
-
-        Insantiates the configuration by attempting to load the
-
-        configuration from YAML files specified by the CONF_PATH module
-
-        variable. This should be the main entry point for configuration.
-
-        """
-
-        config = klass()
-
-        for path in klass.CONF_PATHS:
-
-            if os.path.exists(path):
-
-                with open(path, 'r') as conf:
-
-                    config.configure(yaml.safe_load(conf))
-
-        return config
-
-
-
-    def configure(self, conf={}):
-
-        """
-
-        Allows updating of the configuration via a dictionary of
-
-        configuration terms or a configuration object. Generally speaking,
-
-        this method is utilized to configure the object from a JSON or
-
-        YAML parsing.
-
-        """
-
-        if not conf: return
-
-        if isinstance(conf, Configuration):
-
-            conf = dict(conf.options())
-
-        for key, value in conf.items():
-
-            opt = self.get(key, None)
-
-            if isinstance(opt, Configuration):
-
-                opt.configure(value)
+                    yield self.doctype(token[1])
 
             else:
 
-                setattr(self, key, value)
+                raise ValueError("Unknown token type: " + type)
 
 
 
-    def options(self):
+    def _convertAttrib(self, attribs):
 
-        """
+        """html5lib tree-walkers use a dict of (namespace, name): value for
 
-        Returns an iterable of sorted option names in order to loop
+        attributes, but JSON cannot represent this. Convert from the format
 
-        through all the configuration directives specified in the class.
+        in the serializer tests (a list of dicts with "namespace", "name",
 
-        """
+        and "value" as keys) to html5lib's tree-walker format."""
 
-        keys = self.__class__.__dict__.copy()
+        attrs = {}
 
-        keys.update(self.__dict__)
+        for attrib in attribs:
 
-        keys = sorted(keys.keys())
+            name = (attrib["namespace"], attrib["name"])
 
+            assert(name not in attrs)
 
+            attrs[name] = attrib["value"]
 
-        for opt in keys:
-
-            val = self.get(opt)
-
-            if val is not None:
-
-                yield opt, val
+        return attrs
 
 
 
-    def get(self, key, default=None):
 
-        """
 
-        Fetches a key from the configuration without raising a KeyError
+def serialize_html(input, options):
 
-        exception if the key doesn't exist in the config or
+    options = dict([(str(k), v) for k, v in options.items()])
 
-        ImproperlyConfigured if the key doesn't exist, instead it returns the
+    stream = Lint(JsonWalker(input), False)
 
-        default (None).
+    serializer = HTMLSerializer(alphabetical_attributes=True, **options)
 
-        """
-
-        try:
-
-            return self[key]
-
-        except (KeyError, ImproperlyConfigured):
-
-            return default
+    return serializer.render(stream, options.get("encoding", None))
 
 
 
-    def __getitem__(self, key):
 
-        """
 
-        Main configuration access method. Performs a case insensitive
+def runSerializerTest(input, expected, options):
 
-        lookup of the key on the class, filtering methods and pseudo
-
-        private properties. Raises KeyError if not found. Note, this makes
-
-        all properties that are uppercase invisible to the options.
-
-        """
-
-        key = key.lower()
-
-        if hasattr(self, key):
-
-            attr = getattr(self, key)
-
-            if not callable(attr) and not key.startswith('_'):
-
-                return attr
-
-        raise KeyError(
-
-            "{} has no configuration '{}'".format(
-
-            self.__class__.__name__, key
-
-        ))
+    encoding = options.get("encoding", None)
 
 
 
-    def __repr__(self):
+    if encoding:
 
-        return str(self)
+        expected = list(map(lambda x: x.encode(encoding), expected))
 
 
 
-    def __str__(self):
+    result = serialize_html(input, options)
 
-        s = ""
+    if len(expected) == 1:
 
-        for opt, val in self.options():
+        assert expected[0] == result, "Expected:\n%s\nActual:\n%s\nOptions:\n%s" % (expected[0], result, str(options))
 
-            r = repr(val)
+    elif result not in expected:
 
-            r = " ".join(r.split())
+        assert False, "Expected: %s, Received: %s" % (expected, result)
 
-            wlen = 76-max(len(opt),10)
 
-            if len(r) > wlen:
 
-                r = r[:wlen-3]+"..."
 
-            s += "%-10s = %s\n" % (opt, r)
 
-        return s[:-1]
+def throwsWithLatin1(input):
+
+    with pytest.raises(UnicodeEncodeError):
+
+        serialize_html(input, {"encoding": "iso-8859-1"})
+
+
+
+
+
+def testDoctypeName():
+
+    throwsWithLatin1([["Doctype", "\u0101"]])
+
+
+
+
+
+def testDoctypePublicId():
+
+    throwsWithLatin1([["Doctype", "potato", "\u0101"]])
+
+
+
+
+
+def testDoctypeSystemId():
+
+    throwsWithLatin1([["Doctype", "potato", "potato", "\u0101"]])
+
+
+
+
+
+def testCdataCharacters():
+
+    runSerializerTest([["StartTag", "http://www.w3.org/1999/xhtml", "style", {}], ["Characters", "\u0101"]],
+
+                      ["<style>&amacr;"], {"encoding": "iso-8859-1"})
+
+
+
+
+
+def testCharacters():
+
+    runSerializerTest([["Characters", "\u0101"]],
+
+                      ["&amacr;"], {"encoding": "iso-8859-1"})
+
+
+
+
+
+def testStartTagName():
+
+    throwsWithLatin1([["StartTag", "http://www.w3.org/1999/xhtml", "\u0101", []]])
+
+
+
+
+
+def testAttributeName():
+
+    throwsWithLatin1([["StartTag", "http://www.w3.org/1999/xhtml", "span", [{"namespace": None, "name": "\u0101", "value": "potato"}]]])
+
+
+
+
+
+def testAttributeValue():
+
+    runSerializerTest([["StartTag", "http://www.w3.org/1999/xhtml", "span",
+
+                        [{"namespace": None, "name": "potato", "value": "\u0101"}]]],
+
+                      ["<span potato=&amacr;>"], {"encoding": "iso-8859-1"})
+
+
+
+
+
+def testEndTagName():
+
+    throwsWithLatin1([["EndTag", "http://www.w3.org/1999/xhtml", "\u0101"]])
+
+
+
+
+
+def testComment():
+
+    throwsWithLatin1([["Comment", "\u0101"]])
+
+
+
+
+
+@pytest.mark.parametrize("c", list("\t\n\u000C\x20\r\"'=<>`"))
+
+def testSpecQuoteAttribute(c):
+
+    input_ = [["StartTag", "http://www.w3.org/1999/xhtml", "span",
+
+               [{"namespace": None, "name": "foo", "value": c}]]]
+
+    if c == '"':
+
+        output_ = ["<span foo='%s'>" % c]
+
+    else:
+
+        output_ = ['<span foo="%s">' % c]
+
+    options_ = {"quote_attr_values": "spec"}
+
+    runSerializerTest(input_, output_, options_)
+
+
+
+
+
+@pytest.mark.parametrize("c", list("\t\n\u000C\x20\r\"'=<>`"
+
+                                   "\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n"
+
+                                   "\x0b\x0c\r\x0e\x0f\x10\x11\x12\x13\x14\x15"
+
+                                   "\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f"
+
+                                   "\x20\x2f\x60\xa0\u1680\u180e\u180f\u2000"
+
+                                   "\u2001\u2002\u2003\u2004\u2005\u2006\u2007"
+
+                                   "\u2008\u2009\u200a\u2028\u2029\u202f\u205f"
+
+                                   "\u3000"))
+
+def testLegacyQuoteAttribute(c):
+
+    input_ = [["StartTag", "http://www.w3.org/1999/xhtml", "span",
+
+               [{"namespace": None, "name": "foo", "value": c}]]]
+
+    if c == '"':
+
+        output_ = ["<span foo='%s'>" % c]
+
+    else:
+
+        output_ = ['<span foo="%s">' % c]
+
+    options_ = {"quote_attr_values": "legacy"}
+
+    runSerializerTest(input_, output_, options_)
+
+
+
+
+
+@pytest.fixture
+
+def lxml_parser():
+
+    return etree.XMLParser(resolve_entities=False)
+
+
+
+
+
+@pytest.mark.skipif("lxml" not in optionals_loaded, reason="lxml not importable")
+
+def testEntityReplacement(lxml_parser):
+
+    doc = '<!DOCTYPE html SYSTEM "about:legacy-compat"><html>&beta;</html>'
+
+    tree = etree.fromstring(doc, parser=lxml_parser).getroottree()
+
+    result = serialize(tree, tree="lxml", omit_optional_tags=False)
+
+    assert result == '<!DOCTYPE html SYSTEM "about:legacy-compat"><html>\u03B2</html>'
+
+
+
+
+
+@pytest.mark.skipif("lxml" not in optionals_loaded, reason="lxml not importable")
+
+def testEntityXML(lxml_parser):
+
+    doc = '<!DOCTYPE html SYSTEM "about:legacy-compat"><html>&gt;</html>'
+
+    tree = etree.fromstring(doc, parser=lxml_parser).getroottree()
+
+    result = serialize(tree, tree="lxml", omit_optional_tags=False)
+
+    assert result == '<!DOCTYPE html SYSTEM "about:legacy-compat"><html>&gt;</html>'
+
+
+
+
+
+@pytest.mark.skipif("lxml" not in optionals_loaded, reason="lxml not importable")
+
+def testEntityNoResolve(lxml_parser):
+
+    doc = '<!DOCTYPE html SYSTEM "about:legacy-compat"><html>&beta;</html>'
+
+    tree = etree.fromstring(doc, parser=lxml_parser).getroottree()
+
+    result = serialize(tree, tree="lxml", omit_optional_tags=False,
+
+                                  resolve_entities=False)
+
+    assert result == '<!DOCTYPE html SYSTEM "about:legacy-compat"><html>&beta;</html>'
+
+
+
+
+
+def test_serializer():
+
+    for filename in get_data_files('serializer-testdata', '*.test', os.path.dirname(__file__)):
+
+        with open(filename) as fp:
+
+            tests = json.load(fp)
+
+            for index, test in enumerate(tests['tests']):
+
+                yield runSerializerTest, test["input"], test["expected"], test.get("options", {})

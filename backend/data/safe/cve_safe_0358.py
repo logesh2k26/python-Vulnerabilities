@@ -4,2066 +4,6668 @@
 
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
+# -*- coding: utf-8 -*-
 
 
-# Copyright 2012 OpenStack LLC
 
-#
+# Copyright 2010-2011 OpenStack, LLC
 
-# Licensed under the Apache License, Version 2.0 (the "License"); you may
-
-# not use this file except in compliance with the License. You may obtain
-
-# a copy of the License at
+# All Rights Reserved.
 
 #
 
-#      http://www.apache.org/licenses/LICENSE-2.0
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+
+#    not use this file except in compliance with the License. You may obtain
+
+#    a copy of the License at
 
 #
 
-# Unless required by applicable law or agreed to in writing, software
+#         http://www.apache.org/licenses/LICENSE-2.0
 
-# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#
 
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    Unless required by applicable law or agreed to in writing, software
 
-# License for the specific language governing permissions and limitations
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-# under the License.
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+
+#    License for the specific language governing permissions and limitations
+
+#    under the License.
 
 
 
-import uuid
+import datetime
 
-import routes
+import hashlib
+
+import httplib
 
 import json
 
+import StringIO
 
 
-from keystone import config
 
-from keystone import catalog
+import routes
 
-from keystone.common import cms
+from sqlalchemy import exc
 
-from keystone.common import logging
+import stubout
 
-from keystone.common import wsgi
+import webob
 
-from keystone import exception
 
-from keystone import identity
 
-from keystone.openstack.common import timeutils
+import glance.api.middleware.context as context_middleware
 
-from keystone import policy
+import glance.api.common
 
-from keystone import token
+from glance.api.v1 import images
 
+from glance.api.v1 import router
 
+import glance.common.config
 
+from glance.common import utils
 
+import glance.context
 
-LOG = logging.getLogger(__name__)
+from glance.db.sqlalchemy import api as db_api
 
+from glance.db.sqlalchemy import models as db_models
 
+from glance.openstack.common import cfg
 
+from glance.openstack.common import timeutils
 
+from glance.registry.api import v1 as rserver
 
-class V3Router(wsgi.ComposingRouter):
+import glance.store.filesystem
 
-    def crud_routes(self, mapper, controller, collection_key, key):
+from glance.tests.unit import base
 
-        collection_path = '/%(collection_key)s' % {
+from glance.tests import utils as test_utils
 
-            'collection_key': collection_key}
 
-        entity_path = '/%(collection_key)s/{%(key)s_id}' % {
 
-            'collection_key': collection_key,
 
-            'key': key}
 
+CONF = cfg.CONF
 
 
-        mapper.connect(
 
-            collection_path,
+_gen_uuid = utils.generate_uuid
 
-            controller=controller,
 
-            action='create_%s' % key,
 
-            conditions=dict(method=['POST']))
+UUID1 = _gen_uuid()
 
-        mapper.connect(
+UUID2 = _gen_uuid()
 
-            collection_path,
 
-            controller=controller,
 
-            action='list_%s' % collection_key,
 
-            conditions=dict(method=['GET']))
 
-        mapper.connect(
+class TestRegistryDb(test_utils.BaseTestCase):
 
-            entity_path,
 
-            controller=controller,
 
-            action='get_%s' % key,
+    def setUp(self):
 
-            conditions=dict(method=['GET']))
+        """Establish a clean test environment"""
 
-        mapper.connect(
+        super(TestRegistryDb, self).setUp()
 
-            entity_path,
+        self.stubs = stubout.StubOutForTesting()
 
-            controller=controller,
+        self.orig_engine = db_api._ENGINE
 
-            action='update_%s' % key,
 
-            conditions=dict(method=['PATCH']))
 
-        mapper.connect(
-
-            entity_path,
-
-            controller=controller,
-
-            action='delete_%s' % key,
-
-            conditions=dict(method=['DELETE']))
-
-
-
-    def __init__(self):
-
-        mapper = routes.Mapper()
-
-
-
-        apis = dict(
-
-            catalog_api=catalog.Manager(),
-
-            identity_api=identity.Manager(),
-
-            policy_api=policy.Manager(),
-
-            token_api=token.Manager())
-
-
-
-        # Catalog
-
-
-
-        self.crud_routes(
-
-            mapper,
-
-            catalog.ServiceControllerV3(**apis),
-
-            'services',
-
-            'service')
-
-
-
-        self.crud_routes(
-
-            mapper,
-
-            catalog.EndpointControllerV3(**apis),
-
-            'endpoints',
-
-            'endpoint')
-
-
-
-        # Identity
-
-
-
-        self.crud_routes(
-
-            mapper,
-
-            identity.DomainControllerV3(**apis),
-
-            'domains',
-
-            'domain')
-
-
-
-        project_controller = identity.ProjectControllerV3(**apis)
-
-        self.crud_routes(
-
-            mapper,
-
-            project_controller,
-
-            'projects',
-
-            'project')
-
-        mapper.connect(
-
-            '/users/{user_id}/projects',
-
-            controller=project_controller,
-
-            action='list_user_projects',
-
-            conditions=dict(method=['GET']))
-
-
-
-        self.crud_routes(
-
-            mapper,
-
-            identity.UserControllerV3(**apis),
-
-            'users',
-
-            'user')
-
-
-
-        self.crud_routes(
-
-            mapper,
-
-            identity.CredentialControllerV3(**apis),
-
-            'credentials',
-
-            'credential')
-
-
-
-        role_controller = identity.RoleControllerV3(**apis)
-
-        self.crud_routes(
-
-            mapper,
-
-            role_controller,
-
-            'roles',
-
-            'role')
-
-        mapper.connect(
-
-            '/projects/{project_id}/users/{user_id}/roles/{role_id}',
-
-            controller=role_controller,
-
-            action='create_grant',
-
-            conditions=dict(method=['PUT']))
-
-        mapper.connect(
-
-            '/projects/{project_id}/users/{user_id}/roles/{role_id}',
-
-            controller=role_controller,
-
-            action='check_grant',
-
-            conditions=dict(method=['HEAD']))
-
-        mapper.connect(
-
-            '/projects/{project_id}/users/{user_id}/roles',
-
-            controller=role_controller,
-
-            action='list_grants',
-
-            conditions=dict(method=['GET']))
-
-        mapper.connect(
-
-            '/projects/{project_id}/users/{user_id}/roles/{role_id}',
-
-            controller=role_controller,
-
-            action='revoke_grant',
-
-            conditions=dict(method=['DELETE']))
-
-        mapper.connect(
-
-            '/domains/{domain_id}/users/{user_id}/roles/{role_id}',
-
-            controller=role_controller,
-
-            action='create_grant',
-
-            conditions=dict(method=['PUT']))
-
-        mapper.connect(
-
-            '/domains/{domain_id}/users/{user_id}/roles/{role_id}',
-
-            controller=role_controller,
-
-            action='check_grant',
-
-            conditions=dict(method=['HEAD']))
-
-        mapper.connect(
-
-            '/domains/{domain_id}/users/{user_id}/roles',
-
-            controller=role_controller,
-
-            action='list_grants',
-
-            conditions=dict(method=['GET']))
-
-        mapper.connect(
-
-            '/domains/{domain_id}/users/{user_id}/roles/{role_id}',
-
-            controller=role_controller,
-
-            action='revoke_grant',
-
-            conditions=dict(method=['DELETE']))
-
-
-
-        # Policy
-
-
-
-        policy_controller = policy.PolicyControllerV3(**apis)
-
-        self.crud_routes(
-
-            mapper,
-
-            policy_controller,
-
-            'policies',
-
-            'policy')
-
-
-
-        # Token
-
-
+    def test_bad_sql_connection(self):
 
         """
 
-        # v2.0 LEGACY
+        Test that a bad sql_connection option supplied to the registry
 
-        mapper.connect('/tokens/{token_id}',
+        API controller results in a) an Exception being thrown and b)
 
-                       controller=auth_controller,
-
-                       action='validate_token',
-
-                       conditions=dict(method=['GET']))
-
-        mapper.connect('/tokens/{token_id}',
-
-                       controller=auth_controller,
-
-                       action='validate_token_head',
-
-                       conditions=dict(method=['HEAD']))
-
-        mapper.connect('/tokens/{token_id}',
-
-                       controller=auth_controller,
-
-                       action='delete_token',
-
-                       conditions=dict(method=['DELETE']))
-
-        mapper.connect('/tokens/{token_id}/endpoints',
-
-                       controller=auth_controller,
-
-                       action='endpoints',
-
-                       conditions=dict(method=['GET']))
+        a message being logged to the registry log file...
 
         """
 
+        self.config(verbose=True, debug=True, sql_connection='baddriver:///')
 
 
-        super(V3Router, self).__init__(mapper, [])
 
+        # We set this to None to trigger a reconfigure, otherwise
 
+        # other modules may have already correctly configured the DB
 
+        db_api._ENGINE = None
 
+        self.assertRaises((ImportError, exc.ArgumentError),
 
-class AdminRouter(wsgi.ComposingRouter):
+                          db_api.configure_db)
 
-    def __init__(self):
+        exc_raised = False
 
-        mapper = routes.Mapper()
+        self.log_written = False
 
 
 
-        version_controller = VersionController('admin')
+        def fake_log_error(msg):
 
-        mapper.connect('/',
+            if 'Error configuring registry database' in msg:
 
-                       controller=version_controller,
+                self.log_written = True
 
-                       action='get_version')
 
 
+        self.stubs.Set(db_api.LOG, 'error', fake_log_error)
 
-        # Token Operations
+        try:
 
-        auth_controller = TokenController()
+            api_obj = rserver.API(routes.Mapper())
 
-        mapper.connect('/tokens',
+        except exc.ArgumentError:
 
-                       controller=auth_controller,
+            exc_raised = True
 
-                       action='authenticate',
+        except ImportError:
 
-                       conditions=dict(method=['POST']))
+            exc_raised = True
 
-        mapper.connect('/tokens/revoked',
 
-                       controller=auth_controller,
 
-                       action='revocation_list',
+        self.assertTrue(exc_raised)
 
-                       conditions=dict(method=['GET']))
+        self.assertTrue(self.log_written)
 
-        mapper.connect('/tokens/{token_id}',
 
-                       controller=auth_controller,
 
-                       action='validate_token',
+    def tearDown(self):
 
-                       conditions=dict(method=['GET']))
+        """Clear the test environment"""
 
-        mapper.connect('/tokens/{token_id}',
+        super(TestRegistryDb, self).setUp()
 
-                       controller=auth_controller,
+        db_api._ENGINE = self.orig_engine
 
-                       action='validate_token_head',
+        self.stubs.UnsetAll()
 
-                       conditions=dict(method=['HEAD']))
 
-        mapper.connect('/tokens/{token_id}',
 
-                       controller=auth_controller,
 
-                       action='delete_token',
 
-                       conditions=dict(method=['DELETE']))
+class TestRegistryAPI(base.IsolatedUnitTest):
 
-        mapper.connect('/tokens/{token_id}/endpoints',
+    def setUp(self):
 
-                       controller=auth_controller,
+        """Establish a clean test environment"""
 
-                       action='endpoints',
+        super(TestRegistryAPI, self).setUp()
 
-                       conditions=dict(method=['GET']))
+        self.mapper = routes.Mapper()
 
+        self.api = test_utils.FakeAuthMiddleware(rserver.API(self.mapper),
 
+                                                 is_admin=True)
 
-        # Certificates used to verify auth tokens
+        self.FIXTURES = [
 
-        mapper.connect('/certificates/ca',
+            {'id': UUID1,
 
-                       controller=auth_controller,
+             'name': 'fake image #1',
 
-                       action='ca_cert',
+             'status': 'active',
 
-                       conditions=dict(method=['GET']))
+             'disk_format': 'ami',
 
+             'container_format': 'ami',
 
+             'is_public': False,
 
-        mapper.connect('/certificates/signing',
+             'created_at': timeutils.utcnow(),
 
-                       controller=auth_controller,
+             'updated_at': timeutils.utcnow(),
 
-                       action='signing_cert',
+             'deleted_at': None,
 
-                       conditions=dict(method=['GET']))
+             'deleted': False,
 
+             'checksum': None,
 
+             'min_disk': 0,
 
-        # Miscellaneous Operations
+             'min_ram': 0,
 
-        extensions_controller = AdminExtensionsController()
+             'size': 13,
 
-        mapper.connect('/extensions',
+             'location': "file:///%s/%s" % (self.test_dir, UUID1),
 
-                       controller=extensions_controller,
+             'properties': {'type': 'kernel'}},
 
-                       action='get_extensions_info',
+            {'id': UUID2,
 
-                       conditions=dict(method=['GET']))
+             'name': 'fake image #2',
 
-        mapper.connect('/extensions/{extension_alias}',
+             'status': 'active',
 
-                       controller=extensions_controller,
+             'disk_format': 'vhd',
 
-                       action='get_extension_info',
+             'container_format': 'ovf',
 
-                       conditions=dict(method=['GET']))
+             'is_public': True,
 
-        identity_router = identity.AdminRouter()
+             'created_at': timeutils.utcnow(),
 
-        routers = [identity_router]
+             'updated_at': timeutils.utcnow(),
 
-        super(AdminRouter, self).__init__(mapper, routers)
+             'deleted_at': None,
 
+             'deleted': False,
 
+             'checksum': None,
 
+             'min_disk': 5,
 
+             'min_ram': 256,
 
-class PublicRouter(wsgi.ComposingRouter):
+             'size': 19,
 
-    def __init__(self):
+             'location': "file:///%s/%s" % (self.test_dir, UUID2),
 
-        mapper = routes.Mapper()
+             'properties': {}}]
 
+        self.context = glance.context.RequestContext(is_admin=True)
 
+        db_api.configure_db()
 
-        version_controller = VersionController('public')
+        self.destroy_fixtures()
 
-        mapper.connect('/',
+        self.create_fixtures()
 
-                       controller=version_controller,
 
-                       action='get_version')
 
+    def tearDown(self):
 
+        """Clear the test environment"""
 
-        # Token Operations
+        super(TestRegistryAPI, self).tearDown()
 
-        auth_controller = TokenController()
+        self.destroy_fixtures()
 
-        mapper.connect('/tokens',
 
-                       controller=auth_controller,
 
-                       action='authenticate',
+    def create_fixtures(self):
 
-                       conditions=dict(method=['POST']))
+        for fixture in self.FIXTURES:
 
+            db_api.image_create(self.context, fixture)
 
+            # We write a fake image file to the filesystem
 
-        mapper.connect('/certificates/ca',
+            with open("%s/%s" % (self.test_dir, fixture['id']), 'wb') as image:
 
-                       controller=auth_controller,
+                image.write("chunk00000remainder")
 
-                       action='ca_cert',
+                image.flush()
 
-                       conditions=dict(method=['GET']))
 
 
+    def destroy_fixtures(self):
 
-        mapper.connect('/certificates/signing',
+        # Easiest to just drop the models and re-create them...
 
-                       controller=auth_controller,
+        db_models.unregister_models(db_api._ENGINE)
 
-                       action='signing_cert',
+        db_models.register_models(db_api._ENGINE)
 
-                       conditions=dict(method=['GET']))
 
 
+    def test_show(self):
 
-        # Miscellaneous
+        """
 
-        extensions_controller = PublicExtensionsController()
+        Tests that the /images/<id> registry API endpoint
 
-        mapper.connect('/extensions',
+        returns the expected image
 
-                       controller=extensions_controller,
+        """
 
-                       action='get_extensions_info',
+        fixture = {'id': UUID2,
 
-                       conditions=dict(method=['GET']))
+                   'name': 'fake image #2',
 
-        mapper.connect('/extensions/{extension_alias}',
+                   'size': 19,
 
-                       controller=extensions_controller,
+                   'min_ram': 256,
 
-                       action='get_extension_info',
+                   'min_disk': 5,
 
-                       conditions=dict(method=['GET']))
+                   'checksum': None}
 
+        req = webob.Request.blank('/images/%s' % UUID2)
 
+        res = req.get_response(self.api)
 
-        identity_router = identity.PublicRouter()
+        self.assertEquals(res.status_int, 200)
 
-        routers = [identity_router]
+        res_dict = json.loads(res.body)
 
+        image = res_dict['image']
 
+        for k, v in fixture.iteritems():
 
-        super(PublicRouter, self).__init__(mapper, routers)
+            self.assertEquals(v, image[k])
 
 
 
+    def test_show_unknown(self):
 
+        """
 
-class PublicVersionRouter(wsgi.ComposingRouter):
+        Tests that the /images/<id> registry API endpoint
 
-    def __init__(self):
+        returns a 404 for an unknown image id
 
-        mapper = routes.Mapper()
+        """
 
-        version_controller = VersionController('public')
+        req = webob.Request.blank('/images/%s' % _gen_uuid())
 
-        mapper.connect('/',
+        res = req.get_response(self.api)
 
-                       controller=version_controller,
+        self.assertEquals(res.status_int, 404)
 
-                       action='get_versions')
 
-        routers = []
 
-        super(PublicVersionRouter, self).__init__(mapper, routers)
+    def test_show_invalid(self):
 
+        """
 
+        Tests that the /images/<id> registry API endpoint
 
+        returns a 404 for an invalid (therefore unknown) image id
 
+        """
 
-class AdminVersionRouter(wsgi.ComposingRouter):
+        req = webob.Request.blank('/images/%s' % _gen_uuid())
 
-    def __init__(self):
+        res = req.get_response(self.api)
 
-        mapper = routes.Mapper()
+        self.assertEquals(res.status_int, 404)
 
-        version_controller = VersionController('admin')
 
-        mapper.connect('/',
 
-                       controller=version_controller,
+    def test_get_root(self):
 
-                       action='get_versions')
+        """
 
-        routers = []
+        Tests that the root registry API returns "index",
 
-        super(AdminVersionRouter, self).__init__(mapper, routers)
+        which is a list of public images
 
+        """
 
+        fixture = {'id': UUID2,
 
+                   'name': 'fake image #2',
 
+                   'size': 19,
 
-class VersionController(wsgi.Application):
+                   'checksum': None}
 
-    def __init__(self, version_type):
+        req = webob.Request.blank('/')
 
-        self.catalog_api = catalog.Manager()
+        res = req.get_response(self.api)
 
-        self.url_key = '%sURL' % version_type
+        res_dict = json.loads(res.body)
 
+        self.assertEquals(res.status_int, 200)
 
 
-        super(VersionController, self).__init__()
 
+        images = res_dict['images']
 
+        self.assertEquals(len(images), 1)
 
-    def _get_identity_url(self, context):
 
-        catalog_ref = self.catalog_api.get_catalog(context=context,
 
-                                                   user_id=None,
+        for k, v in fixture.iteritems():
 
-                                                   tenant_id=None)
+            self.assertEquals(v, images[0][k])
 
-        for region, region_ref in catalog_ref.iteritems():
 
-            for service, service_ref in region_ref.iteritems():
 
-                if service == 'identity':
+    def test_get_index(self):
 
-                    return service_ref[self.url_key]
+        """
 
+        Tests that the /images registry API returns list of
 
+        public images
 
-        raise exception.NotImplemented()
+        """
 
+        fixture = {'id': UUID2,
 
+                   'name': 'fake image #2',
 
-    def _get_versions_list(self, context):
+                   'size': 19,
 
-        """The list of versions is dependent on the context."""
+                   'checksum': None}
 
-        identity_url = self._get_identity_url(context)
+        req = webob.Request.blank('/images')
 
-        if not identity_url.endswith('/'):
+        res = req.get_response(self.api)
 
-            identity_url = identity_url + '/'
+        res_dict = json.loads(res.body)
 
+        self.assertEquals(res.status_int, 200)
 
 
-        versions = {}
 
-        versions['v2.0'] = {
+        images = res_dict['images']
 
-            'id': 'v2.0',
+        self.assertEquals(len(images), 1)
 
-            'status': 'beta',
 
-            'updated': '2011-11-19T00:00:00Z',
 
-            'links': [
+        for k, v in fixture.iteritems():
 
-                {
+            self.assertEquals(v, images[0][k])
 
-                    'rel': 'self',
 
-                    'href': identity_url,
 
-                }, {
+    def test_get_index_marker(self):
 
-                    'rel': 'describedby',
+        """
 
-                    'type': 'text/html',
+        Tests that the /images registry API returns list of
 
-                    'href': 'http://docs.openstack.org/api/openstack-'
+        public images that conforms to a marker query param
 
-                            'identity-service/2.0/content/'
+        """
 
-                }, {
+        time1 = timeutils.utcnow() + datetime.timedelta(seconds=5)
 
-                    'rel': 'describedby',
+        time2 = timeutils.utcnow() + datetime.timedelta(seconds=4)
 
-                    'type': 'application/pdf',
+        time3 = timeutils.utcnow()
 
-                    'href': 'http://docs.openstack.org/api/openstack-'
 
-                            'identity-service/2.0/identity-dev-guide-'
 
-                            '2.0.pdf'
+        UUID3 = _gen_uuid()
 
-                }
+        extra_fixture = {'id': UUID3,
 
-            ],
+                         'status': 'active',
 
-            'media-types': [
+                         'is_public': True,
 
-                {
+                         'disk_format': 'vhd',
 
-                    'base': 'application/json',
+                         'container_format': 'ovf',
 
-                    'type': 'application/vnd.openstack.identity-v2.0'
+                         'name': 'new name! #123',
 
-                            '+json'
+                         'size': 19,
 
-                }, {
+                         'checksum': None,
 
-                    'base': 'application/xml',
+                         'created_at': time1}
 
-                    'type': 'application/vnd.openstack.identity-v2.0'
 
-                            '+xml'
 
-                }
+        db_api.image_create(self.context, extra_fixture)
 
-            ]
+
+
+        UUID4 = _gen_uuid()
+
+        extra_fixture = {'id': UUID4,
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'new name! #123',
+
+                         'size': 20,
+
+                         'checksum': None,
+
+                         'created_at': time2}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        UUID5 = _gen_uuid()
+
+        extra_fixture = {'id': UUID5,
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'new name! #123',
+
+                         'size': 20,
+
+                         'checksum': None,
+
+                         'created_at': time3}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        req = webob.Request.blank('/images?marker=%s' % UUID4)
+
+        res = req.get_response(self.api)
+
+        res_dict = json.loads(res.body)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        images = res_dict['images']
+
+        # should be sorted by created_at desc, id desc
+
+        # page should start after marker 4
+
+        self.assertEquals(len(images), 2)
+
+        self.assertEquals(images[0]['id'], UUID5)
+
+        self.assertEquals(images[1]['id'], UUID2)
+
+
+
+    def test_get_index_unknown_marker(self):
+
+        """
+
+        Tests that the /images registry API returns a 400
+
+        when an unknown marker is provided
+
+        """
+
+        req = webob.Request.blank('/images?marker=%s' % _gen_uuid())
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 400)
+
+
+
+    def test_get_index_malformed_marker(self):
+
+        """
+
+        Tests that the /images registry API returns a 400
+
+        when a malformed marker is provided
+
+        """
+
+        req = webob.Request.blank('/images?marker=4')
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 400)
+
+        self.assertTrue('marker' in res.body)
+
+
+
+    def test_get_index_limit(self):
+
+        """
+
+        Tests that the /images registry API returns list of
+
+        public images that conforms to a limit query param
+
+        """
+
+        UUID3 = _gen_uuid()
+
+        extra_fixture = {'id': UUID3,
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'new name! #123',
+
+                         'size': 19,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        UUID4 = _gen_uuid()
+
+        extra_fixture = {'id': UUID4,
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'new name! #123',
+
+                         'size': 20,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        req = webob.Request.blank('/images?limit=1')
+
+        res = req.get_response(self.api)
+
+        res_dict = json.loads(res.body)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 1)
+
+
+
+        # expect list to be sorted by created_at desc
+
+        self.assertTrue(images[0]['id'], UUID4)
+
+
+
+    def test_get_index_limit_negative(self):
+
+        """
+
+        Tests that the /images registry API returns list of
+
+        public images that conforms to a limit query param
+
+        """
+
+        req = webob.Request.blank('/images?limit=-1')
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 400)
+
+
+
+    def test_get_index_limit_non_int(self):
+
+        """
+
+        Tests that the /images registry API returns list of
+
+        public images that conforms to a limit query param
+
+        """
+
+        req = webob.Request.blank('/images?limit=a')
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 400)
+
+
+
+    def test_get_index_limit_marker(self):
+
+        """
+
+        Tests that the /images registry API returns list of
+
+        public images that conforms to limit and marker query params
+
+        """
+
+        UUID3 = _gen_uuid()
+
+        extra_fixture = {'id': UUID3,
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'new name! #123',
+
+                         'size': 19,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        extra_fixture = {'id': _gen_uuid(),
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'new name! #123',
+
+                         'size': 20,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        req = webob.Request.blank('/images?marker=%s&limit=1' % UUID3)
+
+        res = req.get_response(self.api)
+
+        res_dict = json.loads(res.body)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 1)
+
+
+
+        # expect list to be sorted by created_at desc
+
+        self.assertEqual(images[0]['id'], UUID2)
+
+
+
+    def test_get_index_filter_name(self):
+
+        """
+
+        Tests that the /images registry API returns list of
+
+        public images that have a specific name. This is really a sanity
+
+        check, filtering is tested more in-depth using /images/detail
+
+        """
+
+        fixture = {'id': UUID2,
+
+                   'name': 'fake image #2',
+
+                   'size': 19,
+
+                   'checksum': None}
+
+
+
+        extra_fixture = {'id': _gen_uuid(),
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'new name! #123',
+
+                         'size': 19,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        extra_fixture = {'id': _gen_uuid(),
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'new name! #123',
+
+                         'size': 20,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        req = webob.Request.blank('/images?name=new name! #123')
+
+        res = req.get_response(self.api)
+
+        res_dict = json.loads(res.body)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 2)
+
+
+
+        for image in images:
+
+            self.assertEqual('new name! #123', image['name'])
+
+
+
+    def test_get_index_sort_default_created_at_desc(self):
+
+        """
+
+        Tests that the /images registry API returns list of
+
+        public images that conforms to a default sort key/dir
+
+        """
+
+        time1 = timeutils.utcnow() + datetime.timedelta(seconds=5)
+
+        time2 = timeutils.utcnow() + datetime.timedelta(seconds=4)
+
+        time3 = timeutils.utcnow()
+
+
+
+        UUID3 = _gen_uuid()
+
+        extra_fixture = {'id': UUID3,
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'new name! #123',
+
+                         'size': 19,
+
+                         'checksum': None,
+
+                         'created_at': time1}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        UUID4 = _gen_uuid()
+
+        extra_fixture = {'id': UUID4,
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'new name! #123',
+
+                         'size': 20,
+
+                         'checksum': None,
+
+                         'created_at': time2}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        UUID5 = _gen_uuid()
+
+        extra_fixture = {'id': UUID5,
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'new name! #123',
+
+                         'size': 20,
+
+                         'checksum': None,
+
+                         'created_at': time3}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        req = webob.Request.blank('/images')
+
+        res = req.get_response(self.api)
+
+        res_dict = json.loads(res.body)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 4)
+
+        self.assertEquals(images[0]['id'], UUID3)
+
+        self.assertEquals(images[1]['id'], UUID4)
+
+        self.assertEquals(images[2]['id'], UUID5)
+
+        self.assertEquals(images[3]['id'], UUID2)
+
+
+
+    def test_get_index_bad_sort_key(self):
+
+        """Ensure a 400 is returned when a bad sort_key is provided."""
+
+        req = webob.Request.blank('/images?sort_key=asdf')
+
+        res = req.get_response(self.api)
+
+        self.assertEqual(400, res.status_int)
+
+
+
+    def test_get_index_bad_sort_dir(self):
+
+        """Ensure a 400 is returned when a bad sort_dir is provided."""
+
+        req = webob.Request.blank('/images?sort_dir=asdf')
+
+        res = req.get_response(self.api)
+
+        self.assertEqual(400, res.status_int)
+
+
+
+    def test_get_index_sort_name_asc(self):
+
+        """
+
+        Tests that the /images registry API returns list of
+
+        public images sorted alphabetically by name in
+
+        ascending order.
+
+        """
+
+        UUID3 = _gen_uuid()
+
+        extra_fixture = {'id': UUID3,
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'asdf',
+
+                         'size': 19,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        UUID4 = _gen_uuid()
+
+        extra_fixture = {'id': UUID4,
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'xyz',
+
+                         'size': 20,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        req = webob.Request.blank('/images?sort_key=name&sort_dir=asc')
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 200)
+
+        res_dict = json.loads(res.body)
+
+
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 3)
+
+        self.assertEquals(images[0]['id'], UUID3)
+
+        self.assertEquals(images[1]['id'], UUID2)
+
+        self.assertEquals(images[2]['id'], UUID4)
+
+
+
+    def test_get_index_sort_status_desc(self):
+
+        """
+
+        Tests that the /images registry API returns list of
+
+        public images sorted alphabetically by status in
+
+        descending order.
+
+        """
+
+        UUID3 = _gen_uuid()
+
+        extra_fixture = {'id': UUID3,
+
+                         'status': 'queued',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'asdf',
+
+                         'size': 19,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        UUID4 = _gen_uuid()
+
+        extra_fixture = {'id': UUID4,
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'xyz',
+
+                         'size': 20,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        req = webob.Request.blank('/images?sort_key=status&sort_dir=desc')
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 200)
+
+        res_dict = json.loads(res.body)
+
+
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 3)
+
+        self.assertEquals(images[0]['id'], UUID3)
+
+        self.assertEquals(images[1]['id'], UUID4)
+
+        self.assertEquals(images[2]['id'], UUID2)
+
+
+
+    def test_get_index_sort_disk_format_asc(self):
+
+        """
+
+        Tests that the /images registry API returns list of
+
+        public images sorted alphabetically by disk_format in
+
+        ascending order.
+
+        """
+
+        UUID3 = _gen_uuid()
+
+        extra_fixture = {'id': UUID3,
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'ami',
+
+                         'container_format': 'ami',
+
+                         'name': 'asdf',
+
+                         'size': 19,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        UUID4 = _gen_uuid()
+
+        extra_fixture = {'id': UUID4,
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vdi',
+
+                         'container_format': 'ovf',
+
+                         'name': 'xyz',
+
+                         'size': 20,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        req = webob.Request.blank('/images?sort_key=disk_format&sort_dir=asc')
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 200)
+
+        res_dict = json.loads(res.body)
+
+
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 3)
+
+        self.assertEquals(images[0]['id'], UUID3)
+
+        self.assertEquals(images[1]['id'], UUID4)
+
+        self.assertEquals(images[2]['id'], UUID2)
+
+
+
+    def test_get_index_sort_container_format_desc(self):
+
+        """
+
+        Tests that the /images registry API returns list of
+
+        public images sorted alphabetically by container_format in
+
+        descending order.
+
+        """
+
+        UUID3 = _gen_uuid()
+
+        extra_fixture = {'id': UUID3,
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'ami',
+
+                         'container_format': 'ami',
+
+                         'name': 'asdf',
+
+                         'size': 19,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        UUID4 = _gen_uuid()
+
+        extra_fixture = {'id': UUID4,
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'iso',
+
+                         'container_format': 'bare',
+
+                         'name': 'xyz',
+
+                         'size': 20,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        url = '/images?sort_key=container_format&sort_dir=desc'
+
+        req = webob.Request.blank(url)
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 200)
+
+        res_dict = json.loads(res.body)
+
+
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 3)
+
+        self.assertEquals(images[0]['id'], UUID2)
+
+        self.assertEquals(images[1]['id'], UUID4)
+
+        self.assertEquals(images[2]['id'], UUID3)
+
+
+
+    def test_get_index_sort_size_asc(self):
+
+        """
+
+        Tests that the /images registry API returns list of
+
+        public images sorted by size in ascending order.
+
+        """
+
+        UUID3 = _gen_uuid()
+
+        extra_fixture = {'id': UUID3,
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'ami',
+
+                         'container_format': 'ami',
+
+                         'name': 'asdf',
+
+                         'size': 100,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        UUID4 = _gen_uuid()
+
+        extra_fixture = {'id': UUID4,
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'iso',
+
+                         'container_format': 'bare',
+
+                         'name': 'xyz',
+
+                         'size': 2,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        url = '/images?sort_key=size&sort_dir=asc'
+
+        req = webob.Request.blank(url)
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 200)
+
+        res_dict = json.loads(res.body)
+
+
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 3)
+
+        self.assertEquals(images[0]['id'], UUID4)
+
+        self.assertEquals(images[1]['id'], UUID2)
+
+        self.assertEquals(images[2]['id'], UUID3)
+
+
+
+    def test_get_index_sort_created_at_asc(self):
+
+        """
+
+        Tests that the /images registry API returns list of
+
+        public images sorted by created_at in ascending order.
+
+        """
+
+        now = timeutils.utcnow()
+
+        time1 = now + datetime.timedelta(seconds=5)
+
+        time2 = now
+
+
+
+        UUID3 = _gen_uuid()
+
+        extra_fixture = {'id': UUID3,
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'new name! #123',
+
+                         'size': 19,
+
+                         'checksum': None,
+
+                         'created_at': time1}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        UUID4 = _gen_uuid()
+
+        extra_fixture = {'id': UUID4,
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'new name! #123',
+
+                         'size': 20,
+
+                         'checksum': None,
+
+                         'created_at': time2}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        req = webob.Request.blank('/images?sort_key=created_at&sort_dir=asc')
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 200)
+
+        res_dict = json.loads(res.body)
+
+
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 3)
+
+        self.assertEquals(images[0]['id'], UUID2)
+
+        self.assertEquals(images[1]['id'], UUID4)
+
+        self.assertEquals(images[2]['id'], UUID3)
+
+
+
+    def test_get_index_sort_updated_at_desc(self):
+
+        """
+
+        Tests that the /images registry API returns list of
+
+        public images sorted by updated_at in descending order.
+
+        """
+
+        now = timeutils.utcnow()
+
+        time1 = now + datetime.timedelta(seconds=5)
+
+        time2 = now
+
+
+
+        UUID3 = _gen_uuid()
+
+        extra_fixture = {'id': UUID3,
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'new name! #123',
+
+                         'size': 19,
+
+                         'checksum': None,
+
+                         'created_at': None,
+
+                         'updated_at': time1}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        UUID4 = _gen_uuid()
+
+        extra_fixture = {'id': UUID4,
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'new name! #123',
+
+                         'size': 20,
+
+                         'checksum': None,
+
+                         'created_at': None,
+
+                         'updated_at': time2}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        req = webob.Request.blank('/images?sort_key=updated_at&sort_dir=desc')
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 200)
+
+        res_dict = json.loads(res.body)
+
+
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 3)
+
+        self.assertEquals(images[0]['id'], UUID3)
+
+        self.assertEquals(images[1]['id'], UUID4)
+
+        self.assertEquals(images[2]['id'], UUID2)
+
+
+
+    def test_get_details(self):
+
+        """
+
+        Tests that the /images/detail registry API returns
+
+        a mapping containing a list of detailed image information
+
+        """
+
+        fixture = {'id': UUID2,
+
+                   'name': 'fake image #2',
+
+                   'is_public': True,
+
+                   'size': 19,
+
+                   'min_disk': 5,
+
+                   'min_ram': 256,
+
+                   'checksum': None,
+
+                   'disk_format': 'vhd',
+
+                   'container_format': 'ovf',
+
+                   'status': 'active'}
+
+
+
+        req = webob.Request.blank('/images/detail')
+
+        res = req.get_response(self.api)
+
+        res_dict = json.loads(res.body)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 1)
+
+
+
+        for k, v in fixture.iteritems():
+
+            self.assertEquals(v, images[0][k])
+
+
+
+    def test_get_details_limit_marker(self):
+
+        """
+
+        Tests that the /images/details registry API returns list of
+
+        public images that conforms to limit and marker query params.
+
+        This functionality is tested more thoroughly on /images, this is
+
+        just a sanity check
+
+        """
+
+        UUID3 = _gen_uuid()
+
+        extra_fixture = {'id': UUID3,
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'new name! #123',
+
+                         'size': 19,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        extra_fixture = {'id': _gen_uuid(),
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'new name! #123',
+
+                         'size': 20,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        req = webob.Request.blank('/images/detail?marker=%s&limit=1' % UUID3)
+
+        res = req.get_response(self.api)
+
+        res_dict = json.loads(res.body)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 1)
+
+
+
+        # expect list to be sorted by created_at desc
+
+        self.assertEqual(images[0]['id'], UUID2)
+
+
+
+    def test_get_details_invalid_marker(self):
+
+        """
+
+        Tests that the /images/detail registry API returns a 400
+
+        when an invalid marker is provided
+
+        """
+
+        req = webob.Request.blank('/images/detail?marker=%s'
+
+                                  % _gen_uuid())
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 400)
+
+
+
+    def test_get_details_filter_name(self):
+
+        """
+
+        Tests that the /images/detail registry API returns list of
+
+        public images that have a specific name
+
+        """
+
+        extra_fixture = {'id': _gen_uuid(),
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'new name! #123',
+
+                         'size': 19,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        extra_fixture = {'id': _gen_uuid(),
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'new name! #123',
+
+                         'size': 20,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        req = webob.Request.blank('/images/detail?name=new name! #123')
+
+        res = req.get_response(self.api)
+
+        res_dict = json.loads(res.body)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 2)
+
+
+
+        for image in images:
+
+            self.assertEqual('new name! #123', image['name'])
+
+
+
+    def test_get_details_filter_status(self):
+
+        """
+
+        Tests that the /images/detail registry API returns list of
+
+        public images that have a specific status
+
+        """
+
+        extra_fixture = {'id': _gen_uuid(),
+
+                         'status': 'saving',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'fake image #3',
+
+                         'size': 19,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        extra_fixture = {'id': _gen_uuid(),
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'fake image #4',
+
+                         'size': 19,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        req = webob.Request.blank('/images/detail?status=saving')
+
+        res = req.get_response(self.api)
+
+        res_dict = json.loads(res.body)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 1)
+
+
+
+        for image in images:
+
+            self.assertEqual('saving', image['status'])
+
+
+
+    def test_get_details_filter_container_format(self):
+
+        """
+
+        Tests that the /images/detail registry API returns list of
+
+        public images that have a specific container_format
+
+        """
+
+        extra_fixture = {'id': _gen_uuid(),
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vdi',
+
+                         'container_format': 'ovf',
+
+                         'name': 'fake image #3',
+
+                         'size': 19,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        extra_fixture = {'id': _gen_uuid(),
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'ami',
+
+                         'container_format': 'ami',
+
+                         'name': 'fake image #4',
+
+                         'size': 19,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        req = webob.Request.blank('/images/detail?container_format=ovf')
+
+        res = req.get_response(self.api)
+
+        res_dict = json.loads(res.body)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 2)
+
+
+
+        for image in images:
+
+            self.assertEqual('ovf', image['container_format'])
+
+
+
+    def test_get_details_filter_min_disk(self):
+
+        """
+
+        Tests that the /images/detail registry API returns list of
+
+        public images that have a specific min_disk
+
+        """
+
+        extra_fixture = {'id': _gen_uuid(),
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'fake image #3',
+
+                         'size': 19,
+
+                         'min_disk': 7,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        extra_fixture = {'id': _gen_uuid(),
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'ami',
+
+                         'container_format': 'ami',
+
+                         'name': 'fake image #4',
+
+                         'size': 19,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        req = webob.Request.blank('/images/detail?min_disk=7')
+
+        res = req.get_response(self.api)
+
+        res_dict = json.loads(res.body)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 1)
+
+
+
+        for image in images:
+
+            self.assertEqual(7, image['min_disk'])
+
+
+
+    def test_get_details_filter_min_ram(self):
+
+        """
+
+        Tests that the /images/detail registry API returns list of
+
+        public images that have a specific min_ram
+
+        """
+
+        extra_fixture = {'id': _gen_uuid(),
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'fake image #3',
+
+                         'size': 19,
+
+                         'min_ram': 514,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        extra_fixture = {'id': _gen_uuid(),
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'ami',
+
+                         'container_format': 'ami',
+
+                         'name': 'fake image #4',
+
+                         'size': 19,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        req = webob.Request.blank('/images/detail?min_ram=514')
+
+        res = req.get_response(self.api)
+
+        res_dict = json.loads(res.body)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 1)
+
+
+
+        for image in images:
+
+            self.assertEqual(514, image['min_ram'])
+
+
+
+    def test_get_details_filter_disk_format(self):
+
+        """
+
+        Tests that the /images/detail registry API returns list of
+
+        public images that have a specific disk_format
+
+        """
+
+        extra_fixture = {'id': _gen_uuid(),
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'fake image #3',
+
+                         'size': 19,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        extra_fixture = {'id': _gen_uuid(),
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'ami',
+
+                         'container_format': 'ami',
+
+                         'name': 'fake image #4',
+
+                         'size': 19,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        req = webob.Request.blank('/images/detail?disk_format=vhd')
+
+        res = req.get_response(self.api)
+
+        res_dict = json.loads(res.body)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 2)
+
+
+
+        for image in images:
+
+            self.assertEqual('vhd', image['disk_format'])
+
+
+
+    def test_get_details_filter_size_min(self):
+
+        """
+
+        Tests that the /images/detail registry API returns list of
+
+        public images that have a size greater than or equal to size_min
+
+        """
+
+        extra_fixture = {'id': _gen_uuid(),
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'fake image #3',
+
+                         'size': 18,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        extra_fixture = {'id': _gen_uuid(),
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'ami',
+
+                         'container_format': 'ami',
+
+                         'name': 'fake image #4',
+
+                         'size': 20,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        req = webob.Request.blank('/images/detail?size_min=19')
+
+        res = req.get_response(self.api)
+
+        res_dict = json.loads(res.body)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 2)
+
+
+
+        for image in images:
+
+            self.assertTrue(image['size'] >= 19)
+
+
+
+    def test_get_details_filter_size_max(self):
+
+        """
+
+        Tests that the /images/detail registry API returns list of
+
+        public images that have a size less than or equal to size_max
+
+        """
+
+        extra_fixture = {'id': _gen_uuid(),
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'fake image #3',
+
+                         'size': 18,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        extra_fixture = {'id': _gen_uuid(),
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'ami',
+
+                         'container_format': 'ami',
+
+                         'name': 'fake image #4',
+
+                         'size': 20,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        req = webob.Request.blank('/images/detail?size_max=19')
+
+        res = req.get_response(self.api)
+
+        res_dict = json.loads(res.body)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 2)
+
+
+
+        for image in images:
+
+            self.assertTrue(image['size'] <= 19)
+
+
+
+    def test_get_details_filter_size_min_max(self):
+
+        """
+
+        Tests that the /images/detail registry API returns list of
+
+        public images that have a size less than or equal to size_max
+
+        and greater than or equal to size_min
+
+        """
+
+        extra_fixture = {'id': _gen_uuid(),
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'fake image #3',
+
+                         'size': 18,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        extra_fixture = {'id': _gen_uuid(),
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'ami',
+
+                         'container_format': 'ami',
+
+                         'name': 'fake image #4',
+
+                         'size': 20,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        extra_fixture = {'id': _gen_uuid(),
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'ami',
+
+                         'container_format': 'ami',
+
+                         'name': 'fake image #5',
+
+                         'size': 6,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        req = webob.Request.blank('/images/detail?size_min=18&size_max=19')
+
+        res = req.get_response(self.api)
+
+        res_dict = json.loads(res.body)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 2)
+
+
+
+        for image in images:
+
+            self.assertTrue(image['size'] <= 19 and image['size'] >= 18)
+
+
+
+    def test_get_details_filter_changes_since(self):
+
+        """
+
+        Tests that the /images/detail registry API returns list of
+
+        public images that have a size less than or equal to size_max
+
+        """
+
+        dt1 = timeutils.utcnow() - datetime.timedelta(1)
+
+        iso1 = timeutils.isotime(dt1)
+
+
+
+        dt2 = timeutils.utcnow() + datetime.timedelta(1)
+
+        iso2 = timeutils.isotime(dt2)
+
+
+
+        image_ts = timeutils.utcnow() + datetime.timedelta(2)
+
+        hour_before = image_ts.strftime('%Y-%m-%dT%H:%M:%S%%2B01:00')
+
+        hour_after = image_ts.strftime('%Y-%m-%dT%H:%M:%S-01:00')
+
+
+
+        dt4 = timeutils.utcnow() + datetime.timedelta(3)
+
+        iso4 = timeutils.isotime(dt4)
+
+
+
+        UUID3 = _gen_uuid()
+
+        extra_fixture = {'id': UUID3,
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'fake image #3',
+
+                         'size': 18,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+        db_api.image_destroy(self.context, UUID3)
+
+
+
+        UUID4 = _gen_uuid()
+
+        extra_fixture = {'id': UUID4,
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'ami',
+
+                         'container_format': 'ami',
+
+                         'name': 'fake image #4',
+
+                         'size': 20,
+
+                         'checksum': None,
+
+                         'created_at': image_ts,
+
+                         'updated_at': image_ts}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        # Check a standard list, 4 images in db (2 deleted)
+
+        req = webob.Request.blank('/images/detail')
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 200)
+
+        res_dict = json.loads(res.body)
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 2)
+
+        self.assertEqual(images[0]['id'], UUID4)
+
+        self.assertEqual(images[1]['id'], UUID2)
+
+
+
+        # Expect 3 images (1 deleted)
+
+        req = webob.Request.blank('/images/detail?changes-since=%s' % iso1)
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 200)
+
+        res_dict = json.loads(res.body)
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 3)
+
+        self.assertEqual(images[0]['id'], UUID4)
+
+        self.assertEqual(images[1]['id'], UUID3)  # deleted
+
+        self.assertEqual(images[2]['id'], UUID2)
+
+
+
+        # Expect 1 images (0 deleted)
+
+        req = webob.Request.blank('/images/detail?changes-since=%s' % iso2)
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 200)
+
+        res_dict = json.loads(res.body)
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 1)
+
+        self.assertEqual(images[0]['id'], UUID4)
+
+
+
+        # Expect 1 images (0 deleted)
+
+        req = webob.Request.blank('/images/detail?changes-since=%s' %
+
+                                  hour_before)
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 200)
+
+        res_dict = json.loads(res.body)
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 1)
+
+        self.assertEqual(images[0]['id'], UUID4)
+
+
+
+        # Expect 0 images (0 deleted)
+
+        req = webob.Request.blank('/images/detail?changes-since=%s' %
+
+                                  hour_after)
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 200)
+
+        res_dict = json.loads(res.body)
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 0)
+
+
+
+        # Expect 0 images (0 deleted)
+
+        req = webob.Request.blank('/images/detail?changes-since=%s' % iso4)
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 200)
+
+        res_dict = json.loads(res.body)
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 0)
+
+
+
+        # Bad request (empty changes-since param)
+
+        req = webob.Request.blank('/images/detail?changes-since=')
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 400)
+
+
+
+        # Bad request (invalid changes-since param)
+
+        req = webob.Request.blank('/images/detail?changes-since=2011-09-05')
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 400)
+
+
+
+    def test_get_details_filter_property(self):
+
+        """
+
+        Tests that the /images/detail registry API returns list of
+
+        public images that have a specific custom property
+
+        """
+
+        extra_fixture = {'id': _gen_uuid(),
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'fake image #3',
+
+                         'size': 19,
+
+                         'checksum': None,
+
+                         'properties': {'prop_123': 'v a'}}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        extra_fixture = {'id': _gen_uuid(),
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'ami',
+
+                         'container_format': 'ami',
+
+                         'name': 'fake image #4',
+
+                         'size': 19,
+
+                         'checksum': None,
+
+                         'properties': {'prop_123': 'v b'}}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        req = webob.Request.blank('/images/detail?property-prop_123=v%20a')
+
+        res = req.get_response(self.api)
+
+        res_dict = json.loads(res.body)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 1)
+
+
+
+        for image in images:
+
+            self.assertEqual('v a', image['properties']['prop_123'])
+
+
+
+    def test_get_details_filter_public_none(self):
+
+        """
+
+        Tests that the /images/detail registry API returns list of
+
+        all images if is_public none is passed
+
+        """
+
+        extra_fixture = {'id': _gen_uuid(),
+
+                         'status': 'active',
+
+                         'is_public': False,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'fake image #3',
+
+                         'size': 18,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        req = webob.Request.blank('/images/detail?is_public=None')
+
+        res = req.get_response(self.api)
+
+        res_dict = json.loads(res.body)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 3)
+
+
+
+    def test_get_details_filter_public_false(self):
+
+        """
+
+        Tests that the /images/detail registry API returns list of
+
+        private images if is_public false is passed
+
+        """
+
+        extra_fixture = {'id': _gen_uuid(),
+
+                         'status': 'active',
+
+                         'is_public': False,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'fake image #3',
+
+                         'size': 18,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        req = webob.Request.blank('/images/detail?is_public=False')
+
+        res = req.get_response(self.api)
+
+        res_dict = json.loads(res.body)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 2)
+
+
+
+        for image in images:
+
+            self.assertEqual(False, image['is_public'])
+
+
+
+    def test_get_details_filter_public_true(self):
+
+        """
+
+        Tests that the /images/detail registry API returns list of
+
+        public images if is_public true is passed (same as default)
+
+        """
+
+        extra_fixture = {'id': _gen_uuid(),
+
+                         'status': 'active',
+
+                         'is_public': False,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'fake image #3',
+
+                         'size': 18,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        req = webob.Request.blank('/images/detail?is_public=True')
+
+        res = req.get_response(self.api)
+
+        res_dict = json.loads(res.body)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 1)
+
+
+
+        for image in images:
+
+            self.assertEqual(True, image['is_public'])
+
+
+
+    def test_get_details_sort_name_asc(self):
+
+        """
+
+        Tests that the /images/details registry API returns list of
+
+        public images sorted alphabetically by name in
+
+        ascending order.
+
+        """
+
+        UUID3 = _gen_uuid()
+
+        extra_fixture = {'id': UUID3,
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'asdf',
+
+                         'size': 19,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        UUID4 = _gen_uuid()
+
+        extra_fixture = {'id': UUID4,
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'xyz',
+
+                         'size': 20,
+
+                         'checksum': None}
+
+
+
+        db_api.image_create(self.context, extra_fixture)
+
+
+
+        req = webob.Request.blank('/images/detail?sort_key=name&sort_dir=asc')
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 200)
+
+        res_dict = json.loads(res.body)
+
+
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 3)
+
+        self.assertEquals(images[0]['id'], UUID3)
+
+        self.assertEquals(images[1]['id'], UUID2)
+
+        self.assertEquals(images[2]['id'], UUID4)
+
+
+
+    def test_create_image(self):
+
+        """Tests that the /images POST registry API creates the image"""
+
+        fixture = {'name': 'fake public image',
+
+                   'is_public': True,
+
+                   'disk_format': 'vhd',
+
+                   'container_format': 'ovf'}
+
+
+
+        req = webob.Request.blank('/images')
+
+
+
+        req.method = 'POST'
+
+        req.content_type = 'application/json'
+
+        req.body = json.dumps(dict(image=fixture))
+
+
+
+        res = req.get_response(self.api)
+
+
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        res_dict = json.loads(res.body)
+
+
+
+        for k, v in fixture.iteritems():
+
+            self.assertEquals(v, res_dict['image'][k])
+
+
+
+        # Test status was updated properly
+
+        self.assertEquals('active', res_dict['image']['status'])
+
+
+
+    def test_create_image_with_min_disk(self):
+
+        """Tests that the /images POST registry API creates the image"""
+
+        fixture = {'name': 'fake public image',
+
+                   'is_public': True,
+
+                   'min_disk': 5,
+
+                   'disk_format': 'vhd',
+
+                   'container_format': 'ovf'}
+
+
+
+        req = webob.Request.blank('/images')
+
+
+
+        req.method = 'POST'
+
+        req.content_type = 'application/json'
+
+        req.body = json.dumps(dict(image=fixture))
+
+
+
+        res = req.get_response(self.api)
+
+
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        res_dict = json.loads(res.body)
+
+
+
+        self.assertEquals(5, res_dict['image']['min_disk'])
+
+
+
+    def test_create_image_with_min_ram(self):
+
+        """Tests that the /images POST registry API creates the image"""
+
+        fixture = {'name': 'fake public image',
+
+                   'is_public': True,
+
+                   'min_ram': 256,
+
+                   'disk_format': 'vhd',
+
+                   'container_format': 'ovf'}
+
+
+
+        req = webob.Request.blank('/images')
+
+
+
+        req.method = 'POST'
+
+        req.content_type = 'application/json'
+
+        req.body = json.dumps(dict(image=fixture))
+
+
+
+        res = req.get_response(self.api)
+
+
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        res_dict = json.loads(res.body)
+
+
+
+        self.assertEquals(256, res_dict['image']['min_ram'])
+
+
+
+    def test_create_image_with_min_ram_default(self):
+
+        """Tests that the /images POST registry API creates the image"""
+
+        fixture = {'name': 'fake public image',
+
+                   'is_public': True,
+
+                   'disk_format': 'vhd',
+
+                   'container_format': 'ovf'}
+
+
+
+        req = webob.Request.blank('/images')
+
+
+
+        req.method = 'POST'
+
+        req.content_type = 'application/json'
+
+        req.body = json.dumps(dict(image=fixture))
+
+
+
+        res = req.get_response(self.api)
+
+
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        res_dict = json.loads(res.body)
+
+
+
+        self.assertEquals(0, res_dict['image']['min_ram'])
+
+
+
+    def test_create_image_with_min_disk_default(self):
+
+        """Tests that the /images POST registry API creates the image"""
+
+        fixture = {'name': 'fake public image',
+
+                   'is_public': True,
+
+                   'disk_format': 'vhd',
+
+                   'container_format': 'ovf'}
+
+
+
+        req = webob.Request.blank('/images')
+
+
+
+        req.method = 'POST'
+
+        req.content_type = 'application/json'
+
+        req.body = json.dumps(dict(image=fixture))
+
+
+
+        res = req.get_response(self.api)
+
+
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        res_dict = json.loads(res.body)
+
+
+
+        self.assertEquals(0, res_dict['image']['min_disk'])
+
+
+
+    def test_create_image_with_bad_status(self):
+
+        """Tests proper exception is raised if a bad status is set"""
+
+        fixture = {'id': _gen_uuid(),
+
+                   'name': 'fake public image',
+
+                   'is_public': True,
+
+                   'disk_format': 'vhd',
+
+                   'container_format': 'ovf',
+
+                   'status': 'bad status'}
+
+
+
+        req = webob.Request.blank('/images')
+
+
+
+        req.method = 'POST'
+
+        req.content_type = 'application/json'
+
+        req.body = json.dumps(dict(image=fixture))
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, webob.exc.HTTPBadRequest.code)
+
+        self.assertTrue('Invalid image status' in res.body)
+
+
+
+    def test_create_image_with_bad_id(self):
+
+        """Tests proper exception is raised if a bad disk_format is set"""
+
+        fixture = {'id': 'asdf',
+
+                   'name': 'fake public image',
+
+                   'is_public': True,
+
+                   'disk_format': 'vhd',
+
+                   'container_format': 'ovf'}
+
+
+
+        req = webob.Request.blank('/images')
+
+
+
+        req.method = 'POST'
+
+        req.content_type = 'application/json'
+
+        req.body = json.dumps(dict(image=fixture))
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, webob.exc.HTTPBadRequest.code)
+
+
+
+    def test_update_image(self):
+
+        """Tests that the /images PUT registry API updates the image"""
+
+        fixture = {'name': 'fake public image #2',
+
+                   'min_disk': 5,
+
+                   'min_ram': 256,
+
+                   'disk_format': 'raw'}
+
+
+
+        req = webob.Request.blank('/images/%s' % UUID2)
+
+
+
+        req.method = 'PUT'
+
+        req.content_type = 'application/json'
+
+        req.body = json.dumps(dict(image=fixture))
+
+
+
+        res = req.get_response(self.api)
+
+
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        res_dict = json.loads(res.body)
+
+
+
+        self.assertNotEquals(res_dict['image']['created_at'],
+
+                            res_dict['image']['updated_at'])
+
+
+
+        for k, v in fixture.iteritems():
+
+            self.assertEquals(v, res_dict['image'][k])
+
+
+
+    def test_update_image_not_existing(self):
+
+        """
+
+        Tests proper exception is raised if attempt to update
+
+        non-existing image
+
+        """
+
+        fixture = {'status': 'killed'}
+
+
+
+        req = webob.Request.blank('/images/%s' % _gen_uuid())
+
+
+
+        req.method = 'PUT'
+
+        req.content_type = 'application/json'
+
+        req.body = json.dumps(dict(image=fixture))
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int,
+
+                          webob.exc.HTTPNotFound.code)
+
+
+
+    def test_update_image_with_bad_status(self):
+
+        """Tests that exception raised trying to set a bad status"""
+
+        fixture = {'status': 'invalid'}
+
+
+
+        req = webob.Request.blank('/images/%s' % UUID2)
+
+
+
+        req.method = 'PUT'
+
+        req.content_type = 'application/json'
+
+        req.body = json.dumps(dict(image=fixture))
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, webob.exc.HTTPBadRequest.code)
+
+        self.assertTrue('Invalid image status' in res.body)
+
+
+
+    def test_delete_image(self):
+
+        """Tests that the /images DELETE registry API deletes the image"""
+
+
+
+        # Grab the original number of images
+
+        req = webob.Request.blank('/images')
+
+        res = req.get_response(self.api)
+
+        res_dict = json.loads(res.body)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        orig_num_images = len(res_dict['images'])
+
+
+
+        # Delete image #2
+
+        req = webob.Request.blank('/images/%s' % UUID2)
+
+        req.method = 'DELETE'
+
+
+
+        res = req.get_response(self.api)
+
+
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        # Verify one less image
+
+        req = webob.Request.blank('/images')
+
+        res = req.get_response(self.api)
+
+        res_dict = json.loads(res.body)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        new_num_images = len(res_dict['images'])
+
+        self.assertEquals(new_num_images, orig_num_images - 1)
+
+
+
+    def test_delete_image_response(self):
+
+        """Tests that the registry API delete returns the image metadata"""
+
+
+
+        image = self.FIXTURES[0]
+
+        req = webob.Request.blank('/images/%s' % image['id'])
+
+        req.method = 'DELETE'
+
+        res = req.get_response(self.api)
+
+
+
+        self.assertEquals(res.status_int, 200)
+
+        deleted_image = json.loads(res.body)['image']
+
+
+
+        self.assertEquals(image['id'], deleted_image['id'])
+
+        self.assertTrue(deleted_image['deleted'])
+
+        self.assertTrue(deleted_image['deleted_at'])
+
+
+
+    def test_delete_image_not_existing(self):
+
+        """
+
+        Tests proper exception is raised if attempt to delete
+
+        non-existing image
+
+        """
+
+        req = webob.Request.blank('/images/%s' % _gen_uuid())
+
+        req.method = 'DELETE'
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int,
+
+                          webob.exc.HTTPNotFound.code)
+
+
+
+    def test_get_image_members(self):
+
+        """
+
+        Tests members listing for existing images
+
+        """
+
+        req = webob.Request.blank('/images/%s/members' % UUID2)
+
+        req.method = 'GET'
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        memb_list = json.loads(res.body)
+
+        num_members = len(memb_list['members'])
+
+        self.assertEquals(num_members, 0)
+
+
+
+    def test_get_image_members_not_existing(self):
+
+        """
+
+        Tests proper exception is raised if attempt to get members of
+
+        non-existing image
+
+        """
+
+        req = webob.Request.blank('/images/%s/members' % _gen_uuid())
+
+        req.method = 'GET'
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int,
+
+                          webob.exc.HTTPNotFound.code)
+
+
+
+    def test_get_member_images(self):
+
+        """
+
+        Tests image listing for members
+
+        """
+
+        req = webob.Request.blank('/shared-images/pattieblack')
+
+        req.method = 'GET'
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        memb_list = json.loads(res.body)
+
+        num_members = len(memb_list['shared_images'])
+
+        self.assertEquals(num_members, 0)
+
+
+
+    def test_replace_members(self):
+
+        """
+
+        Tests replacing image members raises right exception
+
+        """
+
+        self.api = test_utils.FakeAuthMiddleware(rserver.API(self.mapper),
+
+                                                     is_admin=False)
+
+        fixture = dict(member_id='pattieblack')
+
+
+
+        req = webob.Request.blank('/images/%s/members' % UUID2)
+
+        req.method = 'PUT'
+
+        req.content_type = 'application/json'
+
+        req.body = json.dumps(dict(image_memberships=fixture))
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, webob.exc.HTTPUnauthorized.code)
+
+
+
+    def test_add_member(self):
+
+        """
+
+        Tests adding image members raises right exception
+
+        """
+
+        self.api = test_utils.FakeAuthMiddleware(rserver.API(self.mapper),
+
+                                                     is_admin=False)
+
+        req = webob.Request.blank('/images/%s/members/pattieblack' % UUID2)
+
+        req.method = 'PUT'
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, webob.exc.HTTPUnauthorized.code)
+
+
+
+    def test_delete_member(self):
+
+        """
+
+        Tests deleting image members raises right exception
+
+        """
+
+        self.api = test_utils.FakeAuthMiddleware(rserver.API(self.mapper),
+
+                                                     is_admin=False)
+
+        req = webob.Request.blank('/images/%s/members/pattieblack' % UUID2)
+
+        req.method = 'DELETE'
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, webob.exc.HTTPUnauthorized.code)
+
+
+
+
+
+class TestGlanceAPI(base.IsolatedUnitTest):
+
+    def setUp(self):
+
+        """Establish a clean test environment"""
+
+        super(TestGlanceAPI, self).setUp()
+
+        self.mapper = routes.Mapper()
+
+        self.api = test_utils.FakeAuthMiddleware(router.API(self.mapper))
+
+        self.FIXTURES = [
+
+            {'id': UUID1,
+
+             'name': 'fake image #1',
+
+             'status': 'active',
+
+             'disk_format': 'ami',
+
+             'container_format': 'ami',
+
+             'is_public': False,
+
+             'created_at': timeutils.utcnow(),
+
+             'updated_at': timeutils.utcnow(),
+
+             'deleted_at': None,
+
+             'deleted': False,
+
+             'checksum': None,
+
+             'size': 13,
+
+             'location': "file:///%s/%s" % (self.test_dir, UUID1),
+
+             'properties': {'type': 'kernel'}},
+
+            {'id': UUID2,
+
+             'name': 'fake image #2',
+
+             'status': 'active',
+
+             'disk_format': 'vhd',
+
+             'container_format': 'ovf',
+
+             'is_public': True,
+
+             'created_at': timeutils.utcnow(),
+
+             'updated_at': timeutils.utcnow(),
+
+             'deleted_at': None,
+
+             'deleted': False,
+
+             'checksum': None,
+
+             'size': 19,
+
+             'location': "file:///%s/%s" % (self.test_dir, UUID2),
+
+             'properties': {}}]
+
+        self.context = glance.context.RequestContext(is_admin=True)
+
+        db_api.configure_db()
+
+        self.destroy_fixtures()
+
+        self.create_fixtures()
+
+
+
+    def tearDown(self):
+
+        """Clear the test environment"""
+
+        super(TestGlanceAPI, self).tearDown()
+
+        self.destroy_fixtures()
+
+
+
+    def create_fixtures(self):
+
+        for fixture in self.FIXTURES:
+
+            db_api.image_create(self.context, fixture)
+
+            # We write a fake image file to the filesystem
+
+            with open("%s/%s" % (self.test_dir, fixture['id']), 'wb') as image:
+
+                image.write("chunk00000remainder")
+
+                image.flush()
+
+
+
+    def destroy_fixtures(self):
+
+        # Easiest to just drop the models and re-create them...
+
+        db_models.unregister_models(db_api._ENGINE)
+
+        db_models.register_models(db_api._ENGINE)
+
+
+
+    def _do_test_defaulted_format(self, format_key, format_value):
+
+        fixture_headers = {'x-image-meta-name': 'defaulted',
+
+                           'x-image-meta-location': 'http://localhost:0/image',
+
+                           format_key: format_value}
+
+
+
+        req = webob.Request.blank("/images")
+
+        req.method = 'POST'
+
+        for k, v in fixture_headers.iteritems():
+
+            req.headers[k] = v
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 201)
+
+        res_body = json.loads(res.body)['image']
+
+        self.assertEquals(format_value, res_body['disk_format'])
+
+        self.assertEquals(format_value, res_body['container_format'])
+
+
+
+    def test_defaulted_amazon_format(self):
+
+        for key in ('x-image-meta-disk-format',
+
+                    'x-image-meta-container-format'):
+
+            for value in ('aki', 'ari', 'ami'):
+
+                self._do_test_defaulted_format(key, value)
+
+
+
+    def test_bad_disk_format(self):
+
+        fixture_headers = {'x-image-meta-store': 'bad',
+
+                   'x-image-meta-name': 'bogus',
+
+                   'x-image-meta-location': 'http://localhost:0/image.tar.gz',
+
+                   'x-image-meta-disk-format': 'invalid',
+
+                   'x-image-meta-container-format': 'ami'}
+
+
+
+        req = webob.Request.blank("/images")
+
+        req.method = 'POST'
+
+        for k, v in fixture_headers.iteritems():
+
+            req.headers[k] = v
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, webob.exc.HTTPBadRequest.code)
+
+        self.assertTrue('Invalid disk format' in res.body, res.body)
+
+
+
+    def test_create_with_location_no_container_format(self):
+
+        fixture_headers = {'x-image-meta-store': 'bad',
+
+                   'x-image-meta-name': 'bogus',
+
+                   'x-image-meta-location': 'http://localhost:0/image.tar.gz',
+
+                   'x-image-meta-disk-format': 'vhd'}
+
+
+
+        req = webob.Request.blank("/images")
+
+        req.method = 'POST'
+
+        for k, v in fixture_headers.iteritems():
+
+            req.headers[k] = v
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, webob.exc.HTTPBadRequest.code)
+
+        self.assertTrue('Invalid container format' in res.body)
+
+
+
+    def test_bad_container_format(self):
+
+        fixture_headers = {'x-image-meta-store': 'bad',
+
+                   'x-image-meta-name': 'bogus',
+
+                   'x-image-meta-location': 'http://localhost:0/image.tar.gz',
+
+                   'x-image-meta-disk-format': 'vhd',
+
+                   'x-image-meta-container-format': 'invalid'}
+
+
+
+        req = webob.Request.blank("/images")
+
+        req.method = 'POST'
+
+        for k, v in fixture_headers.iteritems():
+
+            req.headers[k] = v
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, webob.exc.HTTPBadRequest.code)
+
+        self.assertTrue('Invalid container format' in res.body)
+
+
+
+    def test_bad_image_size(self):
+
+        fixture_headers = {'x-image-meta-store': 'bad',
+
+                   'x-image-meta-name': 'bogus',
+
+                   'x-image-meta-location': 'http://example.com/image.tar.gz',
+
+                   'x-image-meta-disk-format': 'vhd',
+
+                   'x-image-meta-size': 'invalid',
+
+                   'x-image-meta-container-format': 'bare'}
+
+
+
+        req = webob.Request.blank("/images")
+
+        req.method = 'POST'
+
+        for k, v in fixture_headers.iteritems():
+
+            req.headers[k] = v
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, webob.exc.HTTPBadRequest.code)
+
+        self.assertTrue('Incoming image size' in res.body)
+
+
+
+    def test_bad_image_name(self):
+
+        fixture_headers = {'x-image-meta-store': 'bad',
+
+                   'x-image-meta-name': 'X' * 256,
+
+                   'x-image-meta-location': 'http://example.com/image.tar.gz',
+
+                   'x-image-meta-disk-format': 'vhd',
+
+                   'x-image-meta-container-format': 'bare'}
+
+
+
+        req = webob.Request.blank("/images")
+
+        req.method = 'POST'
+
+        for k, v in fixture_headers.iteritems():
+
+            req.headers[k] = v
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, webob.exc.HTTPBadRequest.code)
+
+
+
+    def test_add_image_no_location_no_image_as_body(self):
+
+        """Tests creates a queued image for no body and no loc header"""
+
+        fixture_headers = {'x-image-meta-store': 'file',
+
+                           'x-image-meta-disk-format': 'vhd',
+
+                           'x-image-meta-container-format': 'ovf',
+
+                           'x-image-meta-name': 'fake image #3'}
+
+
+
+        req = webob.Request.blank("/images")
+
+        req.method = 'POST'
+
+        for k, v in fixture_headers.iteritems():
+
+            req.headers[k] = v
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, httplib.CREATED)
+
+
+
+        res_body = json.loads(res.body)['image']
+
+        self.assertEquals('queued', res_body['status'])
+
+        image_id = res_body['id']
+
+
+
+        # Test that we are able to edit the Location field
+
+        # per LP Bug #911599
+
+
+
+        req = webob.Request.blank("/images/%s" % image_id)
+
+        req.method = 'PUT'
+
+        req.headers['x-image-meta-location'] = 'http://localhost:0/images/123'
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, httplib.OK)
+
+
+
+        res_body = json.loads(res.body)['image']
+
+        # Once the location is set, the image should be activated
+
+        # see LP Bug #939484
+
+        self.assertEquals('active', res_body['status'])
+
+        self.assertFalse('location' in res_body)  # location never shown
+
+
+
+    def test_add_image_no_location_no_content_type(self):
+
+        """Tests creates a queued image for no body and no loc header"""
+
+        fixture_headers = {'x-image-meta-store': 'file',
+
+                           'x-image-meta-disk-format': 'vhd',
+
+                           'x-image-meta-container-format': 'ovf',
+
+                           'x-image-meta-name': 'fake image #3'}
+
+
+
+        req = webob.Request.blank("/images")
+
+        req.method = 'POST'
+
+        req.body = "chunk00000remainder"
+
+        for k, v in fixture_headers.iteritems():
+
+            req.headers[k] = v
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 400)
+
+
+
+    def test_add_image_size_header_too_big(self):
+
+        """Tests raises BadRequest for supplied image size that is too big"""
+
+        fixture_headers = {'x-image-meta-size': CONF.image_size_cap + 1,
+
+                           'x-image-meta-name': 'fake image #3'}
+
+
+
+        req = webob.Request.blank("/images")
+
+        req.method = 'POST'
+
+        for k, v in fixture_headers.iteritems():
+
+            req.headers[k] = v
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 400)
+
+
+
+    def test_add_image_size_chunked_data_too_big(self):
+
+        self.config(image_size_cap=512)
+
+        fixture_headers = {
+
+            'x-image-meta-name': 'fake image #3',
+
+            'x-image-meta-container_format': 'ami',
+
+            'x-image-meta-disk_format': 'ami',
+
+            'transfer-encoding': 'chunked',
+
+            'content-type': 'application/octet-stream',
 
         }
 
 
 
-        return versions
+        req = webob.Request.blank("/images")
 
+        req.method = 'POST'
 
 
-    def get_versions(self, context):
 
-        versions = self._get_versions_list(context)
+        req.body_file = StringIO.StringIO('X' * (CONF.image_size_cap + 1))
 
-        return wsgi.render_response(status=(300, 'Multiple Choices'), body={
+        for k, v in fixture_headers.iteritems():
 
-            'versions': {
+            req.headers[k] = v
 
-                'values': versions.values()
 
-            }
 
-        })
+        res = req.get_response(self.api)
 
+        self.assertEquals(res.status_int, 400)
 
 
-    def get_version(self, context):
 
-        versions = self._get_versions_list(context)
+    def test_add_image_size_data_too_big(self):
 
-        return wsgi.render_response(body={
+        self.config(image_size_cap=512)
 
-            'version': versions['v2.0']
+        fixture_headers = {
 
-        })
+            'x-image-meta-name': 'fake image #3',
 
+            'x-image-meta-container_format': 'ami',
 
+            'x-image-meta-disk_format': 'ami',
 
+            'content-type': 'application/octet-stream',
 
+        }
 
-class NoopController(wsgi.Application):
 
-    def __init__(self):
 
-        super(NoopController, self).__init__()
+        req = webob.Request.blank("/images")
 
+        req.method = 'POST'
 
 
-    def noop(self, context):
 
-        return {}
+        req.body = 'X' * (CONF.image_size_cap + 1)
 
+        for k, v in fixture_headers.iteritems():
 
+            req.headers[k] = v
 
 
 
-class ExternalAuthNotApplicable(Exception):
+        res = req.get_response(self.api)
 
-    """External authentication is not applicable"""
+        self.assertEquals(res.status_int, 400)
 
 
 
+    def test_add_image_zero_size(self):
 
+        """Tests creating an active image with explicitly zero size"""
 
-class TokenController(wsgi.Application):
+        fixture_headers = {'x-image-meta-disk-format': 'ami',
 
-    def __init__(self):
+                           'x-image-meta-container-format': 'ami',
 
-        self.catalog_api = catalog.Manager()
+                           'x-image-meta-size': '0',
 
-        self.identity_api = identity.Manager()
+                           'x-image-meta-name': 'empty image'}
 
-        self.token_api = token.Manager()
 
-        self.policy_api = policy.Manager()
 
-        super(TokenController, self).__init__()
+        req = webob.Request.blank("/images")
 
+        req.method = 'POST'
 
+        for k, v in fixture_headers.iteritems():
 
-    def ca_cert(self, context, auth=None):
+            req.headers[k] = v
 
-        ca_file = open(config.CONF.signing.ca_certs, 'r')
+        res = req.get_response(self.api)
 
-        data = ca_file.read()
+        self.assertEquals(res.status_int, httplib.CREATED)
 
-        ca_file.close()
 
-        return data
 
+        res_body = json.loads(res.body)['image']
 
+        self.assertEquals('active', res_body['status'])
 
-    def signing_cert(self, context, auth=None):
+        image_id = res_body['id']
 
-        cert_file = open(config.CONF.signing.certfile, 'r')
 
-        data = cert_file.read()
 
-        cert_file.close()
+        # GET empty image
 
-        return data
+        req = webob.Request.blank("/images/%s" % image_id)
 
+        res = req.get_response(self.api)
 
+        self.assertEqual(res.status_int, 200)
 
-    def authenticate(self, context, auth=None):
+        self.assertEqual(len(res.body), 0)
 
-        """Authenticate credentials and return a token.
 
 
+    def test_add_image_checksum_mismatch(self):
 
-        Accept auth as a dict that looks like::
+        fixture_headers = {
 
+            'x-image-meta-checksum': 'asdf',
 
+            'x-image-meta-size': '4',
 
-            {
+            'x-image-meta-name': 'fake image #3',
 
-                "auth":{
+        }
 
-                    "passwordCredentials":{
 
-                        "username":"test_user",
 
-                        "password":"mypass"
+        req = webob.Request.blank("/images")
 
-                    },
+        req.method = 'POST'
 
-                    "tenantName":"customer-x"
+        for k, v in fixture_headers.iteritems():
 
-                }
+            req.headers[k] = v
 
-            }
 
 
+        req.headers['Content-Type'] = 'application/octet-stream'
 
-        In this case, tenant is optional, if not provided the token will be
+        req.body = "XXXX"
 
-        considered "unscoped" and can later be used to get a scoped token.
+        res = req.get_response(self.api)
 
+        self.assertEquals(res.status_int, 400)
 
 
-        Alternatively, this call accepts auth with only a token and tenant
 
-        that will return a token that is scoped to that tenant.
+    def test_add_image_bad_store(self):
+
+        """Tests raises BadRequest for invalid store header"""
+
+        fixture_headers = {'x-image-meta-store': 'bad',
+
+                           'x-image-meta-name': 'fake image #3'}
+
+
+
+        req = webob.Request.blank("/images")
+
+        req.method = 'POST'
+
+        for k, v in fixture_headers.iteritems():
+
+            req.headers[k] = v
+
+
+
+        req.headers['Content-Type'] = 'application/octet-stream'
+
+        req.body = "chunk00000remainder"
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, webob.exc.HTTPBadRequest.code)
+
+
+
+    def test_add_image_basic_file_store(self):
+
+        """Tests to add a basic image in the file store"""
+
+        fixture_headers = {'x-image-meta-store': 'file',
+
+                           'x-image-meta-disk-format': 'vhd',
+
+                           'x-image-meta-container-format': 'ovf',
+
+                           'x-image-meta-name': 'fake image #3'}
+
+
+
+        req = webob.Request.blank("/images")
+
+        req.method = 'POST'
+
+        for k, v in fixture_headers.iteritems():
+
+            req.headers[k] = v
+
+
+
+        req.headers['Content-Type'] = 'application/octet-stream'
+
+        req.body = "chunk00000remainder"
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, httplib.CREATED)
+
+
+
+        # Test that the Location: header is set to the URI to
+
+        # edit the newly-created image, as required by APP.
+
+        # See LP Bug #719825
+
+        self.assertTrue('location' in res.headers,
+
+                        "'location' not in response headers.\n"
+
+                        "res.headerlist = %r" % res.headerlist)
+
+        res_body = json.loads(res.body)['image']
+
+        self.assertTrue('/images/%s' % res_body['id']
+
+                        in res.headers['location'])
+
+        self.assertEquals('active', res_body['status'])
+
+        image_id = res_body['id']
+
+
+
+        # Test that we are NOT able to edit the Location field
+
+        # per LP Bug #911599
+
+
+
+        req = webob.Request.blank("/images/%s" % image_id)
+
+        req.method = 'PUT'
+
+        req.headers['x-image-meta-location'] = 'http://example.com/images/123'
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, httplib.BAD_REQUEST)
+
+
+
+    def test_add_image_unauthorized(self):
+
+        rules = {"add_image": [["false:false"]]}
+
+        self.set_policy_rules(rules)
+
+        fixture_headers = {'x-image-meta-store': 'file',
+
+                           'x-image-meta-disk-format': 'vhd',
+
+                           'x-image-meta-container-format': 'ovf',
+
+                           'x-image-meta-name': 'fake image #3'}
+
+
+
+        req = webob.Request.blank("/images")
+
+        req.method = 'POST'
+
+        for k, v in fixture_headers.iteritems():
+
+            req.headers[k] = v
+
+
+
+        req.headers['Content-Type'] = 'application/octet-stream'
+
+        req.body = "chunk00000remainder"
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 403)
+
+
+
+    def test_add_public_image_unauthorized(self):
+
+        rules = {"add_image": [], "publicize_image": [["false:false"]]}
+
+        self.set_policy_rules(rules)
+
+        fixture_headers = {'x-image-meta-store': 'file',
+
+                           'x-image-meta-is-public': 'true',
+
+                           'x-image-meta-disk-format': 'vhd',
+
+                           'x-image-meta-container-format': 'ovf',
+
+                           'x-image-meta-name': 'fake image #3'}
+
+
+
+        req = webob.Request.blank("/images")
+
+        req.method = 'POST'
+
+        for k, v in fixture_headers.iteritems():
+
+            req.headers[k] = v
+
+
+
+        req.headers['Content-Type'] = 'application/octet-stream'
+
+        req.body = "chunk00000remainder"
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 403)
+
+
+
+    def _do_test_post_image_content_missing_format(self, missing):
+
+        """Tests creation of an image with missing format"""
+
+        fixture_headers = {'x-image-meta-store': 'file',
+
+                           'x-image-meta-disk-format': 'vhd',
+
+                           'x-image-meta-container-format': 'ovf',
+
+                           'x-image-meta-name': 'fake image #3'}
+
+
+
+        header = 'x-image-meta-' + missing.replace('_', '-')
+
+
+
+        del fixture_headers[header]
+
+
+
+        req = webob.Request.blank("/images")
+
+        req.method = 'POST'
+
+        for k, v in fixture_headers.iteritems():
+
+            req.headers[k] = v
+
+
+
+        req.headers['Content-Type'] = 'application/octet-stream'
+
+        req.body = "chunk00000remainder"
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, httplib.BAD_REQUEST)
+
+
+
+    def test_post_image_content_missing_disk_format(self):
+
+        """Tests creation of an image with missing disk format"""
+
+        self._do_test_post_image_content_missing_format('disk_format')
+
+
+
+    def test_post_image_content_missing_container_type(self):
+
+        """Tests creation of an image with missing container format"""
+
+        self._do_test_post_image_content_missing_format('container_format')
+
+
+
+    def _do_test_put_image_content_missing_format(self, missing):
+
+        """Tests delayed activation of an image with missing format"""
+
+        fixture_headers = {'x-image-meta-store': 'file',
+
+                           'x-image-meta-disk-format': 'vhd',
+
+                           'x-image-meta-container-format': 'ovf',
+
+                           'x-image-meta-name': 'fake image #3'}
+
+
+
+        header = 'x-image-meta-' + missing.replace('_', '-')
+
+
+
+        del fixture_headers[header]
+
+
+
+        req = webob.Request.blank("/images")
+
+        req.method = 'POST'
+
+        for k, v in fixture_headers.iteritems():
+
+            req.headers[k] = v
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, httplib.CREATED)
+
+
+
+        res_body = json.loads(res.body)['image']
+
+        self.assertEquals('queued', res_body['status'])
+
+        image_id = res_body['id']
+
+
+
+        req = webob.Request.blank("/images/%s" % image_id)
+
+        req.method = 'PUT'
+
+        for k, v in fixture_headers.iteritems():
+
+            req.headers[k] = v
+
+        req.headers['Content-Type'] = 'application/octet-stream'
+
+        req.body = "chunk00000remainder"
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, httplib.BAD_REQUEST)
+
+
+
+    def test_put_image_content_missing_disk_format(self):
+
+        """Tests delayed activation of image with missing disk format"""
+
+        self._do_test_put_image_content_missing_format('disk_format')
+
+
+
+    def test_put_image_content_missing_container_type(self):
+
+        """Tests delayed activation of image with missing container format"""
+
+        self._do_test_put_image_content_missing_format('container_format')
+
+
+
+    def test_register_and_upload(self):
 
         """
 
+        Test that the process of registering an image with
 
+        some metadata, then uploading an image file with some
 
-        if auth is None:
+        more metadata doesn't mark the original metadata deleted
 
-            raise exception.ValidationError(attribute='auth',
-
-                                            target='request body')
-
-
-
-        auth_token_data = None
-
-
-
-        if "token" in auth:
-
-            # Try to authenticate using a token
-
-            auth_token_data, auth_info = self._authenticate_token(
-
-                context, auth)
-
-        else:
-
-            # Try external authentication
-
-            try:
-
-                auth_token_data, auth_info = self._authenticate_external(
-
-                    context, auth)
-
-            except ExternalAuthNotApplicable:
-
-                # Try local authentication
-
-                auth_token_data, auth_info = self._authenticate_local(
-
-                    context, auth)
-
-
-
-        user_ref, tenant_ref, metadata_ref = auth_info
-
-
-
-        # If the user is disabled don't allow them to authenticate
-
-        if not user_ref.get('enabled', True):
-
-            msg = 'User is disabled: %s' % user_ref['id']
-
-            LOG.warning(msg)
-
-            raise exception.Unauthorized(msg)
-
-
-
-        # If the tenant is disabled don't allow them to authenticate
-
-        if tenant_ref and not tenant_ref.get('enabled', True):
-
-            msg = 'Tenant is disabled: %s' % tenant_ref['id']
-
-            LOG.warning(msg)
-
-            raise exception.Unauthorized(msg)
-
-
-
-        if tenant_ref:
-
-            catalog_ref = self.catalog_api.get_catalog(
-
-                context=context,
-
-                user_id=user_ref['id'],
-
-                tenant_id=tenant_ref['id'],
-
-                metadata=metadata_ref)
-
-        else:
-
-            catalog_ref = {}
-
-
-
-        auth_token_data['id'] = 'placeholder'
-
-
-
-        roles_ref = []
-
-        for role_id in metadata_ref.get('roles', []):
-
-            role_ref = self.identity_api.get_role(context, role_id)
-
-            roles_ref.append(dict(name=role_ref['name']))
-
-
-
-        token_data = self._format_token(auth_token_data, roles_ref)
-
-
-
-        service_catalog = self._format_catalog(catalog_ref)
-
-        token_data['access']['serviceCatalog'] = service_catalog
-
-
-
-        if config.CONF.signing.token_format == 'UUID':
-
-            token_id = uuid.uuid4().hex
-
-        elif config.CONF.signing.token_format == 'PKI':
-
-            token_id = cms.cms_sign_token(json.dumps(token_data),
-
-                                          config.CONF.signing.certfile,
-
-                                          config.CONF.signing.keyfile)
-
-        else:
-
-            raise exception.UnexpectedError(
-
-                'Invalid value for token_format: %s.'
-
-                '  Allowed values are PKI or UUID.' %
-
-                config.CONF.signing.token_format)
-
-        try:
-
-            self.token_api.create_token(
-
-                context, token_id, dict(key=token_id,
-
-                                        id=token_id,
-
-                                        expires=auth_token_data['expires'],
-
-                                        user=user_ref,
-
-                                        tenant=tenant_ref,
-
-                                        metadata=metadata_ref))
-
-        except Exception as e:
-
-            # an identical token may have been created already.
-
-            # if so, return the token_data as it is also identical
-
-            try:
-
-                self.token_api.get_token(context=context,
-
-                                         token_id=token_id)
-
-            except exception.TokenNotFound:
-
-                raise e
-
-
-
-        token_data['access']['token']['id'] = token_id
-
-
-
-        return token_data
-
-
-
-    def _authenticate_token(self, context, auth):
-
-        """Try to authenticate using an already existing token.
-
-
-
-        Returns auth_token_data, (user_ref, tenant_ref, metadata_ref)
+        :see LP Bug#901534
 
         """
 
-        if 'token' not in auth:
+        fixture_headers = {'x-image-meta-store': 'file',
 
-            raise exception.ValidationError(
+                           'x-image-meta-disk-format': 'vhd',
 
-                attribute='token', target='auth')
+                           'x-image-meta-container-format': 'ovf',
 
+                           'x-image-meta-name': 'fake image #3',
 
-
-        if "id" not in auth['token']:
-
-            raise exception.ValidationError(
-
-                attribute="id", target="token")
+                           'x-image-meta-property-key1': 'value1'}
 
 
 
-        old_token = auth['token']['id']
+        req = webob.Request.blank("/images")
+
+        req.method = 'POST'
+
+        for k, v in fixture_headers.iteritems():
+
+            req.headers[k] = v
 
 
 
-        try:
+        res = req.get_response(self.api)
 
-            old_token_ref = self.token_api.get_token(context=context,
+        self.assertEquals(res.status_int, httplib.CREATED)
 
-                                                     token_id=old_token)
-
-        except exception.NotFound as e:
-
-            raise exception.Unauthorized(e)
+        res_body = json.loads(res.body)['image']
 
 
 
-        user_ref = old_token_ref['user']
-
-        user_id = user_ref['id']
+        self.assertTrue('id' in res_body)
 
 
 
-        current_user_ref = self.identity_api.get_user(context=context,
+        image_id = res_body['id']
 
-                                                      user_id=user_id)
-
-
-
-        tenant_id = self._get_tenant_id_from_auth(context, auth)
+        self.assertTrue('/images/%s' % image_id in res.headers['location'])
 
 
 
-        tenant_ref = self._get_tenant_ref(context, user_id, tenant_id)
+        # Verify the status is queued
 
-        metadata_ref = self._get_metadata_ref(context, user_id, tenant_id)
+        self.assertTrue('status' in res_body)
 
-
-
-        expiry = old_token_ref['expires']
-
-        auth_token_data = self._get_auth_token_data(current_user_ref,
-
-                                                    tenant_ref,
-
-                                                    metadata_ref,
-
-                                                    expiry)
+        self.assertEqual('queued', res_body['status'])
 
 
 
-        return auth_token_data, (current_user_ref, tenant_ref, metadata_ref)
+        # Check properties are not deleted
+
+        self.assertTrue('properties' in res_body)
+
+        self.assertTrue('key1' in res_body['properties'])
+
+        self.assertEqual('value1', res_body['properties']['key1'])
 
 
 
-    def _authenticate_local(self, context, auth):
+        # Now upload the image file along with some more
 
-        """Try to authenticate against the identity backend.
+        # metadata and verify original metadata properties
+
+        # are not marked deleted
+
+        req = webob.Request.blank("/images/%s" % image_id)
+
+        req.method = 'PUT'
+
+        req.headers['Content-Type'] = 'application/octet-stream'
+
+        req.headers['x-image-meta-property-key2'] = 'value2'
+
+        req.body = "chunk00000remainder"
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, httplib.OK)
 
 
 
-        Returns auth_token_data, (user_ref, tenant_ref, metadata_ref)
+        # Verify the status is queued
+
+        req = webob.Request.blank("/images/%s" % image_id)
+
+        req.method = 'HEAD'
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, httplib.OK)
+
+        self.assertTrue('x-image-meta-property-key1' in res.headers,
+
+                        "Did not find required property in headers. "
+
+                        "Got headers: %r" % res.headers)
+
+        self.assertEqual("active", res.headers['x-image-meta-status'])
+
+
+
+    def test_disable_purge_props(self):
 
         """
 
-        if 'passwordCredentials' not in auth:
+        Test the special x-glance-registry-purge-props header controls
 
-            raise exception.ValidationError(
+        the purge property behaviour of the registry.
 
-                attribute='passwordCredentials', target='auth')
-
-
-
-        if "password" not in auth['passwordCredentials']:
-
-            raise exception.ValidationError(
-
-                attribute='password', target='passwordCredentials')
-
-
-
-        password = auth['passwordCredentials']['password']
-
-
-
-        if ("userId" not in auth['passwordCredentials'] and
-
-                "username" not in auth['passwordCredentials']):
-
-            raise exception.ValidationError(
-
-                attribute='username or userId',
-
-                target='passwordCredentials')
-
-
-
-        user_id = auth['passwordCredentials'].get('userId', None)
-
-        username = auth['passwordCredentials'].get('username', '')
-
-
-
-        if username:
-
-            try:
-
-                user_ref = self.identity_api.get_user_by_name(
-
-                    context=context, user_name=username)
-
-                user_id = user_ref['id']
-
-            except exception.UserNotFound as e:
-
-                raise exception.Unauthorized(e)
-
-
-
-        tenant_id = self._get_tenant_id_from_auth(context, auth)
-
-
-
-        try:
-
-            auth_info = self.identity_api.authenticate(
-
-                context=context,
-
-                user_id=user_id,
-
-                password=password,
-
-                tenant_id=tenant_id)
-
-        except AssertionError as e:
-
-            raise exception.Unauthorized(e)
-
-        (user_ref, tenant_ref, metadata_ref) = auth_info
-
-
-
-        expiry = self.token_api._get_default_expire_time(context=context)
-
-        auth_token_data = self._get_auth_token_data(user_ref,
-
-                                                    tenant_ref,
-
-                                                    metadata_ref,
-
-                                                    expiry)
-
-
-
-        return auth_token_data, (user_ref, tenant_ref, metadata_ref)
-
-
-
-    def _authenticate_external(self, context, auth):
-
-        """Try to authenticate an external user via REMOTE_USER variable.
-
-
-
-        Returns auth_token_data, (user_ref, tenant_ref, metadata_ref)
+        :see LP Bug#901534
 
         """
 
-        if 'REMOTE_USER' not in context:
+        fixture_headers = {'x-image-meta-store': 'file',
 
-            raise ExternalAuthNotApplicable()
+                           'x-image-meta-disk-format': 'vhd',
 
+                           'x-image-meta-container-format': 'ovf',
 
+                           'x-image-meta-name': 'fake image #3',
 
-        username = context['REMOTE_USER']
-
-        try:
-
-            user_ref = self.identity_api.get_user_by_name(
-
-                context=context, user_name=username)
-
-            user_id = user_ref['id']
-
-        except exception.UserNotFound as e:
-
-            raise exception.Unauthorized(e)
+                           'x-image-meta-property-key1': 'value1'}
 
 
 
-        tenant_id = self._get_tenant_id_from_auth(context, auth)
+        req = webob.Request.blank("/images")
+
+        req.method = 'POST'
+
+        for k, v in fixture_headers.iteritems():
+
+            req.headers[k] = v
 
 
 
-        tenant_ref = self._get_tenant_ref(context, user_id, tenant_id)
+        req.headers['Content-Type'] = 'application/octet-stream'
 
-        metadata_ref = self._get_metadata_ref(context, user_id, tenant_id)
+        req.body = "chunk00000remainder"
 
+        res = req.get_response(self.api)
 
+        self.assertEquals(res.status_int, httplib.CREATED)
 
-        expiry = self.token_api._get_default_expire_time(context=context)
-
-        auth_token_data = self._get_auth_token_data(user_ref,
-
-                                                    tenant_ref,
-
-                                                    metadata_ref,
-
-                                                    expiry)
+        res_body = json.loads(res.body)['image']
 
 
 
-        return auth_token_data, (user_ref, tenant_ref, metadata_ref)
+        self.assertTrue('id' in res_body)
 
 
 
-    def _get_auth_token_data(self, user, tenant, metadata, expiry):
+        image_id = res_body['id']
 
-        return dict(dict(user=user,
-
-                         tenant=tenant,
-
-                         metadata=metadata,
-
-                         expires=expiry))
+        self.assertTrue('/images/%s' % image_id in res.headers['location'])
 
 
 
-    def _get_tenant_id_from_auth(self, context, auth):
+        # Verify the status is queued
 
-        """Extract tenant information from auth dict.
+        self.assertTrue('status' in res_body)
+
+        self.assertEqual('active', res_body['status'])
 
 
 
-        Returns a valid tenant_id if it exists, or None if not specified.
+        # Check properties are not deleted
+
+        self.assertTrue('properties' in res_body)
+
+        self.assertTrue('key1' in res_body['properties'])
+
+        self.assertEqual('value1', res_body['properties']['key1'])
+
+
+
+        # Now update the image, setting new properties without
+
+        # passing the x-glance-registry-purge-props header and
+
+        # verify that original properties are marked deleted.
+
+        req = webob.Request.blank("/images/%s" % image_id)
+
+        req.method = 'PUT'
+
+        req.headers['x-image-meta-property-key2'] = 'value2'
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, httplib.OK)
+
+
+
+        # Verify the original property no longer in headers
+
+        req = webob.Request.blank("/images/%s" % image_id)
+
+        req.method = 'HEAD'
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, httplib.OK)
+
+        self.assertTrue('x-image-meta-property-key2' in res.headers,
+
+                        "Did not find required property in headers. "
+
+                        "Got headers: %r" % res.headers)
+
+        self.assertFalse('x-image-meta-property-key1' in res.headers,
+
+                         "Found property in headers that was not expected. "
+
+                         "Got headers: %r" % res.headers)
+
+
+
+        # Now update the image, setting new properties and
+
+        # passing the x-glance-registry-purge-props header with
+
+        # a value of "false" and verify that second property
+
+        # still appears in headers.
+
+        req = webob.Request.blank("/images/%s" % image_id)
+
+        req.method = 'PUT'
+
+        req.headers['x-image-meta-property-key3'] = 'value3'
+
+        req.headers['x-glance-registry-purge-props'] = 'false'
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, httplib.OK)
+
+
+
+        # Verify the second and third property in headers
+
+        req = webob.Request.blank("/images/%s" % image_id)
+
+        req.method = 'HEAD'
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, httplib.OK)
+
+        self.assertTrue('x-image-meta-property-key2' in res.headers,
+
+                        "Did not find required property in headers. "
+
+                        "Got headers: %r" % res.headers)
+
+        self.assertTrue('x-image-meta-property-key3' in res.headers,
+
+                        "Did not find required property in headers. "
+
+                        "Got headers: %r" % res.headers)
+
+
+
+    def test_publicize_image_unauthorized(self):
+
+        """Create a non-public image then fail to make public"""
+
+        rules = {"add_image": [], "publicize_image": [["false:false"]]}
+
+        self.set_policy_rules(rules)
+
+
+
+        fixture_headers = {'x-image-meta-store': 'file',
+
+                           'x-image-meta-disk-format': 'vhd',
+
+                           'x-image-meta-is-public': 'false',
+
+                           'x-image-meta-container-format': 'ovf',
+
+                           'x-image-meta-name': 'fake image #3'}
+
+
+
+        req = webob.Request.blank("/images")
+
+        req.method = 'POST'
+
+        for k, v in fixture_headers.iteritems():
+
+            req.headers[k] = v
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, httplib.CREATED)
+
+
+
+        res_body = json.loads(res.body)['image']
+
+        req = webob.Request.blank("/images/%s" % res_body['id'])
+
+        req.method = 'PUT'
+
+        req.headers['x-image-meta-is-public'] = 'true'
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 403)
+
+
+
+    def test_update_image_size_header_too_big(self):
+
+        """Tests raises BadRequest for supplied image size that is too big"""
+
+        fixture_headers = {'x-image-meta-size': CONF.image_size_cap + 1}
+
+
+
+        req = webob.Request.blank("/images/%s" % UUID2)
+
+        req.method = 'PUT'
+
+        for k, v in fixture_headers.iteritems():
+
+            req.headers[k] = v
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 400)
+
+
+
+    def test_update_image_size_data_too_big(self):
+
+        self.config(image_size_cap=512)
+
+
+
+        fixture_headers = {'content-type': 'application/octet-stream'}
+
+        req = webob.Request.blank("/images/%s" % UUID2)
+
+        req.method = 'PUT'
+
+
+
+        req.body = 'X' * (CONF.image_size_cap + 1)
+
+        for k, v in fixture_headers.iteritems():
+
+            req.headers[k] = v
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 400)
+
+
+
+    def test_update_image_size_chunked_data_too_big(self):
+
+        self.config(image_size_cap=512)
+
+
+
+        # Create new image that has no data
+
+        req = webob.Request.blank("/images")
+
+        req.method = 'POST'
+
+        req.headers['x-image-meta-name'] = 'something'
+
+        req.headers['x-image-meta-container_format'] = 'ami'
+
+        req.headers['x-image-meta-disk_format'] = 'ami'
+
+        res = req.get_response(self.api)
+
+        image_id = json.loads(res.body)['image']['id']
+
+
+
+        fixture_headers = {
+
+            'content-type': 'application/octet-stream',
+
+            'transfer-encoding': 'chunked',
+
+        }
+
+        req = webob.Request.blank("/images/%s" % image_id)
+
+        req.method = 'PUT'
+
+
+
+        req.body_file = StringIO.StringIO('X' * (CONF.image_size_cap + 1))
+
+        for k, v in fixture_headers.iteritems():
+
+            req.headers[k] = v
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 400)
+
+
+
+    def test_get_index_sort_name_asc(self):
 
         """
 
-        tenant_id = auth.get('tenantId', None)
+        Tests that the /images registry API returns list of
 
-        tenant_name = auth.get('tenantName', None)
+        public images sorted alphabetically by name in
 
-        if tenant_name:
-
-            try:
-
-                tenant_ref = self.identity_api.get_tenant_by_name(
-
-                    context=context, tenant_name=tenant_name)
-
-                tenant_id = tenant_ref['id']
-
-            except exception.TenantNotFound as e:
-
-                raise exception.Unauthorized(e)
-
-        return tenant_id
-
-
-
-    def _get_tenant_ref(self, context, user_id, tenant_id):
-
-        """Returns the tenant_ref for the user's tenant"""
-
-        tenant_ref = None
-
-        if tenant_id:
-
-            tenants = self.identity_api.get_tenants_for_user(context, user_id)
-
-            if tenant_id not in tenants:
-
-                msg = 'User %s is unauthorized for tenant %s' % (
-
-                    user_id, tenant_id)
-
-                LOG.warning(msg)
-
-                raise exception.Unauthorized(msg)
-
-
-
-            try:
-
-                tenant_ref = self.identity_api.get_tenant(context=context,
-
-                                                          tenant_id=tenant_id)
-
-            except exception.TenantNotFound as e:
-
-                exception.Unauthorized(e)
-
-        return tenant_ref
-
-
-
-    def _get_metadata_ref(self, context, user_id, tenant_id):
-
-        """Returns the metadata_ref for a user in a tenant"""
-
-        metadata_ref = {}
-
-        if tenant_id:
-
-            try:
-
-                metadata_ref = self.identity_api.get_metadata(
-
-                    context=context,
-
-                    user_id=user_id,
-
-                    tenant_id=tenant_id)
-
-            except exception.MetadataNotFound:
-
-                metadata_ref = {}
-
-
-
-        return metadata_ref
-
-
-
-    def _get_token_ref(self, context, token_id, belongs_to=None):
-
-        """Returns a token if a valid one exists.
-
-
-
-        Optionally, limited to a token owned by a specific tenant.
-
-
+        ascending order.
 
         """
 
-        # TODO(termie): this stuff should probably be moved to middleware
+        UUID3 = _gen_uuid()
 
-        self.assert_admin(context)
+        extra_fixture = {'id': UUID3,
 
+                         'status': 'active',
 
+                         'is_public': True,
 
-        if cms.is_ans1_token(token_id):
+                         'disk_format': 'vhd',
 
-            data = json.loads(cms.cms_verify(cms.token_to_cms(token_id),
+                         'container_format': 'ovf',
 
-                                             config.CONF.signing.certfile,
+                         'name': 'asdf',
 
-                                             config.CONF.signing.ca_certs))
+                         'size': 19,
 
-            data['access']['token']['user'] = data['access']['user']
-
-            data['access']['token']['metadata'] = data['access']['metadata']
-
-            if belongs_to:
-
-                assert data['access']['token']['tenant']['id'] == belongs_to
-
-            token_ref = data['access']['token']
-
-        else:
-
-            token_ref = self.token_api.get_token(context=context,
-
-                                                 token_id=token_id)
-
-        return token_ref
+                         'checksum': None}
 
 
 
-    # admin only
-
-    def validate_token_head(self, context, token_id):
-
-        """Check that a token is valid.
+        db_api.image_create(self.context, extra_fixture)
 
 
 
-        Optionally, also ensure that it is owned by a specific tenant.
+        UUID4 = _gen_uuid()
+
+        extra_fixture = {'id': UUID4,
+
+                         'status': 'active',
+
+                         'is_public': True,
+
+                         'disk_format': 'vhd',
+
+                         'container_format': 'ovf',
+
+                         'name': 'xyz',
+
+                         'size': 20,
+
+                         'checksum': None}
 
 
 
-        Identical to ``validate_token``, except does not return a response.
+        db_api.image_create(self.context, extra_fixture)
 
 
 
-        """
+        req = webob.Request.blank('/images?sort_key=name&sort_dir=asc')
 
-        belongs_to = context['query_string'].get('belongsTo')
+        res = req.get_response(self.api)
 
-        assert self._get_token_ref(context, token_id, belongs_to)
+        self.assertEquals(res.status_int, 200)
 
-
-
-    # admin only
-
-    def validate_token(self, context, token_id):
-
-        """Check that a token is valid.
+        res_dict = json.loads(res.body)
 
 
 
-        Optionally, also ensure that it is owned by a specific tenant.
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 3)
+
+        self.assertEquals(images[0]['id'], UUID3)
+
+        self.assertEquals(images[1]['id'], UUID2)
+
+        self.assertEquals(images[2]['id'], UUID4)
 
 
 
-        Returns metadata about the token along any associated roles.
-
-
+    def test_get_details_filter_changes_since(self):
 
         """
 
-        belongs_to = context['query_string'].get('belongsTo')
+        Tests that the /images/detail registry API returns list of
 
-        token_ref = self._get_token_ref(context, token_id, belongs_to)
+        public images that have a size less than or equal to size_max
 
+        """
 
+        dt1 = timeutils.utcnow() - datetime.timedelta(1)
 
-        # TODO(termie): optimize this call at some point and put it into the
+        iso1 = timeutils.isotime(dt1)
 
-        #               the return for metadata
 
-        # fill out the roles in the metadata
 
-        metadata_ref = token_ref['metadata']
+        dt2 = timeutils.utcnow() + datetime.timedelta(1)
 
-        roles_ref = []
+        iso2 = timeutils.isotime(dt2)
 
-        for role_id in metadata_ref.get('roles', []):
 
-            roles_ref.append(self.identity_api.get_role(context, role_id))
 
+        image_ts = timeutils.utcnow() + datetime.timedelta(2)
 
+        hour_before = image_ts.strftime('%Y-%m-%dT%H:%M:%S%%2B01:00')
 
-        # Get a service catalog if possible
+        hour_after = image_ts.strftime('%Y-%m-%dT%H:%M:%S-01:00')
 
-        # This is needed for on-behalf-of requests
 
-        catalog_ref = None
 
-        if token_ref.get('tenant'):
+        dt4 = timeutils.utcnow() + datetime.timedelta(3)
 
-            catalog_ref = self.catalog_api.get_catalog(
+        iso4 = timeutils.isotime(dt4)
 
-                context=context,
 
-                user_id=token_ref['user']['id'],
 
-                tenant_id=token_ref['tenant']['id'],
+        UUID3 = _gen_uuid()
 
-                metadata=metadata_ref)
+        extra_fixture = {'id': UUID3,
 
-        return self._format_token(token_ref, roles_ref, catalog_ref)
+                         'status': 'active',
 
+                         'is_public': True,
 
+                         'disk_format': 'vhd',
 
-    def delete_token(self, context, token_id):
+                         'container_format': 'ovf',
 
-        """Delete a token, effectively invalidating it for authz."""
+                         'name': 'fake image #3',
 
-        # TODO(termie): this stuff should probably be moved to middleware
+                         'size': 18,
 
-        self.assert_admin(context)
+                         'checksum': None}
 
-        self.token_api.delete_token(context=context, token_id=token_id)
 
 
+        db_api.image_create(self.context, extra_fixture)
 
-    def revocation_list(self, context, auth=None):
+        db_api.image_destroy(self.context, UUID3)
 
-        self.assert_admin(context)
 
-        tokens = self.token_api.list_revoked_tokens(context)
 
+        UUID4 = _gen_uuid()
 
+        extra_fixture = {'id': UUID4,
 
-        for t in tokens:
+                         'status': 'active',
 
-            expires = t['expires']
+                         'is_public': True,
 
-            if not (expires and isinstance(expires, unicode)):
+                         'disk_format': 'ami',
 
-                    t['expires'] = timeutils.isotime(expires)
+                         'container_format': 'ami',
 
-        data = {'revoked': tokens}
+                         'name': 'fake image #4',
 
-        json_data = json.dumps(data)
+                         'size': 20,
 
-        signed_text = cms.cms_sign_text(json_data,
+                         'checksum': None,
 
-                                        config.CONF.signing.certfile,
+                         'created_at': image_ts,
 
-                                        config.CONF.signing.keyfile)
+                         'updated_at': image_ts}
 
 
 
-        return {'signed': signed_text}
+        db_api.image_create(self.context, extra_fixture)
 
 
 
-    def endpoints(self, context, token_id):
+        # Check a standard list, 4 images in db (2 deleted)
 
-        """Return a list of endpoints available to the token."""
+        req = webob.Request.blank('/images/detail')
 
-        self.assert_admin(context)
+        res = req.get_response(self.api)
 
+        self.assertEquals(res.status_int, 200)
 
+        res_dict = json.loads(res.body)
 
-        token_ref = self._get_token_ref(context, token_id)
+        images = res_dict['images']
 
+        self.assertEquals(len(images), 2)
 
+        self.assertEqual(images[0]['id'], UUID4)
 
-        catalog_ref = None
+        self.assertEqual(images[1]['id'], UUID2)
 
-        if token_ref.get('tenant'):
 
-            catalog_ref = self.catalog_api.get_catalog(
 
-                context=context,
+        # Expect 3 images (1 deleted)
 
-                user_id=token_ref['user']['id'],
+        req = webob.Request.blank('/images/detail?changes-since=%s' % iso1)
 
-                tenant_id=token_ref['tenant']['id'],
+        res = req.get_response(self.api)
 
-                metadata=token_ref['metadata'])
+        self.assertEquals(res.status_int, 200)
 
+        res_dict = json.loads(res.body)
 
+        images = res_dict['images']
 
-        return self._format_endpoint_list(catalog_ref)
+        self.assertEquals(len(images), 3)
 
+        self.assertEqual(images[0]['id'], UUID4)
 
+        self.assertEqual(images[1]['id'], UUID3)  # deleted
 
-    def _format_authenticate(self, token_ref, roles_ref, catalog_ref):
+        self.assertEqual(images[2]['id'], UUID2)
 
-        o = self._format_token(token_ref, roles_ref)
 
-        o['access']['serviceCatalog'] = self._format_catalog(catalog_ref)
 
-        return o
+        # Expect 1 images (0 deleted)
 
+        req = webob.Request.blank('/images/detail?changes-since=%s' % iso2)
 
+        res = req.get_response(self.api)
 
-    def _format_token(self, token_ref, roles_ref, catalog_ref=None):
+        self.assertEquals(res.status_int, 200)
 
-        user_ref = token_ref['user']
+        res_dict = json.loads(res.body)
 
-        metadata_ref = token_ref['metadata']
+        images = res_dict['images']
 
-        expires = token_ref['expires']
+        self.assertEquals(len(images), 1)
 
-        if expires is not None:
+        self.assertEqual(images[0]['id'], UUID4)
 
-            if not isinstance(expires, unicode):
 
-                expires = timeutils.isotime(expires)
 
-        o = {'access': {'token': {'id': token_ref['id'],
+        # Expect 1 images (0 deleted)
 
-                                  'expires': expires,
+        req = webob.Request.blank('/images/detail?changes-since=%s' %
 
-                                  'issued_at': timeutils.strtime()
+                                  hour_before)
 
-                                  },
+        res = req.get_response(self.api)
 
-                        'user': {'id': user_ref['id'],
+        self.assertEquals(res.status_int, 200)
 
-                                 'name': user_ref['name'],
+        res_dict = json.loads(res.body)
 
-                                 'username': user_ref['name'],
+        images = res_dict['images']
 
-                                 'roles': roles_ref,
+        self.assertEquals(len(images), 1)
 
-                                 'roles_links': metadata_ref.get('roles_links',
+        self.assertEqual(images[0]['id'], UUID4)
 
-                                                                 [])
 
-                                 }
 
-                        }
+        # Expect 0 images (0 deleted)
+
+        req = webob.Request.blank('/images/detail?changes-since=%s' %
+
+                                  hour_after)
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 200)
+
+        res_dict = json.loads(res.body)
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 0)
+
+
+
+        # Expect 0 images (0 deleted)
+
+        req = webob.Request.blank('/images/detail?changes-since=%s' % iso4)
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 200)
+
+        res_dict = json.loads(res.body)
+
+        images = res_dict['images']
+
+        self.assertEquals(len(images), 0)
+
+
+
+        # Bad request (empty changes-since param)
+
+        req = webob.Request.blank('/images/detail?changes-since=')
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 400)
+
+
+
+        # Bad request (invalid changes-since param)
+
+        req = webob.Request.blank('/images/detail?changes-since=2011-09-05')
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 400)
+
+
+
+    def test_get_images_detailed_unauthorized(self):
+
+        rules = {"get_images": [["false:false"]]}
+
+        self.set_policy_rules(rules)
+
+        req = webob.Request.blank('/images/detail')
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 403)
+
+
+
+    def test_get_images_unauthorized(self):
+
+        rules = {"get_images": [["false:false"]]}
+
+        self.set_policy_rules(rules)
+
+        req = webob.Request.blank('/images/detail')
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 403)
+
+
+
+    def test_store_location_not_revealed(self):
+
+        """
+
+        Test that the internal store location is NOT revealed
+
+        through the API server
+
+        """
+
+        # Check index and details...
+
+        for url in ('/images', '/images/detail'):
+
+            req = webob.Request.blank(url)
+
+            res = req.get_response(self.api)
+
+            self.assertEquals(res.status_int, 200)
+
+            res_dict = json.loads(res.body)
+
+
+
+            images = res_dict['images']
+
+            num_locations = sum([1 for record in images
+
+                                if 'location' in record.keys()])
+
+            self.assertEquals(0, num_locations, images)
+
+
+
+        # Check GET
+
+        req = webob.Request.blank("/images/%s" % UUID2)
+
+        res = req.get_response(self.api)
+
+        self.assertEqual(res.status_int, 200)
+
+        self.assertFalse('X-Image-Meta-Location' in res.headers)
+
+
+
+        # Check HEAD
+
+        req = webob.Request.blank("/images/%s" % UUID2)
+
+        req.method = 'HEAD'
+
+        res = req.get_response(self.api)
+
+        self.assertEqual(res.status_int, 200)
+
+        self.assertFalse('X-Image-Meta-Location' in res.headers)
+
+
+
+        # Check PUT
+
+        req = webob.Request.blank("/images/%s" % UUID2)
+
+        req.body = res.body
+
+        req.method = 'PUT'
+
+        res = req.get_response(self.api)
+
+        self.assertEqual(res.status_int, 200)
+
+        res_body = json.loads(res.body)
+
+        self.assertFalse('location' in res_body['image'])
+
+
+
+        # Check POST
+
+        req = webob.Request.blank("/images")
+
+        headers = {'x-image-meta-location': 'http://localhost',
+
+                   'x-image-meta-disk-format': 'vhd',
+
+                   'x-image-meta-container-format': 'ovf',
+
+                   'x-image-meta-name': 'fake image #3'}
+
+        for k, v in headers.iteritems():
+
+            req.headers[k] = v
+
+        req.method = 'POST'
+
+        res = req.get_response(self.api)
+
+        self.assertEqual(res.status_int, 201)
+
+        res_body = json.loads(res.body)
+
+        self.assertFalse('location' in res_body['image'])
+
+
+
+    def test_image_is_checksummed(self):
+
+        """Test that the image contents are checksummed properly"""
+
+        fixture_headers = {'x-image-meta-store': 'file',
+
+                           'x-image-meta-disk-format': 'vhd',
+
+                           'x-image-meta-container-format': 'ovf',
+
+                           'x-image-meta-name': 'fake image #3'}
+
+        image_contents = "chunk00000remainder"
+
+        image_checksum = hashlib.md5(image_contents).hexdigest()
+
+
+
+        req = webob.Request.blank("/images")
+
+        req.method = 'POST'
+
+        for k, v in fixture_headers.iteritems():
+
+            req.headers[k] = v
+
+
+
+        req.headers['Content-Type'] = 'application/octet-stream'
+
+        req.body = image_contents
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, httplib.CREATED)
+
+
+
+        res_body = json.loads(res.body)['image']
+
+        self.assertEquals(image_checksum, res_body['checksum'],
+
+                          "Mismatched checksum. Expected %s, got %s" %
+
+                          (image_checksum, res_body['checksum']))
+
+
+
+    def test_etag_equals_checksum_header(self):
+
+        """Test that the ETag header matches the x-image-meta-checksum"""
+
+        fixture_headers = {'x-image-meta-store': 'file',
+
+                           'x-image-meta-disk-format': 'vhd',
+
+                           'x-image-meta-container-format': 'ovf',
+
+                           'x-image-meta-name': 'fake image #3'}
+
+        image_contents = "chunk00000remainder"
+
+        image_checksum = hashlib.md5(image_contents).hexdigest()
+
+
+
+        req = webob.Request.blank("/images")
+
+        req.method = 'POST'
+
+        for k, v in fixture_headers.iteritems():
+
+            req.headers[k] = v
+
+
+
+        req.headers['Content-Type'] = 'application/octet-stream'
+
+        req.body = image_contents
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, httplib.CREATED)
+
+
+
+        image = json.loads(res.body)['image']
+
+
+
+        # HEAD the image and check the ETag equals the checksum header...
+
+        expected_headers = {'x-image-meta-checksum': image_checksum,
+
+                            'etag': image_checksum}
+
+        req = webob.Request.blank("/images/%s" % image['id'])
+
+        req.method = 'HEAD'
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        for key in expected_headers.keys():
+
+            self.assertTrue(key in res.headers,
+
+                            "required header '%s' missing from "
+
+                            "returned headers" % key)
+
+        for key, value in expected_headers.iteritems():
+
+            self.assertEquals(value, res.headers[key])
+
+
+
+    def test_bad_checksum_prevents_image_creation(self):
+
+        """Test that the image contents are checksummed properly"""
+
+        image_contents = "chunk00000remainder"
+
+        bad_checksum = hashlib.md5("invalid").hexdigest()
+
+        fixture_headers = {'x-image-meta-store': 'file',
+
+                           'x-image-meta-disk-format': 'vhd',
+
+                           'x-image-meta-container-format': 'ovf',
+
+                           'x-image-meta-name': 'fake image #3',
+
+                           'x-image-meta-checksum': bad_checksum,
+
+                           'x-image-meta-is-public': 'true'}
+
+
+
+        req = webob.Request.blank("/images")
+
+        req.method = 'POST'
+
+        for k, v in fixture_headers.iteritems():
+
+            req.headers[k] = v
+
+
+
+        req.headers['Content-Type'] = 'application/octet-stream'
+
+        req.body = image_contents
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, webob.exc.HTTPBadRequest.code)
+
+
+
+        # Test that only one image was returned (that already exists)
+
+        req = webob.Request.blank("/images")
+
+        req.method = 'GET'
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 200)
+
+        images = json.loads(res.body)['images']
+
+        self.assertEqual(len(images), 1)
+
+
+
+    def test_image_meta(self):
+
+        """Test for HEAD /images/<ID>"""
+
+        expected_headers = {'x-image-meta-id': UUID2,
+
+                            'x-image-meta-name': 'fake image #2'}
+
+        req = webob.Request.blank("/images/%s" % UUID2)
+
+        req.method = 'HEAD'
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        for key, value in expected_headers.iteritems():
+
+            self.assertEquals(value, res.headers[key])
+
+
+
+    def test_image_meta_unauthorized(self):
+
+        rules = {"get_image": [["false:false"]]}
+
+        self.set_policy_rules(rules)
+
+        req = webob.Request.blank("/images/%s" % UUID2)
+
+        req.method = 'HEAD'
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 403)
+
+
+
+    def test_show_image_basic(self):
+
+        req = webob.Request.blank("/images/%s" % UUID2)
+
+        res = req.get_response(self.api)
+
+        self.assertEqual(res.status_int, 200)
+
+        self.assertEqual(res.content_type, 'application/octet-stream')
+
+        self.assertEqual('chunk00000remainder', res.body)
+
+
+
+    def test_show_non_exists_image(self):
+
+        req = webob.Request.blank("/images/%s" % _gen_uuid())
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, webob.exc.HTTPNotFound.code)
+
+
+
+    def test_show_image_unauthorized(self):
+
+        rules = {"get_image": [["false:false"]]}
+
+        self.set_policy_rules(rules)
+
+        req = webob.Request.blank("/images/%s" % UUID2)
+
+        res = req.get_response(self.api)
+
+        self.assertEqual(res.status_int, 403)
+
+
+
+    def test_show_image_unauthorized_download(self):
+
+        rules = {"download_image": [["false:false"]]}
+
+        self.set_policy_rules(rules)
+
+        req = webob.Request.blank("/images/%s" % UUID2)
+
+        res = req.get_response(self.api)
+
+        self.assertEqual(res.status_int, 403)
+
+
+
+    def test_delete_image(self):
+
+        req = webob.Request.blank("/images/%s" % UUID2)
+
+        req.method = 'DELETE'
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        req = webob.Request.blank("/images/%s" % UUID2)
+
+        req.method = 'GET'
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, webob.exc.HTTPNotFound.code,
+
+                          res.body)
+
+
+
+        req = webob.Request.blank("/images/%s" % UUID2)
+
+        req.method = 'HEAD'
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 200)
+
+        self.assertEquals(res.headers['x-image-meta-deleted'], 'True')
+
+        self.assertEquals(res.headers['x-image-meta-status'], 'deleted')
+
+
+
+    def test_delete_non_exists_image(self):
+
+        req = webob.Request.blank("/images/%s" % _gen_uuid())
+
+        req.method = 'DELETE'
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, webob.exc.HTTPNotFound.code)
+
+
+
+    def test_delete_not_allowed(self):
+
+        # Verify we can get the image data
+
+        req = webob.Request.blank("/images/%s" % UUID2)
+
+        req.method = 'GET'
+
+        req.headers['X-Auth-Token'] = 'user:tenant:'
+
+        res = req.get_response(self.api)
+
+        self.assertEqual(res.status_int, 200)
+
+        self.assertEqual(len(res.body), 19)
+
+
+
+        # Verify we cannot delete the image
+
+        req.method = 'DELETE'
+
+        res = req.get_response(self.api)
+
+        self.assertEqual(res.status_int, 403)
+
+
+
+        # Verify the image data is still there
+
+        req.method = 'GET'
+
+        res = req.get_response(self.api)
+
+        self.assertEqual(res.status_int, 200)
+
+        self.assertEqual(len(res.body), 19)
+
+
+
+    def test_delete_queued_image(self):
+
+        """Delete an image in a queued state
+
+
+
+        Bug #747799 demonstrated that trying to DELETE an image
+
+        that had had its save process killed manually results in failure
+
+        because the location attribute is None.
+
+
+
+        Bug #1048851 demonstrated that the status was not properly
+
+        being updated to 'deleted' from 'queued'.
+
+        """
+
+        fixture_headers = {'x-image-meta-store': 'file',
+
+                           'x-image-meta-disk-format': 'vhd',
+
+                           'x-image-meta-container-format': 'ovf',
+
+                           'x-image-meta-name': 'fake image #3'}
+
+
+
+        req = webob.Request.blank("/images")
+
+        req.method = 'POST'
+
+        for k, v in fixture_headers.iteritems():
+
+            req.headers[k] = v
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, httplib.CREATED)
+
+
+
+        res_body = json.loads(res.body)['image']
+
+        self.assertEquals('queued', res_body['status'])
+
+
+
+        # Now try to delete the image...
+
+        req = webob.Request.blank("/images/%s" % res_body['id'])
+
+        req.method = 'DELETE'
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        req = webob.Request.blank('/images/%s' % res_body['id'])
+
+        req.method = 'HEAD'
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 200)
+
+        self.assertEquals(res.headers['x-image-meta-deleted'], 'True')
+
+        self.assertEquals(res.headers['x-image-meta-status'], 'deleted')
+
+
+
+    def test_delete_queued_image_delayed_delete(self):
+
+        """Delete an image in a queued state when delayed_delete is on
+
+
+
+        Bug #1048851 demonstrated that the status was not properly
+
+        being updated to 'deleted' from 'queued'.
+
+        """
+
+        self.config(delayed_delete=True)
+
+        fixture_headers = {'x-image-meta-store': 'file',
+
+                           'x-image-meta-disk-format': 'vhd',
+
+                           'x-image-meta-container-format': 'ovf',
+
+                           'x-image-meta-name': 'fake image #3'}
+
+
+
+        req = webob.Request.blank("/images")
+
+        req.method = 'POST'
+
+        for k, v in fixture_headers.iteritems():
+
+            req.headers[k] = v
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, httplib.CREATED)
+
+
+
+        res_body = json.loads(res.body)['image']
+
+        self.assertEquals('queued', res_body['status'])
+
+
+
+        # Now try to delete the image...
+
+        req = webob.Request.blank("/images/%s" % res_body['id'])
+
+        req.method = 'DELETE'
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        req = webob.Request.blank('/images/%s' % res_body['id'])
+
+        req.method = 'HEAD'
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 200)
+
+        self.assertEquals(res.headers['x-image-meta-deleted'], 'True')
+
+        self.assertEquals(res.headers['x-image-meta-status'], 'deleted')
+
+
+
+    def test_delete_protected_image(self):
+
+        fixture_headers = {'x-image-meta-store': 'file',
+
+                           'x-image-meta-name': 'fake image #3',
+
+                           'x-image-meta-disk-format': 'vhd',
+
+                           'x-image-meta-container-format': 'ovf',
+
+                           'x-image-meta-protected': 'True'}
+
+
+
+        req = webob.Request.blank("/images")
+
+        req.method = 'POST'
+
+        for k, v in fixture_headers.iteritems():
+
+            req.headers[k] = v
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, httplib.CREATED)
+
+
+
+        res_body = json.loads(res.body)['image']
+
+        self.assertEquals('queued', res_body['status'])
+
+
+
+        # Now try to delete the image...
+
+        req = webob.Request.blank("/images/%s" % res_body['id'])
+
+        req.method = 'DELETE'
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, httplib.FORBIDDEN)
+
+
+
+    def test_delete_image_unauthorized(self):
+
+        rules = {"delete_image": [["false:false"]]}
+
+        self.set_policy_rules(rules)
+
+        req = webob.Request.blank("/images/%s" % UUID2)
+
+        req.method = 'DELETE'
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 403)
+
+
+
+    def test_get_details_invalid_marker(self):
+
+        """
+
+        Tests that the /images/detail registry API returns a 400
+
+        when an invalid marker is provided
+
+        """
+
+        req = webob.Request.blank('/images/detail?marker=%s' % _gen_uuid())
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 400)
+
+
+
+    def test_get_image_members(self):
+
+        """
+
+        Tests members listing for existing images
+
+        """
+
+        req = webob.Request.blank('/images/%s/members' % UUID2)
+
+        req.method = 'GET'
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        memb_list = json.loads(res.body)
+
+        num_members = len(memb_list['members'])
+
+        self.assertEquals(num_members, 0)
+
+
+
+    def test_get_image_members_not_existing(self):
+
+        """
+
+        Tests proper exception is raised if attempt to get members of
+
+        non-existing image
+
+        """
+
+        req = webob.Request.blank('/images/%s/members' % _gen_uuid())
+
+        req.method = 'GET'
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int,
+
+                          webob.exc.HTTPNotFound.code)
+
+
+
+    def test_get_member_images(self):
+
+        """
+
+        Tests image listing for members
+
+        """
+
+        req = webob.Request.blank('/shared-images/pattieblack')
+
+        req.method = 'GET'
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, 200)
+
+
+
+        memb_list = json.loads(res.body)
+
+        num_members = len(memb_list['shared_images'])
+
+        self.assertEquals(num_members, 0)
+
+
+
+    def test_replace_members(self):
+
+        """
+
+        Tests replacing image members raises right exception
+
+        """
+
+        self.api = test_utils.FakeAuthMiddleware(router.API(self.mapper),
+
+                                                     is_admin=False)
+
+        fixture = dict(member_id='pattieblack')
+
+
+
+        req = webob.Request.blank('/images/%s/members' % UUID2)
+
+        req.method = 'PUT'
+
+        req.content_type = 'application/json'
+
+        req.body = json.dumps(dict(image_memberships=fixture))
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, webob.exc.HTTPUnauthorized.code)
+
+
+
+    def test_add_member(self):
+
+        """
+
+        Tests adding image members raises right exception
+
+        """
+
+        self.api = test_utils.FakeAuthMiddleware(router.API(self.mapper),
+
+                                                     is_admin=False)
+
+        req = webob.Request.blank('/images/%s/members/pattieblack' % UUID2)
+
+        req.method = 'PUT'
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, webob.exc.HTTPUnauthorized.code)
+
+
+
+    def test_delete_member(self):
+
+        """
+
+        Tests deleting image members raises right exception
+
+        """
+
+        self.api = test_utils.FakeAuthMiddleware(router.API(self.mapper),
+
+                                                     is_admin=False)
+
+        req = webob.Request.blank('/images/%s/members/pattieblack' % UUID2)
+
+        req.method = 'DELETE'
+
+
+
+        res = req.get_response(self.api)
+
+        self.assertEquals(res.status_int, webob.exc.HTTPUnauthorized.code)
+
+
+
+
+
+class TestImageSerializer(base.IsolatedUnitTest):
+
+    def setUp(self):
+
+        """Establish a clean test environment"""
+
+        super(TestImageSerializer, self).setUp()
+
+        self.receiving_user = 'fake_user'
+
+        self.receiving_tenant = 2
+
+        self.context = glance.context.RequestContext(
+
+                is_admin=True,
+
+                user=self.receiving_user,
+
+                tenant=self.receiving_tenant)
+
+        self.serializer = images.ImageSerializer()
+
+
+
+        def image_iter():
+
+            for x in ['chunk', '678911234', '56789']:
+
+                yield x
+
+
+
+        self.FIXTURE = {
+
+             'image_iterator': image_iter(),
+
+             'image_meta': {
+
+                 'id': UUID2,
+
+                 'name': 'fake image #2',
+
+                 'status': 'active',
+
+                 'disk_format': 'vhd',
+
+                 'container_format': 'ovf',
+
+                 'is_public': True,
+
+                 'created_at': timeutils.utcnow(),
+
+                 'updated_at': timeutils.utcnow(),
+
+                 'deleted_at': None,
+
+                 'deleted': False,
+
+                 'checksum': '06ff575a2856444fbe93100157ed74ab92eb7eff',
+
+                 'size': 19,
+
+                 'owner': _gen_uuid(),
+
+                 'location': "file:///tmp/glance-tests/2",
+
+                 'properties': {}}
 
              }
 
-        if 'tenant' in token_ref and token_ref['tenant']:
-
-            token_ref['tenant']['enabled'] = True
-
-            o['access']['token']['tenant'] = token_ref['tenant']
-
-        if catalog_ref is not None:
-
-            o['access']['serviceCatalog'] = self._format_catalog(catalog_ref)
-
-        if metadata_ref:
-
-            if 'is_admin' in metadata_ref:
-
-                o['access']['metadata'] = {'is_admin':
-
-                                           metadata_ref['is_admin']}
-
-            else:
-
-                o['access']['metadata'] = {'is_admin': 0}
-
-        if 'roles' in metadata_ref:
-
-                o['access']['metadata']['roles'] = metadata_ref['roles']
-
-        return o
 
 
+    def test_meta(self):
 
-    def _format_catalog(self, catalog_ref):
+        exp_headers = {'x-image-meta-id': UUID2,
 
-        """Munge catalogs from internal to output format
+                       'x-image-meta-location': 'file:///tmp/glance-tests/2',
 
-        Internal catalogs look like:
+                       'ETag': self.FIXTURE['image_meta']['checksum'],
+
+                       'x-image-meta-name': 'fake image #2'}
+
+        req = webob.Request.blank("/images/%s" % UUID2)
+
+        req.method = 'HEAD'
+
+        req.remote_addr = "1.2.3.4"
+
+        req.context = self.context
+
+        response = webob.Response(request=req)
+
+        self.serializer.meta(response, self.FIXTURE)
+
+        for key, value in exp_headers.iteritems():
+
+            self.assertEquals(value, response.headers[key])
 
 
 
-        {$REGION: {
+    def test_meta_utf8(self):
 
-            {$SERVICE: {
+        # We get unicode strings from JSON, and therefore all strings in the
 
-                $key1: $value1,
+        # metadata will actually be unicode when handled internally. But we
 
-                ...
+        # want to output utf-8.
 
-                }
+        FIXTURE = {
+
+             'image_meta': {
+
+                 'id': unicode(UUID2),
+
+                 'name': u'fake image #2 with utf-8 éàè',
+
+                 'status': u'active',
+
+                 'disk_format': u'vhd',
+
+                 'container_format': u'ovf',
+
+                 'is_public': True,
+
+                 'created_at': timeutils.utcnow(),
+
+                 'updated_at': timeutils.utcnow(),
+
+                 'deleted_at': None,
+
+                 'deleted': False,
+
+                 'checksum': u'06ff575a2856444fbe93100157ed74ab92eb7eff',
+
+                 'size': 19,
+
+                 'owner': unicode(_gen_uuid()),
+
+                 'location': u"file:///tmp/glance-tests/2",
+
+                 'properties': {
+
+                     u'prop_éé': u'ça marche',
+
+                     u'prop_çé': u'çé',
+
+                     }
+
+                 }
+
+             }
+
+        exp_headers = {'x-image-meta-id': UUID2.encode('utf-8'),
+
+                       'x-image-meta-location': 'file:///tmp/glance-tests/2',
+
+                       'ETag': '06ff575a2856444fbe93100157ed74ab92eb7eff',
+
+                       'x-image-meta-size': '19',  # str, not int
+
+                       'x-image-meta-name': 'fake image #2 with utf-8 éàè',
+
+                       'x-image-meta-property-prop_éé': 'ça marche',
+
+                       'x-image-meta-property-prop_çé': u'çé'.encode('utf-8')}
+
+        req = webob.Request.blank("/images/%s" % UUID2)
+
+        req.method = 'HEAD'
+
+        req.remote_addr = "1.2.3.4"
+
+        req.context = self.context
+
+        response = webob.Response(request=req)
+
+        self.serializer.meta(response, FIXTURE)
+
+        self.assertNotEqual(type(FIXTURE['image_meta']['name']),
+
+                            type(response.headers['x-image-meta-name']))
+
+        self.assertEqual(response.headers['x-image-meta-name'].decode('utf-8'),
+
+                         FIXTURE['image_meta']['name'])
+
+        for key, value in exp_headers.iteritems():
+
+            self.assertEquals(value, response.headers[key])
+
+
+
+        FIXTURE['image_meta']['properties'][u'prop_bad'] = 'çé'
+
+        self.assertRaises(UnicodeDecodeError,
+
+                          self.serializer.meta, response, FIXTURE)
+
+
+
+    def test_show(self):
+
+        exp_headers = {'x-image-meta-id': UUID2,
+
+                       'x-image-meta-location': 'file:///tmp/glance-tests/2',
+
+                       'ETag': self.FIXTURE['image_meta']['checksum'],
+
+                       'x-image-meta-name': 'fake image #2'}
+
+        req = webob.Request.blank("/images/%s" % UUID2)
+
+        req.method = 'GET'
+
+        req.context = self.context
+
+        response = webob.Response(request=req)
+
+        self.serializer.show(response, self.FIXTURE)
+
+        for key, value in exp_headers.iteritems():
+
+            self.assertEquals(value, response.headers[key])
+
+
+
+        self.assertEqual(response.body, 'chunk67891123456789')
+
+
+
+    def test_show_notify(self):
+
+        """Make sure an eventlet posthook for notify_image_sent is added."""
+
+        req = webob.Request.blank("/images/%s" % UUID2)
+
+        req.method = 'GET'
+
+        req.context = self.context
+
+        response = webob.Response(request=req)
+
+        response.request.environ['eventlet.posthooks'] = []
+
+
+
+        self.serializer.show(response, self.FIXTURE)
+
+
+
+        #just make sure the app_iter is called
+
+        for chunk in response.app_iter:
+
+            pass
+
+
+
+        self.assertNotEqual(response.request.environ['eventlet.posthooks'], [])
+
+
+
+    def test_image_send_notification(self):
+
+        req = webob.Request.blank("/images/%s" % UUID2)
+
+        req.method = 'GET'
+
+        req.remote_addr = '1.2.3.4'
+
+        req.context = self.context
+
+
+
+        image_meta = self.FIXTURE['image_meta']
+
+        called = {"notified": False}
+
+        expected_payload = {
+
+            'bytes_sent': 19,
+
+            'image_id': UUID2,
+
+            'owner_id': image_meta['owner'],
+
+            'receiver_tenant_id': self.receiving_tenant,
+
+            'receiver_user_id': self.receiving_user,
+
+            'destination_ip': '1.2.3.4',
 
             }
 
-        }
+
+
+        def fake_info(_event_type, _payload):
+
+            self.assertEqual(_payload, expected_payload)
+
+            called['notified'] = True
 
 
 
-        The legacy api wants them to look like
+        self.stubs.Set(self.serializer.notifier, 'info', fake_info)
 
 
 
-        [{'name': $SERVICE[name],
+        glance.api.common.image_send_notification(19, 19, image_meta, req,
 
-          'type': $SERVICE,
-
-          'endpoints': [{
-
-              'tenantId': $tenant_id,
-
-              ...
-
-              'region': $REGION,
-
-              }],
-
-          'endpoints_links': [],
-
-         }]
+                                                  self.serializer.notifier)
 
 
 
-        """
-
-        if not catalog_ref:
-
-            return {}
+        self.assertTrue(called['notified'])
 
 
 
-        services = {}
+    def test_image_send_notification_error(self):
 
-        for region, region_ref in catalog_ref.iteritems():
+        """Ensure image.send notification is sent on error."""
 
-            for service, service_ref in region_ref.iteritems():
+        req = webob.Request.blank("/images/%s" % UUID2)
 
-                new_service_ref = services.get(service, {})
+        req.method = 'GET'
 
-                new_service_ref['name'] = service_ref.pop('name')
+        req.remote_addr = '1.2.3.4'
 
-                new_service_ref['type'] = service
-
-                new_service_ref['endpoints_links'] = []
-
-                service_ref['region'] = region
+        req.context = self.context
 
 
 
-                endpoints_ref = new_service_ref.get('endpoints', [])
+        image_meta = self.FIXTURE['image_meta']
 
-                endpoints_ref.append(service_ref)
+        called = {"notified": False}
 
+        expected_payload = {
 
+            'bytes_sent': 17,
 
-                new_service_ref['endpoints'] = endpoints_ref
+            'image_id': UUID2,
 
-                services[service] = new_service_ref
+            'owner_id': image_meta['owner'],
 
+            'receiver_tenant_id': self.receiving_tenant,
 
+            'receiver_user_id': self.receiving_user,
 
-        return services.values()
-
-
-
-    def _format_endpoint_list(self, catalog_ref):
-
-        """Formats a list of endpoints according to Identity API v2.
-
-
-
-        The v2.0 API wants an endpoint list to look like::
-
-
-
-            {
-
-                'endpoints': [
-
-                    {
-
-                        'id': $endpoint_id,
-
-                        'name': $SERVICE[name],
-
-                        'type': $SERVICE,
-
-                        'tenantId': $tenant_id,
-
-                        'region': $REGION,
-
-                    }
-
-                ],
-
-                'endpoints_links': [],
+            'destination_ip': '1.2.3.4',
 
             }
 
 
 
-        """
+        def fake_error(_event_type, _payload):
 
-        if not catalog_ref:
+            self.assertEqual(_payload, expected_payload)
 
-            return {}
+            called['notified'] = True
 
 
 
-        endpoints = []
+        self.stubs.Set(self.serializer.notifier, 'error', fake_error)
 
-        for region_name, region_ref in catalog_ref.iteritems():
 
-            for service_type, service_ref in region_ref.iteritems():
 
-                endpoints.append({
+        #expected and actually sent bytes differ
 
-                    'id': service_ref.get('id'),
+        glance.api.common.image_send_notification(17, 19, image_meta, req,
 
-                    'name': service_ref.get('name'),
+                                                  self.serializer.notifier)
 
-                    'type': service_type,
 
-                    'region': region_name,
 
-                    'publicURL': service_ref.get('publicURL'),
-
-                    'internalURL': service_ref.get('internalURL'),
-
-                    'adminURL': service_ref.get('adminURL'),
-
-                })
-
-
-
-        return {'endpoints': endpoints, 'endpoints_links': []}
-
-
-
-
-
-class ExtensionsController(wsgi.Application):
-
-    """Base extensions controller to be extended by public and admin API's."""
-
-
-
-    def __init__(self, extensions=None):
-
-        super(ExtensionsController, self).__init__()
-
-
-
-        self.extensions = extensions or {}
-
-
-
-    def get_extensions_info(self, context):
-
-        return {'extensions': {'values': self.extensions.values()}}
-
-
-
-    def get_extension_info(self, context, extension_alias):
-
-        try:
-
-            return {'extension': self.extensions[extension_alias]}
-
-        except KeyError:
-
-            raise exception.NotFound(target=extension_alias)
-
-
-
-
-
-class PublicExtensionsController(ExtensionsController):
-
-    pass
-
-
-
-
-
-class AdminExtensionsController(ExtensionsController):
-
-    def __init__(self, *args, **kwargs):
-
-        super(AdminExtensionsController, self).__init__(*args, **kwargs)
-
-
-
-        # TODO(dolph): Extensions should obviously provide this information
-
-        #               themselves, but hardcoding it here allows us to match
-
-        #               the API spec in the short term with minimal complexity.
-
-        self.extensions['OS-KSADM'] = {
-
-            'name': 'Openstack Keystone Admin',
-
-            'namespace': 'http://docs.openstack.org/identity/api/ext/'
-
-                         'OS-KSADM/v1.0',
-
-            'alias': 'OS-KSADM',
-
-            'updated': '2011-08-19T13:25:27-06:00',
-
-            'description': 'Openstack extensions to Keystone v2.0 API '
-
-                           'enabling Admin Operations.',
-
-            'links': [
-
-                {
-
-                    'rel': 'describedby',
-
-                    # TODO(dolph): link needs to be revised after
-
-                    #              bug 928059 merges
-
-                    'type': 'text/html',
-
-                    'href': 'https://github.com/openstack/identity-api',
-
-                }
-
-            ]
-
-        }
-
-
-
-
-
-@logging.fail_gracefully
-
-def public_app_factory(global_conf, **local_conf):
-
-    conf = global_conf.copy()
-
-    conf.update(local_conf)
-
-    return PublicRouter()
-
-
-
-
-
-@logging.fail_gracefully
-
-def admin_app_factory(global_conf, **local_conf):
-
-    conf = global_conf.copy()
-
-    conf.update(local_conf)
-
-    return AdminRouter()
-
-
-
-
-
-@logging.fail_gracefully
-
-def public_version_app_factory(global_conf, **local_conf):
-
-    conf = global_conf.copy()
-
-    conf.update(local_conf)
-
-    return PublicVersionRouter()
-
-
-
-
-
-@logging.fail_gracefully
-
-def admin_version_app_factory(global_conf, **local_conf):
-
-    conf = global_conf.copy()
-
-    conf.update(local_conf)
-
-    return AdminVersionRouter()
-
-
-
-
-
-@logging.fail_gracefully
-
-def v3_app_factory(global_conf, **local_conf):
-
-    conf = global_conf.copy()
-
-    conf.update(local_conf)
-
-    return V3Router()
+        self.assertTrue(called['notified'])

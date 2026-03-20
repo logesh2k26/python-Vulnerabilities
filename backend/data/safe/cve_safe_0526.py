@@ -2,384 +2,286 @@
 # Safety: safe
 # Category: safe
 
-# Author: Trevor Perrin
+# -*- coding: utf8 -*-
 
-# See the LICENSE file for legal information regarding use of this file.
+from django.contrib.auth import get_user_model
 
+from django.core import mail
 
+from django.test import TestCase
 
-"""Factory functions for asymmetric cryptography."""
+from rest_framework.authtoken.models import Token
 
 
 
-from .compat import *
+from nopassword.models import LoginCode
 
 
 
-from .rsakey import RSAKey
 
-from .python_rsakey import Python_RSAKey
 
-from tlslite.utils import cryptomath
+class TestRestViews(TestCase):
 
 
 
-if cryptomath.m2cryptoLoaded:
+    def setUp(self):
 
-    from .openssl_rsakey import OpenSSL_RSAKey
+        self.user = get_user_model().objects.create(username='user', email='foo@bar.com')
 
 
 
-if cryptomath.pycryptoLoaded:
+    def test_request_login_code(self):
 
-    from .pycrypto_rsakey import PyCrypto_RSAKey
+        response = self.client.post('/accounts-rest/login/', {
 
+            'username': self.user.username,
 
+            'next': '/private/',
 
-# **************************************************************************
+        })
 
-# Factory Functions for RSA Keys
 
-# **************************************************************************
 
+        self.assertEqual(response.status_code, 200)
 
 
-def generateRSAKey(bits, implementations=["openssl", "python"]):
 
-    """Generate an RSA key with the specified bit length.
+        login_code = LoginCode.objects.filter(user=self.user).first()
 
 
 
-    :type bits: int
+        self.assertIsNotNone(login_code)
 
-    :param bits: Desired bit length of the new key's modulus.
+        self.assertEqual(login_code.next, '/private/')
 
+        self.assertEqual(len(mail.outbox), 1)
 
+        self.assertIn(
 
-    :rtype: ~tlslite.utils.rsakey.RSAKey
+            'http://testserver/accounts/login/code/?user={}&code={}'.format(
 
-    :returns: A new RSA private key.
+                login_code.user.pk,
 
-    """
+                login_code.code
 
-    for implementation in implementations:
+            ),
 
-        if implementation == "openssl" and cryptomath.m2cryptoLoaded:
+            mail.outbox[0].body,
 
-            return OpenSSL_RSAKey.generate(bits)
+        )
 
-        elif implementation == "python":
 
-            return Python_RSAKey.generate(bits)
 
-    raise ValueError("No acceptable implementations")
+    def test_request_login_code_missing_username(self):
 
+        response = self.client.post('/accounts-rest/login/')
 
 
-#Parse as an OpenSSL or Python key
 
-def parsePEMKey(s, private=False, public=False, passwordCallback=None,
+        self.assertEqual(response.status_code, 400)
 
-                implementations=["openssl", "python"]):
+        self.assertEqual(response.json(), {
 
-    """Parse a PEM-format key.
+            'username': ['This field is required.'],
 
+        })
 
 
-    The PEM format is used by OpenSSL and other tools.  The
 
-    format is typically used to store both the public and private
+    def test_request_login_code_unknown_user(self):
 
-    components of a key.  For example::
+        response = self.client.post('/accounts-rest/login/', {
 
+            'username': 'unknown',
 
+        })
 
-       -----BEGIN RSA PRIVATE KEY-----
 
-        MIICXQIBAAKBgQDYscuoMzsGmW0pAYsmyHltxB2TdwHS0dImfjCMfaSDkfLdZY5+
 
-        dOWORVns9etWnr194mSGA1F0Pls/VJW8+cX9+3vtJV8zSdANPYUoQf0TP7VlJxkH
+        self.assertEqual(response.status_code, 400)
 
-        dSRkUbEoz5bAAs/+970uos7n7iXQIni+3erUTdYEk2iWnMBjTljfgbK/dQIDAQAB
+        self.assertEqual(response.json(), {
 
-        AoGAJHoJZk75aKr7DSQNYIHuruOMdv5ZeDuJvKERWxTrVJqE32/xBKh42/IgqRrc
+            'username': ['Please enter a correct userid. Note that it is case-sensitive.'],
 
-        esBN9ZregRCd7YtxoL+EVUNWaJNVx2mNmezEznrc9zhcYUrgeaVdFO2yBF1889zO
+        })
 
-        gCOVwrO8uDgeyj6IKa25H6c1N13ih/o7ZzEgWbGG+ylU1yECQQDv4ZSJ4EjSh/Fl
 
-        aHdz3wbBa/HKGTjC8iRy476Cyg2Fm8MZUe9Yy3udOrb5ZnS2MTpIXt5AF3h2TfYV
 
-        VoFXIorjAkEA50FcJmzT8sNMrPaV8vn+9W2Lu4U7C+K/O2g1iXMaZms5PC5zV5aV
+    def test_request_login_code_inactive_user(self):
 
-        CKXZWUX1fq2RaOzlbQrpgiolhXpeh8FjxwJBAOFHzSQfSsTNfttp3KUpU0LbiVvv
+        self.user.is_active = False
 
-        i+spVSnA0O4rq79KpVNmK44Mq67hsW1P11QzrzTAQ6GVaUBRv0YS061td1kCQHnP
+        self.user.save()
 
-        wtN2tboFR6lABkJDjxoGRvlSt4SOPr7zKGgrWjeiuTZLHXSAnCY+/hr5L9Q3ZwXG
 
-        6x6iBdgLjVIe4BZQNtcCQQDXGv/gWinCNTN3MPWfTW/RGzuMYVmyBFais0/VrgdH
 
-        h1dLpztmpQqfyH/zrBXQ9qL/zR4ojS6XYneO/U18WpEe
+        response = self.client.post('/accounts-rest/login/', {
 
-        -----END RSA PRIVATE KEY-----
+            'username': self.user.username,
 
+        })
 
 
-    To generate a key like this with OpenSSL, run::
 
+        self.assertEqual(response.status_code, 400)
 
+        self.assertEqual(response.json(), {
 
-        openssl genrsa 2048 > key.pem
+            'username': ['This account is inactive.'],
 
+        })
 
 
-    This format also supports password-encrypted private keys.  TLS
 
-    Lite can only handle password-encrypted private keys when OpenSSL
+    def test_login(self):
 
-    and M2Crypto are installed.  In this case, passwordCallback will be
+        login_code = LoginCode.objects.create(user=self.user, next='/private/')
 
-    invoked to query the user for the password.
 
 
+        response = self.client.post('/accounts-rest/login/code/', {
 
-    :type s: str
+            'user': login_code.user.pk,
 
-    :param s: A string containing a PEM-encoded public or private key.
+            'code': login_code.code,
 
+        })
 
 
-    :type private: bool
 
-    :param private: If True, a :py:class:`SyntaxError` will be raised if the
+        self.assertEqual(response.status_code, 200)
 
-        private key component is not present.
+        self.assertFalse(LoginCode.objects.filter(pk=login_code.pk).exists())
 
 
 
-    :type public: bool
+        token = Token.objects.filter(user=self.user).first()
 
-    :param public: If True, the private key component (if present) will
 
-        be discarded, so this function will always return a public key.
 
+        self.assertIsNotNone(token)
 
+        self.assertEqual(response.data, {
 
-    :type passwordCallback: callable
+            'key': token.key,
 
-    :param passwordCallback: This function will be called, with no
+            'next': '/private/',
 
-        arguments, if the PEM-encoded private key is password-encrypted.
+        })
 
-        The callback should return the password string.  If the password is
 
-        incorrect, SyntaxError will be raised.  If no callback is passed
 
-        and the key is password-encrypted, a prompt will be displayed at
+    def test_login_missing_code(self):
 
-        the console.
+        response = self.client.post('/accounts-rest/login/code/')
 
 
 
-    :rtype: ~tlslite.utils.rsakey.RSAKey
+        self.assertEqual(response.status_code, 400)
 
-    :returns: An RSA key.
+        self.assertEqual(response.json(), {
 
+            'code': ['This field is required.'],
 
+        })
 
-    :raises SyntaxError: If the key is not properly formatted.
 
-    """
 
-    for implementation in implementations:
+    def test_login_unknown_code(self):
 
-        if implementation == "openssl" and cryptomath.m2cryptoLoaded:
+        response = self.client.post('/accounts-rest/login/code/', {
 
-            key = OpenSSL_RSAKey.parse(s, passwordCallback)
+            'code': 'unknown',
 
-            break
+        })
 
-        elif implementation == "python":
 
-            key = Python_RSAKey.parsePEM(s)
 
-            break
+        self.assertEqual(response.status_code, 400)
 
-    else:
+        self.assertEqual(response.json(), {
 
-        raise ValueError("No acceptable implementations")
+            '__all__': ['Unable to log in with provided login code.'],
 
+            'user': ['This field is required.']
 
+        })
 
-    return _parseKeyHelper(key, private, public)
 
 
+    def test_login_inactive_user(self):
 
+        self.user.is_active = False
 
+        self.user.save()
 
-def _parseKeyHelper(key, private, public):
 
-    if private and not key.hasPrivateKey():
 
-        raise SyntaxError("Not a private key!")
+        login_code = LoginCode.objects.create(user=self.user)
 
 
 
-    if public:
+        response = self.client.post('/accounts-rest/login/code/', {
 
-        return _createPublicKey(key)
+            'code': login_code.code,
 
+        })
 
 
-    if private:
 
-        if cryptomath.m2cryptoLoaded:
+        self.assertEqual(response.status_code, 400)
 
-            if type(key) == Python_RSAKey:
+        self.assertEqual(response.json(), {
 
-                return _createPrivateKey(key)
+            '__all__': ['Unable to log in with provided login code.'],
 
-            assert type(key) in (OpenSSL_RSAKey, ), type(key)
+            'user': ['This field is required.']
 
-            return key
+        })
 
-        elif hasattr(key, "d"):
 
-            return _createPrivateKey(key)
 
-    return key
+    def test_logout(self):
 
+        token = Token.objects.create(user=self.user, key='foobar')
 
 
 
+        response = self.client.post(
 
-def parseAsPublicKey(s):
+            '/accounts-rest/logout/',
 
-    """Parse a PEM-formatted public key.
+            HTTP_AUTHORIZATION='Token {}'.format(token.key),
 
+        )
 
 
-    :type s: str
 
-    :param s: A string containing a PEM-encoded public or private key.
+        self.assertEqual(response.status_code, 200)
 
+        self.assertFalse(Token.objects.filter(user=self.user).exists())
 
 
-    :rtype: ~tlslite.utils.rsakey.RSAKey
 
-    :returns: An RSA public key.
+    def test_logout_unknown_token(self):
 
+        login_code = LoginCode.objects.create(user=self.user)
 
 
-    :raises SyntaxError: If the key is not properly formatted.
 
-    """
+        self.client.login(username=self.user.username, code=login_code.code)
 
-    return parsePEMKey(s, public=True)
 
 
+        response = self.client.post(
 
-def parsePrivateKey(s):
+            '/accounts-rest/logout/',
 
-    """Parse a PEM-formatted private key.
+            HTTP_AUTHORIZATION='Token unknown',
 
+        )
 
 
-    :type s: str
 
-    :param s: A string containing a PEM-encoded private key.
-
-
-
-    :rtype: ~tlslite.utils.rsakey.RSAKey
-
-    :returns: An RSA private key.
-
-
-
-    :raises SyntaxError: If the key is not properly formatted.
-
-    """
-
-    return parsePEMKey(s, private=True)
-
-
-
-def _createPublicKey(key):
-
-    """
-
-    Create a new public key.  Discard any private component,
-
-    and return the most efficient key possible.
-
-    """
-
-    if not isinstance(key, RSAKey):
-
-        raise AssertionError()
-
-    return _createPublicRSAKey(key.n, key.e)
-
-
-
-def _createPrivateKey(key):
-
-    """
-
-    Create a new private key.  Return the most efficient key possible.
-
-    """
-
-    if not isinstance(key, RSAKey):
-
-        raise AssertionError()
-
-    if not key.hasPrivateKey():
-
-        raise AssertionError()
-
-    return _createPrivateRSAKey(key.n, key.e, key.d, key.p, key.q, key.dP,
-
-                                key.dQ, key.qInv)
-
-
-
-def _createPublicRSAKey(n, e, implementations = ["openssl", "pycrypto",
-
-                                                "python"]):
-
-    for implementation in implementations:
-
-        if implementation == "openssl" and cryptomath.m2cryptoLoaded:
-
-            return OpenSSL_RSAKey(n, e)
-
-        elif implementation == "pycrypto" and cryptomath.pycryptoLoaded:
-
-            return PyCrypto_RSAKey(n, e)
-
-        elif implementation == "python":
-
-            return Python_RSAKey(n, e)
-
-    raise ValueError("No acceptable implementations")
-
-
-
-def _createPrivateRSAKey(n, e, d, p, q, dP, dQ, qInv,
-
-                        implementations = ["pycrypto", "python"]):
-
-    for implementation in implementations:
-
-        if implementation == "pycrypto" and cryptomath.pycryptoLoaded:
-
-            return PyCrypto_RSAKey(n, e, d, p, q, dP, dQ, qInv)
-
-        elif implementation == "python":
-
-            return Python_RSAKey(n, e, d, p, q, dP, dQ, qInv)
-
-    raise ValueError("No acceptable implementations")
+        self.assertEqual(response.status_code, 200)

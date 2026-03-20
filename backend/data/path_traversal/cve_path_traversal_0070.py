@@ -2,850 +2,576 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
 
+# The Python Imaging Library.
 
-
-#    Copyright 2010 United States Government as represented by the
-
-#    Administrator of the National Aeronautics and Space Administration.
-
-#    All Rights Reserved.
-
-#    Copyright (c) 2010 Citrix Systems, Inc.
-
-#    Copyright (c) 2011 Piston Cloud Computing, Inc
-
-#    Copyright (c) 2011 OpenStack LLC
+# $Id$
 
 #
 
-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
-
-#    not use this file except in compliance with the License. You may obtain
-
-#    a copy of the License at
+# IPTC/NAA file handling
 
 #
 
-#         http://www.apache.org/licenses/LICENSE-2.0
+# history:
+
+# 1995-10-01 fl   Created
+
+# 1998-03-09 fl   Cleaned up and added to PIL
+
+# 2002-06-18 fl   Added getiptcinfo helper
 
 #
 
-#    Unless required by applicable law or agreed to in writing, software
+# Copyright (c) Secret Labs AB 1997-2002.
 
-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# Copyright (c) Fredrik Lundh 1995.
 
-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#
 
-#    License for the specific language governing permissions and limitations
+# See the README file for information on usage and redistribution.
 
-#    under the License.
+#
 
 
 
-import os
+from __future__ import print_function
 
-import time
 
 
+__version__ = "0.3"
 
-from lxml import etree
 
 
 
-from nova import exception
 
-from nova.openstack.common import cfg
+from PIL import Image, ImageFile, _binary
 
-from nova.openstack.common import log as logging
+import os, tempfile
 
-from nova import utils
 
-from nova.virt import images
 
+i8 = _binary.i8
 
+i16 = _binary.i16be
 
-CONF = cfg.CONF
+i32 = _binary.i32be
 
-LOG = logging.getLogger(__name__)
+o8 = _binary.o8
 
 
 
+COMPRESSION = {
 
+    1: "raw",
 
-def execute(*args, **kwargs):
+    5: "jpeg"
 
-    return utils.execute(*args, **kwargs)
+}
 
 
 
+PAD = o8(0) * 4
 
 
-def get_iscsi_initiator():
 
-    """Get iscsi initiator name for this machine"""
+#
 
-    # NOTE(vish) openiscsi stores initiator name in a file that
+# Helpers
 
-    #            needs root permission to read.
 
-    contents = utils.read_file_as_root('/etc/iscsi/initiatorname.iscsi')
 
-    for l in contents.split('\n'):
+def i(c):
 
-        if l.startswith('InitiatorName='):
+    return i32((PAD + c)[-4:])
 
-            return l[l.index('=') + 1:].strip()
 
 
+def dump(c):
 
+    for i in c:
 
+        print("%02x" % i8(i), end=' ')
 
-def create_image(disk_format, path, size):
+    print()
 
-    """Create a disk image
 
 
+##
 
-    :param disk_format: Disk image format (as known by qemu-img)
+# Image plugin for IPTC/NAA datastreams.  To read IPTC/NAA fields
 
-    :param path: Desired location of the disk image
+# from TIFF and JPEG files, use the <b>getiptcinfo</b> function.
 
-    :param size: Desired size of disk image. May be given as an int or
 
-                 a string. If given as an int, it will be interpreted
 
-                 as bytes. If it's a string, it should consist of a number
+class IptcImageFile(ImageFile.ImageFile):
 
-                 with an optional suffix ('K' for Kibibytes,
 
-                 M for Mebibytes, 'G' for Gibibytes, 'T' for Tebibytes).
 
-                 If no suffix is given, it will be interpreted as bytes.
+    format = "IPTC"
 
-    """
+    format_description = "IPTC/NAA"
 
-    execute('qemu-img', 'create', '-f', disk_format, path, size)
 
 
+    def getint(self, key):
 
+        return i(self.info[key])
 
 
-def create_cow_image(backing_file, path):
 
-    """Create COW image
+    def field(self):
 
+        #
 
+        # get a IPTC field header
 
-    Creates a COW image with the given backing file
+        s = self.fp.read(5)
 
+        if not len(s):
 
+            return None, 0
 
-    :param backing_file: Existing image on which to base the COW image
 
-    :param path: Desired location of the COW image
 
-    """
+        tag = i8(s[1]), i8(s[2])
 
-    base_cmd = ['qemu-img', 'create', '-f', 'qcow2']
 
-    cow_opts = []
 
-    if backing_file:
+        # syntax
 
-        cow_opts += ['backing_file=%s' % backing_file]
+        if i8(s[0]) != 0x1C or tag[0] < 1 or tag[0] > 9:
 
-        base_details = images.qemu_img_info(backing_file)
+            raise SyntaxError("invalid IPTC/NAA file")
 
-    else:
 
-        base_details = None
 
-    # This doesn't seem to get inherited so force it to...
+        # field size
 
-    # http://paste.ubuntu.com/1213295/
+        size = i8(s[3])
 
-    # TODO(harlowja) probably file a bug against qemu-img/qemu
+        if size > 132:
 
-    if base_details and base_details.cluster_size is not None:
+            raise IOError("illegal field length in IPTC/NAA file")
 
-        cow_opts += ['cluster_size=%s' % base_details.cluster_size]
+        elif size == 128:
 
-    # For now don't inherit this due the following discussion...
+            size = 0
 
-    # See: http://www.gossamer-threads.com/lists/openstack/dev/10592
+        elif size > 128:
 
-    # if 'preallocation' in base_details:
-
-    #     cow_opts += ['preallocation=%s' % base_details['preallocation']]
-
-    if base_details and base_details.encryption:
-
-        cow_opts += ['encryption=%s' % base_details.encryption]
-
-    if cow_opts:
-
-        # Format as a comma separated list
-
-        csv_opts = ",".join(cow_opts)
-
-        cow_opts = ['-o', csv_opts]
-
-    cmd = base_cmd + cow_opts + [path]
-
-    execute(*cmd)
-
-
-
-
-
-def create_lvm_image(vg, lv, size, sparse=False):
-
-    """Create LVM image.
-
-
-
-    Creates a LVM image with given size.
-
-
-
-    :param vg: existing volume group which should hold this image
-
-    :param lv: name for this image (logical volume)
-
-    :size: size of image in bytes
-
-    :sparse: create sparse logical volume
-
-    """
-
-    free_space = volume_group_free_space(vg)
-
-
-
-    def check_size(size):
-
-        if size > free_space:
-
-            raise RuntimeError(_('Insufficient Space on Volume Group %(vg)s.'
-
-                                 ' Only %(free_space)db available,'
-
-                                 ' but %(size)db required'
-
-                                 ' by volume %(lv)s.') % locals())
-
-
-
-    if sparse:
-
-        preallocated_space = 64 * 1024 * 1024
-
-        check_size(preallocated_space)
-
-        if free_space < size:
-
-            LOG.warning(_('Volume group %(vg)s will not be able'
-
-                          ' to hold sparse volume %(lv)s.'
-
-                          ' Virtual volume size is %(size)db,'
-
-                          ' but free space on volume group is'
-
-                          ' only %(free_space)db.') % locals())
-
-
-
-        cmd = ('lvcreate', '-L', '%db' % preallocated_space,
-
-                '--virtualsize', '%db' % size, '-n', lv, vg)
-
-    else:
-
-        check_size(size)
-
-        cmd = ('lvcreate', '-L', '%db' % size, '-n', lv, vg)
-
-    execute(*cmd, run_as_root=True, attempts=3)
-
-
-
-
-
-def volume_group_free_space(vg):
-
-    """Return available space on volume group in bytes.
-
-
-
-    :param vg: volume group name
-
-    """
-
-    out, err = execute('vgs', '--noheadings', '--nosuffix',
-
-                       '--units', 'b', '-o', 'vg_free', vg,
-
-                       run_as_root=True)
-
-    return int(out.strip())
-
-
-
-
-
-def list_logical_volumes(vg):
-
-    """List logical volumes paths for given volume group.
-
-
-
-    :param vg: volume group name
-
-    """
-
-    out, err = execute('lvs', '--noheadings', '-o', 'lv_name', vg,
-
-                       run_as_root=True)
-
-
-
-    return [line.strip() for line in out.splitlines()]
-
-
-
-
-
-def logical_volume_info(path):
-
-    """Get logical volume info.
-
-
-
-    :param path: logical volume path
-
-    """
-
-    out, err = execute('lvs', '-o', 'vg_all,lv_all',
-
-                       '--separator', '|', path, run_as_root=True)
-
-
-
-    info = [line.split('|') for line in out.splitlines()]
-
-
-
-    if len(info) != 2:
-
-        raise RuntimeError(_("Path %s must be LVM logical volume") % path)
-
-
-
-    return dict(zip(*info))
-
-
-
-
-
-def remove_logical_volumes(*paths):
-
-    """Remove one or more logical volume."""
-
-    if paths:
-
-        lvremove = ('lvremove', '-f') + paths
-
-        execute(*lvremove, attempts=3, run_as_root=True)
-
-
-
-
-
-def pick_disk_driver_name(is_block_dev=False):
-
-    """Pick the libvirt primary backend driver name
-
-
-
-    If the hypervisor supports multiple backend drivers, then the name
-
-    attribute selects the primary backend driver name, while the optional
-
-    type attribute provides the sub-type.  For example, xen supports a name
-
-    of "tap", "tap2", "phy", or "file", with a type of "aio" or "qcow2",
-
-    while qemu only supports a name of "qemu", but multiple types including
-
-    "raw", "bochs", "qcow2", and "qed".
-
-
-
-    :param is_block_dev:
-
-    :returns: driver_name or None
-
-    """
-
-    if CONF.libvirt_type == "xen":
-
-        if is_block_dev:
-
-            return "phy"
+            size = i(self.fp.read(size-128))
 
         else:
 
-            return "tap"
-
-    elif CONF.libvirt_type in ('kvm', 'qemu'):
-
-        return "qemu"
-
-    else:
-
-        # UML doesn't want a driver_name set
-
-        return None
+            size = i16(s[3:])
 
 
 
-
-
-def get_disk_size(path):
-
-    """Get the (virtual) size of a disk image
+        return tag, size
 
 
 
-    :param path: Path to the disk image
+    def _is_raw(self, offset, size):
 
-    :returns: Size (in bytes) of the given disk image as it would be seen
+        #
 
-              by a virtual machine.
-
-    """
-
-    size = images.qemu_img_info(path).virtual_size
-
-    return int(size)
+        # check if the file can be mapped
 
 
 
+        # DISABLED: the following only slows things down...
 
-
-def get_disk_backing_file(path):
-
-    """Get the backing file of a disk image
-
-
-
-    :param path: Path to the disk image
-
-    :returns: a path to the image's backing store
-
-    """
-
-    backing_file = images.qemu_img_info(path).backing_file
-
-    if backing_file:
-
-        backing_file = os.path.basename(backing_file)
+        return 0
 
 
 
-    return backing_file
+        self.fp.seek(offset)
+
+        t, sz = self.field()
+
+        if sz != size[0]:
+
+            return 0
+
+        y = 1
+
+        while True:
+
+            self.fp.seek(sz, 1)
+
+            t, s = self.field()
+
+            if t != (8, 10):
+
+                break
+
+            if s != sz:
+
+                return 0
+
+            y = y + 1
+
+        return y == size[1]
 
 
 
-
-
-def copy_image(src, dest, host=None):
-
-    """Copy a disk image to an existing directory
+    def _open(self):
 
 
 
-    :param src: Source image
+        # load descriptive fields
 
-    :param dest: Destination path
+        while True:
 
-    :param host: Remote host
+            offset = self.fp.tell()
 
-    """
+            tag, size = self.field()
+
+            if not tag or tag == (8,10):
+
+                break
+
+            if size:
+
+                tagdata = self.fp.read(size)
+
+            else:
+
+                tagdata = None
+
+            if tag in list(self.info.keys()):
+
+                if isinstance(self.info[tag], list):
+
+                    self.info[tag].append(tagdata)
+
+                else:
+
+                    self.info[tag] = [self.info[tag], tagdata]
+
+            else:
+
+                self.info[tag] = tagdata
 
 
 
-    if not host:
+            # print tag, self.info[tag]
 
-        # We shell out to cp because that will intelligently copy
 
-        # sparse files.  I.E. holes will not be written to DEST,
 
-        # rather recreated efficiently.  In addition, since
+        # mode
 
-        # coreutils 8.11, holes can be read efficiently too.
+        layers = i8(self.info[(3,60)][0])
 
-        execute('cp', src, dest)
+        component = i8(self.info[(3,60)][1])
 
-    else:
+        if (3,65) in self.info:
 
-        dest = "%s:%s" % (host, dest)
+            id = i8(self.info[(3,65)][0])-1
 
-        # Try rsync first as that can compress and create sparse dest files.
+        else:
 
-        # Note however that rsync currently doesn't read sparse files
+            id = 0
 
-        # efficiently: https://bugzilla.samba.org/show_bug.cgi?id=8918
+        if layers == 1 and not component:
 
-        # At least network traffic is mitigated with compression.
+            self.mode = "L"
+
+        elif layers == 3 and component:
+
+            self.mode = "RGB"[id]
+
+        elif layers == 4 and component:
+
+            self.mode = "CMYK"[id]
+
+
+
+        # size
+
+        self.size = self.getint((3,20)), self.getint((3,30))
+
+
+
+        # compression
 
         try:
 
-            # Do a relatively light weight test first, so that we
+            compression = COMPRESSION[self.getint((3,120))]
 
-            # can fall back to scp, without having run out of space
+        except KeyError:
 
-            # on the destination for example.
-
-            execute('rsync', '--sparse', '--compress', '--dry-run', src, dest)
-
-        except exception.ProcessExecutionError:
-
-            execute('scp', src, dest)
-
-        else:
-
-            execute('rsync', '--sparse', '--compress', src, dest)
+            raise IOError("Unknown IPTC image compression")
 
 
 
+        # tile
+
+        if tag == (8,10):
+
+            if compression == "raw" and self._is_raw(offset, self.size):
+
+                self.tile = [(compression, (offset, size + 5, -1),
+
+                             (0, 0, self.size[0], self.size[1]))]
+
+            else:
+
+                self.tile = [("iptc", (compression, offset),
+
+                             (0, 0, self.size[0], self.size[1]))]
 
 
-def write_to_file(path, contents, umask=None):
 
-    """Write the given contents to a file
-
+    def load(self):
 
 
-    :param path: Destination file
 
-    :param contents: Desired contents of the file
+        if len(self.tile) != 1 or self.tile[0][0] != "iptc":
 
-    :param umask: Umask to set when creating this file (will be reset)
+            return ImageFile.ImageFile.load(self)
 
-    """
 
-    if umask:
 
-        saved_umask = os.umask(umask)
+        type, tile, box = self.tile[0]
+
+
+
+        encoding, offset = tile
+
+
+
+        self.fp.seek(offset)
+
+
+
+        # Copy image data to temporary file
+
+        outfile = tempfile.mktemp()
+
+        o = open(outfile, "wb")
+
+        if encoding == "raw":
+
+            # To simplify access to the extracted file,
+
+            # prepend a PPM header
+
+            o.write("P5\n%d %d\n255\n" % self.size)
+
+        while True:
+
+            type, size = self.field()
+
+            if type != (8, 10):
+
+                break
+
+            while size > 0:
+
+                s = self.fp.read(min(size, 8192))
+
+                if not s:
+
+                    break
+
+                o.write(s)
+
+                size = size - len(s)
+
+        o.close()
+
+
+
+        try:
+
+            try:
+
+                # fast
+
+                self.im = Image.core.open_ppm(outfile)
+
+            except:
+
+                # slightly slower
+
+                im = Image.open(outfile)
+
+                im.load()
+
+                self.im = im.im
+
+        finally:
+
+            try: os.unlink(outfile)
+
+            except: pass
+
+
+
+
+
+Image.register_open("IPTC", IptcImageFile)
+
+
+
+Image.register_extension("IPTC", ".iim")
+
+
+
+##
+
+# Get IPTC information from TIFF, JPEG, or IPTC file.
+
+#
+
+# @param im An image containing IPTC data.
+
+# @return A dictionary containing IPTC information, or None if
+
+#     no IPTC information block was found.
+
+
+
+def getiptcinfo(im):
+
+
+
+    from PIL import TiffImagePlugin, JpegImagePlugin
+
+    import io
+
+
+
+    data = None
+
+
+
+    if isinstance(im, IptcImageFile):
+
+        # return info dictionary right away
+
+        return im.info
+
+
+
+    elif isinstance(im, JpegImagePlugin.JpegImageFile):
+
+        # extract the IPTC/NAA resource
+
+        try:
+
+            app = im.app["APP13"]
+
+            if app[:14] == "Photoshop 3.0\x00":
+
+                app = app[14:]
+
+                # parse the image resource block
+
+                offset = 0
+
+                while app[offset:offset+4] == "8BIM":
+
+                    offset = offset + 4
+
+                    # resource code
+
+                    code = JpegImagePlugin.i16(app, offset)
+
+                    offset = offset + 2
+
+                    # resource name (usually empty)
+
+                    name_len = i8(app[offset])
+
+                    name = app[offset+1:offset+1+name_len]
+
+                    offset = 1 + offset + name_len
+
+                    if offset & 1:
+
+                        offset = offset + 1
+
+                    # resource data block
+
+                    size = JpegImagePlugin.i32(app, offset)
+
+                    offset = offset + 4
+
+                    if code == 0x0404:
+
+                        # 0x0404 contains IPTC/NAA data
+
+                        data = app[offset:offset+size]
+
+                        break
+
+                    offset = offset + size
+
+                    if offset & 1:
+
+                        offset = offset + 1
+
+        except (AttributeError, KeyError):
+
+            pass
+
+
+
+    elif isinstance(im, TiffImagePlugin.TiffImageFile):
+
+        # get raw data from the IPTC/NAA tag (PhotoShop tags the data
+
+        # as 4-byte integers, so we cannot use the get method...)
+
+        try:
+
+            data = im.tag.tagdata[TiffImagePlugin.IPTC_NAA_CHUNK]
+
+        except (AttributeError, KeyError):
+
+            pass
+
+
+
+    if data is None:
+
+        return None # no properties
+
+
+
+    # create an IptcImagePlugin object without initializing it
+
+    class FakeImage:
+
+        pass
+
+    im = FakeImage()
+
+    im.__class__ = IptcImageFile
+
+
+
+    # parse the IPTC information chunk
+
+    im.info = {}
+
+    im.fp = io.BytesIO(data)
 
 
 
     try:
 
-        with open(path, 'w') as f:
+        im._open()
 
-            f.write(contents)
+    except (IndexError, KeyError):
 
-    finally:
+        pass # expected failure
 
-        if umask:
 
-            os.umask(saved_umask)
 
-
-
-
-
-def chown(path, owner):
-
-    """Change ownership of file or directory
-
-
-
-    :param path: File or directory whose ownership to change
-
-    :param owner: Desired new owner (given as uid or username)
-
-    """
-
-    execute('chown', owner, path, run_as_root=True)
-
-
-
-
-
-def create_snapshot(disk_path, snapshot_name):
-
-    """Create a snapshot in a disk image
-
-
-
-    :param disk_path: Path to disk image
-
-    :param snapshot_name: Name of snapshot in disk image
-
-    """
-
-    qemu_img_cmd = ('qemu-img',
-
-                    'snapshot',
-
-                    '-c',
-
-                    snapshot_name,
-
-                    disk_path)
-
-    # NOTE(vish): libvirt changes ownership of images
-
-    execute(*qemu_img_cmd, run_as_root=True)
-
-
-
-
-
-def delete_snapshot(disk_path, snapshot_name):
-
-    """Create a snapshot in a disk image
-
-
-
-    :param disk_path: Path to disk image
-
-    :param snapshot_name: Name of snapshot in disk image
-
-    """
-
-    qemu_img_cmd = ('qemu-img',
-
-                    'snapshot',
-
-                    '-d',
-
-                    snapshot_name,
-
-                    disk_path)
-
-    # NOTE(vish): libvirt changes ownership of images
-
-    execute(*qemu_img_cmd, run_as_root=True)
-
-
-
-
-
-def extract_snapshot(disk_path, source_fmt, snapshot_name, out_path, dest_fmt):
-
-    """Extract a named snapshot from a disk image
-
-
-
-    :param disk_path: Path to disk image
-
-    :param snapshot_name: Name of snapshot in disk image
-
-    :param out_path: Desired path of extracted snapshot
-
-    """
-
-    # NOTE(markmc): ISO is just raw to qemu-img
-
-    if dest_fmt == 'iso':
-
-        dest_fmt = 'raw'
-
-    qemu_img_cmd = ('qemu-img',
-
-                    'convert',
-
-                    '-f',
-
-                    source_fmt,
-
-                    '-O',
-
-                    dest_fmt,
-
-                    '-s',
-
-                    snapshot_name,
-
-                    disk_path,
-
-                    out_path)
-
-    execute(*qemu_img_cmd)
-
-
-
-
-
-def load_file(path):
-
-    """Read contents of file
-
-
-
-    :param path: File to read
-
-    """
-
-    with open(path, 'r') as fp:
-
-        return fp.read()
-
-
-
-
-
-def file_open(*args, **kwargs):
-
-    """Open file
-
-
-
-    see built-in file() documentation for more details
-
-
-
-    Note: The reason this is kept in a separate module is to easily
-
-          be able to provide a stub module that doesn't alter system
-
-          state at all (for unit tests)
-
-    """
-
-    return file(*args, **kwargs)
-
-
-
-
-
-def file_delete(path):
-
-    """Delete (unlink) file
-
-
-
-    Note: The reason this is kept in a separate module is to easily
-
-          be able to provide a stub module that doesn't alter system
-
-          state at all (for unit tests)
-
-    """
-
-    return os.unlink(path)
-
-
-
-
-
-def find_disk(virt_dom):
-
-    """Find root device path for instance
-
-
-
-    May be file or device"""
-
-    xml_desc = virt_dom.XMLDesc(0)
-
-    domain = etree.fromstring(xml_desc)
-
-    if CONF.libvirt_type == 'lxc':
-
-        source = domain.find('devices/filesystem/source')
-
-        disk_path = source.get('dir')
-
-        disk_path = disk_path[0:disk_path.rfind('rootfs')]
-
-        disk_path = os.path.join(disk_path, 'disk')
-
-    else:
-
-        source = domain.find('devices/disk/source')
-
-        disk_path = source.get('file') or source.get('dev')
-
-
-
-    if not disk_path:
-
-        raise RuntimeError(_("Can't retrieve root device path "
-
-                             "from instance libvirt configuration"))
-
-
-
-    return disk_path
-
-
-
-
-
-def get_disk_type(path):
-
-    """Retrieve disk type (raw, qcow2, lvm) for given file"""
-
-    if path.startswith('/dev'):
-
-        return 'lvm'
-
-
-
-    return images.qemu_img_info(path).file_format
-
-
-
-
-
-def get_fs_info(path):
-
-    """Get free/used/total space info for a filesystem
-
-
-
-    :param path: Any dirent on the filesystem
-
-    :returns: A dict containing:
-
-
-
-             :free: How much space is free (in bytes)
-
-             :used: How much space is used (in bytes)
-
-             :total: How big the filesystem is (in bytes)
-
-    """
-
-    hddinfo = os.statvfs(path)
-
-    total = hddinfo.f_frsize * hddinfo.f_blocks
-
-    free = hddinfo.f_frsize * hddinfo.f_bavail
-
-    used = hddinfo.f_frsize * (hddinfo.f_blocks - hddinfo.f_bfree)
-
-    return {'total': total,
-
-            'free': free,
-
-            'used': used}
-
-
-
-
-
-def fetch_image(context, target, image_id, user_id, project_id):
-
-    """Grab image"""
-
-    images.fetch_to_raw(context, image_id, target, user_id, project_id)
+    return im.info

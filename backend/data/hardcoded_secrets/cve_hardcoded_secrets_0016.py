@@ -2,1140 +2,2392 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# Copyright 2011 OpenStack LLC.
+import inspect
 
-# All Rights Reserved.
+import json
 
-#
+import logging
 
-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+import sys
 
-#    not use this file except in compliance with the License. You may obtain
+import time
 
-#    a copy of the License at
+import warnings
 
-#
+from typing import Dict
 
-#         http://www.apache.org/licenses/LICENSE-2.0
+from typing import List
 
-#
+from urllib.parse import urlencode
 
-#    Unless required by applicable law or agreed to in writing, software
+from urllib.parse import urlparse
 
-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
-#    License for the specific language governing permissions and limitations
+from jwkest import jws
 
-#    under the License.
+from jwkest.jwe import JWEException
 
+from jwkest.jwe import factory as JWE_factory
 
+from jwkest.jwt import JWT
 
-"""The security groups extension."""
 
 
+from oic.exception import InvalidRequest
 
-import urllib
+from oic.exception import IssuerMismatch
 
-from webob import exc
+from oic.exception import MessageException
 
-import webob
+from oic.exception import NotForMe
 
+from oic.exception import PyoidcError
 
+from oic.oauth2 import message
 
-from nova import compute
+from oic.oauth2.exception import VerificationError
 
-from nova import db
+from oic.oauth2.message import OPTIONAL_LIST_OF_SP_SEP_STRINGS
 
-from nova import exception
+from oic.oauth2.message import OPTIONAL_LIST_OF_STRINGS
 
-from nova import flags
+from oic.oauth2.message import REQUIRED_LIST_OF_SP_SEP_STRINGS
 
-from nova import log as logging
+from oic.oauth2.message import REQUIRED_LIST_OF_STRINGS
 
-from nova import rpc
+from oic.oauth2.message import SINGLE_OPTIONAL_INT
 
-from nova import utils
+from oic.oauth2.message import SINGLE_OPTIONAL_JSON
 
-from nova.api.openstack import common
+from oic.oauth2.message import SINGLE_OPTIONAL_STRING
 
-from nova.api.openstack import extensions
+from oic.oauth2.message import SINGLE_REQUIRED_STRING
 
-from nova.api.openstack import wsgi
+from oic.oauth2.message import Message
 
-from nova.compute import power_state
+from oic.oauth2.message import MessageFactory
 
+from oic.oauth2.message import MessageTuple
 
+from oic.oauth2.message import MissingRequiredAttribute
 
-from xml.dom import minidom
+from oic.oauth2.message import MissingRequiredValue
 
+from oic.oauth2.message import NotAllowedValue
 
+from oic.oauth2.message import ParamDefinition
 
+from oic.oauth2.message import SchemeError
 
+from oic.utils import time_util
 
-LOG = logging.getLogger("nova.api.contrib.security_groups")
+from oic.utils.time_util import utc_time_sans_frac
 
-FLAGS = flags.FLAGS
 
 
+__author__ = "rohe0002"
 
 
 
-class SecurityGroupController(object):
+logger = logging.getLogger(__name__)
 
-    """The Security group API controller for the OpenStack API."""
 
 
+NONCE_STORAGE_TIME = 4 * 3600
 
-    def __init__(self):
 
-        self.compute_api = compute.API()
 
-        super(SecurityGroupController, self).__init__()
 
 
+class AtHashError(VerificationError):
 
-    def _format_security_group_rule(self, context, rule):
+    pass
 
-        sg_rule = {}
 
-        sg_rule['id'] = rule.id
 
-        sg_rule['parent_group_id'] = rule.parent_group_id
 
-        sg_rule['ip_protocol'] = rule.protocol
 
-        sg_rule['from_port'] = rule.from_port
+class CHashError(VerificationError):
 
-        sg_rule['to_port'] = rule.to_port
+    pass
 
-        sg_rule['group'] = {}
 
-        sg_rule['ip_range'] = {}
 
-        if rule.group_id:
 
-            source_group = db.security_group_get(context, rule.group_id)
 
-            sg_rule['group'] = {'name': source_group.name,
+class EXPError(VerificationError):
 
-                             'tenant_id': source_group.project_id}
+    pass
+
+
+
+
+
+class IATError(VerificationError):
+
+    pass
+
+
+
+
+
+def json_ser(val, sformat=None, lev=0):
+
+    return json.dumps(val)
+
+
+
+
+
+def json_deser(val, sformat=None, lev=0):
+
+    return json.loads(val)
+
+
+
+
+
+def json_conv(val, sformat=None, lev=0):
+
+    if isinstance(val, dict):
+
+        for key, _val in val.items():
+
+            if _val is None:
+
+                val[key] = "none"
+
+            elif _val is True:
+
+                val[key] = "true"
+
+            elif _val is False:
+
+                val[key] = "false"
+
+
+
+    return val
+
+
+
+
+
+def json_rest(val, sformat=None, lev=0):
+
+    if isinstance(val, dict):
+
+        for key, _val in val.items():
+
+            if _val == "none":
+
+                val[key] = None
+
+            elif _val == "true":
+
+                val[key] = True
+
+            elif _val == "false":
+
+                val[key] = False
+
+
+
+    return val
+
+
+
+
+
+# value type, required, serializer, deserializer, null value allowed
+
+SINGLE_OPTIONAL_BOOLEAN = ParamDefinition(bool, False, None, None, False)
+
+SINGLE_OPTIONAL_JSON_WN = ParamDefinition(dict, False, json_ser, json_deser, True)
+
+SINGLE_OPTIONAL_JSON_CONV = ParamDefinition(dict, False, json_conv, json_rest, True)
+
+SINGLE_REQUIRED_INT = ParamDefinition(int, True, None, None, False)
+
+
+
+
+
+def idtoken_deser(val, sformat="urlencoded"):
+
+    # id_token are always serialized as a JWT
+
+    return IdToken().deserialize(val, "jwt")
+
+
+
+
+
+def address_deser(val, sformat="urlencoded"):
+
+    if sformat in ["dict", "json"]:
+
+        if not isinstance(val, str):
+
+            val = json.dumps(val)
+
+            sformat = "json"
+
+        elif sformat == "dict":
+
+            sformat = "json"
+
+    return AddressClaim().deserialize(val, sformat)
+
+
+
+
+
+def claims_deser(val, sformat="urlencoded"):
+
+    if sformat in ["dict", "json"]:
+
+        if not isinstance(val, str):
+
+            val = json.dumps(val)
+
+            sformat = "json"
+
+    return Claims().deserialize(val, sformat)
+
+
+
+
+
+def message_deser(val, sformat="urlencoded"):
+
+    if sformat in ["dict", "json"]:
+
+        if not isinstance(val, str):
+
+            val = json.dumps(val)
+
+            sformat = "json"
+
+    return Message().deserialize(val, sformat)
+
+
+
+
+
+def msg_ser(inst, sformat, lev=0):
+
+    if sformat in ["urlencoded", "json"]:
+
+        if isinstance(inst, Message):
+
+            res = inst.serialize(sformat, lev)
 
         else:
 
-            sg_rule['ip_range'] = {'cidr': rule.cidr}
+            res = inst
 
-        return sg_rule
+    elif sformat == "dict":
 
+        if isinstance(inst, Message):
 
+            res = inst.serialize(sformat, lev)
 
-    def _format_security_group(self, context, group):
+        elif isinstance(inst, dict):
 
-        security_group = {}
+            res = inst
 
-        security_group['id'] = group.id
+        elif isinstance(inst, str):  # Iff ID Token
 
-        security_group['description'] = group.description
-
-        security_group['name'] = group.name
-
-        security_group['tenant_id'] = group.project_id
-
-        security_group['rules'] = []
-
-        for rule in group.rules:
-
-            security_group['rules'] += [self._format_security_group_rule(
-
-                    context, rule)]
-
-        return security_group
-
-
-
-    def _get_security_group(self, context, id):
-
-        try:
-
-            id = int(id)
-
-            security_group = db.security_group_get(context, id)
-
-        except ValueError:
-
-            msg = _("Security group id should be integer")
-
-            raise exc.HTTPBadRequest(explanation=msg)
-
-        except exception.NotFound as exp:
-
-            raise exc.HTTPNotFound(explanation=unicode(exp))
-
-        return security_group
-
-
-
-    def show(self, req, id):
-
-        """Return data about the given security group."""
-
-        context = req.environ['nova.context']
-
-        security_group = self._get_security_group(context, id)
-
-        return {'security_group': self._format_security_group(context,
-
-                                                              security_group)}
-
-
-
-    def delete(self, req, id):
-
-        """Delete a security group."""
-
-        context = req.environ['nova.context']
-
-        security_group = self._get_security_group(context, id)
-
-        LOG.audit(_("Delete security group %s"), id, context=context)
-
-        db.security_group_destroy(context, security_group.id)
-
-
-
-        return exc.HTTPAccepted()
-
-
-
-    def index(self, req):
-
-        """Returns a list of security groups"""
-
-        context = req.environ['nova.context']
-
-
-
-        self.compute_api.ensure_default_security_group(context)
-
-        groups = db.security_group_get_by_project(context,
-
-                                                  context.project_id)
-
-        limited_list = common.limited(groups, req)
-
-        result = [self._format_security_group(context, group)
-
-                     for group in limited_list]
-
-
-
-        return {'security_groups':
-
-                list(sorted(result,
-
-                            key=lambda k: (k['tenant_id'], k['name'])))}
-
-
-
-    def create(self, req, body):
-
-        """Creates a new security group."""
-
-        context = req.environ['nova.context']
-
-        if not body:
-
-            return exc.HTTPUnprocessableEntity()
-
-
-
-        security_group = body.get('security_group', None)
-
-
-
-        if security_group is None:
-
-            return exc.HTTPUnprocessableEntity()
-
-
-
-        group_name = security_group.get('name', None)
-
-        group_description = security_group.get('description', None)
-
-
-
-        self._validate_security_group_property(group_name, "name")
-
-        self._validate_security_group_property(group_description,
-
-                                               "description")
-
-        group_name = group_name.strip()
-
-        group_description = group_description.strip()
-
-
-
-        LOG.audit(_("Create Security Group %s"), group_name, context=context)
-
-        self.compute_api.ensure_default_security_group(context)
-
-        if db.security_group_exists(context, context.project_id, group_name):
-
-            msg = _('Security group %s already exists') % group_name
-
-            raise exc.HTTPBadRequest(explanation=msg)
-
-
-
-        group = {'user_id': context.user_id,
-
-                 'project_id': context.project_id,
-
-                 'name': group_name,
-
-                 'description': group_description}
-
-        group_ref = db.security_group_create(context, group)
-
-
-
-        return {'security_group': self._format_security_group(context,
-
-                                                                 group_ref)}
-
-
-
-    def _validate_security_group_property(self, value, typ):
-
-        """ typ will be either 'name' or 'description',
-
-            depending on the caller
-
-        """
-
-        try:
-
-            val = value.strip()
-
-        except AttributeError:
-
-            msg = _("Security group %s is not a string or unicode") % typ
-
-            raise exc.HTTPBadRequest(explanation=msg)
-
-        if not val:
-
-            msg = _("Security group %s cannot be empty.") % typ
-
-            raise exc.HTTPBadRequest(explanation=msg)
-
-        if len(val) > 255:
-
-            msg = _("Security group %s should not be greater "
-
-                            "than 255 characters.") % typ
-
-            raise exc.HTTPBadRequest(explanation=msg)
-
-
-
-
-
-class SecurityGroupRulesController(SecurityGroupController):
-
-
-
-    def create(self, req, body):
-
-        context = req.environ['nova.context']
-
-
-
-        if not body:
-
-            raise exc.HTTPUnprocessableEntity()
-
-
-
-        if not 'security_group_rule' in body:
-
-            raise exc.HTTPUnprocessableEntity()
-
-
-
-        self.compute_api.ensure_default_security_group(context)
-
-
-
-        sg_rule = body['security_group_rule']
-
-        parent_group_id = sg_rule.get('parent_group_id', None)
-
-        try:
-
-            parent_group_id = int(parent_group_id)
-
-            security_group = db.security_group_get(context, parent_group_id)
-
-        except ValueError:
-
-            msg = _("Parent group id is not integer")
-
-            return exc.HTTPBadRequest(explanation=msg)
-
-        except exception.NotFound as exp:
-
-            msg = _("Security group (%s) not found") % parent_group_id
-
-            return exc.HTTPNotFound(explanation=msg)
-
-
-
-        msg = _("Authorize security group ingress %s")
-
-        LOG.audit(msg, security_group['name'], context=context)
-
-
-
-        try:
-
-            values = self._rule_args_to_dict(context,
-
-                              to_port=sg_rule.get('to_port'),
-
-                              from_port=sg_rule.get('from_port'),
-
-                              parent_group_id=sg_rule.get('parent_group_id'),
-
-                              ip_protocol=sg_rule.get('ip_protocol'),
-
-                              cidr=sg_rule.get('cidr'),
-
-                              group_id=sg_rule.get('group_id'))
-
-        except Exception as exp:
-
-            raise exc.HTTPBadRequest(explanation=unicode(exp))
-
-
-
-        if values is None:
-
-            msg = _("Not enough parameters to build a "
-
-                                       "valid rule.")
-
-            raise exc.HTTPBadRequest(explanation=msg)
-
-
-
-        values['parent_group_id'] = security_group.id
-
-
-
-        if self._security_group_rule_exists(security_group, values):
-
-            msg = _('This rule already exists in group %s') % parent_group_id
-
-            raise exc.HTTPBadRequest(explanation=msg)
-
-
-
-        security_group_rule = db.security_group_rule_create(context, values)
-
-
-
-        self.compute_api.trigger_security_group_rules_refresh(context,
-
-                                    security_group_id=security_group['id'])
-
-
-
-        return {"security_group_rule": self._format_security_group_rule(
-
-                                                        context,
-
-                                                        security_group_rule)}
-
-
-
-    def _security_group_rule_exists(self, security_group, values):
-
-        """Indicates whether the specified rule values are already
-
-           defined in the given security group.
-
-        """
-
-        for rule in security_group.rules:
-
-            if 'group_id' in values:
-
-                if rule['group_id'] == values['group_id']:
-
-                    return True
-
-            else:
-
-                is_duplicate = True
-
-                for key in ('cidr', 'from_port', 'to_port', 'protocol'):
-
-                    if rule[key] != values[key]:
-
-                        is_duplicate = False
-
-                        break
-
-                if is_duplicate:
-
-                    return True
-
-        return False
-
-
-
-    def _rule_args_to_dict(self, context, to_port=None, from_port=None,
-
-                                  parent_group_id=None, ip_protocol=None,
-
-                                  cidr=None, group_id=None):
-
-        values = {}
-
-
-
-        if group_id:
-
-            try:
-
-                parent_group_id = int(parent_group_id)
-
-                group_id = int(group_id)
-
-            except ValueError:
-
-                msg = _("Parent or group id is not integer")
-
-                raise exception.InvalidInput(reason=msg)
-
-
-
-            if parent_group_id == group_id:
-
-                msg = _("Parent group id and group id cannot be same")
-
-                raise exception.InvalidInput(reason=msg)
-
-
-
-            values['group_id'] = group_id
-
-            #check if groupId exists
-
-            db.security_group_get(context, group_id)
-
-        elif cidr:
-
-            # If this fails, it throws an exception. This is what we want.
-
-            try:
-
-                cidr = urllib.unquote(cidr).decode()
-
-            except Exception:
-
-                raise exception.InvalidCidr(cidr=cidr)
-
-
-
-            if not utils.is_valid_cidr(cidr):
-
-                # Raise exception for non-valid address
-
-                raise exception.InvalidCidr(cidr=cidr)
-
-
-
-            values['cidr'] = cidr
+            res = inst
 
         else:
 
-            values['cidr'] = '0.0.0.0/0'
+            raise MessageException("Wrong type: %s" % type(inst))
+
+    else:
+
+        raise PyoidcError("Unknown sformat", inst)
 
 
 
-        if ip_protocol and from_port and to_port:
+    return res
 
 
 
-            ip_protocol = str(ip_protocol)
 
-            try:
 
-                from_port = int(from_port)
+def msg_ser_json(inst, sformat="json", lev=0):
 
-                to_port = int(to_port)
+    # sformat = "json" always except when dict
 
-            except ValueError:
+    if lev:
 
-                if ip_protocol.upper() == 'ICMP':
-
-                    raise exception.InvalidInput(reason="Type and"
-
-                         " Code must be integers for ICMP protocol type")
-
-                else:
-
-                    raise exception.InvalidInput(reason="To and From ports "
-
-                          "must be integers")
+        sformat = "dict"
 
 
 
-            if ip_protocol.upper() not in ['TCP', 'UDP', 'ICMP']:
+    if sformat == "dict":
 
-                raise exception.InvalidIpProtocol(protocol=ip_protocol)
+        if isinstance(inst, Message):
 
+            res = inst.serialize(sformat, lev)
 
+        elif isinstance(inst, dict):
 
-            # Verify that from_port must always be less than
-
-            # or equal to to_port
-
-            if from_port > to_port:
-
-                raise exception.InvalidPortRange(from_port=from_port,
-
-                      to_port=to_port, msg="Former value cannot"
-
-                                            " be greater than the later")
-
-
-
-            # Verify valid TCP, UDP port ranges
-
-            if (ip_protocol.upper() in ['TCP', 'UDP'] and
-
-                (from_port < 1 or to_port > 65535)):
-
-                raise exception.InvalidPortRange(from_port=from_port,
-
-                      to_port=to_port, msg="Valid TCP ports should"
-
-                                           " be between 1-65535")
-
-
-
-            # Verify ICMP type and code
-
-            if (ip_protocol.upper() == "ICMP" and
-
-                (from_port < -1 or to_port > 255)):
-
-                raise exception.InvalidPortRange(from_port=from_port,
-
-                      to_port=to_port, msg="For ICMP, the"
-
-                                           " type:code must be valid")
-
-
-
-            values['protocol'] = ip_protocol
-
-            values['from_port'] = from_port
-
-            values['to_port'] = to_port
+            res = inst
 
         else:
 
-            # If cidr based filtering, protocol and ports are mandatory
+            raise MessageException("Wrong type: %s" % type(inst))
 
-            if 'cidr' in values:
+    else:
 
-                return None
+        sformat = "json"
 
+        if isinstance(inst, Message):
 
+            res = inst.serialize(sformat, lev)
 
-        return values
+        else:
 
-
-
-    def delete(self, req, id):
-
-        context = req.environ['nova.context']
+            res = inst
 
 
 
-        self.compute_api.ensure_default_security_group(context)
+    return res
+
+
+
+
+
+def msg_list_ser(insts, sformat, lev=0):
+
+    return [msg_ser(inst, sformat, lev) for inst in insts]
+
+
+
+
+
+def claims_ser(val, sformat="urlencoded", lev=0):
+
+    # everything in c_extension
+
+    if isinstance(val, str):
+
+        item = val
+
+    elif isinstance(val, list):
+
+        item = val[0]
+
+    else:
+
+        item = val
+
+
+
+    if isinstance(item, Message):
+
+        return item.serialize(method=sformat, lev=lev + 1)
+
+
+
+    if sformat == "urlencoded":
+
+        assert isinstance(  # nosec
+
+            item, dict
+
+        )  # We cannot urlencode anything else than Mapping
+
+        res = urlencode(item)
+
+    elif sformat == "json":
+
+        if lev:
+
+            res = item
+
+        else:
+
+            res = json.dumps(item)
+
+    elif sformat == "dict":
+
+        if isinstance(item, dict):
+
+            res = item
+
+        else:
+
+            raise MessageException("Wrong type: %s" % type(item))
+
+    else:
+
+        raise PyoidcError("Unknown sformat: %s" % sformat, val)
+
+
+
+    return res
+
+
+
+
+
+def registration_request_deser(val, sformat="urlencoded"):
+
+    if sformat in ["dict", "json"]:
+
+        if not isinstance(val, str):
+
+            val = json.dumps(val)
+
+            sformat = "json"
+
+    return RegistrationRequest().deserialize(val, sformat)
+
+
+
+
+
+def claims_request_deser(val, sformat="json"):
+
+    # never 'urlencoded'
+
+    if sformat == "urlencoded":
+
+        sformat = "json"
+
+    if sformat in ["dict", "json"]:
+
+        if not isinstance(val, str):
+
+            val = json.dumps(val)
+
+            sformat = "json"
+
+    return ClaimsRequest().deserialize(val, sformat)
+
+
+
+
+
+OPTIONAL_ADDRESS = ParamDefinition(Message, False, msg_ser, address_deser, False)
+
+OPTIONAL_LOGICAL = ParamDefinition(bool, False, None, None, False)
+
+OPTIONAL_MULTIPLE_Claims = ParamDefinition(
+
+    Message, False, claims_ser, claims_deser, False
+
+)
+
+
+
+SINGLE_OPTIONAL_IDTOKEN = ParamDefinition(str, False, msg_ser, None, False)
+
+
+
+SINGLE_OPTIONAL_REGISTRATION_REQUEST = ParamDefinition(
+
+    Message, False, msg_ser, registration_request_deser, False
+
+)
+
+SINGLE_OPTIONAL_CLAIMSREQ = ParamDefinition(
+
+    Message, False, msg_ser_json, claims_request_deser, False
+
+)
+
+
+
+OPTIONAL_MESSAGE = ParamDefinition(Message, False, msg_ser, message_deser, False)
+
+REQUIRED_MESSAGE = ParamDefinition(Message, True, msg_ser, message_deser, False)
+
+
+
+# ----------------------------------------------------------------------------
+
+
+
+
+
+SCOPE_CHARSET = []
+
+for char in ["\x21", ("\x23", "\x5b"), ("\x5d", "\x7E")]:
+
+    if isinstance(char, tuple):
+
+        c = char[0]
+
+        while c <= char[1]:
+
+            SCOPE_CHARSET.append(c)
+
+            c = chr(ord(c) + 1)
+
+    else:
+
+        SCOPE_CHARSET.append(set)
+
+
+
+
+
+def check_char_set(string, allowed):
+
+    for c in string:
+
+        if c not in allowed:
+
+            raise NotAllowedValue("'%c' not in the allowed character set" % c)
+
+
+
+
+
+TOKEN_VERIFY_ARGS = ["key", "keyjar", "algs", "sender"]
+
+
+
+
+
+def verify_id_token(instance, check_hash=False, **kwargs):
+
+    # Try to decode the JWT, checks the signature
+
+    args = {}
+
+    for arg in TOKEN_VERIFY_ARGS:
 
         try:
 
-            id = int(id)
-
-            rule = db.security_group_rule_get(context, id)
-
-        except ValueError:
-
-            msg = _("Rule id is not integer")
-
-            return exc.HTTPBadRequest(explanation=msg)
-
-        except exception.NotFound as exp:
-
-            msg = _("Rule (%s) not found") % id
-
-            return exc.HTTPNotFound(explanation=msg)
-
-
-
-        group_id = rule.parent_group_id
-
-        self.compute_api.ensure_default_security_group(context)
-
-        security_group = db.security_group_get(context, group_id)
-
-
-
-        msg = _("Revoke security group ingress %s")
-
-        LOG.audit(msg, security_group['name'], context=context)
-
-
-
-        db.security_group_rule_destroy(context, rule['id'])
-
-        self.compute_api.trigger_security_group_rules_refresh(context,
-
-                                    security_group_id=security_group['id'])
-
-
-
-        return exc.HTTPAccepted()
-
-
-
-
-
-class Security_groups(extensions.ExtensionDescriptor):
-
-
-
-    def __init__(self):
-
-        self.compute_api = compute.API()
-
-        super(Security_groups, self).__init__()
-
-
-
-    def get_name(self):
-
-        return "SecurityGroups"
-
-
-
-    def get_alias(self):
-
-        return "security_groups"
-
-
-
-    def get_description(self):
-
-        return "Security group support"
-
-
-
-    def get_namespace(self):
-
-        return "http://docs.openstack.org/ext/securitygroups/api/v1.1"
-
-
-
-    def get_updated(self):
-
-        return "2011-07-21T00:00:00+00:00"
-
-
-
-    def _addSecurityGroup(self, input_dict, req, instance_id):
-
-        context = req.environ['nova.context']
-
-
-
-        try:
-
-            body = input_dict['addSecurityGroup']
-
-            group_name = body['name']
-
-            instance_id = int(instance_id)
-
-        except ValueError:
-
-            msg = _("Server id should be integer")
-
-            raise exc.HTTPBadRequest(explanation=msg)
-
-        except TypeError:
-
-            msg = _("Missing parameter dict")
-
-            raise webob.exc.HTTPBadRequest(explanation=msg)
+            args[arg] = kwargs[arg]
 
         except KeyError:
 
-            msg = _("Security group not specified")
-
-            raise webob.exc.HTTPBadRequest(explanation=msg)
+            pass
 
 
 
-        if not group_name or group_name.strip() == '':
-
-            msg = _("Security group name cannot be empty")
-
-            raise webob.exc.HTTPBadRequest(explanation=msg)
+    _jws = str(instance["id_token"])
 
 
 
-        try:
+    # It can be encrypted, so try to decrypt first
 
-            self.compute_api.add_security_group(context, instance_id,
+    _jwe = JWE_factory(_jws)
 
-                                                group_name)
-
-        except exception.SecurityGroupNotFound as exp:
-
-            return exc.HTTPNotFound(explanation=unicode(exp))
-
-        except exception.InstanceNotFound as exp:
-
-            return exc.HTTPNotFound(explanation=unicode(exp))
-
-        except exception.Invalid as exp:
-
-            return exc.HTTPBadRequest(explanation=unicode(exp))
-
-
-
-        return exc.HTTPAccepted()
-
-
-
-    def _removeSecurityGroup(self, input_dict, req, instance_id):
-
-        context = req.environ['nova.context']
-
-
+    if _jwe is not None:
 
         try:
 
-            body = input_dict['removeSecurityGroup']
+            _jws = _jwe.decrypt(keys=kwargs["keyjar"].get_decrypt_key())
 
-            group_name = body['name']
+        except JWEException as err:
 
-            instance_id = int(instance_id)
+            raise VerificationError("Could not decrypt id_token", err)
 
-        except ValueError:
+    _packer = JWT()
 
-            msg = _("Server id should be integer")
+    _body = _packer.unpack(_jws).payload()
 
-            raise exc.HTTPBadRequest(explanation=msg)
 
-        except TypeError:
 
-            msg = _("Missing parameter dict")
+    if "keyjar" in kwargs:
 
-            raise webob.exc.HTTPBadRequest(explanation=msg)
+        try:
+
+            if _body["iss"] not in kwargs["keyjar"]:
+
+                raise ValueError("Unknown issuer")
 
         except KeyError:
 
-            msg = _("Security group not specified")
-
-            raise webob.exc.HTTPBadRequest(explanation=msg)
+            raise MissingRequiredAttribute("iss")
 
 
 
-        if not group_name or group_name.strip() == '':
+    if _jwe is not None:
 
-            msg = _("Security group name cannot be empty")
+        # Use the original encrypted token to set correct headers
 
-            raise webob.exc.HTTPBadRequest(explanation=msg)
+        idt = IdToken().from_jwt(str(instance["id_token"]), **args)
 
+    else:
 
+        idt = IdToken().from_jwt(_jws, **args)
 
-        try:
+    if not idt.verify(**kwargs):
 
-            self.compute_api.remove_security_group(context, instance_id,
-
-                                                   group_name)
-
-        except exception.SecurityGroupNotFound as exp:
-
-            return exc.HTTPNotFound(explanation=unicode(exp))
-
-        except exception.InstanceNotFound as exp:
-
-            return exc.HTTPNotFound(explanation=unicode(exp))
-
-        except exception.Invalid as exp:
-
-            return exc.HTTPBadRequest(explanation=unicode(exp))
+        raise VerificationError("Could not verify id_token", idt)
 
 
 
-        return exc.HTTPAccepted()
+    if check_hash:
+
+        _alg = idt.jws_header["alg"]
+
+        # What if _alg == 'none'
 
 
 
-    def get_actions(self):
-
-        """Return the actions the extensions adds"""
-
-        actions = [
-
-                extensions.ActionExtension("servers", "addSecurityGroup",
-
-                                           self._addSecurityGroup),
-
-                extensions.ActionExtension("servers", "removeSecurityGroup",
-
-                                           self._removeSecurityGroup)
-
-                   ]
-
-        return actions
+        hfunc = "HS" + _alg[-3:]
 
 
 
-    def get_resources(self):
+        if "access_token" in instance:
 
-        resources = []
+            if "at_hash" not in idt:
+
+                raise MissingRequiredAttribute("Missing at_hash property", idt)
+
+            if idt["at_hash"] != jws.left_hash(instance["access_token"], hfunc):
+
+                raise AtHashError("Failed to verify access_token hash", idt)
 
 
 
-        metadata = _get_metadata()
+        if "code" in instance:
 
-        body_serializers = {
+            if "c_hash" not in idt:
 
-            'application/xml': wsgi.XMLDictSerializer(metadata=metadata,
+                raise MissingRequiredAttribute("Missing c_hash property", idt)
 
-                                                      xmlns=wsgi.XMLNS_V11),
+            if idt["c_hash"] != jws.left_hash(instance["code"], hfunc):
+
+                raise CHashError("Failed to verify code hash", idt)
+
+
+
+    return idt
+
+
+
+
+
+# -----------------------------------------------------------------------------
+
+
+
+
+
+class RefreshAccessTokenRequest(message.RefreshAccessTokenRequest):
+
+    pass
+
+
+
+
+
+class TokenErrorResponse(message.TokenErrorResponse):
+
+    pass
+
+
+
+
+
+class AccessTokenResponse(message.AccessTokenResponse):
+
+    c_param = message.AccessTokenResponse.c_param.copy()
+
+    c_param.update({"id_token": SINGLE_OPTIONAL_STRING})
+
+
+
+    def verify(self, **kwargs):
+
+        super().verify(**kwargs)
+
+        if "id_token" in self:
+
+            # replace the JWT with the verified IdToken instance
+
+            self["id_token"] = verify_id_token(self, **kwargs)
+
+
+
+        return True
+
+
+
+
+
+class UserInfoRequest(Message):
+
+    c_param = {"access_token": SINGLE_OPTIONAL_STRING}
+
+
+
+
+
+class AuthorizationResponse(message.AuthorizationResponse, message.AccessTokenResponse):
+
+    c_param = message.AuthorizationResponse.c_param.copy()
+
+    c_param.update(message.AccessTokenResponse.c_param)
+
+    c_param.update(
+
+        {
+
+            "code": SINGLE_OPTIONAL_STRING,
+
+            "access_token": SINGLE_OPTIONAL_STRING,
+
+            "token_type": SINGLE_OPTIONAL_STRING,
+
+            "id_token": SINGLE_OPTIONAL_IDTOKEN,
 
         }
 
-        serializer = wsgi.ResponseSerializer(body_serializers, None)
+    )
 
 
 
-        body_deserializers = {
+    def verify(self, **kwargs):
 
-            'application/xml': SecurityGroupXMLDeserializer(),
+        super().verify(**kwargs)
+
+
+
+        if "aud" in self:
+
+            if "client_id" in kwargs:
+
+                # check that it's for me
+
+                if kwargs["client_id"] not in self["aud"]:
+
+                    return False
+
+
+
+        if "id_token" in self:
+
+            self["id_token"] = verify_id_token(self, check_hash=True, **kwargs)
+
+
+
+        if "access_token" in self:
+
+            if "token_type" not in self:
+
+                raise MissingRequiredValue("Missing token_type parameter", self)
+
+
+
+        return True
+
+
+
+
+
+class AuthorizationErrorResponse(message.AuthorizationErrorResponse):
+
+    c_allowed_values = message.AuthorizationErrorResponse.c_allowed_values.copy()
+
+    c_allowed_values["error"].extend(
+
+        [
+
+            "interaction_required",
+
+            "login_required",
+
+            "session_selection_required",
+
+            "consent_required",
+
+            "invalid_request_uri",
+
+            "invalid_request_object",
+
+            "registration_not_supported",
+
+            "request_not_supported",
+
+            "request_uri_not_supported",
+
+        ]
+
+    )
+
+
+
+
+
+class AuthorizationRequest(message.AuthorizationRequest):
+
+    c_param = message.AuthorizationRequest.c_param.copy()
+
+    c_param.update(
+
+        {
+
+            "scope": REQUIRED_LIST_OF_SP_SEP_STRINGS,
+
+            "redirect_uri": SINGLE_REQUIRED_STRING,
+
+            "nonce": SINGLE_OPTIONAL_STRING,
+
+            "display": SINGLE_OPTIONAL_STRING,
+
+            "prompt": OPTIONAL_LIST_OF_STRINGS,
+
+            "max_age": SINGLE_OPTIONAL_INT,
+
+            "ui_locales": OPTIONAL_LIST_OF_SP_SEP_STRINGS,
+
+            "claims_locales": OPTIONAL_LIST_OF_SP_SEP_STRINGS,
+
+            "id_token_hint": SINGLE_OPTIONAL_STRING,
+
+            "login_hint": SINGLE_OPTIONAL_STRING,
+
+            "acr_values": OPTIONAL_LIST_OF_SP_SEP_STRINGS,
+
+            "claims": SINGLE_OPTIONAL_CLAIMSREQ,
+
+            "registration": SINGLE_OPTIONAL_JSON,
+
+            "request": SINGLE_OPTIONAL_STRING,
+
+            "request_uri": SINGLE_OPTIONAL_STRING,
+
+            "response_mode": SINGLE_OPTIONAL_STRING,
 
         }
 
-        deserializer = wsgi.RequestDeserializer(body_deserializers)
+    )
 
+    c_allowed_values = message.AuthorizationRequest.c_allowed_values.copy()
 
+    c_allowed_values.update(
 
-        res = extensions.ResourceExtension('os-security-groups',
+        {
 
-                                controller=SecurityGroupController(),
+            "display": ["page", "popup", "touch", "wap"],
 
-                                deserializer=deserializer,
-
-                                serializer=serializer)
-
-
-
-        resources.append(res)
-
-
-
-        body_deserializers = {
-
-            'application/xml': SecurityGroupRulesXMLDeserializer(),
+            "prompt": ["none", "login", "consent", "select_account"],
 
         }
 
-        deserializer = wsgi.RequestDeserializer(body_deserializers)
+    )
 
 
 
-        res = extensions.ResourceExtension('os-security-group-rules',
+    def verify(self, **kwargs):
 
-                                controller=SecurityGroupRulesController(),
+        """
 
-                                deserializer=deserializer,
+        Check that the request is valid.
 
-                                serializer=serializer)
 
-        resources.append(res)
 
-        return resources
+        Authorization Request parameters that are OPTIONAL in the OAuth 2.0
 
+        specification MAY be included in the OpenID Request Object without also
 
+        passing them as OAuth 2.0 Authorization Request parameters, with one
 
+        exception: The scope parameter MUST always be present in OAuth 2.0
 
+        Authorization Request parameters.
 
-class SecurityGroupXMLDeserializer(wsgi.MetadataXMLDeserializer):
+        All parameter values that are present both in the OAuth 2.0
 
-    """
+        Authorization Request and in the OpenID Request Object MUST exactly match.
 
-    Deserializer to handle xml-formatted security group requests.
+        """
 
-    """
+        super().verify(**kwargs)
 
-    def create(self, string):
 
-        """Deserialize an xml-formatted security group create request"""
 
-        dom = minidom.parseString(string)
+        args = {}
 
-        security_group = {}
+        for arg in ["key", "keyjar", "opponent_id", "sender"]:
 
-        sg_node = self.find_first_child_named(dom,
+            try:
 
-                                               'security_group')
+                args[arg] = kwargs[arg]
 
-        if sg_node is not None:
+            except KeyError:
 
-            if sg_node.hasAttribute('name'):
+                pass
 
-                security_group['name'] = sg_node.getAttribute('name')
 
-            desc_node = self.find_first_child_named(sg_node,
 
-                                                     "description")
+        if "opponent_id" not in kwargs:
 
-            if desc_node:
+            args["opponent_id"] = self["client_id"]
 
-                security_group['description'] = self.extract_text(desc_node)
 
-        return {'body': {'security_group': security_group}}
 
+        if "request" in self:
 
+            if isinstance(self["request"], str):
 
+                # Try to decode the JWT, checks the signature
 
+                oidr = OpenIDRequest().from_jwt(str(self["request"]), **args)
 
-class SecurityGroupRulesXMLDeserializer(wsgi.MetadataXMLDeserializer):
 
-    """
 
-    Deserializer to handle xml-formatted security group requests.
+                # verify that nothing is change in the original message
 
-    """
+                for key, val in oidr.items():
 
+                    if key in self and self[key] != val:
 
+                        raise AssertionError()
 
-    def create(self, string):
 
-        """Deserialize an xml-formatted security group create request"""
 
-        dom = minidom.parseString(string)
+                # replace the JWT with the parsed and verified instance
 
-        security_group_rule = self._extract_security_group_rule(dom)
+                self["request"] = oidr
 
-        return {'body': {'security_group_rule': security_group_rule}}
 
 
+        if "id_token_hint" in self:
 
-    def _extract_security_group_rule(self, node):
+            if isinstance(self["id_token_hint"], str):
 
-        """Marshal the security group rule attribute of a parsed request"""
+                idt = IdToken().from_jwt(str(self["id_token_hint"]), **args)
 
-        sg_rule = {}
+                self["id_token_hint"] = idt
 
-        sg_rule_node = self.find_first_child_named(node,
 
-                                                   'security_group_rule')
 
-        if sg_rule_node is not None:
+        if "response_type" not in self:
 
-            ip_protocol_node = self.find_first_child_named(sg_rule_node,
+            raise MissingRequiredAttribute("response_type missing", self)
 
-                                                           "ip_protocol")
 
-            if ip_protocol_node is not None:
 
-                sg_rule['ip_protocol'] = self.extract_text(ip_protocol_node)
+        _rt = self["response_type"]
 
+        if "token" in _rt or "id_token" in _rt:
 
+            if "nonce" not in self:
 
-            from_port_node = self.find_first_child_named(sg_rule_node,
+                raise MissingRequiredAttribute("Nonce missing", self)
 
-                                                         "from_port")
 
-            if from_port_node is not None:
 
-                sg_rule['from_port'] = self.extract_text(from_port_node)
+        if "openid" not in self.get("scope", []):
 
+            raise MissingRequiredValue("openid not in scope", self)
 
 
-            to_port_node = self.find_first_child_named(sg_rule_node, "to_port")
 
-            if to_port_node is not None:
+        if "offline_access" in self.get("scope", []):
 
-                sg_rule['to_port'] = self.extract_text(to_port_node)
+            if "prompt" not in self or "consent" not in self["prompt"]:
 
+                raise MissingRequiredValue("consent in prompt", self)
 
 
-            parent_group_id_node = self.find_first_child_named(sg_rule_node,
 
-                                                            "parent_group_id")
+        if "prompt" in self:
 
-            if parent_group_id_node is not None:
+            if "none" in self["prompt"] and len(self["prompt"]) > 1:
 
-                sg_rule['parent_group_id'] = self.extract_text(
+                raise InvalidRequest("prompt none combined with other value", self)
 
-                                                         parent_group_id_node)
 
 
+        return True
 
-            group_id_node = self.find_first_child_named(sg_rule_node,
 
-                                                        "group_id")
 
-            if group_id_node is not None:
 
-                sg_rule['group_id'] = self.extract_text(group_id_node)
 
+class AccessTokenRequest(message.AccessTokenRequest):
 
+    c_param = message.AccessTokenRequest.c_param.copy()
 
-            cidr_node = self.find_first_child_named(sg_rule_node, "cidr")
+    c_param.update(
 
-            if cidr_node is not None:
+        {
 
-                sg_rule['cidr'] = self.extract_text(cidr_node)
+            "client_assertion_type": SINGLE_OPTIONAL_STRING,
 
-
-
-        return sg_rule
-
-
-
-
-
-def _get_metadata():
-
-    metadata = {
-
-        "attributes": {
-
-            "security_group": ["id", "tenant_id", "name"],
-
-            "rule": ["id", "parent_group_id"],
-
-            "security_group_rule": ["id", "parent_group_id"],
+            "client_assertion": SINGLE_OPTIONAL_STRING,
 
         }
+
+    )
+
+    c_default = {"grant_type": "authorization_code"}
+
+    c_allowed_values = {
+
+        "client_assertion_type": [
+
+            "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+
+        ]
 
     }
 
-    return metadata
+
+
+
+
+class AddressClaim(Message):
+
+    c_param = {
+
+        "formatted": SINGLE_OPTIONAL_STRING,
+
+        "street_address": SINGLE_OPTIONAL_STRING,
+
+        "locality": SINGLE_OPTIONAL_STRING,
+
+        "region": SINGLE_OPTIONAL_STRING,
+
+        "postal_code": SINGLE_OPTIONAL_STRING,
+
+        "country": SINGLE_OPTIONAL_STRING,
+
+    }
+
+
+
+
+
+class OpenIDSchema(Message):
+
+    c_param = {
+
+        "sub": SINGLE_REQUIRED_STRING,
+
+        "name": SINGLE_OPTIONAL_STRING,
+
+        "given_name": SINGLE_OPTIONAL_STRING,
+
+        "family_name": SINGLE_OPTIONAL_STRING,
+
+        "middle_name": SINGLE_OPTIONAL_STRING,
+
+        "nickname": SINGLE_OPTIONAL_STRING,
+
+        "preferred_username": SINGLE_OPTIONAL_STRING,
+
+        "profile": SINGLE_OPTIONAL_STRING,
+
+        "picture": SINGLE_OPTIONAL_STRING,
+
+        "website": SINGLE_OPTIONAL_STRING,
+
+        "email": SINGLE_OPTIONAL_STRING,
+
+        "email_verified": SINGLE_OPTIONAL_BOOLEAN,
+
+        "gender": SINGLE_OPTIONAL_STRING,
+
+        "birthdate": SINGLE_OPTIONAL_STRING,
+
+        "zoneinfo": SINGLE_OPTIONAL_STRING,
+
+        "locale": SINGLE_OPTIONAL_STRING,
+
+        "phone_number": SINGLE_OPTIONAL_STRING,
+
+        "phone_number_verified": SINGLE_OPTIONAL_BOOLEAN,
+
+        "address": OPTIONAL_ADDRESS,
+
+        "updated_at": SINGLE_OPTIONAL_INT,
+
+        "_claim_names": OPTIONAL_MESSAGE,
+
+        "_claim_sources": OPTIONAL_MESSAGE,
+
+    }
+
+
+
+    def verify(self, **kwargs):
+
+        super().verify(**kwargs)
+
+
+
+        if "birthdate" in self:
+
+            # Either YYYY-MM-DD or just YYYY or 0000-MM-DD
+
+            try:
+
+                time.strptime(self["birthdate"], "%Y-%m-%d")
+
+            except ValueError:
+
+                try:
+
+                    time.strptime(self["birthdate"], "%Y")
+
+                except ValueError:
+
+                    try:
+
+                        time.strptime(self["birthdate"], "0000-%m-%d")
+
+                    except ValueError:
+
+                        raise VerificationError("Birthdate format error", self)
+
+
+
+        if any(val is None for val in self.values()):
+
+            return False
+
+
+
+        return True
+
+
+
+
+
+class RegistrationRequest(Message):
+
+    c_param = {
+
+        "redirect_uris": REQUIRED_LIST_OF_STRINGS,
+
+        "response_types": OPTIONAL_LIST_OF_STRINGS,
+
+        "grant_types": OPTIONAL_LIST_OF_STRINGS,
+
+        "application_type": SINGLE_OPTIONAL_STRING,
+
+        "contacts": OPTIONAL_LIST_OF_STRINGS,
+
+        "client_name": SINGLE_OPTIONAL_STRING,
+
+        "logo_uri": SINGLE_OPTIONAL_STRING,
+
+        "client_uri": SINGLE_OPTIONAL_STRING,
+
+        "policy_uri": SINGLE_OPTIONAL_STRING,
+
+        "tos_uri": SINGLE_OPTIONAL_STRING,
+
+        "jwks": SINGLE_OPTIONAL_STRING,
+
+        "jwks_uri": SINGLE_OPTIONAL_STRING,
+
+        "sector_identifier_uri": SINGLE_OPTIONAL_STRING,
+
+        "subject_type": SINGLE_OPTIONAL_STRING,
+
+        "id_token_signed_response_alg": SINGLE_OPTIONAL_STRING,
+
+        "id_token_encrypted_response_alg": SINGLE_OPTIONAL_STRING,
+
+        "id_token_encrypted_response_enc": SINGLE_OPTIONAL_STRING,
+
+        "userinfo_signed_response_alg": SINGLE_OPTIONAL_STRING,
+
+        "userinfo_encrypted_response_alg": SINGLE_OPTIONAL_STRING,
+
+        "userinfo_encrypted_response_enc": SINGLE_OPTIONAL_STRING,
+
+        "request_object_signing_alg": SINGLE_OPTIONAL_STRING,
+
+        "request_object_encryption_alg": SINGLE_OPTIONAL_STRING,
+
+        "request_object_encryption_enc": SINGLE_OPTIONAL_STRING,
+
+        "token_endpoint_auth_method": SINGLE_OPTIONAL_STRING,
+
+        "token_endpoint_auth_signing_alg": SINGLE_OPTIONAL_STRING,
+
+        "default_max_age": SINGLE_OPTIONAL_INT,
+
+        "require_auth_time": OPTIONAL_LOGICAL,
+
+        "default_acr_values": OPTIONAL_LIST_OF_STRINGS,
+
+        "initiate_login_uri": SINGLE_OPTIONAL_STRING,
+
+        "request_uris": OPTIONAL_LIST_OF_STRINGS,
+
+        "post_logout_redirect_uris": OPTIONAL_LIST_OF_STRINGS,
+
+        "frontchannel_logout_uri": SINGLE_OPTIONAL_STRING,
+
+        "frontchannel_logout_session_required": OPTIONAL_LOGICAL,
+
+        "backchannel_logout_uri": SINGLE_OPTIONAL_STRING,
+
+        "backchannel_logout_session_required": OPTIONAL_LOGICAL,
+
+    }
+
+    c_default = {"application_type": "web", "response_types": ["code"]}
+
+    c_allowed_values = {
+
+        "application_type": ["native", "web"],
+
+        "subject_type": ["public", "pairwise"],
+
+    }
+
+
+
+    def verify(self, **kwargs):
+
+        super().verify(**kwargs)
+
+
+
+        if "initiate_login_uri" in self and not self["initiate_login_uri"].startswith(
+
+            "https:"
+
+        ):
+
+            raise AssertionError()
+
+
+
+        for param in [
+
+            "request_object_encryption",
+
+            "id_token_encrypted_response",
+
+            "userinfo_encrypted_response",
+
+        ]:
+
+            alg_param = "%s_alg" % param
+
+            enc_param = "%s_enc" % param
+
+            if alg_param in self:
+
+                if enc_param not in self:
+
+                    self[enc_param] = "A128CBC-HS256"
+
+
+
+            # both or none
+
+            if enc_param in self and alg_param not in self:
+
+                raise AssertionError()
+
+
+
+        if (
+
+            "token_endpoint_auth_signing_alg" in self
+
+            and self["token_endpoint_auth_signing_alg"] == "none"
+
+        ):
+
+            raise AssertionError()
+
+
+
+        return True
+
+
+
+
+
+class RegistrationResponse(Message):
+
+    """Response to client_register registration requests."""
+
+
+
+    c_param = {
+
+        "client_id": SINGLE_REQUIRED_STRING,
+
+        "client_secret": SINGLE_OPTIONAL_STRING,
+
+        "registration_access_token": SINGLE_OPTIONAL_STRING,
+
+        "registration_client_uri": SINGLE_OPTIONAL_STRING,
+
+        "client_id_issued_at": SINGLE_OPTIONAL_INT,
+
+        "client_secret_expires_at": SINGLE_OPTIONAL_INT,
+
+    }
+
+    c_param.update(RegistrationRequest.c_param)
+
+
+
+    def verify(self, **kwargs):
+
+        """
+
+        Verify that the response is valid.
+
+
+
+        Implementations MUST either return both a Client Configuration Endpoint
+
+        and a Registration Access Token or neither of them.
+
+        :param kwargs:
+
+        :return: True if the message is OK otherwise False
+
+        """
+
+        super(RegistrationResponse, self).verify(**kwargs)
+
+
+
+        has_reg_uri = "registration_client_uri" in self
+
+        has_reg_at = "registration_access_token" in self
+
+        if has_reg_uri != has_reg_at:
+
+            raise VerificationError(
+
+                (
+
+                    "Only one of registration_client_uri"
+
+                    " and registration_access_token present"
+
+                ),
+
+                self,
+
+            )
+
+
+
+        return True
+
+
+
+
+
+class ClientRegistrationErrorResponse(message.ErrorResponse):
+
+    c_allowed_values = {
+
+        "error": [
+
+            "invalid_redirect_uri",
+
+            "invalid_client_metadata",
+
+            "invalid_configuration_parameter",
+
+        ]
+
+    }
+
+
+
+
+
+class IdToken(OpenIDSchema):
+
+    c_param = OpenIDSchema.c_param.copy()
+
+    c_param.update(
+
+        {
+
+            "iss": SINGLE_REQUIRED_STRING,
+
+            "sub": SINGLE_REQUIRED_STRING,
+
+            "aud": REQUIRED_LIST_OF_STRINGS,  # Array of strings or string
+
+            "exp": SINGLE_REQUIRED_INT,
+
+            "iat": SINGLE_REQUIRED_INT,
+
+            "auth_time": SINGLE_OPTIONAL_INT,
+
+            "nonce": SINGLE_OPTIONAL_STRING,
+
+            "at_hash": SINGLE_OPTIONAL_STRING,
+
+            "c_hash": SINGLE_OPTIONAL_STRING,
+
+            "acr": SINGLE_OPTIONAL_STRING,
+
+            "amr": OPTIONAL_LIST_OF_STRINGS,
+
+            "azp": SINGLE_OPTIONAL_STRING,
+
+            "sub_jwk": SINGLE_OPTIONAL_STRING,
+
+        }
+
+    )
+
+
+
+    def verify(self, **kwargs):
+
+        super(IdToken, self).verify(**kwargs)
+
+
+
+        try:
+
+            if kwargs["iss"] != self["iss"]:
+
+                raise IssuerMismatch("{} != {}".format(kwargs["iss"], self["iss"]))
+
+        except KeyError:
+
+            pass
+
+
+
+        if "aud" in self:
+
+            if "client_id" in kwargs:
+
+                # check that I'm among the recipients
+
+                if kwargs["client_id"] not in self["aud"]:
+
+                    raise NotForMe(
+
+                        "{} not in aud:{}".format(kwargs["client_id"], self["aud"]),
+
+                        self,
+
+                    )
+
+
+
+            # Then azp has to be present and be one of the aud values
+
+            if len(self["aud"]) > 1:
+
+                if "azp" not in self:
+
+                    raise VerificationError("azp missing", self)
+
+                if self["azp"] not in self["aud"]:
+
+                    raise VerificationError("Mismatch between azp and aud claims", self)
+
+
+
+        if "azp" in self:
+
+            if "client_id" in kwargs:
+
+                if kwargs["client_id"] != self["azp"]:
+
+                    raise NotForMe(
+
+                        "{} != azp:{}".format(kwargs["client_id"], self["azp"]), self
+
+                    )
+
+
+
+        _now = time_util.utc_time_sans_frac()
+
+
+
+        try:
+
+            _skew = kwargs["skew"]
+
+        except KeyError:
+
+            _skew = 0
+
+
+
+        try:
+
+            _exp = self["exp"]
+
+        except KeyError:
+
+            raise MissingRequiredAttribute("exp")
+
+        else:
+
+            if (_now - _skew) > _exp:
+
+                raise EXPError("Invalid expiration time")
+
+
+
+        try:
+
+            _storage_time = kwargs["nonce_storage_time"]
+
+        except KeyError:
+
+            _storage_time = NONCE_STORAGE_TIME
+
+
+
+        try:
+
+            _iat = self["iat"]
+
+        except KeyError:
+
+            raise MissingRequiredAttribute("iat")
+
+        else:
+
+            if (_iat + _storage_time) < (_now - _skew):
+
+                raise IATError("Issued too long ago")
+
+
+
+        return True
+
+
+
+
+
+class StateFullMessage(Message):
+
+    c_param = {"state": SINGLE_REQUIRED_STRING}
+
+
+
+
+
+class RefreshSessionRequest(StateFullMessage):
+
+    c_param = StateFullMessage.c_param.copy()
+
+    c_param.update(
+
+        {"id_token": SINGLE_REQUIRED_STRING, "redirect_url": SINGLE_REQUIRED_STRING}
+
+    )
+
+
+
+    def verify(self, **kwargs):
+
+        super(RefreshSessionRequest, self).verify(**kwargs)
+
+        if "id_token" in self:
+
+            self["id_token"] = verify_id_token(self, check_hash=True, **kwargs)
+
+
+
+
+
+class RefreshSessionResponse(StateFullMessage):
+
+    c_param = StateFullMessage.c_param.copy()
+
+    c_param.update({"id_token": SINGLE_REQUIRED_STRING})
+
+
+
+    def verify(self, **kwargs):
+
+        super(RefreshSessionResponse, self).verify(**kwargs)
+
+        if "id_token" in self:
+
+            self["id_token"] = verify_id_token(self, check_hash=True, **kwargs)
+
+
+
+
+
+class CheckSessionRequest(Message):
+
+    c_param = {"id_token": SINGLE_REQUIRED_STRING}
+
+
+
+    def verify(self, **kwargs):
+
+        super(CheckSessionRequest, self).verify(**kwargs)
+
+        if "id_token" in self:
+
+            self["id_token"] = verify_id_token(self, check_hash=True, **kwargs)
+
+
+
+
+
+class CheckIDRequest(Message):
+
+    c_param = {"access_token": SINGLE_REQUIRED_STRING}
+
+
+
+
+
+class EndSessionRequest(Message):
+
+    c_param = {
+
+        "id_token_hint": SINGLE_OPTIONAL_STRING,
+
+        "post_logout_redirect_uri": SINGLE_OPTIONAL_STRING,
+
+        "state": SINGLE_OPTIONAL_STRING,
+
+    }
+
+
+
+
+
+class EndSessionResponse(Message):
+
+    c_param = {"state": SINGLE_OPTIONAL_STRING}
+
+
+
+
+
+class Claims(Message):
+
+    pass
+
+
+
+
+
+class ClaimsRequest(Message):
+
+    c_param = {
+
+        "userinfo": OPTIONAL_MULTIPLE_Claims,
+
+        "id_token": OPTIONAL_MULTIPLE_Claims,
+
+    }
+
+
+
+
+
+class OpenIDRequest(AuthorizationRequest):
+
+    pass
+
+
+
+
+
+class ProviderConfigurationResponse(Message):
+
+    c_param = {
+
+        "issuer": SINGLE_REQUIRED_STRING,
+
+        "authorization_endpoint": SINGLE_REQUIRED_STRING,
+
+        "token_endpoint": SINGLE_OPTIONAL_STRING,
+
+        "userinfo_endpoint": SINGLE_OPTIONAL_STRING,
+
+        "jwks_uri": SINGLE_REQUIRED_STRING,
+
+        "registration_endpoint": SINGLE_OPTIONAL_STRING,
+
+        "scopes_supported": OPTIONAL_LIST_OF_STRINGS,
+
+        "response_types_supported": REQUIRED_LIST_OF_STRINGS,
+
+        "response_modes_supported": OPTIONAL_LIST_OF_STRINGS,
+
+        "grant_types_supported": OPTIONAL_LIST_OF_STRINGS,
+
+        "acr_values_supported": OPTIONAL_LIST_OF_STRINGS,
+
+        "subject_types_supported": REQUIRED_LIST_OF_STRINGS,
+
+        "id_token_signing_alg_values_supported": REQUIRED_LIST_OF_STRINGS,
+
+        "id_token_encryption_alg_values_supported": OPTIONAL_LIST_OF_STRINGS,
+
+        "id_token_encryption_enc_values_supported": OPTIONAL_LIST_OF_STRINGS,
+
+        "userinfo_signing_alg_values_supported": OPTIONAL_LIST_OF_STRINGS,
+
+        "userinfo_encryption_alg_values_supported": OPTIONAL_LIST_OF_STRINGS,
+
+        "userinfo_encryption_enc_values_supported": OPTIONAL_LIST_OF_STRINGS,
+
+        "request_object_signing_alg_values_supported": OPTIONAL_LIST_OF_STRINGS,
+
+        "request_object_encryption_alg_values_supported": OPTIONAL_LIST_OF_STRINGS,
+
+        "request_object_encryption_enc_values_supported": OPTIONAL_LIST_OF_STRINGS,
+
+        "token_endpoint_auth_methods_supported": OPTIONAL_LIST_OF_STRINGS,
+
+        "token_endpoint_auth_signing_alg_values_supported": OPTIONAL_LIST_OF_STRINGS,
+
+        "display_values_supported": OPTIONAL_LIST_OF_STRINGS,
+
+        "claim_types_supported": OPTIONAL_LIST_OF_STRINGS,
+
+        "claims_supported": OPTIONAL_LIST_OF_STRINGS,
+
+        "service_documentation": SINGLE_OPTIONAL_STRING,
+
+        "claims_locales_supported": OPTIONAL_LIST_OF_STRINGS,
+
+        "ui_locales_supported": OPTIONAL_LIST_OF_STRINGS,
+
+        "claims_parameter_supported": SINGLE_OPTIONAL_BOOLEAN,
+
+        "request_parameter_supported": SINGLE_OPTIONAL_BOOLEAN,
+
+        "request_uri_parameter_supported": SINGLE_OPTIONAL_BOOLEAN,
+
+        "require_request_uri_registration": SINGLE_OPTIONAL_BOOLEAN,
+
+        "op_policy_uri": SINGLE_OPTIONAL_STRING,
+
+        "op_tos_uri": SINGLE_OPTIONAL_STRING,
+
+        "check_session_iframe": SINGLE_OPTIONAL_STRING,
+
+        "end_session_endpoint": SINGLE_OPTIONAL_STRING,
+
+        "frontchannel_logout_supported": SINGLE_OPTIONAL_BOOLEAN,
+
+        "frontchannel_logout_session_supported": SINGLE_OPTIONAL_BOOLEAN,
+
+        "backchannel_logout_supported": SINGLE_OPTIONAL_BOOLEAN,
+
+        "backchannel_logout_session_supported": SINGLE_OPTIONAL_BOOLEAN,
+
+    }
+
+    c_default = {
+
+        "version": "3.0",
+
+        "token_endpoint_auth_methods_supported": ["client_secret_basic"],
+
+        "claims_parameter_supported": False,
+
+        "request_parameter_supported": False,
+
+        "request_uri_parameter_supported": True,
+
+        "require_request_uri_registration": False,
+
+        "grant_types_supported": ["authorization_code", "implicit"],
+
+        "frontchannel_logout_supported": False,
+
+        "frontchannel_logout_session_supported": False,
+
+        "backchannel_logout_supported": False,
+
+        "backchannel_logout_session_supported": False,
+
+    }
+
+
+
+    def verify(self, **kwargs):
+
+        super().verify(**kwargs)
+
+
+
+        if "scopes_supported" in self:
+
+            if "openid" not in self["scopes_supported"]:
+
+                raise AssertionError()
+
+            for scope in self["scopes_supported"]:
+
+                check_char_set(scope, SCOPE_CHARSET)
+
+
+
+        parts = urlparse(self["issuer"])
+
+        if parts.scheme != "https":
+
+            raise SchemeError("Not HTTPS")
+
+
+
+        if parts.query or parts.fragment:
+
+            raise AssertionError()
+
+
+
+        if (
+
+            any("code" in rt for rt in self["response_types_supported"])
+
+            and "token_endpoint" not in self
+
+        ):
+
+            raise MissingRequiredAttribute("token_endpoint")
+
+
+
+        return True
+
+
+
+
+
+class AuthnToken(Message):
+
+    c_param = {
+
+        "iss": SINGLE_REQUIRED_STRING,
+
+        "sub": SINGLE_REQUIRED_STRING,
+
+        "aud": REQUIRED_LIST_OF_STRINGS,  # Array of strings or string
+
+        "jti": SINGLE_REQUIRED_STRING,
+
+        "exp": SINGLE_REQUIRED_INT,
+
+        "iat": SINGLE_OPTIONAL_INT,
+
+    }
+
+
+
+
+
+# According to RFC 7519 all claims are optional
+
+class JasonWebToken(Message):
+
+    c_param = {
+
+        "iss": SINGLE_OPTIONAL_STRING,
+
+        "sub": SINGLE_OPTIONAL_STRING,
+
+        "aud": OPTIONAL_LIST_OF_STRINGS,  # Array of strings or string
+
+        "exp": SINGLE_OPTIONAL_INT,
+
+        "nbf": SINGLE_OPTIONAL_INT,
+
+        "iat": SINGLE_OPTIONAL_INT,
+
+        "jti": SINGLE_OPTIONAL_STRING,
+
+    }
+
+
+
+
+
+def jwt_deser(val, sformat="json"):
+
+    if sformat == "urlencoded":
+
+        sformat = "json"
+
+    if sformat in ["dict", "json"]:
+
+        if not isinstance(val, str):
+
+            val = json.dumps(val)
+
+            sformat = "json"
+
+    return JasonWebToken().deserialize(val, sformat)
+
+
+
+
+
+SINGLE_OPTIONAL_JWT = ParamDefinition(Message, False, msg_ser, jwt_deser, False)
+
+
+
+
+
+class UserInfoErrorResponse(message.ErrorResponse):
+
+    c_allowed_values = {
+
+        "error": [
+
+            "invalid_schema",
+
+            "invalid_request",
+
+            "invalid_token",
+
+            "insufficient_scope",
+
+        ]
+
+    }
+
+
+
+
+
+class DiscoveryRequest(Message):
+
+    c_param = {"principal": SINGLE_REQUIRED_STRING, "service": SINGLE_REQUIRED_STRING}
+
+
+
+
+
+class DiscoveryResponse(Message):
+
+    c_param = {"locations": REQUIRED_LIST_OF_STRINGS}
+
+
+
+
+
+class ResourceRequest(Message):
+
+    c_param = {"access_token": SINGLE_OPTIONAL_STRING}
+
+
+
+
+
+SCOPE2CLAIMS: Dict[str, List[str]] = {
+
+    "openid": ["sub"],
+
+    "profile": [
+
+        "name",
+
+        "given_name",
+
+        "family_name",
+
+        "middle_name",
+
+        "nickname",
+
+        "profile",
+
+        "picture",
+
+        "website",
+
+        "gender",
+
+        "birthdate",
+
+        "zoneinfo",
+
+        "locale",
+
+        "updated_at",
+
+        "preferred_username",
+
+    ],
+
+    "email": ["email", "email_verified"],
+
+    "address": ["address"],
+
+    "phone": ["phone_number", "phone_number_verified"],
+
+    "offline_access": [],
+
+}
+
+
+
+# LOGOUT related messages
+
+
+
+SINGLE_OPTIONAL_JSON = ParamDefinition(dict, False, json_ser, json_deser, False)
+
+SINGLE_REQUIRED_JSON = ParamDefinition(dict, True, json_ser, json_deser, False)
+
+
+
+BACK_CHANNEL_LOGOUT_EVENT = "http://schemas.openid.net/event/backchannel-logout"
+
+
+
+
+
+class LogoutToken(Message):
+
+    """Defined in https://openid.net/specs/openid-connect-backchannel-1_0.html#LogoutToken ."""
+
+
+
+    c_param = {
+
+        "iss": SINGLE_REQUIRED_STRING,
+
+        "sub": SINGLE_OPTIONAL_STRING,
+
+        "aud": REQUIRED_LIST_OF_STRINGS,  # Array of strings or string
+
+        "iat": SINGLE_REQUIRED_INT,
+
+        "jti": SINGLE_REQUIRED_STRING,
+
+        "events": SINGLE_REQUIRED_JSON,
+
+        "sid": SINGLE_OPTIONAL_STRING,
+
+    }
+
+
+
+    def verify(self, **kwargs):
+
+        super().verify(**kwargs)
+
+
+
+        if "nonce" in self:
+
+            raise MessageException(
+
+                '"nonce" is prohibited from appearing in a LogoutToken.'
+
+            )
+
+
+
+        # Check the 'events' JSON
+
+        _keys = list(self["events"].keys())
+
+        if len(_keys) != 1:
+
+            raise ValueError('Must only be one member in "events"')
+
+        if _keys[0] != BACK_CHANNEL_LOGOUT_EVENT:
+
+            raise ValueError('Wrong member in "events"')
+
+        if self["events"][_keys[0]] != {}:
+
+            raise ValueError('Wrong member value in "events"')
+
+
+
+        # There must be either a 'sub' or a 'sid', and may contain both
+
+        if not ("sub" in self or "sid" in self):
+
+            raise ValueError('There MUST be either a "sub" or a "sid"')
+
+
+
+        try:
+
+            if kwargs["aud"] not in self["aud"]:
+
+                raise NotForMe("Not among intended audience")
+
+        except KeyError:
+
+            pass
+
+
+
+        try:
+
+            if kwargs["iss"] != self["iss"]:
+
+                raise NotForMe("Wrong issuer")
+
+        except KeyError:
+
+            pass
+
+
+
+        _now = utc_time_sans_frac()
+
+
+
+        _skew = kwargs.get("skew", 0)
+
+        _iat = self.get("iat", 0)
+
+
+
+        if _iat and _iat > (_now + _skew):
+
+            raise ValueError("Invalid issued_at time")
+
+
+
+        return True
+
+
+
+
+
+ID_TOKEN_VERIFY_ARGS = [
+
+    "keyjar",
+
+    "verify",
+
+    "encalg",
+
+    "encenc",
+
+    "sigalg",
+
+    "issuer",
+
+    "allow_missing_kid",
+
+    "no_kid_issuer",
+
+    "trusting",
+
+    "skew",
+
+    "nonce_storage_time",
+
+    "client_id",
+
+]
+
+
+
+
+
+class BackChannelLogoutRequest(Message):
+
+    """Defines the message used in https://openid.net/specs/openid-connect-backchannel-1_0.html ."""
+
+
+
+    c_param = {"logout_token": SINGLE_REQUIRED_STRING}
+
+
+
+    def verify(self, **kwargs):
+
+        super().verify(**kwargs)
+
+
+
+        args = {arg: kwargs[arg] for arg in TOKEN_VERIFY_ARGS if arg in kwargs}
+
+
+
+        logout_token = LogoutToken().from_jwt(str(self["logout_token"]), **args)
+
+        logout_token.verify(**kwargs)
+
+
+
+        self["logout_token"] = logout_token
+
+        logger.info("Verified Logout Token: {}".format(logout_token.to_dict()))
+
+
+
+        return True
+
+
+
+
+
+class FrontChannelLogoutRequest(Message):
+
+    """Defines the message used in https://openid.net/specs/openid-connect-frontchannel-1_0.html ."""
+
+
+
+    c_param = {"iss": SINGLE_OPTIONAL_STRING, "sid": SINGLE_OPTIONAL_STRING}
+
+
+
+
+
+MSG = {
+
+    "RefreshAccessTokenRequest": RefreshAccessTokenRequest,
+
+    "TokenErrorResponse": TokenErrorResponse,
+
+    "AccessTokenResponse": AccessTokenResponse,
+
+    "UserInfoRequest": UserInfoRequest,
+
+    "AuthorizationResponse": AuthorizationResponse,
+
+    "AuthorizationErrorResponse": AuthorizationErrorResponse,
+
+    "AuthorizationRequest": AuthorizationRequest,
+
+    "AccessTokenRequest": AccessTokenRequest,
+
+    "AddressClaim": AddressClaim,
+
+    "OpenIDSchema": OpenIDSchema,
+
+    "RegistrationRequest": RegistrationRequest,
+
+    "RegistrationResponse": RegistrationResponse,
+
+    "ClientRegistrationErrorResponse": ClientRegistrationErrorResponse,
+
+    "IdToken": IdToken,
+
+    "RefreshSessionRequest": RefreshSessionRequest,
+
+    "RefreshSessionResponse": RefreshSessionResponse,
+
+    "CheckSessionRequest": CheckSessionRequest,
+
+    "CheckIDRequest": CheckIDRequest,
+
+    "EndSessionRequest": EndSessionRequest,
+
+    "EndSessionResponse": EndSessionResponse,
+
+    "Claims": Claims,
+
+    "OpenIDRequest": OpenIDRequest,
+
+    "ProviderConfigurationResponse": ProviderConfigurationResponse,
+
+    "AuthnToken": AuthnToken,
+
+    "UserInfoErrorResponse": UserInfoErrorResponse,
+
+    "DiscoveryRequest": DiscoveryRequest,
+
+    "DiscoveryResponse": DiscoveryResponse,
+
+    "ResourceRequest": ResourceRequest,
+
+    # LOGOUT messages
+
+    "LogoutToken": LogoutToken,
+
+    "BackChannelLogoutRequest": BackChannelLogoutRequest,
+
+    "FrontChannelLogoutRequest": FrontChannelLogoutRequest,
+
+}
+
+
+
+
+
+def factory(msgtype):
+
+    warnings.warn(
+
+        "`factory` is deprecated. Use `OIDCMessageFactory` instead.", DeprecationWarning
+
+    )
+
+    for _, obj in inspect.getmembers(sys.modules[__name__]):
+
+        if inspect.isclass(obj) and issubclass(obj, Message):
+
+            try:
+
+                if obj.__name__ == msgtype:
+
+                    return obj
+
+            except AttributeError:
+
+                pass
+
+
+
+    # Fall back to basic OAuth2 messages
+
+    return message.factory(msgtype)
+
+
+
+
+
+class OIDCMessageFactory(MessageFactory):
+
+    """Factory that knows OIDC message types."""
+
+
+
+    authorization_endpoint = MessageTuple(AuthorizationRequest, AuthorizationResponse)
+
+    token_endpoint = MessageTuple(AccessTokenRequest, AccessTokenResponse)
+
+    refresh_endpoint = MessageTuple(RefreshAccessTokenRequest, AccessTokenResponse)
+
+    resource_endpoint = MessageTuple(ResourceRequest, Message)
+
+    configuration_endpoint = MessageTuple(Message, ProviderConfigurationResponse)
+
+
+
+    userinfo_endpoint = MessageTuple(UserInfoRequest, Message)
+
+    registration_endpoint = MessageTuple(RegistrationRequest, RegistrationResponse)
+
+    endsession_endpoint = MessageTuple(EndSessionRequest, EndSessionResponse)
+
+    checkid_endpoint = MessageTuple(CheckIDRequest, IdToken)
+
+    checksession_endpoint = MessageTuple(CheckSessionRequest, IdToken)
+
+    refreshsession_endpoint = MessageTuple(
+
+        RefreshSessionRequest, RefreshSessionResponse
+
+    )
+
+    discovery_endpoint = MessageTuple(DiscoveryRequest, DiscoveryResponse)

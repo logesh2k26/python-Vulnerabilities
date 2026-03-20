@@ -2,778 +2,1422 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# -*- coding: utf-8 -*-
+##############################################################################
 
 #
 
-# Copyright © 2012 - 2016 Michal Čihař <michal@cihar.com>
+# Copyright (c) 2002 Zope Foundation and Contributors.
+
+# All Rights Reserved.
 
 #
 
-# This file is part of Weblate <https://weblate.org/>
+# This software is subject to the provisions of the Zope Public License,
+
+# Version 2.1 (ZPL).  A copy of the ZPL should accompany this distribution.
+
+# THIS SOFTWARE IS PROVIDED "AS IS" AND ANY AND ALL EXPRESS OR IMPLIED
+
+# WARRANTIES ARE DISCLAIMED, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+
+# WARRANTIES OF TITLE, MERCHANTABILITY, AGAINST INFRINGEMENT, AND FITNESS
+
+# FOR A PARTICULAR PURPOSE.
 
 #
 
-# This program is free software: you can redistribute it and/or modify
+##############################################################################
 
-# it under the terms of the GNU General Public License as published by
-
-# the Free Software Foundation, either version 3 of the License, or
-
-# (at your option) any later version.
-
-#
-
-# This program is distributed in the hope that it will be useful,
-
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-
-# GNU General Public License for more details.
-
-#
-
-# You should have received a copy of the GNU General Public License
-
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
-
-#
-
-
+"""HTTP Request Parser tests
 
 """
 
-Tests for user handling.
-
-"""
+import unittest
 
 
 
-import json
-
-
-
-import httpretty
-
-from six.moves.urllib.parse import parse_qs, urlparse
-
-
-
-from django.contrib.auth.models import User
-
-from django.core.urlresolvers import reverse
-
-from django.core import mail
-
-from django.test import TestCase
-
-from django.test.utils import override_settings
-
-
-
-import social.apps.django_app.utils
-
-
-
-from weblate.accounts.models import VerifiedEmail
-
-from weblate.trans.tests.test_views import RegistrationTestMixin
-
-from weblate.trans.tests import OverrideSettings
-
-
-
-REGISTRATION_DATA = {
-
-    'username': 'username',
-
-    'email': 'noreply-weblate@example.org',
-
-    'first_name': 'First Last',
-
-    'captcha_id': '00',
-
-    'captcha': '9999'
-
-}
-
-
-
-GH_BACKENDS = (
-
-    'weblate.accounts.auth.EmailAuth',
-
-    'social.backends.github.GithubOAuth2',
-
-    'weblate.accounts.auth.WeblateUserBackend',
-
-)
+from waitress.compat import text_, tobytes
 
 
 
 
 
-class RegistrationTest(TestCase, RegistrationTestMixin):
+class TestHTTPRequestParser(unittest.TestCase):
 
-    clear_cookie = False
+    def setUp(self):
 
+        from waitress.parser import HTTPRequestParser
 
-
-    def assert_registration(self, match=None):
-
-        url = self.assert_registration_mailbox(match)
+        from waitress.adjustments import Adjustments
 
 
 
-        if self.clear_cookie and 'sessionid' in self.client.cookies:
+        my_adj = Adjustments()
 
-            del self.client.cookies['sessionid']
+        self.parser = HTTPRequestParser(my_adj)
 
 
 
-        # Confirm account
+    def test_get_body_stream_None(self):
 
-        response = self.client.get(url, follow=True)
+        self.parser.body_recv = None
 
-        self.assertRedirects(
+        result = self.parser.get_body_stream()
 
-            response,
+        self.assertEqual(result.getvalue(), b"")
 
-            reverse('password')
+
+
+    def test_get_body_stream_nonNone(self):
+
+        body_rcv = DummyBodyStream()
+
+        self.parser.body_rcv = body_rcv
+
+        result = self.parser.get_body_stream()
+
+        self.assertEqual(result, body_rcv)
+
+
+
+    def test_received_get_no_headers(self):
+
+        data = b"HTTP/1.0 GET /foobar\r\n\r\n"
+
+        result = self.parser.received(data)
+
+        self.assertEqual(result, 24)
+
+        self.assertTrue(self.parser.completed)
+
+        self.assertEqual(self.parser.headers, {})
+
+
+
+    def test_received_bad_host_header(self):
+
+        from waitress.utilities import BadRequest
+
+
+
+        data = b"HTTP/1.0 GET /foobar\r\n Host: foo\r\n\r\n"
+
+        result = self.parser.received(data)
+
+        self.assertEqual(result, 36)
+
+        self.assertTrue(self.parser.completed)
+
+        self.assertEqual(self.parser.error.__class__, BadRequest)
+
+
+
+    def test_received_bad_transfer_encoding(self):
+
+        from waitress.utilities import ServerNotImplemented
+
+        data = (
+
+            b"GET /foobar HTTP/1.1\r\n"
+
+            b"Transfer-Encoding: foo\r\n"
+
+            b"\r\n"
+
+            b"1d;\r\n"
+
+            b"This string has 29 characters\r\n"
+
+            b"0\r\n\r\n"
+
+        )
+
+        result = self.parser.received(data)
+
+        self.assertEqual(result, 48)
+
+        self.assertTrue(self.parser.completed)
+
+        self.assertEqual(self.parser.error.__class__, ServerNotImplemented)
+
+
+
+    def test_received_nonsense_nothing(self):
+
+        data = b"\r\n\r\n"
+
+        result = self.parser.received(data)
+
+        self.assertEqual(result, 4)
+
+        self.assertTrue(self.parser.completed)
+
+        self.assertEqual(self.parser.headers, {})
+
+
+
+    def test_received_no_doublecr(self):
+
+        data = b"GET /foobar HTTP/8.4\r\n"
+
+        result = self.parser.received(data)
+
+        self.assertEqual(result, 22)
+
+        self.assertFalse(self.parser.completed)
+
+        self.assertEqual(self.parser.headers, {})
+
+
+
+    def test_received_already_completed(self):
+
+        self.parser.completed = True
+
+        result = self.parser.received(b"a")
+
+        self.assertEqual(result, 0)
+
+
+
+    def test_received_cl_too_large(self):
+
+        from waitress.utilities import RequestEntityTooLarge
+
+
+
+        self.parser.adj.max_request_body_size = 2
+
+        data = b"GET /foobar HTTP/8.4\r\nContent-Length: 10\r\n\r\n"
+
+        result = self.parser.received(data)
+
+        self.assertEqual(result, 44)
+
+        self.assertTrue(self.parser.completed)
+
+        self.assertTrue(isinstance(self.parser.error, RequestEntityTooLarge))
+
+
+
+    def test_received_headers_too_large(self):
+
+        from waitress.utilities import RequestHeaderFieldsTooLarge
+
+
+
+        self.parser.adj.max_request_header_size = 2
+
+        data = b"GET /foobar HTTP/8.4\r\nX-Foo: 1\r\n\r\n"
+
+        result = self.parser.received(data)
+
+        self.assertEqual(result, 34)
+
+        self.assertTrue(self.parser.completed)
+
+        self.assertTrue(isinstance(self.parser.error, RequestHeaderFieldsTooLarge))
+
+
+
+    def test_received_body_too_large(self):
+
+        from waitress.utilities import RequestEntityTooLarge
+
+
+
+        self.parser.adj.max_request_body_size = 2
+
+        data = (
+
+            b"GET /foobar HTTP/1.1\r\n"
+
+            b"Transfer-Encoding: chunked\r\n"
+
+            b"X-Foo: 1\r\n"
+
+            b"\r\n"
+
+            b"1d;\r\n"
+
+            b"This string has 29 characters\r\n"
+
+            b"0\r\n\r\n"
 
         )
 
 
 
-    @OverrideSettings(REGISTRATION_CAPTCHA=True)
+        result = self.parser.received(data)
 
-    def test_register_captcha(self):
+        self.assertEqual(result, 62)
 
-        # Enable captcha
+        self.parser.received(data[result:])
 
+        self.assertTrue(self.parser.completed)
 
-
-        response = self.client.post(
-
-            reverse('register'),
-
-            REGISTRATION_DATA
-
-        )
-
-        self.assertContains(
-
-            response,
-
-            'Please check your math and try again.'
-
-        )
+        self.assertTrue(isinstance(self.parser.error, RequestEntityTooLarge))
 
 
 
-    @OverrideSettings(REGISTRATION_OPEN=False)
+    def test_received_error_from_parser(self):
 
-    def test_register_closed(self):
+        from waitress.utilities import BadRequest
 
-        # Disable registration
 
-        response = self.client.post(
 
-            reverse('register'),
+        data = (
 
-            REGISTRATION_DATA
+            b"GET /foobar HTTP/1.1\r\n"
+
+            b"Transfer-Encoding: chunked\r\n"
+
+            b"X-Foo: 1\r\n"
+
+            b"\r\n"
+
+            b"garbage\r\n"
 
         )
 
-        self.assertContains(
+        # header
 
-            response,
+        result = self.parser.received(data)
 
-            'Sorry, but registrations on this site are disabled.'
+        # body
 
-        )
+        result = self.parser.received(data[result:])
 
+        self.assertEqual(result, 9)
 
+        self.assertTrue(self.parser.completed)
 
-    @OverrideSettings(REGISTRATION_OPEN=True)
-
-    @OverrideSettings(REGISTRATION_CAPTCHA=False)
-
-    def test_register(self):
-
-        # Disable captcha
-
-        response = self.client.post(
-
-            reverse('register'),
-
-            REGISTRATION_DATA
-
-        )
-
-        # Check we did succeed
-
-        self.assertRedirects(response, reverse('email-sent'))
+        self.assertTrue(isinstance(self.parser.error, BadRequest))
 
 
 
-        # Confirm account
+    def test_received_chunked_completed_sets_content_length(self):
 
-        self.assert_registration()
+        data = (
 
+            b"GET /foobar HTTP/1.1\r\n"
 
+            b"Transfer-Encoding: chunked\r\n"
 
-        # Set password
+            b"X-Foo: 1\r\n"
 
-        response = self.client.post(
+            b"\r\n"
 
-            reverse('password'),
+            b"1d;\r\n"
 
-            {
+            b"This string has 29 characters\r\n"
 
-                'password1': 'password',
-
-                'password2': 'password',
-
-            }
+            b"0\r\n\r\n"
 
         )
 
-        self.assertRedirects(response, reverse('profile'))
+        result = self.parser.received(data)
 
+        self.assertEqual(result, 62)
 
+        data = data[result:]
 
-        # Check we can access home (was redirected to password change)
+        result = self.parser.received(data)
 
-        response = self.client.get(reverse('home'))
+        self.assertTrue(self.parser.completed)
 
-        self.assertContains(response, 'First Last')
+        self.assertTrue(self.parser.error is None)
 
+        self.assertEqual(self.parser.headers["CONTENT_LENGTH"], "29")
 
 
-        user = User.objects.get(username='username')
 
-        # Verify user is active
+    def test_parse_header_gardenpath(self):
 
-        self.assertTrue(user.is_active)
+        data = b"GET /foobar HTTP/8.4\r\nfoo: bar\r\n"
 
-        # Verify stored first/last name
+        self.parser.parse_header(data)
 
-        self.assertEqual(user.first_name, 'First Last')
+        self.assertEqual(self.parser.first_line, b"GET /foobar HTTP/8.4")
 
+        self.assertEqual(self.parser.headers["FOO"], "bar")
 
 
-    @OverrideSettings(REGISTRATION_OPEN=True)
 
-    @OverrideSettings(REGISTRATION_CAPTCHA=False)
+    def test_parse_header_no_cr_in_headerplus(self):
 
-    def test_double_register(self):
+        from waitress.parser import ParsingError
 
-        """Test double registration from single browser"""
 
 
+        data = b"GET /foobar HTTP/8.4"
 
-        # First registration
 
-        response = self.client.post(
-
-            reverse('register'),
-
-            REGISTRATION_DATA
-
-        )
-
-        first_url = self.assert_registration_mailbox()
-
-        mail.outbox.pop()
-
-
-
-        # Second registration
-
-        data = REGISTRATION_DATA.copy()
-
-        data['email'] = 'noreply@example.net'
-
-        data['username'] = 'second'
-
-        response = self.client.post(
-
-            reverse('register'),
-
-            data,
-
-        )
-
-        second_url = self.assert_registration_mailbox()
-
-        mail.outbox.pop()
-
-
-
-        # Confirm first account
-
-        response = self.client.get(first_url, follow=True)
-
-        self.assertRedirects(
-
-            response,
-
-            reverse('password')
-
-        )
-
-        self.client.get(reverse('logout'))
-
-
-
-        # Confirm second account
-
-        response = self.client.get(second_url, follow=True)
-
-        self.assertRedirects(
-
-            response,
-
-            reverse('password')
-
-        )
-
-
-
-    @OverrideSettings(REGISTRATION_OPEN=True)
-
-    @OverrideSettings(REGISTRATION_CAPTCHA=False)
-
-    def test_register_missing(self):
-
-        # Disable captcha
-
-        response = self.client.post(
-
-            reverse('register'),
-
-            REGISTRATION_DATA
-
-        )
-
-        # Check we did succeed
-
-        self.assertRedirects(response, reverse('email-sent'))
-
-
-
-        # Confirm account
-
-        url = self.assert_registration_mailbox()
-
-
-
-        # Remove session ID from URL
-
-        url = url.split('&id=')[0]
-
-
-
-        # Confirm account
-
-        response = self.client.get(url, follow=True)
-
-        self.assertRedirects(response, reverse('login'))
-
-        self.assertContains(response, 'Failed to verify your registration')
-
-
-
-    def test_reset(self):
-
-        '''
-
-        Test for password reset.
-
-        '''
-
-        User.objects.create_user('testuser', 'test@example.com', 'x')
-
-
-
-        response = self.client.get(
-
-            reverse('password_reset'),
-
-        )
-
-        self.assertContains(response, 'Reset my password')
-
-        response = self.client.post(
-
-            reverse('password_reset'),
-
-            {
-
-                'email': 'test@example.com'
-
-            }
-
-        )
-
-        self.assertRedirects(response, reverse('email-sent'))
-
-
-
-        self.assert_registration('[Weblate] Password reset on Weblate')
-
-
-
-    def test_reset_twice(self):
-
-        '''
-
-        Test for password reset.
-
-        '''
-
-        User.objects.create_user('testuser', 'test@example.com', 'x')
-
-        User.objects.create_user('testuser2', 'test2@example.com', 'x')
-
-
-
-        response = self.client.post(
-
-            reverse('password_reset'),
-
-            {'email': 'test@example.com'}
-
-        )
-
-        self.assertRedirects(response, reverse('email-sent'))
-
-        self.assert_registration('[Weblate] Password reset on Weblate')
-
-        sent_mail = mail.outbox.pop()
-
-        self.assertEqual(['test@example.com'], sent_mail.to)
-
-
-
-        response = self.client.post(
-
-            reverse('password_reset'),
-
-            {'email': 'test2@example.com'}
-
-        )
-
-        self.assertRedirects(response, reverse('email-sent'))
-
-        self.assert_registration('[Weblate] Password reset on Weblate')
-
-        sent_mail = mail.outbox.pop()
-
-        self.assertEqual(['test2@example.com'], sent_mail.to)
-
-
-
-    def test_wrong_username(self):
-
-        data = REGISTRATION_DATA.copy()
-
-        data['username'] = ''
-
-        response = self.client.post(
-
-            reverse('register'),
-
-            data
-
-        )
-
-        self.assertContains(
-
-            response,
-
-            'This field is required.',
-
-        )
-
-
-
-    def test_wrong_mail(self):
-
-        data = REGISTRATION_DATA.copy()
-
-        data['email'] = 'x'
-
-        response = self.client.post(
-
-            reverse('register'),
-
-            data
-
-        )
-
-        self.assertContains(
-
-            response,
-
-            'Enter a valid email address.'
-
-        )
-
-
-
-    def test_spam(self):
-
-        data = REGISTRATION_DATA.copy()
-
-        data['content'] = 'x'
-
-        response = self.client.post(
-
-            reverse('register'),
-
-            data
-
-        )
-
-        self.assertContains(
-
-            response,
-
-            'Invalid value'
-
-        )
-
-
-
-    def test_add_mail(self):
-
-        # Create user
-
-        self.test_register()
-
-        mail.outbox.pop()
-
-
-
-        # Check adding email page
-
-        response = self.client.get(
-
-            reverse('email_login')
-
-        )
-
-        self.assertContains(response, 'Register email')
-
-
-
-        # Try invalid address first
-
-        response = self.client.post(
-
-            reverse('email_login'),
-
-            {'email': 'invalid'},
-
-        )
-
-        self.assertContains(response, 'has-error')
-
-
-
-        # Add email account
-
-        response = self.client.post(
-
-            reverse('email_login'),
-
-            {'email': 'second@example.net'},
-
-            follow=True,
-
-        )
-
-        self.assertRedirects(response, reverse('email-sent'))
-
-
-
-        # Verify confirmation mail
-
-        url = self.assert_registration_mailbox()
-
-        response = self.client.get(url, follow=True)
-
-        self.assertRedirects(
-
-            response, '{0}#auth'.format(reverse('profile'))
-
-        )
-
-
-
-        # Check database models
-
-        user = User.objects.get(username='username')
-
-        self.assertEqual(
-
-            VerifiedEmail.objects.filter(social__user=user).count(), 2
-
-        )
-
-        self.assertTrue(
-
-            VerifiedEmail.objects.filter(
-
-                social__user=user, email='second@example.net'
-
-            ).exists()
-
-        )
-
-
-
-    @httpretty.activate
-
-    @override_settings(AUTHENTICATION_BACKENDS=GH_BACKENDS)
-
-    def test_github(self):
-
-        """Test GitHub integration"""
 
         try:
 
-            # psa creates copy of settings...
+            self.parser.parse_header(data)
 
-            orig_backends = social.apps.django_app.utils.BACKENDS
+        except ParsingError:
 
-            social.apps.django_app.utils.BACKENDS = GH_BACKENDS
+            pass
 
+        else:  # pragma: nocover
 
+            self.assertTrue(False)
 
-            httpretty.register_uri(
 
-                httpretty.POST,
 
-                'https://github.com/login/oauth/access_token',
+    def test_parse_header_bad_content_length(self):
 
-                body=json.dumps({
+        from waitress.parser import ParsingError
 
-                    'access_token': '123',
 
-                    'token_type': 'bearer',
 
-                })
+        data = b"GET /foobar HTTP/8.4\r\ncontent-length: abc\r\n"
 
-            )
 
-            httpretty.register_uri(
 
-                httpretty.GET,
+        try:
 
-                'https://api.github.com/user',
+            self.parser.parse_header(data)
 
-                body=json.dumps({
+        except ParsingError as e:
 
-                    'email': 'foo@example.net',
+            self.assertIn("Content-Length is invalid", e.args[0])
 
-                    'login': 'weblate',
+        else:  # pragma: nocover
 
-                    'id': 1,
+            self.assertTrue(False)
 
-                    'name': 'Weblate',
 
-                }),
 
-            )
+    def test_parse_header_multiple_content_length(self):
 
-            httpretty.register_uri(
+        from waitress.parser import ParsingError
 
-                httpretty.GET,
 
-                'https://api.github.com/user/emails',
 
-                body=json.dumps([
+        data = b"GET /foobar HTTP/8.4\r\ncontent-length: 10\r\ncontent-length: 20\r\n"
 
-                    {
 
-                        'email': 'noreply2@example.org',
 
-                        'verified': False,
+        try:
 
-                        'primary': False,
+            self.parser.parse_header(data)
 
-                    }, {
+        except ParsingError as e:
 
-                        'email': 'noreply-weblate@example.org',
+            self.assertIn("Content-Length is invalid", e.args[0])
 
-                        'verified': True,
+        else:  # pragma: nocover
 
-                        'primary': True
+            self.assertTrue(False)
 
-                    }
 
-                ])
 
-            )
+    def test_parse_header_11_te_chunked(self):
 
-            response = self.client.get(
+        # NB: test that capitalization of header value is unimportant
 
-                reverse('social:begin', args=('github',))
+        data = b"GET /foobar HTTP/1.1\r\ntransfer-encoding: ChUnKed\r\n"
 
-            )
+        self.parser.parse_header(data)
 
-            self.assertEqual(response.status_code, 302)
+        self.assertEqual(self.parser.body_rcv.__class__.__name__, "ChunkedReceiver")
 
-            self.assertTrue(
 
-                response['Location'].startswith(
 
-                    'https://github.com/login/oauth/authorize'
 
-                )
 
-            )
+    def test_parse_header_transfer_encoding_invalid(self):
 
-            query = parse_qs(urlparse(response['Location']).query)
+        from waitress.parser import TransferEncodingNotImplemented
 
-            return_query = parse_qs(urlparse(query['redirect_uri'][0]).query)
 
-            response = self.client.get(
 
-                reverse('social:complete', args=('github',)),
+        data = b"GET /foobar HTTP/1.1\r\ntransfer-encoding: gzip\r\n"
 
-                {
 
-                    'state': query['state'][0],
 
-                    'redirect_state': return_query['redirect_state'][0],
+        try:
 
-                    'code': 'XXX'
+            self.parser.parse_header(data)
 
-                },
+        except TransferEncodingNotImplemented as e:
 
-                follow=True
+            self.assertIn("Transfer-Encoding requested is not supported.", e.args[0])
 
-            )
+        else:  # pragma: nocover
 
-            user = User.objects.get(username='weblate')
+            self.assertTrue(False)
 
-            self.assertEqual(user.first_name, 'Weblate')
 
-            self.assertEqual(user.email, 'noreply-weblate@example.org')
 
-        finally:
+    def test_parse_header_transfer_encoding_invalid_multiple(self):
 
-            social.apps.django_app.utils.BACKENDS = orig_backends
+        from waitress.parser import TransferEncodingNotImplemented
 
 
 
+        data = b"GET /foobar HTTP/1.1\r\ntransfer-encoding: gzip\r\ntransfer-encoding: chunked\r\n"
 
 
-class NoCookieRegistrationTest(RegistrationTest):
 
-    clear_cookie = True
+        try:
+
+            self.parser.parse_header(data)
+
+        except TransferEncodingNotImplemented as e:
+
+            self.assertIn("Transfer-Encoding requested is not supported.", e.args[0])
+
+        else:  # pragma: nocover
+
+            self.assertTrue(False)
+
+
+
+    def test_parse_header_transfer_encoding_invalid_whitespace(self):
+
+        from waitress.parser import TransferEncodingNotImplemented
+
+
+
+        data = b"GET /foobar HTTP/1.1\r\nTransfer-Encoding:\x85chunked\r\n"
+
+
+
+        try:
+
+            self.parser.parse_header(data)
+
+        except TransferEncodingNotImplemented as e:
+
+            self.assertIn("Transfer-Encoding requested is not supported.", e.args[0])
+
+        else:  # pragma: nocover
+
+            self.assertTrue(False)
+
+
+
+    def test_parse_header_transfer_encoding_invalid_unicode(self):
+
+        from waitress.parser import TransferEncodingNotImplemented
+
+
+
+        # This is the binary encoding for the UTF-8 character
+
+        # https://www.compart.com/en/unicode/U+212A "unicode character "K""
+
+        # which if waitress were to accidentally do the wrong thing get
+
+        # lowercased to just the ascii "k" due to unicode collisions during
+
+        # transformation
+
+        data = b"GET /foobar HTTP/1.1\r\nTransfer-Encoding: chun\xe2\x84\xaaed\r\n"
+
+
+
+        try:
+
+            self.parser.parse_header(data)
+
+        except TransferEncodingNotImplemented as e:
+
+            self.assertIn("Transfer-Encoding requested is not supported.", e.args[0])
+
+        else:  # pragma: nocover
+
+            self.assertTrue(False)
+
+
+
+    def test_parse_header_11_expect_continue(self):
+
+        data = b"GET /foobar HTTP/1.1\r\nexpect: 100-continue\r\n"
+
+        self.parser.parse_header(data)
+
+        self.assertEqual(self.parser.expect_continue, True)
+
+
+
+    def test_parse_header_connection_close(self):
+
+        data = b"GET /foobar HTTP/1.1\r\nConnection: close\r\n"
+
+        self.parser.parse_header(data)
+
+        self.assertEqual(self.parser.connection_close, True)
+
+
+
+    def test_close_with_body_rcv(self):
+
+        body_rcv = DummyBodyStream()
+
+        self.parser.body_rcv = body_rcv
+
+        self.parser.close()
+
+        self.assertTrue(body_rcv.closed)
+
+
+
+    def test_close_with_no_body_rcv(self):
+
+        self.parser.body_rcv = None
+
+        self.parser.close()  # doesn't raise
+
+
+
+    def test_parse_header_lf_only(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        data = b"GET /foobar HTTP/8.4\nfoo: bar"
+
+
+
+        try:
+
+            self.parser.parse_header(data)
+
+        except ParsingError:
+
+            pass
+
+        else:  # pragma: nocover
+
+            self.assertTrue(False)
+
+
+
+    def test_parse_header_cr_only(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        data = b"GET /foobar HTTP/8.4\rfoo: bar"
+
+        try:
+
+            self.parser.parse_header(data)
+
+        except ParsingError:
+
+            pass
+
+        else:  # pragma: nocover
+
+            self.assertTrue(False)
+
+
+
+    def test_parse_header_extra_lf_in_header(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        data = b"GET /foobar HTTP/8.4\r\nfoo: \nbar\r\n"
+
+        try:
+
+            self.parser.parse_header(data)
+
+        except ParsingError as e:
+
+            self.assertIn("Bare CR or LF found in header line", e.args[0])
+
+        else:  # pragma: nocover
+
+            self.assertTrue(False)
+
+
+
+    def test_parse_header_extra_lf_in_first_line(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        data = b"GET /foobar\n HTTP/8.4\r\n"
+
+        try:
+
+            self.parser.parse_header(data)
+
+        except ParsingError as e:
+
+            self.assertIn("Bare CR or LF found in HTTP message", e.args[0])
+
+        else:  # pragma: nocover
+
+            self.assertTrue(False)
+
+
+
+    def test_parse_header_invalid_whitespace(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        data = b"GET /foobar HTTP/8.4\r\nfoo : bar\r\n"
+
+        try:
+
+            self.parser.parse_header(data)
+
+        except ParsingError as e:
+
+            self.assertIn("Invalid header", e.args[0])
+
+        else:  # pragma: nocover
+
+            self.assertTrue(False)
+
+
+
+    def test_parse_header_invalid_whitespace_vtab(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        data = b"GET /foobar HTTP/1.1\r\nfoo:\x0bbar\r\n"
+
+        try:
+
+            self.parser.parse_header(data)
+
+        except ParsingError as e:
+
+            self.assertIn("Invalid header", e.args[0])
+
+        else:  # pragma: nocover
+
+            self.assertTrue(False)
+
+
+
+    def test_parse_header_invalid_no_colon(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        data = b"GET /foobar HTTP/1.1\r\nfoo: bar\r\nnotvalid\r\n"
+
+        try:
+
+            self.parser.parse_header(data)
+
+        except ParsingError as e:
+
+            self.assertIn("Invalid header", e.args[0])
+
+        else:  # pragma: nocover
+
+            self.assertTrue(False)
+
+
+
+    def test_parse_header_invalid_folding_spacing(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        data = b"GET /foobar HTTP/1.1\r\nfoo: bar\r\n\t\x0bbaz\r\n"
+
+        try:
+
+            self.parser.parse_header(data)
+
+        except ParsingError as e:
+
+            self.assertIn("Invalid header", e.args[0])
+
+        else:  # pragma: nocover
+
+            self.assertTrue(False)
+
+
+
+    def test_parse_header_invalid_chars(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        data = b"GET /foobar HTTP/1.1\r\nfoo: bar\r\n\foo: \x0bbaz\r\n"
+
+        try:
+
+            self.parser.parse_header(data)
+
+        except ParsingError as e:
+
+            self.assertIn("Invalid header", e.args[0])
+
+        else:  # pragma: nocover
+
+            self.assertTrue(False)
+
+
+
+    def test_parse_header_empty(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        data = b"GET /foobar HTTP/1.1\r\nfoo: bar\r\nempty:\r\n"
+
+        self.parser.parse_header(data)
+
+
+
+        self.assertIn("EMPTY", self.parser.headers)
+
+        self.assertIn("FOO", self.parser.headers)
+
+        self.assertEqual(self.parser.headers["EMPTY"], "")
+
+        self.assertEqual(self.parser.headers["FOO"], "bar")
+
+
+
+    def test_parse_header_multiple_values(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        data = b"GET /foobar HTTP/1.1\r\nfoo: bar, whatever, more, please, yes\r\n"
+
+        self.parser.parse_header(data)
+
+
+
+        self.assertIn("FOO", self.parser.headers)
+
+        self.assertEqual(self.parser.headers["FOO"], "bar, whatever, more, please, yes")
+
+
+
+    def test_parse_header_multiple_values_header_folded(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        data = b"GET /foobar HTTP/1.1\r\nfoo: bar, whatever,\r\n more, please, yes\r\n"
+
+        self.parser.parse_header(data)
+
+
+
+        self.assertIn("FOO", self.parser.headers)
+
+        self.assertEqual(self.parser.headers["FOO"], "bar, whatever, more, please, yes")
+
+
+
+    def test_parse_header_multiple_values_header_folded_multiple(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        data = b"GET /foobar HTTP/1.1\r\nfoo: bar, whatever,\r\n more\r\nfoo: please, yes\r\n"
+
+        self.parser.parse_header(data)
+
+
+
+        self.assertIn("FOO", self.parser.headers)
+
+        self.assertEqual(self.parser.headers["FOO"], "bar, whatever, more, please, yes")
+
+
+
+    def test_parse_header_multiple_values_extra_space(self):
+
+        # Tests errata from: https://www.rfc-editor.org/errata_search.php?rfc=7230&eid=4189
+
+        from waitress.parser import ParsingError
+
+
+
+        data = b"GET /foobar HTTP/1.1\r\nfoo: abrowser/0.001 (C O M M E N T)\r\n"
+
+        self.parser.parse_header(data)
+
+
+
+        self.assertIn("FOO", self.parser.headers)
+
+        self.assertEqual(self.parser.headers["FOO"], "abrowser/0.001 (C O M M E N T)")
+
+
+
+
+
+class Test_split_uri(unittest.TestCase):
+
+    def _callFUT(self, uri):
+
+        from waitress.parser import split_uri
+
+
+
+        (
+
+            self.proxy_scheme,
+
+            self.proxy_netloc,
+
+            self.path,
+
+            self.query,
+
+            self.fragment,
+
+        ) = split_uri(uri)
+
+
+
+    def test_split_uri_unquoting_unneeded(self):
+
+        self._callFUT(b"http://localhost:8080/abc def")
+
+        self.assertEqual(self.path, "/abc def")
+
+
+
+    def test_split_uri_unquoting_needed(self):
+
+        self._callFUT(b"http://localhost:8080/abc%20def")
+
+        self.assertEqual(self.path, "/abc def")
+
+
+
+    def test_split_url_with_query(self):
+
+        self._callFUT(b"http://localhost:8080/abc?a=1&b=2")
+
+        self.assertEqual(self.path, "/abc")
+
+        self.assertEqual(self.query, "a=1&b=2")
+
+
+
+    def test_split_url_with_query_empty(self):
+
+        self._callFUT(b"http://localhost:8080/abc?")
+
+        self.assertEqual(self.path, "/abc")
+
+        self.assertEqual(self.query, "")
+
+
+
+    def test_split_url_with_fragment(self):
+
+        self._callFUT(b"http://localhost:8080/#foo")
+
+        self.assertEqual(self.path, "/")
+
+        self.assertEqual(self.fragment, "foo")
+
+
+
+    def test_split_url_https(self):
+
+        self._callFUT(b"https://localhost:8080/")
+
+        self.assertEqual(self.path, "/")
+
+        self.assertEqual(self.proxy_scheme, "https")
+
+        self.assertEqual(self.proxy_netloc, "localhost:8080")
+
+
+
+    def test_split_uri_unicode_error_raises_parsing_error(self):
+
+        # See https://github.com/Pylons/waitress/issues/64
+
+        from waitress.parser import ParsingError
+
+
+
+        # Either pass or throw a ParsingError, just don't throw another type of
+
+        # exception as that will cause the connection to close badly:
+
+        try:
+
+            self._callFUT(b"/\xd0")
+
+        except ParsingError:
+
+            pass
+
+
+
+    def test_split_uri_path(self):
+
+        self._callFUT(b"//testing/whatever")
+
+        self.assertEqual(self.path, "//testing/whatever")
+
+        self.assertEqual(self.proxy_scheme, "")
+
+        self.assertEqual(self.proxy_netloc, "")
+
+        self.assertEqual(self.query, "")
+
+        self.assertEqual(self.fragment, "")
+
+
+
+    def test_split_uri_path_query(self):
+
+        self._callFUT(b"//testing/whatever?a=1&b=2")
+
+        self.assertEqual(self.path, "//testing/whatever")
+
+        self.assertEqual(self.proxy_scheme, "")
+
+        self.assertEqual(self.proxy_netloc, "")
+
+        self.assertEqual(self.query, "a=1&b=2")
+
+        self.assertEqual(self.fragment, "")
+
+
+
+    def test_split_uri_path_query_fragment(self):
+
+        self._callFUT(b"//testing/whatever?a=1&b=2#fragment")
+
+        self.assertEqual(self.path, "//testing/whatever")
+
+        self.assertEqual(self.proxy_scheme, "")
+
+        self.assertEqual(self.proxy_netloc, "")
+
+        self.assertEqual(self.query, "a=1&b=2")
+
+        self.assertEqual(self.fragment, "fragment")
+
+
+
+
+
+class Test_get_header_lines(unittest.TestCase):
+
+    def _callFUT(self, data):
+
+        from waitress.parser import get_header_lines
+
+
+
+        return get_header_lines(data)
+
+
+
+    def test_get_header_lines(self):
+
+        result = self._callFUT(b"slam\r\nslim")
+
+        self.assertEqual(result, [b"slam", b"slim"])
+
+
+
+    def test_get_header_lines_folded(self):
+
+        # From RFC2616:
+
+        # HTTP/1.1 header field values can be folded onto multiple lines if the
+
+        # continuation line begins with a space or horizontal tab. All linear
+
+        # white space, including folding, has the same semantics as SP. A
+
+        # recipient MAY replace any linear white space with a single SP before
+
+        # interpreting the field value or forwarding the message downstream.
+
+
+
+        # We are just preserving the whitespace that indicates folding.
+
+        result = self._callFUT(b"slim\r\n slam")
+
+        self.assertEqual(result, [b"slim slam"])
+
+
+
+    def test_get_header_lines_tabbed(self):
+
+        result = self._callFUT(b"slam\r\n\tslim")
+
+        self.assertEqual(result, [b"slam\tslim"])
+
+
+
+    def test_get_header_lines_malformed(self):
+
+        # https://corte.si/posts/code/pathod/pythonservers/index.html
+
+        from waitress.parser import ParsingError
+
+
+
+        self.assertRaises(ParsingError, self._callFUT, b" Host: localhost\r\n\r\n")
+
+
+
+
+
+class Test_crack_first_line(unittest.TestCase):
+
+    def _callFUT(self, line):
+
+        from waitress.parser import crack_first_line
+
+
+
+        return crack_first_line(line)
+
+
+
+    def test_crack_first_line_matchok(self):
+
+        result = self._callFUT(b"GET / HTTP/1.0")
+
+        self.assertEqual(result, (b"GET", b"/", b"1.0"))
+
+
+
+    def test_crack_first_line_lowercase_method(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        self.assertRaises(ParsingError, self._callFUT, b"get / HTTP/1.0")
+
+
+
+    def test_crack_first_line_nomatch(self):
+
+        result = self._callFUT(b"GET / bleh")
+
+        self.assertEqual(result, (b"", b"", b""))
+
+
+
+        result = self._callFUT(b"GET /info?txtAirPlay&txtRAOP RTSP/1.0")
+
+        self.assertEqual(result, (b"", b"", b""))
+
+
+
+    def test_crack_first_line_missing_version(self):
+
+        result = self._callFUT(b"GET /")
+
+        self.assertEqual(result, (b"GET", b"/", b""))
+
+
+
+
+
+class TestHTTPRequestParserIntegration(unittest.TestCase):
+
+    def setUp(self):
+
+        from waitress.parser import HTTPRequestParser
+
+        from waitress.adjustments import Adjustments
+
+
+
+        my_adj = Adjustments()
+
+        self.parser = HTTPRequestParser(my_adj)
+
+
+
+    def feed(self, data):
+
+        parser = self.parser
+
+
+
+        for n in range(100):  # make sure we never loop forever
+
+            consumed = parser.received(data)
+
+            data = data[consumed:]
+
+
+
+            if parser.completed:
+
+                return
+
+        raise ValueError("Looping")  # pragma: no cover
+
+
+
+    def testSimpleGET(self):
+
+        data = (
+
+            b"GET /foobar HTTP/8.4\r\n"
+
+            b"FirstName: mickey\r\n"
+
+            b"lastname: Mouse\r\n"
+
+            b"content-length: 6\r\n"
+
+            b"\r\n"
+
+            b"Hello."
+
+        )
+
+        parser = self.parser
+
+        self.feed(data)
+
+        self.assertTrue(parser.completed)
+
+        self.assertEqual(parser.version, "8.4")
+
+        self.assertFalse(parser.empty)
+
+        self.assertEqual(
+
+            parser.headers,
+
+            {"FIRSTNAME": "mickey", "LASTNAME": "Mouse", "CONTENT_LENGTH": "6",},
+
+        )
+
+        self.assertEqual(parser.path, "/foobar")
+
+        self.assertEqual(parser.command, "GET")
+
+        self.assertEqual(parser.query, "")
+
+        self.assertEqual(parser.proxy_scheme, "")
+
+        self.assertEqual(parser.proxy_netloc, "")
+
+        self.assertEqual(parser.get_body_stream().getvalue(), b"Hello.")
+
+
+
+    def testComplexGET(self):
+
+        data = (
+
+            b"GET /foo/a+%2B%2F%C3%A4%3D%26a%3Aint?d=b+%2B%2F%3D%26b%3Aint&c+%2B%2F%3D%26c%3Aint=6 HTTP/8.4\r\n"
+
+            b"FirstName: mickey\r\n"
+
+            b"lastname: Mouse\r\n"
+
+            b"content-length: 10\r\n"
+
+            b"\r\n"
+
+            b"Hello mickey."
+
+        )
+
+        parser = self.parser
+
+        self.feed(data)
+
+        self.assertEqual(parser.command, "GET")
+
+        self.assertEqual(parser.version, "8.4")
+
+        self.assertFalse(parser.empty)
+
+        self.assertEqual(
+
+            parser.headers,
+
+            {"FIRSTNAME": "mickey", "LASTNAME": "Mouse", "CONTENT_LENGTH": "10"},
+
+        )
+
+        # path should be utf-8 encoded
+
+        self.assertEqual(
+
+            tobytes(parser.path).decode("utf-8"),
+
+            text_(b"/foo/a++/\xc3\xa4=&a:int", "utf-8"),
+
+        )
+
+        self.assertEqual(
+
+            parser.query, "d=b+%2B%2F%3D%26b%3Aint&c+%2B%2F%3D%26c%3Aint=6"
+
+        )
+
+        self.assertEqual(parser.get_body_stream().getvalue(), b"Hello mick")
+
+
+
+    def testProxyGET(self):
+
+        data = (
+
+            b"GET https://example.com:8080/foobar HTTP/8.4\r\n"
+
+            b"content-length: 6\r\n"
+
+            b"\r\n"
+
+            b"Hello."
+
+        )
+
+        parser = self.parser
+
+        self.feed(data)
+
+        self.assertTrue(parser.completed)
+
+        self.assertEqual(parser.version, "8.4")
+
+        self.assertFalse(parser.empty)
+
+        self.assertEqual(parser.headers, {"CONTENT_LENGTH": "6"})
+
+        self.assertEqual(parser.path, "/foobar")
+
+        self.assertEqual(parser.command, "GET")
+
+        self.assertEqual(parser.proxy_scheme, "https")
+
+        self.assertEqual(parser.proxy_netloc, "example.com:8080")
+
+        self.assertEqual(parser.command, "GET")
+
+        self.assertEqual(parser.query, "")
+
+        self.assertEqual(parser.get_body_stream().getvalue(), b"Hello.")
+
+
+
+    def testDuplicateHeaders(self):
+
+        # Ensure that headers with the same key get concatenated as per
+
+        # RFC2616.
+
+        data = (
+
+            b"GET /foobar HTTP/8.4\r\n"
+
+            b"x-forwarded-for: 10.11.12.13\r\n"
+
+            b"x-forwarded-for: unknown,127.0.0.1\r\n"
+
+            b"X-Forwarded_for: 255.255.255.255\r\n"
+
+            b"content-length: 6\r\n"
+
+            b"\r\n"
+
+            b"Hello."
+
+        )
+
+        self.feed(data)
+
+        self.assertTrue(self.parser.completed)
+
+        self.assertEqual(
+
+            self.parser.headers,
+
+            {
+
+                "CONTENT_LENGTH": "6",
+
+                "X_FORWARDED_FOR": "10.11.12.13, unknown,127.0.0.1",
+
+            },
+
+        )
+
+
+
+    def testSpoofedHeadersDropped(self):
+
+        data = (
+
+            b"GET /foobar HTTP/8.4\r\n"
+
+            b"x-auth_user: bob\r\n"
+
+            b"content-length: 6\r\n"
+
+            b"\r\n"
+
+            b"Hello."
+
+        )
+
+        self.feed(data)
+
+        self.assertTrue(self.parser.completed)
+
+        self.assertEqual(self.parser.headers, {"CONTENT_LENGTH": "6",})
+
+
+
+
+
+class DummyBodyStream(object):
+
+    def getfile(self):
+
+        return self
+
+
+
+    def getbuf(self):
+
+        return self
+
+
+
+    def close(self):
+
+        self.closed = True

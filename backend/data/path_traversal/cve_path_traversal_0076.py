@@ -2,2074 +2,1414 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-# vim: ft=python fileencoding=utf-8 sts=4 sw=4 et:
+import base64
 
+import re
 
+from datetime import datetime
 
-# Copyright 2016-2018 Florian Bruhin (The Compiler) <mail@qutebrowser.org>
+import logging
 
-#
+import ssl
 
-# This file is part of qutebrowser.
+from xml.etree import ElementTree
 
-#
 
-# qutebrowser is free software: you can redistribute it and/or modify
 
-# it under the terms of the GNU General Public License as published by
+import iso8601
 
-# the Free Software Foundation, either version 3 of the License, or
+import six
 
-# (at your option) any later version.
 
-#
 
-# qutebrowser is distributed in the hope that it will be useful,
+import recurly
 
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
+import recurly.errors
 
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+from recurly.link_header import parse_link_value
 
-# GNU General Public License for more details.
+from six.moves import http_client
 
-#
+from six.moves.urllib.parse import urlencode, urljoin, urlsplit
 
-# You should have received a copy of the GNU General Public License
 
-# along with qutebrowser.  If not, see <http://www.gnu.org/licenses/>.
 
 
 
-"""Base class for a wrapper over QWebView/QWebEngineView."""
+class Money(object):
 
 
 
-import enum
+    """An amount of money in one or more currencies."""
 
-import itertools
 
 
+    def __init__(self, *args, **kwargs):
 
-import attr
+        if args and kwargs:
 
-from PyQt5.QtCore import pyqtSignal, pyqtSlot, QUrl, QObject, QSizeF, Qt
+            raise ValueError("Money may be single currency or multi-currency but not both")
 
-from PyQt5.QtGui import QIcon
+        elif kwargs:
 
-from PyQt5.QtWidgets import QWidget, QApplication, QDialog
+            self.currencies = dict(kwargs)
 
-from PyQt5.QtPrintSupport import QPrintDialog
+        elif args and len(args) > 1:
 
+            raise ValueError("Multi-currency Money must be instantiated with codes")
 
+        elif args:
 
-import pygments
-
-import pygments.lexers
-
-import pygments.formatters
-
-
-
-from qutebrowser.keyinput import modeman
-
-from qutebrowser.config import config
-
-from qutebrowser.utils import (utils, objreg, usertypes, log, qtutils,
-
-                               urlutils, message)
-
-from qutebrowser.misc import miscwidgets, objects
-
-from qutebrowser.browser import mouse, hints
-
-from qutebrowser.qt import sip
-
-
-
-
-
-tab_id_gen = itertools.count(0)
-
-
-
-
-
-def create(win_id, private, parent=None):
-
-    """Get a QtWebKit/QtWebEngine tab object.
-
-
-
-    Args:
-
-        win_id: The window ID where the tab will be shown.
-
-        private: Whether the tab is a private/off the record tab.
-
-        parent: The Qt parent to set.
-
-    """
-
-    # Importing modules here so we don't depend on QtWebEngine without the
-
-    # argument and to avoid circular imports.
-
-    mode_manager = modeman.instance(win_id)
-
-    if objects.backend == usertypes.Backend.QtWebEngine:
-
-        from qutebrowser.browser.webengine import webenginetab
-
-        tab_class = webenginetab.WebEngineTab
-
-    else:
-
-        from qutebrowser.browser.webkit import webkittab
-
-        tab_class = webkittab.WebKitTab
-
-    return tab_class(win_id=win_id, mode_manager=mode_manager, private=private,
-
-                     parent=parent)
-
-
-
-
-
-def init():
-
-    """Initialize backend-specific modules."""
-
-    if objects.backend == usertypes.Backend.QtWebEngine:
-
-        from qutebrowser.browser.webengine import webenginetab
-
-        webenginetab.init()
-
-
-
-
-
-class WebTabError(Exception):
-
-
-
-    """Base class for various errors."""
-
-
-
-
-
-class UnsupportedOperationError(WebTabError):
-
-
-
-    """Raised when an operation is not supported with the given backend."""
-
-
-
-
-
-TerminationStatus = enum.Enum('TerminationStatus', [
-
-    'normal',
-
-    'abnormal',  # non-zero exit status
-
-    'crashed',   # e.g. segfault
-
-    'killed',
-
-    'unknown',
-
-])
-
-
-
-
-
-@attr.s
-
-class TabData:
-
-
-
-    """A simple namespace with a fixed set of attributes.
-
-
-
-    Attributes:
-
-        keep_icon: Whether the (e.g. cloned) icon should not be cleared on page
-
-                   load.
-
-        inspector: The QWebInspector used for this webview.
-
-        viewing_source: Set if we're currently showing a source view.
-
-                        Only used when sources are shown via pygments.
-
-        open_target: Where to open the next link.
-
-                     Only used for QtWebKit.
-
-        override_target: Override for open_target for fake clicks (like hints).
-
-                         Only used for QtWebKit.
-
-        pinned: Flag to pin the tab.
-
-        fullscreen: Whether the tab has a video shown fullscreen currently.
-
-        netrc_used: Whether netrc authentication was performed.
-
-        input_mode: current input mode for the tab.
-
-    """
-
-
-
-    keep_icon = attr.ib(False)
-
-    viewing_source = attr.ib(False)
-
-    inspector = attr.ib(None)
-
-    open_target = attr.ib(usertypes.ClickTarget.normal)
-
-    override_target = attr.ib(None)
-
-    pinned = attr.ib(False)
-
-    fullscreen = attr.ib(False)
-
-    netrc_used = attr.ib(False)
-
-    input_mode = attr.ib(usertypes.KeyMode.normal)
-
-
-
-    def should_show_icon(self):
-
-        return (config.val.tabs.favicons.show == 'always' or
-
-                config.val.tabs.favicons.show == 'pinned' and self.pinned)
-
-
-
-
-
-class AbstractAction:
-
-
-
-    """Attribute of AbstractTab for Qt WebActions.
-
-
-
-    Class attributes (overridden by subclasses):
-
-        action_class: The class actions are defined on (QWeb{Engine,}Page)
-
-        action_base: The type of the actions (QWeb{Engine,}Page.WebAction)
-
-    """
-
-
-
-    action_class = None
-
-    action_base = None
-
-
-
-    def __init__(self, tab):
-
-        self._widget = None
-
-        self._tab = tab
-
-
-
-    def exit_fullscreen(self):
-
-        """Exit the fullscreen mode."""
-
-        raise NotImplementedError
-
-
-
-    def save_page(self):
-
-        """Save the current page."""
-
-        raise NotImplementedError
-
-
-
-    def run_string(self, name):
-
-        """Run a webaction based on its name."""
-
-        member = getattr(self.action_class, name, None)
-
-        if not isinstance(member, self.action_base):
-
-            raise WebTabError("{} is not a valid web action!".format(name))
-
-        self._widget.triggerPageAction(member)
-
-
-
-    def show_source(self,
-
-                    pygments=False):  # pylint: disable=redefined-outer-name
-
-        """Show the source of the current page in a new tab."""
-
-        raise NotImplementedError
-
-
-
-    def _show_source_pygments(self):
-
-
-
-        def show_source_cb(source):
-
-            """Show source as soon as it's ready."""
-
-            # WORKAROUND for https://github.com/PyCQA/pylint/issues/491
-
-            # pylint: disable=no-member
-
-            lexer = pygments.lexers.HtmlLexer()
-
-            formatter = pygments.formatters.HtmlFormatter(
-
-                full=True, linenos='table')
-
-            # pylint: enable=no-member
-
-            highlighted = pygments.highlight(source, lexer, formatter)
-
-
-
-            tb = objreg.get('tabbed-browser', scope='window',
-
-                            window=self._tab.win_id)
-
-            new_tab = tb.tabopen(background=False, related=True)
-
-            new_tab.set_html(highlighted, self._tab.url())
-
-            new_tab.data.viewing_source = True
-
-
-
-        self._tab.dump_async(show_source_cb)
-
-
-
-
-
-class AbstractPrinting:
-
-
-
-    """Attribute of AbstractTab for printing the page."""
-
-
-
-    def __init__(self, tab):
-
-        self._widget = None
-
-        self._tab = tab
-
-
-
-    def check_pdf_support(self):
-
-        raise NotImplementedError
-
-
-
-    def check_printer_support(self):
-
-        raise NotImplementedError
-
-
-
-    def check_preview_support(self):
-
-        raise NotImplementedError
-
-
-
-    def to_pdf(self, filename):
-
-        raise NotImplementedError
-
-
-
-    def to_printer(self, printer, callback=None):
-
-        """Print the tab.
-
-
-
-        Args:
-
-            printer: The QPrinter to print to.
-
-            callback: Called with a boolean
-
-                      (True if printing succeeded, False otherwise)
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def show_dialog(self):
-
-        """Print with a QPrintDialog."""
-
-        self.check_printer_support()
-
-
-
-        def print_callback(ok):
-
-            """Called when printing finished."""
-
-            if not ok:
-
-                message.error("Printing failed!")
-
-            diag.deleteLater()
-
-
-
-        def do_print():
-
-            """Called when the dialog was closed."""
-
-            self.to_printer(diag.printer(), print_callback)
-
-
-
-        diag = QPrintDialog(self._tab)
-
-        if utils.is_mac:
-
-            # For some reason we get a segfault when using open() on macOS
-
-            ret = diag.exec_()
-
-            if ret == QDialog.Accepted:
-
-                do_print()
+            self.currencies = { recurly.DEFAULT_CURRENCY: args[0] }
 
         else:
 
-            diag.open(do_print)
+            self.currencies = dict()
+
+
+
+    @classmethod
+
+    def from_element(cls, elem):
+
+        currency = dict()
+
+        for child_el in elem:
+
+            if not child_el.tag:
+
+                continue
+
+            currency[child_el.tag] = int(child_el.text)
+
+        return cls(**currency)
+
+
+
+    def add_to_element(self, elem):
+
+        for currency, amount in self.currencies.items():
+
+            currency_el = ElementTree.Element(currency)
+
+            currency_el.attrib['type'] = 'integer'
+
+            currency_el.text = six.text_type(amount)
+
+            elem.append(currency_el)
+
+
+
+    def __getitem__(self, name):
+
+        return self.currencies[name]
+
+
+
+    def __setitem__(self, name, value):
+
+        self.currencies[name] = value
+
+
+
+    def __delitem__(self, name, value):
+
+        del self.currencies[name]
+
+
+
+    def __contains__(self, name):
+
+        return name in self.currencies
 
 
 
 
 
-class AbstractSearch(QObject):
+class PageError(ValueError):
+
+    """An error raised when requesting to continue to a stream page that
+
+    doesn't exist.
 
 
 
-    """Attribute of AbstractTab for doing searches.
+    This error can be raised when requesting the next page for the last page in
+
+    a series, or the first page for the first page in a series.
 
 
-
-    Attributes:
-
-        text: The last thing this view was searched for.
-
-        search_displayed: Whether we're currently displaying search results in
-
-                          this view.
-
-        _flags: The flags of the last search (needs to be set by subclasses).
-
-        _widget: The underlying WebView widget.
-
-
-
-    Signals:
-
-        finished: Emitted when a search was finished.
-
-                  arg: True if the text was found, False otherwise.
-
-        cleared: Emitted when an existing search was cleared.
 
     """
 
+    pass
 
 
-    finished = pyqtSignal(bool)
 
-    cleared = pyqtSignal()
 
 
+class Page(list):
 
-    def __init__(self, tab, parent=None):
 
-        super().__init__(parent)
 
-        self._tab = tab
+    """A set of related `Resource` instances retrieved together from
 
-        self._widget = None
+    the API.
 
-        self.text = None
 
-        self.search_displayed = False
 
+    Use `Page` instances as `list` instances to access their contents.
 
 
-    def _is_case_sensitive(self, ignore_case):
-
-        """Check if case-sensitivity should be used.
-
-
-
-        This assumes self.text is already set properly.
-
-
-
-        Arguments:
-
-            ignore_case: The ignore_case value from the config.
-
-        """
-
-        mapping = {
-
-            'smart': not self.text.islower(),
-
-            'never': True,
-
-            'always': False,
-
-        }
-
-        return mapping[ignore_case]
-
-
-
-    def search(self, text, *, ignore_case='never', reverse=False,
-
-               result_cb=None):
-
-        """Find the given text on the page.
-
-
-
-        Args:
-
-            text: The text to search for.
-
-            ignore_case: Search case-insensitively. ('always'/'never/'smart')
-
-            reverse: Reverse search direction.
-
-            result_cb: Called with a bool indicating whether a match was found.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def clear(self):
-
-        """Clear the current search."""
-
-        raise NotImplementedError
-
-
-
-    def prev_result(self, *, result_cb=None):
-
-        """Go to the previous result of the current search.
-
-
-
-        Args:
-
-            result_cb: Called with a bool indicating whether a match was found.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def next_result(self, *, result_cb=None):
-
-        """Go to the next result of the current search.
-
-
-
-        Args:
-
-            result_cb: Called with a bool indicating whether a match was found.
-
-        """
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractZoom(QObject):
-
-
-
-    """Attribute of AbstractTab for controlling zoom.
-
-
-
-    Attributes:
-
-        _neighborlist: A NeighborList with the zoom levels.
-
-        _default_zoom_changed: Whether the zoom was changed from the default.
 
     """
-
-
-
-    def __init__(self, tab, parent=None):
-
-        super().__init__(parent)
-
-        self._tab = tab
-
-        self._widget = None
-
-        self._default_zoom_changed = False
-
-        self._init_neighborlist()
-
-        config.instance.changed.connect(self._on_config_changed)
-
-        self._zoom_factor = float(config.val.zoom.default) / 100
-
-
-
-        # # FIXME:qtwebengine is this needed?
-
-        # # For some reason, this signal doesn't get disconnected automatically
-
-        # # when the WebView is destroyed on older PyQt versions.
-
-        # # See https://github.com/qutebrowser/qutebrowser/issues/390
-
-        # self.destroyed.connect(functools.partial(
-
-        #     cfg.changed.disconnect, self.init_neighborlist))
-
-
-
-    @pyqtSlot(str)
-
-    def _on_config_changed(self, option):
-
-        if option in ['zoom.levels', 'zoom.default']:
-
-            if not self._default_zoom_changed:
-
-                factor = float(config.val.zoom.default) / 100
-
-                self.set_factor(factor)
-
-            self._init_neighborlist()
-
-
-
-    def _init_neighborlist(self):
-
-        """Initialize self._neighborlist."""
-
-        levels = config.val.zoom.levels
-
-        self._neighborlist = usertypes.NeighborList(
-
-            levels, mode=usertypes.NeighborList.Modes.edge)
-
-        self._neighborlist.fuzzyval = config.val.zoom.default
-
-
-
-    def offset(self, offset):
-
-        """Increase/Decrease the zoom level by the given offset.
-
-
-
-        Args:
-
-            offset: The offset in the zoom level list.
-
-
-
-        Return:
-
-            The new zoom percentage.
-
-        """
-
-        level = self._neighborlist.getitem(offset)
-
-        self.set_factor(float(level) / 100, fuzzyval=False)
-
-        return level
-
-
-
-    def _set_factor_internal(self, factor):
-
-        raise NotImplementedError
-
-
-
-    def set_factor(self, factor, *, fuzzyval=True):
-
-        """Zoom to a given zoom factor.
-
-
-
-        Args:
-
-            factor: The zoom factor as float.
-
-            fuzzyval: Whether to set the NeighborLists fuzzyval.
-
-        """
-
-        if fuzzyval:
-
-            self._neighborlist.fuzzyval = int(factor * 100)
-
-        if factor < 0:
-
-            raise ValueError("Can't zoom to factor {}!".format(factor))
-
-
-
-        default_zoom_factor = float(config.val.zoom.default) / 100
-
-        self._default_zoom_changed = (factor != default_zoom_factor)
-
-
-
-        self._zoom_factor = factor
-
-        self._set_factor_internal(factor)
-
-
-
-    def factor(self):
-
-        return self._zoom_factor
-
-
-
-    def set_default(self):
-
-        self._set_factor_internal(float(config.val.zoom.default) / 100)
-
-
-
-    def set_current(self):
-
-        self._set_factor_internal(self._zoom_factor)
-
-
-
-
-
-class AbstractCaret(QObject):
-
-
-
-    """Attribute of AbstractTab for caret browsing.
-
-
-
-    Signals:
-
-        selection_toggled: Emitted when the selection was toggled.
-
-                           arg: Whether the selection is now active.
-
-        follow_selected_done: Emitted when a follow_selection action is done.
-
-    """
-
-
-
-    selection_toggled = pyqtSignal(bool)
-
-    follow_selected_done = pyqtSignal()
-
-
-
-    def __init__(self, tab, mode_manager, parent=None):
-
-        super().__init__(parent)
-
-        self._tab = tab
-
-        self._widget = None
-
-        self.selection_enabled = False
-
-        mode_manager.entered.connect(self._on_mode_entered)
-
-        mode_manager.left.connect(self._on_mode_left)
-
-
-
-    def _on_mode_entered(self, mode):
-
-        raise NotImplementedError
-
-
-
-    def _on_mode_left(self, mode):
-
-        raise NotImplementedError
-
-
-
-    def move_to_next_line(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def move_to_prev_line(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def move_to_next_char(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def move_to_prev_char(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def move_to_end_of_word(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def move_to_next_word(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def move_to_prev_word(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def move_to_start_of_line(self):
-
-        raise NotImplementedError
-
-
-
-    def move_to_end_of_line(self):
-
-        raise NotImplementedError
-
-
-
-    def move_to_start_of_next_block(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def move_to_start_of_prev_block(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def move_to_end_of_next_block(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def move_to_end_of_prev_block(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def move_to_start_of_document(self):
-
-        raise NotImplementedError
-
-
-
-    def move_to_end_of_document(self):
-
-        raise NotImplementedError
-
-
-
-    def toggle_selection(self):
-
-        raise NotImplementedError
-
-
-
-    def drop_selection(self):
-
-        raise NotImplementedError
-
-
-
-    def selection(self, callback):
-
-        raise NotImplementedError
-
-
-
-    def _follow_enter(self, tab):
-
-        """Follow a link by faking an enter press."""
-
-        if tab:
-
-            self._tab.key_press(Qt.Key_Enter, modifier=Qt.ControlModifier)
-
-        else:
-
-            self._tab.key_press(Qt.Key_Enter)
-
-
-
-    def follow_selected(self, *, tab=False):
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractScroller(QObject):
-
-
-
-    """Attribute of AbstractTab to manage scroll position."""
-
-
-
-    perc_changed = pyqtSignal(int, int)
-
-
-
-    def __init__(self, tab, parent=None):
-
-        super().__init__(parent)
-
-        self._tab = tab
-
-        self._widget = None
-
-        self.perc_changed.connect(self._log_scroll_pos_change)
-
-
-
-    @pyqtSlot()
-
-    def _log_scroll_pos_change(self):
-
-        log.webview.vdebug("Scroll position changed to {}".format(
-
-            self.pos_px()))
-
-
-
-    def _init_widget(self, widget):
-
-        self._widget = widget
-
-
-
-    def pos_px(self):
-
-        raise NotImplementedError
-
-
-
-    def pos_perc(self):
-
-        raise NotImplementedError
-
-
-
-    def to_perc(self, x=None, y=None):
-
-        raise NotImplementedError
-
-
-
-    def to_point(self, point):
-
-        raise NotImplementedError
-
-
-
-    def to_anchor(self, name):
-
-        raise NotImplementedError
-
-
-
-    def delta(self, x=0, y=0):
-
-        raise NotImplementedError
-
-
-
-    def delta_page(self, x=0, y=0):
-
-        raise NotImplementedError
-
-
-
-    def up(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def down(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def left(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def right(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def top(self):
-
-        raise NotImplementedError
-
-
-
-    def bottom(self):
-
-        raise NotImplementedError
-
-
-
-    def page_up(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def page_down(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def at_top(self):
-
-        raise NotImplementedError
-
-
-
-    def at_bottom(self):
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractHistory:
-
-
-
-    """The history attribute of a AbstractTab."""
-
-
-
-    def __init__(self, tab):
-
-        self._tab = tab
-
-        self._history = None
-
-
-
-    def __len__(self):
-
-        return len(self._history)
-
-
 
     def __iter__(self):
 
-        return iter(self._history.items())
+        if not self:
 
+            raise StopIteration
 
+        page = self
 
-    def current_idx(self):
+        while page:
 
-        raise NotImplementedError
+            for x in list.__iter__(page):
 
+                yield x
 
+            try:
 
-    def back(self, count=1):
+                page = page.next_page()
 
-        """Go back in the tab's history."""
+            except PageError:
 
-        idx = self.current_idx() - count
+                try:
 
-        if idx >= 0:
+                    del self.next_url
 
-            self._go_to_item(self._item_at(idx))
+                except AttributeError:
 
-        else:
+                    pass
 
-            self._go_to_item(self._item_at(0))
+                raise StopIteration
 
-            raise WebTabError("At beginning of history.")
 
 
+    def next_page(self):
 
-    def forward(self, count=1):
+        """Return the next `Page` after this one in the result sequence
 
-        """Go forward in the tab's history."""
+        it's from.
 
-        idx = self.current_idx() + count
 
-        if idx < len(self):
 
-            self._go_to_item(self._item_at(idx))
+        If the current page is the last page in the sequence, calling
 
-        else:
+        this method raises a `ValueError`.
 
-            self._go_to_item(self._item_at(len(self) - 1))
 
-            raise WebTabError("At end of history.")
-
-
-
-    def can_go_back(self):
-
-        raise NotImplementedError
-
-
-
-    def can_go_forward(self):
-
-        raise NotImplementedError
-
-
-
-    def _item_at(self, i):
-
-        raise NotImplementedError
-
-
-
-    def _go_to_item(self, item):
-
-        raise NotImplementedError
-
-
-
-    def serialize(self):
-
-        """Serialize into an opaque format understood by self.deserialize."""
-
-        raise NotImplementedError
-
-
-
-    def deserialize(self, data):
-
-        """Serialize from a format produced by self.serialize."""
-
-        raise NotImplementedError
-
-
-
-    def load_items(self, items):
-
-        """Deserialize from a list of WebHistoryItems."""
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractElements:
-
-
-
-    """Finding and handling of elements on the page."""
-
-
-
-    def __init__(self, tab):
-
-        self._widget = None
-
-        self._tab = tab
-
-
-
-    def find_css(self, selector, callback, *, only_visible=False):
-
-        """Find all HTML elements matching a given selector async.
-
-
-
-        Args:
-
-            callback: The callback to be called when the search finished.
-
-            selector: The CSS selector to search for.
-
-            only_visible: Only show elements which are visible on screen.
 
         """
 
-        raise NotImplementedError
+        try:
+
+            next_url = self.next_url
+
+        except AttributeError:
+
+            raise PageError("Page %r has no next page" % self)
+
+        return self.page_for_url(next_url)
 
 
 
-    def find_id(self, elem_id, callback):
+    def first_page(self):
 
-        """Find the HTML element with the given ID async.
+        """Return the first `Page` in the result sequence this `Page`
+
+        instance is from.
 
 
 
-        Args:
+        If the current page is already the first page in the sequence,
 
-            callback: The callback to be called when the search finished.
+        calling this method raises a `ValueError`.
 
-            elem_id: The ID to search for.
+
 
         """
 
-        raise NotImplementedError
+        try:
+
+            start_url = self.start_url
+
+        except AttributeError:
+
+            raise PageError("Page %r is already the first page" % self)
+
+        return self.page_for_url(start_url)
 
 
 
-    def find_focused(self, callback):
+    @classmethod
 
-        """Find the focused element on the page async.
+    def page_for_url(cls, url):
+
+        """Return a new `Page` containing the items at the given
+
+        endpoint URL."""
+
+        resp, elem = Resource.element_for_url(url)
 
 
 
-        Args:
+        value = Resource.value_for_element(elem)
 
-            callback: The callback to be called when the search finished.
 
-                      Called with a WebEngineElement or None.
+
+        return cls.page_for_value(resp, value)
+
+
+
+    @classmethod
+
+    def count_for_url(cls, url):
+
+        """Return the count of server side resources given a url"""
+
+        headers = Resource.headers_for_url(url)
+
+        return int(headers['X-Records'])
+
+
+
+    @classmethod
+
+    def page_for_value(cls, resp, value):
+
+        """Return a new `Page` representing the given resource `value`
+
+        retrieved using the HTTP response `resp`.
+
+
+
+        This method records pagination ``Link`` headers present in `resp`, so
+
+        that the returned `Page` can return their resources from its
+
+        `next_page()` and `first_page()` methods.
+
+
 
         """
 
-        raise NotImplementedError
+        page = cls(value)
 
+        links = parse_link_value(resp.getheader('Link'))
 
+        for url, data in six.iteritems(links):
 
-    def find_at_pos(self, pos, callback):
+            if data.get('rel') == 'start':
 
-        """Find the element at the given position async.
+                page.start_url = url
 
+            if data.get('rel') == 'next':
 
+                page.next_url = url
 
-        This is also called "hit test" elsewhere.
 
 
+        return page
 
-        Args:
 
-            pos: The QPoint to get the element for.
 
-            callback: The callback to be called when the search finished.
 
-                      Called with a WebEngineElement or None.
 
-        """
+class Resource(object):
 
-        raise NotImplementedError
 
 
+    """A Recurly API resource.
 
 
 
-class AbstractAudio(QObject):
+    This superclass implements the general behavior for all the
 
+    specific Recurly API resources.
 
 
-    """Handling of audio/muting for this tab."""
 
+    All method parameters and return values that are XML elements are
 
+    `xml.etree.ElementTree.Element` instances.
 
-    muted_changed = pyqtSignal(bool)
 
-    recently_audible_changed = pyqtSignal(bool)
-
-
-
-    def __init__(self, tab, parent=None):
-
-        super().__init__(parent)
-
-        self._widget = None
-
-        self._tab = tab
-
-
-
-    def set_muted(self, muted: bool, override: bool = False):
-
-        """Set this tab as muted or not.
-
-
-
-        Arguments:
-
-            override: If set to True, muting/unmuting was done manually and
-
-                      overrides future automatic mute/unmute changes based on
-
-                      the URL.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def is_muted(self):
-
-        """Whether this tab is muted."""
-
-        raise NotImplementedError
-
-
-
-    def toggle_muted(self, *, override: bool = False):
-
-        self.set_muted(not self.is_muted(), override=override)
-
-
-
-    def is_recently_audible(self):
-
-        """Whether this tab has had audio playing recently."""
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractTab(QWidget):
-
-
-
-    """A wrapper over the given widget to hide its API and expose another one.
-
-
-
-    We use this to unify QWebView and QWebEngineView.
-
-
-
-    Attributes:
-
-        history: The AbstractHistory for the current tab.
-
-        registry: The ObjectRegistry associated with this tab.
-
-        private: Whether private browsing is turned on for this tab.
-
-
-
-        _load_status: loading status of this page
-
-                      Accessible via load_status() method.
-
-        _has_ssl_errors: Whether SSL errors happened.
-
-                         Needs to be set by subclasses.
-
-
-
-        for properties, see WebView/WebEngineView docs.
-
-
-
-    Signals:
-
-        See related Qt signals.
-
-
-
-        new_tab_requested: Emitted when a new tab should be opened with the
-
-                           given URL.
-
-        load_status_changed: The loading status changed
-
-        fullscreen_requested: Fullscreen display was requested by the page.
-
-                              arg: True if fullscreen should be turned on,
-
-                                   False if it should be turned off.
-
-        renderer_process_terminated: Emitted when the underlying renderer
-
-                                     process terminated.
-
-                                     arg 0: A TerminationStatus member.
-
-                                     arg 1: The exit code.
-
-        predicted_navigation: Emitted before we tell Qt to open a URL.
 
     """
 
 
 
-    window_close_requested = pyqtSignal()
+    _classes_for_nodename = dict()
 
-    link_hovered = pyqtSignal(str)
 
-    load_started = pyqtSignal()
 
-    load_progress = pyqtSignal(int)
+    sensitive_attributes = ()
 
-    load_finished = pyqtSignal(bool)
+    """Attributes that are not logged with the rest of a `Resource`
 
-    icon_changed = pyqtSignal(QIcon)
+    of this class when submitted in a ``POST`` or ``PUT`` request."""
 
-    title_changed = pyqtSignal(str)
+    xml_attribute_attributes = ()
 
-    load_status_changed = pyqtSignal(str)
+    """Attributes of a `Resource` of this class that are not serialized
 
-    new_tab_requested = pyqtSignal(QUrl)
+    as subelements, but rather attributes of the top level element."""
 
-    url_changed = pyqtSignal(QUrl)
+    inherits_currency = False
 
-    shutting_down = pyqtSignal()
+    """Whether a `Resource` of this class inherits a currency from a
 
-    contents_size_changed = pyqtSignal(QSizeF)
+    parent `Resource`, and therefore should not use `Money` instances
 
-    add_history_item = pyqtSignal(QUrl, QUrl, str)  # url, requested url, title
+    even though this `Resource` class has no ``currency`` attribute of
 
-    fullscreen_requested = pyqtSignal(bool)
+    its own."""
 
-    renderer_process_terminated = pyqtSignal(TerminationStatus, int)
 
-    predicted_navigation = pyqtSignal(QUrl)
 
+    def serializable_attributes(self):
 
+        """ Attributes to be serialized in a ``POST`` or ``PUT`` request.
 
-    def __init__(self, *, win_id, mode_manager, private, parent=None):
-
-        self.private = private
-
-        self.win_id = win_id
-
-        self.tab_id = next(tab_id_gen)
-
-        super().__init__(parent)
-
-
-
-        self.registry = objreg.ObjectRegistry()
-
-        tab_registry = objreg.get('tab-registry', scope='window',
-
-                                  window=win_id)
-
-        tab_registry[self.tab_id] = self
-
-        objreg.register('tab', self, registry=self.registry)
-
-
-
-        self.data = TabData()
-
-        self._layout = miscwidgets.WrapperLayout(self)
-
-        self._widget = None
-
-        self._progress = 0
-
-        self._has_ssl_errors = False
-
-        self._mode_manager = mode_manager
-
-        self._load_status = usertypes.LoadStatus.none
-
-        self._mouse_event_filter = mouse.MouseEventFilter(
-
-            self, parent=self)
-
-        self.backend = None
-
-
-
-        # FIXME:qtwebengine  Should this be public api via self.hints?
-
-        #                    Also, should we get it out of objreg?
-
-        hintmanager = hints.HintManager(win_id, self.tab_id, parent=self)
-
-        objreg.register('hintmanager', hintmanager, scope='tab',
-
-                        window=self.win_id, tab=self.tab_id)
-
-
-
-        self.predicted_navigation.connect(self._on_predicted_navigation)
-
-
-
-    def _set_widget(self, widget):
-
-        # pylint: disable=protected-access
-
-        self._widget = widget
-
-        self._layout.wrap(self, widget)
-
-        self.history._history = widget.history()
-
-        self.scroller._init_widget(widget)
-
-        self.caret._widget = widget
-
-        self.zoom._widget = widget
-
-        self.search._widget = widget
-
-        self.printing._widget = widget
-
-        self.action._widget = widget
-
-        self.elements._widget = widget
-
-        self.audio._widget = widget
-
-        self.settings._settings = widget.settings()
-
-
-
-        self._install_event_filter()
-
-        self.zoom.set_default()
-
-
-
-    def _install_event_filter(self):
-
-        raise NotImplementedError
-
-
-
-    def _set_load_status(self, val):
-
-        """Setter for load_status."""
-
-        if not isinstance(val, usertypes.LoadStatus):
-
-            raise TypeError("Type {} is no LoadStatus member!".format(val))
-
-        log.webview.debug("load status for {}: {}".format(repr(self), val))
-
-        self._load_status = val
-
-        self.load_status_changed.emit(val.name)
-
-
-
-    def event_target(self):
-
-        """Return the widget events should be sent to."""
-
-        raise NotImplementedError
-
-
-
-    def send_event(self, evt):
-
-        """Send the given event to the underlying widget.
-
-
-
-        The event will be sent via QApplication.postEvent.
-
-        Note that a posted event may not be re-used in any way!
+        Returns all attributes unless a blacklist is specified
 
         """
 
-        # This only gives us some mild protection against re-using events, but
 
-        # it's certainly better than a segfault.
 
-        if getattr(evt, 'posted', False):
+        if hasattr(self, 'blacklist_attributes'):
 
-            raise utils.Unreachable("Can't re-use an event which was already "
+            return [attr for attr in self.attributes if attr not in
 
-                                    "posted!")
-
-
-
-        recipient = self.event_target()
-
-        if recipient is None:
-
-            # https://github.com/qutebrowser/qutebrowser/issues/3888
-
-            log.webview.warning("Unable to find event target!")
-
-            return
-
-
-
-        evt.posted = True
-
-        QApplication.postEvent(recipient, evt)
-
-
-
-    @pyqtSlot(QUrl)
-
-    def _on_predicted_navigation(self, url):
-
-        """Adjust the title if we are going to visit an URL soon."""
-
-        qtutils.ensure_valid(url)
-
-        url_string = url.toDisplayString()
-
-        log.webview.debug("Predicted navigation: {}".format(url_string))
-
-        self.title_changed.emit(url_string)
-
-
-
-    @pyqtSlot(QUrl)
-
-    def _on_url_changed(self, url):
-
-        """Update title when URL has changed and no title is available."""
-
-        if url.isValid() and not self.title():
-
-            self.title_changed.emit(url.toDisplayString())
-
-        self.url_changed.emit(url)
-
-
-
-    @pyqtSlot()
-
-    def _on_load_started(self):
-
-        self._progress = 0
-
-        self._has_ssl_errors = False
-
-        self.data.viewing_source = False
-
-        self._set_load_status(usertypes.LoadStatus.loading)
-
-        self.load_started.emit()
-
-
-
-    @pyqtSlot(usertypes.NavigationRequest)
-
-    def _on_navigation_request(self, navigation):
-
-        """Handle common acceptNavigationRequest code."""
-
-        url = utils.elide(navigation.url.toDisplayString(), 100)
-
-        log.webview.debug("navigation request: url {}, type {}, is_main_frame "
-
-                          "{}".format(url,
-
-                                      navigation.navigation_type,
-
-                                      navigation.is_main_frame))
-
-
-
-        if not navigation.url.isValid():
-
-            # Also a WORKAROUND for missing IDNA 2008 support in QUrl, see
-
-            # https://bugreports.qt.io/browse/QTBUG-60364
-
-
-
-            if navigation.navigation_type == navigation.Type.link_clicked:
-
-                msg = urlutils.get_errstring(navigation.url,
-
-                                             "Invalid link clicked")
-
-                message.error(msg)
-
-                self.data.open_target = usertypes.ClickTarget.normal
-
-
-
-            log.webview.debug("Ignoring invalid URL {} in "
-
-                              "acceptNavigationRequest: {}".format(
-
-                                  navigation.url.toDisplayString(),
-
-                                  navigation.url.errorString()))
-
-            navigation.accepted = False
-
-
-
-    def handle_auto_insert_mode(self, ok):
-
-        """Handle `input.insert_mode.auto_load` after loading finished."""
-
-        if not config.val.input.insert_mode.auto_load or not ok:
-
-            return
-
-
-
-        cur_mode = self._mode_manager.mode
-
-        if cur_mode == usertypes.KeyMode.insert:
-
-            return
-
-
-
-        def _auto_insert_mode_cb(elem):
-
-            """Called from JS after finding the focused element."""
-
-            if elem is None:
-
-                log.webview.debug("No focused element!")
-
-                return
-
-            if elem.is_editable():
-
-                modeman.enter(self.win_id, usertypes.KeyMode.insert,
-
-                              'load finished', only_if_normal=True)
-
-
-
-        self.elements.find_focused(_auto_insert_mode_cb)
-
-
-
-    @pyqtSlot(bool)
-
-    def _on_load_finished(self, ok):
-
-        if sip.isdeleted(self._widget):
-
-            # https://github.com/qutebrowser/qutebrowser/issues/3498
-
-            return
-
-
-
-        sess_manager = objreg.get('session-manager')
-
-        sess_manager.save_autosave()
-
-
-
-        if ok and not self._has_ssl_errors:
-
-            if self.url().scheme() == 'https':
-
-                self._set_load_status(usertypes.LoadStatus.success_https)
-
-            else:
-
-                self._set_load_status(usertypes.LoadStatus.success)
-
-        elif ok:
-
-            self._set_load_status(usertypes.LoadStatus.warn)
+                    self.blacklist_attributes]
 
         else:
 
-            self._set_load_status(usertypes.LoadStatus.error)
+            return self.attributes
 
 
 
-        self.load_finished.emit(ok)
 
 
-
-        if not self.title():
-
-            self.title_changed.emit(self.url().toDisplayString())
-
-
-
-        self.zoom.set_current()
-
-
-
-    @pyqtSlot()
-
-    def _on_history_trigger(self):
-
-        """Emit add_history_item when triggered by backend-specific signal."""
-
-        raise NotImplementedError
-
-
-
-    @pyqtSlot(int)
-
-    def _on_load_progress(self, perc):
-
-        self._progress = perc
-
-        self.load_progress.emit(perc)
-
-
-
-    def url(self, requested=False):
-
-        raise NotImplementedError
-
-
-
-    def progress(self):
-
-        return self._progress
-
-
-
-    def load_status(self):
-
-        return self._load_status
-
-
-
-    def _openurl_prepare(self, url, *, predict=True):
-
-        qtutils.ensure_valid(url)
-
-        if predict:
-
-            self.predicted_navigation.emit(url)
-
-
-
-    def openurl(self, url, *, predict=True):
-
-        raise NotImplementedError
-
-
-
-    def reload(self, *, force=False):
-
-        raise NotImplementedError
-
-
-
-    def stop(self):
-
-        raise NotImplementedError
-
-
-
-    def clear_ssl_errors(self):
-
-        raise NotImplementedError
-
-
-
-    def key_press(self, key, modifier=Qt.NoModifier):
-
-        """Send a fake key event to this tab."""
-
-        raise NotImplementedError
-
-
-
-    def dump_async(self, callback, *, plain=False):
-
-        """Dump the current page's html asynchronously.
-
-
-
-        The given callback will be called with the result when dumping is
-
-        complete.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def run_js_async(self, code, callback=None, *, world=None):
-
-        """Run javascript async.
-
-
-
-        The given callback will be called with the result when running JS is
-
-        complete.
-
-
-
-        Args:
-
-            code: The javascript code to run.
-
-            callback: The callback to call with the result, or None.
-
-            world: A world ID (int or usertypes.JsWorld member) to run the JS
-
-                   in the main world or in another isolated world.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def shutdown(self):
-
-        raise NotImplementedError
-
-
-
-    def title(self):
-
-        raise NotImplementedError
-
-
-
-    def icon(self):
-
-        raise NotImplementedError
-
-
-
-    def set_html(self, html, base_url=QUrl()):
-
-        raise NotImplementedError
-
-
-
-    def networkaccessmanager(self):
-
-        """Get the QNetworkAccessManager for this tab.
-
-
-
-        This is only implemented for QtWebKit.
-
-        For QtWebEngine, always returns None.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def user_agent(self):
-
-        """Get the user agent for this tab.
-
-
-
-        This is only implemented for QtWebKit.
-
-        For QtWebEngine, always returns None.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def __repr__(self):
+    def __init__(self, **kwargs):
 
         try:
 
-            url = utils.elide(self.url().toDisplayString(QUrl.EncodeUnicode),
+            self.attributes.index('currency') # Test for currency attribute,
 
-                              100)
+            self.currency                     # and test if it's set.
 
-        except (AttributeError, RuntimeError) as exc:
+        except ValueError:
 
-            url = '<{}>'.format(exc.__class__.__name__)
+            pass
 
-        return utils.get_repr(self, tab_id=self.tab_id, url=url)
+        except AttributeError:
+
+            self.currency = recurly.DEFAULT_CURRENCY
 
 
 
-    def is_deleted(self):
+        for key, value in six.iteritems(kwargs):
 
-        return sip.isdeleted(self._widget)
+            setattr(self, key, value)
+
+
+
+    @classmethod
+
+    def http_request(cls, url, method='GET', body=None, headers=None):
+
+        """Make an HTTP request with the given method to the given URL,
+
+        returning the resulting `http_client.HTTPResponse` instance.
+
+
+
+        If the `body` argument is a `Resource` instance, it is serialized
+
+        to XML by calling its `to_element()` method before submitting it.
+
+        Requests are authenticated per the Recurly API specification
+
+        using the ``recurly.API_KEY`` value for the API key.
+
+
+
+        Requests and responses are logged at the ``DEBUG`` level to the
+
+        ``recurly.http.request`` and ``recurly.http.response`` loggers
+
+        respectively.
+
+
+
+        """
+
+
+
+        if recurly.API_KEY is None:
+
+            raise recurly.UnauthorizedError('recurly.API_KEY not set')
+
+
+
+        is_non_ascii = lambda s: any(ord(c) >= 128 for c in s)
+
+
+
+        if is_non_ascii(recurly.API_KEY) or is_non_ascii(recurly.SUBDOMAIN):
+
+            raise recurly.ConfigurationError("""Setting API_KEY or SUBDOMAIN to
+
+                    unicode strings may cause problems. Please use strings.
+
+                    Issue described here:
+
+                    https://gist.github.com/maximehardy/d3a0a6427d2b6791b3dc""")
+
+
+
+        urlparts = urlsplit(url)
+
+        connection_options = {}
+
+        if recurly.SOCKET_TIMEOUT_SECONDS:
+
+            connection_options['timeout'] = recurly.SOCKET_TIMEOUT_SECONDS
+
+        if urlparts.scheme != 'https':
+
+            connection = http_client.HTTPConnection(urlparts.netloc, **connection_options)
+
+        elif recurly.CA_CERTS_FILE is None:
+
+            connection = http_client.HTTPSConnection(urlparts.netloc, **connection_options)
+
+        else:
+
+            connection_options['context'] = ssl.create_default_context(cafile=recurly.CA_CERTS_FILE)
+
+            connection = http_client.HTTPSConnection(urlparts.netloc, **connection_options)
+
+
+
+        headers = {} if headers is None else dict(headers)
+
+        headers.setdefault('Accept', 'application/xml')
+
+        headers.update({
+
+            'User-Agent': recurly.USER_AGENT
+
+        })
+
+        headers['X-Api-Version'] = recurly.api_version()
+
+        headers['Authorization'] = 'Basic %s' % base64.b64encode(six.b('%s:' % recurly.API_KEY)).decode()
+
+
+
+        log = logging.getLogger('recurly.http.request')
+
+        if log.isEnabledFor(logging.DEBUG):
+
+            log.debug("%s %s HTTP/1.1", method, url)
+
+            for header, value in six.iteritems(headers):
+
+                if header == 'Authorization':
+
+                    value = '<redacted>'
+
+                log.debug("%s: %s", header, value)
+
+            log.debug('')
+
+            if method in ('POST', 'PUT') and body is not None:
+
+                if isinstance(body, Resource):
+
+                    log.debug(body.as_log_output())
+
+                else:
+
+                    log.debug(body)
+
+
+
+        if isinstance(body, Resource):
+
+            body = ElementTree.tostring(body.to_element(), encoding='UTF-8')
+
+            headers['Content-Type'] = 'application/xml; charset=utf-8'
+
+        if method in ('POST', 'PUT') and body is None:
+
+            headers['Content-Length'] = '0'
+
+        connection.request(method, url, body, headers)
+
+        resp = connection.getresponse()
+
+
+
+        resp_headers = cls.headers_as_dict(resp)
+
+
+
+        log = logging.getLogger('recurly.http.response')
+
+        if log.isEnabledFor(logging.DEBUG):
+
+            log.debug("HTTP/1.1 %d %s", resp.status, resp.reason)
+
+            log.debug(resp_headers)
+
+            log.debug('')
+
+
+
+        recurly.cache_rate_limit_headers(resp_headers)
+
+
+
+        return resp
+
+
+
+    @classmethod
+
+    def headers_as_dict(cls, resp):
+
+        """Turns an array of response headers into a dictionary"""
+
+        if six.PY2:
+
+            pairs = [header.split(': ') for header in resp.msg.headers]
+
+            return dict([(k, v.strip()) for k, v in pairs])
+
+        else:
+
+            return dict([(k, v.strip()) for k, v in resp.msg._headers])
+
+
+
+    def as_log_output(self):
+
+        """Returns an XML string containing a serialization of this
+
+        instance suitable for logging.
+
+
+
+        Attributes named in the instance's `sensitive_attributes` are
+
+        redacted.
+
+
+
+        """
+
+        elem = self.to_element()
+
+        for attrname in self.sensitive_attributes:
+
+            for sensitive_el in elem.iter(attrname):
+
+                sensitive_el.text = 'XXXXXXXXXXXXXXXX'
+
+        return ElementTree.tostring(elem, encoding='UTF-8')
+
+
+
+    @classmethod
+
+    def _learn_nodenames(cls, classes):
+
+        for resource_class in classes:
+
+            try:
+
+                rc_is_subclass = issubclass(resource_class, cls)
+
+            except TypeError:
+
+                continue
+
+            if not rc_is_subclass:
+
+                continue
+
+            nodename = getattr(resource_class, 'nodename', None)
+
+            if nodename is None:
+
+                continue
+
+
+
+            cls._classes_for_nodename[nodename] = resource_class
+
+
+
+    @classmethod
+
+    def get(cls, uuid):
+
+        """Return a `Resource` instance of this class identified by
+
+        the given code or UUID.
+
+
+
+        Only `Resource` classes with specified `member_path` attributes
+
+        can be directly requested with this method.
+
+
+
+        """
+
+        url = urljoin(recurly.base_uri(), cls.member_path % (uuid,))
+
+        resp, elem = cls.element_for_url(url)
+
+        return cls.from_element(elem)
+
+
+
+    @classmethod
+
+    def headers_for_url(cls, url):
+
+        """Return the headers only for the given URL as a dict"""
+
+        response = cls.http_request(url, method='HEAD')
+
+        if response.status != 200:
+
+            cls.raise_http_error(response)
+
+
+
+        return Resource.headers_as_dict(response)
+
+
+
+    @classmethod
+
+    def element_for_url(cls, url):
+
+        """Return the resource at the given URL, as a
+
+        (`http_client.HTTPResponse`, `xml.etree.ElementTree.Element`) tuple
+
+        resulting from a ``GET`` request to that URL."""
+
+        response = cls.http_request(url)
+
+        if response.status != 200:
+
+            cls.raise_http_error(response)
+
+
+
+        assert response.getheader('Content-Type').startswith('application/xml')
+
+
+
+        response_xml = response.read()
+
+        logging.getLogger('recurly.http.response').debug(response_xml)
+
+        response_doc = ElementTree.fromstring(response_xml)
+
+
+
+        return response, response_doc
+
+
+
+    @classmethod
+
+    def _subclass_for_nodename(cls, nodename):
+
+        try:
+
+            return cls._classes_for_nodename[nodename]
+
+        except KeyError:
+
+            raise ValueError("Could not determine resource class for array member with tag %r"
+
+                % nodename)
+
+
+
+    @classmethod
+
+    def value_for_element(cls, elem):
+
+        """Deserialize the given XML `Element` into its representative
+
+        value.
+
+
+
+        Depending on the content of the element, the returned value may be:
+
+        * a string, integer, or boolean value
+
+        * a `datetime.datetime` instance
+
+        * a list of `Resource` instances
+
+        * a single `Resource` instance
+
+        * a `Money` instance
+
+        * ``None``
+
+
+
+        """
+
+        log = logging.getLogger('recurly.resource')
+
+        if elem is None:
+
+            log.debug("Converting %r element into None value", elem)
+
+            return
+
+
+
+        if elem.attrib.get('nil') is not None:
+
+            log.debug("Converting %r element with nil attribute into None value", elem.tag)
+
+            return
+
+
+
+        if elem.tag.endswith('_in_cents') and 'currency' not in cls.attributes and not cls.inherits_currency:
+
+            log.debug("Converting %r element in class with no matching 'currency' into a Money value", elem.tag)
+
+            return Money.from_element(elem)
+
+
+
+        attr_type = elem.attrib.get('type')
+
+        log.debug("Converting %r element with type %r", elem.tag, attr_type)
+
+
+
+        if attr_type == 'integer':
+
+            return int(elem.text.strip())
+
+        if attr_type == 'float':
+
+            return float(elem.text.strip())
+
+        if attr_type == 'boolean':
+
+            return elem.text.strip() == 'true'
+
+        if attr_type == 'datetime':
+
+            return iso8601.parse_date(elem.text.strip())
+
+        if attr_type == 'array':
+
+            return [cls._subclass_for_nodename(sub_elem.tag).from_element(sub_elem) for sub_elem in elem]
+
+
+
+        # Unknown types may be the names of resource classes.
+
+        if attr_type is not None:
+
+            try:
+
+                value_class = cls._subclass_for_nodename(attr_type)
+
+            except ValueError:
+
+                log.debug("Not converting %r element with type %r to a resource as that matches no known nodename",
+
+                    elem.tag, attr_type)
+
+            else:
+
+                return value_class.from_element(elem)
+
+
+
+        # Untyped complex elements should still be resource instances. Guess from the nodename.
+
+        if len(elem):  # has children
+
+            value_class = cls._subclass_for_nodename(elem.tag)
+
+            log.debug("Converting %r tag into a %s", elem.tag, value_class.__name__)
+
+            return value_class.from_element(elem)
+
+
+
+        value = elem.text or ''
+
+        return value.strip()
+
+
+
+    @classmethod
+
+    def element_for_value(cls, attrname, value):
+
+        """Serialize the given value into an XML `Element` with the
+
+        given tag name, returning it.
+
+
+
+        The value argument may be:
+
+        * a `Resource` instance
+
+        * a `Money` instance
+
+        * a `datetime.datetime` instance
+
+        * a string, integer, or boolean value
+
+        * ``None``
+
+        * a list or tuple of these values
+
+
+
+        """
+
+        if isinstance(value, Resource):
+
+            if attrname in cls._classes_for_nodename:
+
+                # override the child's node name with this attribute name
+
+                return value.to_element(attrname)
+
+
+
+            return value.to_element()
+
+
+
+        el = ElementTree.Element(attrname)
+
+
+
+        if value is None:
+
+            el.attrib['nil'] = 'nil'
+
+        elif isinstance(value, bool):
+
+            el.attrib['type'] = 'boolean'
+
+            el.text = 'true' if value else 'false'
+
+        elif isinstance(value, int):
+
+            el.attrib['type'] = 'integer'
+
+            el.text = str(value)
+
+        elif isinstance(value, datetime):
+
+            el.attrib['type'] = 'datetime'
+
+            el.text = value.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+        elif isinstance(value, list) or isinstance(value, tuple):
+
+            for sub_resource in value:
+
+                if hasattr(sub_resource, 'to_element'):
+
+                  el.append(sub_resource.to_element())
+
+                else:
+
+                  el.append(cls.element_for_value(re.sub(r"s$", "", attrname), sub_resource))
+
+        elif isinstance(value, Money):
+
+            value.add_to_element(el)
+
+        else:
+
+            el.text = six.text_type(value)
+
+
+
+        return el
+
+
+
+    @classmethod
+
+    def paginated(self, url):
+
+        """ Exposes Page.page_for_url in Resource """
+
+        return Page.page_for_url(url)
+
+
+
+    @classmethod
+
+    def from_element(cls, elem):
+
+        """Return a new instance of this `Resource` class representing
+
+        the given XML element."""
+
+        return cls().update_from_element(elem)
+
+
+
+    def update_from_element(self, elem):
+
+        """Reset this `Resource` instance to represent the values in
+
+        the given XML element."""
+
+        self._elem = elem
+
+
+
+        for attrname in self.attributes:
+
+            try:
+
+                delattr(self, attrname)
+
+            except AttributeError:
+
+                pass
+
+
+
+        document_url = elem.attrib.get('href')
+
+        if document_url is not None:
+
+            self._url = document_url
+
+
+
+        return self
+
+
+
+    def _make_actionator(self, url, method, extra_handler=None):
+
+        def actionator(*args, **kwargs):
+
+            if kwargs:
+
+                full_url = '%s?%s' % (url, urlencode(kwargs))
+
+            else:
+
+                full_url = url
+
+
+
+            body = args[0] if args else None
+
+            response = self.http_request(full_url, method, body)
+
+
+
+            if response.status == 200:
+
+                response_xml = response.read()
+
+                logging.getLogger('recurly.http.response').debug(response_xml)
+
+                return self.update_from_element(ElementTree.fromstring(response_xml))
+
+            elif response.status == 201:
+
+                response_xml = response.read()
+
+                logging.getLogger('recurly.http.response').debug(response_xml)
+
+                elem = ElementTree.fromstring(response_xml)
+
+                return self.value_for_element(elem)
+
+            elif response.status == 204:
+
+                pass
+
+            elif extra_handler is not None:
+
+                return extra_handler(response)
+
+            else:
+
+                self.raise_http_error(response)
+
+        return actionator
+
+
+
+    #usually the path is the same as the element name
+
+    def __getpath__(self, name):
+
+        return name
+
+
+
+    def __getattr__(self, name):
+
+        if name.startswith('_'):
+
+            raise AttributeError(name)
+
+
+
+        try:
+
+            selfnode = self._elem
+
+        except AttributeError:
+
+            raise AttributeError(name)
+
+
+
+        if name in self.xml_attribute_attributes:
+
+            try:
+
+                return selfnode.attrib[name]
+
+            except KeyError:
+
+                raise AttributeError(name)
+
+
+
+        elem = selfnode.find(self.__getpath__(name))
+
+
+
+        if elem is None:
+
+            # It might be an <a name> link.
+
+            for anchor_elem in selfnode.findall('a'):
+
+                if anchor_elem.attrib.get('name') == name:
+
+                    url = anchor_elem.attrib['href']
+
+                    method = anchor_elem.attrib['method'].upper()
+
+                    return self._make_actionator(url, method)
+
+
+
+            raise AttributeError(name)
+
+
+
+        # Follow links.
+
+        if 'href' in elem.attrib:
+
+            def make_relatitator(url):
+
+                def relatitator(**kwargs):
+
+                    if kwargs:
+
+                        full_url = '%s?%s' % (url, urlencode(kwargs))
+
+                    else:
+
+                        full_url = url
+
+
+
+                    resp, elem = Resource.element_for_url(full_url)
+
+                    value = Resource.value_for_element(elem)
+
+
+
+                    if isinstance(value, list):
+
+                        return Page.page_for_value(resp, value)
+
+                    return value
+
+                return relatitator
+
+
+
+            url = elem.attrib['href']
+
+
+
+            if url is '':
+
+                return Resource.value_for_element(elem)
+
+            else:
+
+                return make_relatitator(url)
+
+
+
+        return self.value_for_element(elem)
+
+
+
+    @classmethod
+
+    def all(cls, **kwargs):
+
+        """Return a `Page` of instances of this `Resource` class from
+
+        its general collection endpoint.
+
+
+
+        Only `Resource` classes with specified `collection_path`
+
+        endpoints can be requested with this method. Any provided
+
+        keyword arguments are passed to the API endpoint as query
+
+        parameters.
+
+
+
+        """
+
+        url = urljoin(recurly.base_uri(), cls.collection_path)
+
+        if kwargs:
+
+            url = '%s?%s' % (url, urlencode(kwargs))
+
+        return Page.page_for_url(url)
+
+
+
+    @classmethod
+
+    def count(cls, **kwargs):
+
+        """Return a count of server side resources given
+
+        filtering arguments in kwargs.
+
+        """
+
+        url = urljoin(recurly.base_uri(), cls.collection_path)
+
+        if kwargs:
+
+            url = '%s?%s' % (url, urlencode(kwargs))
+
+        return Page.count_for_url(url)
+
+
+
+    def save(self):
+
+        """Save this `Resource` instance to the service.
+
+
+
+        If this is a new instance, it is created through a ``POST``
+
+        request to its collection endpoint. If this instance already
+
+        exists in the service, it is updated through a ``PUT`` request
+
+        to its own URL.
+
+
+
+        """
+
+        if hasattr(self, '_url'):
+
+            return self._update()
+
+        return self._create()
+
+
+
+    def _update(self):
+
+        return self.put(self._url)
+
+
+
+    def _create(self):
+
+        url = urljoin(recurly.base_uri(), self.collection_path)
+
+        return self.post(url)
+
+
+
+    def put(self, url):
+
+        """Sends this `Resource` instance to the service with a
+
+        ``PUT`` request to the given URL."""
+
+        response = self.http_request(url, 'PUT', self, {'Content-Type': 'application/xml; charset=utf-8'})
+
+        if response.status != 200:
+
+            self.raise_http_error(response)
+
+
+
+        response_xml = response.read()
+
+        logging.getLogger('recurly.http.response').debug(response_xml)
+
+        self.update_from_element(ElementTree.fromstring(response_xml))
+
+
+
+    def post(self, url, body=None):
+
+        """Sends this `Resource` instance to the service with a
+
+        ``POST`` request to the given URL. Takes an optional body"""
+
+        response = self.http_request(url, 'POST', body or self, {'Content-Type': 'application/xml; charset=utf-8'})
+
+        if response.status not in (200, 201, 204):
+
+            self.raise_http_error(response)
+
+
+
+        self._url = response.getheader('Location')
+
+
+
+        if response.status in (200, 201):
+
+            response_xml = response.read()
+
+            logging.getLogger('recurly.http.response').debug(response_xml)
+
+            self.update_from_element(ElementTree.fromstring(response_xml))
+
+
+
+    def delete(self):
+
+        """Submits a deletion request for this `Resource` instance as
+
+        a ``DELETE`` request to its URL."""
+
+        response = self.http_request(self._url, 'DELETE')
+
+        if response.status != 204:
+
+            self.raise_http_error(response)
+
+
+
+    @classmethod
+
+    def raise_http_error(cls, response):
+
+        """Raise a `ResponseError` of the appropriate subclass in
+
+        reaction to the given `http_client.HTTPResponse`."""
+
+        response_xml = response.read()
+
+        logging.getLogger('recurly.http.response').debug(response_xml)
+
+        exc_class = recurly.errors.error_class_for_http_status(response.status)
+
+        raise exc_class(response_xml)
+
+
+
+    def to_element(self, root_name=None):
+
+        """Serialize this `Resource` instance to an XML element."""
+
+        if not root_name:
+
+            root_name = self.nodename
+
+        elem = ElementTree.Element(root_name)
+
+        for attrname in self.serializable_attributes():
+
+            # Only use values that have been loaded into the internal
+
+            # __dict__. For retrieved objects we look into the XML response at
+
+            # access time, so the internal __dict__ contains only the elements
+
+            # that have been set on the client side.
+
+            try:
+
+                value = self.__dict__[attrname]
+
+            except KeyError:
+
+                continue
+
+
+
+            if attrname in self.xml_attribute_attributes:
+
+                elem.attrib[attrname] = six.text_type(value)
+
+            else:
+
+                sub_elem = self.element_for_value(attrname, value)
+
+                elem.append(sub_elem)
+
+
+
+        return elem

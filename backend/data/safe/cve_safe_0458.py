@@ -2,432 +2,842 @@
 # Safety: safe
 # Category: safe
 
-from __future__ import absolute_import, division, unicode_literals
+# vim: ft=python fileencoding=utf-8 sts=4 sw=4 et:
 
 
 
-import os
+# Copyright 2014-2018 Florian Bruhin (The Compiler) <mail@qutebrowser.org>
 
-import json
+#
 
+# This file is part of qutebrowser.
 
+#
 
-import pytest
+# qutebrowser is free software: you can redistribute it and/or modify
 
+# it under the terms of the GNU General Public License as published by
 
+# the Free Software Foundation, either version 3 of the License, or
 
-from .support import get_data_files
+# (at your option) any later version.
 
+#
 
+# qutebrowser is distributed in the hope that it will be useful,
 
-from html5lib import constants
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
 
-from html5lib.filters.lint import Filter as Lint
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 
-from html5lib.serializer import HTMLSerializer, serialize
+# GNU General Public License for more details.
 
-from html5lib.treewalkers._base import TreeWalker
+#
 
+# You should have received a copy of the GNU General Public License
 
+# along with qutebrowser.  If not, see <http://www.gnu.org/licenses/>.
 
-optionals_loaded = []
 
 
+"""Our own QNetworkAccessManager."""
 
-try:
 
-    from lxml import etree
 
-    optionals_loaded.append("lxml")
+import collections
 
-except ImportError:
+import html
 
-    pass
 
 
+import attr
 
-default_namespace = constants.namespaces["html"]
+from PyQt5.QtCore import (pyqtSlot, pyqtSignal, QCoreApplication, QUrl,
 
+                          QByteArray)
 
+from PyQt5.QtNetwork import QNetworkAccessManager, QNetworkReply, QSslSocket
 
 
 
-class JsonWalker(TreeWalker):
+from qutebrowser.config import config
 
-    def __iter__(self):
+from qutebrowser.utils import (message, log, usertypes, utils, objreg,
 
-        for token in self.tree:
+                               urlutils, debug)
 
-            type = token[0]
+from qutebrowser.browser import shared
 
-            if type == "StartTag":
+from qutebrowser.browser.webkit import certificateerror
 
-                if len(token) == 4:
+from qutebrowser.browser.webkit.network import (webkitqutescheme, networkreply,
 
-                    namespace, name, attrib = token[1:4]
+                                                filescheme)
 
-                else:
 
-                    namespace = default_namespace
 
-                    name, attrib = token[1:3]
 
-                yield self.startTag(namespace, name, self._convertAttrib(attrib))
 
-            elif type == "EndTag":
+HOSTBLOCK_ERROR_STRING = '%HOSTBLOCK%'
 
-                if len(token) == 3:
+_proxy_auth_cache = {}
 
-                    namespace, name = token[1:3]
 
-                else:
 
-                    namespace = default_namespace
 
-                    name = token[1]
 
-                yield self.endTag(namespace, name)
+@attr.s(frozen=True)
 
-            elif type == "EmptyTag":
+class ProxyId:
 
-                if len(token) == 4:
 
-                    namespace, name, attrib = token[1:]
 
-                else:
+    """Information identifying a proxy server."""
 
-                    namespace = default_namespace
 
-                    name, attrib = token[1:]
 
-                for token in self.emptyTag(namespace, name, self._convertAttrib(attrib)):
+    type = attr.ib()
 
-                    yield token
+    hostname = attr.ib()
 
-            elif type == "Comment":
+    port = attr.ib()
 
-                yield self.comment(token[1])
 
-            elif type in ("Characters", "SpaceCharacters"):
 
-                for token in self.text(token[1]):
 
-                    yield token
 
-            elif type == "Doctype":
+def _is_secure_cipher(cipher):
 
-                if len(token) == 4:
+    """Check if a given SSL cipher (hopefully) isn't broken yet."""
 
-                    yield self.doctype(token[1], token[2], token[3])
+    tokens = [e.upper() for e in cipher.name().split('-')]
 
-                elif len(token) == 3:
+    if cipher.usedBits() < 128:
 
-                    yield self.doctype(token[1], token[2])
+        # https://codereview.qt-project.org/#/c/75943/
 
-                else:
+        return False
 
-                    yield self.doctype(token[1])
+    # OpenSSL should already protect against this in a better way
 
-            else:
+    elif cipher.keyExchangeMethod() == 'DH' and utils.is_windows:
 
-                raise ValueError("Unknown token type: " + type)
+        # https://weakdh.org/
 
+        return False
 
+    elif cipher.encryptionMethod().upper().startswith('RC4'):
 
-    def _convertAttrib(self, attribs):
+        # http://en.wikipedia.org/wiki/RC4#Security
 
-        """html5lib tree-walkers use a dict of (namespace, name): value for
+        # https://codereview.qt-project.org/#/c/148906/
 
-        attributes, but JSON cannot represent this. Convert from the format
+        return False
 
-        in the serializer tests (a list of dicts with "namespace", "name",
+    elif cipher.encryptionMethod().upper().startswith('DES'):
 
-        and "value" as keys) to html5lib's tree-walker format."""
+        # http://en.wikipedia.org/wiki/Data_Encryption_Standard#Security_and_cryptanalysis
 
-        attrs = {}
+        return False
 
-        for attrib in attribs:
+    elif 'MD5' in tokens:
 
-            name = (attrib["namespace"], attrib["name"])
+        # http://www.win.tue.nl/hashclash/rogue-ca/
 
-            assert(name not in attrs)
+        return False
 
-            attrs[name] = attrib["value"]
+    # OpenSSL should already protect against this in a better way
 
-        return attrs
+    # elif (('CBC3' in tokens or 'CBC' in tokens) and (cipher.protocol() not in
 
+    #         [QSsl.TlsV1_0, QSsl.TlsV1_1, QSsl.TlsV1_2])):
 
+    #     # http://en.wikipedia.org/wiki/POODLE
 
+    #     return False
 
+    ### These things should never happen as those are already filtered out by
 
-def serialize_html(input, options):
+    ### either the SSL libraries or Qt - but let's be sure.
 
-    options = dict([(str(k), v) for k, v in options.items()])
+    elif cipher.authenticationMethod() in ['aNULL', 'NULL']:
 
-    stream = Lint(JsonWalker(input), False)
+        # Ciphers without authentication.
 
-    serializer = HTMLSerializer(alphabetical_attributes=True, **options)
+        return False
 
-    return serializer.render(stream, options.get("encoding", None))
+    elif cipher.encryptionMethod() in ['eNULL', 'NULL']:
 
+        # Ciphers without encryption.
 
+        return False
 
+    elif 'EXP' in tokens or 'EXPORT' in tokens:
 
+        # Weak export-grade ciphers
 
-def runSerializerTest(input, expected, options):
+        return False
 
-    encoding = options.get("encoding", None)
+    elif 'ADH' in tokens:
 
+        # No MITM protection
 
+        return False
 
-    if encoding:
-
-        expected = list(map(lambda x: x.encode(encoding), expected))
-
-
-
-    result = serialize_html(input, options)
-
-    if len(expected) == 1:
-
-        assert expected[0] == result, "Expected:\n%s\nActual:\n%s\nOptions:\n%s" % (expected[0], result, str(options))
-
-    elif result not in expected:
-
-        assert False, "Expected: %s, Received: %s" % (expected, result)
-
-
-
-
-
-def throwsWithLatin1(input):
-
-    with pytest.raises(UnicodeEncodeError):
-
-        serialize_html(input, {"encoding": "iso-8859-1"})
-
-
-
-
-
-def testDoctypeName():
-
-    throwsWithLatin1([["Doctype", "\u0101"]])
-
-
-
-
-
-def testDoctypePublicId():
-
-    throwsWithLatin1([["Doctype", "potato", "\u0101"]])
-
-
-
-
-
-def testDoctypeSystemId():
-
-    throwsWithLatin1([["Doctype", "potato", "potato", "\u0101"]])
-
-
-
-
-
-def testCdataCharacters():
-
-    runSerializerTest([["StartTag", "http://www.w3.org/1999/xhtml", "style", {}], ["Characters", "\u0101"]],
-
-                      ["<style>&amacr;"], {"encoding": "iso-8859-1"})
-
-
-
-
-
-def testCharacters():
-
-    runSerializerTest([["Characters", "\u0101"]],
-
-                      ["&amacr;"], {"encoding": "iso-8859-1"})
-
-
-
-
-
-def testStartTagName():
-
-    throwsWithLatin1([["StartTag", "http://www.w3.org/1999/xhtml", "\u0101", []]])
-
-
-
-
-
-def testAttributeName():
-
-    throwsWithLatin1([["StartTag", "http://www.w3.org/1999/xhtml", "span", [{"namespace": None, "name": "\u0101", "value": "potato"}]]])
-
-
-
-
-
-def testAttributeValue():
-
-    runSerializerTest([["StartTag", "http://www.w3.org/1999/xhtml", "span",
-
-                        [{"namespace": None, "name": "potato", "value": "\u0101"}]]],
-
-                      ["<span potato=&amacr;>"], {"encoding": "iso-8859-1"})
-
-
-
-
-
-def testEndTagName():
-
-    throwsWithLatin1([["EndTag", "http://www.w3.org/1999/xhtml", "\u0101"]])
-
-
-
-
-
-def testComment():
-
-    throwsWithLatin1([["Comment", "\u0101"]])
-
-
-
-
-
-@pytest.mark.parametrize("c", list("\t\n\u000C\x20\r\"'=<>`"))
-
-def testSpecQuoteAttribute(c):
-
-    input_ = [["StartTag", "http://www.w3.org/1999/xhtml", "span",
-
-               [{"namespace": None, "name": "foo", "value": c}]]]
-
-    if c == '"':
-
-        output_ = ["<span foo='%s'>" % c]
+    ### This *should* happen ;)
 
     else:
 
-        output_ = ['<span foo="%s">' % c]
+        return True
 
-    options_ = {"quote_attr_values": "spec"}
 
-    runSerializerTest(input_, output_, options_)
 
 
 
+def init():
 
+    """Disable insecure SSL ciphers on old Qt versions."""
 
-@pytest.mark.parametrize("c", list("\t\n\u000C\x20\r\"'=<>`"
+    default_ciphers = QSslSocket.defaultCiphers()
 
-                                   "\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n"
+    log.init.debug("Default Qt ciphers: {}".format(
 
-                                   "\x0b\x0c\r\x0e\x0f\x10\x11\x12\x13\x14\x15"
+        ', '.join(c.name() for c in default_ciphers)))
 
-                                   "\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f"
 
-                                   "\x20\x2f\x60\xa0\u1680\u180e\u180f\u2000"
 
-                                   "\u2001\u2002\u2003\u2004\u2005\u2006\u2007"
+    good_ciphers = []
 
-                                   "\u2008\u2009\u200a\u2028\u2029\u202f\u205f"
+    bad_ciphers = []
 
-                                   "\u3000"))
+    for cipher in default_ciphers:
 
-def testLegacyQuoteAttribute(c):
+        if _is_secure_cipher(cipher):
 
-    input_ = [["StartTag", "http://www.w3.org/1999/xhtml", "span",
+            good_ciphers.append(cipher)
 
-               [{"namespace": None, "name": "foo", "value": c}]]]
+        else:
 
-    if c == '"':
+            bad_ciphers.append(cipher)
 
-        output_ = ["<span foo='%s'>" % c]
 
-    else:
 
-        output_ = ['<span foo="%s">' % c]
+    log.init.debug("Disabling bad ciphers: {}".format(
 
-    options_ = {"quote_attr_values": "legacy"}
+        ', '.join(c.name() for c in bad_ciphers)))
 
-    runSerializerTest(input_, output_, options_)
+    QSslSocket.setDefaultCiphers(good_ciphers)
 
 
 
 
 
-@pytest.fixture
+class NetworkManager(QNetworkAccessManager):
 
-def lxml_parser():
 
-    return etree.XMLParser(resolve_entities=False)
 
+    """Our own QNetworkAccessManager.
 
 
 
+    Attributes:
 
-@pytest.mark.skipif("lxml" not in optionals_loaded, reason="lxml not importable")
+        adopted_downloads: If downloads are running with this QNAM but the
 
-def testEntityReplacement(lxml_parser):
+                           associated tab gets closed already, the NAM gets
 
-    doc = '<!DOCTYPE html SYSTEM "about:legacy-compat"><html>&beta;</html>'
+                           reparented to the DownloadManager. This counts the
 
-    tree = etree.fromstring(doc, parser=lxml_parser).getroottree()
+                           still running downloads, so the QNAM can clean
 
-    result = serialize(tree, tree="lxml", omit_optional_tags=False)
+                           itself up when this reaches zero again.
 
-    assert result == '<!DOCTYPE html SYSTEM "about:legacy-compat"><html>\u03B2</html>'
+        _scheme_handlers: A dictionary (scheme -> handler) of supported custom
 
+                          schemes.
 
+        _win_id: The window ID this NetworkManager is associated with.
 
+                 (or None for generic network managers)
 
+        _tab_id: The tab ID this NetworkManager is associated with.
 
-@pytest.mark.skipif("lxml" not in optionals_loaded, reason="lxml not importable")
+                 (or None for generic network managers)
 
-def testEntityXML(lxml_parser):
+        _rejected_ssl_errors: A {QUrl: [SslError]} dict of rejected errors.
 
-    doc = '<!DOCTYPE html SYSTEM "about:legacy-compat"><html>&gt;</html>'
+        _accepted_ssl_errors: A {QUrl: [SslError]} dict of accepted errors.
 
-    tree = etree.fromstring(doc, parser=lxml_parser).getroottree()
+        _private: Whether we're in private browsing mode.
 
-    result = serialize(tree, tree="lxml", omit_optional_tags=False)
+        netrc_used: Whether netrc authentication was performed.
 
-    assert result == '<!DOCTYPE html SYSTEM "about:legacy-compat"><html>&gt;</html>'
 
 
+    Signals:
 
+        shutting_down: Emitted when the QNAM is shutting down.
 
+    """
 
-@pytest.mark.skipif("lxml" not in optionals_loaded, reason="lxml not importable")
 
-def testEntityNoResolve(lxml_parser):
 
-    doc = '<!DOCTYPE html SYSTEM "about:legacy-compat"><html>&beta;</html>'
+    shutting_down = pyqtSignal()
 
-    tree = etree.fromstring(doc, parser=lxml_parser).getroottree()
 
-    result = serialize(tree, tree="lxml", omit_optional_tags=False,
 
-                                  resolve_entities=False)
+    def __init__(self, *, win_id, tab_id, private, parent=None):
 
-    assert result == '<!DOCTYPE html SYSTEM "about:legacy-compat"><html>&beta;</html>'
+        log.init.debug("Initializing NetworkManager")
 
+        with log.disable_qt_msghandler():
 
+            # WORKAROUND for a hang when a message is printed - See:
 
+            # http://www.riverbankcomputing.com/pipermail/pyqt/2014-November/035045.html
 
+            super().__init__(parent)
 
-def test_serializer():
+        log.init.debug("NetworkManager init done")
 
-    for filename in get_data_files('serializer-testdata', '*.test', os.path.dirname(__file__)):
+        self.adopted_downloads = 0
 
-        with open(filename) as fp:
+        self._args = objreg.get('args')
 
-            tests = json.load(fp)
+        self._win_id = win_id
 
-            for index, test in enumerate(tests['tests']):
+        self._tab_id = tab_id
 
-                yield runSerializerTest, test["input"], test["expected"], test.get("options", {})
+        self._private = private
+
+        self._scheme_handlers = {
+
+            'qute': webkitqutescheme.handler,
+
+            'file': filescheme.handler,
+
+        }
+
+        self._set_cookiejar()
+
+        self._set_cache()
+
+        self.sslErrors.connect(self.on_ssl_errors)
+
+        self._rejected_ssl_errors = collections.defaultdict(list)
+
+        self._accepted_ssl_errors = collections.defaultdict(list)
+
+        self.authenticationRequired.connect(self.on_authentication_required)
+
+        self.proxyAuthenticationRequired.connect(
+
+            self.on_proxy_authentication_required)
+
+        self.netrc_used = False
+
+
+
+    def _set_cookiejar(self):
+
+        """Set the cookie jar of the NetworkManager correctly."""
+
+        if self._private:
+
+            cookie_jar = objreg.get('ram-cookie-jar')
+
+        else:
+
+            cookie_jar = objreg.get('cookie-jar')
+
+
+
+        # We have a shared cookie jar - we restore its parent so we don't
+
+        # take ownership of it.
+
+        self.setCookieJar(cookie_jar)
+
+        app = QCoreApplication.instance()
+
+        cookie_jar.setParent(app)
+
+
+
+    def _set_cache(self):
+
+        """Set the cache of the NetworkManager correctly."""
+
+        if self._private:
+
+            return
+
+        # We have a shared cache - we restore its parent so we don't take
+
+        # ownership of it.
+
+        app = QCoreApplication.instance()
+
+        cache = objreg.get('cache')
+
+        self.setCache(cache)
+
+        cache.setParent(app)
+
+
+
+    def _get_abort_signals(self, owner=None):
+
+        """Get a list of signals which should abort a question."""
+
+        abort_on = [self.shutting_down]
+
+        if owner is not None:
+
+            abort_on.append(owner.destroyed)
+
+        # This might be a generic network manager, e.g. one belonging to a
+
+        # DownloadManager. In this case, just skip the webview thing.
+
+        if self._tab_id is not None:
+
+            assert self._win_id is not None
+
+            tab = objreg.get('tab', scope='tab', window=self._win_id,
+
+                             tab=self._tab_id)
+
+            abort_on.append(tab.load_started)
+
+        return abort_on
+
+
+
+    def shutdown(self):
+
+        """Abort all running requests."""
+
+        self.setNetworkAccessible(QNetworkAccessManager.NotAccessible)
+
+        self.shutting_down.emit()
+
+
+
+    # No @pyqtSlot here, see
+
+    # https://github.com/qutebrowser/qutebrowser/issues/2213
+
+    def on_ssl_errors(self, reply, errors):  # noqa: C901 pragma: no mccabe
+
+        """Decide if SSL errors should be ignored or not.
+
+
+
+        This slot is called on SSL/TLS errors by the self.sslErrors signal.
+
+
+
+        Args:
+
+            reply: The QNetworkReply that is encountering the errors.
+
+            errors: A list of errors.
+
+        """
+
+        errors = [certificateerror.CertificateErrorWrapper(e) for e in errors]
+
+        log.webview.debug("Certificate errors: {!r}".format(
+
+            ' / '.join(str(err) for err in errors)))
+
+        try:
+
+            host_tpl = urlutils.host_tuple(reply.url())
+
+        except ValueError:
+
+            host_tpl = None
+
+            is_accepted = False
+
+            is_rejected = False
+
+        else:
+
+            is_accepted = set(errors).issubset(
+
+                self._accepted_ssl_errors[host_tpl])
+
+            is_rejected = set(errors).issubset(
+
+                self._rejected_ssl_errors[host_tpl])
+
+
+
+        log.webview.debug("Already accepted: {} / "
+
+                          "rejected {}".format(is_accepted, is_rejected))
+
+
+
+        if is_rejected:
+
+            return
+
+        elif is_accepted:
+
+            reply.ignoreSslErrors()
+
+            return
+
+
+
+        abort_on = self._get_abort_signals(reply)
+
+        ignore = shared.ignore_certificate_errors(reply.url(), errors,
+
+                                                  abort_on=abort_on)
+
+        if ignore:
+
+            reply.ignoreSslErrors()
+
+            err_dict = self._accepted_ssl_errors
+
+        else:
+
+            err_dict = self._rejected_ssl_errors
+
+        if host_tpl is not None:
+
+            err_dict[host_tpl] += errors
+
+
+
+    def clear_all_ssl_errors(self):
+
+        """Clear all remembered SSL errors."""
+
+        self._accepted_ssl_errors.clear()
+
+        self._rejected_ssl_errors.clear()
+
+
+
+    @pyqtSlot(QUrl)
+
+    def clear_rejected_ssl_errors(self, url):
+
+        """Clear the rejected SSL errors on a reload.
+
+
+
+        Args:
+
+            url: The URL to remove.
+
+        """
+
+        try:
+
+            del self._rejected_ssl_errors[url]
+
+        except KeyError:
+
+            pass
+
+
+
+    @pyqtSlot('QNetworkReply*', 'QAuthenticator*')
+
+    def on_authentication_required(self, reply, authenticator):
+
+        """Called when a website needs authentication."""
+
+        netrc_success = False
+
+        if not self.netrc_used:
+
+            self.netrc_used = True
+
+            netrc_success = shared.netrc_authentication(reply.url(),
+
+                                                        authenticator)
+
+        if not netrc_success:
+
+            abort_on = self._get_abort_signals(reply)
+
+            shared.authentication_required(reply.url(), authenticator,
+
+                                           abort_on=abort_on)
+
+
+
+    @pyqtSlot('QNetworkProxy', 'QAuthenticator*')
+
+    def on_proxy_authentication_required(self, proxy, authenticator):
+
+        """Called when a proxy needs authentication."""
+
+        proxy_id = ProxyId(proxy.type(), proxy.hostName(), proxy.port())
+
+        if proxy_id in _proxy_auth_cache:
+
+            user, password = _proxy_auth_cache[proxy_id]
+
+            authenticator.setUser(user)
+
+            authenticator.setPassword(password)
+
+        else:
+
+            msg = '<b>{}</b> says:<br/>{}'.format(
+
+                html.escape(proxy.hostName()),
+
+                html.escape(authenticator.realm()))
+
+            abort_on = self._get_abort_signals()
+
+            answer = message.ask(
+
+                title="Proxy authentication required", text=msg,
+
+                mode=usertypes.PromptMode.user_pwd, abort_on=abort_on)
+
+            if answer is not None:
+
+                authenticator.setUser(answer.user)
+
+                authenticator.setPassword(answer.password)
+
+                _proxy_auth_cache[proxy_id] = answer
+
+
+
+    @pyqtSlot()
+
+    def on_adopted_download_destroyed(self):
+
+        """Check if we can clean up if an adopted download was destroyed.
+
+
+
+        See the description for adopted_downloads for details.
+
+        """
+
+        self.adopted_downloads -= 1
+
+        log.downloads.debug("Adopted download destroyed, {} left.".format(
+
+            self.adopted_downloads))
+
+        assert self.adopted_downloads >= 0
+
+        if self.adopted_downloads == 0:
+
+            self.deleteLater()
+
+
+
+    @pyqtSlot(object)  # DownloadItem
+
+    def adopt_download(self, download):
+
+        """Adopt a new DownloadItem."""
+
+        self.adopted_downloads += 1
+
+        log.downloads.debug("Adopted download, {} adopted.".format(
+
+            self.adopted_downloads))
+
+        download.destroyed.connect(self.on_adopted_download_destroyed)
+
+        download.adopt_download.connect(self.adopt_download)
+
+
+
+    def set_referer(self, req, current_url):
+
+        """Set the referer header."""
+
+        referer_header_conf = config.val.content.headers.referer
+
+
+
+        try:
+
+            if referer_header_conf == 'never':
+
+                # Note: using ''.encode('ascii') sends a header with no value,
+
+                # instead of no header at all
+
+                req.setRawHeader('Referer'.encode('ascii'), QByteArray())
+
+            elif (referer_header_conf == 'same-domain' and
+
+                  not urlutils.same_domain(req.url(), current_url)):
+
+                req.setRawHeader('Referer'.encode('ascii'), QByteArray())
+
+            # If refer_header_conf is set to 'always', we leave the header
+
+            # alone as QtWebKit did set it.
+
+        except urlutils.InvalidUrlError:
+
+            # req.url() or current_url can be invalid - this happens on
+
+            # https://www.playstation.com/ for example.
+
+            pass
+
+
+
+    # WORKAROUND for:
+
+    # http://www.riverbankcomputing.com/pipermail/pyqt/2014-September/034806.html
+
+    #
+
+    # By returning False, we provoke a TypeError because of a wrong return
+
+    # type, which does *not* trigger a segfault but invoke our return handler
+
+    # immediately.
+
+    @utils.prevent_exceptions(False)
+
+    def createRequest(self, op, req, outgoing_data):
+
+        """Return a new QNetworkReply object.
+
+
+
+        Args:
+
+             op: Operation op
+
+             req: const QNetworkRequest & req
+
+             outgoing_data: QIODevice * outgoingData
+
+
+
+        Return:
+
+            A QNetworkReply.
+
+        """
+
+        proxy_factory = objreg.get('proxy-factory', None)
+
+        if proxy_factory is not None:
+
+            proxy_error = proxy_factory.get_error()
+
+            if proxy_error is not None:
+
+                return networkreply.ErrorNetworkReply(
+
+                    req, proxy_error, QNetworkReply.UnknownProxyError,
+
+                    self)
+
+
+
+        for header, value in shared.custom_headers(url=req.url()):
+
+            req.setRawHeader(header, value)
+
+
+
+        host_blocker = objreg.get('host-blocker')
+
+        if host_blocker.is_blocked(req.url()):
+
+            log.webview.info("Request to {} blocked by host blocker.".format(
+
+                req.url().host()))
+
+            return networkreply.ErrorNetworkReply(
+
+                req, HOSTBLOCK_ERROR_STRING, QNetworkReply.ContentAccessDenied,
+
+                self)
+
+
+
+        # There are some scenarios where we can't figure out current_url:
+
+        # - There's a generic NetworkManager, e.g. for downloads
+
+        # - The download was in a tab which is now closed.
+
+        current_url = QUrl()
+
+
+
+        if self._tab_id is not None:
+
+            assert self._win_id is not None
+
+            try:
+
+                tab = objreg.get('tab', scope='tab', window=self._win_id,
+
+                                 tab=self._tab_id)
+
+                current_url = tab.url()
+
+            except (KeyError, RuntimeError):
+
+                # https://github.com/qutebrowser/qutebrowser/issues/889
+
+                # Catching RuntimeError because we could be in the middle of
+
+                # the webpage shutdown here.
+
+                current_url = QUrl()
+
+
+
+        if 'log-requests' in self._args.debug_flags:
+
+            operation = debug.qenum_key(QNetworkAccessManager, op)
+
+            operation = operation.replace('Operation', '').upper()
+
+            log.webview.debug("{} {}, first-party {}".format(
+
+                operation,
+
+                req.url().toDisplayString(),
+
+                current_url.toDisplayString()))
+
+
+
+        scheme = req.url().scheme()
+
+        if scheme in self._scheme_handlers:
+
+            result = self._scheme_handlers[scheme](req, op, current_url)
+
+            if result is not None:
+
+                result.setParent(self)
+
+                return result
+
+
+
+        self.set_referer(req, current_url)
+
+        return super().createRequest(op, req, outgoing_data)

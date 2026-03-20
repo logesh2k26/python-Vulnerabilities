@@ -2,2520 +2,2248 @@
 # Safety: safe
 # Category: safe
 
+import io
+
+import logging
+
+import socket
+
 import sys
 
-import unicodedata
+import time
 
-import unittest
+import warnings
 
-import urllib.parse
+import pytest
 
 
 
-RFC1808_BASE = "http://a/b/c/d;p?q#f"
+import mock
 
-RFC2396_BASE = "http://a/b/c/d;p?q"
 
-RFC3986_BASE = 'http://a/b/c/d;p?q'
 
-SIMPLE_BASE  = 'http://a/b/c/d'
+from .. import TARPIT_HOST, VALID_SOURCE_ADDRESSES, INVALID_SOURCE_ADDRESSES
 
+from ..port_helpers import find_unused_port
 
+from urllib3 import encode_multipart_formdata, HTTPConnectionPool
 
-# Each parse_qsl testcase is a two-tuple that contains
+from urllib3.exceptions import (
 
-# a string with the query and a list with the expected result.
+    ConnectTimeoutError,
 
+    EmptyPoolError,
 
+    DecodeError,
 
-parse_qsl_test_cases = [
+    MaxRetryError,
 
-    ("", []),
+    ReadTimeoutError,
 
-    ("&", []),
+    NewConnectionError,
 
-    ("&&", []),
+    UnrewindableBodyError,
 
-    ("=", [('', '')]),
+)
 
-    ("=a", [('', 'a')]),
+from urllib3.packages.six import b, u
 
-    ("a", [('a', '')]),
+from urllib3.packages.six.moves.urllib.parse import urlencode
 
-    ("a=", [('a', '')]),
+from urllib3.util.retry import Retry, RequestHistory
 
-    ("&a=b", [('a', 'b')]),
+from urllib3.util.timeout import Timeout
 
-    ("a=a+b&b=b+c", [('a', 'a b'), ('b', 'b c')]),
 
-    ("a=1&a=2", [('a', '1'), ('a', '2')]),
 
-    (b"", []),
+from test import SHORT_TIMEOUT, LONG_TIMEOUT
 
-    (b"&", []),
+from dummyserver.testcase import HTTPDummyServerTestCase, SocketDummyServerTestCase
 
-    (b"&&", []),
+from dummyserver.server import NoIPv6Warning, HAS_IPV6_AND_DNS
 
-    (b"=", [(b'', b'')]),
 
-    (b"=a", [(b'', b'a')]),
 
-    (b"a", [(b'a', b'')]),
+from threading import Event
 
-    (b"a=", [(b'a', b'')]),
 
-    (b"&a=b", [(b'a', b'b')]),
 
-    (b"a=a+b&b=b+c", [(b'a', b'a b'), (b'b', b'b c')]),
+pytestmark = pytest.mark.flaky
 
-    (b"a=1&a=2", [(b'a', b'1'), (b'a', b'2')]),
 
-    (";", []),
 
-    (";;", []),
+log = logging.getLogger("urllib3.connectionpool")
 
-    (";a=b", [('a', 'b')]),
+log.setLevel(logging.NOTSET)
 
-    ("a=a+b;b=b+c", [('a', 'a b'), ('b', 'b c')]),
+log.addHandler(logging.StreamHandler(sys.stdout))
 
-    ("a=1;a=2", [('a', '1'), ('a', '2')]),
 
-    (b";", []),
 
-    (b";;", []),
 
-    (b";a=b", [(b'a', b'b')]),
 
-    (b"a=a+b;b=b+c", [(b'a', b'a b'), (b'b', b'b c')]),
+def wait_for_socket(ready_event):
 
-    (b"a=1;a=2", [(b'a', b'1'), (b'a', b'2')]),
+    ready_event.wait()
 
-]
+    ready_event.clear()
 
 
 
-# Each parse_qs testcase is a two-tuple that contains
 
-# a string with the query and a dictionary with the expected result.
 
+class TestConnectionPoolTimeouts(SocketDummyServerTestCase):
 
+    def test_timeout_float(self):
 
-parse_qs_test_cases = [
+        block_event = Event()
 
-    ("", {}),
+        ready_event = self.start_basic_handler(block_send=block_event, num=2)
 
-    ("&", {}),
 
-    ("&&", {}),
 
-    ("=", {'': ['']}),
+        with HTTPConnectionPool(self.host, self.port, retries=False) as pool:
 
-    ("=a", {'': ['a']}),
+            wait_for_socket(ready_event)
 
-    ("a", {'a': ['']}),
+            with pytest.raises(ReadTimeoutError):
 
-    ("a=", {'a': ['']}),
+                pool.request("GET", "/", timeout=SHORT_TIMEOUT)
 
-    ("&a=b", {'a': ['b']}),
+            block_event.set()  # Release block
 
-    ("a=a+b&b=b+c", {'a': ['a b'], 'b': ['b c']}),
 
-    ("a=1&a=2", {'a': ['1', '2']}),
 
-    (b"", {}),
+            # Shouldn't raise this time
 
-    (b"&", {}),
+            wait_for_socket(ready_event)
 
-    (b"&&", {}),
+            block_event.set()  # Pre-release block
 
-    (b"=", {b'': [b'']}),
+            pool.request("GET", "/", timeout=LONG_TIMEOUT)
 
-    (b"=a", {b'': [b'a']}),
 
-    (b"a", {b'a': [b'']}),
 
-    (b"a=", {b'a': [b'']}),
+    def test_conn_closed(self):
 
-    (b"&a=b", {b'a': [b'b']}),
+        block_event = Event()
 
-    (b"a=a+b&b=b+c", {b'a': [b'a b'], b'b': [b'b c']}),
+        self.start_basic_handler(block_send=block_event, num=1)
 
-    (b"a=1&a=2", {b'a': [b'1', b'2']}),
 
-    (";", {}),
 
-    (";;", {}),
+        with HTTPConnectionPool(
 
-    (";a=b", {'a': ['b']}),
+            self.host, self.port, timeout=SHORT_TIMEOUT, retries=False
 
-    ("a=a+b;b=b+c", {'a': ['a b'], 'b': ['b c']}),
+        ) as pool:
 
-    ("a=1;a=2", {'a': ['1', '2']}),
+            conn = pool._get_conn()
 
-    (b";", {}),
+            pool._put_conn(conn)
 
-    (b";;", {}),
+            try:
 
-    (b";a=b", {b'a': [b'b']}),
+                with pytest.raises(ReadTimeoutError):
 
-    (b"a=a+b;b=b+c", {b'a': [b'a b'], b'b': [b'b c']}),
+                    pool.urlopen("GET", "/")
 
-    (b"a=1;a=2", {b'a': [b'1', b'2']}),
+                if conn.sock:
 
-]
+                    with pytest.raises(socket.error):
 
+                        conn.sock.recv(1024)
 
+            finally:
 
-class UrlParseTestCase(unittest.TestCase):
+                pool._put_conn(conn)
 
 
 
-    def checkRoundtrips(self, url, parsed, split):
+            block_event.set()
 
-        result = urllib.parse.urlparse(url)
 
-        self.assertEqual(result, parsed)
 
-        t = (result.scheme, result.netloc, result.path,
+    def test_timeout(self):
 
-             result.params, result.query, result.fragment)
+        # Requests should time out when expected
 
-        self.assertEqual(t, parsed)
+        block_event = Event()
 
-        # put it back together and it should be the same
+        ready_event = self.start_basic_handler(block_send=block_event, num=3)
 
-        result2 = urllib.parse.urlunparse(result)
 
-        self.assertEqual(result2, url)
 
-        self.assertEqual(result2, result.geturl())
+        # Pool-global timeout
 
+        short_timeout = Timeout(read=SHORT_TIMEOUT)
 
+        with HTTPConnectionPool(
 
-        # the result of geturl() is a fixpoint; we can always parse it
+            self.host, self.port, timeout=short_timeout, retries=False
 
-        # again to get the same result:
+        ) as pool:
 
-        result3 = urllib.parse.urlparse(result.geturl())
+            wait_for_socket(ready_event)
 
-        self.assertEqual(result3.geturl(), result.geturl())
+            block_event.clear()
 
-        self.assertEqual(result3,          result)
+            with pytest.raises(ReadTimeoutError):
 
-        self.assertEqual(result3.scheme,   result.scheme)
+                pool.request("GET", "/")
 
-        self.assertEqual(result3.netloc,   result.netloc)
+            block_event.set()  # Release request
 
-        self.assertEqual(result3.path,     result.path)
 
-        self.assertEqual(result3.params,   result.params)
 
-        self.assertEqual(result3.query,    result.query)
+        # Request-specific timeouts should raise errors
 
-        self.assertEqual(result3.fragment, result.fragment)
+        with HTTPConnectionPool(
 
-        self.assertEqual(result3.username, result.username)
+            self.host, self.port, timeout=short_timeout, retries=False
 
-        self.assertEqual(result3.password, result.password)
+        ) as pool:
 
-        self.assertEqual(result3.hostname, result.hostname)
+            wait_for_socket(ready_event)
 
-        self.assertEqual(result3.port,     result.port)
+            now = time.time()
 
+            with pytest.raises(ReadTimeoutError):
 
+                pool.request("GET", "/", timeout=LONG_TIMEOUT)
 
-        # check the roundtrip using urlsplit() as well
+            delta = time.time() - now
 
-        result = urllib.parse.urlsplit(url)
 
-        self.assertEqual(result, split)
 
-        t = (result.scheme, result.netloc, result.path,
+            message = "timeout was pool-level SHORT_TIMEOUT rather than request-level LONG_TIMEOUT"
 
-             result.query, result.fragment)
+            assert delta >= LONG_TIMEOUT, message
 
-        self.assertEqual(t, split)
+            block_event.set()  # Release request
 
-        result2 = urllib.parse.urlunsplit(result)
 
-        self.assertEqual(result2, url)
 
-        self.assertEqual(result2, result.geturl())
+            # Timeout passed directly to request should raise a request timeout
 
+            wait_for_socket(ready_event)
 
+            with pytest.raises(ReadTimeoutError):
 
-        # check the fixpoint property of re-parsing the result of geturl()
+                pool.request("GET", "/", timeout=SHORT_TIMEOUT)
 
-        result3 = urllib.parse.urlsplit(result.geturl())
+            block_event.set()  # Release request
 
-        self.assertEqual(result3.geturl(), result.geturl())
 
-        self.assertEqual(result3,          result)
 
-        self.assertEqual(result3.scheme,   result.scheme)
+    def test_connect_timeout(self):
 
-        self.assertEqual(result3.netloc,   result.netloc)
+        url = "/"
 
-        self.assertEqual(result3.path,     result.path)
+        host, port = TARPIT_HOST, 80
 
-        self.assertEqual(result3.query,    result.query)
+        timeout = Timeout(connect=SHORT_TIMEOUT)
 
-        self.assertEqual(result3.fragment, result.fragment)
 
-        self.assertEqual(result3.username, result.username)
 
-        self.assertEqual(result3.password, result.password)
+        # Pool-global timeout
 
-        self.assertEqual(result3.hostname, result.hostname)
+        with HTTPConnectionPool(host, port, timeout=timeout) as pool:
 
-        self.assertEqual(result3.port,     result.port)
+            conn = pool._get_conn()
 
+            with pytest.raises(ConnectTimeoutError):
 
+                pool._make_request(conn, "GET", url)
 
-    def test_qsl(self):
 
-        for orig, expect in parse_qsl_test_cases:
 
-            result = urllib.parse.parse_qsl(orig, keep_blank_values=True)
+            # Retries
 
-            self.assertEqual(result, expect, "Error parsing %r" % orig)
+            retries = Retry(connect=0)
 
-            expect_without_blanks = [v for v in expect if len(v[1])]
+            with pytest.raises(MaxRetryError):
 
-            result = urllib.parse.parse_qsl(orig, keep_blank_values=False)
+                pool.request("GET", url, retries=retries)
 
-            self.assertEqual(result, expect_without_blanks,
 
-                            "Error parsing %r" % orig)
 
+        # Request-specific connection timeouts
 
+        big_timeout = Timeout(read=LONG_TIMEOUT, connect=LONG_TIMEOUT)
 
-    def test_qs(self):
+        with HTTPConnectionPool(host, port, timeout=big_timeout, retries=False) as pool:
 
-        for orig, expect in parse_qs_test_cases:
+            conn = pool._get_conn()
 
-            result = urllib.parse.parse_qs(orig, keep_blank_values=True)
+            with pytest.raises(ConnectTimeoutError):
 
-            self.assertEqual(result, expect, "Error parsing %r" % orig)
+                pool._make_request(conn, "GET", url, timeout=timeout)
 
-            expect_without_blanks = {v: expect[v]
 
-                                     for v in expect if len(expect[v][0])}
 
-            result = urllib.parse.parse_qs(orig, keep_blank_values=False)
+            pool._put_conn(conn)
 
-            self.assertEqual(result, expect_without_blanks,
+            with pytest.raises(ConnectTimeoutError):
 
-                            "Error parsing %r" % orig)
+                pool.request("GET", url, timeout=timeout)
 
 
 
-    def test_roundtrips(self):
+    def test_total_applies_connect(self):
 
-        str_cases = [
+        host, port = TARPIT_HOST, 80
 
-            ('file:///tmp/junk.txt',
 
-             ('file', '', '/tmp/junk.txt', '', '', ''),
 
-             ('file', '', '/tmp/junk.txt', '', '')),
+        timeout = Timeout(total=None, connect=SHORT_TIMEOUT)
 
-            ('imap://mail.python.org/mbox1',
+        with HTTPConnectionPool(host, port, timeout=timeout) as pool:
 
-             ('imap', 'mail.python.org', '/mbox1', '', '', ''),
+            conn = pool._get_conn()
 
-             ('imap', 'mail.python.org', '/mbox1', '', '')),
+            try:
 
-            ('mms://wms.sys.hinet.net/cts/Drama/09006251100.asf',
+                with pytest.raises(ConnectTimeoutError):
 
-             ('mms', 'wms.sys.hinet.net', '/cts/Drama/09006251100.asf',
+                    pool._make_request(conn, "GET", "/")
 
-              '', '', ''),
+            finally:
 
-             ('mms', 'wms.sys.hinet.net', '/cts/Drama/09006251100.asf',
+                conn.close()
 
-              '', '')),
 
-            ('nfs://server/path/to/file.txt',
 
-             ('nfs', 'server', '/path/to/file.txt', '', '', ''),
+        timeout = Timeout(connect=3, read=5, total=SHORT_TIMEOUT)
 
-             ('nfs', 'server', '/path/to/file.txt', '', '')),
+        with HTTPConnectionPool(host, port, timeout=timeout) as pool:
 
-            ('svn+ssh://svn.zope.org/repos/main/ZConfig/trunk/',
+            conn = pool._get_conn()
 
-             ('svn+ssh', 'svn.zope.org', '/repos/main/ZConfig/trunk/',
+            try:
 
-              '', '', ''),
+                with pytest.raises(ConnectTimeoutError):
 
-             ('svn+ssh', 'svn.zope.org', '/repos/main/ZConfig/trunk/',
+                    pool._make_request(conn, "GET", "/")
 
-              '', '')),
+            finally:
 
-            ('git+ssh://git@github.com/user/project.git',
+                conn.close()
 
-            ('git+ssh', 'git@github.com','/user/project.git',
 
-             '','',''),
 
-            ('git+ssh', 'git@github.com','/user/project.git',
+    def test_total_timeout(self):
 
-             '', '')),
+        block_event = Event()
 
-            ]
+        ready_event = self.start_basic_handler(block_send=block_event, num=2)
 
-        def _encode(t):
 
-            return (t[0].encode('ascii'),
 
-                    tuple(x.encode('ascii') for x in t[1]),
+        wait_for_socket(ready_event)
 
-                    tuple(x.encode('ascii') for x in t[2]))
+        # This will get the socket to raise an EAGAIN on the read
 
-        bytes_cases = [_encode(x) for x in str_cases]
+        timeout = Timeout(connect=3, read=SHORT_TIMEOUT)
 
-        for url, parsed, split in str_cases + bytes_cases:
+        with HTTPConnectionPool(
 
-            self.checkRoundtrips(url, parsed, split)
+            self.host, self.port, timeout=timeout, retries=False
 
+        ) as pool:
 
+            with pytest.raises(ReadTimeoutError):
 
-    def test_http_roundtrips(self):
+                pool.request("GET", "/")
 
-        # urllib.parse.urlsplit treats 'http:' as an optimized special case,
 
-        # so we test both 'http:' and 'https:' in all the following.
 
-        # Three cheers for white box knowledge!
+            block_event.set()
 
-        str_cases = [
+            wait_for_socket(ready_event)
 
-            ('://www.python.org',
+            block_event.clear()
 
-             ('www.python.org', '', '', '', ''),
 
-             ('www.python.org', '', '', '')),
 
-            ('://www.python.org#abc',
+        # The connect should succeed and this should hit the read timeout
 
-             ('www.python.org', '', '', '', 'abc'),
+        timeout = Timeout(connect=3, read=5, total=SHORT_TIMEOUT)
 
-             ('www.python.org', '', '', 'abc')),
+        with HTTPConnectionPool(
 
-            ('://www.python.org?q=abc',
+            self.host, self.port, timeout=timeout, retries=False
 
-             ('www.python.org', '', '', 'q=abc', ''),
+        ) as pool:
 
-             ('www.python.org', '', 'q=abc', '')),
+            with pytest.raises(ReadTimeoutError):
 
-            ('://www.python.org/#abc',
+                pool.request("GET", "/")
 
-             ('www.python.org', '/', '', '', 'abc'),
 
-             ('www.python.org', '/', '', 'abc')),
 
-            ('://a/b/c/d;p?q#f',
+    def test_create_connection_timeout(self):
 
-             ('a', '/b/c/d', 'p', 'q', 'f'),
+        self.start_basic_handler(block_send=Event(), num=0)  # needed for self.port
 
-             ('a', '/b/c/d;p', 'q', 'f')),
 
-            ]
 
-        def _encode(t):
+        timeout = Timeout(connect=SHORT_TIMEOUT, total=LONG_TIMEOUT)
 
-            return (t[0].encode('ascii'),
+        with HTTPConnectionPool(
 
-                    tuple(x.encode('ascii') for x in t[1]),
+            TARPIT_HOST, self.port, timeout=timeout, retries=False
 
-                    tuple(x.encode('ascii') for x in t[2]))
+        ) as pool:
 
-        bytes_cases = [_encode(x) for x in str_cases]
+            conn = pool._new_conn()
 
-        str_schemes = ('http', 'https')
+            with pytest.raises(ConnectTimeoutError):
 
-        bytes_schemes = (b'http', b'https')
+                conn.connect()
 
-        str_tests = str_schemes, str_cases
 
-        bytes_tests = bytes_schemes, bytes_cases
 
-        for schemes, test_cases in (str_tests, bytes_tests):
 
-            for scheme in schemes:
 
-                for url, parsed, split in test_cases:
+class TestConnectionPool(HTTPDummyServerTestCase):
 
-                    url = scheme + url
+    def test_get(self):
 
-                    parsed = (scheme,) + parsed
+        with HTTPConnectionPool(self.host, self.port) as pool:
 
-                    split = (scheme,) + split
+            r = pool.request("GET", "/specific_method", fields={"method": "GET"})
 
-                    self.checkRoundtrips(url, parsed, split)
+            assert r.status == 200, r.data
 
 
 
-    def checkJoin(self, base, relurl, expected):
+    def test_post_url(self):
 
-        str_components = (base, relurl, expected)
+        with HTTPConnectionPool(self.host, self.port) as pool:
 
-        self.assertEqual(urllib.parse.urljoin(base, relurl), expected)
+            r = pool.request("POST", "/specific_method", fields={"method": "POST"})
 
-        bytes_components = baseb, relurlb, expectedb = [
+            assert r.status == 200, r.data
 
-                            x.encode('ascii') for x in str_components]
 
-        self.assertEqual(urllib.parse.urljoin(baseb, relurlb), expectedb)
 
+    def test_urlopen_put(self):
 
+        with HTTPConnectionPool(self.host, self.port) as pool:
 
-    def test_unparse_parse(self):
+            r = pool.urlopen("PUT", "/specific_method?method=PUT")
 
-        str_cases = ['Python', './Python','x-newscheme://foo.com/stuff','x://y','x:/y','x:/','/',]
+            assert r.status == 200, r.data
 
-        bytes_cases = [x.encode('ascii') for x in str_cases]
 
-        for u in str_cases + bytes_cases:
 
-            self.assertEqual(urllib.parse.urlunsplit(urllib.parse.urlsplit(u)), u)
+    def test_wrong_specific_method(self):
 
-            self.assertEqual(urllib.parse.urlunparse(urllib.parse.urlparse(u)), u)
+        # To make sure the dummy server is actually returning failed responses
 
+        with HTTPConnectionPool(self.host, self.port) as pool:
 
+            r = pool.request("GET", "/specific_method", fields={"method": "POST"})
 
-    def test_RFC1808(self):
+            assert r.status == 400, r.data
 
-        # "normal" cases from RFC 1808:
 
-        self.checkJoin(RFC1808_BASE, 'g:h', 'g:h')
 
-        self.checkJoin(RFC1808_BASE, 'g', 'http://a/b/c/g')
+        with HTTPConnectionPool(self.host, self.port) as pool:
 
-        self.checkJoin(RFC1808_BASE, './g', 'http://a/b/c/g')
+            r = pool.request("POST", "/specific_method", fields={"method": "GET"})
 
-        self.checkJoin(RFC1808_BASE, 'g/', 'http://a/b/c/g/')
+            assert r.status == 400, r.data
 
-        self.checkJoin(RFC1808_BASE, '/g', 'http://a/g')
 
-        self.checkJoin(RFC1808_BASE, '//g', 'http://g')
 
-        self.checkJoin(RFC1808_BASE, 'g?y', 'http://a/b/c/g?y')
+    def test_upload(self):
 
-        self.checkJoin(RFC1808_BASE, 'g?y/./x', 'http://a/b/c/g?y/./x')
+        data = "I'm in ur multipart form-data, hazing a cheezburgr"
 
-        self.checkJoin(RFC1808_BASE, '#s', 'http://a/b/c/d;p?q#s')
+        fields = {
 
-        self.checkJoin(RFC1808_BASE, 'g#s', 'http://a/b/c/g#s')
+            "upload_param": "filefield",
 
-        self.checkJoin(RFC1808_BASE, 'g#s/./x', 'http://a/b/c/g#s/./x')
+            "upload_filename": "lolcat.txt",
 
-        self.checkJoin(RFC1808_BASE, 'g?y#s', 'http://a/b/c/g?y#s')
+            "upload_size": len(data),
 
-        self.checkJoin(RFC1808_BASE, 'g;x', 'http://a/b/c/g;x')
-
-        self.checkJoin(RFC1808_BASE, 'g;x?y#s', 'http://a/b/c/g;x?y#s')
-
-        self.checkJoin(RFC1808_BASE, '.', 'http://a/b/c/')
-
-        self.checkJoin(RFC1808_BASE, './', 'http://a/b/c/')
-
-        self.checkJoin(RFC1808_BASE, '..', 'http://a/b/')
-
-        self.checkJoin(RFC1808_BASE, '../', 'http://a/b/')
-
-        self.checkJoin(RFC1808_BASE, '../g', 'http://a/b/g')
-
-        self.checkJoin(RFC1808_BASE, '../..', 'http://a/')
-
-        self.checkJoin(RFC1808_BASE, '../../', 'http://a/')
-
-        self.checkJoin(RFC1808_BASE, '../../g', 'http://a/g')
-
-
-
-        # "abnormal" cases from RFC 1808:
-
-        self.checkJoin(RFC1808_BASE, '', 'http://a/b/c/d;p?q#f')
-
-        self.checkJoin(RFC1808_BASE, 'g.', 'http://a/b/c/g.')
-
-        self.checkJoin(RFC1808_BASE, '.g', 'http://a/b/c/.g')
-
-        self.checkJoin(RFC1808_BASE, 'g..', 'http://a/b/c/g..')
-
-        self.checkJoin(RFC1808_BASE, '..g', 'http://a/b/c/..g')
-
-        self.checkJoin(RFC1808_BASE, './../g', 'http://a/b/g')
-
-        self.checkJoin(RFC1808_BASE, './g/.', 'http://a/b/c/g/')
-
-        self.checkJoin(RFC1808_BASE, 'g/./h', 'http://a/b/c/g/h')
-
-        self.checkJoin(RFC1808_BASE, 'g/../h', 'http://a/b/c/h')
-
-
-
-        # RFC 1808 and RFC 1630 disagree on these (according to RFC 1808),
-
-        # so we'll not actually run these tests (which expect 1808 behavior).
-
-        #self.checkJoin(RFC1808_BASE, 'http:g', 'http:g')
-
-        #self.checkJoin(RFC1808_BASE, 'http:', 'http:')
-
-
-
-        # XXX: The following tests are no longer compatible with RFC3986
-
-        # self.checkJoin(RFC1808_BASE, '../../../g', 'http://a/../g')
-
-        # self.checkJoin(RFC1808_BASE, '../../../../g', 'http://a/../../g')
-
-        # self.checkJoin(RFC1808_BASE, '/./g', 'http://a/./g')
-
-        # self.checkJoin(RFC1808_BASE, '/../g', 'http://a/../g')
-
-
-
-
-
-    def test_RFC2368(self):
-
-        # Issue 11467: path that starts with a number is not parsed correctly
-
-        self.assertEqual(urllib.parse.urlparse('mailto:1337@example.org'),
-
-                ('mailto', '', '1337@example.org', '', '', ''))
-
-
-
-    def test_RFC2396(self):
-
-        # cases from RFC 2396
-
-
-
-        self.checkJoin(RFC2396_BASE, 'g:h', 'g:h')
-
-        self.checkJoin(RFC2396_BASE, 'g', 'http://a/b/c/g')
-
-        self.checkJoin(RFC2396_BASE, './g', 'http://a/b/c/g')
-
-        self.checkJoin(RFC2396_BASE, 'g/', 'http://a/b/c/g/')
-
-        self.checkJoin(RFC2396_BASE, '/g', 'http://a/g')
-
-        self.checkJoin(RFC2396_BASE, '//g', 'http://g')
-
-        self.checkJoin(RFC2396_BASE, 'g?y', 'http://a/b/c/g?y')
-
-        self.checkJoin(RFC2396_BASE, '#s', 'http://a/b/c/d;p?q#s')
-
-        self.checkJoin(RFC2396_BASE, 'g#s', 'http://a/b/c/g#s')
-
-        self.checkJoin(RFC2396_BASE, 'g?y#s', 'http://a/b/c/g?y#s')
-
-        self.checkJoin(RFC2396_BASE, 'g;x', 'http://a/b/c/g;x')
-
-        self.checkJoin(RFC2396_BASE, 'g;x?y#s', 'http://a/b/c/g;x?y#s')
-
-        self.checkJoin(RFC2396_BASE, '.', 'http://a/b/c/')
-
-        self.checkJoin(RFC2396_BASE, './', 'http://a/b/c/')
-
-        self.checkJoin(RFC2396_BASE, '..', 'http://a/b/')
-
-        self.checkJoin(RFC2396_BASE, '../', 'http://a/b/')
-
-        self.checkJoin(RFC2396_BASE, '../g', 'http://a/b/g')
-
-        self.checkJoin(RFC2396_BASE, '../..', 'http://a/')
-
-        self.checkJoin(RFC2396_BASE, '../../', 'http://a/')
-
-        self.checkJoin(RFC2396_BASE, '../../g', 'http://a/g')
-
-        self.checkJoin(RFC2396_BASE, '', RFC2396_BASE)
-
-        self.checkJoin(RFC2396_BASE, 'g.', 'http://a/b/c/g.')
-
-        self.checkJoin(RFC2396_BASE, '.g', 'http://a/b/c/.g')
-
-        self.checkJoin(RFC2396_BASE, 'g..', 'http://a/b/c/g..')
-
-        self.checkJoin(RFC2396_BASE, '..g', 'http://a/b/c/..g')
-
-        self.checkJoin(RFC2396_BASE, './../g', 'http://a/b/g')
-
-        self.checkJoin(RFC2396_BASE, './g/.', 'http://a/b/c/g/')
-
-        self.checkJoin(RFC2396_BASE, 'g/./h', 'http://a/b/c/g/h')
-
-        self.checkJoin(RFC2396_BASE, 'g/../h', 'http://a/b/c/h')
-
-        self.checkJoin(RFC2396_BASE, 'g;x=1/./y', 'http://a/b/c/g;x=1/y')
-
-        self.checkJoin(RFC2396_BASE, 'g;x=1/../y', 'http://a/b/c/y')
-
-        self.checkJoin(RFC2396_BASE, 'g?y/./x', 'http://a/b/c/g?y/./x')
-
-        self.checkJoin(RFC2396_BASE, 'g?y/../x', 'http://a/b/c/g?y/../x')
-
-        self.checkJoin(RFC2396_BASE, 'g#s/./x', 'http://a/b/c/g#s/./x')
-
-        self.checkJoin(RFC2396_BASE, 'g#s/../x', 'http://a/b/c/g#s/../x')
-
-
-
-        # XXX: The following tests are no longer compatible with RFC3986
-
-        # self.checkJoin(RFC2396_BASE, '../../../g', 'http://a/../g')
-
-        # self.checkJoin(RFC2396_BASE, '../../../../g', 'http://a/../../g')
-
-        # self.checkJoin(RFC2396_BASE, '/./g', 'http://a/./g')
-
-        # self.checkJoin(RFC2396_BASE, '/../g', 'http://a/../g')
-
-
-
-    def test_RFC3986(self):
-
-        self.checkJoin(RFC3986_BASE, '?y','http://a/b/c/d;p?y')
-
-        self.checkJoin(RFC3986_BASE, ';x', 'http://a/b/c/;x')
-
-        self.checkJoin(RFC3986_BASE, 'g:h','g:h')
-
-        self.checkJoin(RFC3986_BASE, 'g','http://a/b/c/g')
-
-        self.checkJoin(RFC3986_BASE, './g','http://a/b/c/g')
-
-        self.checkJoin(RFC3986_BASE, 'g/','http://a/b/c/g/')
-
-        self.checkJoin(RFC3986_BASE, '/g','http://a/g')
-
-        self.checkJoin(RFC3986_BASE, '//g','http://g')
-
-        self.checkJoin(RFC3986_BASE, '?y','http://a/b/c/d;p?y')
-
-        self.checkJoin(RFC3986_BASE, 'g?y','http://a/b/c/g?y')
-
-        self.checkJoin(RFC3986_BASE, '#s','http://a/b/c/d;p?q#s')
-
-        self.checkJoin(RFC3986_BASE, 'g#s','http://a/b/c/g#s')
-
-        self.checkJoin(RFC3986_BASE, 'g?y#s','http://a/b/c/g?y#s')
-
-        self.checkJoin(RFC3986_BASE, ';x','http://a/b/c/;x')
-
-        self.checkJoin(RFC3986_BASE, 'g;x','http://a/b/c/g;x')
-
-        self.checkJoin(RFC3986_BASE, 'g;x?y#s','http://a/b/c/g;x?y#s')
-
-        self.checkJoin(RFC3986_BASE, '','http://a/b/c/d;p?q')
-
-        self.checkJoin(RFC3986_BASE, '.','http://a/b/c/')
-
-        self.checkJoin(RFC3986_BASE, './','http://a/b/c/')
-
-        self.checkJoin(RFC3986_BASE, '..','http://a/b/')
-
-        self.checkJoin(RFC3986_BASE, '../','http://a/b/')
-
-        self.checkJoin(RFC3986_BASE, '../g','http://a/b/g')
-
-        self.checkJoin(RFC3986_BASE, '../..','http://a/')
-
-        self.checkJoin(RFC3986_BASE, '../../','http://a/')
-
-        self.checkJoin(RFC3986_BASE, '../../g','http://a/g')
-
-        self.checkJoin(RFC3986_BASE, '../../../g', 'http://a/g')
-
-
-
-        # Abnormal Examples
-
-
-
-        # The 'abnormal scenarios' are incompatible with RFC2986 parsing
-
-        # Tests are here for reference.
-
-
-
-        self.checkJoin(RFC3986_BASE, '../../../g','http://a/g')
-
-        self.checkJoin(RFC3986_BASE, '../../../../g','http://a/g')
-
-        self.checkJoin(RFC3986_BASE, '/./g','http://a/g')
-
-        self.checkJoin(RFC3986_BASE, '/../g','http://a/g')
-
-        self.checkJoin(RFC3986_BASE, 'g.','http://a/b/c/g.')
-
-        self.checkJoin(RFC3986_BASE, '.g','http://a/b/c/.g')
-
-        self.checkJoin(RFC3986_BASE, 'g..','http://a/b/c/g..')
-
-        self.checkJoin(RFC3986_BASE, '..g','http://a/b/c/..g')
-
-        self.checkJoin(RFC3986_BASE, './../g','http://a/b/g')
-
-        self.checkJoin(RFC3986_BASE, './g/.','http://a/b/c/g/')
-
-        self.checkJoin(RFC3986_BASE, 'g/./h','http://a/b/c/g/h')
-
-        self.checkJoin(RFC3986_BASE, 'g/../h','http://a/b/c/h')
-
-        self.checkJoin(RFC3986_BASE, 'g;x=1/./y','http://a/b/c/g;x=1/y')
-
-        self.checkJoin(RFC3986_BASE, 'g;x=1/../y','http://a/b/c/y')
-
-        self.checkJoin(RFC3986_BASE, 'g?y/./x','http://a/b/c/g?y/./x')
-
-        self.checkJoin(RFC3986_BASE, 'g?y/../x','http://a/b/c/g?y/../x')
-
-        self.checkJoin(RFC3986_BASE, 'g#s/./x','http://a/b/c/g#s/./x')
-
-        self.checkJoin(RFC3986_BASE, 'g#s/../x','http://a/b/c/g#s/../x')
-
-        #self.checkJoin(RFC3986_BASE, 'http:g','http:g') # strict parser
-
-        self.checkJoin(RFC3986_BASE, 'http:g','http://a/b/c/g') #relaxed parser
-
-
-
-        # Test for issue9721
-
-        self.checkJoin('http://a/b/c/de', ';x','http://a/b/c/;x')
-
-
-
-    def test_urljoins(self):
-
-        self.checkJoin(SIMPLE_BASE, 'g:h','g:h')
-
-        self.checkJoin(SIMPLE_BASE, 'http:g','http://a/b/c/g')
-
-        self.checkJoin(SIMPLE_BASE, 'http:','http://a/b/c/d')
-
-        self.checkJoin(SIMPLE_BASE, 'g','http://a/b/c/g')
-
-        self.checkJoin(SIMPLE_BASE, './g','http://a/b/c/g')
-
-        self.checkJoin(SIMPLE_BASE, 'g/','http://a/b/c/g/')
-
-        self.checkJoin(SIMPLE_BASE, '/g','http://a/g')
-
-        self.checkJoin(SIMPLE_BASE, '//g','http://g')
-
-        self.checkJoin(SIMPLE_BASE, '?y','http://a/b/c/d?y')
-
-        self.checkJoin(SIMPLE_BASE, 'g?y','http://a/b/c/g?y')
-
-        self.checkJoin(SIMPLE_BASE, 'g?y/./x','http://a/b/c/g?y/./x')
-
-        self.checkJoin(SIMPLE_BASE, '.','http://a/b/c/')
-
-        self.checkJoin(SIMPLE_BASE, './','http://a/b/c/')
-
-        self.checkJoin(SIMPLE_BASE, '..','http://a/b/')
-
-        self.checkJoin(SIMPLE_BASE, '../','http://a/b/')
-
-        self.checkJoin(SIMPLE_BASE, '../g','http://a/b/g')
-
-        self.checkJoin(SIMPLE_BASE, '../..','http://a/')
-
-        self.checkJoin(SIMPLE_BASE, '../../g','http://a/g')
-
-        self.checkJoin(SIMPLE_BASE, './../g','http://a/b/g')
-
-        self.checkJoin(SIMPLE_BASE, './g/.','http://a/b/c/g/')
-
-        self.checkJoin(SIMPLE_BASE, 'g/./h','http://a/b/c/g/h')
-
-        self.checkJoin(SIMPLE_BASE, 'g/../h','http://a/b/c/h')
-
-        self.checkJoin(SIMPLE_BASE, 'http:g','http://a/b/c/g')
-
-        self.checkJoin(SIMPLE_BASE, 'http:','http://a/b/c/d')
-
-        self.checkJoin(SIMPLE_BASE, 'http:?y','http://a/b/c/d?y')
-
-        self.checkJoin(SIMPLE_BASE, 'http:g?y','http://a/b/c/g?y')
-
-        self.checkJoin(SIMPLE_BASE, 'http:g?y/./x','http://a/b/c/g?y/./x')
-
-        self.checkJoin('http:///', '..','http:///')
-
-        self.checkJoin('', 'http://a/b/c/g?y/./x','http://a/b/c/g?y/./x')
-
-        self.checkJoin('', 'http://a/./g', 'http://a/./g')
-
-        self.checkJoin('svn://pathtorepo/dir1', 'dir2', 'svn://pathtorepo/dir2')
-
-        self.checkJoin('svn+ssh://pathtorepo/dir1', 'dir2', 'svn+ssh://pathtorepo/dir2')
-
-        self.checkJoin('ws://a/b','g','ws://a/g')
-
-        self.checkJoin('wss://a/b','g','wss://a/g')
-
-
-
-        # XXX: The following tests are no longer compatible with RFC3986
-
-        # self.checkJoin(SIMPLE_BASE, '../../../g','http://a/../g')
-
-        # self.checkJoin(SIMPLE_BASE, '/./g','http://a/./g')
-
-
-
-        # test for issue22118 duplicate slashes
-
-        self.checkJoin(SIMPLE_BASE + '/', 'foo', SIMPLE_BASE + '/foo')
-
-
-
-        # Non-RFC-defined tests, covering variations of base and trailing
-
-        # slashes
-
-        self.checkJoin('http://a/b/c/d/e/', '../../f/g/', 'http://a/b/c/f/g/')
-
-        self.checkJoin('http://a/b/c/d/e', '../../f/g/', 'http://a/b/f/g/')
-
-        self.checkJoin('http://a/b/c/d/e/', '/../../f/g/', 'http://a/f/g/')
-
-        self.checkJoin('http://a/b/c/d/e', '/../../f/g/', 'http://a/f/g/')
-
-        self.checkJoin('http://a/b/c/d/e/', '../../f/g', 'http://a/b/c/f/g')
-
-        self.checkJoin('http://a/b/', '../../f/g/', 'http://a/f/g/')
-
-
-
-        # issue 23703: don't duplicate filename
-
-        self.checkJoin('a', 'b', 'b')
-
-
-
-    def test_RFC2732(self):
-
-        str_cases = [
-
-            ('http://Test.python.org:5432/foo/', 'test.python.org', 5432),
-
-            ('http://12.34.56.78:5432/foo/', '12.34.56.78', 5432),
-
-            ('http://[::1]:5432/foo/', '::1', 5432),
-
-            ('http://[dead:beef::1]:5432/foo/', 'dead:beef::1', 5432),
-
-            ('http://[dead:beef::]:5432/foo/', 'dead:beef::', 5432),
-
-            ('http://[dead:beef:cafe:5417:affe:8FA3:deaf:feed]:5432/foo/',
-
-             'dead:beef:cafe:5417:affe:8fa3:deaf:feed', 5432),
-
-            ('http://[::12.34.56.78]:5432/foo/', '::12.34.56.78', 5432),
-
-            ('http://[::ffff:12.34.56.78]:5432/foo/',
-
-             '::ffff:12.34.56.78', 5432),
-
-            ('http://Test.python.org/foo/', 'test.python.org', None),
-
-            ('http://12.34.56.78/foo/', '12.34.56.78', None),
-
-            ('http://[::1]/foo/', '::1', None),
-
-            ('http://[dead:beef::1]/foo/', 'dead:beef::1', None),
-
-            ('http://[dead:beef::]/foo/', 'dead:beef::', None),
-
-            ('http://[dead:beef:cafe:5417:affe:8FA3:deaf:feed]/foo/',
-
-             'dead:beef:cafe:5417:affe:8fa3:deaf:feed', None),
-
-            ('http://[::12.34.56.78]/foo/', '::12.34.56.78', None),
-
-            ('http://[::ffff:12.34.56.78]/foo/',
-
-             '::ffff:12.34.56.78', None),
-
-            ('http://Test.python.org:/foo/', 'test.python.org', None),
-
-            ('http://12.34.56.78:/foo/', '12.34.56.78', None),
-
-            ('http://[::1]:/foo/', '::1', None),
-
-            ('http://[dead:beef::1]:/foo/', 'dead:beef::1', None),
-
-            ('http://[dead:beef::]:/foo/', 'dead:beef::', None),
-
-            ('http://[dead:beef:cafe:5417:affe:8FA3:deaf:feed]:/foo/',
-
-             'dead:beef:cafe:5417:affe:8fa3:deaf:feed', None),
-
-            ('http://[::12.34.56.78]:/foo/', '::12.34.56.78', None),
-
-            ('http://[::ffff:12.34.56.78]:/foo/',
-
-             '::ffff:12.34.56.78', None),
-
-            ]
-
-        def _encode(t):
-
-            return t[0].encode('ascii'), t[1].encode('ascii'), t[2]
-
-        bytes_cases = [_encode(x) for x in str_cases]
-
-        for url, hostname, port in str_cases + bytes_cases:
-
-            urlparsed = urllib.parse.urlparse(url)
-
-            self.assertEqual((urlparsed.hostname, urlparsed.port) , (hostname, port))
-
-
-
-        str_cases = [
-
-                'http://::12.34.56.78]/',
-
-                'http://[::1/foo/',
-
-                'ftp://[::1/foo/bad]/bad',
-
-                'http://[::1/foo/bad]/bad',
-
-                'http://[::ffff:12.34.56.78']
-
-        bytes_cases = [x.encode('ascii') for x in str_cases]
-
-        for invalid_url in str_cases + bytes_cases:
-
-            self.assertRaises(ValueError, urllib.parse.urlparse, invalid_url)
-
-
-
-    def test_urldefrag(self):
-
-        str_cases = [
-
-            ('http://python.org#frag', 'http://python.org', 'frag'),
-
-            ('http://python.org', 'http://python.org', ''),
-
-            ('http://python.org/#frag', 'http://python.org/', 'frag'),
-
-            ('http://python.org/', 'http://python.org/', ''),
-
-            ('http://python.org/?q#frag', 'http://python.org/?q', 'frag'),
-
-            ('http://python.org/?q', 'http://python.org/?q', ''),
-
-            ('http://python.org/p#frag', 'http://python.org/p', 'frag'),
-
-            ('http://python.org/p?q', 'http://python.org/p?q', ''),
-
-            (RFC1808_BASE, 'http://a/b/c/d;p?q', 'f'),
-
-            (RFC2396_BASE, 'http://a/b/c/d;p?q', ''),
-
-        ]
-
-        def _encode(t):
-
-            return type(t)(x.encode('ascii') for x in t)
-
-        bytes_cases = [_encode(x) for x in str_cases]
-
-        for url, defrag, frag in str_cases + bytes_cases:
-
-            result = urllib.parse.urldefrag(url)
-
-            self.assertEqual(result.geturl(), url)
-
-            self.assertEqual(result, (defrag, frag))
-
-            self.assertEqual(result.url, defrag)
-
-            self.assertEqual(result.fragment, frag)
-
-
-
-    def test_urlsplit_scoped_IPv6(self):
-
-        p = urllib.parse.urlsplit('http://[FE80::822a:a8ff:fe49:470c%tESt]:1234')
-
-        self.assertEqual(p.hostname, "fe80::822a:a8ff:fe49:470c%tESt")
-
-        self.assertEqual(p.netloc, '[FE80::822a:a8ff:fe49:470c%tESt]:1234')
-
-
-
-        p = urllib.parse.urlsplit(b'http://[FE80::822a:a8ff:fe49:470c%tESt]:1234')
-
-        self.assertEqual(p.hostname, b"fe80::822a:a8ff:fe49:470c%tESt")
-
-        self.assertEqual(p.netloc, b'[FE80::822a:a8ff:fe49:470c%tESt]:1234')
-
-
-
-    def test_urlsplit_attributes(self):
-
-        url = "HTTP://WWW.PYTHON.ORG/doc/#frag"
-
-        p = urllib.parse.urlsplit(url)
-
-        self.assertEqual(p.scheme, "http")
-
-        self.assertEqual(p.netloc, "WWW.PYTHON.ORG")
-
-        self.assertEqual(p.path, "/doc/")
-
-        self.assertEqual(p.query, "")
-
-        self.assertEqual(p.fragment, "frag")
-
-        self.assertEqual(p.username, None)
-
-        self.assertEqual(p.password, None)
-
-        self.assertEqual(p.hostname, "www.python.org")
-
-        self.assertEqual(p.port, None)
-
-        # geturl() won't return exactly the original URL in this case
-
-        # since the scheme is always case-normalized
-
-        # We handle this by ignoring the first 4 characters of the URL
-
-        self.assertEqual(p.geturl()[4:], url[4:])
-
-
-
-        url = "http://User:Pass@www.python.org:080/doc/?query=yes#frag"
-
-        p = urllib.parse.urlsplit(url)
-
-        self.assertEqual(p.scheme, "http")
-
-        self.assertEqual(p.netloc, "User:Pass@www.python.org:080")
-
-        self.assertEqual(p.path, "/doc/")
-
-        self.assertEqual(p.query, "query=yes")
-
-        self.assertEqual(p.fragment, "frag")
-
-        self.assertEqual(p.username, "User")
-
-        self.assertEqual(p.password, "Pass")
-
-        self.assertEqual(p.hostname, "www.python.org")
-
-        self.assertEqual(p.port, 80)
-
-        self.assertEqual(p.geturl(), url)
-
-
-
-        # Addressing issue1698, which suggests Username can contain
-
-        # "@" characters.  Though not RFC compliant, many ftp sites allow
-
-        # and request email addresses as usernames.
-
-
-
-        url = "http://User@example.com:Pass@www.python.org:080/doc/?query=yes#frag"
-
-        p = urllib.parse.urlsplit(url)
-
-        self.assertEqual(p.scheme, "http")
-
-        self.assertEqual(p.netloc, "User@example.com:Pass@www.python.org:080")
-
-        self.assertEqual(p.path, "/doc/")
-
-        self.assertEqual(p.query, "query=yes")
-
-        self.assertEqual(p.fragment, "frag")
-
-        self.assertEqual(p.username, "User@example.com")
-
-        self.assertEqual(p.password, "Pass")
-
-        self.assertEqual(p.hostname, "www.python.org")
-
-        self.assertEqual(p.port, 80)
-
-        self.assertEqual(p.geturl(), url)
-
-
-
-        # And check them all again, only with bytes this time
-
-        url = b"HTTP://WWW.PYTHON.ORG/doc/#frag"
-
-        p = urllib.parse.urlsplit(url)
-
-        self.assertEqual(p.scheme, b"http")
-
-        self.assertEqual(p.netloc, b"WWW.PYTHON.ORG")
-
-        self.assertEqual(p.path, b"/doc/")
-
-        self.assertEqual(p.query, b"")
-
-        self.assertEqual(p.fragment, b"frag")
-
-        self.assertEqual(p.username, None)
-
-        self.assertEqual(p.password, None)
-
-        self.assertEqual(p.hostname, b"www.python.org")
-
-        self.assertEqual(p.port, None)
-
-        self.assertEqual(p.geturl()[4:], url[4:])
-
-
-
-        url = b"http://User:Pass@www.python.org:080/doc/?query=yes#frag"
-
-        p = urllib.parse.urlsplit(url)
-
-        self.assertEqual(p.scheme, b"http")
-
-        self.assertEqual(p.netloc, b"User:Pass@www.python.org:080")
-
-        self.assertEqual(p.path, b"/doc/")
-
-        self.assertEqual(p.query, b"query=yes")
-
-        self.assertEqual(p.fragment, b"frag")
-
-        self.assertEqual(p.username, b"User")
-
-        self.assertEqual(p.password, b"Pass")
-
-        self.assertEqual(p.hostname, b"www.python.org")
-
-        self.assertEqual(p.port, 80)
-
-        self.assertEqual(p.geturl(), url)
-
-
-
-        url = b"http://User@example.com:Pass@www.python.org:080/doc/?query=yes#frag"
-
-        p = urllib.parse.urlsplit(url)
-
-        self.assertEqual(p.scheme, b"http")
-
-        self.assertEqual(p.netloc, b"User@example.com:Pass@www.python.org:080")
-
-        self.assertEqual(p.path, b"/doc/")
-
-        self.assertEqual(p.query, b"query=yes")
-
-        self.assertEqual(p.fragment, b"frag")
-
-        self.assertEqual(p.username, b"User@example.com")
-
-        self.assertEqual(p.password, b"Pass")
-
-        self.assertEqual(p.hostname, b"www.python.org")
-
-        self.assertEqual(p.port, 80)
-
-        self.assertEqual(p.geturl(), url)
-
-
-
-        # Verify an illegal port raises ValueError
-
-        url = b"HTTP://WWW.PYTHON.ORG:65536/doc/#frag"
-
-        p = urllib.parse.urlsplit(url)
-
-        with self.assertRaisesRegex(ValueError, "out of range"):
-
-            p.port
-
-
-
-    def test_attributes_bad_port(self):
-
-        """Check handling of invalid ports."""
-
-        for bytes in (False, True):
-
-            for parse in (urllib.parse.urlsplit, urllib.parse.urlparse):
-
-                for port in ("foo", "1.5", "-1", "0x10"):
-
-                    with self.subTest(bytes=bytes, parse=parse, port=port):
-
-                        netloc = "www.example.net:" + port
-
-                        url = "http://" + netloc
-
-                        if bytes:
-
-                            netloc = netloc.encode("ascii")
-
-                            url = url.encode("ascii")
-
-                        p = parse(url)
-
-                        self.assertEqual(p.netloc, netloc)
-
-                        with self.assertRaises(ValueError):
-
-                            p.port
-
-
-
-    def test_attributes_without_netloc(self):
-
-        # This example is straight from RFC 3261.  It looks like it
-
-        # should allow the username, hostname, and port to be filled
-
-        # in, but doesn't.  Since it's a URI and doesn't use the
-
-        # scheme://netloc syntax, the netloc and related attributes
-
-        # should be left empty.
-
-        uri = "sip:alice@atlanta.com;maddr=239.255.255.1;ttl=15"
-
-        p = urllib.parse.urlsplit(uri)
-
-        self.assertEqual(p.netloc, "")
-
-        self.assertEqual(p.username, None)
-
-        self.assertEqual(p.password, None)
-
-        self.assertEqual(p.hostname, None)
-
-        self.assertEqual(p.port, None)
-
-        self.assertEqual(p.geturl(), uri)
-
-
-
-        p = urllib.parse.urlparse(uri)
-
-        self.assertEqual(p.netloc, "")
-
-        self.assertEqual(p.username, None)
-
-        self.assertEqual(p.password, None)
-
-        self.assertEqual(p.hostname, None)
-
-        self.assertEqual(p.port, None)
-
-        self.assertEqual(p.geturl(), uri)
-
-
-
-        # You guessed it, repeating the test with bytes input
-
-        uri = b"sip:alice@atlanta.com;maddr=239.255.255.1;ttl=15"
-
-        p = urllib.parse.urlsplit(uri)
-
-        self.assertEqual(p.netloc, b"")
-
-        self.assertEqual(p.username, None)
-
-        self.assertEqual(p.password, None)
-
-        self.assertEqual(p.hostname, None)
-
-        self.assertEqual(p.port, None)
-
-        self.assertEqual(p.geturl(), uri)
-
-
-
-        p = urllib.parse.urlparse(uri)
-
-        self.assertEqual(p.netloc, b"")
-
-        self.assertEqual(p.username, None)
-
-        self.assertEqual(p.password, None)
-
-        self.assertEqual(p.hostname, None)
-
-        self.assertEqual(p.port, None)
-
-        self.assertEqual(p.geturl(), uri)
-
-
-
-    def test_noslash(self):
-
-        # Issue 1637: http://foo.com?query is legal
-
-        self.assertEqual(urllib.parse.urlparse("http://example.com?blahblah=/foo"),
-
-                         ('http', 'example.com', '', '', 'blahblah=/foo', ''))
-
-        self.assertEqual(urllib.parse.urlparse(b"http://example.com?blahblah=/foo"),
-
-                         (b'http', b'example.com', b'', b'', b'blahblah=/foo', b''))
-
-
-
-    def test_withoutscheme(self):
-
-        # Test urlparse without scheme
-
-        # Issue 754016: urlparse goes wrong with IP:port without scheme
-
-        # RFC 1808 specifies that netloc should start with //, urlparse expects
-
-        # the same, otherwise it classifies the portion of url as path.
-
-        self.assertEqual(urllib.parse.urlparse("path"),
-
-                ('','','path','','',''))
-
-        self.assertEqual(urllib.parse.urlparse("//www.python.org:80"),
-
-                ('','www.python.org:80','','','',''))
-
-        self.assertEqual(urllib.parse.urlparse("http://www.python.org:80"),
-
-                ('http','www.python.org:80','','','',''))
-
-        # Repeat for bytes input
-
-        self.assertEqual(urllib.parse.urlparse(b"path"),
-
-                (b'',b'',b'path',b'',b'',b''))
-
-        self.assertEqual(urllib.parse.urlparse(b"//www.python.org:80"),
-
-                (b'',b'www.python.org:80',b'',b'',b'',b''))
-
-        self.assertEqual(urllib.parse.urlparse(b"http://www.python.org:80"),
-
-                (b'http',b'www.python.org:80',b'',b'',b'',b''))
-
-
-
-    def test_portseparator(self):
-
-        # Issue 754016 makes changes for port separator ':' from scheme separator
-
-        self.assertEqual(urllib.parse.urlparse("path:80"),
-
-                ('','','path:80','','',''))
-
-        self.assertEqual(urllib.parse.urlparse("http:"),('http','','','','',''))
-
-        self.assertEqual(urllib.parse.urlparse("https:"),('https','','','','',''))
-
-        self.assertEqual(urllib.parse.urlparse("http://www.python.org:80"),
-
-                ('http','www.python.org:80','','','',''))
-
-        # As usual, need to check bytes input as well
-
-        self.assertEqual(urllib.parse.urlparse(b"path:80"),
-
-                (b'',b'',b'path:80',b'',b'',b''))
-
-        self.assertEqual(urllib.parse.urlparse(b"http:"),(b'http',b'',b'',b'',b'',b''))
-
-        self.assertEqual(urllib.parse.urlparse(b"https:"),(b'https',b'',b'',b'',b'',b''))
-
-        self.assertEqual(urllib.parse.urlparse(b"http://www.python.org:80"),
-
-                (b'http',b'www.python.org:80',b'',b'',b'',b''))
-
-
-
-    def test_usingsys(self):
-
-        # Issue 3314: sys module is used in the error
-
-        self.assertRaises(TypeError, urllib.parse.urlencode, "foo")
-
-
-
-    def test_anyscheme(self):
-
-        # Issue 7904: s3://foo.com/stuff has netloc "foo.com".
-
-        self.assertEqual(urllib.parse.urlparse("s3://foo.com/stuff"),
-
-                         ('s3', 'foo.com', '/stuff', '', '', ''))
-
-        self.assertEqual(urllib.parse.urlparse("x-newscheme://foo.com/stuff"),
-
-                         ('x-newscheme', 'foo.com', '/stuff', '', '', ''))
-
-        self.assertEqual(urllib.parse.urlparse("x-newscheme://foo.com/stuff?query#fragment"),
-
-                         ('x-newscheme', 'foo.com', '/stuff', '', 'query', 'fragment'))
-
-        self.assertEqual(urllib.parse.urlparse("x-newscheme://foo.com/stuff?query"),
-
-                         ('x-newscheme', 'foo.com', '/stuff', '', 'query', ''))
-
-
-
-        # And for bytes...
-
-        self.assertEqual(urllib.parse.urlparse(b"s3://foo.com/stuff"),
-
-                         (b's3', b'foo.com', b'/stuff', b'', b'', b''))
-
-        self.assertEqual(urllib.parse.urlparse(b"x-newscheme://foo.com/stuff"),
-
-                         (b'x-newscheme', b'foo.com', b'/stuff', b'', b'', b''))
-
-        self.assertEqual(urllib.parse.urlparse(b"x-newscheme://foo.com/stuff?query#fragment"),
-
-                         (b'x-newscheme', b'foo.com', b'/stuff', b'', b'query', b'fragment'))
-
-        self.assertEqual(urllib.parse.urlparse(b"x-newscheme://foo.com/stuff?query"),
-
-                         (b'x-newscheme', b'foo.com', b'/stuff', b'', b'query', b''))
-
-
-
-    def test_default_scheme(self):
-
-        # Exercise the scheme parameter of urlparse() and urlsplit()
-
-        for func in (urllib.parse.urlparse, urllib.parse.urlsplit):
-
-            with self.subTest(function=func):
-
-                result = func("http://example.net/", "ftp")
-
-                self.assertEqual(result.scheme, "http")
-
-                result = func(b"http://example.net/", b"ftp")
-
-                self.assertEqual(result.scheme, b"http")
-
-                self.assertEqual(func("path", "ftp").scheme, "ftp")
-
-                self.assertEqual(func("path", scheme="ftp").scheme, "ftp")
-
-                self.assertEqual(func(b"path", scheme=b"ftp").scheme, b"ftp")
-
-                self.assertEqual(func("path").scheme, "")
-
-                self.assertEqual(func(b"path").scheme, b"")
-
-                self.assertEqual(func(b"path", "").scheme, b"")
-
-
-
-    def test_parse_fragments(self):
-
-        # Exercise the allow_fragments parameter of urlparse() and urlsplit()
-
-        tests = (
-
-            ("http:#frag", "path", "frag"),
-
-            ("//example.net#frag", "path", "frag"),
-
-            ("index.html#frag", "path", "frag"),
-
-            (";a=b#frag", "params", "frag"),
-
-            ("?a=b#frag", "query", "frag"),
-
-            ("#frag", "path", "frag"),
-
-            ("abc#@frag", "path", "@frag"),
-
-            ("//abc#@frag", "path", "@frag"),
-
-            ("//abc:80#@frag", "path", "@frag"),
-
-            ("//abc#@frag:80", "path", "@frag:80"),
-
-        )
-
-        for url, attr, expected_frag in tests:
-
-            for func in (urllib.parse.urlparse, urllib.parse.urlsplit):
-
-                if attr == "params" and func is urllib.parse.urlsplit:
-
-                    attr = "path"
-
-                with self.subTest(url=url, function=func):
-
-                    result = func(url, allow_fragments=False)
-
-                    self.assertEqual(result.fragment, "")
-
-                    self.assertTrue(
-
-                            getattr(result, attr).endswith("#" + expected_frag))
-
-                    self.assertEqual(func(url, "", False).fragment, "")
-
-
-
-                    result = func(url, allow_fragments=True)
-
-                    self.assertEqual(result.fragment, expected_frag)
-
-                    self.assertFalse(
-
-                            getattr(result, attr).endswith(expected_frag))
-
-                    self.assertEqual(func(url, "", True).fragment,
-
-                                     expected_frag)
-
-                    self.assertEqual(func(url).fragment, expected_frag)
-
-
-
-    def test_mixed_types_rejected(self):
-
-        # Several functions that process either strings or ASCII encoded bytes
-
-        # accept multiple arguments. Check they reject mixed type input
-
-        with self.assertRaisesRegex(TypeError, "Cannot mix str"):
-
-            urllib.parse.urlparse("www.python.org", b"http")
-
-        with self.assertRaisesRegex(TypeError, "Cannot mix str"):
-
-            urllib.parse.urlparse(b"www.python.org", "http")
-
-        with self.assertRaisesRegex(TypeError, "Cannot mix str"):
-
-            urllib.parse.urlsplit("www.python.org", b"http")
-
-        with self.assertRaisesRegex(TypeError, "Cannot mix str"):
-
-            urllib.parse.urlsplit(b"www.python.org", "http")
-
-        with self.assertRaisesRegex(TypeError, "Cannot mix str"):
-
-            urllib.parse.urlunparse(( b"http", "www.python.org","","","",""))
-
-        with self.assertRaisesRegex(TypeError, "Cannot mix str"):
-
-            urllib.parse.urlunparse(("http", b"www.python.org","","","",""))
-
-        with self.assertRaisesRegex(TypeError, "Cannot mix str"):
-
-            urllib.parse.urlunsplit((b"http", "www.python.org","","",""))
-
-        with self.assertRaisesRegex(TypeError, "Cannot mix str"):
-
-            urllib.parse.urlunsplit(("http", b"www.python.org","","",""))
-
-        with self.assertRaisesRegex(TypeError, "Cannot mix str"):
-
-            urllib.parse.urljoin("http://python.org", b"http://python.org")
-
-        with self.assertRaisesRegex(TypeError, "Cannot mix str"):
-
-            urllib.parse.urljoin(b"http://python.org", "http://python.org")
-
-
-
-    def _check_result_type(self, str_type):
-
-        num_args = len(str_type._fields)
-
-        bytes_type = str_type._encoded_counterpart
-
-        self.assertIs(bytes_type._decoded_counterpart, str_type)
-
-        str_args = ('',) * num_args
-
-        bytes_args = (b'',) * num_args
-
-        str_result = str_type(*str_args)
-
-        bytes_result = bytes_type(*bytes_args)
-
-        encoding = 'ascii'
-
-        errors = 'strict'
-
-        self.assertEqual(str_result, str_args)
-
-        self.assertEqual(bytes_result.decode(), str_args)
-
-        self.assertEqual(bytes_result.decode(), str_result)
-
-        self.assertEqual(bytes_result.decode(encoding), str_args)
-
-        self.assertEqual(bytes_result.decode(encoding), str_result)
-
-        self.assertEqual(bytes_result.decode(encoding, errors), str_args)
-
-        self.assertEqual(bytes_result.decode(encoding, errors), str_result)
-
-        self.assertEqual(bytes_result, bytes_args)
-
-        self.assertEqual(str_result.encode(), bytes_args)
-
-        self.assertEqual(str_result.encode(), bytes_result)
-
-        self.assertEqual(str_result.encode(encoding), bytes_args)
-
-        self.assertEqual(str_result.encode(encoding), bytes_result)
-
-        self.assertEqual(str_result.encode(encoding, errors), bytes_args)
-
-        self.assertEqual(str_result.encode(encoding, errors), bytes_result)
-
-
-
-    def test_result_pairs(self):
-
-        # Check encoding and decoding between result pairs
-
-        result_types = [
-
-          urllib.parse.DefragResult,
-
-          urllib.parse.SplitResult,
-
-          urllib.parse.ParseResult,
-
-        ]
-
-        for result_type in result_types:
-
-            self._check_result_type(result_type)
-
-
-
-    def test_parse_qs_encoding(self):
-
-        result = urllib.parse.parse_qs("key=\u0141%E9", encoding="latin-1")
-
-        self.assertEqual(result, {'key': ['\u0141\xE9']})
-
-        result = urllib.parse.parse_qs("key=\u0141%C3%A9", encoding="utf-8")
-
-        self.assertEqual(result, {'key': ['\u0141\xE9']})
-
-        result = urllib.parse.parse_qs("key=\u0141%C3%A9", encoding="ascii")
-
-        self.assertEqual(result, {'key': ['\u0141\ufffd\ufffd']})
-
-        result = urllib.parse.parse_qs("key=\u0141%E9-", encoding="ascii")
-
-        self.assertEqual(result, {'key': ['\u0141\ufffd-']})
-
-        result = urllib.parse.parse_qs("key=\u0141%E9-", encoding="ascii",
-
-                                                          errors="ignore")
-
-        self.assertEqual(result, {'key': ['\u0141-']})
-
-
-
-    def test_parse_qsl_encoding(self):
-
-        result = urllib.parse.parse_qsl("key=\u0141%E9", encoding="latin-1")
-
-        self.assertEqual(result, [('key', '\u0141\xE9')])
-
-        result = urllib.parse.parse_qsl("key=\u0141%C3%A9", encoding="utf-8")
-
-        self.assertEqual(result, [('key', '\u0141\xE9')])
-
-        result = urllib.parse.parse_qsl("key=\u0141%C3%A9", encoding="ascii")
-
-        self.assertEqual(result, [('key', '\u0141\ufffd\ufffd')])
-
-        result = urllib.parse.parse_qsl("key=\u0141%E9-", encoding="ascii")
-
-        self.assertEqual(result, [('key', '\u0141\ufffd-')])
-
-        result = urllib.parse.parse_qsl("key=\u0141%E9-", encoding="ascii",
-
-                                                          errors="ignore")
-
-        self.assertEqual(result, [('key', '\u0141-')])
-
-
-
-    def test_parse_qsl_max_num_fields(self):
-
-        with self.assertRaises(ValueError):
-
-            urllib.parse.parse_qs('&'.join(['a=a']*11), max_num_fields=10)
-
-        with self.assertRaises(ValueError):
-
-            urllib.parse.parse_qs(';'.join(['a=a']*11), max_num_fields=10)
-
-        urllib.parse.parse_qs('&'.join(['a=a']*10), max_num_fields=10)
-
-
-
-    def test_urlencode_sequences(self):
-
-        # Other tests incidentally urlencode things; test non-covered cases:
-
-        # Sequence and object values.
-
-        result = urllib.parse.urlencode({'a': [1, 2], 'b': (3, 4, 5)}, True)
-
-        # we cannot rely on ordering here
-
-        assert set(result.split('&')) == {'a=1', 'a=2', 'b=3', 'b=4', 'b=5'}
-
-
-
-        class Trivial:
-
-            def __str__(self):
-
-                return 'trivial'
-
-
-
-        result = urllib.parse.urlencode({'a': Trivial()}, True)
-
-        self.assertEqual(result, 'a=trivial')
-
-
-
-    def test_urlencode_quote_via(self):
-
-        result = urllib.parse.urlencode({'a': 'some value'})
-
-        self.assertEqual(result, "a=some+value")
-
-        result = urllib.parse.urlencode({'a': 'some value/another'},
-
-                                        quote_via=urllib.parse.quote)
-
-        self.assertEqual(result, "a=some%20value%2Fanother")
-
-        result = urllib.parse.urlencode({'a': 'some value/another'},
-
-                                        safe='/', quote_via=urllib.parse.quote)
-
-        self.assertEqual(result, "a=some%20value/another")
-
-
-
-    def test_quote_from_bytes(self):
-
-        self.assertRaises(TypeError, urllib.parse.quote_from_bytes, 'foo')
-
-        result = urllib.parse.quote_from_bytes(b'archaeological arcana')
-
-        self.assertEqual(result, 'archaeological%20arcana')
-
-        result = urllib.parse.quote_from_bytes(b'')
-
-        self.assertEqual(result, '')
-
-
-
-    def test_unquote_to_bytes(self):
-
-        result = urllib.parse.unquote_to_bytes('abc%20def')
-
-        self.assertEqual(result, b'abc def')
-
-        result = urllib.parse.unquote_to_bytes('')
-
-        self.assertEqual(result, b'')
-
-
-
-    def test_quote_errors(self):
-
-        self.assertRaises(TypeError, urllib.parse.quote, b'foo',
-
-                          encoding='utf-8')
-
-        self.assertRaises(TypeError, urllib.parse.quote, b'foo', errors='strict')
-
-
-
-    def test_issue14072(self):
-
-        p1 = urllib.parse.urlsplit('tel:+31-641044153')
-
-        self.assertEqual(p1.scheme, 'tel')
-
-        self.assertEqual(p1.path, '+31-641044153')
-
-        p2 = urllib.parse.urlsplit('tel:+31641044153')
-
-        self.assertEqual(p2.scheme, 'tel')
-
-        self.assertEqual(p2.path, '+31641044153')
-
-        # assert the behavior for urlparse
-
-        p1 = urllib.parse.urlparse('tel:+31-641044153')
-
-        self.assertEqual(p1.scheme, 'tel')
-
-        self.assertEqual(p1.path, '+31-641044153')
-
-        p2 = urllib.parse.urlparse('tel:+31641044153')
-
-        self.assertEqual(p2.scheme, 'tel')
-
-        self.assertEqual(p2.path, '+31641044153')
-
-
-
-    def test_port_casting_failure_message(self):
-
-        message = "Port could not be cast to integer value as 'oracle'"
-
-        p1 = urllib.parse.urlparse('http://Server=sde; Service=sde:oracle')
-
-        with self.assertRaisesRegex(ValueError, message):
-
-            p1.port
-
-
-
-        p2 = urllib.parse.urlsplit('http://Server=sde; Service=sde:oracle')
-
-        with self.assertRaisesRegex(ValueError, message):
-
-            p2.port
-
-
-
-    def test_telurl_params(self):
-
-        p1 = urllib.parse.urlparse('tel:123-4;phone-context=+1-650-516')
-
-        self.assertEqual(p1.scheme, 'tel')
-
-        self.assertEqual(p1.path, '123-4')
-
-        self.assertEqual(p1.params, 'phone-context=+1-650-516')
-
-
-
-        p1 = urllib.parse.urlparse('tel:+1-201-555-0123')
-
-        self.assertEqual(p1.scheme, 'tel')
-
-        self.assertEqual(p1.path, '+1-201-555-0123')
-
-        self.assertEqual(p1.params, '')
-
-
-
-        p1 = urllib.parse.urlparse('tel:7042;phone-context=example.com')
-
-        self.assertEqual(p1.scheme, 'tel')
-
-        self.assertEqual(p1.path, '7042')
-
-        self.assertEqual(p1.params, 'phone-context=example.com')
-
-
-
-        p1 = urllib.parse.urlparse('tel:863-1234;phone-context=+1-914-555')
-
-        self.assertEqual(p1.scheme, 'tel')
-
-        self.assertEqual(p1.path, '863-1234')
-
-        self.assertEqual(p1.params, 'phone-context=+1-914-555')
-
-
-
-    def test_Quoter_repr(self):
-
-        quoter = urllib.parse.Quoter(urllib.parse._ALWAYS_SAFE)
-
-        self.assertIn('Quoter', repr(quoter))
-
-
-
-    def test_all(self):
-
-        expected = []
-
-        undocumented = {
-
-            'splitattr', 'splithost', 'splitnport', 'splitpasswd',
-
-            'splitport', 'splitquery', 'splittag', 'splittype', 'splituser',
-
-            'splitvalue',
-
-            'Quoter', 'ResultBase', 'clear_cache', 'to_bytes', 'unwrap',
+            "filefield": ("lolcat.txt", data),
 
         }
 
-        for name in dir(urllib.parse):
 
-            if name.startswith('_') or name in undocumented:
+
+        with HTTPConnectionPool(self.host, self.port) as pool:
+
+            r = pool.request("POST", "/upload", fields=fields)
+
+            assert r.status == 200, r.data
+
+
+
+    def test_one_name_multiple_values(self):
+
+        fields = [("foo", "a"), ("foo", "b")]
+
+
+
+        with HTTPConnectionPool(self.host, self.port) as pool:
+
+            # urlencode
+
+            r = pool.request("GET", "/echo", fields=fields)
+
+            assert r.data == b"foo=a&foo=b"
+
+
+
+            # multipart
+
+            r = pool.request("POST", "/echo", fields=fields)
+
+            assert r.data.count(b'name="foo"') == 2
+
+
+
+    def test_request_method_body(self):
+
+        with HTTPConnectionPool(self.host, self.port) as pool:
+
+            body = b"hi"
+
+            r = pool.request("POST", "/echo", body=body)
+
+            assert r.data == body
+
+
+
+            fields = [("hi", "hello")]
+
+            with pytest.raises(TypeError):
+
+                pool.request("POST", "/echo", body=body, fields=fields)
+
+
+
+    def test_unicode_upload(self):
+
+        fieldname = u("myfile")
+
+        filename = u("\xe2\x99\xa5.txt")
+
+        data = u("\xe2\x99\xa5").encode("utf8")
+
+        size = len(data)
+
+
+
+        fields = {
+
+            u("upload_param"): fieldname,
+
+            u("upload_filename"): filename,
+
+            u("upload_size"): size,
+
+            fieldname: (filename, data),
+
+        }
+
+        with HTTPConnectionPool(self.host, self.port) as pool:
+
+            r = pool.request("POST", "/upload", fields=fields)
+
+            assert r.status == 200, r.data
+
+
+
+    def test_nagle(self):
+
+        """ Test that connections have TCP_NODELAY turned on """
+
+        # This test needs to be here in order to be run. socket.create_connection actually tries
+
+        # to connect to the host provided so we need a dummyserver to be running.
+
+        with HTTPConnectionPool(self.host, self.port) as pool:
+
+            conn = pool._get_conn()
+
+            try:
+
+                pool._make_request(conn, "GET", "/")
+
+                tcp_nodelay_setting = conn.sock.getsockopt(
+
+                    socket.IPPROTO_TCP, socket.TCP_NODELAY
+
+                )
+
+                assert tcp_nodelay_setting
+
+            finally:
+
+                conn.close()
+
+
+
+    def test_socket_options(self):
+
+        """Test that connections accept socket options."""
+
+        # This test needs to be here in order to be run. socket.create_connection actually tries to
+
+        # connect to the host provided so we need a dummyserver to be running.
+
+        with HTTPConnectionPool(
+
+            self.host,
+
+            self.port,
+
+            socket_options=[(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)],
+
+        ) as pool:
+
+            s = pool._new_conn()._new_conn()  # Get the socket
+
+            try:
+
+                using_keepalive = (
+
+                    s.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE) > 0
+
+                )
+
+                assert using_keepalive
+
+            finally:
+
+                s.close()
+
+
+
+    def test_disable_default_socket_options(self):
+
+        """Test that passing None disables all socket options."""
+
+        # This test needs to be here in order to be run. socket.create_connection actually tries
+
+        # to connect to the host provided so we need a dummyserver to be running.
+
+        with HTTPConnectionPool(self.host, self.port, socket_options=None) as pool:
+
+            s = pool._new_conn()._new_conn()
+
+            try:
+
+                using_nagle = s.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) == 0
+
+                assert using_nagle
+
+            finally:
+
+                s.close()
+
+
+
+    def test_defaults_are_applied(self):
+
+        """Test that modifying the default socket options works."""
+
+        # This test needs to be here in order to be run. socket.create_connection actually tries
+
+        # to connect to the host provided so we need a dummyserver to be running.
+
+        with HTTPConnectionPool(self.host, self.port) as pool:
+
+            # Get the HTTPConnection instance
+
+            conn = pool._new_conn()
+
+            try:
+
+                # Update the default socket options
+
+                conn.default_socket_options += [
+
+                    (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+                ]
+
+                s = conn._new_conn()
+
+                nagle_disabled = (
+
+                    s.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) > 0
+
+                )
+
+                using_keepalive = (
+
+                    s.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE) > 0
+
+                )
+
+                assert nagle_disabled
+
+                assert using_keepalive
+
+            finally:
+
+                conn.close()
+
+                s.close()
+
+
+
+    def test_connection_error_retries(self):
+
+        """ ECONNREFUSED error should raise a connection error, with retries """
+
+        port = find_unused_port()
+
+        with HTTPConnectionPool(self.host, port) as pool:
+
+            with pytest.raises(MaxRetryError) as e:
+
+                pool.request("GET", "/", retries=Retry(connect=3))
+
+            assert type(e.value.reason) == NewConnectionError
+
+
+
+    def test_timeout_success(self):
+
+        timeout = Timeout(connect=3, read=5, total=None)
+
+        with HTTPConnectionPool(self.host, self.port, timeout=timeout) as pool:
+
+            pool.request("GET", "/")
+
+            # This should not raise a "Timeout already started" error
+
+            pool.request("GET", "/")
+
+
+
+        with HTTPConnectionPool(self.host, self.port, timeout=timeout) as pool:
+
+            # This should also not raise a "Timeout already started" error
+
+            pool.request("GET", "/")
+
+
+
+        timeout = Timeout(total=None)
+
+        with HTTPConnectionPool(self.host, self.port, timeout=timeout) as pool:
+
+            pool.request("GET", "/")
+
+
+
+    def test_tunnel(self):
+
+        # note the actual httplib.py has no tests for this functionality
+
+        timeout = Timeout(total=None)
+
+        with HTTPConnectionPool(self.host, self.port, timeout=timeout) as pool:
+
+            conn = pool._get_conn()
+
+            try:
+
+                conn.set_tunnel(self.host, self.port)
+
+                conn._tunnel = mock.Mock(return_value=None)
+
+                pool._make_request(conn, "GET", "/")
+
+                conn._tunnel.assert_called_once_with()
+
+            finally:
+
+                conn.close()
+
+
+
+        # test that it's not called when tunnel is not set
+
+        timeout = Timeout(total=None)
+
+        with HTTPConnectionPool(self.host, self.port, timeout=timeout) as pool:
+
+            conn = pool._get_conn()
+
+            try:
+
+                conn._tunnel = mock.Mock(return_value=None)
+
+                pool._make_request(conn, "GET", "/")
+
+                assert not conn._tunnel.called
+
+            finally:
+
+                conn.close()
+
+
+
+    def test_redirect(self):
+
+        with HTTPConnectionPool(self.host, self.port) as pool:
+
+            r = pool.request("GET", "/redirect", fields={"target": "/"}, redirect=False)
+
+            assert r.status == 303
+
+
+
+            r = pool.request("GET", "/redirect", fields={"target": "/"})
+
+            assert r.status == 200
+
+            assert r.data == b"Dummy server!"
+
+
+
+    def test_bad_connect(self):
+
+        with HTTPConnectionPool("badhost.invalid", self.port) as pool:
+
+            with pytest.raises(MaxRetryError) as e:
+
+                pool.request("GET", "/", retries=5)
+
+            assert type(e.value.reason) == NewConnectionError
+
+
+
+    def test_keepalive(self):
+
+        with HTTPConnectionPool(self.host, self.port, block=True, maxsize=1) as pool:
+
+            r = pool.request("GET", "/keepalive?close=0")
+
+            r = pool.request("GET", "/keepalive?close=0")
+
+
+
+            assert r.status == 200
+
+            assert pool.num_connections == 1
+
+            assert pool.num_requests == 2
+
+
+
+    def test_keepalive_close(self):
+
+        with HTTPConnectionPool(
+
+            self.host, self.port, block=True, maxsize=1, timeout=2
+
+        ) as pool:
+
+            r = pool.request(
+
+                "GET", "/keepalive?close=1", retries=0, headers={"Connection": "close"}
+
+            )
+
+
+
+            assert pool.num_connections == 1
+
+
+
+            # The dummyserver will have responded with Connection:close,
+
+            # and httplib will properly cleanup the socket.
+
+
+
+            # We grab the HTTPConnection object straight from the Queue,
+
+            # because _get_conn() is where the check & reset occurs
+
+            # pylint: disable-msg=W0212
+
+            conn = pool.pool.get()
+
+            assert conn.sock is None
+
+            pool._put_conn(conn)
+
+
+
+            # Now with keep-alive
+
+            r = pool.request(
+
+                "GET",
+
+                "/keepalive?close=0",
+
+                retries=0,
+
+                headers={"Connection": "keep-alive"},
+
+            )
+
+
+
+            # The dummyserver responded with Connection:keep-alive, the connection
+
+            # persists.
+
+            conn = pool.pool.get()
+
+            assert conn.sock is not None
+
+            pool._put_conn(conn)
+
+
+
+            # Another request asking the server to close the connection. This one
+
+            # should get cleaned up for the next request.
+
+            r = pool.request(
+
+                "GET", "/keepalive?close=1", retries=0, headers={"Connection": "close"}
+
+            )
+
+
+
+            assert r.status == 200
+
+
+
+            conn = pool.pool.get()
+
+            assert conn.sock is None
+
+            pool._put_conn(conn)
+
+
+
+            # Next request
+
+            r = pool.request("GET", "/keepalive?close=0")
+
+
+
+    def test_post_with_urlencode(self):
+
+        with HTTPConnectionPool(self.host, self.port) as pool:
+
+            data = {"banana": "hammock", "lol": "cat"}
+
+            r = pool.request("POST", "/echo", fields=data, encode_multipart=False)
+
+            assert r.data.decode("utf-8") == urlencode(data)
+
+
+
+    def test_post_with_multipart(self):
+
+        with HTTPConnectionPool(self.host, self.port) as pool:
+
+            data = {"banana": "hammock", "lol": "cat"}
+
+            r = pool.request("POST", "/echo", fields=data, encode_multipart=True)
+
+            body = r.data.split(b"\r\n")
+
+
+
+            encoded_data = encode_multipart_formdata(data)[0]
+
+            expected_body = encoded_data.split(b"\r\n")
+
+
+
+            # TODO: Get rid of extra parsing stuff when you can specify
+
+            # a custom boundary to encode_multipart_formdata
+
+            """
+
+            We need to loop the return lines because a timestamp is attached
+
+            from within encode_multipart_formdata. When the server echos back
+
+            the data, it has the timestamp from when the data was encoded, which
+
+            is not equivalent to when we run encode_multipart_formdata on
+
+            the data again.
+
+            """
+
+            for i, line in enumerate(body):
+
+                if line.startswith(b"--"):
+
+                    continue
+
+
+
+                assert body[i] == expected_body[i]
+
+
+
+    def test_post_with_multipart__iter__(self):
+
+        with HTTPConnectionPool(self.host, self.port) as pool:
+
+            data = {"hello": "world"}
+
+            r = pool.request(
+
+                "POST",
+
+                "/echo",
+
+                fields=data,
+
+                preload_content=False,
+
+                multipart_boundary="boundary",
+
+                encode_multipart=True,
+
+            )
+
+
+
+            chunks = [chunk for chunk in r]
+
+            assert chunks == [
+
+                b"--boundary\r\n",
+
+                b'Content-Disposition: form-data; name="hello"\r\n',
+
+                b"\r\n",
+
+                b"world\r\n",
+
+                b"--boundary--\r\n",
+
+            ]
+
+
+
+    def test_check_gzip(self):
+
+        with HTTPConnectionPool(self.host, self.port) as pool:
+
+            r = pool.request(
+
+                "GET", "/encodingrequest", headers={"accept-encoding": "gzip"}
+
+            )
+
+            assert r.headers.get("content-encoding") == "gzip"
+
+            assert r.data == b"hello, world!"
+
+
+
+    def test_check_deflate(self):
+
+        with HTTPConnectionPool(self.host, self.port) as pool:
+
+            r = pool.request(
+
+                "GET", "/encodingrequest", headers={"accept-encoding": "deflate"}
+
+            )
+
+            assert r.headers.get("content-encoding") == "deflate"
+
+            assert r.data == b"hello, world!"
+
+
+
+    def test_bad_decode(self):
+
+        with HTTPConnectionPool(self.host, self.port) as pool:
+
+            with pytest.raises(DecodeError):
+
+                pool.request(
+
+                    "GET",
+
+                    "/encodingrequest",
+
+                    headers={"accept-encoding": "garbage-deflate"},
+
+                )
+
+
+
+            with pytest.raises(DecodeError):
+
+                pool.request(
+
+                    "GET",
+
+                    "/encodingrequest",
+
+                    headers={"accept-encoding": "garbage-gzip"},
+
+                )
+
+
+
+    def test_connection_count(self):
+
+        with HTTPConnectionPool(self.host, self.port, maxsize=1) as pool:
+
+            pool.request("GET", "/")
+
+            pool.request("GET", "/")
+
+            pool.request("GET", "/")
+
+
+
+            assert pool.num_connections == 1
+
+            assert pool.num_requests == 3
+
+
+
+    def test_connection_count_bigpool(self):
+
+        with HTTPConnectionPool(self.host, self.port, maxsize=16) as http_pool:
+
+            http_pool.request("GET", "/")
+
+            http_pool.request("GET", "/")
+
+            http_pool.request("GET", "/")
+
+
+
+            assert http_pool.num_connections == 1
+
+            assert http_pool.num_requests == 3
+
+
+
+    def test_partial_response(self):
+
+        with HTTPConnectionPool(self.host, self.port, maxsize=1) as pool:
+
+            req_data = {"lol": "cat"}
+
+            resp_data = urlencode(req_data).encode("utf-8")
+
+
+
+            r = pool.request("GET", "/echo", fields=req_data, preload_content=False)
+
+
+
+            assert r.read(5) == resp_data[:5]
+
+            assert r.read() == resp_data[5:]
+
+
+
+    def test_lazy_load_twice(self):
+
+        # This test is sad and confusing. Need to figure out what's
+
+        # going on with partial reads and socket reuse.
+
+
+
+        with HTTPConnectionPool(
+
+            self.host, self.port, block=True, maxsize=1, timeout=2
+
+        ) as pool:
+
+            payload_size = 1024 * 2
+
+            first_chunk = 512
+
+
+
+            boundary = "foo"
+
+
+
+            req_data = {"count": "a" * payload_size}
+
+            resp_data = encode_multipart_formdata(req_data, boundary=boundary)[0]
+
+
+
+            req2_data = {"count": "b" * payload_size}
+
+            resp2_data = encode_multipart_formdata(req2_data, boundary=boundary)[0]
+
+
+
+            r1 = pool.request(
+
+                "POST",
+
+                "/echo",
+
+                fields=req_data,
+
+                multipart_boundary=boundary,
+
+                preload_content=False,
+
+            )
+
+
+
+            assert r1.read(first_chunk) == resp_data[:first_chunk]
+
+
+
+            try:
+
+                r2 = pool.request(
+
+                    "POST",
+
+                    "/echo",
+
+                    fields=req2_data,
+
+                    multipart_boundary=boundary,
+
+                    preload_content=False,
+
+                    pool_timeout=0.001,
+
+                )
+
+
+
+                # This branch should generally bail here, but maybe someday it will
+
+                # work? Perhaps by some sort of magic. Consider it a TODO.
+
+
+
+                assert r2.read(first_chunk) == resp2_data[:first_chunk]
+
+
+
+                assert r1.read() == resp_data[first_chunk:]
+
+                assert r2.read() == resp2_data[first_chunk:]
+
+                assert pool.num_requests == 2
+
+
+
+            except EmptyPoolError:
+
+                assert r1.read() == resp_data[first_chunk:]
+
+                assert pool.num_requests == 1
+
+
+
+            assert pool.num_connections == 1
+
+
+
+    def test_for_double_release(self):
+
+        MAXSIZE = 5
+
+
+
+        # Check default state
+
+        with HTTPConnectionPool(self.host, self.port, maxsize=MAXSIZE) as pool:
+
+            assert pool.num_connections == 0
+
+            assert pool.pool.qsize() == MAXSIZE
+
+
+
+            # Make an empty slot for testing
+
+            pool.pool.get()
+
+            assert pool.pool.qsize() == MAXSIZE - 1
+
+
+
+            # Check state after simple request
+
+            pool.urlopen("GET", "/")
+
+            assert pool.pool.qsize() == MAXSIZE - 1
+
+
+
+            # Check state without release
+
+            pool.urlopen("GET", "/", preload_content=False)
+
+            assert pool.pool.qsize() == MAXSIZE - 2
+
+
+
+            pool.urlopen("GET", "/")
+
+            assert pool.pool.qsize() == MAXSIZE - 2
+
+
+
+            # Check state after read
+
+            pool.urlopen("GET", "/").data
+
+            assert pool.pool.qsize() == MAXSIZE - 2
+
+
+
+            pool.urlopen("GET", "/")
+
+            assert pool.pool.qsize() == MAXSIZE - 2
+
+
+
+    def test_release_conn_parameter(self):
+
+        MAXSIZE = 5
+
+        with HTTPConnectionPool(self.host, self.port, maxsize=MAXSIZE) as pool:
+
+            assert pool.pool.qsize() == MAXSIZE
+
+
+
+            # Make request without releasing connection
+
+            pool.request("GET", "/", release_conn=False, preload_content=False)
+
+            assert pool.pool.qsize() == MAXSIZE - 1
+
+
+
+    def test_dns_error(self):
+
+        with HTTPConnectionPool(
+
+            "thishostdoesnotexist.invalid", self.port, timeout=0.001
+
+        ) as pool:
+
+            with pytest.raises(MaxRetryError):
+
+                pool.request("GET", "/test", retries=2)
+
+
+
+    @pytest.mark.parametrize("char", [" ", "\r", "\n", "\x00"])
+
+    def test_invalid_method_not_allowed(self, char):
+
+        with pytest.raises(ValueError):
+
+            with HTTPConnectionPool(self.host, self.port) as pool:
+
+                pool.request("GET" + char, "/")
+
+
+
+    def test_percent_encode_invalid_target_chars(self):
+
+        with HTTPConnectionPool(self.host, self.port) as pool:
+
+            r = pool.request("GET", "/echo_params?q=\r&k=\n \n")
+
+            assert r.data == b"[('k', '\\n \\n'), ('q', '\\r')]"
+
+
+
+    def test_source_address(self):
+
+        for addr, is_ipv6 in VALID_SOURCE_ADDRESSES:
+
+            if is_ipv6 and not HAS_IPV6_AND_DNS:
+
+                warnings.warn("No IPv6 support: skipping.", NoIPv6Warning)
 
                 continue
 
-            object = getattr(urllib.parse, name)
+            with HTTPConnectionPool(
 
-            if getattr(object, '__module__', None) == 'urllib.parse':
+                self.host, self.port, source_address=addr, retries=False
 
-                expected.append(name)
+            ) as pool:
 
-        self.assertCountEqual(urllib.parse.__all__, expected)
+                r = pool.request("GET", "/source_address")
 
+                assert r.data == b(addr[0])
 
 
-    def test_urlsplit_normalization(self):
 
-        # Certain characters should never occur in the netloc,
+    def test_source_address_error(self):
 
-        # including under normalization.
+        for addr in INVALID_SOURCE_ADDRESSES:
 
-        # Ensure that ALL of them are detected and cause an error
+            with HTTPConnectionPool(
 
-        illegal_chars = '/:#?@'
+                self.host, self.port, source_address=addr, retries=False
 
-        hex_chars = {'{:04X}'.format(ord(c)) for c in illegal_chars}
+            ) as pool:
 
-        denorm_chars = [
+                with pytest.raises(NewConnectionError):
 
-            c for c in map(chr, range(128, sys.maxunicode))
+                    pool.request("GET", "/source_address?{0}".format(addr))
 
-            if (hex_chars & set(unicodedata.decomposition(c).split()))
 
-            and c not in illegal_chars
 
-        ]
+    def test_stream_keepalive(self):
 
-        # Sanity check that we found at least one such character
+        x = 2
 
-        self.assertIn('\u2100', denorm_chars)
 
-        self.assertIn('\uFF03', denorm_chars)
 
+        with HTTPConnectionPool(self.host, self.port) as pool:
 
+            for _ in range(x):
 
-        # bpo-36742: Verify port separators are ignored when they
+                response = pool.request(
 
-        # existed prior to decomposition
+                    "GET",
 
-        urllib.parse.urlsplit('http://\u30d5\u309a:80')
+                    "/chunked",
 
-        with self.assertRaises(ValueError):
+                    headers={"Connection": "keep-alive"},
 
-            urllib.parse.urlsplit('http://\u30d5\u309a\ufe1380')
+                    preload_content=False,
 
+                    retries=False,
 
+                )
 
-        for scheme in ["http", "https", "ftp"]:
+                for chunk in response.stream():
 
-            for netloc in ["netloc{}false.netloc", "n{}user@netloc"]:
+                    assert chunk == b"123"
 
-                for c in denorm_chars:
 
-                    url = "{}://{}/path".format(scheme, netloc.format(c))
 
-                    with self.subTest(url=url, char='{:04X}'.format(ord(c))):
+            assert pool.num_connections == 1
 
-                        with self.assertRaises(ValueError):
+            assert pool.num_requests == x
 
-                            urllib.parse.urlsplit(url)
 
 
+    def test_read_chunked_short_circuit(self):
 
-class Utility_Tests(unittest.TestCase):
+        with HTTPConnectionPool(self.host, self.port) as pool:
 
-    """Testcase to test the various utility functions in the urllib."""
+            response = pool.request("GET", "/chunked", preload_content=False)
 
-    # In Python 2 this test class was in test_urllib.
+            response.read()
 
+            with pytest.raises(StopIteration):
 
+                next(response.read_chunked())
 
-    def test_splittype(self):
 
-        splittype = urllib.parse._splittype
 
-        self.assertEqual(splittype('type:opaquestring'), ('type', 'opaquestring'))
+    def test_read_chunked_on_closed_response(self):
 
-        self.assertEqual(splittype('opaquestring'), (None, 'opaquestring'))
+        with HTTPConnectionPool(self.host, self.port) as pool:
 
-        self.assertEqual(splittype(':opaquestring'), (None, ':opaquestring'))
+            response = pool.request("GET", "/chunked", preload_content=False)
 
-        self.assertEqual(splittype('type:'), ('type', ''))
+            response.close()
 
-        self.assertEqual(splittype('type:opaque:string'), ('type', 'opaque:string'))
+            with pytest.raises(StopIteration):
 
+                next(response.read_chunked())
 
 
-    def test_splithost(self):
 
-        splithost = urllib.parse._splithost
+    def test_chunked_gzip(self):
 
-        self.assertEqual(splithost('//www.example.org:80/foo/bar/baz.html'),
+        with HTTPConnectionPool(self.host, self.port) as pool:
 
-                         ('www.example.org:80', '/foo/bar/baz.html'))
+            response = pool.request(
 
-        self.assertEqual(splithost('//www.example.org:80'),
+                "GET", "/chunked_gzip", preload_content=False, decode_content=True
 
-                         ('www.example.org:80', ''))
+            )
 
-        self.assertEqual(splithost('/foo/bar/baz.html'),
 
-                         (None, '/foo/bar/baz.html'))
 
+            assert b"123" * 4 == response.read()
 
 
-        # bpo-30500: # starts a fragment.
 
-        self.assertEqual(splithost('//127.0.0.1#@host.com'),
+    def test_cleanup_on_connection_error(self):
 
-                         ('127.0.0.1', '/#@host.com'))
+        """
 
-        self.assertEqual(splithost('//127.0.0.1#@host.com:80'),
+        Test that connections are recycled to the pool on
 
-                         ('127.0.0.1', '/#@host.com:80'))
+        connection errors where no http response is received.
 
-        self.assertEqual(splithost('//127.0.0.1:80#@host.com'),
+        """
 
-                         ('127.0.0.1:80', '/#@host.com'))
+        poolsize = 3
 
+        with HTTPConnectionPool(
 
+            self.host, self.port, maxsize=poolsize, block=True
 
-        # Empty host is returned as empty string.
+        ) as http:
 
-        self.assertEqual(splithost("///file"),
+            assert http.pool.qsize() == poolsize
 
-                         ('', '/file'))
 
 
+            # force a connection error by supplying a non-existent
 
-        # Trailing semicolon, question mark and hash symbol are kept.
+            # url. We won't get a response for this  and so the
 
-        self.assertEqual(splithost("//example.net/file;"),
+            # conn won't be implicitly returned to the pool.
 
-                         ('example.net', '/file;'))
+            with pytest.raises(MaxRetryError):
 
-        self.assertEqual(splithost("//example.net/file?"),
+                http.request(
 
-                         ('example.net', '/file?'))
+                    "GET",
 
-        self.assertEqual(splithost("//example.net/file#"),
+                    "/redirect",
 
-                         ('example.net', '/file#'))
+                    fields={"target": "/"},
 
+                    release_conn=False,
 
+                    retries=0,
 
-    def test_splituser(self):
+                )
 
-        splituser = urllib.parse._splituser
 
-        self.assertEqual(splituser('User:Pass@www.python.org:080'),
 
-                         ('User:Pass', 'www.python.org:080'))
+            r = http.request(
 
-        self.assertEqual(splituser('@www.python.org:080'),
+                "GET",
 
-                         ('', 'www.python.org:080'))
+                "/redirect",
 
-        self.assertEqual(splituser('www.python.org:080'),
+                fields={"target": "/"},
 
-                         (None, 'www.python.org:080'))
+                release_conn=False,
 
-        self.assertEqual(splituser('User:Pass@'),
+                retries=1,
 
-                         ('User:Pass', ''))
+            )
 
-        self.assertEqual(splituser('User@example.com:Pass@www.python.org:080'),
+            r.release_conn()
 
-                         ('User@example.com:Pass', 'www.python.org:080'))
 
 
+            # the pool should still contain poolsize elements
 
-    def test_splitpasswd(self):
+            assert http.pool.qsize() == http.pool.maxsize
 
-        # Some of the password examples are not sensible, but it is added to
 
-        # confirming to RFC2617 and addressing issue4675.
 
-        splitpasswd = urllib.parse._splitpasswd
+    def test_mixed_case_hostname(self):
 
-        self.assertEqual(splitpasswd('user:ab'), ('user', 'ab'))
+        with HTTPConnectionPool("LoCaLhOsT", self.port) as pool:
 
-        self.assertEqual(splitpasswd('user:a\nb'), ('user', 'a\nb'))
+            response = pool.request("GET", "http://LoCaLhOsT:%d/" % self.port)
 
-        self.assertEqual(splitpasswd('user:a\tb'), ('user', 'a\tb'))
+            assert response.status == 200
 
-        self.assertEqual(splitpasswd('user:a\rb'), ('user', 'a\rb'))
 
-        self.assertEqual(splitpasswd('user:a\fb'), ('user', 'a\fb'))
 
-        self.assertEqual(splitpasswd('user:a\vb'), ('user', 'a\vb'))
 
-        self.assertEqual(splitpasswd('user:a:b'), ('user', 'a:b'))
 
-        self.assertEqual(splitpasswd('user:a b'), ('user', 'a b'))
+class TestRetry(HTTPDummyServerTestCase):
 
-        self.assertEqual(splitpasswd('user 2:ab'), ('user 2', 'ab'))
+    def test_max_retry(self):
 
-        self.assertEqual(splitpasswd('user+1:a+b'), ('user+1', 'a+b'))
+        with HTTPConnectionPool(self.host, self.port) as pool:
 
-        self.assertEqual(splitpasswd('user:'), ('user', ''))
+            with pytest.raises(MaxRetryError):
 
-        self.assertEqual(splitpasswd('user'), ('user', None))
+                pool.request("GET", "/redirect", fields={"target": "/"}, retries=0)
 
-        self.assertEqual(splitpasswd(':ab'), ('', 'ab'))
 
 
+    def test_disabled_retry(self):
 
-    def test_splitport(self):
+        """ Disabled retries should disable redirect handling. """
 
-        splitport = urllib.parse._splitport
+        with HTTPConnectionPool(self.host, self.port) as pool:
 
-        self.assertEqual(splitport('parrot:88'), ('parrot', '88'))
+            r = pool.request("GET", "/redirect", fields={"target": "/"}, retries=False)
 
-        self.assertEqual(splitport('parrot'), ('parrot', None))
+            assert r.status == 303
 
-        self.assertEqual(splitport('parrot:'), ('parrot', None))
 
-        self.assertEqual(splitport('127.0.0.1'), ('127.0.0.1', None))
 
-        self.assertEqual(splitport('parrot:cheese'), ('parrot:cheese', None))
+            r = pool.request(
 
-        self.assertEqual(splitport('[::1]:88'), ('[::1]', '88'))
+                "GET",
 
-        self.assertEqual(splitport('[::1]'), ('[::1]', None))
+                "/redirect",
 
-        self.assertEqual(splitport(':88'), ('', '88'))
+                fields={"target": "/"},
 
+                retries=Retry(redirect=False),
 
+            )
 
-    def test_splitnport(self):
+            assert r.status == 303
 
-        splitnport = urllib.parse._splitnport
 
-        self.assertEqual(splitnport('parrot:88'), ('parrot', 88))
 
-        self.assertEqual(splitnport('parrot'), ('parrot', -1))
+        with HTTPConnectionPool(
 
-        self.assertEqual(splitnport('parrot', 55), ('parrot', 55))
+            "thishostdoesnotexist.invalid", self.port, timeout=0.001
 
-        self.assertEqual(splitnport('parrot:'), ('parrot', -1))
+        ) as pool:
 
-        self.assertEqual(splitnport('parrot:', 55), ('parrot', 55))
+            with pytest.raises(NewConnectionError):
 
-        self.assertEqual(splitnport('127.0.0.1'), ('127.0.0.1', -1))
+                pool.request("GET", "/test", retries=False)
 
-        self.assertEqual(splitnport('127.0.0.1', 55), ('127.0.0.1', 55))
 
-        self.assertEqual(splitnport('parrot:cheese'), ('parrot', None))
 
-        self.assertEqual(splitnport('parrot:cheese', 55), ('parrot', None))
+    def test_read_retries(self):
 
+        """ Should retry for status codes in the whitelist """
 
+        with HTTPConnectionPool(self.host, self.port) as pool:
 
-    def test_splitquery(self):
+            retry = Retry(read=1, status_forcelist=[418])
 
-        # Normal cases are exercised by other tests; ensure that we also
+            resp = pool.request(
 
-        # catch cases with no port specified (testcase ensuring coverage)
+                "GET",
 
-        splitquery = urllib.parse._splitquery
+                "/successful_retry",
 
-        self.assertEqual(splitquery('http://python.org/fake?foo=bar'),
+                headers={"test-name": "test_read_retries"},
 
-                         ('http://python.org/fake', 'foo=bar'))
+                retries=retry,
 
-        self.assertEqual(splitquery('http://python.org/fake?foo=bar?'),
+            )
 
-                         ('http://python.org/fake?foo=bar', ''))
+            assert resp.status == 200
 
-        self.assertEqual(splitquery('http://python.org/fake'),
 
-                         ('http://python.org/fake', None))
 
-        self.assertEqual(splitquery('?foo=bar'), ('', 'foo=bar'))
+    def test_read_total_retries(self):
 
+        """ HTTP response w/ status code in the whitelist should be retried """
 
+        with HTTPConnectionPool(self.host, self.port) as pool:
 
-    def test_splittag(self):
+            headers = {"test-name": "test_read_total_retries"}
 
-        splittag = urllib.parse._splittag
+            retry = Retry(total=1, status_forcelist=[418])
 
-        self.assertEqual(splittag('http://example.com?foo=bar#baz'),
+            resp = pool.request(
 
-                         ('http://example.com?foo=bar', 'baz'))
+                "GET", "/successful_retry", headers=headers, retries=retry
 
-        self.assertEqual(splittag('http://example.com?foo=bar#'),
+            )
 
-                         ('http://example.com?foo=bar', ''))
+            assert resp.status == 200
 
-        self.assertEqual(splittag('#baz'), ('', 'baz'))
 
-        self.assertEqual(splittag('http://example.com?foo=bar'),
 
-                         ('http://example.com?foo=bar', None))
+    def test_retries_wrong_whitelist(self):
 
-        self.assertEqual(splittag('http://example.com?foo=bar#baz#boo'),
+        """HTTP response w/ status code not in whitelist shouldn't be retried"""
 
-                         ('http://example.com?foo=bar#baz', 'boo'))
+        with HTTPConnectionPool(self.host, self.port) as pool:
 
+            retry = Retry(total=1, status_forcelist=[202])
 
+            resp = pool.request(
 
-    def test_splitattr(self):
+                "GET",
 
-        splitattr = urllib.parse._splitattr
+                "/successful_retry",
 
-        self.assertEqual(splitattr('/path;attr1=value1;attr2=value2'),
+                headers={"test-name": "test_wrong_whitelist"},
 
-                         ('/path', ['attr1=value1', 'attr2=value2']))
+                retries=retry,
 
-        self.assertEqual(splitattr('/path;'), ('/path', ['']))
+            )
 
-        self.assertEqual(splitattr(';attr1=value1;attr2=value2'),
+            assert resp.status == 418
 
-                         ('', ['attr1=value1', 'attr2=value2']))
 
-        self.assertEqual(splitattr('/path'), ('/path', []))
 
+    def test_default_method_whitelist_retried(self):
 
+        """ urllib3 should retry methods in the default method whitelist """
 
-    def test_splitvalue(self):
+        with HTTPConnectionPool(self.host, self.port) as pool:
 
-        # Normal cases are exercised by other tests; test pathological cases
+            retry = Retry(total=1, status_forcelist=[418])
 
-        # with no key/value pairs. (testcase ensuring coverage)
+            resp = pool.request(
 
-        splitvalue = urllib.parse._splitvalue
+                "OPTIONS",
 
-        self.assertEqual(splitvalue('foo=bar'), ('foo', 'bar'))
+                "/successful_retry",
 
-        self.assertEqual(splitvalue('foo='), ('foo', ''))
+                headers={"test-name": "test_default_whitelist"},
 
-        self.assertEqual(splitvalue('=bar'), ('', 'bar'))
+                retries=retry,
 
-        self.assertEqual(splitvalue('foobar'), ('foobar', None))
+            )
 
-        self.assertEqual(splitvalue('foo=bar=baz'), ('foo', 'bar=baz'))
+            assert resp.status == 200
 
 
 
-    def test_to_bytes(self):
+    def test_retries_wrong_method_list(self):
 
-        result = urllib.parse._to_bytes('http://www.python.org')
+        """Method not in our whitelist should not be retried, even if code matches"""
 
-        self.assertEqual(result, 'http://www.python.org')
+        with HTTPConnectionPool(self.host, self.port) as pool:
 
-        self.assertRaises(UnicodeError, urllib.parse._to_bytes,
+            headers = {"test-name": "test_wrong_method_whitelist"}
 
-                          'http://www.python.org/medi\u00e6val')
+            retry = Retry(total=1, status_forcelist=[418], method_whitelist=["POST"])
 
+            resp = pool.request(
 
+                "GET", "/successful_retry", headers=headers, retries=retry
 
-    def test_unwrap(self):
+            )
 
-        for wrapped_url in ('<URL:scheme://host/path>', '<scheme://host/path>',
+            assert resp.status == 418
 
-                            'URL:scheme://host/path', 'scheme://host/path'):
 
-            url = urllib.parse.unwrap(wrapped_url)
 
-            self.assertEqual(url, 'scheme://host/path')
+    def test_read_retries_unsuccessful(self):
 
+        with HTTPConnectionPool(self.host, self.port) as pool:
 
+            headers = {"test-name": "test_read_retries_unsuccessful"}
 
+            resp = pool.request("GET", "/successful_retry", headers=headers, retries=1)
 
+            assert resp.status == 418
 
-class DeprecationTest(unittest.TestCase):
 
 
+    def test_retry_reuse_safe(self):
 
-    def test_splittype_deprecation(self):
+        """ It should be possible to reuse a Retry object across requests """
 
-        with self.assertWarns(DeprecationWarning) as cm:
+        with HTTPConnectionPool(self.host, self.port) as pool:
 
-            urllib.parse.splittype('')
+            headers = {"test-name": "test_retry_safe"}
 
-        self.assertEqual(str(cm.warning),
+            retry = Retry(total=1, status_forcelist=[418])
 
-                         'urllib.parse.splittype() is deprecated as of 3.8, '
+            resp = pool.request(
 
-                         'use urllib.parse.urlparse() instead')
+                "GET", "/successful_retry", headers=headers, retries=retry
 
+            )
 
+            assert resp.status == 200
 
-    def test_splithost_deprecation(self):
 
-        with self.assertWarns(DeprecationWarning) as cm:
 
-            urllib.parse.splithost('')
+        with HTTPConnectionPool(self.host, self.port) as pool:
 
-        self.assertEqual(str(cm.warning),
+            resp = pool.request(
 
-                         'urllib.parse.splithost() is deprecated as of 3.8, '
+                "GET", "/successful_retry", headers=headers, retries=retry
 
-                         'use urllib.parse.urlparse() instead')
+            )
 
+            assert resp.status == 200
 
 
-    def test_splituser_deprecation(self):
 
-        with self.assertWarns(DeprecationWarning) as cm:
+    def test_retry_return_in_response(self):
 
-            urllib.parse.splituser('')
+        with HTTPConnectionPool(self.host, self.port) as pool:
 
-        self.assertEqual(str(cm.warning),
+            headers = {"test-name": "test_retry_return_in_response"}
 
-                         'urllib.parse.splituser() is deprecated as of 3.8, '
+            retry = Retry(total=2, status_forcelist=[418])
 
-                         'use urllib.parse.urlparse() instead')
+            resp = pool.request(
 
+                "GET", "/successful_retry", headers=headers, retries=retry
 
+            )
 
-    def test_splitpasswd_deprecation(self):
+            assert resp.status == 200
 
-        with self.assertWarns(DeprecationWarning) as cm:
+            assert resp.retries.total == 1
 
-            urllib.parse.splitpasswd('')
+            assert resp.retries.history == (
 
-        self.assertEqual(str(cm.warning),
+                RequestHistory("GET", "/successful_retry", None, 418, None),
 
-                         'urllib.parse.splitpasswd() is deprecated as of 3.8, '
+            )
 
-                         'use urllib.parse.urlparse() instead')
 
 
+    def test_retry_redirect_history(self):
 
-    def test_splitport_deprecation(self):
+        with HTTPConnectionPool(self.host, self.port) as pool:
 
-        with self.assertWarns(DeprecationWarning) as cm:
+            resp = pool.request("GET", "/redirect", fields={"target": "/"})
 
-            urllib.parse.splitport('')
+            assert resp.status == 200
 
-        self.assertEqual(str(cm.warning),
+            assert resp.retries.history == (
 
-                         'urllib.parse.splitport() is deprecated as of 3.8, '
+                RequestHistory("GET", "/redirect?target=%2F", None, 303, "/"),
 
-                         'use urllib.parse.urlparse() instead')
+            )
 
 
 
-    def test_splitnport_deprecation(self):
+    def test_multi_redirect_history(self):
 
-        with self.assertWarns(DeprecationWarning) as cm:
+        with HTTPConnectionPool(self.host, self.port) as pool:
 
-            urllib.parse.splitnport('')
+            r = pool.request(
 
-        self.assertEqual(str(cm.warning),
+                "GET",
 
-                         'urllib.parse.splitnport() is deprecated as of 3.8, '
+                "/multi_redirect",
 
-                         'use urllib.parse.urlparse() instead')
+                fields={"redirect_codes": "303,302,200"},
 
+                redirect=False,
 
+            )
 
-    def test_splitquery_deprecation(self):
+            assert r.status == 303
 
-        with self.assertWarns(DeprecationWarning) as cm:
+            assert r.retries.history == tuple()
 
-            urllib.parse.splitquery('')
 
-        self.assertEqual(str(cm.warning),
 
-                         'urllib.parse.splitquery() is deprecated as of 3.8, '
+        with HTTPConnectionPool(self.host, self.port) as pool:
 
-                         'use urllib.parse.urlparse() instead')
+            r = pool.request(
 
+                "GET",
 
+                "/multi_redirect",
 
-    def test_splittag_deprecation(self):
+                retries=10,
 
-        with self.assertWarns(DeprecationWarning) as cm:
+                fields={"redirect_codes": "303,302,301,307,302,200"},
 
-            urllib.parse.splittag('')
+            )
 
-        self.assertEqual(str(cm.warning),
+            assert r.status == 200
 
-                         'urllib.parse.splittag() is deprecated as of 3.8, '
+            assert r.data == b"Done redirecting"
 
-                         'use urllib.parse.urlparse() instead')
 
 
+            expected = [
 
-    def test_splitattr_deprecation(self):
+                (303, "/multi_redirect?redirect_codes=302,301,307,302,200"),
 
-        with self.assertWarns(DeprecationWarning) as cm:
+                (302, "/multi_redirect?redirect_codes=301,307,302,200"),
 
-            urllib.parse.splitattr('')
+                (301, "/multi_redirect?redirect_codes=307,302,200"),
 
-        self.assertEqual(str(cm.warning),
+                (307, "/multi_redirect?redirect_codes=302,200"),
 
-                         'urllib.parse.splitattr() is deprecated as of 3.8, '
+                (302, "/multi_redirect?redirect_codes=200"),
 
-                         'use urllib.parse.urlparse() instead')
+            ]
 
+            actual = [
 
+                (history.status, history.redirect_location)
 
-    def test_splitvalue_deprecation(self):
+                for history in r.retries.history
 
-        with self.assertWarns(DeprecationWarning) as cm:
+            ]
 
-            urllib.parse.splitvalue('')
+            assert actual == expected
 
-        self.assertEqual(str(cm.warning),
 
-                         'urllib.parse.splitvalue() is deprecated as of 3.8, '
 
-                         'use urllib.parse.parse_qsl() instead')
 
 
+class TestRetryAfter(HTTPDummyServerTestCase):
 
-    def test_to_bytes_deprecation(self):
+    def test_retry_after(self):
 
-        with self.assertWarns(DeprecationWarning) as cm:
+        # Request twice in a second to get a 429 response.
 
-            urllib.parse.to_bytes('')
+        with HTTPConnectionPool(self.host, self.port) as pool:
 
-        self.assertEqual(str(cm.warning),
+            r = pool.request(
 
-                         'urllib.parse.to_bytes() is deprecated as of 3.8')
+                "GET",
 
+                "/retry_after",
 
+                fields={"status": "429 Too Many Requests"},
 
+                retries=False,
 
+            )
 
-if __name__ == "__main__":
+            r = pool.request(
 
-    unittest.main()
+                "GET",
+
+                "/retry_after",
+
+                fields={"status": "429 Too Many Requests"},
+
+                retries=False,
+
+            )
+
+            assert r.status == 429
+
+
+
+            r = pool.request(
+
+                "GET",
+
+                "/retry_after",
+
+                fields={"status": "429 Too Many Requests"},
+
+                retries=True,
+
+            )
+
+            assert r.status == 200
+
+
+
+            # Request twice in a second to get a 503 response.
+
+            r = pool.request(
+
+                "GET",
+
+                "/retry_after",
+
+                fields={"status": "503 Service Unavailable"},
+
+                retries=False,
+
+            )
+
+            r = pool.request(
+
+                "GET",
+
+                "/retry_after",
+
+                fields={"status": "503 Service Unavailable"},
+
+                retries=False,
+
+            )
+
+            assert r.status == 503
+
+
+
+            r = pool.request(
+
+                "GET",
+
+                "/retry_after",
+
+                fields={"status": "503 Service Unavailable"},
+
+                retries=True,
+
+            )
+
+            assert r.status == 200
+
+
+
+            # Ignore Retry-After header on status which is not defined in
+
+            # Retry.RETRY_AFTER_STATUS_CODES.
+
+            r = pool.request(
+
+                "GET",
+
+                "/retry_after",
+
+                fields={"status": "418 I'm a teapot"},
+
+                retries=True,
+
+            )
+
+            assert r.status == 418
+
+
+
+    def test_redirect_after(self):
+
+        with HTTPConnectionPool(self.host, self.port) as pool:
+
+            r = pool.request("GET", "/redirect_after", retries=False)
+
+            assert r.status == 303
+
+
+
+            t = time.time()
+
+            r = pool.request("GET", "/redirect_after")
+
+            assert r.status == 200
+
+            delta = time.time() - t
+
+            assert delta >= 1
+
+
+
+            t = time.time()
+
+            timestamp = t + 2
+
+            r = pool.request("GET", "/redirect_after?date=" + str(timestamp))
+
+            assert r.status == 200
+
+            delta = time.time() - t
+
+            assert delta >= 1
+
+
+
+            # Retry-After is past
+
+            t = time.time()
+
+            timestamp = t - 1
+
+            r = pool.request("GET", "/redirect_after?date=" + str(timestamp))
+
+            delta = time.time() - t
+
+            assert r.status == 200
+
+            assert delta < 1
+
+
+
+
+
+class TestFileBodiesOnRetryOrRedirect(HTTPDummyServerTestCase):
+
+    def test_retries_put_filehandle(self):
+
+        """HTTP PUT retry with a file-like object should not timeout"""
+
+        with HTTPConnectionPool(self.host, self.port, timeout=0.1) as pool:
+
+            retry = Retry(total=3, status_forcelist=[418])
+
+            # httplib reads in 8k chunks; use a larger content length
+
+            content_length = 65535
+
+            data = b"A" * content_length
+
+            uploaded_file = io.BytesIO(data)
+
+            headers = {
+
+                "test-name": "test_retries_put_filehandle",
+
+                "Content-Length": str(content_length),
+
+            }
+
+            resp = pool.urlopen(
+
+                "PUT",
+
+                "/successful_retry",
+
+                headers=headers,
+
+                retries=retry,
+
+                body=uploaded_file,
+
+                assert_same_host=False,
+
+                redirect=False,
+
+            )
+
+            assert resp.status == 200
+
+
+
+    def test_redirect_put_file(self):
+
+        """PUT with file object should work with a redirection response"""
+
+        with HTTPConnectionPool(self.host, self.port, timeout=0.1) as pool:
+
+            retry = Retry(total=3, status_forcelist=[418])
+
+            # httplib reads in 8k chunks; use a larger content length
+
+            content_length = 65535
+
+            data = b"A" * content_length
+
+            uploaded_file = io.BytesIO(data)
+
+            headers = {
+
+                "test-name": "test_redirect_put_file",
+
+                "Content-Length": str(content_length),
+
+            }
+
+            url = "/redirect?target=/echo&status=307"
+
+            resp = pool.urlopen(
+
+                "PUT",
+
+                url,
+
+                headers=headers,
+
+                retries=retry,
+
+                body=uploaded_file,
+
+                assert_same_host=False,
+
+                redirect=True,
+
+            )
+
+            assert resp.status == 200
+
+            assert resp.data == data
+
+
+
+    def test_redirect_with_failed_tell(self):
+
+        """Abort request if failed to get a position from tell()"""
+
+
+
+        class BadTellObject(io.BytesIO):
+
+            def tell(self):
+
+                raise IOError
+
+
+
+        body = BadTellObject(b"the data")
+
+        url = "/redirect?target=/successful_retry"
+
+        # httplib uses fileno if Content-Length isn't supplied,
+
+        # which is unsupported by BytesIO.
+
+        headers = {"Content-Length": "8"}
+
+        with HTTPConnectionPool(self.host, self.port, timeout=0.1) as pool:
+
+            with pytest.raises(UnrewindableBodyError) as e:
+
+                pool.urlopen("PUT", url, headers=headers, body=body)
+
+            assert "Unable to record file position for" in str(e.value)
+
+
+
+
+
+class TestRetryPoolSize(HTTPDummyServerTestCase):
+
+    def test_pool_size_retry(self):
+
+        retries = Retry(total=1, raise_on_status=False, status_forcelist=[404])
+
+        with HTTPConnectionPool(
+
+            self.host, self.port, maxsize=10, retries=retries, block=True
+
+        ) as pool:
+
+            pool.urlopen("GET", "/not_found", preload_content=False)
+
+            assert pool.num_connections == 1
+
+
+
+
+
+class TestRedirectPoolSize(HTTPDummyServerTestCase):
+
+    def test_pool_size_redirect(self):
+
+        retries = Retry(
+
+            total=1, raise_on_status=False, status_forcelist=[404], redirect=True
+
+        )
+
+        with HTTPConnectionPool(
+
+            self.host, self.port, maxsize=10, retries=retries, block=True
+
+        ) as pool:
+
+            pool.urlopen("GET", "/redirect", preload_content=False)
+
+            assert pool.num_connections == 1

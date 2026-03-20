@@ -1,1751 +1,1759 @@
 # Source: CVEFixes dataset
-# Safety: safe
+# Safety: vulnerable
 # Category: safe
 
-# vim: ft=python fileencoding=utf-8 sts=4 sw=4 et:
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
 
 
 
-# Copyright 2016-2020 Florian Bruhin (The Compiler) <mail@qutebrowser.org>
-
-#
-
-# This file is part of qutebrowser.
+# Copyright 2012 OpenStack LLC
 
 #
 
-# qutebrowser is free software: you can redistribute it and/or modify
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
 
-# it under the terms of the GNU General Public License as published by
+# not use this file except in compliance with the License. You may obtain
 
-# the Free Software Foundation, either version 3 of the License, or
-
-# (at your option) any later version.
+# a copy of the License at
 
 #
 
-# qutebrowser is distributed in the hope that it will be useful,
-
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-
-# GNU General Public License for more details.
+#      http://www.apache.org/licenses/LICENSE-2.0
 
 #
 
-# You should have received a copy of the GNU General Public License
+# Unless required by applicable law or agreed to in writing, software
 
-# along with qutebrowser.  If not, see <http://www.gnu.org/licenses/>.
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
+# License for the specific language governing permissions and limitations
 
-"""Wrapper over our (QtWebKit) WebView."""
+# under the License.
 
 
 
-import re
+import uuid
 
-import functools
 
-import xml.etree.ElementTree
 
+import nose.exc
 
 
-from PyQt5.QtCore import pyqtSlot, Qt, QUrl, QPoint, QTimer, QSizeF, QSize
 
-from PyQt5.QtGui import QIcon
+from keystone import test
 
-from PyQt5.QtWebKitWidgets import QWebPage, QWebFrame
 
-from PyQt5.QtWebKit import QWebSettings
 
-from PyQt5.QtPrintSupport import QPrinter
+import default_fixtures
 
 
 
-from qutebrowser.browser import browsertab, shared
+OPENSTACK_REPO = 'https://review.openstack.org/p/openstack'
 
-from qutebrowser.browser.webkit import (webview, tabhistory, webkitelem,
+KEYSTONECLIENT_REPO = '%s/python-keystoneclient.git' % OPENSTACK_REPO
 
-                                        webkitsettings)
 
-from qutebrowser.utils import qtutils, usertypes, utils, log, debug
 
-from qutebrowser.qt import sip
 
 
+class CompatTestCase(test.TestCase):
 
+    def setUp(self):
 
+        super(CompatTestCase, self).setUp()
 
-class WebKitAction(browsertab.AbstractAction):
 
 
+        revdir = test.checkout_vendor(*self.get_checkout())
 
-    """QtWebKit implementations related to web actions."""
+        self.add_path(revdir)
 
+        self.clear_module('keystoneclient')
 
 
-    action_class = QWebPage
 
-    action_base = QWebPage.WebAction
+        self.load_backends()
 
+        self.load_fixtures(default_fixtures)
 
 
-    def exit_fullscreen(self):
 
-        raise browsertab.UnsupportedOperationError
+        self.public_server = self.serveapp('keystone', name='main')
 
+        self.admin_server = self.serveapp('keystone', name='admin')
 
 
-    def save_page(self):
 
-        """Save the current page."""
+        # TODO(termie): is_admin is being deprecated once the policy stuff
 
-        raise browsertab.UnsupportedOperationError
+        #               is all working
 
+        # TODO(termie): add an admin user to the fixtures and use that user
 
+        # override the fixtures, for now
 
-    def show_source(self, pygments=False):
+        self.metadata_foobar = self.identity_api.update_metadata(
 
-        self._show_source_pygments()
+            self.user_foo['id'], self.tenant_bar['id'],
 
+            dict(roles=['keystone_admin'], is_admin='1'))
 
 
 
+    def tearDown(self):
 
-class WebKitPrinting(browsertab.AbstractPrinting):
+        self.public_server.kill()
 
+        self.admin_server.kill()
 
+        self.public_server = None
 
-    """QtWebKit implementations related to printing."""
+        self.admin_server = None
 
+        super(CompatTestCase, self).tearDown()
 
 
-    def check_pdf_support(self):
 
-        pass
+    def _public_url(self):
 
+        public_port = self.public_server.socket_info['socket'][1]
 
+        return "http://localhost:%s/v2.0" % public_port
 
-    def check_printer_support(self):
 
-        pass
 
+    def _admin_url(self):
 
+        admin_port = self.admin_server.socket_info['socket'][1]
 
-    def check_preview_support(self):
+        return "http://localhost:%s/v2.0" % admin_port
 
-        pass
 
 
+    def _client(self, admin=False, **kwargs):
 
-    def to_pdf(self, filename):
+        from keystoneclient.v2_0 import client as ks_client
 
-        printer = QPrinter()
 
-        printer.setOutputFileName(filename)
 
-        self.to_printer(printer)
+        url = self._admin_url() if admin else self._public_url()
 
+        kc = ks_client.Client(endpoint=url,
 
+                              auth_url=self._public_url(),
 
-    def to_printer(self, printer, callback=None):
+                              **kwargs)
 
-        self._widget.print(printer)
+        kc.authenticate()
 
-        # Can't find out whether there was an error...
+        # have to manually overwrite the management url after authentication
 
-        if callback is not None:
+        kc.management_url = url
 
-            callback(True)
+        return kc
 
 
 
+    def get_client(self, user_ref=None, tenant_ref=None, admin=False):
 
+        if user_ref is None:
 
-class WebKitSearch(browsertab.AbstractSearch):
+            user_ref = self.user_foo
 
+        if tenant_ref is None:
 
+            for user in default_fixtures.USERS:
 
-    """QtWebKit implementations related to searching on the page."""
+                if user['id'] == user_ref['id']:
 
-
-
-    def __init__(self, tab, parent=None):
-
-        super().__init__(tab, parent)
-
-        self._flags = QWebPage.FindFlags(0)  # type: ignore
-
-
-
-    def _call_cb(self, callback, found, text, flags, caller):
-
-        """Call the given callback if it's non-None.
-
-
-
-        Delays the call via a QTimer so the website is re-rendered in between.
-
-
-
-        Args:
-
-            callback: What to call
-
-            found: If the text was found
-
-            text: The text searched for
-
-            flags: The flags searched with
-
-            caller: Name of the caller.
-
-        """
-
-        found_text = 'found' if found else "didn't find"
-
-        # Removing FindWrapsAroundDocument to get the same logging as with
-
-        # QtWebEngine
-
-        debug_flags = debug.qflags_key(
-
-            QWebPage, flags & ~QWebPage.FindWrapsAroundDocument,
-
-            klass=QWebPage.FindFlag)
-
-        if debug_flags != '0x0000':
-
-            flag_text = 'with flags {}'.format(debug_flags)
+                    tenant_id = user['tenants'][0]
 
         else:
 
-            flag_text = ''
+            tenant_id = tenant_ref['id']
 
-        log.webview.debug(' '.join([caller, found_text, text, flag_text])
 
-                          .strip())
 
-        if callback is not None:
+        return self._client(username=user_ref['name'],
 
-            QTimer.singleShot(0, functools.partial(callback, found))
+                            password=user_ref['password'],
 
+                            tenant_id=tenant_id,
 
+                            admin=admin)
 
-        self.finished.emit(found)
 
 
 
-    def clear(self):
 
-        if self.search_displayed:
+class KeystoneClientTests(object):
 
-            self.cleared.emit()
+    """Tests for all versions of keystoneclient."""
 
-        self.search_displayed = False
 
-        # We first clear the marked text, then the highlights
 
-        self._widget.findText('')
+    def test_authenticate_tenant_name_and_tenants(self):
 
-        self._widget.findText('', QWebPage.HighlightAllOccurrences)
+        client = self.get_client()
 
+        tenants = client.tenants.list()
 
+        self.assertEquals(tenants[0].id, self.tenant_bar['id'])
 
-    def search(self, text, *, ignore_case=usertypes.IgnoreCase.never,
 
-               reverse=False, wrap=True, result_cb=None):
 
-        # Don't go to next entry on duplicate search
+    def test_authenticate_tenant_id_and_tenants(self):
 
-        if self.text == text and self.search_displayed:
+        client = self._client(username=self.user_foo['name'],
 
-            log.webview.debug("Ignoring duplicate search request"
+                              password=self.user_foo['password'],
 
-                              " for {}".format(text))
+                              tenant_id='bar')
 
-            return
+        tenants = client.tenants.list()
 
+        self.assertEquals(tenants[0].id, self.tenant_bar['id'])
 
 
-        # Clear old search results, this is done automatically on QtWebEngine.
 
-        self.clear()
+    def test_authenticate_invalid_tenant_id(self):
 
+        from keystoneclient import exceptions as client_exceptions
 
+        self.assertRaises(client_exceptions.Unauthorized,
 
-        self.text = text
+                          self._client,
 
-        self.search_displayed = True
+                          username=self.user_foo['name'],
 
-        self._flags = QWebPage.FindFlags(0)  # type: ignore
+                          password=self.user_foo['password'],
 
-        if self._is_case_sensitive(ignore_case):
+                          tenant_id='baz')
 
-            self._flags |= QWebPage.FindCaseSensitively
 
-        if reverse:
 
-            self._flags |= QWebPage.FindBackward
+    def test_authenticate_token_no_tenant(self):
 
-        if wrap:
+        client = self.get_client()
 
-            self._flags |= QWebPage.FindWrapsAroundDocument
+        token = client.auth_token
 
-        # We actually search *twice* - once to highlight everything, then again
+        token_client = self._client(token=token)
 
-        # to get a mark so we can navigate.
+        tenants = token_client.tenants.list()
 
-        found = self._widget.findText(text, self._flags)
+        self.assertEquals(tenants[0].id, self.tenant_bar['id'])
 
-        self._widget.findText(text,
 
-                              self._flags | QWebPage.HighlightAllOccurrences)
 
-        self._call_cb(result_cb, found, text, self._flags, 'search')
+    def test_authenticate_token_tenant_id(self):
 
+        client = self.get_client()
 
+        token = client.auth_token
 
-    def next_result(self, *, result_cb=None):
+        token_client = self._client(token=token, tenant_id='bar')
 
-        self.search_displayed = True
+        tenants = token_client.tenants.list()
 
-        found = self._widget.findText(self.text, self._flags)
+        self.assertEquals(tenants[0].id, self.tenant_bar['id'])
 
-        self._call_cb(result_cb, found, self.text, self._flags, 'next_result')
 
 
+    def test_authenticate_token_invalid_tenant_id(self):
 
-    def prev_result(self, *, result_cb=None):
+        from keystoneclient import exceptions as client_exceptions
 
-        self.search_displayed = True
+        client = self.get_client()
 
-        # The int() here makes sure we get a copy of the flags.
+        token = client.auth_token
 
-        flags = QWebPage.FindFlags(int(self._flags))  # type: ignore
+        self.assertRaises(client_exceptions.AuthorizationFailure,
 
-        if flags & QWebPage.FindBackward:
+                          self._client, token=token, tenant_id='baz')
 
-            flags &= ~QWebPage.FindBackward
 
-        else:
 
-            flags |= QWebPage.FindBackward
+    def test_authenticate_token_tenant_name(self):
 
-        found = self._widget.findText(self.text, flags)
+        client = self.get_client()
 
-        self._call_cb(result_cb, found, self.text, flags, 'prev_result')
+        token = client.auth_token
 
+        token_client = self._client(token=token, tenant_name='BAR')
 
+        tenants = token_client.tenants.list()
 
+        self.assertEquals(tenants[0].id, self.tenant_bar['id'])
 
+        self.assertEquals(tenants[0].id, self.tenant_bar['id'])
 
-class WebKitCaret(browsertab.AbstractCaret):
 
 
+    def test_authenticate_and_delete_token(self):
 
-    """QtWebKit implementations related to moving the cursor/selection."""
+        from keystoneclient import exceptions as client_exceptions
 
 
 
-    @pyqtSlot(usertypes.KeyMode)
+        client = self.get_client(admin=True)
 
-    def _on_mode_entered(self, mode):
+        token = client.auth_token
 
-        if mode != usertypes.KeyMode.caret:
+        token_client = self._client(token=token)
 
-            return
+        tenants = token_client.tenants.list()
 
+        self.assertEquals(tenants[0].id, self.tenant_bar['id'])
 
 
-        self.selection_enabled = self._widget.hasSelection()
 
-        self.selection_toggled.emit(self.selection_enabled)
+        client.tokens.delete(token_client.auth_token)
 
-        settings = self._widget.settings()
 
-        settings.setAttribute(QWebSettings.CaretBrowsingEnabled, True)
 
+        self.assertRaises(client_exceptions.Unauthorized,
 
+                          token_client.tenants.list)
 
-        if self._widget.isVisible():
 
-            # Sometimes the caret isn't immediately visible, but unfocusing
 
-            # and refocusing it fixes that.
+    def test_authenticate_no_password(self):
 
-            self._widget.clearFocus()
+        from keystoneclient import exceptions as client_exceptions
 
-            self._widget.setFocus(Qt.OtherFocusReason)
 
 
+        user_ref = self.user_foo.copy()
 
-            # Move the caret to the first element in the viewport if there
+        user_ref['password'] = None
 
-            # isn't any text which is already selected.
+        self.assertRaises(client_exceptions.AuthorizationFailure,
 
-            #
+                          self.get_client,
 
-            # Note: We can't use hasSelection() here, as that's always
+                          user_ref)
 
-            # true in caret mode.
 
-            if not self.selection_enabled:
 
-                self._widget.page().currentFrame().evaluateJavaScript(
+    def test_authenticate_no_username(self):
 
-                    utils.read_file('javascript/position_caret.js'))
+        from keystoneclient import exceptions as client_exceptions
 
 
 
-    @pyqtSlot(usertypes.KeyMode)
+        user_ref = self.user_foo.copy()
 
-    def _on_mode_left(self, _mode):
+        user_ref['name'] = None
 
-        settings = self._widget.settings()
+        self.assertRaises(client_exceptions.AuthorizationFailure,
 
-        if settings.testAttribute(QWebSettings.CaretBrowsingEnabled):
+                          self.get_client,
 
-            if self.selection_enabled and self._widget.hasSelection():
+                          user_ref)
 
-                # Remove selection if it exists
 
-                self._widget.triggerPageAction(QWebPage.MoveToNextChar)
 
-            settings.setAttribute(QWebSettings.CaretBrowsingEnabled, False)
+    # FIXME(ja): this test should require the "keystone:admin" roled
 
-            self.selection_enabled = False
+    #            (probably the role set via --keystone_admin_role flag)
 
+    # FIXME(ja): add a test that admin endpoint is only sent to admin user
 
+    # FIXME(ja): add a test that admin endpoint returns unauthorized if not
 
-    def move_to_next_line(self, count=1):
+    #            admin
 
-        if not self.selection_enabled:
+    def test_tenant_create_update_and_delete(self):
 
-            act = QWebPage.MoveToNextLine
+        from keystoneclient import exceptions as client_exceptions
 
-        else:
 
-            act = QWebPage.SelectNextLine
 
-        for _ in range(count):
+        tenant_name = 'original_tenant'
 
-            self._widget.triggerPageAction(act)
+        tenant_description = 'My original tenant!'
 
+        tenant_enabled = True
 
+        client = self.get_client(admin=True)
 
-    def move_to_prev_line(self, count=1):
 
-        if not self.selection_enabled:
 
-            act = QWebPage.MoveToPreviousLine
+        # create, get, and list a tenant
 
-        else:
+        tenant = client.tenants.create(tenant_name=tenant_name,
 
-            act = QWebPage.SelectPreviousLine
+                                       description=tenant_description,
 
-        for _ in range(count):
+                                       enabled=tenant_enabled)
 
-            self._widget.triggerPageAction(act)
+        self.assertEquals(tenant.name, tenant_name)
 
+        self.assertEquals(tenant.description, tenant_description)
 
+        self.assertEquals(tenant.enabled, tenant_enabled)
 
-    def move_to_next_char(self, count=1):
 
-        if not self.selection_enabled:
 
-            act = QWebPage.MoveToNextChar
+        tenant = client.tenants.get(tenant_id=tenant.id)
 
-        else:
+        self.assertEquals(tenant.name, tenant_name)
 
-            act = QWebPage.SelectNextChar
+        self.assertEquals(tenant.description, tenant_description)
 
-        for _ in range(count):
+        self.assertEquals(tenant.enabled, tenant_enabled)
 
-            self._widget.triggerPageAction(act)
 
 
+        tenant = [t for t in client.tenants.list() if t.id == tenant.id].pop()
 
-    def move_to_prev_char(self, count=1):
+        self.assertEquals(tenant.name, tenant_name)
 
-        if not self.selection_enabled:
+        self.assertEquals(tenant.description, tenant_description)
 
-            act = QWebPage.MoveToPreviousChar
+        self.assertEquals(tenant.enabled, tenant_enabled)
 
-        else:
 
-            act = QWebPage.SelectPreviousChar
 
-        for _ in range(count):
+        # update, get, and list a tenant
 
-            self._widget.triggerPageAction(act)
+        tenant_name = 'updated_tenant'
 
+        tenant_description = 'Updated tenant!'
 
+        tenant_enabled = False
 
-    def move_to_end_of_word(self, count=1):
+        tenant = client.tenants.update(tenant_id=tenant.id,
 
-        if not self.selection_enabled:
+                                       tenant_name=tenant_name,
 
-            act = [QWebPage.MoveToNextWord]
+                                       enabled=tenant_enabled,
 
-            if utils.is_windows:  # pragma: no cover
+                                       description=tenant_description)
 
-                act.append(QWebPage.MoveToPreviousChar)
+        self.assertEquals(tenant.name, tenant_name)
 
-        else:
+        self.assertEquals(tenant.description, tenant_description)
 
-            act = [QWebPage.SelectNextWord]
+        self.assertEquals(tenant.enabled, tenant_enabled)
 
-            if utils.is_windows:  # pragma: no cover
 
-                act.append(QWebPage.SelectPreviousChar)
 
-        for _ in range(count):
+        tenant = client.tenants.get(tenant_id=tenant.id)
 
-            for a in act:
+        self.assertEquals(tenant.name, tenant_name)
 
-                self._widget.triggerPageAction(a)
+        self.assertEquals(tenant.description, tenant_description)
 
+        self.assertEquals(tenant.enabled, tenant_enabled)
 
 
-    def move_to_next_word(self, count=1):
 
-        if not self.selection_enabled:
+        tenant = [t for t in client.tenants.list() if t.id == tenant.id].pop()
 
-            act = [QWebPage.MoveToNextWord]
+        self.assertEquals(tenant.name, tenant_name)
 
-            if not utils.is_windows:  # pragma: no branch
+        self.assertEquals(tenant.description, tenant_description)
 
-                act.append(QWebPage.MoveToNextChar)
+        self.assertEquals(tenant.enabled, tenant_enabled)
 
-        else:
 
-            act = [QWebPage.SelectNextWord]
 
-            if not utils.is_windows:  # pragma: no branch
+        # delete, get, and list a tenant
 
-                act.append(QWebPage.SelectNextChar)
+        client.tenants.delete(tenant=tenant.id)
 
-        for _ in range(count):
+        self.assertRaises(client_exceptions.NotFound, client.tenants.get,
 
-            for a in act:
+                          tenant.id)
 
-                self._widget.triggerPageAction(a)
+        self.assertFalse([t for t in client.tenants.list()
 
+                           if t.id == tenant.id])
 
 
-    def move_to_prev_word(self, count=1):
 
-        if not self.selection_enabled:
+    def test_tenant_delete_404(self):
 
-            act = QWebPage.MoveToPreviousWord
+        from keystoneclient import exceptions as client_exceptions
 
-        else:
+        client = self.get_client(admin=True)
 
-            act = QWebPage.SelectPreviousWord
+        self.assertRaises(client_exceptions.NotFound,
 
-        for _ in range(count):
+                          client.tenants.delete,
 
-            self._widget.triggerPageAction(act)
+                          tenant=uuid.uuid4().hex)
 
 
 
-    def move_to_start_of_line(self):
+    def test_tenant_get_404(self):
 
-        if not self.selection_enabled:
+        from keystoneclient import exceptions as client_exceptions
 
-            act = QWebPage.MoveToStartOfLine
+        client = self.get_client(admin=True)
 
-        else:
+        self.assertRaises(client_exceptions.NotFound,
 
-            act = QWebPage.SelectStartOfLine
+                          client.tenants.get,
 
-        self._widget.triggerPageAction(act)
+                          tenant_id=uuid.uuid4().hex)
 
 
 
-    def move_to_end_of_line(self):
+    def test_tenant_update_404(self):
 
-        if not self.selection_enabled:
+        from keystoneclient import exceptions as client_exceptions
 
-            act = QWebPage.MoveToEndOfLine
+        client = self.get_client(admin=True)
 
-        else:
+        self.assertRaises(client_exceptions.NotFound,
 
-            act = QWebPage.SelectEndOfLine
+                          client.tenants.update,
 
-        self._widget.triggerPageAction(act)
+                          tenant_id=uuid.uuid4().hex)
 
 
 
-    def move_to_start_of_next_block(self, count=1):
+    def test_tenant_list(self):
 
-        if not self.selection_enabled:
+        client = self.get_client()
 
-            act = [QWebPage.MoveToNextLine,
+        tenants = client.tenants.list()
 
-                   QWebPage.MoveToStartOfBlock]
+        self.assertEquals(len(tenants), 1)
 
-        else:
 
-            act = [QWebPage.SelectNextLine,
 
-                   QWebPage.SelectStartOfBlock]
+        # Admin endpoint should return *all* tenants
 
-        for _ in range(count):
+        client = self.get_client(admin=True)
 
-            for a in act:
+        tenants = client.tenants.list()
 
-                self._widget.triggerPageAction(a)
+        self.assertEquals(len(tenants), len(default_fixtures.TENANTS))
 
 
 
-    def move_to_start_of_prev_block(self, count=1):
+    def test_invalid_password(self):
 
-        if not self.selection_enabled:
+        from keystoneclient import exceptions as client_exceptions
 
-            act = [QWebPage.MoveToPreviousLine,
 
-                   QWebPage.MoveToStartOfBlock]
 
-        else:
+        good_client = self._client(username=self.user_foo['name'],
 
-            act = [QWebPage.SelectPreviousLine,
+                                   password=self.user_foo['password'])
 
-                   QWebPage.SelectStartOfBlock]
+        good_client.tenants.list()
 
-        for _ in range(count):
 
-            for a in act:
 
-                self._widget.triggerPageAction(a)
+        self.assertRaises(client_exceptions.Unauthorized,
 
+                          self._client,
 
+                          username=self.user_foo['name'],
 
-    def move_to_end_of_next_block(self, count=1):
+                          password='invalid')
 
-        if not self.selection_enabled:
 
-            act = [QWebPage.MoveToNextLine,
 
-                   QWebPage.MoveToEndOfBlock]
+    def test_invalid_user_password(self):
 
-        else:
+        from keystoneclient import exceptions as client_exceptions
 
-            act = [QWebPage.SelectNextLine,
 
-                   QWebPage.SelectEndOfBlock]
 
-        for _ in range(count):
+        self.assertRaises(client_exceptions.Unauthorized,
 
-            for a in act:
+                          self._client,
 
-                self._widget.triggerPageAction(a)
+                          username='blah',
 
+                          password='blah')
 
 
-    def move_to_end_of_prev_block(self, count=1):
 
-        if not self.selection_enabled:
+    def test_user_create_update_delete(self):
 
-            act = [QWebPage.MoveToPreviousLine, QWebPage.MoveToEndOfBlock]
+        from keystoneclient import exceptions as client_exceptions
 
-        else:
 
-            act = [QWebPage.SelectPreviousLine, QWebPage.SelectEndOfBlock]
 
-        for _ in range(count):
+        test_username = 'new_user'
 
-            for a in act:
+        client = self.get_client(admin=True)
 
-                self._widget.triggerPageAction(a)
+        user = client.users.create(name=test_username,
 
+                                   password='password',
 
+                                   email='user1@test.com')
 
-    def move_to_start_of_document(self):
+        self.assertEquals(user.name, test_username)
 
-        if not self.selection_enabled:
 
-            act = QWebPage.MoveToStartOfDocument
 
-        else:
+        user = client.users.get(user=user.id)
 
-            act = QWebPage.SelectStartOfDocument
+        self.assertEquals(user.name, test_username)
 
-        self._widget.triggerPageAction(act)
 
 
+        user = client.users.update(user=user,
 
-    def move_to_end_of_document(self):
+                                   name=test_username,
 
-        if not self.selection_enabled:
+                                   email='user2@test.com')
 
-            act = QWebPage.MoveToEndOfDocument
+        self.assertEquals(user.email, 'user2@test.com')
 
-        else:
 
-            act = QWebPage.SelectEndOfDocument
 
-        self._widget.triggerPageAction(act)
+        # NOTE(termie): update_enabled doesn't return anything, probably a bug
 
+        client.users.update_enabled(user=user, enabled=False)
 
+        user = client.users.get(user.id)
 
-    def toggle_selection(self):
+        self.assertFalse(user.enabled)
 
-        self.selection_enabled = not self.selection_enabled
 
-        self.selection_toggled.emit(self.selection_enabled)
 
+        self.assertRaises(client_exceptions.AuthorizationFailure,
 
+                  self._client,
 
-    def drop_selection(self):
+                  username=test_username,
 
-        self._widget.triggerPageAction(QWebPage.MoveToNextChar)
+                  password='password')
 
+        client.users.update_enabled(user, True)
 
 
-    def selection(self, callback):
 
-        callback(self._widget.selectedText())
+        user = client.users.update_password(user=user, password='password2')
 
 
 
-    def reverse_selection(self):
+        self._client(username=test_username,
 
-        self._tab.run_js_async("""{
+                     password='password2')
 
-            const sel = window.getSelection();
 
-            sel.setBaseAndExtent(
 
-                sel.extentNode, sel.extentOffset, sel.baseNode,
+        user = client.users.update_tenant(user=user, tenant='bar')
 
-                sel.baseOffset
+        # TODO(ja): once keystonelight supports default tenant
 
-            );
+        #           when you login without specifying tenant, the
 
-        }""")
+        #           token should be scoped to tenant 'bar'
 
 
 
-    def _follow_selected(self, *, tab=False):
+        client.users.delete(user.id)
 
-        if QWebSettings.globalSettings().testAttribute(
+        self.assertRaises(client_exceptions.NotFound, client.users.get,
 
-                QWebSettings.JavascriptEnabled):
+                          user.id)
 
-            if tab:
 
-                self._tab.data.override_target = usertypes.ClickTarget.tab
 
-            self._tab.run_js_async("""
+        # Test creating a user with a tenant (auto-add to tenant)
 
-                const aElm = document.activeElement;
+        user2 = client.users.create(name=test_username,
 
-                if (window.getSelection().anchorNode) {
+                                    password='password',
 
-                    window.getSelection().anchorNode.parentNode.click();
+                                    email='user1@test.com',
 
-                } else if (aElm && aElm !== document.body) {
+                                    tenant_id='bar')
 
-                    aElm.click();
+        self.assertEquals(user2.name, test_username)
 
-                }
 
-            """)
 
-        else:
+    def test_user_create_404(self):
 
-            selection = self._widget.selectedHtml()
+        from keystoneclient import exceptions as client_exceptions
 
-            if not selection:
+        client = self.get_client(admin=True)
 
-                # Getting here may mean we crashed, but we can't do anything
+        self.assertRaises(client_exceptions.NotFound,
 
-                # about that until this commit is released:
+                          client.users.create,
 
-                # https://github.com/annulen/webkit/commit/0e75f3272d149bc64899c161f150eb341a2417af
+                          name=uuid.uuid4().hex,
 
-                # TODO find a way to check if something is focused
+                          password=uuid.uuid4().hex,
 
-                self._follow_enter(tab)
+                          email=uuid.uuid4().hex,
 
-                return
+                          tenant_id=uuid.uuid4().hex)
 
-            try:
 
-                selected_element = xml.etree.ElementTree.fromstring(
 
-                    '<html>{}</html>'.format(selection)).find('a')
+    def test_user_get_404(self):
 
-            except xml.etree.ElementTree.ParseError:
+        from keystoneclient import exceptions as client_exceptions
 
-                raise browsertab.WebTabError('Could not parse selected '
+        client = self.get_client(admin=True)
 
-                                             'element!')
+        self.assertRaises(client_exceptions.NotFound,
 
+                          client.users.get,
 
+                          user=uuid.uuid4().hex)
 
-            if selected_element is not None:
 
-                try:
 
-                    url = selected_element.attrib['href']
+    def test_user_list_404(self):
 
-                except KeyError:
+        from keystoneclient import exceptions as client_exceptions
 
-                    raise browsertab.WebTabError('Anchor element without '
+        client = self.get_client(admin=True)
 
-                                                 'href!')
+        self.assertRaises(client_exceptions.NotFound,
 
-                url = self._tab.url().resolved(QUrl(url))
+                          client.users.list,
 
-                if tab:
+                          tenant_id=uuid.uuid4().hex)
 
-                    self._tab.new_tab_requested.emit(url)
 
-                else:
 
-                    self._tab.load_url(url)
+    def test_user_update_404(self):
 
+        from keystoneclient import exceptions as client_exceptions
 
+        client = self.get_client(admin=True)
 
-    def follow_selected(self, *, tab=False):
+        self.assertRaises(client_exceptions.NotFound,
 
-        try:
+                          client.users.update,
 
-            self._follow_selected(tab=tab)
+                          user=uuid.uuid4().hex)
 
-        finally:
 
-            self.follow_selected_done.emit()
 
+    def test_user_update_tenant_404(self):
 
+        raise nose.exc.SkipTest('N/A')
 
+        from keystoneclient import exceptions as client_exceptions
 
+        client = self.get_client(admin=True)
 
-class WebKitZoom(browsertab.AbstractZoom):
+        self.assertRaises(client_exceptions.NotFound,
 
+                          client.users.update,
 
+                          user=self.user_foo['id'],
 
-    """QtWebKit implementations related to zooming."""
+                          tenant_id=uuid.uuid4().hex)
 
 
 
-    def _set_factor_internal(self, factor):
+    def test_user_update_password_404(self):
 
-        self._widget.setZoomFactor(factor)
+        from keystoneclient import exceptions as client_exceptions
 
+        client = self.get_client(admin=True)
 
+        self.assertRaises(client_exceptions.NotFound,
 
+                          client.users.update_password,
 
+                          user=uuid.uuid4().hex,
 
-class WebKitScroller(browsertab.AbstractScroller):
+                          password=uuid.uuid4().hex)
 
 
 
-    """QtWebKit implementations related to scrolling."""
+    def test_user_delete_404(self):
 
+        from keystoneclient import exceptions as client_exceptions
 
+        client = self.get_client(admin=True)
 
-    # FIXME:qtwebengine When to use the main frame, when the current one?
+        self.assertRaises(client_exceptions.NotFound,
 
+                          client.users.delete,
 
+                          user=uuid.uuid4().hex)
 
-    def pos_px(self):
 
-        return self._widget.page().mainFrame().scrollPosition()
 
+    def test_user_list(self):
 
+        client = self.get_client(admin=True)
 
-    def pos_perc(self):
+        users = client.users.list()
 
-        return self._widget.scroll_pos
+        self.assertTrue(len(users) > 0)
 
+        user = users[0]
 
+        self.assertRaises(AttributeError, lambda: user.password)
 
-    def to_point(self, point):
 
-        self._widget.page().mainFrame().setScrollPosition(point)
 
+    def test_user_get(self):
 
+        client = self.get_client(admin=True)
 
-    def to_anchor(self, name):
+        user = client.users.get(user=self.user_foo['id'])
 
-        self._widget.page().mainFrame().scrollToAnchor(name)
+        self.assertRaises(AttributeError, lambda: user.password)
 
 
 
-    def delta(self, x: int = 0, y: int = 0) -> None:
+    def test_role_get(self):
 
-        qtutils.check_overflow(x, 'int')
+        client = self.get_client(admin=True)
 
-        qtutils.check_overflow(y, 'int')
+        role = client.roles.get(role='keystone_admin')
 
-        self._widget.page().mainFrame().scroll(x, y)
+        self.assertEquals(role.id, 'keystone_admin')
 
 
 
-    def delta_page(self, x: float = 0.0, y: float = 0.0) -> None:
+    def test_role_crud(self):
 
-        if y.is_integer():
+        from keystoneclient import exceptions as client_exceptions
 
-            y = int(y)
 
-            if y == 0:
 
-                pass
+        test_role = 'new_role'
 
-            elif y < 0:
+        client = self.get_client(admin=True)
 
-                self.page_up(count=-y)
+        role = client.roles.create(name=test_role)
 
-            elif y > 0:
+        self.assertEquals(role.name, test_role)
 
-                self.page_down(count=y)
 
-            y = 0
 
-        if x == 0 and y == 0:
+        role = client.roles.get(role=role.id)
 
-            return
+        self.assertEquals(role.name, test_role)
 
-        size = self._widget.page().mainFrame().geometry()
 
-        self.delta(int(x * size.width()), int(y * size.height()))
 
+        client.roles.delete(role=role.id)
 
 
-    def to_perc(self, x=None, y=None):
 
-        if x is None and y == 0:
+        self.assertRaises(client_exceptions.NotFound,
 
-            self.top()
+                          client.roles.delete,
 
-        elif x is None and y == 100:
+                          role=role.id)
 
-            self.bottom()
+        self.assertRaises(client_exceptions.NotFound,
 
-        else:
+                          client.roles.get,
 
-            for val, orientation in [(x, Qt.Horizontal), (y, Qt.Vertical)]:
+                          role=role.id)
 
-                if val is not None:
 
-                    frame = self._widget.page().mainFrame()
 
-                    maximum = frame.scrollBarMaximum(orientation)
+    def test_role_get_404(self):
 
-                    if maximum == 0:
+        from keystoneclient import exceptions as client_exceptions
 
-                        continue
+        client = self.get_client(admin=True)
 
-                    pos = int(maximum * val / 100)
+        self.assertRaises(client_exceptions.NotFound,
 
-                    pos = qtutils.check_overflow(pos, 'int', fatal=False)
+                          client.roles.get,
 
-                    frame.setScrollBarValue(orientation, pos)
+                          role=uuid.uuid4().hex)
 
 
 
-    def _key_press(self, key, count=1, getter_name=None, direction=None):
+    def test_role_delete_404(self):
 
-        frame = self._widget.page().mainFrame()
+        from keystoneclient import exceptions as client_exceptions
 
-        getter = None if getter_name is None else getattr(frame, getter_name)
+        client = self.get_client(admin=True)
 
+        self.assertRaises(client_exceptions.NotFound,
 
+                          client.roles.delete,
 
-        # FIXME:qtwebengine needed?
+                          role=uuid.uuid4().hex)
 
-        # self._widget.setFocus()
 
 
+    def test_role_list_404(self):
 
-        for _ in range(min(count, 5000)):
+        from keystoneclient import exceptions as client_exceptions
 
-            # Abort scrolling if the minimum/maximum was reached.
+        client = self.get_client(admin=True)
 
-            if (getter is not None and
+        self.assertRaises(client_exceptions.NotFound,
 
-                    frame.scrollBarValue(direction) == getter(direction)):
+                          client.roles.roles_for_user,
 
-                return
+                          user=uuid.uuid4().hex,
 
-            self._tab.fake_key_press(key)
+                          tenant=uuid.uuid4().hex)
 
+        self.assertRaises(client_exceptions.NotFound,
 
+                          client.roles.roles_for_user,
 
-    def up(self, count=1):
+                          user=self.user_foo['id'],
 
-        self._key_press(Qt.Key_Up, count, 'scrollBarMinimum', Qt.Vertical)
+                          tenant=uuid.uuid4().hex)
 
+        self.assertRaises(client_exceptions.NotFound,
 
+                          client.roles.roles_for_user,
 
-    def down(self, count=1):
+                          user=uuid.uuid4().hex,
 
-        self._key_press(Qt.Key_Down, count, 'scrollBarMaximum', Qt.Vertical)
+                          tenant=self.tenant_bar['id'])
 
 
 
-    def left(self, count=1):
+    def test_role_list(self):
 
-        self._key_press(Qt.Key_Left, count, 'scrollBarMinimum', Qt.Horizontal)
+        client = self.get_client(admin=True)
 
+        roles = client.roles.list()
 
+        # TODO(devcamcar): This assert should be more specific.
 
-    def right(self, count=1):
+        self.assertTrue(len(roles) > 0)
 
-        self._key_press(Qt.Key_Right, count, 'scrollBarMaximum', Qt.Horizontal)
 
 
+    def test_ec2_credential_crud(self):
 
-    def top(self):
+        client = self.get_client()
 
-        self._key_press(Qt.Key_Home)
+        creds = client.ec2.list(user_id=self.user_foo['id'])
 
+        self.assertEquals(creds, [])
 
 
-    def bottom(self):
 
-        self._key_press(Qt.Key_End)
+        cred = client.ec2.create(user_id=self.user_foo['id'],
 
+                                 tenant_id=self.tenant_bar['id'])
 
+        creds = client.ec2.list(user_id=self.user_foo['id'])
 
-    def page_up(self, count=1):
+        self.assertEquals(creds, [cred])
 
-        self._key_press(Qt.Key_PageUp, count, 'scrollBarMinimum', Qt.Vertical)
 
 
+        got = client.ec2.get(user_id=self.user_foo['id'], access=cred.access)
 
-    def page_down(self, count=1):
+        self.assertEquals(cred, got)
 
-        self._key_press(Qt.Key_PageDown, count, 'scrollBarMaximum',
 
-                        Qt.Vertical)
 
+        client.ec2.delete(user_id=self.user_foo['id'], access=cred.access)
 
+        creds = client.ec2.list(user_id=self.user_foo['id'])
 
-    def at_top(self):
+        self.assertEquals(creds, [])
 
-        return self.pos_px().y() == 0
 
 
+    def test_ec2_credentials_create_404(self):
 
-    def at_bottom(self):
+        from keystoneclient import exceptions as client_exceptions
 
-        frame = self._widget.page().currentFrame()
+        client = self.get_client()
 
-        return self.pos_px().y() >= frame.scrollBarMaximum(Qt.Vertical)
+        self.assertRaises(client_exceptions.NotFound,
 
+                          client.ec2.create,
 
+                          user_id=uuid.uuid4().hex,
 
+                          tenant_id=self.tenant_bar['id'])
 
+        self.assertRaises(client_exceptions.NotFound,
 
-class WebKitHistoryPrivate(browsertab.AbstractHistoryPrivate):
+                          client.ec2.create,
 
+                          user_id=self.user_foo['id'],
 
+                          tenant_id=uuid.uuid4().hex)
 
-    """History-related methods which are not part of the extension API."""
 
 
+    def test_ec2_credentials_delete_404(self):
 
-    def serialize(self):
+        from keystoneclient import exceptions as client_exceptions
 
-        return qtutils.serialize(self._history)
+        client = self.get_client()
 
+        self.assertRaises(client_exceptions.NotFound,
 
+                          client.ec2.delete,
 
-    def deserialize(self, data):
+                          user_id=uuid.uuid4().hex,
 
-        qtutils.deserialize(data, self._history)
+                          access=uuid.uuid4().hex)
 
 
 
-    def load_items(self, items):
+    def test_ec2_credentials_get_404(self):
 
-        if items:
+        from keystoneclient import exceptions as client_exceptions
 
-            self._tab.before_load_started.emit(items[-1].url)
+        client = self.get_client()
 
+        self.assertRaises(client_exceptions.NotFound,
 
+                          client.ec2.get,
 
-        stream, _data, user_data = tabhistory.serialize(items)
+                          user_id=uuid.uuid4().hex,
 
-        qtutils.deserialize_stream(stream, self._history)
+                          access=uuid.uuid4().hex)
 
-        for i, data in enumerate(user_data):
 
-            self._history.itemAt(i).setUserData(data)
 
-        cur_data = self._history.currentItem().userData()
+    def test_ec2_credentials_list_404(self):
 
-        if cur_data is not None:
+        from keystoneclient import exceptions as client_exceptions
 
-            if 'zoom' in cur_data:
+        client = self.get_client()
 
-                self._tab.zoom.set_factor(cur_data['zoom'])
+        self.assertRaises(client_exceptions.NotFound,
 
-            if ('scroll-pos' in cur_data and
+                          client.ec2.list,
 
-                    self._tab.scroller.pos_px() == QPoint(0, 0)):
+                          user_id=uuid.uuid4().hex)
 
-                QTimer.singleShot(0, functools.partial(
 
-                    self._tab.scroller.to_point, cur_data['scroll-pos']))
 
+    def test_ec2_credentials_list_user_forbidden(self):
 
+        from keystoneclient import exceptions as client_exceptions
 
 
 
-class WebKitHistory(browsertab.AbstractHistory):
+        two = self.get_client(self.user_two)
 
+        self.assertRaises(client_exceptions.Forbidden, two.ec2.list,
 
+                          user_id=self.user_foo['id'])
 
-    """QtWebKit implementations related to page history."""
 
 
+    def test_ec2_credentials_get_user_forbidden(self):
 
-    def __init__(self, tab):
+        from keystoneclient import exceptions as client_exceptions
 
-        super().__init__(tab)
 
-        self.private_api = WebKitHistoryPrivate(tab)
 
+        foo = self.get_client()
 
+        cred = foo.ec2.create(user_id=self.user_foo['id'],
 
-    def __len__(self):
+                              tenant_id=self.tenant_bar['id'])
 
-        return len(self._history)
 
 
+        two = self.get_client(self.user_two)
 
-    def __iter__(self):
+        self.assertRaises(client_exceptions.Forbidden, two.ec2.get,
 
-        return iter(self._history.items())
+                          user_id=self.user_foo['id'], access=cred.access)
 
 
 
-    def current_idx(self):
+        foo.ec2.delete(user_id=self.user_foo['id'], access=cred.access)
 
-        return self._history.currentItemIndex()
 
 
+    def test_ec2_credentials_delete_user_forbidden(self):
 
-    def can_go_back(self):
+        from keystoneclient import exceptions as client_exceptions
 
-        return self._history.canGoBack()
 
 
+        foo = self.get_client()
 
-    def can_go_forward(self):
+        cred = foo.ec2.create(user_id=self.user_foo['id'],
 
-        return self._history.canGoForward()
+                              tenant_id=self.tenant_bar['id'])
 
 
 
-    def _item_at(self, i):
+        two = self.get_client(self.user_two)
 
-        return self._history.itemAt(i)
+        self.assertRaises(client_exceptions.Forbidden, two.ec2.delete,
 
+                          user_id=self.user_foo['id'], access=cred.access)
 
 
-    def _go_to_item(self, item):
 
-        self._tab.before_load_started.emit(item.url())
+        foo.ec2.delete(user_id=self.user_foo['id'], access=cred.access)
 
-        self._history.goToItem(item)
 
 
+    def test_service_create_and_delete(self):
 
+        from keystoneclient import exceptions as client_exceptions
 
 
-class WebKitElements(browsertab.AbstractElements):
 
+        test_service = 'new_service'
 
+        client = self.get_client(admin=True)
 
-    """QtWebKit implemementations related to elements on the page."""
+        service = client.services.create(name=test_service,
 
+                                         service_type='test',
 
+                                         description='test')
 
-    def find_css(self, selector, callback, error_cb, *, only_visible=False):
+        self.assertEquals(service.name, test_service)
 
-        utils.unused(error_cb)
 
-        mainframe = self._widget.page().mainFrame()
 
-        if mainframe is None:
+        service = client.services.get(id=service.id)
 
-            raise browsertab.WebTabError("No frame focused!")
+        self.assertEquals(service.name, test_service)
 
 
 
-        elems = []
+        client.services.delete(id=service.id)
 
-        frames = webkitelem.get_child_frames(mainframe)
+        self.assertRaises(client_exceptions.NotFound, client.services.get,
 
-        for f in frames:
+                          id=service.id)
 
-            for elem in f.findAllElements(selector):
 
-                elems.append(webkitelem.WebKitElement(elem, tab=self._tab))
 
+    def test_service_list(self):
 
+        client = self.get_client(admin=True)
 
-        if only_visible:
+        test_service = 'new_service'
 
-            # pylint: disable=protected-access
+        service = client.services.create(name=test_service,
 
-            elems = [e for e in elems if e._is_visible(mainframe)]
+                                         service_type='test',
 
-            # pylint: enable=protected-access
+                                         description='test')
 
+        services = client.services.list()
 
+        # TODO(devcamcar): This assert should be more specific.
 
-        callback(elems)
+        self.assertTrue(len(services) > 0)
 
 
 
-    def find_id(self, elem_id, callback):
+    def test_service_delete_404(self):
 
-        def find_id_cb(elems):
+        from keystoneclient import exceptions as client_exceptions
 
-            """Call the real callback with the found elements."""
+        client = self.get_client(admin=True)
 
-            if not elems:
+        self.assertRaises(client_exceptions.NotFound,
 
-                callback(None)
+                          client.services.delete,
 
-            else:
+                          id=uuid.uuid4().hex)
 
-                callback(elems[0])
 
 
+    def test_service_get_404(self):
 
-        # Escape non-alphanumeric characters in the selector
+        from keystoneclient import exceptions as client_exceptions
 
-        # https://www.w3.org/TR/CSS2/syndata.html#value-def-identifier
+        client = self.get_client(admin=True)
 
-        elem_id = re.sub(r'[^a-zA-Z0-9_-]', r'\\\g<0>', elem_id)
+        self.assertRaises(client_exceptions.NotFound,
 
-        self.find_css('#' + elem_id, find_id_cb, error_cb=lambda exc: None)
+                          client.services.get,
 
+                          id=uuid.uuid4().hex)
 
 
-    def find_focused(self, callback):
 
-        frame = self._widget.page().currentFrame()
+    def test_endpoint_create_404(self):
 
-        if frame is None:
+        from keystoneclient import exceptions as client_exceptions
 
-            callback(None)
+        client = self.get_client(admin=True)
 
-            return
+        self.assertRaises(client_exceptions.NotFound,
 
+                          client.endpoints.create,
 
+                          region=uuid.uuid4().hex,
 
-        elem = frame.findFirstElement('*:focus')
+                          service_id=uuid.uuid4().hex,
 
-        if elem.isNull():
+                          publicurl=uuid.uuid4().hex,
 
-            callback(None)
+                          adminurl=uuid.uuid4().hex,
 
-        else:
+                          internalurl=uuid.uuid4().hex)
 
-            callback(webkitelem.WebKitElement(elem, tab=self._tab))
 
 
+    def test_endpoint_delete_404(self):
 
-    def find_at_pos(self, pos, callback):
+        # the catalog backend is expected to return Not Implemented
 
-        assert pos.x() >= 0
+        from keystoneclient import exceptions as client_exceptions
 
-        assert pos.y() >= 0
+        client = self.get_client(admin=True)
 
-        frame = self._widget.page().frameAt(pos)
+        self.assertRaises(client_exceptions.HTTPNotImplemented,
 
-        if frame is None:
+                          client.endpoints.delete,
 
-            # This happens when we click inside the webview, but not actually
+                          id=uuid.uuid4().hex)
 
-            # on the QWebPage - for example when clicking the scrollbar
 
-            # sometimes.
 
-            log.webview.debug("Hit test at {} but frame is None!".format(pos))
+    def test_admin_requires_adminness(self):
 
-            callback(None)
+        from keystoneclient import exceptions as client_exceptions
 
-            return
+        # FIXME(ja): this should be Unauthorized
 
+        exception = client_exceptions.ClientException
 
 
-        # You'd think we have to subtract frame.geometry().topLeft() from the
 
-        # position, but it seems QWebFrame::hitTestContent wants a position
+        two = self.get_client(self.user_two, admin=True)  # non-admin user
 
-        # relative to the QWebView, not to the frame. This makes no sense to
 
-        # me, but it works this way.
 
-        hitresult = frame.hitTestContent(pos)
+        # USER CRUD
 
-        if hitresult.isNull():
+        self.assertRaises(exception,
 
-            # For some reason, the whole hit result can be null sometimes (e.g.
+                          two.users.list)
 
-            # on doodle menu links).
+        self.assertRaises(exception,
 
-            log.webview.debug("Hit test result is null!")
+                          two.users.get,
 
-            callback(None)
+                          user=self.user_two['id'])
 
-            return
+        self.assertRaises(exception,
 
+                          two.users.create,
 
+                          name='oops',
 
-        try:
+                          password='password',
 
-            elem = webkitelem.WebKitElement(hitresult.element(), tab=self._tab)
+                          email='oops@test.com')
 
-        except webkitelem.IsNullError:
+        self.assertRaises(exception,
 
-            # For some reason, the hit result element can be a null element
+                          two.users.delete,
 
-            # sometimes (e.g. when clicking the timetable fields on
+                          user=self.user_foo['id'])
 
-            # http://www.sbb.ch/ ).
 
-            log.webview.debug("Hit test result element is null!")
 
-            callback(None)
+        # TENANT CRUD
 
-            return
+        self.assertRaises(exception,
 
+                          two.tenants.list)
 
+        self.assertRaises(exception,
 
-        callback(elem)
+                          two.tenants.get,
 
+                          tenant_id=self.tenant_bar['id'])
 
+        self.assertRaises(exception,
 
+                          two.tenants.create,
 
+                          tenant_name='oops',
 
-class WebKitAudio(browsertab.AbstractAudio):
+                          description="shouldn't work!",
 
+                          enabled=True)
 
+        self.assertRaises(exception,
 
-    """Dummy handling of audio status for QtWebKit."""
+                          two.tenants.delete,
 
+                          tenant=self.tenant_baz['id'])
 
 
-    def set_muted(self, muted: bool, override: bool = False) -> None:
 
-        raise browsertab.WebTabError('Muting is not supported on QtWebKit!')
+        # ROLE CRUD
 
+        self.assertRaises(exception,
 
+                          two.roles.get,
 
-    def is_muted(self):
+                          role='keystone_admin')
 
-        return False
+        self.assertRaises(exception,
 
+                          two.roles.list)
 
+        self.assertRaises(exception,
 
-    def is_recently_audible(self):
+                          two.roles.create,
 
-        return False
+                          name='oops')
 
+        self.assertRaises(exception,
 
+                          two.roles.delete,
 
+                          role='keystone_admin')
 
 
-class WebKitTabPrivate(browsertab.AbstractTabPrivate):
 
+        # TODO(ja): MEMBERSHIP CRUD
 
+        # TODO(ja): determine what else todo
 
-    """QtWebKit-related methods which aren't part of the public API."""
 
 
 
-    def networkaccessmanager(self):
 
-        return self._widget.page().networkAccessManager()
+class KcMasterTestCase(CompatTestCase, KeystoneClientTests):
 
+    def get_checkout(self):
 
+        return KEYSTONECLIENT_REPO, 'master'
 
-    def clear_ssl_errors(self):
 
-        self.networkaccessmanager().clear_all_ssl_errors()
 
+    def test_tenant_add_and_remove_user(self):
 
+        client = self.get_client(admin=True)
 
-    def event_target(self):
+        client.roles.add_user_role(tenant=self.tenant_baz['id'],
 
-        return self._widget
+                                   user=self.user_foo['id'],
 
+                                   role=self.role_useless['id'])
 
+        user_refs = client.tenants.list_users(tenant=self.tenant_baz['id'])
 
-    def shutdown(self):
+        self.assert_(self.user_foo['id'] in [x.id for x in user_refs])
 
-        self._widget.shutdown()
+        client.roles.remove_user_role(tenant=self.tenant_baz['id'],
 
+                                      user=self.user_foo['id'],
 
+                                      role=self.role_useless['id'])
 
+        user_refs = client.tenants.list_users(tenant=self.tenant_baz['id'])
 
+        self.assert_(self.user_foo['id'] not in [x.id for x in user_refs])
 
-class WebKitTab(browsertab.AbstractTab):
 
 
+    def test_user_role_add_404(self):
 
-    """A QtWebKit tab in the browser."""
+        from keystoneclient import exceptions as client_exceptions
 
+        client = self.get_client(admin=True)
 
+        self.assertRaises(client_exceptions.NotFound,
 
-    def __init__(self, *, win_id, mode_manager, private, parent=None):
+                          client.roles.add_user_role,
 
-        super().__init__(win_id=win_id, private=private, parent=parent)
+                          tenant=uuid.uuid4().hex,
 
-        widget = webview.WebView(win_id=win_id, tab_id=self.tab_id,
+                          user=self.user_foo['id'],
 
-                                 private=private, tab=self)
+                          role=self.role_useless['id'])
 
-        if private:
+        self.assertRaises(client_exceptions.NotFound,
 
-            self._make_private(widget)
+                          client.roles.add_user_role,
 
-        self.history = WebKitHistory(tab=self)
+                          tenant=self.tenant_baz['id'],
 
-        self.scroller = WebKitScroller(tab=self, parent=self)
+                          user=uuid.uuid4().hex,
 
-        self.caret = WebKitCaret(mode_manager=mode_manager,
+                          role=self.role_useless['id'])
 
-                                 tab=self, parent=self)
+        self.assertRaises(client_exceptions.NotFound,
 
-        self.zoom = WebKitZoom(tab=self, parent=self)
+                          client.roles.add_user_role,
 
-        self.search = WebKitSearch(tab=self, parent=self)
+                          tenant=self.tenant_baz['id'],
 
-        self.printing = WebKitPrinting(tab=self)
+                          user=self.user_foo['id'],
 
-        self.elements = WebKitElements(tab=self)
+                          role=uuid.uuid4().hex)
 
-        self.action = WebKitAction(tab=self)
 
-        self.audio = WebKitAudio(tab=self, parent=self)
 
-        self.private_api = WebKitTabPrivate(mode_manager=mode_manager,
+    def test_user_role_remove_404(self):
 
-                                            tab=self)
+        from keystoneclient import exceptions as client_exceptions
 
-        # We're assigning settings in _set_widget
+        client = self.get_client(admin=True)
 
-        self.settings = webkitsettings.WebKitSettings(settings=None)
+        self.assertRaises(client_exceptions.NotFound,
 
-        self._set_widget(widget)
+                          client.roles.remove_user_role,
 
-        self._connect_signals()
+                          tenant=uuid.uuid4().hex,
 
-        self.backend = usertypes.Backend.QtWebKit
+                          user=self.user_foo['id'],
 
+                          role=self.role_useless['id'])
 
+        self.assertRaises(client_exceptions.NotFound,
 
-    def _install_event_filter(self):
+                          client.roles.remove_user_role,
 
-        self._widget.installEventFilter(self._tab_event_filter)
+                          tenant=self.tenant_baz['id'],
 
+                          user=uuid.uuid4().hex,
 
+                          role=self.role_useless['id'])
 
-    def _make_private(self, widget):
+        self.assertRaises(client_exceptions.NotFound,
 
-        settings = widget.settings()
+                          client.roles.remove_user_role,
 
-        settings.setAttribute(QWebSettings.PrivateBrowsingEnabled, True)
+                          tenant=self.tenant_baz['id'],
 
+                          user=self.user_foo['id'],
 
+                          role=uuid.uuid4().hex)
 
-    def load_url(self, url, *, emit_before_load_started=True):
+        self.assertRaises(client_exceptions.NotFound,
 
-        self._load_url_prepare(
+                          client.roles.remove_user_role,
 
-            url, emit_before_load_started=emit_before_load_started)
+                          tenant=self.tenant_baz['id'],
 
-        self._widget.load(url)
+                          user=self.user_foo['id'],
 
+                          role=self.role_useless['id'])
 
 
-    def url(self, *, requested=False):
 
-        frame = self._widget.page().mainFrame()
+    def test_tenant_list_marker(self):
 
-        if requested:
+        client = self.get_client()
 
-            return frame.requestedUrl()
 
-        else:
 
-            return frame.url()
+        # Add two arbitrary tenants to user for testing purposes
 
+        for i in range(2):
 
+            tenant_id = uuid.uuid4().hex
 
-    def dump_async(self, callback, *, plain=False):
+            tenant = {'name': 'tenant-%s' % tenant_id, 'id': tenant_id}
 
-        frame = self._widget.page().mainFrame()
+            self.identity_api.create_tenant(tenant_id, tenant)
 
-        if plain:
+            self.identity_api.add_user_to_tenant(tenant_id,
 
-            callback(frame.toPlainText())
+                                                 self.user_foo['id'])
 
-        else:
 
-            callback(frame.toHtml())
 
+        tenants = client.tenants.list()
 
+        self.assertEqual(len(tenants), 3)
 
-    def run_js_async(self, code, callback=None, *, world=None):
 
-        if world is not None and world != usertypes.JsWorld.jseval:
 
-            log.webview.warning("Ignoring world ID {}".format(world))
+        tenants_marker = client.tenants.list(marker=tenants[0].id)
 
-        document_element = self._widget.page().mainFrame().documentElement()
+        self.assertEqual(len(tenants_marker), 2)
 
-        result = document_element.evaluateJavaScript(code)
+        self.assertEqual(tenants[1].name, tenants_marker[0].name)
 
-        if callback is not None:
+        self.assertEqual(tenants[2].name, tenants_marker[1].name)
 
-            callback(result)
 
 
+    def test_tenant_list_marker_not_found(self):
 
-    def icon(self):
+        from keystoneclient import exceptions as client_exceptions
 
-        return self._widget.icon()
 
 
+        client = self.get_client()
 
-    def reload(self, *, force=False):
+        self.assertRaises(client_exceptions.BadRequest,
 
-        if force:
+                          client.tenants.list, marker=uuid.uuid4().hex)
 
-            action = QWebPage.ReloadAndBypassCache
 
-        else:
 
-            action = QWebPage.Reload
+    def test_tenant_list_limit(self):
 
-        self._widget.triggerPageAction(action)
+        client = self.get_client()
 
 
 
-    def stop(self):
+        # Add two arbitrary tenants to user for testing purposes
 
-        self._widget.stop()
+        for i in range(2):
 
+            tenant_id = uuid.uuid4().hex
 
+            tenant = {'name': 'tenant-%s' % tenant_id, 'id': tenant_id}
 
-    def title(self):
+            self.identity_api.create_tenant(tenant_id, tenant)
 
-        return self._widget.title()
+            self.identity_api.add_user_to_tenant(tenant_id,
 
+                                                 self.user_foo['id'])
 
 
-    @pyqtSlot()
 
-    def _on_history_trigger(self):
+        tenants = client.tenants.list()
 
-        url = self.url()
+        self.assertEqual(len(tenants), 3)
 
-        requested_url = self.url(requested=True)
 
-        self.history_item_triggered.emit(url, requested_url, self.title())
 
+        tenants_limited = client.tenants.list(limit=2)
 
+        self.assertEqual(len(tenants_limited), 2)
 
-    def set_html(self, html, base_url=QUrl()):
+        self.assertEqual(tenants[0].name, tenants_limited[0].name)
 
-        self._widget.setHtml(html, base_url)
+        self.assertEqual(tenants[1].name, tenants_limited[1].name)
 
 
 
-    @pyqtSlot()
+    def test_tenant_list_limit_bad_value(self):
 
-    def _on_load_started(self):
+        from keystoneclient import exceptions as client_exceptions
 
-        super()._on_load_started()
 
-        nam = self._widget.page().networkAccessManager()
 
-        nam.netrc_used = False
+        client = self.get_client()
 
-        # Make sure the icon is cleared when navigating to a page without one.
+        self.assertRaises(client_exceptions.BadRequest,
 
-        self.icon_changed.emit(QIcon())
+                          client.tenants.list, limit='a')
 
+        self.assertRaises(client_exceptions.BadRequest,
 
+                          client.tenants.list, limit=-1)
 
-    @pyqtSlot(bool)
 
-    def _on_load_finished(self, ok: bool) -> None:
 
-        super()._on_load_finished(ok)
+    def test_roles_get_by_user(self):
 
-        self._update_load_status(ok)
+        client = self.get_client(admin=True)
 
+        roles = client.roles.roles_for_user(user=self.user_foo['id'],
 
+                                            tenant=self.tenant_bar['id'])
 
-    @pyqtSlot()
+        self.assertTrue(len(roles) > 0)
 
-    def _on_frame_load_finished(self):
 
-        """Make sure we emit an appropriate status when loading finished.
 
 
 
-        While Qt has a bool "ok" attribute for loadFinished, it always is True
+class KcEssex3TestCase(CompatTestCase, KeystoneClientTests):
 
-        when using error pages... See
+    def get_checkout(self):
 
-        https://github.com/qutebrowser/qutebrowser/issues/84
+        return KEYSTONECLIENT_REPO, 'essex-3'
 
-        """
 
-        self._on_load_finished(not self._widget.page().error_occurred)
 
+    def test_tenant_add_and_remove_user(self):
 
+        client = self.get_client(admin=True)
 
-    @pyqtSlot()
+        client.roles.add_user_to_tenant(tenant_id=self.tenant_baz['id'],
 
-    def _on_webkit_icon_changed(self):
+                                        user_id=self.user_foo['id'],
 
-        """Emit iconChanged with a QIcon like QWebEngineView does."""
+                                        role_id=self.role_useless['id'])
 
-        if sip.isdeleted(self._widget):
+        role_refs = client.roles.get_user_role_refs(
 
-            log.webview.debug("Got _on_webkit_icon_changed for deleted view!")
+                user_id=self.user_foo['id'])
 
-            return
+        self.assert_(self.tenant_baz['id'] in [x.tenantId for x in role_refs])
 
-        self.icon_changed.emit(self._widget.icon())
 
 
+        # get the "role_refs" so we get the proper id, this is how the clients
 
-    @pyqtSlot(QWebFrame)
+        # do it
 
-    def _on_frame_created(self, frame):
+        roleref_refs = client.roles.get_user_role_refs(
 
-        """Connect the contentsSizeChanged signal of each frame."""
+                user_id=self.user_foo['id'])
 
-        # FIXME:qtwebengine those could theoretically regress:
+        for roleref_ref in roleref_refs:
 
-        # https://github.com/qutebrowser/qutebrowser/issues/152
+            if (roleref_ref.roleId == self.role_useless['id']
 
-        # https://github.com/qutebrowser/qutebrowser/issues/263
+                and roleref_ref.tenantId == self.tenant_baz['id']):
 
-        frame.contentsSizeChanged.connect(self._on_contents_size_changed)
+                # use python's scope fall through to leave roleref_ref set
 
+                break
 
 
-    @pyqtSlot(QSize)
 
-    def _on_contents_size_changed(self, size):
+        client.roles.remove_user_from_tenant(tenant_id=self.tenant_baz['id'],
 
-        self.contents_size_changed.emit(QSizeF(size))
+                                             user_id=self.user_foo['id'],
 
+                                             role_id=roleref_ref.id)
 
 
-    @pyqtSlot(usertypes.NavigationRequest)
 
-    def _on_navigation_request(self, navigation):
+        role_refs = client.roles.get_user_role_refs(
 
-        super()._on_navigation_request(navigation)
+                user_id=self.user_foo['id'])
 
-        if not navigation.accepted:
+        self.assert_(self.tenant_baz['id'] not in
 
-            return
+                     [x.tenantId for x in role_refs])
 
 
 
-        log.webview.debug("target {} override {}".format(
+    def test_roles_get_by_user(self):
 
-            self.data.open_target, self.data.override_target))
+        client = self.get_client(admin=True)
 
+        roles = client.roles.get_user_role_refs(user_id='foo')
 
+        self.assertTrue(len(roles) > 0)
 
-        if self.data.override_target is not None:
 
-            target = self.data.override_target
 
-            self.data.override_target = None
+    def test_role_list_404(self):
 
-        else:
+        raise nose.exc.SkipTest('N/A')
 
-            target = self.data.open_target
 
 
+    def test_authenticate_and_delete_token(self):
 
-        if (navigation.navigation_type == navigation.Type.link_clicked and
+        raise nose.exc.SkipTest('N/A')
 
-                target != usertypes.ClickTarget.normal):
 
-            tab = shared.get_tab(self.win_id, target)
 
-            tab.load_url(navigation.url)
+    def test_user_create_update_delete(self):
 
-            self.data.open_target = usertypes.ClickTarget.normal
+        from keystoneclient import exceptions as client_exceptions
 
-            navigation.accepted = False
 
 
+        test_username = 'new_user'
 
-        if navigation.is_main_frame:
+        client = self.get_client(admin=True)
 
-            self.settings.update_for_url(navigation.url)
+        user = client.users.create(name=test_username,
 
+                                   password='password',
 
+                                   email='user1@test.com')
 
-    @pyqtSlot('QNetworkReply*')
+        self.assertEquals(user.name, test_username)
 
-    def _on_ssl_errors(self, reply):
 
-        self._insecure_hosts.add(reply.url().host())
 
+        user = client.users.get(user=user.id)
 
+        self.assertEquals(user.name, test_username)
 
-    def _connect_signals(self):
 
-        view = self._widget
 
-        page = view.page()
+        user = client.users.update_email(user=user, email='user2@test.com')
 
-        frame = page.mainFrame()
+        self.assertEquals(user.email, 'user2@test.com')
 
-        page.windowCloseRequested.connect(self.window_close_requested)
 
-        page.linkHovered.connect(self.link_hovered)
 
-        page.loadProgress.connect(self._on_load_progress)
+        # NOTE(termie): update_enabled doesn't return anything, probably a bug
 
-        frame.loadStarted.connect(self._on_load_started)
+        client.users.update_enabled(user=user, enabled=False)
 
-        view.scroll_pos_changed.connect(self.scroller.perc_changed)
+        user = client.users.get(user.id)
 
-        view.titleChanged.connect(self.title_changed)
+        self.assertFalse(user.enabled)
 
-        view.urlChanged.connect(self._on_url_changed)
 
-        view.shutting_down.connect(self.shutting_down)
 
-        page.networkAccessManager().sslErrors.connect(self._on_ssl_errors)
+        self.assertRaises(client_exceptions.AuthorizationFailure,
 
-        frame.loadFinished.connect(self._on_frame_load_finished)
+                  self._client,
 
-        view.iconChanged.connect(self._on_webkit_icon_changed)
+                  username=test_username,
 
-        page.frameCreated.connect(self._on_frame_created)
+                  password='password')
 
-        frame.contentsSizeChanged.connect(self._on_contents_size_changed)
+        client.users.update_enabled(user, True)
 
-        frame.initialLayoutCompleted.connect(self._on_history_trigger)
 
-        page.navigation_request.connect(self._on_navigation_request)
+
+        user = client.users.update_password(user=user, password='password2')
+
+
+
+        self._client(username=test_username,
+
+                     password='password2')
+
+
+
+        user = client.users.update_tenant(user=user, tenant='bar')
+
+        # TODO(ja): once keystonelight supports default tenant
+
+        #           when you login without specifying tenant, the
+
+        #           token should be scoped to tenant 'bar'
+
+
+
+        client.users.delete(user.id)
+
+        self.assertRaises(client_exceptions.NotFound, client.users.get,
+
+                          user.id)
+
+
+
+    def test_user_update_404(self):
+
+        raise nose.exc.SkipTest('N/A')
+
+
+
+    def test_endpoint_create_404(self):
+
+        raise nose.exc.SkipTest('N/A')
+
+
+
+    def test_endpoint_delete_404(self):
+
+        raise nose.exc.SkipTest('N/A')

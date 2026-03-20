@@ -2,240 +2,120 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-# -*- coding: utf-8 -*-
-
-
-
-"""Simple security for Flask apps."""
-
-
-
-import io
+#!/usr/bin/env python
 
 import re
 
-from setuptools import find_packages, setup
+
+
+import sys
 
 
 
-with io.open("README.rst", "rt", encoding="utf8") as f:
+from setuptools import setup
 
-    readme = f.read()
-
-
-
-with io.open("flask_security/__init__.py", "rt", encoding="utf8") as f:
-
-    version = re.search(r'__version__ = "(.*?)"', f.read()).group(1)
-
-
-
-tests_require = [
-
-    "Flask-Mongoengine>=0.9.5",
-
-    "peewee>=3.11.2",
-
-    "Flask-SQLAlchemy>=2.3",
-
-    "argon2_cffi>=19.1.0",
-
-    "bcrypt>=3.1.5",
-
-    "cachetools>=3.1.0",
-
-    "check-manifest>=0.25",
-
-    "coverage>=4.5.4",
-
-    "cryptography>=2.3.1",
-
-    "isort>=4.2.2",
-
-    "mock>=1.3.0",
-
-    "mongoengine>=0.15.3",
-
-    "mongomock>=3.14.0",
-
-    "msgcheck>=2.9",
-
-    "pony>=0.7.11",
-
-    "phonenumberslite>=8.11.1",
-
-    "psycopg2>=2.8.4",
-
-    "pydocstyle>=1.0.0",
-
-    "pymysql>=0.9.3",
-
-    "pyqrcode>=1.2",
-
-    "pytest==4.6.11",
-
-    "pytest-black>=0.3.8",
-
-    "pytest-cache>=1.0",
-
-    "pytest-cov>=2.5.1",
-
-    "pytest-flake8>=1.0.6",
-
-    "pytest-mongo>=1.2.1",
-
-    "pytest>=3.5.1",
-
-    "sqlalchemy>=1.2.6",
-
-    "sqlalchemy-utils>=0.33.0",
-
-    "werkzeug>=0.15.5",
-
-    "zxcvbn~=4.4.28",
-
-]
-
-
-
-extras_require = {
-
-    "docs": ["Pallets-Sphinx-Themes>=1.2.0", "Sphinx>=1.8.5", "sphinx-issues>=1.2.0"],
-
-    "tests": tests_require,
-
-}
-
-
-
-extras_require["all"] = []
-
-for reqs in extras_require.values():
-
-    extras_require["all"].extend(reqs)
-
-
-
-setup_requires = ["Babel>=1.3", "pytest-runner>=2.6.2", "twine", "wheel"]
+from setuptools.command.test import test as TestCommand
 
 
 
 install_requires = [
 
-    "Flask>=1.0.2",
+    # core dependencies
 
-    "Flask-Login>=0.4.1",
+    'decorator',
 
-    "Flask-Mail>=0.9.1",
+    'requests >= 1.0.0',
 
-    "Flask-Principal>=0.4.0",
+    'future',
 
-    "Flask-WTF>=0.14.2",
+    'paste',
 
-    "Flask-BabelEx>=0.9.3",
+    'zope.interface',
 
-    "email-validator>=1.0.5",
+    'repoze.who',
 
-    "itsdangerous>=1.1.0",
+    'pycryptodomex',
 
-    "passlib>=1.7.1",
+    'pytz',
+
+    'pyOpenSSL',
+
+    'python-dateutil',
+
+    'six'
 
 ]
 
 
 
-packages = find_packages()
+version = ''
+
+with open('src/saml2/__init__.py', 'r') as fd:
+
+    version = re.search(r'^__version__\s*=\s*[\'"]([^\'"]*)[\'"]',
+
+                        fd.read(), re.MULTILINE).group(1)
 
 
 
 setup(
 
-    name="Flask-Security-Too",
+    name='pysaml2',
 
     version=version,
 
-    description=__doc__,
+    description='Python implementation of SAML Version 2',
 
-    long_description=readme,
+    # long_description = read("README"),
 
-    keywords="flask security",
+    author='Roland Hedberg',
 
-    license="MIT",
+    author_email='roland.hedberg@adm.umu.se',
 
-    author="Matt Wright & Chris Wagner",
+    license='Apache 2.0',
 
-    author_email="jwag.wagner+github@gmail.com",
+    url='https://github.com/rohe/pysaml2',
 
-    url="https://github.com/Flask-Middleware/flask-security",
 
-    project_urls={
 
-        "Documentation": "https://flask-security-too.readthedocs.io",
+    packages=['saml2', 'saml2/xmldsig', 'saml2/xmlenc', 'saml2/s2repoze',
 
-        "Releases": "https://pypi.org/project/Flask-Security-Too/",
+              'saml2/s2repoze.plugins', "saml2/profile", "saml2/schema",
 
-        "Code": "https://github.com/Flask-Middleware/flask-security",
+              "saml2/extension", "saml2/attributemaps", "saml2/authn_context",
 
-        "Issue tracker": "https://github.com/Flask-Middleware/flask-security/issues",
+              "saml2/entity_category", "saml2/userinfo", "saml2/ws"],
 
-    },
 
-    packages=packages,
 
-    zip_safe=False,
+    package_dir={'': 'src'},
 
-    include_package_data=True,
-
-    platforms="any",
-
-    python_requires=">=2.7,!=3.0.*,!=3.1.*,!=3.2.*,!=3.3.*,!=3.4.*",
-
-    extras_require=extras_require,
-
-    install_requires=install_requires,
-
-    setup_requires=setup_requires,
-
-    tests_require=tests_require,
+    package_data={'': ['xml/*.xml']},
 
     classifiers=[
 
-        "Environment :: Web Environment",
+        "Development Status :: 4 - Beta",
 
-        "Framework :: Flask",
-
-        "Intended Audience :: Developers",
-
-        "License :: OSI Approved :: MIT License",
-
-        "Operating System :: OS Independent",
-
-        "Programming Language :: Python",
-
-        "Topic :: Internet :: WWW/HTTP :: Dynamic Content",
+        "License :: OSI Approved :: Apache Software License",
 
         "Topic :: Software Development :: Libraries :: Python Modules",
 
-        "Programming Language :: Python :: 2",
-
         "Programming Language :: Python :: 2.7",
 
-        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.4",
 
-        "Programming Language :: Python :: 3.5",
-
-        "Programming Language :: Python :: 3.6",
-
-        "Programming Language :: Python :: 3.7",
-
-        "Programming Language :: Python :: 3.8",
-
-        "Programming Language :: Python :: Implementation :: CPython",
-
-        "Programming Language :: Python :: Implementation :: PyPy",
-
-        "Development Status :: 4 - Beta",
+        "Programming Language :: Python :: 3.5"
 
     ],
+
+
+
+    scripts=["tools/parse_xsd2.py", "tools/make_metadata.py",
+
+             "tools/mdexport.py", "tools/merge_metadata.py"],
+
+    install_requires=install_requires,
+
+    zip_safe=False,
 
 )

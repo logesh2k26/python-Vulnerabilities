@@ -2,358 +2,586 @@
 # Safety: safe
 # Category: safe
 
-#     Copyright 2014 Netflix, Inc.
+# Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 
 #
 
-#     Licensed under the Apache License, Version 2.0 (the "License");
+# Licensed under the Apache License, Version 2.0 (the "License");
 
-#     you may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 
-#     You may obtain a copy of the License at
-
-#
-
-#         http://www.apache.org/licenses/LICENSE-2.0
+# You may obtain a copy of the License at
 
 #
 
-#     Unless required by applicable law or agreed to in writing, software
+#     http://www.apache.org/licenses/LICENSE-2.0
 
-#     distributed under the License is distributed on an "AS IS" BASIS,
+#
 
-#     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# Unless required by applicable law or agreed to in writing, software
 
-#     See the License for the specific language governing permissions and
+# distributed under the License is distributed on an "AS IS" BASIS,
 
-#     limitations under the License.
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 
+# See the License for the specific language governing permissions and
 
+# limitations under the License.
 
-from security_monkey import app, db
+# ==============================================================================
 
-from flask_wtf.csrf import generate_csrf
+"""Tests for sparse ops."""
 
-from security_monkey.auth.models import RBACRole
 
-from security_monkey.decorators import crossdomain
 
+from __future__ import absolute_import
 
+from __future__ import division
 
-from flask_restful import fields, marshal, Resource, reqparse
+from __future__ import print_function
 
-from flask_login import current_user
 
 
+from absl.testing import parameterized
 
-ORIGINS = [
+import numpy as np
 
-    'https://{}:{}'.format(app.config.get('FQDN'), app.config.get('WEB_PORT')),
 
-    # Adding this next one so you can also access the dart UI by prepending /static to the path.
 
-    'https://{}:{}'.format(app.config.get('FQDN'), app.config.get('API_PORT')),
+from tensorflow.python.eager import context
 
-    'https://{}:{}'.format(app.config.get('FQDN'), app.config.get('NGINX_PORT')),
+from tensorflow.python.framework import constant_op
 
-    'https://{}:80'.format(app.config.get('FQDN'))
+from tensorflow.python.framework import dtypes
 
-]
+from tensorflow.python.framework import errors
 
+from tensorflow.python.framework import ops
 
+from tensorflow.python.framework import sparse_tensor
 
-##### Marshal Datastructures #####
+from tensorflow.python.framework import test_util
 
+# Need array_grad to register gradient for Identity.
 
+from tensorflow.python.ops import array_grad  # pylint: disable=unused-import
 
-# Used by RevisionGet, RevisionList, ItemList
+from tensorflow.python.ops import array_ops
 
-REVISION_FIELDS = {
+from tensorflow.python.ops import gen_sparse_ops
 
-    'id': fields.Integer,
+from tensorflow.python.ops import gradient_checker_v2 as gradient_checker
 
-    'date_created': fields.String,
+from tensorflow.python.ops import math_ops
 
-    'date_last_ephemeral_change': fields.String,
+# Need sparse_grad to register gradient for SparseToDense.
 
-    'active': fields.Boolean,
+from tensorflow.python.ops import sparse_grad  # pylint: disable=unused-import
 
-    'item_id': fields.Integer
+from tensorflow.python.ops import sparse_ops
 
-}
+from tensorflow.python.platform import googletest
 
 
 
-# Used by RevisionList, ItemGet, ItemList
 
-ITEM_FIELDS = {
 
-    'id': fields.Integer,
+@test_util.run_all_in_graph_and_eager_modes
 
-    'region': fields.String,
+class SparseOpsTest(test_util.TensorFlowTestCase, parameterized.TestCase):
 
-    'name': fields.String
 
-}
 
+  def testSparseEye(self):
 
+    def test_one(n, m, as_tensors):
 
-# Used by ItemList, Justify
+      expected = np.eye(n, m)
 
-AUDIT_FIELDS = {
+      if as_tensors:
 
-    'id': fields.Integer,
+        m = constant_op.constant(m)
 
-    'score': fields.Integer,
+        n = constant_op.constant(n)
 
-    'issue': fields.String,
+      s = sparse_ops.sparse_eye(n, m)
 
-    'notes': fields.String,
+      d = sparse_ops.sparse_to_dense(s.indices, s.dense_shape, s.values)
 
-    'justified': fields.Boolean,
+      self.assertAllEqual(self.evaluate(d), expected)
 
-    'justification': fields.String,
 
-    'justified_date': fields.String,
 
-    'item_id': fields.Integer
+    for n in range(2, 10, 2):
 
-}
+      for m in range(2, 10, 2):
 
+        # Test with n and m as both constants and tensors.
 
+        test_one(n, m, True)
 
-## Single Use Marshal Objects ##
+        test_one(n, m, False)
 
 
 
-# SINGLE USE - RevisionGet
+  def testDenseFromConstantToSparse(self):
 
-REVISION_COMMENT_FIELDS = {
+    expected_constant = np.reshape(np.arange(24, dtype=np.int64), (3, 4, 2))
 
-    'id': fields.Integer,
+    tensor = constant_op.constant(expected_constant)
 
-    'revision_id': fields.Integer,
+    sparse = sparse_ops.from_dense(tensor)
 
-    'date_created': fields.String,
+    dense = sparse_ops.sparse_to_dense(sparse.indices, sparse.dense_shape,
 
-    'text': fields.String
+                                       sparse.values)
 
-}
+    constant = self.evaluate(dense)
 
+    self.assertAllEqual(expected_constant, constant)
 
 
-# SINGLE USE - ItemGet
 
-ITEM_COMMENT_FIELDS = {
+  def testTransposePreservesShape(self):
 
-    'id': fields.Integer,
+    with ops.Graph().as_default():
 
-    'date_created': fields.String,
+      t = sparse_tensor.SparseTensor(indices=[[0, 0]],
 
-    'text': fields.String,
+                                     values=[0.],
 
-    'item_id': fields.Integer
+                                     dense_shape=[3, 4])
 
-}
+      self.assertTrue(t.shape.is_fully_defined)
 
+      transposed = sparse_ops.sparse_transpose(t)
 
+      self.assertAllEqual(transposed.shape, [4, 3])
 
-# SINGLE USE - UserSettings
 
-USER_SETTINGS_FIELDS = {
 
-    # 'id': fields.Integer,
+  def testSparseExpandDims(self):
 
-    'daily_audit_email': fields.Boolean,
+    for rank in range(1, 4):
 
-    'change_reports': fields.String
+      # Create a dummy input. When rank=3, shape=[2, 4, 6].
 
-}
+      shape = np.arange(1, rank + 1) * 2
 
+      before = np.arange(np.prod(shape)).reshape(shape)
 
 
-# SINGLE USE - AccountGet
 
-ACCOUNT_FIELDS = {
+      # Make entries sparse.
 
-    'id': fields.Integer,
+      before *= np.random.binomial(1, .2, before.shape)
 
-    'name': fields.String,
+      dense_shape = before.shape
 
-    'identifier': fields.String,
+      indices = np.array(np.where(before)).T
 
-    'notes': fields.String,
+      values = before[before != 0]
 
-    'active': fields.Boolean,
 
-    'third_party': fields.Boolean,
 
-    'account_type': fields.String
+      # Try every possible valid value of axis.
 
-}
+      for axis in range(-rank - 1, rank):
 
+        expected_after = np.expand_dims(before, axis)
 
 
-USER_FIELDS = {
 
-    'id': fields.Integer,
+        for axis_as_tensor in [False, True]:
 
-    'active': fields.Boolean,
+          dense_shape_t = constant_op.constant(dense_shape, dtype=dtypes.int64)
 
-    'email': fields.String,
+          indices_t = constant_op.constant(indices)
 
-    'role': fields.String,
+          values_t = constant_op.constant(values)
 
-    'confirmed_at': fields.String,
+          before_t = sparse_tensor.SparseTensor(
 
-    'daily_audit_email': fields.Boolean,
+              indices=indices_t, values=values_t, dense_shape=dense_shape_t)
 
-    'change_reports': fields.String,
 
-    'last_login_at': fields.String,
 
-    'current_login_at': fields.String,
+          if axis_as_tensor:
 
-    'login_count': fields.Integer,
+            axis = constant_op.constant(axis)
 
-    'last_login_ip': fields.String,
 
-    'current_login_ip': fields.String
 
-}
+          s = sparse_ops.sparse_expand_dims(before_t, axis)
 
+          d = sparse_ops.sparse_to_dense(s.indices, s.dense_shape, s.values)
 
+          self.assertAllEqual(self.evaluate(d), expected_after)
 
-ROLE_FIELDS = {
 
-    'id': fields.Integer,
 
-    'name': fields.String,
+  @parameterized.parameters([
 
-    'description': fields.String,
+      (math_ops.abs, [1.0, -1.0, 3.0, -4.0], [1.0, 1.0, 3.0, 4.0]),
 
-}
+      (math_ops.negative, [1.0, -1.0, 3.0, -4.0], [-1.0, 1.0, -3.0, 4.0]),
 
+      (math_ops.sign, [3.0, -2.0, 0.0, -4.0], [1.0, -1.0, 0.0, -1.0]),
 
+      (math_ops.square, [1.0, -1.0, 3.0, -4.0], [1.0, 1.0, 9.0, 16.0]),
 
-WHITELIST_FIELDS = {
+  ])
 
-    'id': fields.Integer,
+  def testUnarySparseDispatch(self, op, values, expected):
 
-    'name': fields.String,
+    st = sparse_tensor.SparseTensor(
 
-    'notes': fields.String,
+        indices=[[0, 0], [0, 1], [2, 0], [2, 4]],
 
-    'cidr': fields.String
+        values=values,
 
-}
+        dense_shape=[3, 6])
 
+    result = op(st)
 
+    result_value = self.evaluate(result)
 
-IGNORELIST_FIELDS = {
+    self.assertAllEqual(result_value.indices, st.indices)
 
-    'id': fields.Integer,
+    self.assertAllEqual(result_value.values, expected)
 
-    'prefix': fields.String,
+    self.assertAllEqual(result_value.dense_shape, st.dense_shape)
 
-    'notes': fields.String,
 
-}
 
+  def testSparseToDenseGradient(self):
 
 
-AUDITORSETTING_FIELDS = {
 
-    'id': fields.Integer,
+    def f(sparse_values, default_value):
 
-    'disabled': fields.Boolean,
+      st = sparse_tensor.SparseTensor(
 
-    'issue_text': fields.String
+          indices=[[0, 3, 6], [1, 4, 7], [2, 5, 8]],
 
-}
+          values=sparse_values,
 
+          dense_shape=[3, 6, 9])
 
+      return sparse_ops.sparse_tensor_to_dense(st, default_value)
 
-ITEM_LINK_FIELDS = {
 
-    'id': fields.Integer,
 
-    'name': fields.String
+    grads = gradient_checker.compute_gradient(
 
-}
+        f, [constant_op.constant([1.0, 2.0, 3.0]),
 
+            constant_op.constant(0.0)])
 
+    epsilon = 1e-4
 
-class AuthenticatedService(Resource):
+    self.assertLess(gradient_checker.max_error(*grads), epsilon)
 
-    def __init__(self):
 
-        self.reqparse = reqparse.RequestParser()
 
-        super(AuthenticatedService, self).__init__()
+  def testSparseTensorToDenseString(self):
 
-        self.auth_dict = dict()
+    sp = sparse_tensor.SparseTensor(
 
-        if current_user.is_authenticated:
+        indices=[[0, 0], [1, 2]], values=['a', 'b'], dense_shape=[2, 3])
 
-            roles_marshal = []
+    dense = sparse_ops.sparse_tensor_to_dense(sp)
 
-            for role in current_user.roles:
+    expected_dense = [[b'a', b'', b''], [b'', b'', b'b']]
 
-                roles_marshal.append(marshal(role.__dict__, ROLE_FIELDS))
+    result_dense = self.evaluate(dense)
 
+    self.assertAllEqual(expected_dense, result_dense)
 
 
-            roles_marshal.append({"name": current_user.role})
 
+  def testDenseSparseTensorMatMul(self):
 
 
-            for role in RBACRole.roles[current_user.role].get_parents():
 
-                roles_marshal.append({"name": role.name})
+    np.random.seed(42)
 
+    dense_numpy_array = np.random.rand(3, 3)
 
+    independent_dense_tf = constant_op.constant(
 
-            self.auth_dict = {
+        dense_numpy_array, dtype='float32')
 
-                "authenticated": True,
 
-                "user": current_user.email,
 
-                "roles": roles_marshal
+    sp = sparse_tensor.SparseTensor(
 
-            }
+        indices=[[0, 0], [1, 2]], values=[4., 8.], dense_shape=[3, 3])
 
-        else:
+    dense_of_sparse = sparse_ops.sparse_to_dense(sp.indices, sp.shape,
 
-            if app.config.get('FRONTED_BY_NGINX'):
+                                                 sp.values)
 
-                url = "https://{}:{}{}".format(app.config.get('FQDN'), app.config.get('NGINX_PORT'), '/login')
 
-            else:
 
-                url = "http://{}:{}{}".format(app.config.get('FQDN'), app.config.get('API_PORT'), '/login')
+    result = sparse_ops.sparse_tensor_dense_matmul(
 
-            self.auth_dict = {
+        independent_dense_tf, sp, adjoint_a=False, adjoint_b=False)
 
-                "authenticated": False,
+    expected = math_ops.matmul(independent_dense_tf, dense_of_sparse)
 
-                "user": None,
+    self.assertAllEqual(expected, result)
 
-                "url": url
 
-            }
 
+    result = sparse_ops.sparse_tensor_dense_matmul(
 
+        independent_dense_tf, sp, adjoint_a=False, adjoint_b=True)
 
+    expected = math_ops.matmul(independent_dense_tf,
 
+                               array_ops.transpose(dense_of_sparse))
 
-@app.after_request
+    self.assertAllEqual(expected, result)
 
-@crossdomain(allowed_origins=ORIGINS)
 
-def after(response):
 
-    response.set_cookie('XSRF-COOKIE', generate_csrf())
+    result = sparse_ops.sparse_tensor_dense_matmul(
 
-    return response
+        independent_dense_tf, sp, adjoint_a=True, adjoint_b=False)
+
+    expected = math_ops.matmul(
+
+        array_ops.transpose(independent_dense_tf), dense_of_sparse)
+
+    self.assertAllEqual(expected, result)
+
+
+
+    result = sparse_ops.sparse_tensor_dense_matmul(
+
+        independent_dense_tf, sp, adjoint_a=True, adjoint_b=True)
+
+    expected = math_ops.matmul(
+
+        array_ops.transpose(independent_dense_tf),
+
+        array_ops.transpose(dense_of_sparse))
+
+    self.assertAllEqual(expected, result)
+
+
+
+  def testMapValues(self):
+
+    # supplying no sparse tensor should result in ValueError
+
+    with self.assertRaises(ValueError):
+
+      sparse_ops.map_values(math_ops.abs, 0.0)
+
+
+
+    sp = sparse_ops.from_dense([[0.0, 1.0, 0.0], [-2.0, 1.0, 0.0]])
+
+
+
+    # helper function to check equality of sparse tensor
+
+    def assert_sparse_equal(expected, result):
+
+      self.assertAllEqual(expected.values, result.values, msg='Values differ')
+
+      self.assertAllEqual(
+
+          expected.indices, result.indices, msg='Indices differ')
+
+      self.assertAllEqual(
+
+          expected.dense_shape, result.dense_shape, msg='Shapes differ')
+
+
+
+    # check for a single sparse argument
+
+    expected = sparse_ops.from_dense([[0.0, 1.0, 0.0], [2.0, 1.0, 0.0]])
+
+    result = sparse_ops.map_values(math_ops.abs, sp)
+
+    assert_sparse_equal(expected, result)
+
+
+
+    # check correct passing of keyword argument, and handling of two sparse
+
+    # arguments at the same time
+
+    def mapping(arg1, arg2, kwarg):
+
+      self.assertEqual(kwarg, 'kwarg')
+
+      return arg1 + arg2
+
+
+
+    result = sparse_ops.map_values(mapping, sp, sp, kwarg='kwarg')
+
+    expected = sparse_ops.from_dense([[0.0, 2.0, 0.0], [-4.0, 2.0, 0.0]])
+
+    assert_sparse_equal(expected, result)
+
+
+
+    # check that index mismatches are correctly detected even if the `value`s
+
+    # have compatible shape
+
+    sp_incomp = sparse_ops.from_dense([[0.0, 1.0, 0.0], [-2.0, 0.0, 1.0]])
+
+    with self.assertRaises((errors.InvalidArgumentError, ValueError)):
+
+      result = sparse_ops.map_values(mapping, sp, sp_incomp, kwarg='kwarg')
+
+      self.evaluate(result)
+
+
+
+    # check that shape mismatches are correctly detected
+
+    sp_incomp = sparse_tensor.SparseTensor(sp.indices, sp.values, (25, 25))
+
+    with self.assertRaises((errors.InvalidArgumentError, ValueError)):
+
+      result = sparse_ops.map_values(mapping, sp, sp_incomp, kwarg='kwarg')
+
+      self.evaluate(result)
+
+
+
+  def testConstantStringToSparse(self):
+
+    # Test case for GitHub issue 40633.
+
+    tensor = constant_op.constant(list('ababa'))
+
+    sparse = sparse_ops.from_dense(tensor)
+
+    result = self.evaluate(sparse)
+
+    self.assertAllEqual([[0], [1], [2], [3], [4]], result.indices)
+
+    self.assertAllEqual([b'a', b'b', b'a', b'b', b'a'], result.values)
+
+    self.assertAllEqual([5], result.dense_shape)
+
+
+
+
+
+@test_util.run_all_in_graph_and_eager_modes
+
+class RawOpsTest(test_util.TensorFlowTestCase, parameterized.TestCase):
+
+
+
+  def testSparseFillEmptyRowsGrad(self):
+
+    reverse_index_map = [2, 1]
+
+    grad_values = [0, 1, 2, 3]
+
+    d_values, d_default_value = self.evaluate(
+
+        gen_sparse_ops.SparseFillEmptyRowsGrad(
+
+            reverse_index_map=reverse_index_map, grad_values=grad_values))
+
+    self.assertAllEqual([2, 1], d_values)
+
+    self.assertEqual(3, d_default_value)
+
+
+
+  def testSparseFillEmptyRowsGradNegativeIndexMapValue(self):
+
+    reverse_index_map = [2, -1]
+
+    grad_values = [0, 1, 2, 3]
+
+    with self.assertRaisesRegex(
+
+        errors.InvalidArgumentError,
+
+        r'Elements in reverse index must be in \[0, 4\)'):
+
+      self.evaluate(
+
+          gen_sparse_ops.SparseFillEmptyRowsGrad(
+
+              reverse_index_map=reverse_index_map, grad_values=grad_values))
+
+
+
+  def testSparseFillEmptyRowsGradLargeIndexMapValue(self):
+
+    reverse_index_map = [2, 10]
+
+    grad_values = [0, 1, 2, 3]
+
+    with self.assertRaisesRegex(
+
+        errors.InvalidArgumentError,
+
+        r'Elements in reverse index must be in \[0, 4\)'):
+
+      self.evaluate(
+
+          gen_sparse_ops.SparseFillEmptyRowsGrad(
+
+              reverse_index_map=reverse_index_map, grad_values=grad_values))
+
+
+
+  def testSparseFillEmptyRowsGradMatrix(self):
+
+    reverse_index_map = [0, 1]
+
+    grad_values = [[0, 1], [2, 3]]
+
+    # Note: Eager mode and graph mode throw different errors here. Graph mode
+
+    # will fail with a ValueError from the shape checking logic, while Eager
+
+    # will fail with an InvalidArgumentError from the kernel itself.
+
+    if context.executing_eagerly():
+
+      with self.assertRaisesRegex(errors.InvalidArgumentError,
+
+                                  r'grad_values must be a vector'):
+
+        self.evaluate(
+
+            gen_sparse_ops.SparseFillEmptyRowsGrad(
+
+                reverse_index_map=reverse_index_map, grad_values=grad_values))
+
+    else:
+
+      with self.assertRaisesRegex(ValueError,
+
+                                  r'Shape must be rank 1 but is rank 2'):
+
+        self.evaluate(
+
+            gen_sparse_ops.SparseFillEmptyRowsGrad(
+
+                reverse_index_map=reverse_index_map, grad_values=grad_values))
+
+
+
+
+
+if __name__ == '__main__':
+
+  googletest.main()

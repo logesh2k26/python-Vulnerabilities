@@ -2,554 +2,240 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-# Copyright (C) 2013, Red Hat, Inc.
+# -*- coding: utf-8 -*-
 
-# All rights reserved.
 
-#
 
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-
-# of this software and associated documentation files (the "Software"), to deal
-
-# in the Software without restriction, including without limitation the rights
-
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-
-# copies of the Software, and to permit persons to whom the Software is
-
-# furnished to do so, subject to the following conditions:
-
-#
-
-# The above copyright notice and this permission notice shall be included in
-
-# all copies or substantial portions of the Software.
-
-#
-
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-
-# THE SOFTWARE.
+"""Simple security for Flask apps."""
 
 
 
 import io
 
-import logging
+import re
 
-import select
+from setuptools import find_packages, setup
 
-import socket
 
-import struct
 
-import sys
+with io.open("README.rst", "rt", encoding="utf8") as f:
 
-import time
+    readme = f.read()
 
 
 
-try:  # Python 3.x
+with io.open("flask_security/__init__.py", "rt", encoding="utf8") as f:
 
-    import http.client as httplib
+    version = re.search(r'__version__ = "(.*?)"', f.read()).group(1)
 
-    import urllib.parse as urlparse
 
-except ImportError:  # Python 2.x
 
-    import httplib
+tests_require = [
 
-    import urlparse
+    "Flask-Mongoengine>=0.9.5",
 
+    "peewee>=3.11.2",
 
+    "Flask-SQLAlchemy>=2.3",
 
-import kdcproxy.codec as codec
+    "argon2_cffi>=19.1.0",
 
-from kdcproxy.config import MetaResolver
+    "bcrypt>=3.1.5",
 
+    "cachetools>=3.1.0",
 
+    "check-manifest>=0.25",
 
+    "coverage>=4.5.4",
 
+    "cryptography>=2.3.1",
 
-class HTTPException(Exception):
+    "isort>=4.2.2",
 
+    "mock>=1.3.0",
 
+    "mongoengine>=0.15.3",
 
-    def __init__(self, code, msg, headers=[]):
+    "mongomock>=3.14.0",
 
-        headers = list(filter(lambda h: h[0] != 'Content-Length', headers))
+    "msgcheck>=2.9",
 
+    "pony>=0.7.11",
 
+    "phonenumberslite>=8.11.1",
 
-        if 'Content-Type' not in dict(headers):
+    "psycopg2>=2.8.4",
 
-            headers.append(('Content-Type', 'text/plain; charset=utf-8'))
+    "pydocstyle>=1.0.0",
 
+    "pymysql>=0.9.3",
 
+    "pyqrcode>=1.2",
 
-        if sys.version_info.major == 3 and isinstance(msg, str):
+    "pytest==4.6.11",
 
-            msg = bytes(msg, "utf-8")
+    "pytest-black>=0.3.8",
 
+    "pytest-cache>=1.0",
 
+    "pytest-cov>=2.5.1",
 
-        headers.append(('Content-Length', str(len(msg))))
+    "pytest-flake8>=1.0.6",
 
+    "pytest-mongo>=1.2.1",
 
+    "pytest>=3.5.1",
 
-        super(HTTPException, self).__init__(code, msg, headers)
+    "sqlalchemy>=1.2.6",
 
-        self.code = code
+    "sqlalchemy-utils>=0.33.0",
 
-        self.message = msg
+    "werkzeug>=0.15.5",
 
-        self.headers = headers
+    "zxcvbn~=4.4.28",
 
+]
 
 
-    def __str__(self):
 
-        return "%d %s" % (self.code, httplib.responses[self.code])
+extras_require = {
 
+    "docs": ["Pallets-Sphinx-Themes>=1.2.0", "Sphinx>=1.8.5", "sphinx-issues>=1.2.0"],
 
+    "tests": tests_require,
 
+}
 
 
-class Application:
 
-    SOCKTYPES = {
+extras_require["all"] = []
 
-        "tcp": socket.SOCK_STREAM,
+for reqs in extras_require.values():
 
-        "udp": socket.SOCK_DGRAM,
+    extras_require["all"].extend(reqs)
 
-    }
 
 
+setup_requires = ["Babel>=1.3", "pytest-runner>=2.6.2", "twine", "wheel"]
 
-    def __init__(self):
 
-        self.__resolver = MetaResolver()
 
+install_requires = [
 
+    "Flask>=1.0.2",
 
-    def __await_reply(self, pr, rsocks, wsocks, timeout):
+    "Flask-Login>=0.4.1",
 
-        extra = 0
+    "Flask-Mail>=0.9.1",
 
-        read_buffers = {}
+    "Flask-Principal>=0.4.0",
 
-        while (timeout + extra) > time.time():
+    "Flask-WTF>=0.14.2",
 
-            if not wsocks and not rsocks:
+    "Flask-BabelEx>=0.9.3",
 
-                break
+    "email-validator>=1.0.5",
 
+    "itsdangerous>=1.1.0",
 
+    "passlib>=1.7.1",
 
-            r, w, x = select.select(rsocks, wsocks, rsocks + wsocks,
+]
 
-                                    (timeout + extra) - time.time())
 
-            for sock in x:
 
-                sock.close()
+packages = find_packages()
 
-                try:
 
-                    rsocks.remove(sock)
 
-                except ValueError:
+setup(
 
-                    pass
+    name="Flask-Security-Too",
 
-                try:
+    version=version,
 
-                    wsocks.remove(sock)
+    description=__doc__,
 
-                except ValueError:
+    long_description=readme,
 
-                    pass
+    keywords="flask security",
 
+    license="MIT",
 
+    author="Matt Wright & Chris Wagner",
 
-            for sock in w:
+    author_email="jwag.wagner+github@gmail.com",
 
-                try:
+    url="https://github.com/Flask-Middleware/flask-security",
 
-                    if self.sock_type(sock) == socket.SOCK_DGRAM:
+    project_urls={
 
-                        # If we proxy over UDP, remove the 4-byte length
+        "Documentation": "https://flask-security-too.readthedocs.io",
 
-                        # prefix since it is TCP only.
+        "Releases": "https://pypi.org/project/Flask-Security-Too/",
 
-                        sock.sendall(pr.request[4:])
+        "Code": "https://github.com/Flask-Middleware/flask-security",
 
-                    else:
+        "Issue tracker": "https://github.com/Flask-Middleware/flask-security/issues",
 
-                        sock.sendall(pr.request)
+    },
 
-                        extra = 10  # New connections get 10 extra seconds
+    packages=packages,
 
-                except Exception:
+    zip_safe=False,
 
-                    logging.exception('Error in recv() of %s', sock)
+    include_package_data=True,
 
-                    continue
+    platforms="any",
 
-                rsocks.append(sock)
+    python_requires=">=2.7,!=3.0.*,!=3.1.*,!=3.2.*,!=3.3.*,!=3.4.*",
 
-                wsocks.remove(sock)
+    extras_require=extras_require,
 
+    install_requires=install_requires,
 
+    setup_requires=setup_requires,
 
-            for sock in r:
+    tests_require=tests_require,
 
-                try:
+    classifiers=[
 
-                    reply = self.__handle_recv(sock, read_buffers)
+        "Environment :: Web Environment",
 
-                except Exception:
+        "Framework :: Flask",
 
-                    logging.exception('Error in recv() of %s', sock)
+        "Intended Audience :: Developers",
 
-                    if self.sock_type(sock) == socket.SOCK_STREAM:
+        "License :: OSI Approved :: MIT License",
 
-                        # Remove broken TCP socket from readers
+        "Operating System :: OS Independent",
 
-                        rsocks.remove(sock)
+        "Programming Language :: Python",
 
-                else:
+        "Topic :: Internet :: WWW/HTTP :: Dynamic Content",
 
-                    if reply is not None:
+        "Topic :: Software Development :: Libraries :: Python Modules",
 
-                        return reply
+        "Programming Language :: Python :: 2",
 
+        "Programming Language :: Python :: 2.7",
 
+        "Programming Language :: Python :: 3",
 
-        return None
+        "Programming Language :: Python :: 3.5",
 
+        "Programming Language :: Python :: 3.6",
 
+        "Programming Language :: Python :: 3.7",
 
-    def __handle_recv(self, sock, read_buffers):
+        "Programming Language :: Python :: 3.8",
 
-        if self.sock_type(sock) == socket.SOCK_DGRAM:
+        "Programming Language :: Python :: Implementation :: CPython",
 
-            # For UDP sockets, recv() returns an entire datagram
+        "Programming Language :: Python :: Implementation :: PyPy",
 
-            # package. KDC sends one datagram as reply.
+        "Development Status :: 4 - Beta",
 
-            reply = sock.recv(1048576)
+    ],
 
-            # If we proxy over UDP, we will be missing the 4-byte
-
-            # length prefix. So add it.
-
-            reply = struct.pack("!I", len(reply)) + reply
-
-            return reply
-
-        else:
-
-            # TCP is a different story. The reply must be buffered
-
-            # until the full answer is accumulated.
-
-            buf = read_buffers.get(sock)
-
-            part = sock.recv(1048576)
-
-            if buf is None:
-
-                if len(part) > 4:
-
-                    # got enough data in the initial package. Now check
-
-                    # if we got the full package in the first run.
-
-                    (length, ) = struct.unpack("!I", part[0:4])
-
-                    if length + 4 == len(part):
-
-                        return part
-
-                read_buffers[sock] = buf = io.BytesIO()
-
-
-
-            if part:
-
-                # data received, accumulate it in a buffer
-
-                buf.write(part)
-
-                return None
-
-            else:
-
-                # EOF received
-
-                read_buffers.pop(sock)
-
-                reply = buf.getvalue()
-
-                return reply
-
-
-
-    def __filter_addr(self, addr):
-
-        if addr[0] not in (socket.AF_INET, socket.AF_INET6):
-
-            return False
-
-
-
-        if addr[1] not in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
-
-            return False
-
-
-
-        if addr[2] not in (socket.IPPROTO_TCP, socket.IPPROTO_UDP):
-
-            return False
-
-
-
-        return True
-
-
-
-    def sock_type(self, sock):
-
-        try:
-
-            return sock.type & ~socket.SOCK_NONBLOCK
-
-        except AttributeError:
-
-            return sock.type
-
-
-
-    def __call__(self, env, start_response):
-
-        try:
-
-            # Validate the method
-
-            method = env["REQUEST_METHOD"].upper()
-
-            if method != "POST":
-
-                raise HTTPException(405, "Method not allowed (%s)." % method)
-
-
-
-            # Parse the request
-
-            try:
-
-                length = int(env["CONTENT_LENGTH"])
-
-            except AttributeError:
-
-                length = -1
-
-            try:
-
-                pr = codec.decode(env["wsgi.input"].read(length))
-
-            except codec.ParsingError as e:
-
-                raise HTTPException(400, e.message)
-
-
-
-            # Find the remote proxy
-
-            servers = self.__resolver.lookup(
-
-                pr.realm,
-
-                kpasswd=isinstance(pr, codec.KPASSWDProxyRequest)
-
-            )
-
-            if not servers:
-
-                raise HTTPException(503, "Can't find remote (%s)." % pr)
-
-
-
-            # Contact the remote server
-
-            reply = None
-
-            wsocks = []
-
-            rsocks = []
-
-            for server in map(urlparse.urlparse, servers):
-
-                # Enforce valid, supported URIs
-
-                scheme = server.scheme.lower().split("+", 1)
-
-                if scheme[0] not in ("kerberos", "kpasswd"):
-
-                    continue
-
-                if len(scheme) > 1 and scheme[1] not in ("tcp", "udp"):
-
-                    continue
-
-
-
-                # Do the DNS lookup
-
-                try:
-
-                    port = server.port
-
-                    if port is None:
-
-                        port = scheme[0]
-
-                    addrs = socket.getaddrinfo(server.hostname, port)
-
-                except socket.gaierror:
-
-                    continue
-
-
-
-                # Sort addresses so that we get TCP first.
-
-                #
-
-                # Stick a None address on the end so we can get one
-
-                # more attempt after all servers have been contacted.
-
-                addrs = tuple(sorted(filter(self.__filter_addr, addrs)))
-
-                for addr in addrs + (None,):
-
-                    if addr is not None:
-
-                        # Bypass unspecified socktypes
-
-                        if (len(scheme) > 1
-
-                                and addr[1] != self.SOCKTYPES[scheme[1]]):
-
-                            continue
-
-
-
-                        # Create the socket
-
-                        sock = socket.socket(*addr[:3])
-
-                        sock.setblocking(0)
-
-
-
-                        # Connect
-
-                        try:
-
-                            # In Python 2.x, non-blocking connect() throws
-
-                            # socket.error() with errno == EINPROGRESS. In
-
-                            # Python 3.x, it throws io.BlockingIOError().
-
-                            sock.connect(addr[4])
-
-                        except socket.error as e:
-
-                            if e.errno != 115:  # errno != EINPROGRESS
-
-                                sock.close()
-
-                                continue
-
-                        except io.BlockingIOError:
-
-                            pass
-
-                        wsocks.append(sock)
-
-
-
-                    # Resend packets to UDP servers
-
-                    for sock in tuple(rsocks):
-
-                        if self.sock_type(sock) == socket.SOCK_DGRAM:
-
-                            wsocks.append(sock)
-
-                            rsocks.remove(sock)
-
-
-
-                    # Call select()
-
-                    timeout = time.time() + (15 if addr is None else 2)
-
-                    reply = self.__await_reply(pr, rsocks, wsocks, timeout)
-
-                    if reply is not None:
-
-                        break
-
-
-
-                if reply is not None:
-
-                    break
-
-
-
-            for sock in rsocks + wsocks:
-
-                sock.close()
-
-
-
-            if reply is None:
-
-                raise HTTPException(503, "Remote unavailable (%s)." % pr)
-
-
-
-            # Return the result to the client
-
-            raise HTTPException(200, codec.encode(reply),
-
-                                [("Content-Type", "application/kerberos")])
-
-        except HTTPException as e:
-
-            start_response(str(e), e.headers)
-
-            return [e.message]
-
-
-
-application = Application()
+)

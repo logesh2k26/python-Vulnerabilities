@@ -1,4 +1,0 @@
-{
-    "content": "import os\nos.system('ls')",
-    "filename": "test.py"
-}

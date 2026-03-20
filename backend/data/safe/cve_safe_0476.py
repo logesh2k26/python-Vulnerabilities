@@ -2,1674 +2,600 @@
 # Safety: safe
 # Category: safe
 
-# vim: ft=python fileencoding=utf-8 sts=4 sw=4 et:
+"""
 
+Custom Authenticator to use Google OAuth with JupyterHub.
 
 
-# Copyright 2016-2018 Florian Bruhin (The Compiler) <mail@qutebrowser.org>
 
-#
+Derived from the GitHub OAuth authenticator.
 
-# This file is part of qutebrowser.
+"""
 
-#
 
-# qutebrowser is free software: you can redistribute it and/or modify
 
-# it under the terms of the GNU General Public License as published by
+import os
 
-# the Free Software Foundation, either version 3 of the License, or
+import json
 
-# (at your option) any later version.
+import urllib.parse
 
-#
 
-# qutebrowser is distributed in the hope that it will be useful,
 
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
+from tornado import gen
 
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+from tornado.httpclient import HTTPRequest, AsyncHTTPClient
 
-# GNU General Public License for more details.
+from tornado.auth import GoogleOAuth2Mixin
 
-#
+from tornado.web import HTTPError
 
-# You should have received a copy of the GNU General Public License
 
-# along with qutebrowser.  If not, see <http://www.gnu.org/licenses/>.
 
+from traitlets import Dict, Unicode, List, default, validate, observe
 
 
-"""Wrapper over our (QtWebKit) WebView."""
 
+from jupyterhub.crypto import decrypt, EncryptionUnavailable, InvalidToken
 
+from jupyterhub.auth import LocalAuthenticator
 
-import re
+from jupyterhub.utils import url_path_join
 
-import functools
 
-import xml.etree.ElementTree
 
+from .oauth2 import OAuthLoginHandler, OAuthCallbackHandler, OAuthenticator
 
 
-from PyQt5.QtCore import (pyqtSlot, Qt, QEvent, QUrl, QPoint, QTimer, QSizeF,
 
-                          QSize)
+def check_user_in_groups(member_groups, allowed_groups):
 
-from PyQt5.QtGui import QKeyEvent, QIcon
+    # Check if user is a member of any group in the allowed groups
 
-from PyQt5.QtWebKitWidgets import QWebPage, QWebFrame
+    if any(g in member_groups for g in allowed_groups):
 
-from PyQt5.QtWebKit import QWebSettings
+        return True  # user _is_ in group
 
-from PyQt5.QtPrintSupport import QPrinter
+    else:
 
+        return False
 
 
-from qutebrowser.browser import browsertab, shared
 
-from qutebrowser.browser.webkit import (webview, tabhistory, webkitelem,
 
-                                        webkitsettings)
 
-from qutebrowser.utils import qtutils, usertypes, utils, log, debug
+class GoogleOAuthenticator(OAuthenticator, GoogleOAuth2Mixin):
 
-from qutebrowser.qt import sip
+    _deprecated_oauth_aliases = {
 
+        "google_group_whitelist": ("allowed_google_groups", "0.12.0"),
 
+        **OAuthenticator._deprecated_oauth_aliases,
 
+    }
 
 
-class WebKitAction(browsertab.AbstractAction):
 
+    google_api_url = Unicode("https://www.googleapis.com", config=True)
 
 
-    """QtWebKit implementations related to web actions."""
 
+    @default('google_api_url')
 
+    def _google_api_url(self):
 
-    action_class = QWebPage
+        """get default google apis url from env"""
 
-    action_base = QWebPage.WebAction
+        google_api_url = os.getenv('GOOGLE_API_URL')
 
 
 
-    def exit_fullscreen(self):
+        # default to googleapis.com
 
-        raise browsertab.UnsupportedOperationError
+        if not google_api_url:
 
+            google_api_url = 'https://www.googleapis.com'
 
 
-    def save_page(self):
 
-        """Save the current page."""
+        return google_api_url
 
-        raise browsertab.UnsupportedOperationError
 
 
+    @default('scope')
 
-    def show_source(self, pygments=False):
+    def _scope_default(self):
 
-        self._show_source_pygments()
+        return ['openid', 'email']
 
 
 
+    @default("authorize_url")
 
+    def _authorize_url_default(self):
 
-class WebKitPrinting(browsertab.AbstractPrinting):
+        return "https://accounts.google.com/o/oauth2/v2/auth"
 
 
 
-    """QtWebKit implementations related to printing."""
+    @default("token_url")
 
+    def _token_url_default(self):
 
+        return "%s/oauth2/v4/token" % (self.google_api_url)
 
-    def check_pdf_support(self):
 
-        pass
 
+    google_service_account_keys = Dict(
 
+        Unicode(),
 
-    def check_printer_support(self):
+        help="Service account keys to use with each domain, see https://developers.google.com/admin-sdk/directory/v1/guides/delegation"
 
-        pass
+    ).tag(config=True)
 
 
 
-    def check_preview_support(self):
+    gsuite_administrator = Dict(
 
-        pass
+        Unicode(),
 
+        help="Username of a G Suite Administrator for the service account to act as"
 
+    ).tag(config=True)
 
-    def to_pdf(self, filename):
 
-        printer = QPrinter()
 
-        printer.setOutputFileName(filename)
+    google_group_whitelist = Dict(help="Deprecated, use `GoogleOAuthenticator.allowed_google_groups`", config=True,)
 
-        self.to_printer(printer)
 
 
+    allowed_google_groups = Dict(
 
-    def to_printer(self, printer, callback=None):
+        List(Unicode()),
 
-        self._widget.print(printer)
+        help="Automatically allow members of selected groups"
 
-        # Can't find out whether there was an error...
+    ).tag(config=True)
 
-        if callback is not None:
 
-            callback(True)
 
+    admin_google_groups = Dict(
 
+        List(Unicode()),
 
+        help="Groups whose members should have Jupyterhub admin privileges"
 
+    ).tag(config=True)
 
-class WebKitSearch(browsertab.AbstractSearch):
 
 
+    user_info_url = Unicode(
 
-    """QtWebKit implementations related to searching on the page."""
+        "https://www.googleapis.com/oauth2/v1/userinfo", config=True
 
+    )
 
 
-    def __init__(self, parent=None):
 
-        super().__init__(parent)
+    hosted_domain = List(
 
-        self._flags = QWebPage.FindFlags(0)
+        Unicode(),
 
+        config=True,
 
+        help="""List of domains used to restrict sign-in, e.g. mycollege.edu""",
 
-    def _call_cb(self, callback, found, text, flags, caller):
+    )
 
-        """Call the given callback if it's non-None.
 
 
+    @default('hosted_domain')
 
-        Delays the call via a QTimer so the website is re-rendered in between.
+    def _hosted_domain_from_env(self):
 
+        domains = []
 
+        for domain in os.environ.get('HOSTED_DOMAIN', '').split(';'):
 
-        Args:
+            if domain:
 
-            callback: What to call
+                # check falsy to avoid trailing separators
 
-            found: If the text was found
+                # adding empty domains
 
-            text: The text searched for
+                domains.append(domain)
 
-            flags: The flags searched with
+        return domains
 
-            caller: Name of the caller.
 
-        """
 
-        found_text = 'found' if found else "didn't find"
+    @validate('hosted_domain')
 
-        # Removing FindWrapsAroundDocument to get the same logging as with
+    def _cast_hosted_domain(self, proposal):
 
-        # QtWebEngine
+        """handle backward-compatibility with hosted_domain is a single domain as a string"""
 
-        debug_flags = debug.qflags_key(
+        if isinstance(proposal.value, str):
 
-            QWebPage, flags & ~QWebPage.FindWrapsAroundDocument,
+            # pre-0.9 hosted_domain was a string
 
-            klass=QWebPage.FindFlag)
+            # set it to a single item list
 
-        if debug_flags != '0x0000':
+            # (or if it's empty, an empty list)
 
-            flag_text = 'with flags {}'.format(debug_flags)
+            if proposal.value == '':
 
-        else:
+                return []
 
-            flag_text = ''
+            return [proposal.value]
 
-        log.webview.debug(' '.join([caller, found_text, text, flag_text])
+        return proposal.value
 
-                          .strip())
 
-        if callback is not None:
 
-            QTimer.singleShot(0, functools.partial(callback, found))
+    login_service = Unicode(
 
+        os.environ.get('LOGIN_SERVICE', 'Google'),
 
+        config=True,
 
-    def clear(self):
+        help="""Google Apps hosted domain string, e.g. My College""",
 
-        self.search_displayed = False
+    )
 
-        # We first clear the marked text, then the highlights
 
-        self._widget.findText('')
 
-        self._widget.findText('', QWebPage.HighlightAllOccurrences)
+    async def authenticate(self, handler, data=None, google_groups=None):
 
+        code = handler.get_argument("code")
 
+        body = urllib.parse.urlencode(
 
-    def search(self, text, *, ignore_case='never', reverse=False,
+            dict(
 
-               result_cb=None):
+                code=code,
 
-        # Don't go to next entry on duplicate search
+                redirect_uri=self.get_callback_url(handler),
 
-        if self.text == text and self.search_displayed:
+                client_id=self.client_id,
 
-            log.webview.debug("Ignoring duplicate search request"
+                client_secret=self.client_secret,
 
-                              " for {}".format(text))
+                grant_type="authorization_code",
 
-            return
+            )
 
+        )
 
 
-        # Clear old search results, this is done automatically on QtWebEngine.
 
-        self.clear()
+        http_client = AsyncHTTPClient()
 
 
 
-        self.text = text
+        response = await http_client.fetch(
 
-        self.search_displayed = True
+            self.token_url,
 
-        self._flags = QWebPage.FindWrapsAroundDocument
+            method="POST",
 
-        if self._is_case_sensitive(ignore_case):
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
 
-            self._flags |= QWebPage.FindCaseSensitively
+            body=body,
 
-        if reverse:
+        )
 
-            self._flags |= QWebPage.FindBackward
 
-        # We actually search *twice* - once to highlight everything, then again
 
-        # to get a mark so we can navigate.
+        user = json.loads(response.body.decode("utf-8", "replace"))
 
-        found = self._widget.findText(text, self._flags)
+        access_token = str(user['access_token'])
 
-        self._widget.findText(text,
+        refresh_token = user.get('refresh_token', None)
 
-                              self._flags | QWebPage.HighlightAllOccurrences)
 
-        self._call_cb(result_cb, found, text, self._flags, 'search')
 
+        response = await http_client.fetch(
 
+            self.user_info_url + '?access_token=' + access_token
 
-    def next_result(self, *, result_cb=None):
+        )
 
-        self.search_displayed = True
 
-        found = self._widget.findText(self.text, self._flags)
 
-        self._call_cb(result_cb, found, self.text, self._flags, 'next_result')
+        if not response:
 
+            handler.clear_all_cookies()
 
+            raise HTTPError(500, 'Google authentication failed')
 
-    def prev_result(self, *, result_cb=None):
 
-        self.search_displayed = True
 
-        # The int() here makes sure we get a copy of the flags.
+        bodyjs = json.loads(response.body.decode())
 
-        flags = QWebPage.FindFlags(int(self._flags))
+        user_email = username = bodyjs['email']
 
-        if flags & QWebPage.FindBackward:
+        user_email_domain = user_email.split('@')[1]
 
-            flags &= ~QWebPage.FindBackward
 
-        else:
 
-            flags |= QWebPage.FindBackward
+        if not bodyjs['verified_email']:
 
-        found = self._widget.findText(self.text, flags)
+            self.log.warning("Google OAuth unverified email attempt: %s", user_email)
 
-        self._call_cb(result_cb, found, self.text, flags, 'prev_result')
+            raise HTTPError(403, "Google email {} not verified".format(user_email))
 
 
 
+        if self.hosted_domain:
 
+            if user_email_domain not in self.hosted_domain:
 
-class WebKitCaret(browsertab.AbstractCaret):
+                self.log.warning(
 
+                    "Google OAuth unauthorized domain attempt: %s", user_email
 
+                )
 
-    """QtWebKit implementations related to moving the cursor/selection."""
+                raise HTTPError(
 
+                    403,
 
+                    "Google account domain @{} not authorized.".format(
 
-    @pyqtSlot(usertypes.KeyMode)
+                        user_email_domain
 
-    def _on_mode_entered(self, mode):
+                    ),
 
-        if mode != usertypes.KeyMode.caret:
+                )
 
-            return
+            if len(self.hosted_domain) == 1:
 
+                # unambiguous domain, use only base name
 
+                username = user_email.split('@')[0]
 
-        self.selection_enabled = self._widget.hasSelection()
 
-        self.selection_toggled.emit(self.selection_enabled)
 
-        settings = self._widget.settings()
+        if refresh_token is None:
 
-        settings.setAttribute(QWebSettings.CaretBrowsingEnabled, True)
+            self.log.debug("Refresh token was empty, will try to pull refresh_token from previous auth_state")
 
+            user = handler.find_user(username)
 
 
-        if self._widget.isVisible():
 
-            # Sometimes the caret isn't immediately visible, but unfocusing
+            if user:
 
-            # and refocusing it fixes that.
-
-            self._widget.clearFocus()
-
-            self._widget.setFocus(Qt.OtherFocusReason)
-
-
-
-            # Move the caret to the first element in the viewport if there
-
-            # isn't any text which is already selected.
-
-            #
-
-            # Note: We can't use hasSelection() here, as that's always
-
-            # true in caret mode.
-
-            if not self.selection_enabled:
-
-                self._widget.page().currentFrame().evaluateJavaScript(
-
-                    utils.read_file('javascript/position_caret.js'))
-
-
-
-    @pyqtSlot(usertypes.KeyMode)
-
-    def _on_mode_left(self, _mode):
-
-        settings = self._widget.settings()
-
-        if settings.testAttribute(QWebSettings.CaretBrowsingEnabled):
-
-            if self.selection_enabled and self._widget.hasSelection():
-
-                # Remove selection if it exists
-
-                self._widget.triggerPageAction(QWebPage.MoveToNextChar)
-
-            settings.setAttribute(QWebSettings.CaretBrowsingEnabled, False)
-
-            self.selection_enabled = False
-
-
-
-    def move_to_next_line(self, count=1):
-
-        if not self.selection_enabled:
-
-            act = QWebPage.MoveToNextLine
-
-        else:
-
-            act = QWebPage.SelectNextLine
-
-        for _ in range(count):
-
-            self._widget.triggerPageAction(act)
-
-
-
-    def move_to_prev_line(self, count=1):
-
-        if not self.selection_enabled:
-
-            act = QWebPage.MoveToPreviousLine
-
-        else:
-
-            act = QWebPage.SelectPreviousLine
-
-        for _ in range(count):
-
-            self._widget.triggerPageAction(act)
-
-
-
-    def move_to_next_char(self, count=1):
-
-        if not self.selection_enabled:
-
-            act = QWebPage.MoveToNextChar
-
-        else:
-
-            act = QWebPage.SelectNextChar
-
-        for _ in range(count):
-
-            self._widget.triggerPageAction(act)
-
-
-
-    def move_to_prev_char(self, count=1):
-
-        if not self.selection_enabled:
-
-            act = QWebPage.MoveToPreviousChar
-
-        else:
-
-            act = QWebPage.SelectPreviousChar
-
-        for _ in range(count):
-
-            self._widget.triggerPageAction(act)
-
-
-
-    def move_to_end_of_word(self, count=1):
-
-        if not self.selection_enabled:
-
-            act = [QWebPage.MoveToNextWord]
-
-            if utils.is_windows:  # pragma: no cover
-
-                act.append(QWebPage.MoveToPreviousChar)
-
-        else:
-
-            act = [QWebPage.SelectNextWord]
-
-            if utils.is_windows:  # pragma: no cover
-
-                act.append(QWebPage.SelectPreviousChar)
-
-        for _ in range(count):
-
-            for a in act:
-
-                self._widget.triggerPageAction(a)
-
-
-
-    def move_to_next_word(self, count=1):
-
-        if not self.selection_enabled:
-
-            act = [QWebPage.MoveToNextWord]
-
-            if not utils.is_windows:  # pragma: no branch
-
-                act.append(QWebPage.MoveToNextChar)
-
-        else:
-
-            act = [QWebPage.SelectNextWord]
-
-            if not utils.is_windows:  # pragma: no branch
-
-                act.append(QWebPage.SelectNextChar)
-
-        for _ in range(count):
-
-            for a in act:
-
-                self._widget.triggerPageAction(a)
-
-
-
-    def move_to_prev_word(self, count=1):
-
-        if not self.selection_enabled:
-
-            act = QWebPage.MoveToPreviousWord
-
-        else:
-
-            act = QWebPage.SelectPreviousWord
-
-        for _ in range(count):
-
-            self._widget.triggerPageAction(act)
-
-
-
-    def move_to_start_of_line(self):
-
-        if not self.selection_enabled:
-
-            act = QWebPage.MoveToStartOfLine
-
-        else:
-
-            act = QWebPage.SelectStartOfLine
-
-        self._widget.triggerPageAction(act)
-
-
-
-    def move_to_end_of_line(self):
-
-        if not self.selection_enabled:
-
-            act = QWebPage.MoveToEndOfLine
-
-        else:
-
-            act = QWebPage.SelectEndOfLine
-
-        self._widget.triggerPageAction(act)
-
-
-
-    def move_to_start_of_next_block(self, count=1):
-
-        if not self.selection_enabled:
-
-            act = [QWebPage.MoveToNextLine,
-
-                   QWebPage.MoveToStartOfBlock]
-
-        else:
-
-            act = [QWebPage.SelectNextLine,
-
-                   QWebPage.SelectStartOfBlock]
-
-        for _ in range(count):
-
-            for a in act:
-
-                self._widget.triggerPageAction(a)
-
-
-
-    def move_to_start_of_prev_block(self, count=1):
-
-        if not self.selection_enabled:
-
-            act = [QWebPage.MoveToPreviousLine,
-
-                   QWebPage.MoveToStartOfBlock]
-
-        else:
-
-            act = [QWebPage.SelectPreviousLine,
-
-                   QWebPage.SelectStartOfBlock]
-
-        for _ in range(count):
-
-            for a in act:
-
-                self._widget.triggerPageAction(a)
-
-
-
-    def move_to_end_of_next_block(self, count=1):
-
-        if not self.selection_enabled:
-
-            act = [QWebPage.MoveToNextLine,
-
-                   QWebPage.MoveToEndOfBlock]
-
-        else:
-
-            act = [QWebPage.SelectNextLine,
-
-                   QWebPage.SelectEndOfBlock]
-
-        for _ in range(count):
-
-            for a in act:
-
-                self._widget.triggerPageAction(a)
-
-
-
-    def move_to_end_of_prev_block(self, count=1):
-
-        if not self.selection_enabled:
-
-            act = [QWebPage.MoveToPreviousLine, QWebPage.MoveToEndOfBlock]
-
-        else:
-
-            act = [QWebPage.SelectPreviousLine, QWebPage.SelectEndOfBlock]
-
-        for _ in range(count):
-
-            for a in act:
-
-                self._widget.triggerPageAction(a)
-
-
-
-    def move_to_start_of_document(self):
-
-        if not self.selection_enabled:
-
-            act = QWebPage.MoveToStartOfDocument
-
-        else:
-
-            act = QWebPage.SelectStartOfDocument
-
-        self._widget.triggerPageAction(act)
-
-
-
-    def move_to_end_of_document(self):
-
-        if not self.selection_enabled:
-
-            act = QWebPage.MoveToEndOfDocument
-
-        else:
-
-            act = QWebPage.SelectEndOfDocument
-
-        self._widget.triggerPageAction(act)
-
-
-
-    def toggle_selection(self):
-
-        self.selection_enabled = not self.selection_enabled
-
-        self.selection_toggled.emit(self.selection_enabled)
-
-
-
-    def drop_selection(self):
-
-        self._widget.triggerPageAction(QWebPage.MoveToNextChar)
-
-
-
-    def selection(self, callback):
-
-        callback(self._widget.selectedText())
-
-
-
-    def follow_selected(self, *, tab=False):
-
-        if QWebSettings.globalSettings().testAttribute(
-
-                QWebSettings.JavascriptEnabled):
-
-            if tab:
-
-                self._tab.data.override_target = usertypes.ClickTarget.tab
-
-            self._tab.run_js_async("""
-
-                const aElm = document.activeElement;
-
-                if (window.getSelection().anchorNode) {
-
-                    window.getSelection().anchorNode.parentNode.click();
-
-                } else if (aElm && aElm !== document.body) {
-
-                    aElm.click();
-
-                }
-
-            """)
-
-        else:
-
-            selection = self._widget.selectedHtml()
-
-            if not selection:
-
-                # Getting here may mean we crashed, but we can't do anything
-
-                # about that until this commit is released:
-
-                # https://github.com/annulen/webkit/commit/0e75f3272d149bc64899c161f150eb341a2417af
-
-                # TODO find a way to check if something is focused
-
-                self._follow_enter(tab)
-
-                return
-
-            try:
-
-                selected_element = xml.etree.ElementTree.fromstring(
-
-                    '<html>{}</html>'.format(selection)).find('a')
-
-            except xml.etree.ElementTree.ParseError:
-
-                raise browsertab.WebTabError('Could not parse selected '
-
-                                             'element!')
-
-
-
-            if selected_element is not None:
+                self.log.debug("encrypted_auth_state was found, will try to decrypt and pull refresh_token from it")
 
                 try:
 
-                    url = selected_element.attrib['href']
+                    encrypted = user.encrypted_auth_state
 
-                except KeyError:
+                    auth_state = await decrypt(encrypted)
 
-                    raise browsertab.WebTabError('Anchor element without '
+                    refresh_token = auth_state.get('refresh_token')
 
-                                                 'href!')
+                except (ValueError, InvalidToken, EncryptionUnavailable) as e:
 
-                url = self._tab.url().resolved(QUrl(url))
+                    self.log.warning(
 
-                if tab:
+                        "Failed to retrieve encrypted auth_state for %s because %s",
 
-                    self._tab.new_tab_requested.emit(url)
+                        username,
 
-                else:
+                        e,
 
-                    self._tab.openurl(url)
+                    )
 
 
 
+        user_info = {
 
+            'name': username,
 
-class WebKitZoom(browsertab.AbstractZoom):
+            'auth_state': {
 
+                'access_token': access_token,
 
+                'refresh_token': refresh_token,
 
-    """QtWebKit implementations related to zooming."""
+                'google_user': bodyjs
 
+            }
 
+        }
 
-    def _set_factor_internal(self, factor):
 
-        self._widget.setZoomFactor(factor)
 
+        if self.admin_google_groups or self.allowed_google_groups:
 
+            user_info = await self._add_google_groups_info(user_info, google_groups)
 
 
 
-class WebKitScroller(browsertab.AbstractScroller):
+        return user_info
 
 
 
-    """QtWebKit implementations related to scrolling."""
-
-
-
-    # FIXME:qtwebengine When to use the main frame, when the current one?
-
-
-
-    def pos_px(self):
-
-        return self._widget.page().mainFrame().scrollPosition()
-
-
-
-    def pos_perc(self):
-
-        return self._widget.scroll_pos
-
-
-
-    def to_point(self, point):
-
-        self._widget.page().mainFrame().setScrollPosition(point)
-
-
-
-    def to_anchor(self, name):
-
-        self._widget.page().mainFrame().scrollToAnchor(name)
-
-
-
-    def delta(self, x=0, y=0):
-
-        qtutils.check_overflow(x, 'int')
-
-        qtutils.check_overflow(y, 'int')
-
-        self._widget.page().mainFrame().scroll(x, y)
-
-
-
-    def delta_page(self, x=0.0, y=0.0):
-
-        if y.is_integer():
-
-            y = int(y)
-
-            if y == 0:
-
-                pass
-
-            elif y < 0:
-
-                self.page_up(count=-y)
-
-            elif y > 0:
-
-                self.page_down(count=y)
-
-            y = 0
-
-        if x == 0 and y == 0:
-
-            return
-
-        size = self._widget.page().mainFrame().geometry()
-
-        self.delta(x * size.width(), y * size.height())
-
-
-
-    def to_perc(self, x=None, y=None):
-
-        if x is None and y == 0:
-
-            self.top()
-
-        elif x is None and y == 100:
-
-            self.bottom()
-
-        else:
-
-            for val, orientation in [(x, Qt.Horizontal), (y, Qt.Vertical)]:
-
-                if val is not None:
-
-                    frame = self._widget.page().mainFrame()
-
-                    maximum = frame.scrollBarMaximum(orientation)
-
-                    if maximum == 0:
-
-                        continue
-
-                    pos = int(maximum * val / 100)
-
-                    pos = qtutils.check_overflow(pos, 'int', fatal=False)
-
-                    frame.setScrollBarValue(orientation, pos)
-
-
-
-    def _key_press(self, key, count=1, getter_name=None, direction=None):
-
-        frame = self._widget.page().mainFrame()
-
-        getter = None if getter_name is None else getattr(frame, getter_name)
-
-
-
-        # FIXME:qtwebengine needed?
-
-        # self._widget.setFocus()
-
-
-
-        for _ in range(min(count, 5000)):
-
-            # Abort scrolling if the minimum/maximum was reached.
-
-            if (getter is not None and
-
-                    frame.scrollBarValue(direction) == getter(direction)):
-
-                return
-
-            self._tab.key_press(key)
-
-
-
-    def up(self, count=1):
-
-        self._key_press(Qt.Key_Up, count, 'scrollBarMinimum', Qt.Vertical)
-
-
-
-    def down(self, count=1):
-
-        self._key_press(Qt.Key_Down, count, 'scrollBarMaximum', Qt.Vertical)
-
-
-
-    def left(self, count=1):
-
-        self._key_press(Qt.Key_Left, count, 'scrollBarMinimum', Qt.Horizontal)
-
-
-
-    def right(self, count=1):
-
-        self._key_press(Qt.Key_Right, count, 'scrollBarMaximum', Qt.Horizontal)
-
-
-
-    def top(self):
-
-        self._key_press(Qt.Key_Home)
-
-
-
-    def bottom(self):
-
-        self._key_press(Qt.Key_End)
-
-
-
-    def page_up(self, count=1):
-
-        self._key_press(Qt.Key_PageUp, count, 'scrollBarMinimum', Qt.Vertical)
-
-
-
-    def page_down(self, count=1):
-
-        self._key_press(Qt.Key_PageDown, count, 'scrollBarMaximum',
-
-                        Qt.Vertical)
-
-
-
-    def at_top(self):
-
-        return self.pos_px().y() == 0
-
-
-
-    def at_bottom(self):
-
-        frame = self._widget.page().currentFrame()
-
-        return self.pos_px().y() >= frame.scrollBarMaximum(Qt.Vertical)
-
-
-
-
-
-class WebKitHistory(browsertab.AbstractHistory):
-
-
-
-    """QtWebKit implementations related to page history."""
-
-
-
-    def current_idx(self):
-
-        return self._history.currentItemIndex()
-
-
-
-    def can_go_back(self):
-
-        return self._history.canGoBack()
-
-
-
-    def can_go_forward(self):
-
-        return self._history.canGoForward()
-
-
-
-    def _item_at(self, i):
-
-        return self._history.itemAt(i)
-
-
-
-    def _go_to_item(self, item):
-
-        self._tab.predicted_navigation.emit(item.url())
-
-        self._history.goToItem(item)
-
-
-
-    def serialize(self):
-
-        return qtutils.serialize(self._history)
-
-
-
-    def deserialize(self, data):
-
-        return qtutils.deserialize(data, self._history)
-
-
-
-    def load_items(self, items):
-
-        if items:
-
-            self._tab.predicted_navigation.emit(items[-1].url)
-
-
-
-        stream, _data, user_data = tabhistory.serialize(items)
-
-        qtutils.deserialize_stream(stream, self._history)
-
-        for i, data in enumerate(user_data):
-
-            self._history.itemAt(i).setUserData(data)
-
-        cur_data = self._history.currentItem().userData()
-
-        if cur_data is not None:
-
-            if 'zoom' in cur_data:
-
-                self._tab.zoom.set_factor(cur_data['zoom'])
-
-            if ('scroll-pos' in cur_data and
-
-                    self._tab.scroller.pos_px() == QPoint(0, 0)):
-
-                QTimer.singleShot(0, functools.partial(
-
-                    self._tab.scroller.to_point, cur_data['scroll-pos']))
-
-
-
-
-
-class WebKitElements(browsertab.AbstractElements):
-
-
-
-    """QtWebKit implemementations related to elements on the page."""
-
-
-
-    def find_css(self, selector, callback, *, only_visible=False):
-
-        mainframe = self._widget.page().mainFrame()
-
-        if mainframe is None:
-
-            raise browsertab.WebTabError("No frame focused!")
-
-
-
-        elems = []
-
-        frames = webkitelem.get_child_frames(mainframe)
-
-        for f in frames:
-
-            for elem in f.findAllElements(selector):
-
-                elems.append(webkitelem.WebKitElement(elem, tab=self._tab))
-
-
-
-        if only_visible:
-
-            # pylint: disable=protected-access
-
-            elems = [e for e in elems if e._is_visible(mainframe)]
-
-            # pylint: enable=protected-access
-
-
-
-        callback(elems)
-
-
-
-    def find_id(self, elem_id, callback):
-
-        def find_id_cb(elems):
-
-            """Call the real callback with the found elements."""
-
-            if not elems:
-
-                callback(None)
-
-            else:
-
-                callback(elems[0])
-
-
-
-        # Escape non-alphanumeric characters in the selector
-
-        # https://www.w3.org/TR/CSS2/syndata.html#value-def-identifier
-
-        elem_id = re.sub(r'[^a-zA-Z0-9_-]', r'\\\g<0>', elem_id)
-
-        self.find_css('#' + elem_id, find_id_cb)
-
-
-
-    def find_focused(self, callback):
-
-        frame = self._widget.page().currentFrame()
-
-        if frame is None:
-
-            callback(None)
-
-            return
-
-
-
-        elem = frame.findFirstElement('*:focus')
-
-        if elem.isNull():
-
-            callback(None)
-
-        else:
-
-            callback(webkitelem.WebKitElement(elem, tab=self._tab))
-
-
-
-    def find_at_pos(self, pos, callback):
-
-        assert pos.x() >= 0
-
-        assert pos.y() >= 0
-
-        frame = self._widget.page().frameAt(pos)
-
-        if frame is None:
-
-            # This happens when we click inside the webview, but not actually
-
-            # on the QWebPage - for example when clicking the scrollbar
-
-            # sometimes.
-
-            log.webview.debug("Hit test at {} but frame is None!".format(pos))
-
-            callback(None)
-
-            return
-
-
-
-        # You'd think we have to subtract frame.geometry().topLeft() from the
-
-        # position, but it seems QWebFrame::hitTestContent wants a position
-
-        # relative to the QWebView, not to the frame. This makes no sense to
-
-        # me, but it works this way.
-
-        hitresult = frame.hitTestContent(pos)
-
-        if hitresult.isNull():
-
-            # For some reason, the whole hit result can be null sometimes (e.g.
-
-            # on doodle menu links).
-
-            log.webview.debug("Hit test result is null!")
-
-            callback(None)
-
-            return
-
-
-
-        try:
-
-            elem = webkitelem.WebKitElement(hitresult.element(), tab=self._tab)
-
-        except webkitelem.IsNullError:
-
-            # For some reason, the hit result element can be a null element
-
-            # sometimes (e.g. when clicking the timetable fields on
-
-            # http://www.sbb.ch/ ).
-
-            log.webview.debug("Hit test result element is null!")
-
-            callback(None)
-
-            return
-
-
-
-        callback(elem)
-
-
-
-
-
-class WebKitAudio(browsertab.AbstractAudio):
-
-
-
-    """Dummy handling of audio status for QtWebKit."""
-
-
-
-    def set_muted(self, muted: bool):
-
-        raise browsertab.WebTabError('Muting is not supported on QtWebKit!')
-
-
-
-    def is_muted(self):
-
-        return False
-
-
-
-    def is_recently_audible(self):
-
-        return False
-
-
-
-
-
-class WebKitTab(browsertab.AbstractTab):
-
-
-
-    """A QtWebKit tab in the browser."""
-
-
-
-    def __init__(self, *, win_id, mode_manager, private, parent=None):
-
-        super().__init__(win_id=win_id, mode_manager=mode_manager,
-
-                         private=private, parent=parent)
-
-        widget = webview.WebView(win_id=win_id, tab_id=self.tab_id,
-
-                                 private=private, tab=self)
-
-        if private:
-
-            self._make_private(widget)
-
-        self.history = WebKitHistory(self)
-
-        self.scroller = WebKitScroller(self, parent=self)
-
-        self.caret = WebKitCaret(mode_manager=mode_manager,
-
-                                 tab=self, parent=self)
-
-        self.zoom = WebKitZoom(tab=self, parent=self)
-
-        self.search = WebKitSearch(parent=self)
-
-        self.printing = WebKitPrinting(tab=self)
-
-        self.elements = WebKitElements(tab=self)
-
-        self.action = WebKitAction(tab=self)
-
-        self.audio = WebKitAudio(parent=self)
-
-        # We're assigning settings in _set_widget
-
-        self.settings = webkitsettings.WebKitSettings(settings=None)
-
-        self._set_widget(widget)
-
-        self._connect_signals()
-
-        self.backend = usertypes.Backend.QtWebKit
-
-
-
-    def _install_event_filter(self):
-
-        self._widget.installEventFilter(self._mouse_event_filter)
-
-
-
-    def _make_private(self, widget):
-
-        settings = widget.settings()
-
-        settings.setAttribute(QWebSettings.PrivateBrowsingEnabled, True)
-
-
-
-    def openurl(self, url, *, predict=True):
-
-        self._openurl_prepare(url, predict=predict)
-
-        self._widget.openurl(url)
-
-
-
-    def url(self, requested=False):
-
-        frame = self._widget.page().mainFrame()
-
-        if requested:
-
-            return frame.requestedUrl()
-
-        else:
-
-            return frame.url()
-
-
-
-    def dump_async(self, callback, *, plain=False):
-
-        frame = self._widget.page().mainFrame()
-
-        if plain:
-
-            callback(frame.toPlainText())
-
-        else:
-
-            callback(frame.toHtml())
-
-
-
-    def run_js_async(self, code, callback=None, *, world=None):
-
-        if world is not None and world != usertypes.JsWorld.jseval:
-
-            log.webview.warning("Ignoring world ID {}".format(world))
-
-        document_element = self._widget.page().mainFrame().documentElement()
-
-        result = document_element.evaluateJavaScript(code)
-
-        if callback is not None:
-
-            callback(result)
-
-
-
-    def icon(self):
-
-        return self._widget.icon()
-
-
-
-    def shutdown(self):
-
-        self._widget.shutdown()
-
-
-
-    def reload(self, *, force=False):
-
-        if force:
-
-            action = QWebPage.ReloadAndBypassCache
-
-        else:
-
-            action = QWebPage.Reload
-
-        self._widget.triggerPageAction(action)
-
-
-
-    def stop(self):
-
-        self._widget.stop()
-
-
-
-    def title(self):
-
-        return self._widget.title()
-
-
-
-    def clear_ssl_errors(self):
-
-        self.networkaccessmanager().clear_all_ssl_errors()
-
-
-
-    def key_press(self, key, modifier=Qt.NoModifier):
-
-        press_evt = QKeyEvent(QEvent.KeyPress, key, modifier, 0, 0, 0)
-
-        release_evt = QKeyEvent(QEvent.KeyRelease, key, modifier,
-
-                                0, 0, 0)
-
-        self.send_event(press_evt)
-
-        self.send_event(release_evt)
-
-
-
-    @pyqtSlot()
-
-    def _on_history_trigger(self):
-
-        url = self.url()
-
-        requested_url = self.url(requested=True)
-
-        self.add_history_item.emit(url, requested_url, self.title())
-
-
-
-    def set_html(self, html, base_url=QUrl()):
-
-        self._widget.setHtml(html, base_url)
-
-
-
-    def networkaccessmanager(self):
-
-        return self._widget.page().networkAccessManager()
-
-
-
-    def user_agent(self):
-
-        page = self._widget.page()
-
-        return page.userAgentForUrl(self.url())
-
-
-
-    @pyqtSlot()
-
-    def _on_load_started(self):
-
-        super()._on_load_started()
-
-        self.networkaccessmanager().netrc_used = False
-
-        # Make sure the icon is cleared when navigating to a page without one.
-
-        self.icon_changed.emit(QIcon())
-
-
-
-    @pyqtSlot()
-
-    def _on_frame_load_finished(self):
-
-        """Make sure we emit an appropriate status when loading finished.
-
-
-
-        While Qt has a bool "ok" attribute for loadFinished, it always is True
-
-        when using error pages... See
-
-        https://github.com/qutebrowser/qutebrowser/issues/84
+    def _service_client_credentials(self, scopes, user_email_domain):
 
         """
 
-        self._on_load_finished(not self._widget.page().error_occurred)
+        Return a configured service client credentials for the API.
+
+        """
+
+        try:
+
+            from google.oauth2 import service_account
+
+        except:
+
+            raise ImportError(
+
+                "Could not import google.oauth2's service_account,"
+
+                "you may need to run pip install oauthenticator[googlegroups] or not declare google groups"
+
+            )
 
 
 
-    @pyqtSlot()
+        gsuite_administrator_email = "{}@{}".format(self.gsuite_administrator[user_email_domain], user_email_domain)
 
-    def _on_webkit_icon_changed(self):
+        self.log.debug("scopes are %s, user_email_domain is %s", scopes, user_email_domain)
 
-        """Emit iconChanged with a QIcon like QWebEngineView does."""
+        credentials = service_account.Credentials.from_service_account_file(
 
-        if sip.isdeleted(self._widget):
+            self.google_service_account_keys[user_email_domain],
 
-            log.webview.debug("Got _on_webkit_icon_changed for deleted view!")
+            scopes=scopes
 
-            return
-
-        self.icon_changed.emit(self._widget.icon())
+        )
 
 
 
-    @pyqtSlot(QWebFrame)
-
-    def _on_frame_created(self, frame):
-
-        """Connect the contentsSizeChanged signal of each frame."""
-
-        # FIXME:qtwebengine those could theoretically regress:
-
-        # https://github.com/qutebrowser/qutebrowser/issues/152
-
-        # https://github.com/qutebrowser/qutebrowser/issues/263
-
-        frame.contentsSizeChanged.connect(self._on_contents_size_changed)
+        credentials = credentials.with_subject(gsuite_administrator_email)
 
 
 
-    @pyqtSlot(QSize)
-
-    def _on_contents_size_changed(self, size):
-
-        self.contents_size_changed.emit(QSizeF(size))
+        return credentials
 
 
 
-    @pyqtSlot(usertypes.NavigationRequest)
+    def _service_client(self, service_name, service_version, credentials, http=None):
 
-    def _on_navigation_request(self, navigation):
+        """
 
-        super()._on_navigation_request(navigation)
+        Return a configured service client for the API.
 
-        if not navigation.accepted:
+        """
 
-            return
+        try:
+
+            from googleapiclient.discovery import build
+
+        except:
+
+            raise ImportError(
+
+                "Could not import googleapiclient.discovery's build,"
+
+                "you may need to run pip install oauthenticator[googlegroups] or not declare google groups"
+
+            )
 
 
 
-        log.webview.debug("target {} override {}".format(
-
-            self.data.open_target, self.data.override_target))
+        self.log.debug("service_name is %s, service_version is %s", service_name, service_version)
 
 
 
-        if self.data.override_target is not None:
+        return build(
 
-            target = self.data.override_target
+            serviceName=service_name,
 
-            self.data.override_target = None
+            version=service_version,
+
+            credentials=credentials,
+
+            cache_discovery=False,
+
+            http=http)
+
+
+
+    async def _google_groups_for_user(self, user_email, credentials, http=None):
+
+        """
+
+        Return google groups a given user is a member of
+
+        """
+
+        service = self._service_client(
+
+            service_name='admin',
+
+            service_version='directory_v1',
+
+            credentials=credentials,
+
+            http=http)
+
+
+
+        results = service.groups().list(userKey=user_email).execute()
+
+        results = [ g['email'].split('@')[0] for g in results.get('groups', [{'email': None}]) ]
+
+        self.log.debug("user_email %s is a member of %s", user_email, results)
+
+        return results
+
+
+
+    async def _add_google_groups_info(self, user_info, google_groups=None):
+
+        user_email_domain=user_info['auth_state']['google_user']['hd']
+
+        user_email=user_info['auth_state']['google_user']['email']
+
+        if google_groups is None:
+
+            credentials = self._service_client_credentials(
+
+                    scopes=['%s/auth/admin.directory.group.readonly' % (self.google_api_url)],
+
+                    user_email_domain=user_email_domain)
+
+            google_groups = await self._google_groups_for_user(
+
+                    user_email=user_email,
+
+                    credentials=credentials)
+
+        user_info['auth_state']['google_user']['google_groups'] = google_groups
+
+
+
+        # Check if user is a member of any admin groups.
+
+        if self.admin_google_groups:
+
+            is_admin = check_user_in_groups(google_groups, self.admin_google_groups[user_email_domain])
+
+        # Check if user is a member of any allowed groups.
+
+        user_in_group = check_user_in_groups(google_groups, self.allowed_google_groups[user_email_domain])
+
+
+
+        if self.admin_google_groups and (is_admin or user_in_group):
+
+            user_info['admin'] = is_admin
+
+            return user_info
+
+        elif user_in_group:
+
+            return user_info
 
         else:
 
-            target = self.data.open_target
+            return None
 
 
 
-        if (navigation.navigation_type == navigation.Type.link_clicked and
 
-                target != usertypes.ClickTarget.normal):
 
-            tab = shared.get_tab(self.win_id, target)
+class LocalGoogleOAuthenticator(LocalAuthenticator, GoogleOAuthenticator):
 
-            tab.openurl(navigation.url)
-
-            self.data.open_target = usertypes.ClickTarget.normal
-
-            navigation.accepted = False
+    """A version that mixes in local system user creation"""
 
 
 
-        if navigation.is_main_frame:
-
-            self.settings.update_for_url(navigation.url)
-
-
-
-    @pyqtSlot('QNetworkReply*')
-
-    def _on_ssl_errors(self, reply):
-
-        self._insecure_hosts.add(reply.url().host())
-
-
-
-    def _connect_signals(self):
-
-        view = self._widget
-
-        page = view.page()
-
-        frame = page.mainFrame()
-
-        page.windowCloseRequested.connect(self.window_close_requested)
-
-        page.linkHovered.connect(self.link_hovered)
-
-        page.loadProgress.connect(self._on_load_progress)
-
-        frame.loadStarted.connect(self._on_load_started)
-
-        view.scroll_pos_changed.connect(self.scroller.perc_changed)
-
-        view.titleChanged.connect(self.title_changed)
-
-        view.urlChanged.connect(self._on_url_changed)
-
-        view.shutting_down.connect(self.shutting_down)
-
-        page.networkAccessManager().sslErrors.connect(self._on_ssl_errors)
-
-        frame.loadFinished.connect(self._on_frame_load_finished)
-
-        view.iconChanged.connect(self._on_webkit_icon_changed)
-
-        page.frameCreated.connect(self._on_frame_created)
-
-        frame.contentsSizeChanged.connect(self._on_contents_size_changed)
-
-        frame.initialLayoutCompleted.connect(self._on_history_trigger)
-
-        page.navigation_request.connect(self._on_navigation_request)
-
-
-
-    def event_target(self):
-
-        return self._widget
+    pass

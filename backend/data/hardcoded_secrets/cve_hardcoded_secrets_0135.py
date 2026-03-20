@@ -2,380 +2,828 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# Author: Trevor Perrin
+import os
 
-# See the LICENSE file for legal information regarding use of this file.
+import re
 
-
-
-"""Factory functions for asymmetric cryptography."""
+import urllib
 
 
 
-from .compat import *
+from django.conf import settings
+
+from django.contrib.auth import SESSION_KEY, REDIRECT_FIELD_NAME
+
+from django.contrib.auth.forms import AuthenticationForm
+
+from django.contrib.sites.models import Site, RequestSite
+
+from django.contrib.auth.models import User
+
+from django.test import TestCase
+
+from django.core import mail
+
+from django.core.urlresolvers import reverse
+
+from django.http import QueryDict
 
 
 
-from .rsakey import RSAKey
-
-from .python_rsakey import Python_RSAKey
-
-from tlslite.utils import cryptomath
-
-
-
-if cryptomath.m2cryptoLoaded:
-
-    from .openssl_rsakey import OpenSSL_RSAKey
-
-
-
-if cryptomath.pycryptoLoaded:
-
-    from .pycrypto_rsakey import PyCrypto_RSAKey
-
-
-
-# **************************************************************************
-
-# Factory Functions for RSA Keys
-
-# **************************************************************************
-
-
-
-def generateRSAKey(bits, implementations=["openssl", "python"]):
-
-    """Generate an RSA key with the specified bit length.
-
-
-
-    :type bits: int
-
-    :param bits: Desired bit length of the new key's modulus.
-
-
-
-    :rtype: ~tlslite.utils.rsakey.RSAKey
-
-    :returns: A new RSA private key.
+class AuthViewsTestCase(TestCase):
 
     """
 
-    for implementation in implementations:
-
-        if implementation == "openssl" and cryptomath.m2cryptoLoaded:
-
-            return OpenSSL_RSAKey.generate(bits)
-
-        elif implementation == "python":
-
-            return Python_RSAKey.generate(bits)
-
-    raise ValueError("No acceptable implementations")
-
-
-
-#Parse as an OpenSSL or Python key
-
-def parsePEMKey(s, private=False, public=False, passwordCallback=None,
-
-                implementations=["openssl", "python"]):
-
-    """Parse a PEM-format key.
-
-
-
-    The PEM format is used by OpenSSL and other tools.  The
-
-    format is typically used to store both the public and private
-
-    components of a key.  For example::
-
-
-
-       -----BEGIN RSA PRIVATE KEY-----
-
-        MIICXQIBAAKBgQDYscuoMzsGmW0pAYsmyHltxB2TdwHS0dImfjCMfaSDkfLdZY5+
-
-        dOWORVns9etWnr194mSGA1F0Pls/VJW8+cX9+3vtJV8zSdANPYUoQf0TP7VlJxkH
-
-        dSRkUbEoz5bAAs/+970uos7n7iXQIni+3erUTdYEk2iWnMBjTljfgbK/dQIDAQAB
-
-        AoGAJHoJZk75aKr7DSQNYIHuruOMdv5ZeDuJvKERWxTrVJqE32/xBKh42/IgqRrc
-
-        esBN9ZregRCd7YtxoL+EVUNWaJNVx2mNmezEznrc9zhcYUrgeaVdFO2yBF1889zO
-
-        gCOVwrO8uDgeyj6IKa25H6c1N13ih/o7ZzEgWbGG+ylU1yECQQDv4ZSJ4EjSh/Fl
-
-        aHdz3wbBa/HKGTjC8iRy476Cyg2Fm8MZUe9Yy3udOrb5ZnS2MTpIXt5AF3h2TfYV
-
-        VoFXIorjAkEA50FcJmzT8sNMrPaV8vn+9W2Lu4U7C+K/O2g1iXMaZms5PC5zV5aV
-
-        CKXZWUX1fq2RaOzlbQrpgiolhXpeh8FjxwJBAOFHzSQfSsTNfttp3KUpU0LbiVvv
-
-        i+spVSnA0O4rq79KpVNmK44Mq67hsW1P11QzrzTAQ6GVaUBRv0YS061td1kCQHnP
-
-        wtN2tboFR6lABkJDjxoGRvlSt4SOPr7zKGgrWjeiuTZLHXSAnCY+/hr5L9Q3ZwXG
-
-        6x6iBdgLjVIe4BZQNtcCQQDXGv/gWinCNTN3MPWfTW/RGzuMYVmyBFais0/VrgdH
-
-        h1dLpztmpQqfyH/zrBXQ9qL/zR4ojS6XYneO/U18WpEe
-
-        -----END RSA PRIVATE KEY-----
-
-
-
-    To generate a key like this with OpenSSL, run::
-
-
-
-        openssl genrsa 2048 > key.pem
-
-
-
-    This format also supports password-encrypted private keys.  TLS
-
-    Lite can only handle password-encrypted private keys when OpenSSL
-
-    and M2Crypto are installed.  In this case, passwordCallback will be
-
-    invoked to query the user for the password.
-
-
-
-    :type s: str
-
-    :param s: A string containing a PEM-encoded public or private key.
-
-
-
-    :type private: bool
-
-    :param private: If True, a :py:class:`SyntaxError` will be raised if the
-
-        private key component is not present.
-
-
-
-    :type public: bool
-
-    :param public: If True, the private key component (if present) will
-
-        be discarded, so this function will always return a public key.
-
-
-
-    :type passwordCallback: callable
-
-    :param passwordCallback: This function will be called, with no
-
-        arguments, if the PEM-encoded private key is password-encrypted.
-
-        The callback should return the password string.  If the password is
-
-        incorrect, SyntaxError will be raised.  If no callback is passed
-
-        and the key is password-encrypted, a prompt will be displayed at
-
-        the console.
-
-
-
-    :rtype: ~tlslite.utils.rsakey.RSAKey
-
-    :returns: An RSA key.
-
-
-
-    :raises SyntaxError: If the key is not properly formatted.
+    Helper base class for all the follow test cases.
 
     """
 
-    for implementation in implementations:
+    fixtures = ['authtestdata.json']
 
-        if implementation == "openssl" and cryptomath.m2cryptoLoaded:
-
-            key = OpenSSL_RSAKey.parse(s, passwordCallback)
-
-            break
-
-        elif implementation == "python":
-
-            key = Python_RSAKey.parsePEM(s)
-
-            break
-
-    else:
-
-        raise ValueError("No acceptable implementations")
+    urls = 'django.contrib.auth.tests.urls'
 
 
 
-    return _parseKeyHelper(key, private, public)
+    def setUp(self):
+
+        self.old_LANGUAGES = settings.LANGUAGES
+
+        self.old_LANGUAGE_CODE = settings.LANGUAGE_CODE
+
+        settings.LANGUAGES = (('en', 'English'),)
+
+        settings.LANGUAGE_CODE = 'en'
+
+        self.old_TEMPLATE_DIRS = settings.TEMPLATE_DIRS
+
+        settings.TEMPLATE_DIRS = (
+
+            os.path.join(os.path.dirname(__file__), 'templates'),
+
+        )
 
 
 
+    def tearDown(self):
 
+        settings.LANGUAGES = self.old_LANGUAGES
 
-def _parseKeyHelper(key, private, public):
+        settings.LANGUAGE_CODE = self.old_LANGUAGE_CODE
 
-    if private:
-
-        if not key.hasPrivateKey():
-
-            raise SyntaxError("Not a private key!")
-
-
-
-    if public:
-
-        return _createPublicKey(key)
+        settings.TEMPLATE_DIRS = self.old_TEMPLATE_DIRS
 
 
 
-    if private:
+    def login(self, password='password'):
 
-        if hasattr(key, "d"):
+        response = self.client.post('/login/', {
 
-            return _createPrivateKey(key)
+            'username': 'testclient',
+
+            'password': password
+
+            }
+
+        )
+
+        self.assertEqual(response.status_code, 302)
+
+        self.assertTrue(response['Location'].endswith(settings.LOGIN_REDIRECT_URL))
+
+        self.assertTrue(SESSION_KEY in self.client.session)
+
+
+
+class PasswordResetTest(AuthViewsTestCase):
+
+
+
+    def test_email_not_found(self):
+
+        "Error is raised if the provided email address isn't currently registered"
+
+        response = self.client.get('/password_reset/')
+
+        self.assertEqual(response.status_code, 200)
+
+        response = self.client.post('/password_reset/', {'email': 'not_a_real_email@email.com'})
+
+        self.assertContains(response, "That e-mail address doesn&#39;t have an associated user account")
+
+        self.assertEqual(len(mail.outbox), 0)
+
+
+
+    def test_email_found(self):
+
+        "Email is sent if a valid email address is provided for password reset"
+
+        response = self.client.post('/password_reset/', {'email': 'staffmember@example.com'})
+
+        self.assertEqual(response.status_code, 302)
+
+        self.assertEqual(len(mail.outbox), 1)
+
+        self.assertTrue("http://" in mail.outbox[0].body)
+
+        self.assertEqual(settings.DEFAULT_FROM_EMAIL, mail.outbox[0].from_email)
+
+
+
+    def test_email_found_custom_from(self):
+
+        "Email is sent if a valid email address is provided for password reset when a custom from_email is provided."
+
+        response = self.client.post('/password_reset_from_email/', {'email': 'staffmember@example.com'})
+
+        self.assertEqual(response.status_code, 302)
+
+        self.assertEqual(len(mail.outbox), 1)
+
+        self.assertEqual("staffmember@example.com", mail.outbox[0].from_email)
+
+
+
+    def _test_confirm_start(self):
+
+        # Start by creating the email
+
+        response = self.client.post('/password_reset/', {'email': 'staffmember@example.com'})
+
+        self.assertEqual(response.status_code, 302)
+
+        self.assertEqual(len(mail.outbox), 1)
+
+        return self._read_signup_email(mail.outbox[0])
+
+
+
+    def _read_signup_email(self, email):
+
+        urlmatch = re.search(r"https?://[^/]*(/.*reset/\S*)", email.body)
+
+        self.assertTrue(urlmatch is not None, "No URL found in sent email")
+
+        return urlmatch.group(), urlmatch.groups()[0]
+
+
+
+    def test_confirm_valid(self):
+
+        url, path = self._test_confirm_start()
+
+        response = self.client.get(path)
+
+        # redirect to a 'complete' page:
+
+        self.assertEqual(response.status_code, 200)
+
+        self.assertTrue("Please enter your new password" in response.content)
+
+
+
+    def test_confirm_invalid(self):
+
+        url, path = self._test_confirm_start()
+
+        # Let's munge the token in the path, but keep the same length,
+
+        # in case the URLconf will reject a different length.
+
+        path = path[:-5] + ("0"*4) + path[-1]
+
+
+
+        response = self.client.get(path)
+
+        self.assertEqual(response.status_code, 200)
+
+        self.assertTrue("The password reset link was invalid" in response.content)
+
+
+
+    def test_confirm_invalid_user(self):
+
+        # Ensure that we get a 200 response for a non-existant user, not a 404
+
+        response = self.client.get('/reset/123456-1-1/')
+
+        self.assertEqual(response.status_code, 200)
+
+        self.assertTrue("The password reset link was invalid" in response.content)
+
+
+
+    def test_confirm_overflow_user(self):
+
+        # Ensure that we get a 200 response for a base36 user id that overflows int
+
+        response = self.client.get('/reset/zzzzzzzzzzzzz-1-1/')
+
+        self.assertEqual(response.status_code, 200)
+
+        self.assertTrue("The password reset link was invalid" in response.content)
+
+
+
+    def test_confirm_invalid_post(self):
+
+        # Same as test_confirm_invalid, but trying
+
+        # to do a POST instead.
+
+        url, path = self._test_confirm_start()
+
+        path = path[:-5] + ("0"*4) + path[-1]
+
+
+
+        response = self.client.post(path, {'new_password1': 'anewpassword',
+
+                                           'new_password2':' anewpassword'})
+
+        # Check the password has not been changed
+
+        u = User.objects.get(email='staffmember@example.com')
+
+        self.assertTrue(not u.check_password("anewpassword"))
+
+
+
+    def test_confirm_complete(self):
+
+        url, path = self._test_confirm_start()
+
+        response = self.client.post(path, {'new_password1': 'anewpassword',
+
+                                           'new_password2': 'anewpassword'})
+
+        # It redirects us to a 'complete' page:
+
+        self.assertEqual(response.status_code, 302)
+
+        # Check the password has been changed
+
+        u = User.objects.get(email='staffmember@example.com')
+
+        self.assertTrue(u.check_password("anewpassword"))
+
+
+
+        # Check we can't use the link again
+
+        response = self.client.get(path)
+
+        self.assertEqual(response.status_code, 200)
+
+        self.assertTrue("The password reset link was invalid" in response.content)
+
+
+
+    def test_confirm_different_passwords(self):
+
+        url, path = self._test_confirm_start()
+
+        response = self.client.post(path, {'new_password1': 'anewpassword',
+
+                                           'new_password2':' x'})
+
+        self.assertEqual(response.status_code, 200)
+
+        self.assertTrue("The two password fields didn&#39;t match" in response.content)
+
+
+
+class ChangePasswordTest(AuthViewsTestCase):
+
+
+
+    def fail_login(self, password='password'):
+
+        response = self.client.post('/login/', {
+
+            'username': 'testclient',
+
+            'password': password
+
+            }
+
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        self.assertTrue("Please enter a correct username and password. Note that both fields are case-sensitive." in response.content)
+
+
+
+    def logout(self):
+
+        response = self.client.get('/logout/')
+
+
+
+    def test_password_change_fails_with_invalid_old_password(self):
+
+        self.login()
+
+        response = self.client.post('/password_change/', {
+
+            'old_password': 'donuts',
+
+            'new_password1': 'password1',
+
+            'new_password2': 'password1',
+
+            }
+
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        self.assertTrue("Your old password was entered incorrectly. Please enter it again." in response.content)
+
+
+
+    def test_password_change_fails_with_mismatched_passwords(self):
+
+        self.login()
+
+        response = self.client.post('/password_change/', {
+
+            'old_password': 'password',
+
+            'new_password1': 'password1',
+
+            'new_password2': 'donuts',
+
+            }
+
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        self.assertTrue("The two password fields didn&#39;t match." in response.content)
+
+
+
+    def test_password_change_succeeds(self):
+
+        self.login()
+
+        response = self.client.post('/password_change/', {
+
+            'old_password': 'password',
+
+            'new_password1': 'password1',
+
+            'new_password2': 'password1',
+
+            }
+
+        )
+
+        self.assertEqual(response.status_code, 302)
+
+        self.assertTrue(response['Location'].endswith('/password_change/done/'))
+
+        self.fail_login()
+
+        self.login(password='password1')
+
+
+
+class LoginTest(AuthViewsTestCase):
+
+
+
+    def test_current_site_in_context_after_login(self):
+
+        response = self.client.get(reverse('django.contrib.auth.views.login'))
+
+        self.assertEqual(response.status_code, 200)
+
+        if Site._meta.installed:
+
+            site = Site.objects.get_current()
+
+            self.assertEqual(response.context['site'], site)
+
+            self.assertEqual(response.context['site_name'], site.name)
 
         else:
 
-            return key
+            self.assertIsInstance(response.context['site'], RequestSite)
 
+        self.assertTrue(isinstance(response.context['form'], AuthenticationForm),
 
+                     'Login form is not an AuthenticationForm')
 
-    return key
 
 
+    def test_security_check(self, password='password'):
 
-def parseAsPublicKey(s):
+        login_url = reverse('django.contrib.auth.views.login')
 
-    """Parse a PEM-formatted public key.
 
 
+        # Those URLs should not pass the security check
 
-    :type s: str
+        for bad_url in ('http://example.com',
 
-    :param s: A string containing a PEM-encoded public or private key.
+                        'https://example.com',
 
+                        'ftp://exampel.com',
 
+                        '//example.com'):
 
-    :rtype: ~tlslite.utils.rsakey.RSAKey
 
-    :returns: An RSA public key.
 
+            nasty_url = '%(url)s?%(next)s=%(bad_url)s' % {
 
+                'url': login_url,
 
-    :raises SyntaxError: If the key is not properly formatted.
+                'next': REDIRECT_FIELD_NAME,
 
-    """
+                'bad_url': urllib.quote(bad_url)
 
-    return parsePEMKey(s, public=True)
+            }
 
+            response = self.client.post(nasty_url, {
 
+                'username': 'testclient',
 
-def parsePrivateKey(s):
+                'password': password,
 
-    """Parse a PEM-formatted private key.
+                }
 
+            )
 
+            self.assertEqual(response.status_code, 302)
 
-    :type s: str
+            self.assertFalse(bad_url in response['Location'],
 
-    :param s: A string containing a PEM-encoded private key.
+                             "%s should be blocked" % bad_url)
 
 
 
-    :rtype: ~tlslite.utils.rsakey.RSAKey
+        # These URLs *should* still pass the security check
 
-    :returns: An RSA private key.
+        for good_url in ('/view/?param=http://example.com',
 
+                         '/view/?param=https://example.com',
 
+                         '/view?param=ftp://exampel.com',
 
-    :raises SyntaxError: If the key is not properly formatted.
+                         'view/?param=//example.com',
 
-    """
+                         'https:///',
 
-    return parsePEMKey(s, private=True)
+                         '//testserver/',
 
+                         '/url%20with%20spaces/', # see ticket #12534
 
+                         ):
 
-def _createPublicKey(key):
+            safe_url = '%(url)s?%(next)s=%(good_url)s' % {
 
-    """
+                'url': login_url,
 
-    Create a new public key.  Discard any private component,
+                'next': REDIRECT_FIELD_NAME,
 
-    and return the most efficient key possible.
+                'good_url': urllib.quote(good_url)
 
-    """
+            }
 
-    if not isinstance(key, RSAKey):
+            response = self.client.post(safe_url, {
 
-        raise AssertionError()
+                    'username': 'testclient',
 
-    return _createPublicRSAKey(key.n, key.e)
+                    'password': password,
 
+                }
 
+            )
 
-def _createPrivateKey(key):
+            self.assertEqual(response.status_code, 302)
 
-    """
+            self.assertTrue(good_url in response['Location'],
 
-    Create a new private key.  Return the most efficient key possible.
+                            "%s should be allowed" % good_url)
 
-    """
 
-    if not isinstance(key, RSAKey):
 
-        raise AssertionError()
 
-    if not key.hasPrivateKey():
 
-        raise AssertionError()
+class LoginURLSettings(AuthViewsTestCase):
 
-    return _createPrivateRSAKey(key.n, key.e, key.d, key.p, key.q, key.dP,
+    urls = 'django.contrib.auth.tests.urls'
 
-                                key.dQ, key.qInv)
 
 
+    def setUp(self):
 
-def _createPublicRSAKey(n, e, implementations = ["openssl", "pycrypto",
+        super(LoginURLSettings, self).setUp()
 
-                                                "python"]):
+        self.old_LOGIN_URL = settings.LOGIN_URL
 
-    for implementation in implementations:
 
-        if implementation == "openssl" and cryptomath.m2cryptoLoaded:
 
-            return OpenSSL_RSAKey(n, e)
+    def tearDown(self):
 
-        elif implementation == "pycrypto" and cryptomath.pycryptoLoaded:
+        super(LoginURLSettings, self).tearDown()
 
-            return PyCrypto_RSAKey(n, e)
+        settings.LOGIN_URL = self.old_LOGIN_URL
 
-        elif implementation == "python":
 
-            return Python_RSAKey(n, e)
 
-    raise ValueError("No acceptable implementations")
+    def get_login_required_url(self, login_url):
 
+        settings.LOGIN_URL = login_url
 
+        response = self.client.get('/login_required/')
 
-def _createPrivateRSAKey(n, e, d, p, q, dP, dQ, qInv,
+        self.assertEqual(response.status_code, 302)
 
-                        implementations = ["pycrypto", "python"]):
+        return response['Location']
 
-    for implementation in implementations:
 
-        if implementation == "pycrypto" and cryptomath.pycryptoLoaded:
 
-            return PyCrypto_RSAKey(n, e, d, p, q, dP, dQ, qInv)
+    def test_standard_login_url(self):
 
-        elif implementation == "python":
+        login_url = '/login/'
 
-            return Python_RSAKey(n, e, d, p, q, dP, dQ, qInv)
+        login_required_url = self.get_login_required_url(login_url)
 
-    raise ValueError("No acceptable implementations")
+        querystring = QueryDict('', mutable=True)
+
+        querystring['next'] = '/login_required/'
+
+        self.assertEqual(login_required_url,
+
+             'http://testserver%s?%s' % (login_url, querystring.urlencode('/')))
+
+
+
+    def test_remote_login_url(self):
+
+        login_url = 'http://remote.example.com/login'
+
+        login_required_url = self.get_login_required_url(login_url)
+
+        querystring = QueryDict('', mutable=True)
+
+        querystring['next'] = 'http://testserver/login_required/'
+
+        self.assertEqual(login_required_url,
+
+                         '%s?%s' % (login_url, querystring.urlencode('/')))
+
+
+
+    def test_https_login_url(self):
+
+        login_url = 'https:///login/'
+
+        login_required_url = self.get_login_required_url(login_url)
+
+        querystring = QueryDict('', mutable=True)
+
+        querystring['next'] = 'http://testserver/login_required/'
+
+        self.assertEqual(login_required_url,
+
+                         '%s?%s' % (login_url, querystring.urlencode('/')))
+
+
+
+    def test_login_url_with_querystring(self):
+
+        login_url = '/login/?pretty=1'
+
+        login_required_url = self.get_login_required_url(login_url)
+
+        querystring = QueryDict('pretty=1', mutable=True)
+
+        querystring['next'] = '/login_required/'
+
+        self.assertEqual(login_required_url, 'http://testserver/login/?%s' %
+
+                         querystring.urlencode('/'))
+
+
+
+    def test_remote_login_url_with_next_querystring(self):
+
+        login_url = 'http://remote.example.com/login/'
+
+        login_required_url = self.get_login_required_url('%s?next=/default/' %
+
+                                                         login_url)
+
+        querystring = QueryDict('', mutable=True)
+
+        querystring['next'] = 'http://testserver/login_required/'
+
+        self.assertEqual(login_required_url, '%s?%s' % (login_url,
+
+                                                    querystring.urlencode('/')))
+
+
+
+
+
+class LogoutTest(AuthViewsTestCase):
+
+    urls = 'django.contrib.auth.tests.urls'
+
+
+
+    def confirm_logged_out(self):
+
+        self.assertTrue(SESSION_KEY not in self.client.session)
+
+
+
+    def test_logout_default(self):
+
+        "Logout without next_page option renders the default template"
+
+        self.login()
+
+        response = self.client.get('/logout/')
+
+        self.assertEqual(200, response.status_code)
+
+        self.assertTrue('Logged out' in response.content)
+
+        self.confirm_logged_out()
+
+
+
+    def test_14377(self):
+
+        # Bug 14377
+
+        self.login()
+
+        response = self.client.get('/logout/')
+
+        self.assertTrue('site' in response.context)
+
+
+
+    def test_logout_with_overridden_redirect_url(self):
+
+        # Bug 11223
+
+        self.login()
+
+        response = self.client.get('/logout/next_page/')
+
+        self.assertEqual(response.status_code, 302)
+
+        self.assertTrue(response['Location'].endswith('/somewhere/'))
+
+
+
+        response = self.client.get('/logout/next_page/?next=/login/')
+
+        self.assertEqual(response.status_code, 302)
+
+        self.assertTrue(response['Location'].endswith('/login/'))
+
+
+
+        self.confirm_logged_out()
+
+
+
+    def test_logout_with_next_page_specified(self):
+
+        "Logout with next_page option given redirects to specified resource"
+
+        self.login()
+
+        response = self.client.get('/logout/next_page/')
+
+        self.assertEqual(response.status_code, 302)
+
+        self.assertTrue(response['Location'].endswith('/somewhere/'))
+
+        self.confirm_logged_out()
+
+
+
+    def test_logout_with_redirect_argument(self):
+
+        "Logout with query string redirects to specified resource"
+
+        self.login()
+
+        response = self.client.get('/logout/?next=/login/')
+
+        self.assertEqual(response.status_code, 302)
+
+        self.assertTrue(response['Location'].endswith('/login/'))
+
+        self.confirm_logged_out()
+
+
+
+    def test_logout_with_custom_redirect_argument(self):
+
+        "Logout with custom query string redirects to specified resource"
+
+        self.login()
+
+        response = self.client.get('/logout/custom_query/?follow=/somewhere/')
+
+        self.assertEqual(response.status_code, 302)
+
+        self.assertTrue(response['Location'].endswith('/somewhere/'))
+
+        self.confirm_logged_out()
+
+
+
+    def test_security_check(self, password='password'):
+
+        logout_url = reverse('django.contrib.auth.views.logout')
+
+
+
+        # Those URLs should not pass the security check
+
+        for bad_url in ('http://example.com',
+
+                        'https://example.com',
+
+                        'ftp://exampel.com',
+
+                        '//example.com'
+
+                        ):
+
+            nasty_url = '%(url)s?%(next)s=%(bad_url)s' % {
+
+                'url': logout_url,
+
+                'next': REDIRECT_FIELD_NAME,
+
+                'bad_url': urllib.quote(bad_url)
+
+            }
+
+            self.login()
+
+            response = self.client.get(nasty_url)
+
+            self.assertEqual(response.status_code, 302)
+
+            self.assertFalse(bad_url in response['Location'],
+
+                             "%s should be blocked" % bad_url)
+
+            self.confirm_logged_out()
+
+
+
+        # These URLs *should* still pass the security check
+
+        for good_url in ('/view/?param=http://example.com',
+
+                         '/view/?param=https://example.com',
+
+                         '/view?param=ftp://exampel.com',
+
+                         'view/?param=//example.com',
+
+                         'https:///',
+
+                         '//testserver/',
+
+                         '/url%20with%20spaces/', # see ticket #12534
+
+                         ):
+
+            safe_url = '%(url)s?%(next)s=%(good_url)s' % {
+
+                'url': logout_url,
+
+                'next': REDIRECT_FIELD_NAME,
+
+                'good_url': urllib.quote(good_url)
+
+            }
+
+            self.login()
+
+            response = self.client.get(safe_url)
+
+            self.assertEqual(response.status_code, 302)
+
+            self.assertTrue(good_url in response['Location'],
+
+                            "%s should be allowed" % good_url)
+
+            self.confirm_logged_out()

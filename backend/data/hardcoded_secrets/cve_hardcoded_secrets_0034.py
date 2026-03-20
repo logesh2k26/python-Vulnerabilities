@@ -2,404 +2,726 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# Copyright (c) 2015, Hubert Kario
+# -*- coding: utf-8 -*-
 
-#
+from django.conf import settings
 
-# See the LICENSE file for legal information regarding use of this file.
 
-"""Various constant time functions for processing sensitive data"""
 
+from zerver.lib.test_classes import ZulipTestCase
 
+from zerver.lib.test_helpers import (
 
-from __future__ import division
+    use_s3_backend,
 
+    create_s3_buckets,
 
+    override_settings,
 
-from .compat import compatHMAC
+    get_test_image_file
 
-import hmac
+)
 
+from zerver.lib.upload import upload_backend, upload_emoji_image
 
+from zerver.lib.users import get_api_key
 
-def ct_lt_u32(val_a, val_b):
 
-    """
 
-    Returns 1 if val_a < val_b, 0 otherwise. Constant time.
+from io import StringIO
 
+import ujson
 
+import urllib
 
-    :type val_a: int
+import base64
 
-    :type val_b: int
 
-    :param val_a: an unsigned integer representable as a 32 bit value
 
-    :param val_b: an unsigned integer representable as a 32 bit value
+class ThumbnailTest(ZulipTestCase):
 
-    :rtype: int
 
-    """
 
-    val_a &= 0xffffffff
+    @use_s3_backend
 
-    val_b &= 0xffffffff
+    def test_s3_source_type(self) -> None:
 
+        def get_file_path_urlpart(uri: str, size: str='') -> str:
 
+            url_in_result = 'smart/filters:no_upscale()%s/%s/source_type/s3'
 
-    return (val_a^((val_a^val_b)|(((val_a-val_b)&0xffffffff)^val_b)))>>31
+            sharpen_filter = ''
 
+            if size:
 
+                url_in_result = '/%s/%s' % (size, url_in_result)
 
-def ct_gt_u32(val_a, val_b):
+                sharpen_filter = ':sharpen(0.5,0.2,true)'
 
-    """
+            hex_uri = base64.urlsafe_b64encode(uri.encode()).decode('utf-8')
 
-    Return 1 if val_a > val_b, 0 otherwise. Constant time.
+            return url_in_result % (sharpen_filter, hex_uri)
 
 
 
-    :type val_a: int
+        create_s3_buckets(
 
-    :type val_b: int
+            settings.S3_AUTH_UPLOADS_BUCKET,
 
-    :param val_a: an unsigned integer representable as a 32 bit value
+            settings.S3_AVATAR_BUCKET)
 
-    :param val_b: an unsigned integer representable as a 32 bit value
 
-    :rtype: int
 
-    """
+        self.login(self.example_email("hamlet"))
 
-    return ct_lt_u32(val_b, val_a)
+        fp = StringIO("zulip!")
 
+        fp.name = "zulip.jpeg"
 
 
-def ct_le_u32(val_a, val_b):
 
-    """
+        result = self.client_post("/json/user_uploads", {'file': fp})
 
-    Return 1 if val_a <= val_b, 0 otherwise. Constant time.
+        self.assert_json_success(result)
 
+        json = ujson.loads(result.content)
 
+        self.assertIn("uri", json)
 
-    :type val_a: int
+        uri = json["uri"]
 
-    :type val_b: int
+        base = '/user_uploads/'
 
-    :param val_a: an unsigned integer representable as a 32 bit value
+        self.assertEqual(base, uri[:len(base)])
 
-    :param val_b: an unsigned integer representable as a 32 bit value
 
-    :rtype: int
 
-    """
+        quoted_uri = urllib.parse.quote(uri[1:], safe='')
 
-    return 1 ^ ct_gt_u32(val_a, val_b)
 
 
+        # Test full size image.
 
-def ct_lsb_prop_u8(val):
+        result = self.client_get("/thumbnail?url=%s&size=full" % (quoted_uri))
 
-    """Propagate LSB to all 8 bits of the returned byte. Constant time."""
+        self.assertEqual(result.status_code, 302, result)
 
-    val &= 0x01
+        expected_part_url = get_file_path_urlpart(uri)
 
-    val |= val << 1
+        self.assertIn(expected_part_url, result.url)
 
-    val |= val << 2
 
-    val |= val << 4
 
-    return val
+        # Test thumbnail size.
 
+        result = self.client_get("/thumbnail?url=%s&size=thumbnail" % (quoted_uri))
 
+        self.assertEqual(result.status_code, 302, result)
 
-def ct_isnonzero_u32(val):
+        expected_part_url = get_file_path_urlpart(uri, '0x300')
 
-    """
+        self.assertIn(expected_part_url, result.url)
 
-    Returns 1 if val is != 0, 0 otherwise. Constant time.
 
 
+        # Test custom emoji urls in Zulip messages.
 
-    :type val: int
+        user_profile = self.example_user("hamlet")
 
-    :param val: an unsigned integer representable as a 32 bit value
+        image_file = get_test_image_file("img.png")
 
-    :rtype: int
+        file_name = "emoji.png"
 
-    """
 
-    val &= 0xffffffff
 
-    return (val|(-val&0xffffffff)) >> 31
+        upload_emoji_image(image_file, file_name, user_profile)
 
+        custom_emoji_url = upload_backend.get_emoji_url(file_name, user_profile.realm_id)
 
+        emoji_url_base = '/user_avatars/'
 
-def ct_neq_u32(val_a, val_b):
+        self.assertEqual(emoji_url_base, custom_emoji_url[:len(emoji_url_base)])
 
-    """
 
-    Return 1 if val_a != val_b, 0 otherwise. Constant time.
 
+        quoted_emoji_url = urllib.parse.quote(custom_emoji_url[1:], safe='')
 
 
-    :type val_a: int
 
-    :type val_b: int
+        # Test full size custom emoji image (for emoji link in messages case).
 
-    :param val_a: an unsigned integer representable as a 32 bit value
+        result = self.client_get("/thumbnail?url=%s&size=full" % (quoted_emoji_url))
 
-    :param val_b: an unsigned integer representable as a 32 bit value
+        self.assertEqual(result.status_code, 302, result)
 
-    :rtype: int
+        self.assertIn(custom_emoji_url, result.url)
 
-    """
 
-    val_a &= 0xffffffff
 
-    val_b &= 0xffffffff
+        # Tests the /api/v1/thumbnail api endpoint with standard API auth
 
+        self.logout()
 
+        result = self.api_get(
 
-    return (((val_a-val_b)&0xffffffff) | ((val_b-val_a)&0xffffffff)) >> 31
+            self.example_email("hamlet"),
 
+            '/thumbnail?url=%s&size=full' %
 
+            (quoted_uri,))
 
-def ct_eq_u32(val_a, val_b):
+        self.assertEqual(result.status_code, 302, result)
 
-    """
+        expected_part_url = get_file_path_urlpart(uri)
 
-    Return 1 if val_a == val_b, 0 otherwise. Constant time.
+        self.assertIn(expected_part_url, result.url)
 
 
 
-    :type val_a: int
+        # Test with another user trying to access image using thumbor.
 
-    :type val_b: int
+        self.login(self.example_email("iago"))
 
-    :param val_a: an unsigned integer representable as a 32 bit value
+        result = self.client_get("/thumbnail?url=%s&size=full" % (quoted_uri))
 
-    :param val_b: an unsigned integer representable as a 32 bit value
+        self.assertEqual(result.status_code, 403, result)
 
-    :rtype: int
+        self.assert_in_response("You are not authorized to view this file.", result)
 
-    """
 
-    return 1 ^ ct_neq_u32(val_a, val_b)
 
+    def test_external_source_type(self) -> None:
 
+        def run_test_with_image_url(image_url: str) -> None:
 
-def ct_check_cbc_mac_and_pad(data, mac, seqnumBytes, contentType, version):
+            # Test full size image.
 
-    """
+            self.login(self.example_email("hamlet"))
 
-    Check CBC cipher HMAC and padding. Close to constant time.
+            quoted_url = urllib.parse.quote(image_url, safe='')
 
+            encoded_url = base64.urlsafe_b64encode(image_url.encode()).decode('utf-8')
 
+            result = self.client_get("/thumbnail?url=%s&size=full" % (quoted_url))
 
-    :type data: bytearray
+            self.assertEqual(result.status_code, 302, result)
 
-    :param data: data with HMAC value to test and padding
+            expected_part_url = '/smart/filters:no_upscale()/' + encoded_url + '/source_type/external'
 
+            self.assertIn(expected_part_url, result.url)
 
 
-    :type mac: hashlib mac
 
-    :param mac: empty HMAC, initialised with a key
+            # Test thumbnail size.
 
+            result = self.client_get("/thumbnail?url=%s&size=thumbnail" % (quoted_url))
 
+            self.assertEqual(result.status_code, 302, result)
 
-    :type seqnumBytes: bytearray
+            expected_part_url = '/0x300/smart/filters:no_upscale():sharpen(0.5,0.2,true)/' + encoded_url + '/source_type/external'
 
-    :param seqnumBytes: TLS sequence number, used as input to HMAC
+            self.assertIn(expected_part_url, result.url)
 
 
 
-    :type contentType: int
+            # Test api endpoint with standard API authentication.
 
-    :param contentType: a single byte, used as input to HMAC
+            self.logout()
 
+            user_profile = self.example_user("hamlet")
 
+            result = self.api_get(user_profile.email,
 
-    :type version: tuple of int
+                                  "/thumbnail?url=%s&size=thumbnail" % (quoted_url,))
 
-    :param version: a tuple of two ints, used as input to HMAC and to guide
+            self.assertEqual(result.status_code, 302, result)
 
-        checking of padding
+            expected_part_url = '/0x300/smart/filters:no_upscale():sharpen(0.5,0.2,true)/' + encoded_url + '/source_type/external'
 
+            self.assertIn(expected_part_url, result.url)
 
 
-    :rtype: boolean
 
-    :returns: True if MAC and pad is ok, False otherwise
+            # Test api endpoint with legacy API authentication.
 
-    """
+            user_profile = self.example_user("hamlet")
 
-    assert version in ((3, 0), (3, 1), (3, 2), (3, 3))
+            result = self.client_get("/thumbnail?url=%s&size=thumbnail&api_key=%s" % (
 
+                quoted_url, get_api_key(user_profile)))
 
+            self.assertEqual(result.status_code, 302, result)
 
-    data_len = len(data)
+            expected_part_url = '/0x300/smart/filters:no_upscale():sharpen(0.5,0.2,true)/' + encoded_url + '/source_type/external'
 
-    if mac.digest_size + 1 > data_len: # data_len is public
+            self.assertIn(expected_part_url, result.url)
 
-        return False
 
 
+            # Test a second logged-in user; they should also be able to access it
 
-    # 0 - OK
+            user_profile = self.example_user("iago")
 
-    result = 0x00
+            result = self.client_get("/thumbnail?url=%s&size=thumbnail&api_key=%s" % (
 
+                quoted_url, get_api_key(user_profile)))
 
+            self.assertEqual(result.status_code, 302, result)
 
-    #
+            expected_part_url = '/0x300/smart/filters:no_upscale():sharpen(0.5,0.2,true)/' + encoded_url + '/source_type/external'
 
-    # check padding
+            self.assertIn(expected_part_url, result.url)
 
-    #
 
-    pad_length = data[data_len-1]
 
-    pad_start = data_len - pad_length - 1
+            # Test with another user trying to access image using thumbor.
 
-    pad_start = max(0, pad_start)
+            # File should be always accessible to user in case of external source
 
+            self.login(self.example_email("iago"))
 
+            result = self.client_get("/thumbnail?url=%s&size=full" % (quoted_url))
 
-    if version == (3, 0): # version is public
+            self.assertEqual(result.status_code, 302, result)
 
-        # in SSLv3 we can only check if pad is not longer than overall length
+            expected_part_url = '/smart/filters:no_upscale()/' + encoded_url + '/source_type/external'
 
+            self.assertIn(expected_part_url, result.url)
 
 
-        # subtract 1 for the pad length byte
 
-        mask = ct_lsb_prop_u8(ct_lt_u32(data_len-1, pad_length))
+        image_url = 'https://images.foobar.com/12345'
 
-        result |= mask
+        run_test_with_image_url(image_url)
 
-    else:
 
-        start_pos = max(0, data_len - 256)
 
-        for i in range(start_pos, data_len):
+        image_url = 'http://images.foobar.com/12345'
 
-            # if pad_start < i: mask = 0xff; else: mask = 0x00
+        run_test_with_image_url(image_url)
 
-            mask = ct_lsb_prop_u8(ct_le_u32(pad_start, i))
 
-            # if data[i] != pad_length and "inside_pad": result = False
 
-            result |= (data[i] ^ pad_length) & mask
+    def test_local_file_type(self) -> None:
 
+        def get_file_path_urlpart(uri: str, size: str='') -> str:
 
+            url_in_result = 'smart/filters:no_upscale()%s/%s/source_type/local_file'
 
-    #
+            sharpen_filter = ''
 
-    # check MAC
+            if size:
 
-    #
+                url_in_result = '/%s/%s' % (size, url_in_result)
 
+                sharpen_filter = ':sharpen(0.5,0.2,true)'
 
+            hex_uri = base64.urlsafe_b64encode(uri.encode()).decode('utf-8')
 
-    # real place where mac starts and data ends
+            return url_in_result % (sharpen_filter, hex_uri)
 
-    mac_start = pad_start - mac.digest_size
 
-    mac_start = max(0, mac_start)
 
+        self.login(self.example_email("hamlet"))
 
+        fp = StringIO("zulip!")
 
-    # place to start processing
+        fp.name = "zulip.jpeg"
 
-    start_pos = max(0, data_len - (256 + mac.digest_size)) // mac.block_size
 
-    start_pos *= mac.block_size
 
+        result = self.client_post("/json/user_uploads", {'file': fp})
 
+        self.assert_json_success(result)
 
-    # add start data
+        json = ujson.loads(result.content)
 
-    data_mac = mac.copy()
+        self.assertIn("uri", json)
 
-    data_mac.update(compatHMAC(seqnumBytes))
+        uri = json["uri"]
 
-    data_mac.update(compatHMAC(bytearray([contentType])))
+        base = '/user_uploads/'
 
-    if version != (3, 0): # version is public
+        self.assertEqual(base, uri[:len(base)])
 
-        data_mac.update(compatHMAC(bytearray([version[0]])))
 
-        data_mac.update(compatHMAC(bytearray([version[1]])))
 
-    data_mac.update(compatHMAC(bytearray([mac_start >> 8])))
+        # Test full size image.
 
-    data_mac.update(compatHMAC(bytearray([mac_start & 0xff])))
+        # We remove the forward slash infront of the `/user_uploads/` to match
 
-    data_mac.update(compatHMAC(data[:start_pos]))
+        # bugdown behaviour.
 
+        quoted_uri = urllib.parse.quote(uri[1:], safe='')
 
+        result = self.client_get("/thumbnail?url=%s&size=full" % (quoted_uri))
 
-    # don't check past the array end (already checked to be >= zero)
+        self.assertEqual(result.status_code, 302, result)
 
-    end_pos = data_len - mac.digest_size
+        expected_part_url = get_file_path_urlpart(uri)
 
+        self.assertIn(expected_part_url, result.url)
 
 
-    # calculate all possible
 
-    for i in range(start_pos, end_pos): # constant for given overall length
+        # Test thumbnail size.
 
-        cur_mac = data_mac.copy()
+        result = self.client_get("/thumbnail?url=%s&size=thumbnail" % (quoted_uri))
 
-        cur_mac.update(compatHMAC(data[start_pos:i]))
+        self.assertEqual(result.status_code, 302, result)
 
-        mac_compare = bytearray(cur_mac.digest())
+        expected_part_url = get_file_path_urlpart(uri, '0x300')
 
-        # compare the hash for real only if it's the place where mac is
+        self.assertIn(expected_part_url, result.url)
 
-        # supposed to be
 
-        mask = ct_lsb_prop_u8(ct_eq_u32(i, mac_start))
 
-        for j in range(0, mac.digest_size): # digest_size is public
+        # Test with a unicode filename.
 
-            result |= (data[i+j] ^ mac_compare[j]) & mask
+        fp = StringIO("zulip!")
 
+        fp.name = "μένει.jpg"
 
 
-    # return python boolean
 
-    return result == 0
+        result = self.client_post("/json/user_uploads", {'file': fp})
 
+        self.assert_json_success(result)
 
+        json = ujson.loads(result.content)
 
-if hasattr(hmac, 'compare_digest'):
+        self.assertIn("uri", json)
 
-    ct_compare_digest = hmac.compare_digest
+        uri = json["uri"]
 
-else:
 
-    def ct_compare_digest(val_a, val_b):
 
-        """Compares if string like objects are equal. Constant time."""
+        # We remove the forward slash infront of the `/user_uploads/` to match
 
-        if len(val_a) != len(val_b):
+        # bugdown behaviour.
 
-            return False
+        quoted_uri = urllib.parse.quote(uri[1:], safe='')
 
+        result = self.client_get("/thumbnail?url=%s&size=full" % (quoted_uri))
 
+        self.assertEqual(result.status_code, 302, result)
 
-        result = 0
+        expected_part_url = get_file_path_urlpart(uri)
 
-        for x, y in zip(val_a, val_b):
+        self.assertIn(expected_part_url, result.url)
 
-            result |= x ^ y
 
 
+        # Test custom emoji urls in Zulip messages.
 
-        return result == 0
+        user_profile = self.example_user("hamlet")
+
+        image_file = get_test_image_file("img.png")
+
+        file_name = "emoji.png"
+
+
+
+        upload_emoji_image(image_file, file_name, user_profile)
+
+        custom_emoji_url = upload_backend.get_emoji_url(file_name, user_profile.realm_id)
+
+        emoji_url_base = '/user_avatars/'
+
+        self.assertEqual(emoji_url_base, custom_emoji_url[:len(emoji_url_base)])
+
+
+
+        quoted_emoji_url = urllib.parse.quote(custom_emoji_url[1:], safe='')
+
+
+
+        # Test full size custom emoji image (for emoji link in messages case).
+
+        result = self.client_get("/thumbnail?url=%s&size=full" % (quoted_emoji_url))
+
+        self.assertEqual(result.status_code, 302, result)
+
+        self.assertIn(custom_emoji_url, result.url)
+
+
+
+        # Tests the /api/v1/thumbnail api endpoint with HTTP basic auth.
+
+        self.logout()
+
+        user_profile = self.example_user("hamlet")
+
+        result = self.api_get(
+
+            self.example_email("hamlet"),
+
+            '/thumbnail?url=%s&size=full' %
+
+            (quoted_uri,))
+
+        self.assertEqual(result.status_code, 302, result)
+
+        expected_part_url = get_file_path_urlpart(uri)
+
+        self.assertIn(expected_part_url, result.url)
+
+
+
+        # Tests the /api/v1/thumbnail api endpoint with ?api_key
+
+        # auth.
+
+        user_profile = self.example_user("hamlet")
+
+        result = self.client_get(
+
+            '/thumbnail?url=%s&size=full&api_key=%s' %
+
+            (quoted_uri, get_api_key(user_profile)))
+
+        self.assertEqual(result.status_code, 302, result)
+
+        expected_part_url = get_file_path_urlpart(uri)
+
+        self.assertIn(expected_part_url, result.url)
+
+
+
+        # Test with another user trying to access image using thumbor.
+
+        self.login(self.example_email("iago"))
+
+        result = self.client_get("/thumbnail?url=%s&size=full" % (quoted_uri))
+
+        self.assertEqual(result.status_code, 403, result)
+
+        self.assert_in_response("You are not authorized to view this file.", result)
+
+
+
+    @override_settings(THUMBOR_URL='127.0.0.1:9995')
+
+    def test_with_static_files(self) -> None:
+
+        self.login(self.example_email("hamlet"))
+
+        uri = '/static/images/cute/turtle.png'
+
+        quoted_uri = urllib.parse.quote(uri[1:], safe='')
+
+        result = self.client_get("/thumbnail?url=%s&size=full" % (quoted_uri))
+
+        self.assertEqual(result.status_code, 302, result)
+
+        self.assertEqual(uri, result.url)
+
+
+
+    def test_with_thumbor_disabled(self) -> None:
+
+        self.login(self.example_email("hamlet"))
+
+        fp = StringIO("zulip!")
+
+        fp.name = "zulip.jpeg"
+
+
+
+        result = self.client_post("/json/user_uploads", {'file': fp})
+
+        self.assert_json_success(result)
+
+        json = ujson.loads(result.content)
+
+        self.assertIn("uri", json)
+
+        uri = json["uri"]
+
+        base = '/user_uploads/'
+
+        self.assertEqual(base, uri[:len(base)])
+
+
+
+        quoted_uri = urllib.parse.quote(uri[1:], safe='')
+
+
+
+        with self.settings(THUMBOR_URL=''):
+
+            result = self.client_get("/thumbnail?url=%s&size=full" % (quoted_uri))
+
+        self.assertEqual(result.status_code, 302, result)
+
+        self.assertEqual(uri, result.url)
+
+
+
+        uri = 'https://www.google.com/images/srpr/logo4w.png'
+
+        quoted_uri = urllib.parse.quote(uri, safe='')
+
+        with self.settings(THUMBOR_URL=''):
+
+            result = self.client_get("/thumbnail?url=%s&size=full" % (quoted_uri))
+
+        self.assertEqual(result.status_code, 302, result)
+
+        self.assertEqual(uri, result.url)
+
+
+
+        uri = 'http://www.google.com/images/srpr/logo4w.png'
+
+        quoted_uri = urllib.parse.quote(uri, safe='')
+
+        with self.settings(THUMBOR_URL=''):
+
+            result = self.client_get("/thumbnail?url=%s&size=full" % (quoted_uri))
+
+        self.assertEqual(result.status_code, 302, result)
+
+        base = 'https://external-content.zulipcdn.net/external_content/7b6552b60c635e41e8f6daeb36d88afc4eabde79/687474703a2f2f7777772e676f6f676c652e636f6d2f696d616765732f737270722f6c6f676f34772e706e67'
+
+        self.assertEqual(base, result.url)
+
+
+
+    def test_with_different_THUMBOR_URL(self) -> None:
+
+        self.login(self.example_email("hamlet"))
+
+        fp = StringIO("zulip!")
+
+        fp.name = "zulip.jpeg"
+
+
+
+        result = self.client_post("/json/user_uploads", {'file': fp})
+
+        self.assert_json_success(result)
+
+        json = ujson.loads(result.content)
+
+        self.assertIn("uri", json)
+
+        uri = json["uri"]
+
+        base = '/user_uploads/'
+
+        self.assertEqual(base, uri[:len(base)])
+
+
+
+        quoted_uri = urllib.parse.quote(uri[1:], safe='')
+
+        hex_uri = base64.urlsafe_b64encode(uri.encode()).decode('utf-8')
+
+        with self.settings(THUMBOR_URL='http://test-thumborhost.com'):
+
+            result = self.client_get("/thumbnail?url=%s&size=full" % (quoted_uri))
+
+        self.assertEqual(result.status_code, 302, result)
+
+        base = 'http://test-thumborhost.com/'
+
+        self.assertEqual(base, result.url[:len(base)])
+
+        expected_part_url = '/smart/filters:no_upscale()/' + hex_uri + '/source_type/local_file'
+
+        self.assertIn(expected_part_url, result.url)
+
+
+
+    def test_with_different_sizes(self) -> None:
+
+        def get_file_path_urlpart(uri: str, size: str='') -> str:
+
+            url_in_result = 'smart/filters:no_upscale()%s/%s/source_type/local_file'
+
+            sharpen_filter = ''
+
+            if size:
+
+                url_in_result = '/%s/%s' % (size, url_in_result)
+
+                sharpen_filter = ':sharpen(0.5,0.2,true)'
+
+            hex_uri = base64.urlsafe_b64encode(uri.encode()).decode('utf-8')
+
+            return url_in_result % (sharpen_filter, hex_uri)
+
+
+
+        self.login(self.example_email("hamlet"))
+
+        fp = StringIO("zulip!")
+
+        fp.name = "zulip.jpeg"
+
+
+
+        result = self.client_post("/json/user_uploads", {'file': fp})
+
+        self.assert_json_success(result)
+
+        json = ujson.loads(result.content)
+
+        self.assertIn("uri", json)
+
+        uri = json["uri"]
+
+        base = '/user_uploads/'
+
+        self.assertEqual(base, uri[:len(base)])
+
+
+
+        # Test with size supplied as a query parameter.
+
+        # size=thumbnail should return a 0x300 sized image.
+
+        # size=full should return the original resolution image.
+
+        quoted_uri = urllib.parse.quote(uri[1:], safe='')
+
+        result = self.client_get("/thumbnail?url=%s&size=thumbnail" % (quoted_uri))
+
+        self.assertEqual(result.status_code, 302, result)
+
+        expected_part_url = get_file_path_urlpart(uri, '0x300')
+
+        self.assertIn(expected_part_url, result.url)
+
+
+
+        result = self.client_get("/thumbnail?url=%s&size=full" % (quoted_uri))
+
+        self.assertEqual(result.status_code, 302, result)
+
+        expected_part_url = get_file_path_urlpart(uri)
+
+        self.assertIn(expected_part_url, result.url)
+
+
+
+        # Test with size supplied as a query parameter where size is anything
+
+        # else than 'full' or 'thumbnail'. Result should be an error message.
+
+        result = self.client_get("/thumbnail?url=%s&size=480x360" % (quoted_uri))
+
+        self.assertEqual(result.status_code, 403, result)
+
+        self.assert_in_response("Invalid size.", result)
+
+
+
+        # Test with no size param supplied. In this case as well we show an
+
+        # error message.
+
+        result = self.client_get("/thumbnail?url=%s" % (quoted_uri))
+
+        self.assertEqual(result.status_code, 400, "Missing 'size' argument")

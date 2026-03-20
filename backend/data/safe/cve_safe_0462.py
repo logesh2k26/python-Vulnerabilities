@@ -2,1754 +2,1354 @@
 # Safety: safe
 # Category: safe
 
-# vim: ft=python fileencoding=utf-8 sts=4 sw=4 et:
+import difflib
 
 
 
-# Copyright 2016-2019 Florian Bruhin (The Compiler) <mail@qutebrowser.org>
+from bs4 import BeautifulSoup
 
-#
+from django.utils.encoding import force_str
 
-# This file is part of qutebrowser.
+from django.utils.html import escape, format_html, format_html_join
 
-#
+from django.utils.safestring import mark_safe
 
-# qutebrowser is free software: you can redistribute it and/or modify
+from django.utils.text import capfirst
 
-# it under the terms of the GNU General Public License as published by
+from django.utils.translation import ugettext_lazy as _
 
-# the Free Software Foundation, either version 3 of the License, or
 
-# (at your option) any later version.
 
-#
+from wagtail.core import blocks
 
-# qutebrowser is distributed in the hope that it will be useful,
 
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
 
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 
-# GNU General Public License for more details.
 
-#
+def text_from_html(val):
 
-# You should have received a copy of the GNU General Public License
+    # Return the unescaped text content of an HTML string
 
-# along with qutebrowser.  If not, see <http://www.gnu.org/licenses/>.
+    return BeautifulSoup(force_str(val), 'html5lib').getText()
 
 
 
-"""Wrapper over our (QtWebKit) WebView."""
 
 
+class FieldComparison:
 
-import re
+    is_field = True
 
-import functools
+    is_child_relation = False
 
-import xml.etree.ElementTree
 
 
+    def __init__(self, field, obj_a, obj_b):
 
-from PyQt5.QtCore import pyqtSlot, Qt, QUrl, QPoint, QTimer, QSizeF, QSize
+        self.field = field
 
-from PyQt5.QtGui import QIcon
+        self.val_a = field.value_from_object(obj_a)
 
-from PyQt5.QtWebKitWidgets import QWebPage, QWebFrame
+        self.val_b = field.value_from_object(obj_b)
 
-from PyQt5.QtWebKit import QWebSettings
 
-from PyQt5.QtPrintSupport import QPrinter
 
-
-
-from qutebrowser.browser import browsertab, shared
-
-from qutebrowser.browser.webkit import (webview, tabhistory, webkitelem,
-
-                                        webkitsettings)
-
-from qutebrowser.utils import qtutils, usertypes, utils, log, debug
-
-from qutebrowser.qt import sip
-
-
-
-
-
-class WebKitAction(browsertab.AbstractAction):
-
-
-
-    """QtWebKit implementations related to web actions."""
-
-
-
-    action_class = QWebPage
-
-    action_base = QWebPage.WebAction
-
-
-
-    def exit_fullscreen(self):
-
-        raise browsertab.UnsupportedOperationError
-
-
-
-    def save_page(self):
-
-        """Save the current page."""
-
-        raise browsertab.UnsupportedOperationError
-
-
-
-    def show_source(self, pygments=False):
-
-        self._show_source_pygments()
-
-
-
-
-
-class WebKitPrinting(browsertab.AbstractPrinting):
-
-
-
-    """QtWebKit implementations related to printing."""
-
-
-
-    def check_pdf_support(self):
-
-        pass
-
-
-
-    def check_printer_support(self):
-
-        pass
-
-
-
-    def check_preview_support(self):
-
-        pass
-
-
-
-    def to_pdf(self, filename):
-
-        printer = QPrinter()
-
-        printer.setOutputFileName(filename)
-
-        self.to_printer(printer)
-
-
-
-    def to_printer(self, printer, callback=None):
-
-        self._widget.print(printer)
-
-        # Can't find out whether there was an error...
-
-        if callback is not None:
-
-            callback(True)
-
-
-
-
-
-class WebKitSearch(browsertab.AbstractSearch):
-
-
-
-    """QtWebKit implementations related to searching on the page."""
-
-
-
-    def __init__(self, tab, parent=None):
-
-        super().__init__(tab, parent)
-
-        self._flags = QWebPage.FindFlags(0)
-
-
-
-    def _call_cb(self, callback, found, text, flags, caller):
-
-        """Call the given callback if it's non-None.
-
-
-
-        Delays the call via a QTimer so the website is re-rendered in between.
-
-
-
-        Args:
-
-            callback: What to call
-
-            found: If the text was found
-
-            text: The text searched for
-
-            flags: The flags searched with
-
-            caller: Name of the caller.
+    def field_label(self):
 
         """
 
-        found_text = 'found' if found else "didn't find"
+        Returns a label for this field to be displayed to the user
 
-        # Removing FindWrapsAroundDocument to get the same logging as with
+        """
 
-        # QtWebEngine
+        verbose_name = getattr(self.field, 'verbose_name', None)
 
-        debug_flags = debug.qflags_key(
 
-            QWebPage, flags & ~QWebPage.FindWrapsAroundDocument,
 
-            klass=QWebPage.FindFlag)
+        if verbose_name is None:
 
-        if debug_flags != '0x0000':
+            # Relations don't have a verbose_name
 
-            flag_text = 'with flags {}'.format(debug_flags)
+            verbose_name = self.field.name.replace('_', ' ')
+
+
+
+        return capfirst(verbose_name)
+
+
+
+    def htmldiff(self):
+
+        if self.val_a != self.val_b:
+
+            return TextDiff([('deletion', self.val_a), ('addition', self.val_b)]).to_html()
 
         else:
 
-            flag_text = ''
+            return escape(self.val_a)
 
-        log.webview.debug(' '.join([caller, found_text, text, flag_text])
 
-                          .strip())
 
-        if callback is not None:
+    def has_changed(self):
 
-            QTimer.singleShot(0, functools.partial(callback, found))
+        """
 
+        Returns True if the field has changed
 
+        """
 
-        self.finished.emit(found)
+        return self.val_a != self.val_b
 
 
 
-    def clear(self):
 
-        if self.search_displayed:
 
-            self.cleared.emit()
+class TextFieldComparison(FieldComparison):
 
-        self.search_displayed = False
+    def htmldiff(self):
 
-        # We first clear the marked text, then the highlights
+        return diff_text(self.val_a, self.val_b).to_html()
 
-        self._widget.findText('')
 
-        self._widget.findText('', QWebPage.HighlightAllOccurrences)
 
 
 
-    def search(self, text, *, ignore_case=usertypes.IgnoreCase.never,
+class RichTextFieldComparison(TextFieldComparison):
 
-               reverse=False, result_cb=None):
+    def htmldiff(self):
 
-        # Don't go to next entry on duplicate search
+        return diff_text(
 
-        if self.text == text and self.search_displayed:
+            text_from_html(self.val_a),
 
-            log.webview.debug("Ignoring duplicate search request"
+            text_from_html(self.val_b)
 
-                              " for {}".format(text))
+        ).to_html()
 
-            return
 
 
 
-        # Clear old search results, this is done automatically on QtWebEngine.
 
-        self.clear()
+def get_comparison_class_for_block(block):
 
+    if hasattr(block, 'get_comparison_class'):
 
+        return block.get_comparison_class()
 
-        self.text = text
+    elif isinstance(block, (blocks.CharBlock, blocks.TextBlock)):
 
-        self.search_displayed = True
+        return CharBlockComparison
 
-        self._flags = QWebPage.FindWrapsAroundDocument
+    elif isinstance(block, blocks.RawHTMLBlock):
 
-        if self._is_case_sensitive(ignore_case):
+        # Compare raw HTML blocks as if they were plain text, so that tags are shown explicitly
 
-            self._flags |= QWebPage.FindCaseSensitively
+        return CharBlockComparison
 
-        if reverse:
+    elif isinstance(block, blocks.RichTextBlock):
 
-            self._flags |= QWebPage.FindBackward
+        return RichTextBlockComparison
 
-        # We actually search *twice* - once to highlight everything, then again
+    elif isinstance(block, blocks.StructBlock):
 
-        # to get a mark so we can navigate.
+        return StructBlockComparison
 
-        found = self._widget.findText(text, self._flags)
+    else:
 
-        self._widget.findText(text,
+        # As all stream field blocks have a HTML representation, fall back to diffing that.
 
-                              self._flags | QWebPage.HighlightAllOccurrences)
+        return RichTextBlockComparison
 
-        self._call_cb(result_cb, found, text, self._flags, 'search')
 
 
 
-    def next_result(self, *, result_cb=None):
 
-        self.search_displayed = True
+class BlockComparison:
 
-        found = self._widget.findText(self.text, self._flags)
+    def __init__(self, block, exists_a, exists_b, val_a, val_b):
 
-        self._call_cb(result_cb, found, self.text, self._flags, 'next_result')
+        self.block = block
 
+        self.exists_a = exists_a
 
+        self.exists_b = exists_b
 
-    def prev_result(self, *, result_cb=None):
+        self.val_a = val_a
 
-        self.search_displayed = True
+        self.val_b = val_b
 
-        # The int() here makes sure we get a copy of the flags.
 
-        flags = QWebPage.FindFlags(int(self._flags))
 
-        if flags & QWebPage.FindBackward:
+    def is_new(self):
 
-            flags &= ~QWebPage.FindBackward
+        return self.exists_b and not self.exists_a
 
-        else:
 
-            flags |= QWebPage.FindBackward
 
-        found = self._widget.findText(self.text, flags)
+    def is_deleted(self):
 
-        self._call_cb(result_cb, found, self.text, flags, 'prev_result')
+        return self.exists_a and not self.exists_b
 
 
 
+    def has_changed(self):
 
+        return self.val_a != self.val_b
 
-class WebKitCaret(browsertab.AbstractCaret):
 
 
+    def htmlvalue(self, val):
 
-    """QtWebKit implementations related to moving the cursor/selection."""
+        """
 
+        Return an HTML representation of this block that is safe to be included
 
+        in comparison views
 
-    @pyqtSlot(usertypes.KeyMode)
+        """
 
-    def _on_mode_entered(self, mode):
+        return escape(text_from_html(self.block.render_basic(val)))
 
-        if mode != usertypes.KeyMode.caret:
 
-            return
 
+    def htmldiff(self):
 
+        html_val_a = self.block.render_basic(self.val_a)
 
-        self.selection_enabled = self._widget.hasSelection()
+        html_val_b = self.block.render_basic(self.val_b)
 
-        self.selection_toggled.emit(self.selection_enabled)
+        return diff_text(
 
-        settings = self._widget.settings()
+            text_from_html(html_val_a),
 
-        settings.setAttribute(QWebSettings.CaretBrowsingEnabled, True)
+            text_from_html(html_val_b)
 
+        ).to_html()
 
 
-        if self._widget.isVisible():
 
-            # Sometimes the caret isn't immediately visible, but unfocusing
 
-            # and refocusing it fixes that.
 
-            self._widget.clearFocus()
+class CharBlockComparison(BlockComparison):
 
-            self._widget.setFocus(Qt.OtherFocusReason)
+    def htmldiff(self):
 
+        return diff_text(
 
+            force_str(self.val_a),
 
-            # Move the caret to the first element in the viewport if there
+            force_str(self.val_b)
 
-            # isn't any text which is already selected.
+        ).to_html()
 
-            #
 
-            # Note: We can't use hasSelection() here, as that's always
 
-            # true in caret mode.
+    def htmlvalue(self, val):
 
-            if not self.selection_enabled:
+        return escape(val)
 
-                self._widget.page().currentFrame().evaluateJavaScript(
 
-                    utils.read_file('javascript/position_caret.js'))
 
 
 
-    @pyqtSlot(usertypes.KeyMode)
+class RichTextBlockComparison(BlockComparison):
 
-    def _on_mode_left(self, _mode):
+    pass
 
-        settings = self._widget.settings()
 
-        if settings.testAttribute(QWebSettings.CaretBrowsingEnabled):
 
-            if self.selection_enabled and self._widget.hasSelection():
 
-                # Remove selection if it exists
 
-                self._widget.triggerPageAction(QWebPage.MoveToNextChar)
+class StructBlockComparison(BlockComparison):
 
-            settings.setAttribute(QWebSettings.CaretBrowsingEnabled, False)
+    def htmlvalue(self, val):
 
-            self.selection_enabled = False
+        htmlvalues = []
 
+        for name, block in self.block.child_blocks.items():
 
+            label = self.block.child_blocks[name].label
 
-    def move_to_next_line(self, count=1):
+            comparison_class = get_comparison_class_for_block(block)
 
-        if not self.selection_enabled:
 
-            act = QWebPage.MoveToNextLine
 
-        else:
+            htmlvalues.append((label, comparison_class(block, True, True, val[name], val[name]).htmlvalue(val[name])))
 
-            act = QWebPage.SelectNextLine
 
-        for _ in range(count):
 
-            self._widget.triggerPageAction(act)
+        return format_html('<dl>\n{}\n</dl>', format_html_join(
 
+            '\n', '    <dt>{}</dt>\n    <dd>{}</dd>', htmlvalues))
 
 
-    def move_to_prev_line(self, count=1):
 
-        if not self.selection_enabled:
+    def htmldiff(self):
 
-            act = QWebPage.MoveToPreviousLine
+        htmldiffs = []
 
-        else:
+        for name, block in self.block.child_blocks.items():
 
-            act = QWebPage.SelectPreviousLine
+            label = self.block.child_blocks[name].label
 
-        for _ in range(count):
+            comparison_class = get_comparison_class_for_block(block)
 
-            self._widget.triggerPageAction(act)
 
 
+            htmldiffs.append((label, comparison_class(block, self.exists_a, self.exists_b, self.val_a[name], self.val_b[name]).htmldiff()))
 
-    def move_to_next_char(self, count=1):
 
-        if not self.selection_enabled:
 
-            act = QWebPage.MoveToNextChar
+        return format_html('<dl>\n{}\n</dl>', format_html_join(
 
-        else:
+            '\n', '    <dt>{}</dt>\n    <dd>{}</dd>', htmldiffs))
 
-            act = QWebPage.SelectNextChar
 
-        for _ in range(count):
 
-            self._widget.triggerPageAction(act)
 
 
+class StreamBlockComparison(BlockComparison):
 
-    def move_to_prev_char(self, count=1):
+    def get_block_comparisons(self):
 
-        if not self.selection_enabled:
+        a_blocks = list(self.val_a) or []
 
-            act = QWebPage.MoveToPreviousChar
+        b_blocks = list(self.val_b) or []
 
-        else:
 
-            act = QWebPage.SelectPreviousChar
 
-        for _ in range(count):
+        a_blocks_by_id = {block.id: block for block in a_blocks}
 
-            self._widget.triggerPageAction(act)
+        b_blocks_by_id = {block.id: block for block in b_blocks}
 
 
 
-    def move_to_end_of_word(self, count=1):
+        deleted_ids = a_blocks_by_id.keys() - b_blocks_by_id.keys()
 
-        if not self.selection_enabled:
 
-            act = [QWebPage.MoveToNextWord]
 
-            if utils.is_windows:  # pragma: no cover
+        comparisons = []
 
-                act.append(QWebPage.MoveToPreviousChar)
+        for block in b_blocks:
 
-        else:
+            comparison_class = get_comparison_class_for_block(block.block)
 
-            act = [QWebPage.SelectNextWord]
 
-            if utils.is_windows:  # pragma: no cover
 
-                act.append(QWebPage.SelectPreviousChar)
+            if block.id in a_blocks_by_id:
 
-        for _ in range(count):
+                # Changed/existing block
 
-            for a in act:
-
-                self._widget.triggerPageAction(a)
-
-
-
-    def move_to_next_word(self, count=1):
-
-        if not self.selection_enabled:
-
-            act = [QWebPage.MoveToNextWord]
-
-            if not utils.is_windows:  # pragma: no branch
-
-                act.append(QWebPage.MoveToNextChar)
-
-        else:
-
-            act = [QWebPage.SelectNextWord]
-
-            if not utils.is_windows:  # pragma: no branch
-
-                act.append(QWebPage.SelectNextChar)
-
-        for _ in range(count):
-
-            for a in act:
-
-                self._widget.triggerPageAction(a)
-
-
-
-    def move_to_prev_word(self, count=1):
-
-        if not self.selection_enabled:
-
-            act = QWebPage.MoveToPreviousWord
-
-        else:
-
-            act = QWebPage.SelectPreviousWord
-
-        for _ in range(count):
-
-            self._widget.triggerPageAction(act)
-
-
-
-    def move_to_start_of_line(self):
-
-        if not self.selection_enabled:
-
-            act = QWebPage.MoveToStartOfLine
-
-        else:
-
-            act = QWebPage.SelectStartOfLine
-
-        self._widget.triggerPageAction(act)
-
-
-
-    def move_to_end_of_line(self):
-
-        if not self.selection_enabled:
-
-            act = QWebPage.MoveToEndOfLine
-
-        else:
-
-            act = QWebPage.SelectEndOfLine
-
-        self._widget.triggerPageAction(act)
-
-
-
-    def move_to_start_of_next_block(self, count=1):
-
-        if not self.selection_enabled:
-
-            act = [QWebPage.MoveToNextLine,
-
-                   QWebPage.MoveToStartOfBlock]
-
-        else:
-
-            act = [QWebPage.SelectNextLine,
-
-                   QWebPage.SelectStartOfBlock]
-
-        for _ in range(count):
-
-            for a in act:
-
-                self._widget.triggerPageAction(a)
-
-
-
-    def move_to_start_of_prev_block(self, count=1):
-
-        if not self.selection_enabled:
-
-            act = [QWebPage.MoveToPreviousLine,
-
-                   QWebPage.MoveToStartOfBlock]
-
-        else:
-
-            act = [QWebPage.SelectPreviousLine,
-
-                   QWebPage.SelectStartOfBlock]
-
-        for _ in range(count):
-
-            for a in act:
-
-                self._widget.triggerPageAction(a)
-
-
-
-    def move_to_end_of_next_block(self, count=1):
-
-        if not self.selection_enabled:
-
-            act = [QWebPage.MoveToNextLine,
-
-                   QWebPage.MoveToEndOfBlock]
-
-        else:
-
-            act = [QWebPage.SelectNextLine,
-
-                   QWebPage.SelectEndOfBlock]
-
-        for _ in range(count):
-
-            for a in act:
-
-                self._widget.triggerPageAction(a)
-
-
-
-    def move_to_end_of_prev_block(self, count=1):
-
-        if not self.selection_enabled:
-
-            act = [QWebPage.MoveToPreviousLine, QWebPage.MoveToEndOfBlock]
-
-        else:
-
-            act = [QWebPage.SelectPreviousLine, QWebPage.SelectEndOfBlock]
-
-        for _ in range(count):
-
-            for a in act:
-
-                self._widget.triggerPageAction(a)
-
-
-
-    def move_to_start_of_document(self):
-
-        if not self.selection_enabled:
-
-            act = QWebPage.MoveToStartOfDocument
-
-        else:
-
-            act = QWebPage.SelectStartOfDocument
-
-        self._widget.triggerPageAction(act)
-
-
-
-    def move_to_end_of_document(self):
-
-        if not self.selection_enabled:
-
-            act = QWebPage.MoveToEndOfDocument
-
-        else:
-
-            act = QWebPage.SelectEndOfDocument
-
-        self._widget.triggerPageAction(act)
-
-
-
-    def toggle_selection(self):
-
-        self.selection_enabled = not self.selection_enabled
-
-        self.selection_toggled.emit(self.selection_enabled)
-
-
-
-    def drop_selection(self):
-
-        self._widget.triggerPageAction(QWebPage.MoveToNextChar)
-
-
-
-    def selection(self, callback):
-
-        callback(self._widget.selectedText())
-
-
-
-    def reverse_selection(self):
-
-        self._tab.run_js_async("""{
-
-            const sel = window.getSelection();
-
-            sel.setBaseAndExtent(
-
-                sel.extentNode, sel.extentOffset, sel.baseNode,
-
-                sel.baseOffset
-
-            );
-
-        }""")
-
-
-
-    def _follow_selected(self, *, tab=False):
-
-        if QWebSettings.globalSettings().testAttribute(
-
-                QWebSettings.JavascriptEnabled):
-
-            if tab:
-
-                self._tab.data.override_target = usertypes.ClickTarget.tab
-
-            self._tab.run_js_async("""
-
-                const aElm = document.activeElement;
-
-                if (window.getSelection().anchorNode) {
-
-                    window.getSelection().anchorNode.parentNode.click();
-
-                } else if (aElm && aElm !== document.body) {
-
-                    aElm.click();
-
-                }
-
-            """)
-
-        else:
-
-            selection = self._widget.selectedHtml()
-
-            if not selection:
-
-                # Getting here may mean we crashed, but we can't do anything
-
-                # about that until this commit is released:
-
-                # https://github.com/annulen/webkit/commit/0e75f3272d149bc64899c161f150eb341a2417af
-
-                # TODO find a way to check if something is focused
-
-                self._follow_enter(tab)
-
-                return
-
-            try:
-
-                selected_element = xml.etree.ElementTree.fromstring(
-
-                    '<html>{}</html>'.format(selection)).find('a')
-
-            except xml.etree.ElementTree.ParseError:
-
-                raise browsertab.WebTabError('Could not parse selected '
-
-                                             'element!')
-
-
-
-            if selected_element is not None:
-
-                try:
-
-                    url = selected_element.attrib['href']
-
-                except KeyError:
-
-                    raise browsertab.WebTabError('Anchor element without '
-
-                                                 'href!')
-
-                url = self._tab.url().resolved(QUrl(url))
-
-                if tab:
-
-                    self._tab.new_tab_requested.emit(url)
-
-                else:
-
-                    self._tab.load_url(url)
-
-
-
-    def follow_selected(self, *, tab=False):
-
-        try:
-
-            self._follow_selected(tab=tab)
-
-        finally:
-
-            self.follow_selected_done.emit()
-
-
-
-
-
-class WebKitZoom(browsertab.AbstractZoom):
-
-
-
-    """QtWebKit implementations related to zooming."""
-
-
-
-    def _set_factor_internal(self, factor):
-
-        self._widget.setZoomFactor(factor)
-
-
-
-
-
-class WebKitScroller(browsertab.AbstractScroller):
-
-
-
-    """QtWebKit implementations related to scrolling."""
-
-
-
-    # FIXME:qtwebengine When to use the main frame, when the current one?
-
-
-
-    def pos_px(self):
-
-        return self._widget.page().mainFrame().scrollPosition()
-
-
-
-    def pos_perc(self):
-
-        return self._widget.scroll_pos
-
-
-
-    def to_point(self, point):
-
-        self._widget.page().mainFrame().setScrollPosition(point)
-
-
-
-    def to_anchor(self, name):
-
-        self._widget.page().mainFrame().scrollToAnchor(name)
-
-
-
-    def delta(self, x=0, y=0):
-
-        qtutils.check_overflow(x, 'int')
-
-        qtutils.check_overflow(y, 'int')
-
-        self._widget.page().mainFrame().scroll(x, y)
-
-
-
-    def delta_page(self, x=0.0, y=0.0):
-
-        if y.is_integer():
-
-            y = int(y)
-
-            if y == 0:
-
-                pass
-
-            elif y < 0:
-
-                self.page_up(count=-y)
-
-            elif y > 0:
-
-                self.page_down(count=y)
-
-            y = 0
-
-        if x == 0 and y == 0:
-
-            return
-
-        size = self._widget.page().mainFrame().geometry()
-
-        self.delta(x * size.width(), y * size.height())
-
-
-
-    def to_perc(self, x=None, y=None):
-
-        if x is None and y == 0:
-
-            self.top()
-
-        elif x is None and y == 100:
-
-            self.bottom()
-
-        else:
-
-            for val, orientation in [(x, Qt.Horizontal), (y, Qt.Vertical)]:
-
-                if val is not None:
-
-                    frame = self._widget.page().mainFrame()
-
-                    maximum = frame.scrollBarMaximum(orientation)
-
-                    if maximum == 0:
-
-                        continue
-
-                    pos = int(maximum * val / 100)
-
-                    pos = qtutils.check_overflow(pos, 'int', fatal=False)
-
-                    frame.setScrollBarValue(orientation, pos)
-
-
-
-    def _key_press(self, key, count=1, getter_name=None, direction=None):
-
-        frame = self._widget.page().mainFrame()
-
-        getter = None if getter_name is None else getattr(frame, getter_name)
-
-
-
-        # FIXME:qtwebengine needed?
-
-        # self._widget.setFocus()
-
-
-
-        for _ in range(min(count, 5000)):
-
-            # Abort scrolling if the minimum/maximum was reached.
-
-            if (getter is not None and
-
-                    frame.scrollBarValue(direction) == getter(direction)):
-
-                return
-
-            self._tab.fake_key_press(key)
-
-
-
-    def up(self, count=1):
-
-        self._key_press(Qt.Key_Up, count, 'scrollBarMinimum', Qt.Vertical)
-
-
-
-    def down(self, count=1):
-
-        self._key_press(Qt.Key_Down, count, 'scrollBarMaximum', Qt.Vertical)
-
-
-
-    def left(self, count=1):
-
-        self._key_press(Qt.Key_Left, count, 'scrollBarMinimum', Qt.Horizontal)
-
-
-
-    def right(self, count=1):
-
-        self._key_press(Qt.Key_Right, count, 'scrollBarMaximum', Qt.Horizontal)
-
-
-
-    def top(self):
-
-        self._key_press(Qt.Key_Home)
-
-
-
-    def bottom(self):
-
-        self._key_press(Qt.Key_End)
-
-
-
-    def page_up(self, count=1):
-
-        self._key_press(Qt.Key_PageUp, count, 'scrollBarMinimum', Qt.Vertical)
-
-
-
-    def page_down(self, count=1):
-
-        self._key_press(Qt.Key_PageDown, count, 'scrollBarMaximum',
-
-                        Qt.Vertical)
-
-
-
-    def at_top(self):
-
-        return self.pos_px().y() == 0
-
-
-
-    def at_bottom(self):
-
-        frame = self._widget.page().currentFrame()
-
-        return self.pos_px().y() >= frame.scrollBarMaximum(Qt.Vertical)
-
-
-
-
-
-class WebKitHistoryPrivate(browsertab.AbstractHistoryPrivate):
-
-
-
-    """History-related methods which are not part of the extension API."""
-
-
-
-    def serialize(self):
-
-        return qtutils.serialize(self._history)
-
-
-
-    def deserialize(self, data):
-
-        qtutils.deserialize(data, self._history)
-
-
-
-    def load_items(self, items):
-
-        if items:
-
-            self._tab.before_load_started.emit(items[-1].url)
-
-
-
-        stream, _data, user_data = tabhistory.serialize(items)
-
-        qtutils.deserialize_stream(stream, self._history)
-
-        for i, data in enumerate(user_data):
-
-            self._history.itemAt(i).setUserData(data)
-
-        cur_data = self._history.currentItem().userData()
-
-        if cur_data is not None:
-
-            if 'zoom' in cur_data:
-
-                self._tab.zoom.set_factor(cur_data['zoom'])
-
-            if ('scroll-pos' in cur_data and
-
-                    self._tab.scroller.pos_px() == QPoint(0, 0)):
-
-                QTimer.singleShot(0, functools.partial(
-
-                    self._tab.scroller.to_point, cur_data['scroll-pos']))
-
-
-
-
-
-class WebKitHistory(browsertab.AbstractHistory):
-
-
-
-    """QtWebKit implementations related to page history."""
-
-
-
-    def __init__(self, tab):
-
-        super().__init__(tab)
-
-        self.private_api = WebKitHistoryPrivate(tab)
-
-
-
-    def __len__(self):
-
-        return len(self._history)
-
-
-
-    def __iter__(self):
-
-        return iter(self._history.items())
-
-
-
-    def current_idx(self):
-
-        return self._history.currentItemIndex()
-
-
-
-    def can_go_back(self):
-
-        return self._history.canGoBack()
-
-
-
-    def can_go_forward(self):
-
-        return self._history.canGoForward()
-
-
-
-    def _item_at(self, i):
-
-        return self._history.itemAt(i)
-
-
-
-    def _go_to_item(self, item):
-
-        self._tab.before_load_started.emit(item.url())
-
-        self._history.goToItem(item)
-
-
-
-
-
-class WebKitElements(browsertab.AbstractElements):
-
-
-
-    """QtWebKit implemementations related to elements on the page."""
-
-
-
-    def find_css(self, selector, callback, error_cb, *, only_visible=False):
-
-        utils.unused(error_cb)
-
-        mainframe = self._widget.page().mainFrame()
-
-        if mainframe is None:
-
-            raise browsertab.WebTabError("No frame focused!")
-
-
-
-        elems = []
-
-        frames = webkitelem.get_child_frames(mainframe)
-
-        for f in frames:
-
-            for elem in f.findAllElements(selector):
-
-                elems.append(webkitelem.WebKitElement(elem, tab=self._tab))
-
-
-
-        if only_visible:
-
-            # pylint: disable=protected-access
-
-            elems = [e for e in elems if e._is_visible(mainframe)]
-
-            # pylint: enable=protected-access
-
-
-
-        callback(elems)
-
-
-
-    def find_id(self, elem_id, callback):
-
-        def find_id_cb(elems):
-
-            """Call the real callback with the found elements."""
-
-            if not elems:
-
-                callback(None)
+                comparisons.append(comparison_class(block.block, True, True, a_blocks_by_id[block.id].value, block.value))
 
             else:
 
-                callback(elems[0])
+                # New block
+
+                comparisons.append(comparison_class(block.block, False, True, None, block.value))
 
 
 
-        # Escape non-alphanumeric characters in the selector
+        # Insert deleted blocks at the index where they used to be
 
-        # https://www.w3.org/TR/CSS2/syndata.html#value-def-identifier
-
-        elem_id = re.sub(r'[^a-zA-Z0-9_-]', r'\\\g<0>', elem_id)
-
-        self.find_css('#' + elem_id, find_id_cb, error_cb=lambda exc: None)
+        deleted_block_indices = [(block, i) for i, block in enumerate(a_blocks) if block.id in deleted_ids]
 
 
 
-    def find_focused(self, callback):
+        for block, index in deleted_block_indices:
 
-        frame = self._widget.page().currentFrame()
+            comparison_class = get_comparison_class_for_block(block.block)
 
-        if frame is None:
-
-            callback(None)
-
-            return
+            comparison_to_insert = comparison_class(block.block, True, False, block.value, None)
 
 
 
-        elem = frame.findFirstElement('*:focus')
+            # Insert the block back in where it was before it was deleted.
 
-        if elem.isNull():
+            # Note: we need to account for new blocks when finding the position.
 
-            callback(None)
+            current_index = 0
+
+            block_inserted = False
+
+            for i, comparison in enumerate(comparisons):
+
+                if comparison.is_new():
+
+                    continue
+
+
+
+                if current_index == index:
+
+                    comparisons.insert(i, comparison_to_insert)
+
+                    block_inserted = True
+
+                    break
+
+
+
+                current_index += 1
+
+
+
+            # Deleted block was from the end
+
+            if not block_inserted:
+
+                comparisons.append(comparison_to_insert)
+
+
+
+        return comparisons
+
+
+
+    def htmldiff(self):
+
+        comparisons_html = []
+
+
+
+        for comparison in self.get_block_comparisons():
+
+            classes = ['comparison__child-object']
+
+            if comparison.is_new():
+
+                classes.append('addition')
+
+                block_rendered = comparison.htmlvalue(comparison.val_b)
+
+            elif comparison.is_deleted():
+
+                classes.append('deletion')
+
+                block_rendered = comparison.htmlvalue(comparison.val_a)
+
+            elif comparison.has_changed():
+
+                block_rendered = comparison.htmldiff()
+
+            else:
+
+                block_rendered = comparison.htmlvalue(comparison.val_a)
+
+
+
+            classes = ' '.join(classes)
+
+            comparisons_html.append('<div class="{0}">{1}</div>'.format(classes, block_rendered))
+
+
+
+        return mark_safe('\n'.join(comparisons_html))
+
+
+
+
+
+class StreamFieldComparison(FieldComparison):
+
+    def has_block_ids(self, val):
+
+        if not val:
+
+            return True
+
+
+
+        return bool(val[0].id)
+
+
+
+    def htmldiff(self):
+
+        # Our method for diffing streamfields relies on the blocks in both revisions having UUIDs.
+
+        # But as UUIDs were added in Wagtail 1.11 we can't compare revisions that were created before
+
+        # that Wagtail version.
+
+        if self.has_block_ids(self.val_a) and self.has_block_ids(self.val_b):
+
+            return StreamBlockComparison(self.field.stream_block, True, True, self.val_a, self.val_b).htmldiff()
 
         else:
 
-            callback(webkitelem.WebKitElement(elem, tab=self._tab))
+            # Fall back to diffing the HTML representation
 
+            return diff_text(
 
+                text_from_html(self.val_a),
 
-    def find_at_pos(self, pos, callback):
+                text_from_html(self.val_b)
 
-        assert pos.x() >= 0
+            ).to_html()
 
-        assert pos.y() >= 0
 
-        frame = self._widget.page().frameAt(pos)
 
-        if frame is None:
 
-            # This happens when we click inside the webview, but not actually
 
-            # on the QWebPage - for example when clicking the scrollbar
+class ChoiceFieldComparison(FieldComparison):
 
-            # sometimes.
+    def htmldiff(self):
 
-            log.webview.debug("Hit test at {} but frame is None!".format(pos))
+        val_a = force_str(dict(self.field.flatchoices).get(self.val_a, self.val_a), strings_only=True)
 
-            callback(None)
+        val_b = force_str(dict(self.field.flatchoices).get(self.val_b, self.val_b), strings_only=True)
 
-            return
 
 
+        if self.val_a != self.val_b:
 
-        # You'd think we have to subtract frame.geometry().topLeft() from the
+            diffs = []
 
-        # position, but it seems QWebFrame::hitTestContent wants a position
 
-        # relative to the QWebView, not to the frame. This makes no sense to
 
-        # me, but it works this way.
+            if val_a:
 
-        hitresult = frame.hitTestContent(pos)
+                diffs += [('deletion', val_a)]
 
-        if hitresult.isNull():
+            if val_b:
 
-            # For some reason, the whole hit result can be null sometimes (e.g.
+                diffs += [('addition', val_b)]
 
-            # on doodle menu links).
 
-            log.webview.debug("Hit test result is null!")
 
-            callback(None)
-
-            return
-
-
-
-        try:
-
-            elem = webkitelem.WebKitElement(hitresult.element(), tab=self._tab)
-
-        except webkitelem.IsNullError:
-
-            # For some reason, the hit result element can be a null element
-
-            # sometimes (e.g. when clicking the timetable fields on
-
-            # http://www.sbb.ch/ ).
-
-            log.webview.debug("Hit test result element is null!")
-
-            callback(None)
-
-            return
-
-
-
-        callback(elem)
-
-
-
-
-
-class WebKitAudio(browsertab.AbstractAudio):
-
-
-
-    """Dummy handling of audio status for QtWebKit."""
-
-
-
-    def set_muted(self, muted: bool, override: bool = False) -> None:
-
-        raise browsertab.WebTabError('Muting is not supported on QtWebKit!')
-
-
-
-    def is_muted(self):
-
-        return False
-
-
-
-    def is_recently_audible(self):
-
-        return False
-
-
-
-
-
-class WebKitTabPrivate(browsertab.AbstractTabPrivate):
-
-
-
-    """QtWebKit-related methods which aren't part of the public API."""
-
-
-
-    def networkaccessmanager(self):
-
-        return self._widget.page().networkAccessManager()
-
-
-
-    def user_agent(self):
-
-        page = self._widget.page()
-
-        return page.userAgentForUrl(self._tab.url())
-
-
-
-    def clear_ssl_errors(self):
-
-        self.networkaccessmanager().clear_all_ssl_errors()
-
-
-
-    def event_target(self):
-
-        return self._widget
-
-
-
-    def shutdown(self):
-
-        self._widget.shutdown()
-
-
-
-
-
-class WebKitTab(browsertab.AbstractTab):
-
-
-
-    """A QtWebKit tab in the browser."""
-
-
-
-    def __init__(self, *, win_id, mode_manager, private, parent=None):
-
-        super().__init__(win_id=win_id, private=private, parent=parent)
-
-        widget = webview.WebView(win_id=win_id, tab_id=self.tab_id,
-
-                                 private=private, tab=self)
-
-        if private:
-
-            self._make_private(widget)
-
-        self.history = WebKitHistory(tab=self)
-
-        self.scroller = WebKitScroller(tab=self, parent=self)
-
-        self.caret = WebKitCaret(mode_manager=mode_manager,
-
-                                 tab=self, parent=self)
-
-        self.zoom = WebKitZoom(tab=self, parent=self)
-
-        self.search = WebKitSearch(tab=self, parent=self)
-
-        self.printing = WebKitPrinting(tab=self)
-
-        self.elements = WebKitElements(tab=self)
-
-        self.action = WebKitAction(tab=self)
-
-        self.audio = WebKitAudio(tab=self, parent=self)
-
-        self.private_api = WebKitTabPrivate(mode_manager=mode_manager,
-
-                                            tab=self)
-
-        # We're assigning settings in _set_widget
-
-        self.settings = webkitsettings.WebKitSettings(settings=None)
-
-        self._set_widget(widget)
-
-        self._connect_signals()
-
-        self.backend = usertypes.Backend.QtWebKit
-
-
-
-    def _install_event_filter(self):
-
-        self._widget.installEventFilter(self._tab_event_filter)
-
-
-
-    def _make_private(self, widget):
-
-        settings = widget.settings()
-
-        settings.setAttribute(QWebSettings.PrivateBrowsingEnabled, True)
-
-
-
-    def load_url(self, url, *, emit_before_load_started=True):
-
-        self._load_url_prepare(
-
-            url, emit_before_load_started=emit_before_load_started)
-
-        self._widget.load(url)
-
-
-
-    def url(self, *, requested=False):
-
-        frame = self._widget.page().mainFrame()
-
-        if requested:
-
-            return frame.requestedUrl()
+            return TextDiff(diffs).to_html()
 
         else:
 
-            return frame.url()
+            return escape(val_a)
 
 
 
-    def dump_async(self, callback, *, plain=False):
 
-        frame = self._widget.page().mainFrame()
 
-        if plain:
+class M2MFieldComparison(FieldComparison):
 
-            callback(frame.toPlainText())
+    def get_items(self):
+
+        return list(self.val_a), list(self.val_b)
+
+
+
+    def get_item_display(self, item):
+
+        return str(item)
+
+
+
+    def htmldiff(self):
+
+        # Get tags
+
+        items_a, items_b = self.get_items()
+
+
+
+        # Calculate changes
+
+        sm = difflib.SequenceMatcher(0, items_a, items_b)
+
+        changes = []
+
+        for op, i1, i2, j1, j2 in sm.get_opcodes():
+
+            if op == 'replace':
+
+                for item in items_a[i1:i2]:
+
+                    changes.append(('deletion', self.get_item_display(item)))
+
+                for item in items_b[j1:j2]:
+
+                    changes.append(('addition', self.get_item_display(item)))
+
+            elif op == 'delete':
+
+                for item in items_a[i1:i2]:
+
+                    changes.append(('deletion', self.get_item_display(item)))
+
+            elif op == 'insert':
+
+                for item in items_b[j1:j2]:
+
+                    changes.append(('addition', self.get_item_display(item)))
+
+            elif op == 'equal':
+
+                for item in items_a[i1:i2]:
+
+                    changes.append(('equal', self.get_item_display(item)))
+
+
+
+        # Convert changelist to HTML
+
+        return TextDiff(changes, separator=", ").to_html()
+
+
+
+    def has_changed(self):
+
+        items_a, items_b = self.get_items()
+
+        return items_a != items_b
+
+
+
+
+
+class TagsFieldComparison(M2MFieldComparison):
+
+    def get_item_display(self, tag):
+
+        return tag.slug
+
+
+
+
+
+class ForeignObjectComparison(FieldComparison):
+
+    def get_objects(self):
+
+        model = self.field.related_model
+
+        obj_a = model.objects.filter(pk=self.val_a).first()
+
+        obj_b = model.objects.filter(pk=self.val_b).first()
+
+        return obj_a, obj_b
+
+
+
+    def htmldiff(self):
+
+        obj_a, obj_b = self.get_objects()
+
+
+
+        if obj_a != obj_b:
+
+            if obj_a and obj_b:
+
+                # Changed
+
+                return TextDiff([('deletion', force_str(obj_a)), ('addition', force_str(obj_b))]).to_html()
+
+            elif obj_b:
+
+                # Added
+
+                return TextDiff([('addition', force_str(obj_b))]).to_html()
+
+            elif obj_a:
+
+                # Removed
+
+                return TextDiff([('deletion', force_str(obj_a))]).to_html()
 
         else:
 
-            callback(frame.toHtml())
+            if obj_a:
 
+                return escape(force_str(obj_a))
 
+            else:
 
-    def run_js_async(self, code, callback=None, *, world=None):
+                return mark_safe(_("None"))
 
-        if world is not None and world != usertypes.JsWorld.jseval:
 
-            log.webview.warning("Ignoring world ID {}".format(world))
 
-        document_element = self._widget.page().mainFrame().documentElement()
 
-        result = document_element.evaluateJavaScript(code)
 
-        if callback is not None:
+class ChildRelationComparison:
 
-            callback(result)
+    is_field = False
 
+    is_child_relation = True
 
 
-    def icon(self):
 
-        return self._widget.icon()
+    def __init__(self, field, field_comparisons, obj_a, obj_b):
 
+        self.field = field
 
+        self.field_comparisons = field_comparisons
 
-    def reload(self, *, force=False):
+        self.val_a = getattr(obj_a, field.related_name)
 
-        if force:
+        self.val_b = getattr(obj_b, field.related_name)
 
-            action = QWebPage.ReloadAndBypassCache
 
-        else:
 
-            action = QWebPage.Reload
-
-        self._widget.triggerPageAction(action)
-
-
-
-    def stop(self):
-
-        self._widget.stop()
-
-
-
-    def title(self):
-
-        return self._widget.title()
-
-
-
-    @pyqtSlot()
-
-    def _on_history_trigger(self):
-
-        url = self.url()
-
-        requested_url = self.url(requested=True)
-
-        self.history_item_triggered.emit(url, requested_url, self.title())
-
-
-
-    def set_html(self, html, base_url=QUrl()):
-
-        self._widget.setHtml(html, base_url)
-
-
-
-    @pyqtSlot()
-
-    def _on_load_started(self):
-
-        super()._on_load_started()
-
-        nam = self._widget.page().networkAccessManager()
-
-        nam.netrc_used = False
-
-        # Make sure the icon is cleared when navigating to a page without one.
-
-        self.icon_changed.emit(QIcon())
-
-
-
-    @pyqtSlot(bool)
-
-    def _on_load_finished(self, ok: bool) -> None:
-
-        super()._on_load_finished(ok)
-
-        self._update_load_status(ok)
-
-
-
-    @pyqtSlot()
-
-    def _on_frame_load_finished(self):
-
-        """Make sure we emit an appropriate status when loading finished.
-
-
-
-        While Qt has a bool "ok" attribute for loadFinished, it always is True
-
-        when using error pages... See
-
-        https://github.com/qutebrowser/qutebrowser/issues/84
+    def field_label(self):
 
         """
 
-        self._on_load_finished(not self._widget.page().error_occurred)
+        Returns a label for this field to be displayed to the user
+
+        """
+
+        verbose_name = getattr(self.field, 'verbose_name', None)
 
 
 
-    @pyqtSlot()
+        if verbose_name is None:
 
-    def _on_webkit_icon_changed(self):
+            # Relations don't have a verbose_name
 
-        """Emit iconChanged with a QIcon like QWebEngineView does."""
-
-        if sip.isdeleted(self._widget):
-
-            log.webview.debug("Got _on_webkit_icon_changed for deleted view!")
-
-            return
-
-        self.icon_changed.emit(self._widget.icon())
+            verbose_name = self.field.name.replace('_', ' ')
 
 
 
-    @pyqtSlot(QWebFrame)
-
-    def _on_frame_created(self, frame):
-
-        """Connect the contentsSizeChanged signal of each frame."""
-
-        # FIXME:qtwebengine those could theoretically regress:
-
-        # https://github.com/qutebrowser/qutebrowser/issues/152
-
-        # https://github.com/qutebrowser/qutebrowser/issues/263
-
-        frame.contentsSizeChanged.connect(self._on_contents_size_changed)
+        return capfirst(verbose_name)
 
 
 
-    @pyqtSlot(QSize)
+    def get_mapping(self, objs_a, objs_b):
 
-    def _on_contents_size_changed(self, size):
+        """
 
-        self.contents_size_changed.emit(QSizeF(size))
+        This bit of code attempts to match the objects in the A revision with
 
-
-
-    @pyqtSlot(usertypes.NavigationRequest)
-
-    def _on_navigation_request(self, navigation):
-
-        super()._on_navigation_request(navigation)
-
-        if not navigation.accepted:
-
-            return
+        their counterpart in the B revision.
 
 
 
-        log.webview.debug("target {} override {}".format(
+        A match is firstly attempted by PK (where a matching ID indicates they're the same).
 
-            self.data.open_target, self.data.override_target))
+        We compare remaining the objects by their field data; the objects with the fewest
+
+        fields changed are matched until there are no more possible matches left.
 
 
 
-        if self.data.override_target is not None:
+        This returns 4 values:
 
-            target = self.data.override_target
+         - map_forwards => a mapping of object indexes from the B version to the A version
 
-            self.data.override_target = None
+         - map_backwards => a mapping of object indexes from the A version to the B version
+
+         - added => a list of indices for objects that didn't exist in the B version
+
+         - deleted => a list of indices for objects that didn't exist in the A version
+
+
+
+        Note the indices are 0-based array indices indicating the location of the object in either
+
+        the objs_a or objs_b arrays.
+
+
+
+        For example:
+
+
+
+        objs_a => A, B, C, D
+
+        objs_b => B, C, D, E
+
+
+
+        Will return the following:
+
+
+
+        map_forwards = {
+
+            1: 0,  # B (objs_a: objs_b)
+
+            2: 1,  # C (objs_a: objs_b)
+
+            3: 2,  # D (objs_a: objs_b)
+
+        }
+
+        map_backwards = {
+
+            0: 1,  # B (objs_b: objs_a)
+
+            1: 2,  # C (objs_b: objs_a)
+
+            2: 3,  # D (objs_b: objs_a)
+
+        }
+
+        added = [4]  # D in objs_b
+
+        deleted = [0]  # A in objs_a
+
+        """
+
+        map_forwards = {}
+
+        map_backwards = {}
+
+        added = []
+
+        deleted = []
+
+
+
+        # Match child objects on PK (ID)
+
+        for a_idx, a_child in enumerate(objs_a):
+
+            for b_idx, b_child in enumerate(objs_b):
+
+                if b_idx in map_backwards:
+
+                    continue
+
+
+
+                if a_child.pk is not None and b_child.pk is not None and a_child.pk == b_child.pk:
+
+                    map_forwards[a_idx] = b_idx
+
+                    map_backwards[b_idx] = a_idx
+
+
+
+        # Now try to match them by data
+
+        matches = []
+
+        for a_idx, a_child in enumerate(objs_a):
+
+            if a_idx not in map_forwards:
+
+                for b_idx, b_child in enumerate(objs_b):
+
+                    if b_idx not in map_backwards:
+
+                        # If they both have a PK (ID) that is different, they can't be the same child object
+
+                        if a_child.pk and b_child.pk and a_child.pk != b_child.pk:
+
+                            continue
+
+
+
+                        comparison = self.get_child_comparison(objs_a[a_idx], objs_b[b_idx])
+
+                        num_differences = comparison.get_num_differences()
+
+
+
+                        matches.append((a_idx, b_idx, num_differences))
+
+
+
+        # Objects with the least differences will be matched first. So only the best possible matches are made
+
+        matches.sort(key=lambda match: match[2])
+
+        for a_idx, b_idx, num_differences in matches:
+
+            # Make sure both objects were not matched previously
+
+            if a_idx in map_forwards or b_idx in map_backwards:
+
+                continue
+
+
+
+            # Match!
+
+            map_forwards[a_idx] = b_idx
+
+            map_backwards[b_idx] = a_idx
+
+
+
+        # Mark unmapped objects as added/deleted
+
+        for a_idx, a_child in enumerate(objs_a):
+
+            if a_idx not in map_forwards:
+
+                deleted.append(a_idx)
+
+
+
+        for b_idx, b_child in enumerate(objs_b):
+
+            if b_idx not in map_backwards:
+
+                added.append(b_idx)
+
+
+
+        return map_forwards, map_backwards, added, deleted
+
+
+
+    def get_child_comparison(self, obj_a, obj_b):
+
+        return ChildObjectComparison(self.field.related_model, self.field_comparisons, obj_a, obj_b)
+
+
+
+    def get_child_comparisons(self):
+
+        """
+
+        Returns a list of ChildObjectComparison objects. Representing all child
+
+        objects that existed in either version.
+
+
+
+        They are returned in the order they appear in the B version with deletions
+
+        appended at the end.
+
+
+
+        All child objects are returned, regardless of whether they were actually changed.
+
+        """
+
+        objs_a = list(self.val_a.all())
+
+        objs_b = list(self.val_b.all())
+
+
+
+        map_forwards, map_backwards, added, deleted = self.get_mapping(objs_a, objs_b)
+
+        objs_a = dict(enumerate(objs_a))
+
+        objs_b = dict(enumerate(objs_b))
+
+
+
+        comparisons = []
+
+
+
+        for b_idx, b_child in objs_b.items():
+
+            if b_idx in added:
+
+                comparisons.append(self.get_child_comparison(None, b_child))
+
+            else:
+
+                comparisons.append(self.get_child_comparison(objs_a[map_backwards[b_idx]], b_child))
+
+
+
+        for a_idx, a_child in objs_a.items():
+
+            if a_idx in deleted:
+
+                comparisons.append(self.get_child_comparison(a_child, None))
+
+
+
+        return comparisons
+
+
+
+    def has_changed(self):
+
+        """
+
+        Returns true if any changes were made to any of the child objects. This includes
+
+        adding, deleting and reordering.
+
+        """
+
+        objs_a = list(self.val_a.all())
+
+        objs_b = list(self.val_b.all())
+
+
+
+        map_forwards, map_backwards, added, deleted = self.get_mapping(objs_a, objs_b)
+
+
+
+        if added or deleted:
+
+            return True
+
+
+
+        for a_idx, b_idx in map_forwards.items():
+
+            comparison = self.get_child_comparison(objs_a[a_idx], objs_b[b_idx])
+
+
+
+            if comparison.has_changed():
+
+                return True
+
+
+
+        return False
+
+
+
+
+
+class ChildObjectComparison:
+
+    def __init__(self, model, field_comparisons, obj_a, obj_b):
+
+        self.model = model
+
+        self.field_comparisons = field_comparisons
+
+        self.obj_a = obj_a
+
+        self.obj_b = obj_b
+
+
+
+    def is_addition(self):
+
+        """
+
+        Returns True if this child object was created since obj_a
+
+        """
+
+        return self.obj_b and not self.obj_a
+
+
+
+    def is_deletion(self):
+
+        """
+
+        Returns True if this child object was deleted in obj_b
+
+        """
+
+        return self.obj_a and not self.obj_b
+
+
+
+    def get_position_change(self):
+
+        """
+
+        Returns the change in position as an integer. Positive if the object
+
+        was moved down, negative if it moved up.
+
+
+
+        For example: '3' indicates the object moved down three spaces. '-1'
+
+        indicates the object moved up one space.
+
+        """
+
+        if not self.is_addition() and not self.is_deletion():
+
+            sort_a = getattr(self.obj_a, 'sort_order', 0) or 0
+
+            sort_b = getattr(self.obj_b, 'sort_order', 0) or 0
+
+            return sort_b - sort_a
+
+
+
+    def get_field_comparisons(self):
+
+        """
+
+        Returns a list of comparisons for all the fields in this object.
+
+        Fields that haven't changed are included as well.
+
+        """
+
+        comparisons = []
+
+
+
+        if self.is_addition() or self.is_deletion():
+
+            # Display the fields without diff as one of the versions are missing
+
+            obj = self.obj_a or self.obj_b
+
+
+
+            for field_comparison in self.field_comparisons:
+
+                comparisons.append(field_comparison(obj, obj))
 
         else:
 
-            target = self.data.open_target
+            for field_comparison in self.field_comparisons:
+
+                comparisons.append(field_comparison(self.obj_a, self.obj_b))
 
 
 
-        if (navigation.navigation_type == navigation.Type.link_clicked and
-
-                target != usertypes.ClickTarget.normal):
-
-            tab = shared.get_tab(self.win_id, target)
-
-            tab.load_url(navigation.url)
-
-            self.data.open_target = usertypes.ClickTarget.normal
-
-            navigation.accepted = False
+        return comparisons
 
 
 
-        if navigation.is_main_frame:
+    def has_changed(self):
 
-            self.settings.update_for_url(navigation.url)
+        for comparison in self.get_field_comparisons():
 
+            if comparison.has_changed():
 
-
-    @pyqtSlot('QNetworkReply*')
-
-    def _on_ssl_errors(self, reply):
-
-        self._insecure_hosts.add(reply.url().host())
+                return True
 
 
 
-    def _connect_signals(self):
+        return False
 
-        view = self._widget
 
-        page = view.page()
 
-        frame = page.mainFrame()
+    def get_num_differences(self):
 
-        page.windowCloseRequested.connect(self.window_close_requested)
+        """
 
-        page.linkHovered.connect(self.link_hovered)
+        Returns the number of fields that differ between the two
 
-        page.loadProgress.connect(self._on_load_progress)
+        objects.
 
-        frame.loadStarted.connect(self._on_load_started)
+        """
 
-        view.scroll_pos_changed.connect(self.scroller.perc_changed)
+        num_differences = 0
 
-        view.titleChanged.connect(self.title_changed)
 
-        view.urlChanged.connect(self._on_url_changed)
 
-        view.shutting_down.connect(self.shutting_down)
+        for comparison in self.get_field_comparisons():
 
-        page.networkAccessManager().sslErrors.connect(self._on_ssl_errors)
+            if comparison.has_changed():
 
-        frame.loadFinished.connect(self._on_frame_load_finished)
+                num_differences += 1
 
-        view.iconChanged.connect(self._on_webkit_icon_changed)
 
-        page.frameCreated.connect(self._on_frame_created)
 
-        frame.contentsSizeChanged.connect(self._on_contents_size_changed)
+        return num_differences
 
-        frame.initialLayoutCompleted.connect(self._on_history_trigger)
 
-        page.navigation_request.connect(self._on_navigation_request)
+
+
+
+class TextDiff:
+
+    def __init__(self, changes, separator=""):
+
+        self.changes = changes
+
+        self.separator = separator
+
+
+
+    def to_html(self, tag='span', addition_class='addition', deletion_class='deletion'):
+
+        html = []
+
+
+
+        for change_type, value in self.changes:
+
+            if change_type == 'equal':
+
+                html.append(escape(value))
+
+            elif change_type == 'addition':
+
+                html.append('<{tag} class="{classname}">{value}</{tag}>'.format(
+
+                    tag=tag,
+
+                    classname=addition_class,
+
+                    value=escape(value)
+
+                ))
+
+            elif change_type == 'deletion':
+
+                html.append('<{tag} class="{classname}">{value}</{tag}>'.format(
+
+                    tag=tag,
+
+                    classname=deletion_class,
+
+                    value=escape(value)
+
+                ))
+
+
+
+        return mark_safe(self.separator.join(html))
+
+
+
+
+
+def diff_text(a, b):
+
+    """
+
+    Performs a diffing algorithm on two pieces of text. Returns
+
+    a string of HTML containing the content of both texts with
+
+    <span> tags inserted indicating where the differences are.
+
+    """
+
+    def tokenise(text):
+
+        """
+
+        Tokenises a string by spliting it into individual characters
+
+        and grouping the alphanumeric ones together.
+
+
+
+        This means that punctuation, whitespace, CJK characters, etc
+
+        become separate tokens and words/numbers are merged together
+
+        to form bigger tokens.
+
+
+
+        This makes the output of the diff easier to read as words are
+
+        not broken up.
+
+        """
+
+        tokens = []
+
+        current_token = ""
+
+
+
+        for c in text or "":
+
+            if c.isalnum():
+
+                current_token += c
+
+            else:
+
+                if current_token:
+
+                    tokens.append(current_token)
+
+                    current_token = ""
+
+
+
+                tokens.append(c)
+
+
+
+        if current_token:
+
+            tokens.append(current_token)
+
+
+
+        return tokens
+
+
+
+    a_tok = tokenise(a)
+
+    b_tok = tokenise(b)
+
+    sm = difflib.SequenceMatcher(lambda t: len(t) <= 4, a_tok, b_tok)
+
+
+
+    changes = []
+
+
+
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+
+        if op == 'replace':
+
+            for token in a_tok[i1:i2]:
+
+                changes.append(('deletion', token))
+
+            for token in b_tok[j1:j2]:
+
+                changes.append(('addition', token))
+
+        elif op == 'delete':
+
+            for token in a_tok[i1:i2]:
+
+                changes.append(('deletion', token))
+
+        elif op == 'insert':
+
+            for token in b_tok[j1:j2]:
+
+                changes.append(('addition', token))
+
+        elif op == 'equal':
+
+            for token in a_tok[i1:i2]:
+
+                changes.append(('equal', token))
+
+
+
+    # Merge ajacent changes which have the same type. This just cleans up the HTML a bit
+
+    merged_changes = []
+
+    current_value = []
+
+    current_change_type = None
+
+    for change_type, value in changes:
+
+        if change_type != current_change_type:
+
+            if current_change_type is not None:
+
+                merged_changes.append((current_change_type, ''.join(current_value)))
+
+                current_value = []
+
+
+
+            current_change_type = change_type
+
+
+
+        current_value.append(value)
+
+
+
+    if current_value:
+
+        merged_changes.append((current_change_type, ''.join(current_value)))
+
+
+
+    return TextDiff(merged_changes)

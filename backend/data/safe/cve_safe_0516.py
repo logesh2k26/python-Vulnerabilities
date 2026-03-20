@@ -2,364 +2,162 @@
 # Safety: safe
 # Category: safe
 
-# Based on local.py (c) 2012, Michael DeHaan <michael.dehaan@gmail.com>
+from Products.CMFCore.URLTool import URLTool as BaseTool
 
-# and chroot.py     (c) 2013, Maykel Moya <mmoya@speedyrails.com>
+from Products.CMFCore.utils import getToolByName
 
-# and jail.py       (c) 2013, Michael Scherer <misc@zarb.org>
+from AccessControl import ClassSecurityInfo
 
-# (c) 2015, Dagobert Michelsen <dam@baltic-online.de>
+from App.class_init import InitializeClass
 
-# (c) 2015, Toshio Kuratomi <tkuratomi@ansible.com>
+from Products.CMFPlone.PloneBaseTool import PloneBaseTool
 
-#
 
-# This file is part of Ansible
 
-#
+from posixpath import normpath
 
-# Ansible is free software: you can redistribute it and/or modify
+from urlparse import urlparse, urljoin
 
-# it under the terms of the GNU General Public License as published by
+import re
 
-# the Free Software Foundation, either version 3 of the License, or
 
-# (at your option) any later version.
 
-#
 
-# Ansible is distributed in the hope that it will be useful,
 
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
+class URLTool(PloneBaseTool, BaseTool):
 
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 
-# GNU General Public License for more details.
 
-#
+    meta_type = 'Plone URL Tool'
 
-# You should have received a copy of the GNU General Public License
+    security = ClassSecurityInfo()
 
-# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
+    toolicon = 'skins/plone_images/link_icon.png'
 
-from __future__ import (absolute_import, division, print_function)
 
-__metaclass__ = type
 
+    security.declarePublic('isURLInPortal')
 
+    def isURLInPortal(self, url, context=None):
 
-import distutils.spawn
+        """ Check if a given url is on the same host and contains the portal
 
-import traceback
+            path.  Used to ensure that login forms can determine relevant
 
-import os
+            referrers (i.e. in portal).  Also return true for some relative
 
-import subprocess
+            urls if context is passed in to allow for url parsing. When context
 
-from ansible import errors
+            is not provided, assume that relative urls are in the portal. It is
 
-from ansible.callbacks import vvv
+            assumed that http://portal is the same portal as https://portal.
 
-import ansible.constants as C
 
 
+            External sites listed in 'allow_external_login_sites' of
 
-BUFSIZE = 4096
+            site_properties are also considered within the portal to allow for
 
+            single sign on.
 
+        """
 
-class Connection(object):
+        # sanitize url
 
-    ''' Local zone based connections '''
+        url = re.sub('^[\x00-\x20]+', '', url).strip()
 
+        if ('<script' in url or '%3Cscript' in url or 'javascript:' in url or
 
+                'javascript%3A' in url):
 
-    def _search_executable(self, executable):
+            return False
 
-        cmd = distutils.spawn.find_executable(executable)
 
-        if not cmd:
 
-            raise errors.AnsibleError("%s command not found in PATH") % executable
+        p_url = self()
 
-        return cmd
 
 
+        _, u_host, u_path, _, _, _ = urlparse(url)
 
-    def list_zones(self):
+        if not u_host and not u_path.startswith('/'):
 
-        pipe = subprocess.Popen([self.zoneadm_cmd, 'list', '-ip'],
+            if context is None:
 
-                             cwd=self.runner.basedir,
+                return True  # old behavior
 
-                             stdin=subprocess.PIPE,
+            if not context.isPrincipiaFolderish:
 
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                useurl = context.aq_parent.absolute_url()
 
+            else:
 
-
-        zones = []
-
-        for l in pipe.stdout.readlines():
-
-          # 1:work:running:/zones/work:3126dc59-9a07-4829-cde9-a816e4c5040e:native:shared
-
-          s = l.split(':')
-
-          if s[1] != 'global':
-
-            zones.append(s[1])
-
-
-
-        return zones
-
-
-
-    def get_zone_path(self):
-
-        #solaris10vm# zoneadm -z cswbuild list -p         
-
-        #-:cswbuild:installed:/zones/cswbuild:479f3c4b-d0c6-e97b-cd04-fd58f2c0238e:native:shared
-
-        pipe = subprocess.Popen([self.zoneadm_cmd, '-z', self.zone, 'list', '-p'],
-
-                             cwd=self.runner.basedir,
-
-                             stdin=subprocess.PIPE,
-
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-
-
-        #stdout, stderr = p.communicate()
-
-        path = pipe.stdout.readlines()[0].split(':')[3]
-
-        return path + '/root'
-
-        
-
-    def __init__(self, runner, host, port, *args, **kwargs):
-
-        self.zone = host
-
-        self.runner = runner
-
-        self.host = host
-
-        self.has_pipelining = False
-
-        self.become_methods_supported=C.BECOME_METHODS
-
-
-
-        if os.geteuid() != 0:
-
-            raise errors.AnsibleError("zone connection requires running as root")
-
-
-
-        self.zoneadm_cmd = self._search_executable('zoneadm')
-
-        self.zlogin_cmd = self._search_executable('zlogin')
-
-        
-
-        if not self.zone in self.list_zones():
-
-            raise errors.AnsibleError("incorrect zone name %s" % self.zone)
-
-
-
-
-
-        self.host = host
-
-        # port is unused, since this is local
-
-        self.port = port
-
-
-
-    def connect(self, port=None):
-
-        ''' connect to the zone; nothing to do here '''
-
-
-
-        vvv("THIS IS A LOCAL ZONE DIR", host=self.zone)
-
-
-
-        return self
-
-
-
-    # a modifier
-
-    def _generate_cmd(self, executable, cmd):
-
-        if executable:
-
-            ### TODO: Why was "-c" removed from here? (vs jail.py)
-
-            local_cmd = [self.zlogin_cmd, self.zone, executable, cmd]
+                useurl = context.absolute_url()
 
         else:
 
-            local_cmd = '%s "%s" %s' % (self.zlogin_cmd, self.zone, cmd)
+            useurl = p_url  # when u_path.startswith('/')
 
-        return local_cmd
+        if not useurl.endswith('/'):
 
+            useurl += '/'
 
 
-    def _buffered_exec_command(self, cmd, tmp_path, become_user=None, sudoable=False, executable=None, in_data=None, stdin=subprocess.PIPE):
 
-        ''' run a command on the zone.  This is only needed for implementing
+        # urljoin to current url to get an absolute path
 
-        put_file() get_file() so that we don't have to read the whole file
+        _, u_host, u_path, _, _, _ = urlparse(urljoin(useurl, url))
 
-        into memory.
 
 
+        # normalise to end with a '/' so /foobar is not considered within /foo
 
-        compared to exec_command() it looses some niceties like being able to
+        if not u_path:
 
-        return the process's exit code immediately.
+            u_path = '/'
 
-        '''
+        else:
 
+            u_path = normpath(u_path)
 
+            if not u_path.endswith('/'):
 
-        if sudoable and self.runner.become and self.runner.become_method not in self.become_methods_supported:
+                u_path += '/'
 
-            raise errors.AnsibleError("Internal Error: this module does not support running commands via %s" % self.runner.become_method)
+        _, host, path, _, _, _ = urlparse(p_url)
 
+        if not path.endswith('/'):
 
+            path += '/'
 
-        if in_data:
+        if host == u_host and u_path.startswith(path):
 
-            raise errors.AnsibleError("Internal Error: this module does not support optimized module pipelining")
+            return True
 
 
 
-        # We happily ignore privilege escalation
+        props = getToolByName(self, 'portal_properties').site_properties
 
-        local_cmd = self._generate_cmd(executable, cmd)
+        for external_site in props.getProperty('allow_external_login_sites', []):
 
+            _, host, path, _, _, _ = urlparse(external_site)
 
+            if not path.endswith('/'):
 
-        vvv("EXEC %s" % (local_cmd), host=self.zone)
+                path += '/'
 
-        p = subprocess.Popen(local_cmd, shell=isinstance(local_cmd, basestring),
+            if host == u_host and u_path.startswith(path):
 
-                             cwd=self.runner.basedir,
+                return True
 
-                             stdin=stdin,
+        return False
 
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
 
-        return p
 
+URLTool.__doc__ = BaseTool.__doc__
 
 
-    def exec_command(self, cmd, tmp_path, become_user=None, sudoable=False, executable=None, in_data=None):
 
-        ''' run a command on the zone '''
-
-
-
-        ### TODO: Why all the precautions not to specify /bin/sh? (vs jail.py)
-
-        if executable == '/bin/sh':
-
-          executable = None
-
-
-
-        p = self._buffered_exec_command(cmd, tmp_path, become_user, sudoable, executable, in_data)
-
-
-
-        stdout, stderr = p.communicate()
-
-        return (p.returncode, '', stdout, stderr)
-
-
-
-    def put_file(self, in_path, out_path):
-
-        ''' transfer a file from local to zone '''
-
-
-
-        vvv("PUT %s TO %s" % (in_path, out_path), host=self.zone)
-
-
-
-        with open(in_path, 'rb') as in_file:
-
-            p = self._buffered_exec_command('dd of=%s' % out_path, None, stdin=in_file)
-
-            try:
-
-                stdout, stderr = p.communicate()
-
-            except:
-
-                traceback.print_exc()
-
-                raise errors.AnsibleError("failed to transfer file to %s" % out_path)
-
-            if p.returncode != 0:
-
-                raise errors.AnsibleError("failed to transfer file to %s:\n%s\n%s" % (out_path, stdout, stderr))
-
-
-
-    def fetch_file(self, in_path, out_path):
-
-        ''' fetch a file from zone to local '''
-
-
-
-        vvv("FETCH %s TO %s" % (in_path, out_path), host=self.zone)
-
-
-
-
-
-        p = self._buffered_exec_command('dd if=%s bs=%s' % (in_path, BUFSIZE), None)
-
-
-
-        with open(out_path, 'wb+') as out_file:
-
-            try:
-
-                for chunk in p.stdout.read(BUFSIZE):
-
-                    out_file.write(chunk)
-
-            except:
-
-                traceback.print_exc()
-
-                raise errors.AnsibleError("failed to transfer file to %s" % out_path)
-
-            stdout, stderr = p.communicate()
-
-            if p.returncode != 0:
-
-                raise errors.AnsibleError("failed to transfer file to %s:\n%s\n%s" % (out_path, stdout, stderr))
-
-
-
-    def close(self):
-
-        ''' terminate the connection; nothing to do here '''
-
-        pass
+InitializeClass(URLTool)

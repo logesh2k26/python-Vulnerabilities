@@ -1,159 +1,147 @@
 # Source: CVEFixes dataset
-# Safety: vulnerable
+# Safety: safe
 # Category: safe
 
 # -*- coding: utf-8 -*-
 
-# See https://zulip.readthedocs.io/en/latest/subsystems/thumbnailing.html
+#
 
-import base64
+# This file is part of Radicale Server - Calendar Server
+
+#
+
+# This library is free software: you can redistribute it and/or modify
+
+# it under the terms of the GNU General Public License as published by
+
+# the Free Software Foundation, either version 3 of the License, or
+
+# (at your option) any later version.
+
+#
+
+# This library is distributed in the hope that it will be useful,
+
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+
+# GNU General Public License for more details.
+
+#
+
+# You should have received a copy of the GNU General Public License
+
+# along with Radicale.  If not, see <http://www.gnu.org/licenses/>.
+
+
+
+"""
+
+Helper functions for working with paths
+
+
+
+"""
+
+
 
 import os
 
-import sys
+import posixpath
 
-import urllib
 
-from django.conf import settings
 
-from libthumbor import CryptoURL
+from . import log
 
 
 
-ZULIP_PATH = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath('__file__'))))
 
-sys.path.append(ZULIP_PATH)
 
+def sanitize_path(path):
 
+    """Make absolute (with leading slash) to prevent access to other data.
 
-from zthumbor.loaders.helpers import (
+       Preserves an potential trailing slash."""
 
-    THUMBOR_S3_TYPE, THUMBOR_LOCAL_FILE_TYPE, THUMBOR_EXTERNAL_TYPE
+    trailing_slash = "/" if path.endswith("/") else ""
 
-)
+    path = posixpath.normpath(path)
 
-from zerver.lib.camo import get_camo_url
+    new_path = "/"
 
+    for part in path.split("/"):
 
+        if not part or part in (".", ".."):
 
-def is_thumbor_enabled() -> bool:
+            continue
 
-    return settings.THUMBOR_URL != ''
+        new_path = posixpath.join(new_path, part)
 
+    trailing_slash = "" if new_path.endswith("/") else trailing_slash
 
+    return new_path + trailing_slash
 
-def user_uploads_or_external(url: str) -> bool:
 
-    return url.startswith('http') or url.lstrip('/').startswith('user_uploads/')
 
 
 
-def get_source_type(url: str) -> str:
+def is_safe_filesystem_path_component(path):
 
-    if not url.startswith('/user_uploads/'):
+    """Checks if path is a single component of a local filesystem path
 
-        return THUMBOR_EXTERNAL_TYPE
+       and is safe to join"""
 
+    if not path:
 
+        return False
 
-    local_uploads_dir = settings.LOCAL_UPLOADS_DIR
+    drive, _ = os.path.splitdrive(path)
 
-    if local_uploads_dir:
+    if drive:
 
-        return THUMBOR_LOCAL_FILE_TYPE
+        return False
 
-    return THUMBOR_S3_TYPE
+    head, _ = os.path.split(path)
 
+    if head:
 
+        return False
 
-def generate_thumbnail_url(path: str,
+    if path in (os.curdir, os.pardir):
 
-                           size: str='0x0',
+        return False
 
-                           is_camo_url: bool=False) -> str:
+    return True
 
-    if not (path.startswith('https://') or path.startswith('http://')):
 
-        path = '/' + path
 
 
 
-    if not is_thumbor_enabled():
+def path_to_filesystem(path, base_folder):
 
-        if path.startswith('http://'):
+    """Converts path to a local filesystem path relative to base_folder
 
-            return get_camo_url(path)
+        in a secure manner or raises ValueError."""
 
-        return path
+    sane_path = sanitize_path(path).strip("/")
 
+    safe_path = base_folder
 
+    if not sane_path:
 
-    if not user_uploads_or_external(path):
+        return safe_path
 
-        return path
+    for part in sane_path.split("/"):
 
+        if not is_safe_filesystem_path_component(part):
 
+            log.LOGGER.debug("Can't translate path safely to filesystem: %s",
 
-    source_type = get_source_type(path)
+                             path)
 
-    safe_url = base64.urlsafe_b64encode(path.encode()).decode('utf-8')
+            raise ValueError("Unsafe path")
 
-    image_url = '%s/source_type/%s' % (safe_url, source_type)
+        safe_path = os.path.join(safe_path, part)
 
-    width, height = map(int, size.split('x'))
-
-    crypto = CryptoURL(key=settings.THUMBOR_KEY)
-
-
-
-    smart_crop_enabled = True
-
-    apply_filters = ['no_upscale()']
-
-    if is_camo_url:
-
-        smart_crop_enabled = False
-
-        apply_filters.append('quality(100)')
-
-    if size != '0x0':
-
-        apply_filters.append('sharpen(0.5,0.2,true)')
-
-
-
-    encrypted_url = crypto.generate(
-
-        width=width,
-
-        height=height,
-
-        smart=smart_crop_enabled,
-
-        filters=apply_filters,
-
-        image_url=image_url
-
-    )
-
-
-
-    if settings.THUMBOR_URL == 'http://127.0.0.1:9995':
-
-        # If THUMBOR_URL is the default then thumbor is hosted on same machine
-
-        # as the Zulip server and we should serve a relative URL.
-
-        # We add a /thumbor in front of the relative url because we make
-
-        # use of a proxy pass to redirect request internally in Nginx to 9995
-
-        # port where thumbor is running.
-
-        thumbnail_url = '/thumbor' + encrypted_url
-
-    else:
-
-        thumbnail_url = urllib.parse.urljoin(settings.THUMBOR_URL, encrypted_url)
-
-    return thumbnail_url
+    return safe_path

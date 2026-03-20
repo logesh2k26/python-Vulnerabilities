@@ -2,156 +2,478 @@
 # Safety: safe
 # Category: safe
 
-# Copyright 2012 OpenStack LLC
+""" Generate modern Python clients from OpenAPI """
 
-#
+from __future__ import annotations
 
-# Licensed under the Apache License, Version 2.0 (the "License"); you may
 
-# not use this file except in compliance with the License. You may obtain
 
-# a copy of the License at
+import shutil
 
-#
+import subprocess
 
-#      http://www.apache.org/licenses/LICENSE-2.0
+import sys
 
-#
+from pathlib import Path
 
-# Unless required by applicable law or agreed to in writing, software
+from typing import Any, Dict, Optional, Sequence, Union
 
-# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
-# License for the specific language governing permissions and limitations
+import httpcore
 
-# under the License.
+import httpx
 
+import yaml
 
+from jinja2 import Environment, PackageLoader
 
-import time
 
 
+from openapi_python_client import utils
 
-import default_fixtures
 
 
+from .parser import GeneratorData, import_string_from_reference
 
-from keystone import config
+from .parser.errors import GeneratorError
 
-from keystone import service
 
-from keystone import test
 
-from keystone.identity.backends import kvs as kvs_identity
+if sys.version_info.minor == 7:  # version did not exist in 3.7, need to use a backport
 
+    from importlib_metadata import version
 
+else:
 
+    from importlib.metadata import version  # type: ignore
 
 
-CONF = config.CONF
 
 
 
+__version__ = version(__package__)
 
 
-class TokenExpirationTest(test.TestCase):
 
-    def setUp(self):
 
-        super(TokenExpirationTest, self).setUp()
 
-        self.identity_api = kvs_identity.Identity()
+def _get_project_for_url_or_path(url: Optional[str], path: Optional[Path]) -> Union[Project, GeneratorError]:
 
-        self.load_fixtures(default_fixtures)
+    data_dict = _get_document(url=url, path=path)
 
-        self.api = service.TokenController()
+    if isinstance(data_dict, GeneratorError):
 
+        return data_dict
 
+    openapi = GeneratorData.from_dict(data_dict)
 
-    def _maintain_token_expiration(self):
+    if isinstance(openapi, GeneratorError):
 
-        """Token expiration should be maintained after re-auth & validation."""
+        return openapi
 
-        r = self.api.authenticate(
+    return Project(openapi=openapi)
 
-            {},
 
-            auth={
 
-                'passwordCredentials': {
 
-                    'username': self.user_foo['name'],
 
-                    'password': self.user_foo['password']
+def create_new_client(*, url: Optional[str], path: Optional[Path]) -> Sequence[GeneratorError]:
 
-                }
+    """
 
-            })
+    Generate the client library
 
-        unscoped_token_id = r['access']['token']['id']
 
-        original_expiration = r['access']['token']['expires']
 
+    Returns:
 
+         A list containing any errors encountered when generating.
 
-        time.sleep(0.5)
+    """
 
+    project = _get_project_for_url_or_path(url=url, path=path)
 
+    if isinstance(project, GeneratorError):
 
-        r = self.api.validate_token(
+        return [project]
 
-            dict(is_admin=True, query_string={}),
+    return project.build()
 
-            token_id=unscoped_token_id)
 
-        self.assertEqual(original_expiration, r['access']['token']['expires'])
 
 
 
-        time.sleep(0.5)
+def update_existing_client(*, url: Optional[str], path: Optional[Path]) -> Sequence[GeneratorError]:
 
+    """
 
+    Update an existing client library
 
-        r = self.api.authenticate(
 
-            {},
 
-            auth={
+    Returns:
 
-                'token': {
+         A list containing any errors encountered when generating.
 
-                    'id': unscoped_token_id,
+    """
 
-                },
+    project = _get_project_for_url_or_path(url=url, path=path)
 
-                'tenantId': self.tenant_bar['id'],
+    if isinstance(project, GeneratorError):
 
-            })
+        return [project]
 
-        scoped_token_id = r['access']['token']['id']
+    return project.update()
 
-        self.assertEqual(original_expiration, r['access']['token']['expires'])
 
 
 
-        time.sleep(0.5)
 
+def _get_document(*, url: Optional[str], path: Optional[Path]) -> Union[Dict[str, Any], GeneratorError]:
 
+    yaml_bytes: bytes
 
-        r = self.api.validate_token(
+    if url is not None and path is not None:
 
-            dict(is_admin=True, query_string={}),
+        return GeneratorError(header="Provide URL or Path, not both.")
 
-            token_id=scoped_token_id)
+    if url is not None:
 
-        self.assertEqual(original_expiration, r['access']['token']['expires'])
+        try:
 
+            response = httpx.get(url)
 
+            yaml_bytes = response.content
 
-    def test_maintain_uuid_token_expiration(self):
+        except (httpx.HTTPError, httpcore.NetworkError):
 
-        self.opt_in_group('signing', token_format='UUID')
+            return GeneratorError(header="Could not get OpenAPI document from provided URL")
 
-        self._maintain_token_expiration()
+    elif path is not None:
+
+        yaml_bytes = path.read_bytes()
+
+    else:
+
+        return GeneratorError(header="No URL or Path provided")
+
+    try:
+
+        return yaml.safe_load(yaml_bytes)
+
+    except yaml.YAMLError:
+
+        return GeneratorError(header="Invalid YAML from provided source")
+
+
+
+
+
+class Project:
+
+    TEMPLATE_FILTERS = {"snakecase": utils.snake_case, "kebabcase": utils.kebab_case}
+
+    project_name_override: Optional[str] = None
+
+    package_name_override: Optional[str] = None
+
+
+
+    def __init__(self, *, openapi: GeneratorData) -> None:
+
+        self.openapi: GeneratorData = openapi
+
+        self.env: Environment = Environment(loader=PackageLoader(__package__), trim_blocks=True, lstrip_blocks=True)
+
+
+
+        self.project_name: str = self.project_name_override or f"{utils.kebab_case(openapi.title).lower()}-client"
+
+        self.project_dir: Path = Path.cwd() / self.project_name
+
+
+
+        self.package_name: str = self.package_name_override or self.project_name.replace("-", "_")
+
+        self.package_dir: Path = self.project_dir / self.package_name
+
+        self.package_description: str = f"A client library for accessing {self.openapi.title}"
+
+        self.version: str = openapi.version
+
+
+
+        self.env.filters.update(self.TEMPLATE_FILTERS)
+
+
+
+    def build(self) -> Sequence[GeneratorError]:
+
+        """ Create the project from templates """
+
+
+
+        print(f"Generating {self.project_name}")
+
+        try:
+
+            self.project_dir.mkdir()
+
+        except FileExistsError:
+
+            return [GeneratorError(detail="Directory already exists. Delete it or use the update command.")]
+
+        self._create_package()
+
+        self._build_metadata()
+
+        self._build_models()
+
+        self._build_api()
+
+        self._reformat()
+
+        return self._get_errors()
+
+
+
+    def update(self) -> Sequence[GeneratorError]:
+
+        """ Update an existing project """
+
+
+
+        if not self.package_dir.is_dir():
+
+            raise FileNotFoundError()
+
+        print(f"Updating {self.project_name}")
+
+        shutil.rmtree(self.package_dir)
+
+        self._create_package()
+
+        self._build_models()
+
+        self._build_api()
+
+        self._reformat()
+
+        return self._get_errors()
+
+
+
+    def _reformat(self) -> None:
+
+        subprocess.run(
+
+            "isort .", cwd=self.project_dir, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+
+        )
+
+        subprocess.run("black .", cwd=self.project_dir, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+
+    def _get_errors(self) -> Sequence[GeneratorError]:
+
+        errors = []
+
+        for collection in self.openapi.endpoint_collections_by_tag.values():
+
+            errors.extend(collection.parse_errors)
+
+        errors.extend(self.openapi.schemas.errors)
+
+        return errors
+
+
+
+    def _create_package(self) -> None:
+
+        self.package_dir.mkdir()
+
+        # Package __init__.py
+
+        package_init = self.package_dir / "__init__.py"
+
+
+
+        package_init_template = self.env.get_template("package_init.pyi")
+
+        package_init.write_text(package_init_template.render(description=self.package_description))
+
+
+
+        pytyped = self.package_dir / "py.typed"
+
+        pytyped.write_text("# Marker file for PEP 561")
+
+
+
+    def _build_metadata(self) -> None:
+
+        # Create a pyproject.toml file
+
+        pyproject_template = self.env.get_template("pyproject.toml")
+
+        pyproject_path = self.project_dir / "pyproject.toml"
+
+        pyproject_path.write_text(
+
+            pyproject_template.render(
+
+                project_name=self.project_name,
+
+                package_name=self.package_name,
+
+                version=self.version,
+
+                description=self.package_description,
+
+            )
+
+        )
+
+
+
+        # README.md
+
+        readme = self.project_dir / "README.md"
+
+        readme_template = self.env.get_template("README.md")
+
+        readme.write_text(
+
+            readme_template.render(
+
+                project_name=self.project_name, description=self.package_description, package_name=self.package_name
+
+            )
+
+        )
+
+
+
+        # .gitignore
+
+        git_ignore_path = self.project_dir / ".gitignore"
+
+        git_ignore_template = self.env.get_template(".gitignore")
+
+        git_ignore_path.write_text(git_ignore_template.render())
+
+
+
+    def _build_models(self) -> None:
+
+        # Generate models
+
+        models_dir = self.package_dir / "models"
+
+        models_dir.mkdir()
+
+        models_init = models_dir / "__init__.py"
+
+        imports = []
+
+
+
+        types_template = self.env.get_template("types.py")
+
+        types_path = models_dir / "types.py"
+
+        types_path.write_text(types_template.render())
+
+
+
+        model_template = self.env.get_template("model.pyi")
+
+        for model in self.openapi.schemas.models.values():
+
+            module_path = models_dir / f"{model.reference.module_name}.py"
+
+            module_path.write_text(model_template.render(model=model))
+
+            imports.append(import_string_from_reference(model.reference))
+
+
+
+        # Generate enums
+
+        enum_template = self.env.get_template("enum.pyi")
+
+        for enum in self.openapi.enums.values():
+
+            module_path = models_dir / f"{enum.reference.module_name}.py"
+
+            module_path.write_text(enum_template.render(enum=enum))
+
+            imports.append(import_string_from_reference(enum.reference))
+
+
+
+        models_init_template = self.env.get_template("models_init.pyi")
+
+        models_init.write_text(models_init_template.render(imports=imports))
+
+
+
+    def _build_api(self) -> None:
+
+        # Generate Client
+
+        client_path = self.package_dir / "client.py"
+
+        client_template = self.env.get_template("client.pyi")
+
+        client_path.write_text(client_template.render())
+
+
+
+        # Generate endpoints
+
+        api_dir = self.package_dir / "api"
+
+        api_dir.mkdir()
+
+        api_init = api_dir / "__init__.py"
+
+        api_init.write_text('""" Contains synchronous methods for accessing the API """')
+
+
+
+        async_api_dir = self.package_dir / "async_api"
+
+        async_api_dir.mkdir()
+
+        async_api_init = async_api_dir / "__init__.py"
+
+        async_api_init.write_text('""" Contains async methods for accessing the API """')
+
+
+
+        api_errors = self.package_dir / "errors.py"
+
+        errors_template = self.env.get_template("errors.pyi")
+
+        api_errors.write_text(errors_template.render())
+
+
+
+        endpoint_template = self.env.get_template("endpoint_module.pyi")
+
+        async_endpoint_template = self.env.get_template("async_endpoint_module.pyi")
+
+        for tag, collection in self.openapi.endpoint_collections_by_tag.items():
+
+            tag = utils.snake_case(tag)
+
+            module_path = api_dir / f"{tag}.py"
+
+            module_path.write_text(endpoint_template.render(collection=collection))
+
+            async_module_path = async_api_dir / f"{tag}.py"
+
+            async_module_path.write_text(async_endpoint_template.render(collection=collection))

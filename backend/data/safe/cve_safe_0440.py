@@ -2,54 +2,48 @@
 # Safety: safe
 # Category: safe
 
-import json
+""" Regenerate golden-master """
+
+import shutil
+
+from pathlib import Path
 
 
 
-from tornado import web
+from typer.testing import CliRunner
 
 
 
-from ...base.handlers import APIHandler, json_errors
+from openapi_python_client.cli import app
 
 
 
-class NbconvertRootHandler(APIHandler):
+if __name__ == "__main__":
 
-    SUPPORTED_METHODS = ('GET',)
+    runner = CliRunner()
 
+    openapi_path = Path(__file__).parent / "fastapi_app" / "openapi.json"
 
+    gm_path = Path(__file__).parent / "golden-master"
 
-    @web.authenticated
+    shutil.rmtree(gm_path, ignore_errors=True)
 
-    @json_errors
+    output_path = Path.cwd() / "my-test-api-client"
 
-    def get(self):
+    shutil.rmtree(output_path, ignore_errors=True)
 
-        try:
-
-            from IPython.nbconvert.exporters.export import exporter_map
-
-        except ImportError as e:
-
-            raise web.HTTPError(500, "Could not import nbconvert: %s" % e)
-
-        res = {}
-
-        for format, exporter in exporter_map.items():
-
-            res[format] = info = {}
-
-            info['output_mimetype'] = exporter.output_mimetype
+    config_path = Path(__file__).parent / "config.yml"
 
 
 
-        self.finish(json.dumps(res))
+    result = runner.invoke(app, [f"--config={config_path}", "generate", f"--path={openapi_path}"])
 
+    if result.stdout:
 
+        print(result.stdout)
 
-default_handlers = [
+    if result.exception:
 
-    (r"/api/nbconvert", NbconvertRootHandler),
+        raise result.exception
 
-]
+    output_path.rename(gm_path)

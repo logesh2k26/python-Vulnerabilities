@@ -2,954 +2,492 @@
 # Safety: safe
 # Category: safe
 
-"""A contents manager that uses the local file system for storage."""
+"""
+
+SVG colors.
 
 
 
-# Copyright (c) Jupyter Development Team.
-
-# Distributed under the terms of the Modified BSD License.
+"""
 
 
 
-
-
-import io
-
-import os
-
-import shutil
-
-import mimetypes
-
-import nbformat
+import re
 
 
 
-from tornado import web
+COLORS = {
+
+    'aliceblue': (240 / 255, 248 / 255, 255 / 255, 1),
+
+    'antiquewhite': (250 / 255, 235 / 255, 215 / 255, 1),
+
+    'aqua': (0 / 255, 255 / 255, 255 / 255, 1),
+
+    'aquamarine': (127 / 255, 255 / 255, 212 / 255, 1),
+
+    'azure': (240 / 255, 255 / 255, 255 / 255, 1),
+
+    'beige': (245 / 255, 245 / 255, 220 / 255, 1),
+
+    'bisque': (255 / 255, 228 / 255, 196 / 255, 1),
+
+    'black': (0 / 255, 0 / 255, 0 / 255, 1),
+
+    'blanchedalmond': (255 / 255, 235 / 255, 205 / 255, 1),
+
+    'blue': (0 / 255, 0 / 255, 255 / 255, 1),
+
+    'blueviolet': (138 / 255, 43 / 255, 226 / 255, 1),
+
+    'brown': (165 / 255, 42 / 255, 42 / 255, 1),
+
+    'burlywood': (222 / 255, 184 / 255, 135 / 255, 1),
+
+    'cadetblue': (95 / 255, 158 / 255, 160 / 255, 1),
+
+    'chartreuse': (127 / 255, 255 / 255, 0 / 255, 1),
+
+    'chocolate': (210 / 255, 105 / 255, 30 / 255, 1),
+
+    'coral': (255 / 255, 127 / 255, 80 / 255, 1),
+
+    'cornflowerblue': (100 / 255, 149 / 255, 237 / 255, 1),
+
+    'cornsilk': (255 / 255, 248 / 255, 220 / 255, 1),
+
+    'crimson': (220 / 255, 20 / 255, 60 / 255, 1),
+
+    'cyan': (0 / 255, 255 / 255, 255 / 255, 1),
+
+    'darkblue': (0 / 255, 0 / 255, 139 / 255, 1),
+
+    'darkcyan': (0 / 255, 139 / 255, 139 / 255, 1),
+
+    'darkgoldenrod': (184 / 255, 134 / 255, 11 / 255, 1),
+
+    'darkgray': (169 / 255, 169 / 255, 169 / 255, 1),
+
+    'darkgreen': (0 / 255, 100 / 255, 0 / 255, 1),
+
+    'darkgrey': (169 / 255, 169 / 255, 169 / 255, 1),
+
+    'darkkhaki': (189 / 255, 183 / 255, 107 / 255, 1),
+
+    'darkmagenta': (139 / 255, 0 / 255, 139 / 255, 1),
+
+    'darkolivegreen': (85 / 255, 107 / 255, 47 / 255, 1),
+
+    'darkorange': (255 / 255, 140 / 255, 0 / 255, 1),
+
+    'darkorchid': (153 / 255, 50 / 255, 204 / 255, 1),
+
+    'darkred': (139 / 255, 0 / 255, 0 / 255, 1),
+
+    'darksalmon': (233 / 255, 150 / 255, 122 / 255, 1),
+
+    'darkseagreen': (143 / 255, 188 / 255, 143 / 255, 1),
+
+    'darkslateblue': (72 / 255, 61 / 255, 139 / 255, 1),
+
+    'darkslategray': (47 / 255, 79 / 255, 79 / 255, 1),
+
+    'darkslategrey': (47 / 255, 79 / 255, 79 / 255, 1),
+
+    'darkturquoise': (0 / 255, 206 / 255, 209 / 255, 1),
+
+    'darkviolet': (148 / 255, 0 / 255, 211 / 255, 1),
+
+    'deeppink': (255 / 255, 20 / 255, 147 / 255, 1),
+
+    'deepskyblue': (0 / 255, 191 / 255, 255 / 255, 1),
+
+    'dimgray': (105 / 255, 105 / 255, 105 / 255, 1),
+
+    'dimgrey': (105 / 255, 105 / 255, 105 / 255, 1),
+
+    'dodgerblue': (30 / 255, 144 / 255, 255 / 255, 1),
+
+    'firebrick': (178 / 255, 34 / 255, 34 / 255, 1),
+
+    'floralwhite': (255 / 255, 250 / 255, 240 / 255, 1),
+
+    'forestgreen': (34 / 255, 139 / 255, 34 / 255, 1),
+
+    'fuchsia': (255 / 255, 0 / 255, 255 / 255, 1),
+
+    'gainsboro': (220 / 255, 220 / 255, 220 / 255, 1),
+
+    'ghostwhite': (248 / 255, 248 / 255, 255 / 255, 1),
+
+    'gold': (255 / 255, 215 / 255, 0 / 255, 1),
+
+    'goldenrod': (218 / 255, 165 / 255, 32 / 255, 1),
+
+    'gray': (128 / 255, 128 / 255, 128 / 255, 1),
+
+    'grey': (128 / 255, 128 / 255, 128 / 255, 1),
+
+    'green': (0 / 255, 128 / 255, 0 / 255, 1),
+
+    'greenyellow': (173 / 255, 255 / 255, 47 / 255, 1),
+
+    'honeydew': (240 / 255, 255 / 255, 240 / 255, 1),
+
+    'hotpink': (255 / 255, 105 / 255, 180 / 255, 1),
+
+    'indianred': (205 / 255, 92 / 255, 92 / 255, 1),
+
+    'indigo': (75 / 255, 0 / 255, 130 / 255, 1),
+
+    'ivory': (255 / 255, 255 / 255, 240 / 255, 1),
+
+    'khaki': (240 / 255, 230 / 255, 140 / 255, 1),
+
+    'lavender': (230 / 255, 230 / 255, 250 / 255, 1),
+
+    'lavenderblush': (255 / 255, 240 / 255, 245 / 255, 1),
+
+    'lawngreen': (124 / 255, 252 / 255, 0 / 255, 1),
+
+    'lemonchiffon': (255 / 255, 250 / 255, 205 / 255, 1),
+
+    'lightblue': (173 / 255, 216 / 255, 230 / 255, 1),
+
+    'lightcoral': (240 / 255, 128 / 255, 128 / 255, 1),
+
+    'lightcyan': (224 / 255, 255 / 255, 255 / 255, 1),
+
+    'lightgoldenrodyellow': (250 / 255, 250 / 255, 210 / 255, 1),
+
+    'lightgray': (211 / 255, 211 / 255, 211 / 255, 1),
+
+    'lightgreen': (144 / 255, 238 / 255, 144 / 255, 1),
+
+    'lightgrey': (211 / 255, 211 / 255, 211 / 255, 1),
+
+    'lightpink': (255 / 255, 182 / 255, 193 / 255, 1),
+
+    'lightsalmon': (255 / 255, 160 / 255, 122 / 255, 1),
+
+    'lightseagreen': (32 / 255, 178 / 255, 170 / 255, 1),
+
+    'lightskyblue': (135 / 255, 206 / 255, 250 / 255, 1),
+
+    'lightslategray': (119 / 255, 136 / 255, 153 / 255, 1),
+
+    'lightslategrey': (119 / 255, 136 / 255, 153 / 255, 1),
+
+    'lightsteelblue': (176 / 255, 196 / 255, 222 / 255, 1),
+
+    'lightyellow': (255 / 255, 255 / 255, 224 / 255, 1),
+
+    'lime': (0 / 255, 255 / 255, 0 / 255, 1),
+
+    'limegreen': (50 / 255, 205 / 255, 50 / 255, 1),
+
+    'linen': (250 / 255, 240 / 255, 230 / 255, 1),
+
+    'magenta': (255 / 255, 0 / 255, 255 / 255, 1),
+
+    'maroon': (128 / 255, 0 / 255, 0 / 255, 1),
+
+    'mediumaquamarine': (102 / 255, 205 / 255, 170 / 255, 1),
+
+    'mediumblue': (0 / 255, 0 / 255, 205 / 255, 1),
+
+    'mediumorchid': (186 / 255, 85 / 255, 211 / 255, 1),
+
+    'mediumpurple': (147 / 255, 112 / 255, 219 / 255, 1),
+
+    'mediumseagreen': (60 / 255, 179 / 255, 113 / 255, 1),
+
+    'mediumslateblue': (123 / 255, 104 / 255, 238 / 255, 1),
+
+    'mediumspringgreen': (0 / 255, 250 / 255, 154 / 255, 1),
+
+    'mediumturquoise': (72 / 255, 209 / 255, 204 / 255, 1),
+
+    'mediumvioletred': (199 / 255, 21 / 255, 133 / 255, 1),
+
+    'midnightblue': (25 / 255, 25 / 255, 112 / 255, 1),
+
+    'mintcream': (245 / 255, 255 / 255, 250 / 255, 1),
+
+    'mistyrose': (255 / 255, 228 / 255, 225 / 255, 1),
+
+    'moccasin': (255 / 255, 228 / 255, 181 / 255, 1),
+
+    'navajowhite': (255 / 255, 222 / 255, 173 / 255, 1),
+
+    'navy': (0 / 255, 0 / 255, 128 / 255, 1),
+
+    'oldlace': (253 / 255, 245 / 255, 230 / 255, 1),
+
+    'olive': (128 / 255, 128 / 255, 0 / 255, 1),
+
+    'olivedrab': (107 / 255, 142 / 255, 35 / 255, 1),
+
+    'orange': (255 / 255, 165 / 255, 0 / 255, 1),
+
+    'orangered': (255 / 255, 69 / 255, 0 / 255, 1),
+
+    'orchid': (218 / 255, 112 / 255, 214 / 255, 1),
+
+    'palegoldenrod': (238 / 255, 232 / 255, 170 / 255, 1),
+
+    'palegreen': (152 / 255, 251 / 255, 152 / 255, 1),
+
+    'paleturquoise': (175 / 255, 238 / 255, 238 / 255, 1),
+
+    'palevioletred': (219 / 255, 112 / 255, 147 / 255, 1),
+
+    'papayawhip': (255 / 255, 239 / 255, 213 / 255, 1),
+
+    'peachpuff': (255 / 255, 218 / 255, 185 / 255, 1),
+
+    'peru': (205 / 255, 133 / 255, 63 / 255, 1),
+
+    'pink': (255 / 255, 192 / 255, 203 / 255, 1),
+
+    'plum': (221 / 255, 160 / 255, 221 / 255, 1),
+
+    'powderblue': (176 / 255, 224 / 255, 230 / 255, 1),
+
+    'purple': (128 / 255, 0 / 255, 128 / 255, 1),
+
+    'red': (255 / 255, 0 / 255, 0 / 255, 1),
+
+    'rosybrown': (188 / 255, 143 / 255, 143 / 255, 1),
+
+    'royalblue': (65 / 255, 105 / 255, 225 / 255, 1),
+
+    'saddlebrown': (139 / 255, 69 / 255, 19 / 255, 1),
+
+    'salmon': (250 / 255, 128 / 255, 114 / 255, 1),
+
+    'sandybrown': (244 / 255, 164 / 255, 96 / 255, 1),
+
+    'seagreen': (46 / 255, 139 / 255, 87 / 255, 1),
+
+    'seashell': (255 / 255, 245 / 255, 238 / 255, 1),
+
+    'sienna': (160 / 255, 82 / 255, 45 / 255, 1),
+
+    'silver': (192 / 255, 192 / 255, 192 / 255, 1),
+
+    'skyblue': (135 / 255, 206 / 255, 235 / 255, 1),
+
+    'slateblue': (106 / 255, 90 / 255, 205 / 255, 1),
+
+    'slategray': (112 / 255, 128 / 255, 144 / 255, 1),
+
+    'slategrey': (112 / 255, 128 / 255, 144 / 255, 1),
+
+    'snow': (255 / 255, 250 / 255, 250 / 255, 1),
+
+    'springgreen': (0 / 255, 255 / 255, 127 / 255, 1),
+
+    'steelblue': (70 / 255, 130 / 255, 180 / 255, 1),
+
+    'tan': (210 / 255, 180 / 255, 140 / 255, 1),
+
+    'teal': (0 / 255, 128 / 255, 128 / 255, 1),
+
+    'thistle': (216 / 255, 191 / 255, 216 / 255, 1),
+
+    'tomato': (255 / 255, 99 / 255, 71 / 255, 1),
+
+    'turquoise': (64 / 255, 224 / 255, 208 / 255, 1),
+
+    'violet': (238 / 255, 130 / 255, 238 / 255, 1),
+
+    'wheat': (245 / 255, 222 / 255, 179 / 255, 1),
+
+    'white': (255 / 255, 255 / 255, 255 / 255, 1),
+
+    'whitesmoke': (245 / 255, 245 / 255, 245 / 255, 1),
+
+    'yellow': (255 / 255, 255 / 255, 0 / 255, 1),
+
+    'yellowgreen': (154 / 255, 205 / 255, 50 / 255, 1),
 
 
 
-from .filecheckpoints import FileCheckpoints
+    'activeborder': (0, 0, 1, 1),
 
-from .fileio import FileManagerMixin
+    'activecaption': (0, 0, 1, 1),
 
-from .manager import ContentsManager
+    'appworkspace': (1, 1, 1, 1),
+
+    'background': (1, 1, 1, 1),
+
+    'buttonface': (0, 0, 0, 1),
+
+    'buttonhighlight': (0.8, 0.8, 0.8, 1),
+
+    'buttonshadow': (0.2, 0.2, 0.2, 1),
+
+    'buttontext': (0, 0, 0, 1),
+
+    'captiontext': (0, 0, 0, 1),
+
+    'graytext': (0.2, 0.2, 0.2, 1),
+
+    'highlight': (0, 0, 1, 1),
+
+    'highlighttext': (0.8, 0.8, 0.8, 1),
+
+    'inactiveborder': (0.2, 0.2, 0.2, 1),
+
+    'inactivecaption': (0.8, 0.8, 0.8, 1),
+
+    'inactivecaptiontext': (0.2, 0.2, 0.2, 1),
+
+    'infobackground': (0.8, 0.8, 0.8, 1),
+
+    'infotext': (0, 0, 0, 1),
+
+    'menu': (0.8, 0.8, 0.8, 1),
+
+    'menutext': (0.2, 0.2, 0.2, 1),
+
+    'scrollbar': (0.8, 0.8, 0.8, 1),
+
+    'threeddarkshadow': (0.2, 0.2, 0.2, 1),
+
+    'threedface': (0.8, 0.8, 0.8, 1),
+
+    'threedhighlight': (1, 1, 1, 1),
+
+    'threedlightshadow': (0.2, 0.2, 0.2, 1),
+
+    'threedshadow': (0.2, 0.2, 0.2, 1),
+
+    'window': (0.8, 0.8, 0.8, 1),
+
+    'windowframe': (0.8, 0.8, 0.8, 1),
+
+    'windowtext': (0, 0, 0, 1),
+
+
+
+    'none': (0, 0, 0, 0),
+
+    'transparent': (0, 0, 0, 0),
+
+}
+
+
+
+RGBA = re.compile(r'rgba\((.+?)\)')
+
+RGB = re.compile(r'rgb\((.+?)\)')
+
+HEX_RRGGBB = re.compile('#[0-9a-f]{6}')
+
+HEX_RGB = re.compile('#[0-9a-f]{3}')
 
 
 
 
 
-from ipython_genutils.importstring import import_item
+def color(string, opacity=1):
 
-from traitlets import Any, Unicode, Bool, TraitError
-
-from ipython_genutils.py3compat import getcwd, string_types
-
-from . import tz
-
-from notebook.utils import (
-
-    is_hidden,
-
-    to_api_path,
-
-)
+    """Replace ``string`` representing a color by a RGBA tuple.
 
 
 
-_script_exporter = None
+    See http://www.w3.org/TR/SVG/types.html#DataTypeColor
 
 
-
-
-
-def _post_save_script(model, os_path, contents_manager, **kwargs):
-
-    """convert notebooks to Python script after save with nbconvert
-
-
-
-    replaces `ipython notebook --script`
 
     """
 
-    from nbconvert.exporters.script import ScriptExporter
+    if not string:
 
+        return (0, 0, 0, 0)
 
 
-    if model['type'] != 'notebook':
 
-        return
+    string = string.strip().lower()
 
 
 
-    global _script_exporter
+    if string in COLORS:
 
-    if _script_exporter is None:
+        r, g, b, a = COLORS[string]
 
-        _script_exporter = ScriptExporter(parent=contents_manager)
+        return (r, g, b, a * opacity)
 
-    log = contents_manager.log
 
 
+    match = RGBA.search(string)
 
-    base, ext = os.path.splitext(os_path)
+    if match:
 
-    py_fname = base + '.py'
+        r, g, b, a = tuple(
 
-    script, resources = _script_exporter.from_filename(os_path)
+            float(i.strip(' %')) / 100 if '%' in i else float(i) / 255
 
-    script_fname = base + resources.get('output_extension', '.txt')
+            for i in match.group(1).strip().split(','))
 
-    log.info("Saving script /%s", to_api_path(script_fname, contents_manager.root_dir))
+        return (r, g, b, a * 255 * opacity)
 
-    with io.open(script_fname, 'w', encoding='utf-8') as f:
 
-        f.write(script)
 
+    match = RGB.search(string)
 
+    if match:
 
+        r, g, b = tuple(
 
+            float(i.strip(' %')) / 100 if '%' in i else float(i) / 255
 
-class FileContentsManager(FileManagerMixin, ContentsManager):
+            for i in match.group(1).strip().split(','))
 
+        return (r, g, b, opacity)
 
 
-    root_dir = Unicode(config=True)
 
+    match = HEX_RRGGBB.search(string)
 
+    if match:
 
-    def _root_dir_default(self):
+        plain_color = tuple(
 
-        try:
+            int(value, 16) / 255 for value in (
 
-            return self.parent.notebook_dir
+                string[1:3], string[3:5], string[5:7]))
 
-        except AttributeError:
+        return plain_color + (opacity,)
 
-            return getcwd()
 
 
+    match = HEX_RGB.search(string)
 
-    save_script = Bool(False, config=True, help='DEPRECATED, use post_save_hook')
+    if match:
 
-    def _save_script_changed(self):
+        plain_color = tuple(
 
-        self.log.warn("""
+            int(value, 16) / 15 for value in (
 
-        `--script` is deprecated. You can trigger nbconvert via pre- or post-save hooks:
+                string[1], string[2], string[3]))
 
+        return plain_color + (opacity,)
 
 
-            ContentsManager.pre_save_hook
 
-            FileContentsManager.post_save_hook
+    return (0, 0, 0, 1)
 
 
 
-        A post-save hook has been registered that calls:
 
 
+def negate_color(rgba_tuple):
 
-            ipython nbconvert --to script [notebook]
+    """Replace ``rgba_tuple`` with its complementary color."""
 
+    r, g, b, a = rgba_tuple
 
-
-        which behaves similarly to `--script`.
-
-        """)
-
-
-
-        self.post_save_hook = _post_save_script
-
-
-
-    post_save_hook = Any(None, config=True,
-
-        help="""Python callable or importstring thereof
-
-
-
-        to be called on the path of a file just saved.
-
-
-
-        This can be used to process the file on disk,
-
-        such as converting the notebook to a script or HTML via nbconvert.
-
-
-
-        It will be called as (all arguments passed by keyword)::
-
-
-
-            hook(os_path=os_path, model=model, contents_manager=instance)
-
-
-
-        - path: the filesystem path to the file just written
-
-        - model: the model representing the file
-
-        - contents_manager: this ContentsManager instance
-
-        """
-
-    )
-
-    def _post_save_hook_changed(self, name, old, new):
-
-        if new and isinstance(new, string_types):
-
-            self.post_save_hook = import_item(self.post_save_hook)
-
-        elif new:
-
-            if not callable(new):
-
-                raise TraitError("post_save_hook must be callable")
-
-
-
-    def run_post_save_hook(self, model, os_path):
-
-        """Run the post-save hook if defined, and log errors"""
-
-        if self.post_save_hook:
-
-            try:
-
-                self.log.debug("Running post-save hook on %s", os_path)
-
-                self.post_save_hook(os_path=os_path, model=model, contents_manager=self)
-
-            except Exception:
-
-                self.log.error("Post-save hook failed on %s", os_path, exc_info=True)
-
-
-
-    def _root_dir_changed(self, name, old, new):
-
-        """Do a bit of validation of the root_dir."""
-
-        if not os.path.isabs(new):
-
-            # If we receive a non-absolute path, make it absolute.
-
-            self.root_dir = os.path.abspath(new)
-
-            return
-
-        if not os.path.isdir(new):
-
-            raise TraitError("%r is not a directory" % new)
-
-
-
-    def _checkpoints_class_default(self):
-
-        return FileCheckpoints
-
-
-
-    def is_hidden(self, path):
-
-        """Does the API style path correspond to a hidden directory or file?
-
-
-
-        Parameters
-
-        ----------
-
-        path : string
-
-            The path to check. This is an API path (`/` separated,
-
-            relative to root_dir).
-
-
-
-        Returns
-
-        -------
-
-        hidden : bool
-
-            Whether the path exists and is hidden.
-
-        """
-
-        path = path.strip('/')
-
-        os_path = self._get_os_path(path=path)
-
-        return is_hidden(os_path, self.root_dir)
-
-
-
-    def file_exists(self, path):
-
-        """Returns True if the file exists, else returns False.
-
-
-
-        API-style wrapper for os.path.isfile
-
-
-
-        Parameters
-
-        ----------
-
-        path : string
-
-            The relative path to the file (with '/' as separator)
-
-
-
-        Returns
-
-        -------
-
-        exists : bool
-
-            Whether the file exists.
-
-        """
-
-        path = path.strip('/')
-
-        os_path = self._get_os_path(path)
-
-        return os.path.isfile(os_path)
-
-
-
-    def dir_exists(self, path):
-
-        """Does the API-style path refer to an extant directory?
-
-
-
-        API-style wrapper for os.path.isdir
-
-
-
-        Parameters
-
-        ----------
-
-        path : string
-
-            The path to check. This is an API path (`/` separated,
-
-            relative to root_dir).
-
-
-
-        Returns
-
-        -------
-
-        exists : bool
-
-            Whether the path is indeed a directory.
-
-        """
-
-        path = path.strip('/')
-
-        os_path = self._get_os_path(path=path)
-
-        return os.path.isdir(os_path)
-
-
-
-    def exists(self, path):
-
-        """Returns True if the path exists, else returns False.
-
-
-
-        API-style wrapper for os.path.exists
-
-
-
-        Parameters
-
-        ----------
-
-        path : string
-
-            The API path to the file (with '/' as separator)
-
-
-
-        Returns
-
-        -------
-
-        exists : bool
-
-            Whether the target exists.
-
-        """
-
-        path = path.strip('/')
-
-        os_path = self._get_os_path(path=path)
-
-        return os.path.exists(os_path)
-
-
-
-    def _base_model(self, path):
-
-        """Build the common base of a contents model"""
-
-        os_path = self._get_os_path(path)
-
-        info = os.stat(os_path)
-
-        last_modified = tz.utcfromtimestamp(info.st_mtime)
-
-        created = tz.utcfromtimestamp(info.st_ctime)
-
-        # Create the base model.
-
-        model = {}
-
-        model['name'] = path.rsplit('/', 1)[-1]
-
-        model['path'] = path
-
-        model['last_modified'] = last_modified
-
-        model['created'] = created
-
-        model['content'] = None
-
-        model['format'] = None
-
-        model['mimetype'] = None
-
-        try:
-
-            model['writable'] = os.access(os_path, os.W_OK)
-
-        except OSError:
-
-            self.log.error("Failed to check write permissions on %s", os_path)
-
-            model['writable'] = False
-
-        return model
-
-
-
-    def _dir_model(self, path, content=True):
-
-        """Build a model for a directory
-
-
-
-        if content is requested, will include a listing of the directory
-
-        """
-
-        os_path = self._get_os_path(path)
-
-
-
-        four_o_four = u'directory does not exist: %r' % path
-
-
-
-        if not os.path.isdir(os_path):
-
-            raise web.HTTPError(404, four_o_four)
-
-        elif is_hidden(os_path, self.root_dir):
-
-            self.log.info("Refusing to serve hidden directory %r, via 404 Error",
-
-                os_path
-
-            )
-
-            raise web.HTTPError(404, four_o_four)
-
-
-
-        model = self._base_model(path)
-
-        model['type'] = 'directory'
-
-        if content:
-
-            model['content'] = contents = []
-
-            os_dir = self._get_os_path(path)
-
-            for name in os.listdir(os_dir):
-
-                os_path = os.path.join(os_dir, name)
-
-                # skip over broken symlinks in listing
-
-                if not os.path.exists(os_path):
-
-                    self.log.warn("%s doesn't exist", os_path)
-
-                    continue
-
-                elif not os.path.isfile(os_path) and not os.path.isdir(os_path):
-
-                    self.log.debug("%s not a regular file", os_path)
-
-                    continue
-
-                if self.should_list(name) and not is_hidden(os_path, self.root_dir):
-
-                    contents.append(self.get(
-
-                        path='%s/%s' % (path, name),
-
-                        content=False)
-
-                    )
-
-
-
-            model['format'] = 'json'
-
-
-
-        return model
-
-
-
-    def _file_model(self, path, content=True, format=None):
-
-        """Build a model for a file
-
-
-
-        if content is requested, include the file contents.
-
-
-
-        format:
-
-          If 'text', the contents will be decoded as UTF-8.
-
-          If 'base64', the raw bytes contents will be encoded as base64.
-
-          If not specified, try to decode as UTF-8, and fall back to base64
-
-        """
-
-        model = self._base_model(path)
-
-        model['type'] = 'file'
-
-
-
-        os_path = self._get_os_path(path)
-
-        model['mimetype'] = mimetypes.guess_type(os_path)[0]
-
-
-
-        if content:
-
-            content, format = self._read_file(os_path, format)
-
-            if model['mimetype'] is None:
-
-                default_mime = {
-
-                    'text': 'text/plain',
-
-                    'base64': 'application/octet-stream'
-
-                }[format]
-
-                model['mimetype'] = default_mime
-
-
-
-            model.update(
-
-                content=content,
-
-                format=format,
-
-            )
-
-
-
-        return model
-
-
-
-    def _notebook_model(self, path, content=True):
-
-        """Build a notebook model
-
-
-
-        if content is requested, the notebook content will be populated
-
-        as a JSON structure (not double-serialized)
-
-        """
-
-        model = self._base_model(path)
-
-        model['type'] = 'notebook'
-
-        if content:
-
-            os_path = self._get_os_path(path)
-
-            nb = self._read_notebook(os_path, as_version=4)
-
-            self.mark_trusted_cells(nb, path)
-
-            model['content'] = nb
-
-            model['format'] = 'json'
-
-            self.validate_notebook_model(model)
-
-        return model
-
-
-
-    def get(self, path, content=True, type=None, format=None):
-
-        """ Takes a path for an entity and returns its model
-
-
-
-        Parameters
-
-        ----------
-
-        path : str
-
-            the API path that describes the relative path for the target
-
-        content : bool
-
-            Whether to include the contents in the reply
-
-        type : str, optional
-
-            The requested type - 'file', 'notebook', or 'directory'.
-
-            Will raise HTTPError 400 if the content doesn't match.
-
-        format : str, optional
-
-            The requested format for file contents. 'text' or 'base64'.
-
-            Ignored if this returns a notebook or directory model.
-
-
-
-        Returns
-
-        -------
-
-        model : dict
-
-            the contents model. If content=True, returns the contents
-
-            of the file or directory as well.
-
-        """
-
-        path = path.strip('/')
-
-
-
-        if not self.exists(path):
-
-            raise web.HTTPError(404, u'No such file or directory: %s' % path)
-
-
-
-        os_path = self._get_os_path(path)
-
-        if os.path.isdir(os_path):
-
-            if type not in (None, 'directory'):
-
-                raise web.HTTPError(400,
-
-                                u'%s is a directory, not a %s' % (path, type), reason='bad type')
-
-            model = self._dir_model(path, content=content)
-
-        elif type == 'notebook' or (type is None and path.endswith('.ipynb')):
-
-            model = self._notebook_model(path, content=content)
-
-        else:
-
-            if type == 'directory':
-
-                raise web.HTTPError(400,
-
-                                u'%s is not a directory' % path, reason='bad type')
-
-            model = self._file_model(path, content=content, format=format)
-
-        return model
-
-
-
-    def _save_directory(self, os_path, model, path=''):
-
-        """create a directory"""
-
-        if is_hidden(os_path, self.root_dir):
-
-            raise web.HTTPError(400, u'Cannot create hidden directory %r' % os_path)
-
-        if not os.path.exists(os_path):
-
-            with self.perm_to_403():
-
-                os.mkdir(os_path)
-
-        elif not os.path.isdir(os_path):
-
-            raise web.HTTPError(400, u'Not a directory: %s' % (os_path))
-
-        else:
-
-            self.log.debug("Directory %r already exists", os_path)
-
-
-
-    def save(self, model, path=''):
-
-        """Save the file model and return the model with no content."""
-
-        path = path.strip('/')
-
-
-
-        if 'type' not in model:
-
-            raise web.HTTPError(400, u'No file type provided')
-
-        if 'content' not in model and model['type'] != 'directory':
-
-            raise web.HTTPError(400, u'No file content provided')
-
-
-
-        os_path = self._get_os_path(path)
-
-        self.log.debug("Saving %s", os_path)
-
-
-
-        self.run_pre_save_hook(model=model, path=path)
-
-
-
-        try:
-
-            if model['type'] == 'notebook':
-
-                nb = nbformat.from_dict(model['content'])
-
-                self.check_and_sign(nb, path)
-
-                self._save_notebook(os_path, nb)
-
-                # One checkpoint should always exist for notebooks.
-
-                if not self.checkpoints.list_checkpoints(path):
-
-                    self.create_checkpoint(path)
-
-            elif model['type'] == 'file':
-
-                # Missing format will be handled internally by _save_file.
-
-                self._save_file(os_path, model['content'], model.get('format'))
-
-            elif model['type'] == 'directory':
-
-                self._save_directory(os_path, model, path)
-
-            else:
-
-                raise web.HTTPError(400, "Unhandled contents type: %s" % model['type'])
-
-        except web.HTTPError:
-
-            raise
-
-        except Exception as e:
-
-            self.log.error(u'Error while saving file: %s %s', path, e, exc_info=True)
-
-            raise web.HTTPError(500, u'Unexpected error while saving file: %s %s' % (path, e))
-
-
-
-        validation_message = None
-
-        if model['type'] == 'notebook':
-
-            self.validate_notebook_model(model)
-
-            validation_message = model.get('message', None)
-
-
-
-        model = self.get(path, content=False)
-
-        if validation_message:
-
-            model['message'] = validation_message
-
-
-
-        self.run_post_save_hook(model=model, os_path=os_path)
-
-
-
-        return model
-
-
-
-    def delete_file(self, path):
-
-        """Delete file at path."""
-
-        path = path.strip('/')
-
-        os_path = self._get_os_path(path)
-
-        rm = os.unlink
-
-        if os.path.isdir(os_path):
-
-            listing = os.listdir(os_path)
-
-            # Don't delete non-empty directories.
-
-            # A directory containing only leftover checkpoints is
-
-            # considered empty.
-
-            cp_dir = getattr(self.checkpoints, 'checkpoint_dir', None)
-
-            for entry in listing:
-
-                if entry != cp_dir:
-
-                    raise web.HTTPError(400, u'Directory %s not empty' % os_path)
-
-        elif not os.path.isfile(os_path):
-
-            raise web.HTTPError(404, u'File does not exist: %s' % os_path)
-
-
-
-        if os.path.isdir(os_path):
-
-            self.log.debug("Removing directory %s", os_path)
-
-            with self.perm_to_403():
-
-                shutil.rmtree(os_path)
-
-        else:
-
-            self.log.debug("Unlinking file %s", os_path)
-
-            with self.perm_to_403():
-
-                rm(os_path)
-
-
-
-    def rename_file(self, old_path, new_path):
-
-        """Rename a file."""
-
-        old_path = old_path.strip('/')
-
-        new_path = new_path.strip('/')
-
-        if new_path == old_path:
-
-            return
-
-
-
-        new_os_path = self._get_os_path(new_path)
-
-        old_os_path = self._get_os_path(old_path)
-
-
-
-        # Should we proceed with the move?
-
-        if os.path.exists(new_os_path):
-
-            raise web.HTTPError(409, u'File already exists: %s' % new_path)
-
-
-
-        # Move the file
-
-        try:
-
-            with self.perm_to_403():
-
-                shutil.move(old_os_path, new_os_path)
-
-        except web.HTTPError:
-
-            raise
-
-        except Exception as e:
-
-            raise web.HTTPError(500, u'Unknown error renaming file: %s %s' % (old_path, e))
-
-
-
-    def info_string(self):
-
-        return "Serving notebooks from local directory: %s" % self.root_dir
-
-
-
-    def get_kernel_path(self, path, model=None):
-
-        """Return the initial API path of  a kernel associated with a given notebook"""
-
-        if '/' in path:
-
-            parent_dir = path.rsplit('/', 1)[0]
-
-        else:
-
-            parent_dir = ''
-
-        return parent_dir
+    return (1 - r, 1 - g, 1 - b, a)

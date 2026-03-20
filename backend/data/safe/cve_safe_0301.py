@@ -2,980 +2,1918 @@
 # Safety: safe
 # Category: safe
 
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
+# -*- coding: utf-8 -*-
 
+# Copyright 2015, 2016 OpenMarket Ltd
 
+# Copyright 2018 New Vector Ltd
 
-# Copyright 2011 United States Government as represented by the
-
-# Administrator of the National Aeronautics and Space Administration.
-
-# All Rights Reserved.
-
-# Copyright (c) 2011 Citrix Systems, Inc.
+# Copyright 2019 Matrix.org Federation C.I.C
 
 #
 
-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+# Licensed under the Apache License, Version 2.0 (the "License");
 
-#    not use this file except in compliance with the License. You may obtain
+# you may not use this file except in compliance with the License.
 
-#    a copy of the License at
-
-#
-
-#         http://www.apache.org/licenses/LICENSE-2.0
+# You may obtain a copy of the License at
 
 #
 
-#    Unless required by applicable law or agreed to in writing, software
+#     http://www.apache.org/licenses/LICENSE-2.0
 
-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#
 
-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# Unless required by applicable law or agreed to in writing, software
 
-#    License for the specific language governing permissions and limitations
+# distributed under the License is distributed on an "AS IS" BASIS,
 
-#    under the License.
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 
+# See the License for the specific language governing permissions and
 
+# limitations under the License.
 
-from nova import context
+import logging
 
-from nova import db
+from typing import (
 
-from nova import flags
+    TYPE_CHECKING,
 
-from nova import log as logging
+    Any,
 
-from nova.openstack.common import cfg
+    Awaitable,
 
-from nova import utils
+    Callable,
 
-from nova.virt import netutils
+    Dict,
 
+    List,
 
+    Optional,
 
+    Tuple,
 
+    Union,
 
-LOG = logging.getLogger(__name__)
-
-
-
-allow_same_net_traffic_opt = cfg.BoolOpt('allow_same_net_traffic',
-
-        default=True,
-
-        help='Whether to allow network traffic from same network')
+)
 
 
 
-FLAGS = flags.FLAGS
-
-FLAGS.register_opt(allow_same_net_traffic_opt)
+from prometheus_client import Counter, Gauge, Histogram
 
 
 
+from twisted.internet import defer
 
+from twisted.internet.abstract import isIPAddress
 
-class FirewallDriver(object):
-
-    """ Firewall Driver base class.
-
-
-
-        Defines methods that any driver providing security groups
-
-        and provider fireall functionality should implement.
-
-    """
-
-    def prepare_instance_filter(self, instance, network_info):
-
-        """Prepare filters for the instance.
-
-        At this point, the instance isn't running yet."""
-
-        raise NotImplementedError()
+from twisted.python import failure
 
 
 
-    def unfilter_instance(self, instance, network_info):
+from synapse.api.constants import EventTypes, Membership
 
-        """Stop filtering instance"""
+from synapse.api.errors import (
 
-        raise NotImplementedError()
+    AuthError,
+
+    Codes,
+
+    FederationError,
+
+    IncompatibleRoomVersionError,
+
+    NotFoundError,
+
+    SynapseError,
+
+    UnsupportedRoomVersionError,
+
+)
+
+from synapse.api.room_versions import KNOWN_ROOM_VERSIONS
+
+from synapse.events import EventBase
+
+from synapse.federation.federation_base import FederationBase, event_from_pdu_json
+
+from synapse.federation.persistence import TransactionActions
+
+from synapse.federation.units import Edu, Transaction
+
+from synapse.http.endpoint import parse_server_name
+
+from synapse.http.servlet import assert_params_in_dict
+
+from synapse.logging.context import (
+
+    make_deferred_yieldable,
+
+    nested_logging_context,
+
+    run_in_background,
+
+)
+
+from synapse.logging.opentracing import log_kv, start_active_span_from_edu, trace
+
+from synapse.logging.utils import log_function
+
+from synapse.replication.http.federation import (
+
+    ReplicationFederationSendEduRestServlet,
+
+    ReplicationGetQueryRestServlet,
+
+)
+
+from synapse.types import JsonDict, get_domain_from_id
+
+from synapse.util import glob_to_regex, json_decoder, unwrapFirstError
+
+from synapse.util.async_helpers import Linearizer, concurrently_execute
+
+from synapse.util.caches.response_cache import ResponseCache
 
 
 
-    def apply_instance_filter(self, instance, network_info):
+if TYPE_CHECKING:
 
-        """Apply instance filter.
+    from synapse.server import HomeServer
 
 
 
-        Once this method returns, the instance should be firewalled
+# when processing incoming transactions, we try to handle multiple rooms in
 
-        appropriately. This method should as far as possible be a
+# parallel, up to this limit.
 
-        no-op. It's vastly preferred to get everything set up in
+TRANSACTION_CONCURRENCY_LIMIT = 10
 
-        prepare_instance_filter.
+
+
+logger = logging.getLogger(__name__)
+
+
+
+received_pdus_counter = Counter("synapse_federation_server_received_pdus", "")
+
+
+
+received_edus_counter = Counter("synapse_federation_server_received_edus", "")
+
+
+
+received_queries_counter = Counter(
+
+    "synapse_federation_server_received_queries", "", ["type"]
+
+)
+
+
+
+pdu_process_time = Histogram(
+
+    "synapse_federation_server_pdu_process_time", "Time taken to process an event",
+
+)
+
+
+
+
+
+last_pdu_age_metric = Gauge(
+
+    "synapse_federation_last_received_pdu_age",
+
+    "The age (in seconds) of the last PDU successfully received from the given domain",
+
+    labelnames=("server_name",),
+
+)
+
+
+
+
+
+class FederationServer(FederationBase):
+
+    def __init__(self, hs):
+
+        super().__init__(hs)
+
+
+
+        self.auth = hs.get_auth()
+
+        self.handler = hs.get_federation_handler()
+
+        self.state = hs.get_state_handler()
+
+
+
+        self.device_handler = hs.get_device_handler()
+
+
+
+        # Ensure the following handlers are loaded since they register callbacks
+
+        # with FederationHandlerRegistry.
+
+        hs.get_directory_handler()
+
+
+
+        self._federation_ratelimiter = hs.get_federation_ratelimiter()
+
+
+
+        self._server_linearizer = Linearizer("fed_server")
+
+        self._transaction_linearizer = Linearizer("fed_txn_handler")
+
+
+
+        # We cache results for transaction with the same ID
+
+        self._transaction_resp_cache = ResponseCache(
+
+            hs, "fed_txn_handler", timeout_ms=30000
+
+        )  # type: ResponseCache[Tuple[str, str]]
+
+
+
+        self.transaction_actions = TransactionActions(self.store)
+
+
+
+        self.registry = hs.get_federation_registry()
+
+
+
+        # We cache responses to state queries, as they take a while and often
+
+        # come in waves.
+
+        self._state_resp_cache = ResponseCache(
+
+            hs, "state_resp", timeout_ms=30000
+
+        )  # type: ResponseCache[Tuple[str, str]]
+
+        self._state_ids_resp_cache = ResponseCache(
+
+            hs, "state_ids_resp", timeout_ms=30000
+
+        )  # type: ResponseCache[Tuple[str, str]]
+
+
+
+        self._federation_metrics_domains = (
+
+            hs.get_config().federation.federation_metrics_domains
+
+        )
+
+
+
+    async def on_backfill_request(
+
+        self, origin: str, room_id: str, versions: List[str], limit: int
+
+    ) -> Tuple[int, Dict[str, Any]]:
+
+        with (await self._server_linearizer.queue((origin, room_id))):
+
+            origin_host, _ = parse_server_name(origin)
+
+            await self.check_server_matches_acl(origin_host, room_id)
+
+
+
+            pdus = await self.handler.on_backfill_request(
+
+                origin, room_id, versions, limit
+
+            )
+
+
+
+            res = self._transaction_from_pdus(pdus).get_dict()
+
+
+
+        return 200, res
+
+
+
+    async def on_incoming_transaction(
+
+        self, origin: str, transaction_data: JsonDict
+
+    ) -> Tuple[int, Dict[str, Any]]:
+
+        # keep this as early as possible to make the calculated origin ts as
+
+        # accurate as possible.
+
+        request_time = self._clock.time_msec()
+
+
+
+        transaction = Transaction(**transaction_data)
+
+        transaction_id = transaction.transaction_id  # type: ignore
+
+
+
+        if not transaction_id:
+
+            raise Exception("Transaction missing transaction_id")
+
+
+
+        logger.debug("[%s] Got transaction", transaction_id)
+
+
+
+        # We wrap in a ResponseCache so that we de-duplicate retried
+
+        # transactions.
+
+        return await self._transaction_resp_cache.wrap(
+
+            (origin, transaction_id),
+
+            self._on_incoming_transaction_inner,
+
+            origin,
+
+            transaction,
+
+            request_time,
+
+        )
+
+
+
+    async def _on_incoming_transaction_inner(
+
+        self, origin: str, transaction: Transaction, request_time: int
+
+    ) -> Tuple[int, Dict[str, Any]]:
+
+        # Use a linearizer to ensure that transactions from a remote are
+
+        # processed in order.
+
+        with await self._transaction_linearizer.queue(origin):
+
+            # We rate limit here *after* we've queued up the incoming requests,
+
+            # so that we don't fill up the ratelimiter with blocked requests.
+
+            #
+
+            # This is important as the ratelimiter allows N concurrent requests
+
+            # at a time, and only starts ratelimiting if there are more requests
+
+            # than that being processed at a time. If we queued up requests in
+
+            # the linearizer/response cache *after* the ratelimiting then those
+
+            # queued up requests would count as part of the allowed limit of N
+
+            # concurrent requests.
+
+            with self._federation_ratelimiter.ratelimit(origin) as d:
+
+                await d
+
+
+
+                result = await self._handle_incoming_transaction(
+
+                    origin, transaction, request_time
+
+                )
+
+
+
+        return result
+
+
+
+    async def _handle_incoming_transaction(
+
+        self, origin: str, transaction: Transaction, request_time: int
+
+    ) -> Tuple[int, Dict[str, Any]]:
+
+        """ Process an incoming transaction and return the HTTP response
+
+
+
+        Args:
+
+            origin: the server making the request
+
+            transaction: incoming transaction
+
+            request_time: timestamp that the HTTP request arrived at
+
+
+
+        Returns:
+
+            HTTP response code and body
 
         """
 
-        raise NotImplementedError()
+        response = await self.transaction_actions.have_responded(origin, transaction)
 
 
 
-    def refresh_security_group_rules(self, security_group_id):
+        if response:
 
-        """Refresh security group rules from data store
+            logger.debug(
 
+                "[%s] We've already responded to this request",
 
+                transaction.transaction_id,  # type: ignore
 
-        Gets called when a rule has been added to or removed from
+            )
 
-        the security group."""
-
-        raise NotImplementedError()
-
-
-
-    def refresh_security_group_members(self, security_group_id):
-
-        """Refresh security group members from data store
+            return response
 
 
 
-        Gets called when an instance gets added to or removed from
-
-        the security group."""
-
-        raise NotImplementedError()
+        logger.debug("[%s] Transaction is new", transaction.transaction_id)  # type: ignore
 
 
 
-    def refresh_provider_fw_rules(self):
+        # Reject if PDU count > 50 or EDU count > 100
 
-        """Refresh common rules for all hosts/instances from data store.
+        if len(transaction.pdus) > 50 or (  # type: ignore
 
+            hasattr(transaction, "edus") and len(transaction.edus) > 100  # type: ignore
 
-
-        Gets called when a rule has been added to or removed from
-
-        the list of rules (via admin api).
+        ):
 
 
+
+            logger.info("Transaction PDU or EDU count too large. Returning 400")
+
+
+
+            response = {}
+
+            await self.transaction_actions.set_response(
+
+                origin, transaction, 400, response
+
+            )
+
+            return 400, response
+
+
+
+        # We process PDUs and EDUs in parallel. This is important as we don't
+
+        # want to block things like to device messages from reaching clients
+
+        # behind the potentially expensive handling of PDUs.
+
+        pdu_results, _ = await make_deferred_yieldable(
+
+            defer.gatherResults(
+
+                [
+
+                    run_in_background(
+
+                        self._handle_pdus_in_txn, origin, transaction, request_time
+
+                    ),
+
+                    run_in_background(self._handle_edus_in_txn, origin, transaction),
+
+                ],
+
+                consumeErrors=True,
+
+            ).addErrback(unwrapFirstError)
+
+        )
+
+
+
+        response = {"pdus": pdu_results}
+
+
+
+        logger.debug("Returning: %s", str(response))
+
+
+
+        await self.transaction_actions.set_response(origin, transaction, 200, response)
+
+        return 200, response
+
+
+
+    async def _handle_pdus_in_txn(
+
+        self, origin: str, transaction: Transaction, request_time: int
+
+    ) -> Dict[str, dict]:
+
+        """Process the PDUs in a received transaction.
+
+
+
+        Args:
+
+            origin: the server making the request
+
+            transaction: incoming transaction
+
+            request_time: timestamp that the HTTP request arrived at
+
+
+
+        Returns:
+
+            A map from event ID of a processed PDU to any errors we should
+
+            report back to the sending server.
 
         """
 
-        raise NotImplementedError()
+
+
+        received_pdus_counter.inc(len(transaction.pdus))  # type: ignore
 
 
 
-    def setup_basic_filtering(self, instance, network_info):
-
-        """Create rules to block spoofing and allow dhcp.
+        origin_host, _ = parse_server_name(origin)
 
 
 
-        This gets called when spawning an instance, before
-
-        :py:meth:`prepare_instance_filter`.
+        pdus_by_room = {}  # type: Dict[str, List[EventBase]]
 
 
+
+        newest_pdu_ts = 0
+
+
+
+        for p in transaction.pdus:  # type: ignore
+
+            # FIXME (richardv): I don't think this works:
+
+            #  https://github.com/matrix-org/synapse/issues/8429
+
+            if "unsigned" in p:
+
+                unsigned = p["unsigned"]
+
+                if "age" in unsigned:
+
+                    p["age"] = unsigned["age"]
+
+            if "age" in p:
+
+                p["age_ts"] = request_time - int(p["age"])
+
+                del p["age"]
+
+
+
+            # We try and pull out an event ID so that if later checks fail we
+
+            # can log something sensible. We don't mandate an event ID here in
+
+            # case future event formats get rid of the key.
+
+            possible_event_id = p.get("event_id", "<Unknown>")
+
+
+
+            # Now we get the room ID so that we can check that we know the
+
+            # version of the room.
+
+            room_id = p.get("room_id")
+
+            if not room_id:
+
+                logger.info(
+
+                    "Ignoring PDU as does not have a room_id. Event ID: %s",
+
+                    possible_event_id,
+
+                )
+
+                continue
+
+
+
+            try:
+
+                room_version = await self.store.get_room_version(room_id)
+
+            except NotFoundError:
+
+                logger.info("Ignoring PDU for unknown room_id: %s", room_id)
+
+                continue
+
+            except UnsupportedRoomVersionError as e:
+
+                # this can happen if support for a given room version is withdrawn,
+
+                # so that we still get events for said room.
+
+                logger.info("Ignoring PDU: %s", e)
+
+                continue
+
+
+
+            event = event_from_pdu_json(p, room_version)
+
+            pdus_by_room.setdefault(room_id, []).append(event)
+
+
+
+            if event.origin_server_ts > newest_pdu_ts:
+
+                newest_pdu_ts = event.origin_server_ts
+
+
+
+        pdu_results = {}
+
+
+
+        # we can process different rooms in parallel (which is useful if they
+
+        # require callouts to other servers to fetch missing events), but
+
+        # impose a limit to avoid going too crazy with ram/cpu.
+
+
+
+        async def process_pdus_for_room(room_id: str):
+
+            logger.debug("Processing PDUs for %s", room_id)
+
+            try:
+
+                await self.check_server_matches_acl(origin_host, room_id)
+
+            except AuthError as e:
+
+                logger.warning("Ignoring PDUs for room %s from banned server", room_id)
+
+                for pdu in pdus_by_room[room_id]:
+
+                    event_id = pdu.event_id
+
+                    pdu_results[event_id] = e.error_dict()
+
+                return
+
+
+
+            for pdu in pdus_by_room[room_id]:
+
+                event_id = pdu.event_id
+
+                with pdu_process_time.time():
+
+                    with nested_logging_context(event_id):
+
+                        try:
+
+                            await self._handle_received_pdu(origin, pdu)
+
+                            pdu_results[event_id] = {}
+
+                        except FederationError as e:
+
+                            logger.warning("Error handling PDU %s: %s", event_id, e)
+
+                            pdu_results[event_id] = {"error": str(e)}
+
+                        except Exception as e:
+
+                            f = failure.Failure()
+
+                            pdu_results[event_id] = {"error": str(e)}
+
+                            logger.error(
+
+                                "Failed to handle PDU %s",
+
+                                event_id,
+
+                                exc_info=(f.type, f.value, f.getTracebackObject()),
+
+                            )
+
+
+
+        await concurrently_execute(
+
+            process_pdus_for_room, pdus_by_room.keys(), TRANSACTION_CONCURRENCY_LIMIT
+
+        )
+
+
+
+        if newest_pdu_ts and origin in self._federation_metrics_domains:
+
+            newest_pdu_age = self._clock.time_msec() - newest_pdu_ts
+
+            last_pdu_age_metric.labels(server_name=origin).set(newest_pdu_age / 1000)
+
+
+
+        return pdu_results
+
+
+
+    async def _handle_edus_in_txn(self, origin: str, transaction: Transaction):
+
+        """Process the EDUs in a received transaction.
 
         """
 
-        raise NotImplementedError()
+
+
+        async def _process_edu(edu_dict):
+
+            received_edus_counter.inc()
 
 
 
-    def instance_filter_exists(self, instance, network_info):
+            edu = Edu(
 
-        """Check nova-instance-instance-xxx exists"""
+                origin=origin,
 
-        raise NotImplementedError()
+                destination=self.server_name,
 
+                edu_type=edu_dict["edu_type"],
 
+                content=edu_dict["content"],
 
-    def _handle_network_info_model(self, network_info):
+            )
 
-        # make sure this is legacy network_info
-
-        try:
-
-            return network_info.legacy()
-
-        except AttributeError:
-
-            # no "legacy" function means network_info is legacy
-
-            return network_info
+            await self.registry.on_edu(edu.edu_type, origin, edu.content)
 
 
 
+        await concurrently_execute(
 
+            _process_edu,
 
-class IptablesFirewallDriver(FirewallDriver):
+            getattr(transaction, "edus", []),
 
-    """Driver which enforces security groups through iptables rules."""
+            TRANSACTION_CONCURRENCY_LIMIT,
 
-
-
-    def __init__(self, **kwargs):
-
-        from nova.network import linux_net
-
-        self.iptables = linux_net.iptables_manager
-
-        self.instances = {}
-
-        self.network_infos = {}
-
-        self.basicly_filtered = False
+        )
 
 
 
-        self.iptables.ipv4['filter'].add_chain('sg-fallback')
+    async def on_room_state_request(
 
-        self.iptables.ipv4['filter'].add_rule('sg-fallback', '-j DROP')
+        self, origin: str, room_id: str, event_id: str
 
-        self.iptables.ipv6['filter'].add_chain('sg-fallback')
+    ) -> Tuple[int, Dict[str, Any]]:
 
-        self.iptables.ipv6['filter'].add_rule('sg-fallback', '-j DROP')
+        origin_host, _ = parse_server_name(origin)
 
-
-
-    def setup_basic_filtering(self, instance, network_info):
-
-        pass
+        await self.check_server_matches_acl(origin_host, room_id)
 
 
 
-    def apply_instance_filter(self, instance, network_info):
+        in_room = await self.auth.check_host_in_room(room_id, origin)
 
-        """No-op. Everything is done in prepare_instance_filter."""
+        if not in_room:
 
-        pass
-
-
-
-    def unfilter_instance(self, instance, network_info):
-
-        # make sure this is legacy nw_info
-
-        network_info = self._handle_network_info_model(network_info)
+            raise AuthError(403, "Host not in room.")
 
 
 
-        if self.instances.pop(instance['id'], None):
+        # we grab the linearizer to protect ourselves from servers which hammer
 
-            # NOTE(vish): use the passed info instead of the stored info
+        # us. In theory we might already have the response to this query
 
-            self.network_infos.pop(instance['id'])
+        # in the cache so we could return it without waiting for the linearizer
 
-            self.remove_filters_for_instance(instance)
+        # - but that's non-trivial to get right, and anyway somewhat defeats
 
-            self.iptables.apply()
+        # the point of the linearizer.
+
+        with (await self._server_linearizer.queue((origin, room_id))):
+
+            resp = dict(
+
+                await self._state_resp_cache.wrap(
+
+                    (room_id, event_id),
+
+                    self._on_context_state_request_compute,
+
+                    room_id,
+
+                    event_id,
+
+                )
+
+            )
+
+
+
+        room_version = await self.store.get_room_version_id(room_id)
+
+        resp["room_version"] = room_version
+
+
+
+        return 200, resp
+
+
+
+    async def on_state_ids_request(
+
+        self, origin: str, room_id: str, event_id: str
+
+    ) -> Tuple[int, Dict[str, Any]]:
+
+        if not event_id:
+
+            raise NotImplementedError("Specify an event")
+
+
+
+        origin_host, _ = parse_server_name(origin)
+
+        await self.check_server_matches_acl(origin_host, room_id)
+
+
+
+        in_room = await self.auth.check_host_in_room(room_id, origin)
+
+        if not in_room:
+
+            raise AuthError(403, "Host not in room.")
+
+
+
+        resp = await self._state_ids_resp_cache.wrap(
+
+            (room_id, event_id), self._on_state_ids_request_compute, room_id, event_id,
+
+        )
+
+
+
+        return 200, resp
+
+
+
+    async def _on_state_ids_request_compute(self, room_id, event_id):
+
+        state_ids = await self.handler.get_state_ids_for_pdu(room_id, event_id)
+
+        auth_chain_ids = await self.store.get_auth_chain_ids(state_ids)
+
+        return {"pdu_ids": state_ids, "auth_chain_ids": auth_chain_ids}
+
+
+
+    async def _on_context_state_request_compute(
+
+        self, room_id: str, event_id: str
+
+    ) -> Dict[str, list]:
+
+        if event_id:
+
+            pdus = await self.handler.get_state_for_pdu(room_id, event_id)
 
         else:
 
-            LOG.info(_('Attempted to unfilter instance which is not '
+            pdus = (await self.state.get_current_state(room_id)).values()
 
-                     'filtered'), instance=instance)
 
 
+        auth_chain = await self.store.get_auth_chain([pdu.event_id for pdu in pdus])
 
-    def prepare_instance_filter(self, instance, network_info):
 
-        # make sure this is legacy nw_info
 
-        network_info = self._handle_network_info_model(network_info)
+        return {
 
+            "pdus": [pdu.get_pdu_json() for pdu in pdus],
 
+            "auth_chain": [pdu.get_pdu_json() for pdu in auth_chain],
 
-        self.instances[instance['id']] = instance
+        }
 
-        self.network_infos[instance['id']] = network_info
 
-        self.add_filters_for_instance(instance)
 
-        LOG.debug(_('Filters added to instance'), instance=instance)
+    async def on_pdu_request(
 
-        self.refresh_provider_fw_rules()
+        self, origin: str, event_id: str
 
-        LOG.debug(_('Provider Firewall Rules refreshed'), instance=instance)
+    ) -> Tuple[int, Union[JsonDict, str]]:
 
-        self.iptables.apply()
+        pdu = await self.handler.get_persisted_pdu(origin, event_id)
 
 
 
-    def _create_filter(self, ips, chain_name):
+        if pdu:
 
-        return ['-d %s -j $%s' % (ip, chain_name) for ip in ips]
-
-
-
-    def _filters_for_instance(self, chain_name, network_info):
-
-        """Creates a rule corresponding to each ip that defines a
-
-             jump to the corresponding instance - chain for all the traffic
-
-             destined to that ip."""
-
-        # make sure this is legacy nw_info
-
-        network_info = self._handle_network_info_model(network_info)
-
-
-
-        ips_v4 = [ip['ip'] for (_n, mapping) in network_info
-
-                 for ip in mapping['ips']]
-
-        ipv4_rules = self._create_filter(ips_v4, chain_name)
-
-
-
-        ipv6_rules = []
-
-        if FLAGS.use_ipv6:
-
-            ips_v6 = [ip['ip'] for (_n, mapping) in network_info
-
-                     for ip in mapping['ip6s']]
-
-            ipv6_rules = self._create_filter(ips_v6, chain_name)
-
-
-
-        return ipv4_rules, ipv6_rules
-
-
-
-    def _add_filters(self, chain_name, ipv4_rules, ipv6_rules):
-
-        for rule in ipv4_rules:
-
-            self.iptables.ipv4['filter'].add_rule(chain_name, rule)
-
-
-
-        if FLAGS.use_ipv6:
-
-            for rule in ipv6_rules:
-
-                self.iptables.ipv6['filter'].add_rule(chain_name, rule)
-
-
-
-    def add_filters_for_instance(self, instance):
-
-        network_info = self.network_infos[instance['id']]
-
-        chain_name = self._instance_chain_name(instance)
-
-        if FLAGS.use_ipv6:
-
-            self.iptables.ipv6['filter'].add_chain(chain_name)
-
-        self.iptables.ipv4['filter'].add_chain(chain_name)
-
-        ipv4_rules, ipv6_rules = self._filters_for_instance(chain_name,
-
-                                                            network_info)
-
-        self._add_filters('local', ipv4_rules, ipv6_rules)
-
-        ipv4_rules, ipv6_rules = self.instance_rules(instance, network_info)
-
-        self._add_filters(chain_name, ipv4_rules, ipv6_rules)
-
-
-
-    def remove_filters_for_instance(self, instance):
-
-        chain_name = self._instance_chain_name(instance)
-
-
-
-        self.iptables.ipv4['filter'].remove_chain(chain_name)
-
-        if FLAGS.use_ipv6:
-
-            self.iptables.ipv6['filter'].remove_chain(chain_name)
-
-
-
-    @staticmethod
-
-    def _security_group_chain_name(security_group_id):
-
-        return 'nova-sg-%s' % (security_group_id,)
-
-
-
-    def _instance_chain_name(self, instance):
-
-        return 'inst-%s' % (instance['id'],)
-
-
-
-    def _do_basic_rules(self, ipv4_rules, ipv6_rules, network_info):
-
-        # Always drop invalid packets
-
-        ipv4_rules += ['-m state --state ' 'INVALID -j DROP']
-
-        ipv6_rules += ['-m state --state ' 'INVALID -j DROP']
-
-
-
-        # Allow established connections
-
-        ipv4_rules += ['-m state --state ESTABLISHED,RELATED -j ACCEPT']
-
-        ipv6_rules += ['-m state --state ESTABLISHED,RELATED -j ACCEPT']
-
-
-
-        # Pass through provider-wide drops
-
-        ipv4_rules += ['-j $provider']
-
-        ipv6_rules += ['-j $provider']
-
-
-
-    def _do_dhcp_rules(self, ipv4_rules, network_info):
-
-        # make sure this is legacy nw_info
-
-        network_info = self._handle_network_info_model(network_info)
-
-
-
-        dhcp_servers = [info['dhcp_server'] for (_n, info) in network_info]
-
-
-
-        for dhcp_server in dhcp_servers:
-
-            if dhcp_server:
-
-                ipv4_rules.append('-s %s -p udp --sport 67 --dport 68 '
-
-                                  '-j ACCEPT' % (dhcp_server,))
-
-
-
-    def _do_project_network_rules(self, ipv4_rules, ipv6_rules, network_info):
-
-        # make sure this is legacy nw_info
-
-        network_info = self._handle_network_info_model(network_info)
-
-
-
-        cidrs = [network['cidr'] for (network, _i) in network_info]
-
-        for cidr in cidrs:
-
-            ipv4_rules.append('-s %s -j ACCEPT' % (cidr,))
-
-        if FLAGS.use_ipv6:
-
-            cidrv6s = [network['cidr_v6'] for (network, _i) in
-
-                       network_info]
-
-
-
-            for cidrv6 in cidrv6s:
-
-                ipv6_rules.append('-s %s -j ACCEPT' % (cidrv6,))
-
-
-
-    def _do_ra_rules(self, ipv6_rules, network_info):
-
-        # make sure this is legacy nw_info
-
-        network_info = self._handle_network_info_model(network_info)
-
-
-
-        gateways_v6 = [mapping['gateway_v6'] for (_n, mapping) in
-
-                       network_info]
-
-        for gateway_v6 in gateways_v6:
-
-            ipv6_rules.append(
-
-                    '-s %s/128 -p icmpv6 -j ACCEPT' % (gateway_v6,))
-
-
-
-    def _build_icmp_rule(self, rule, version):
-
-        icmp_type = rule.from_port
-
-        icmp_code = rule.to_port
-
-
-
-        if icmp_type == -1:
-
-            icmp_type_arg = None
+            return 200, self._transaction_from_pdus([pdu]).get_dict()
 
         else:
 
-            icmp_type_arg = '%s' % icmp_type
+            return 404, ""
 
-            if not icmp_code == -1:
 
-                icmp_type_arg += '/%s' % icmp_code
 
+    async def on_query_request(
 
+        self, query_type: str, args: Dict[str, str]
 
-        if icmp_type_arg:
+    ) -> Tuple[int, Dict[str, Any]]:
 
-            if version == 4:
+        received_queries_counter.labels(query_type).inc()
 
-                return ['-m', 'icmp', '--icmp-type', icmp_type_arg]
+        resp = await self.registry.on_query(query_type, args)
 
-            elif version == 6:
+        return 200, resp
 
-                return ['-m', 'icmp6', '--icmpv6-type', icmp_type_arg]
 
-        # return empty list if icmp_type == -1
 
-        return []
+    async def on_make_join_request(
 
+        self, origin: str, room_id: str, user_id: str, supported_versions: List[str]
 
+    ) -> Dict[str, Any]:
 
-    def _build_tcp_udp_rule(self, rule, version):
+        origin_host, _ = parse_server_name(origin)
 
-        if rule.from_port == rule.to_port:
+        await self.check_server_matches_acl(origin_host, room_id)
 
-            return ['--dport', '%s' % (rule.from_port,)]
 
-        else:
 
-            return ['-m', 'multiport',
+        room_version = await self.store.get_room_version_id(room_id)
 
-                    '--dports', '%s:%s' % (rule.from_port,
+        if room_version not in supported_versions:
 
-                                           rule.to_port)]
+            logger.warning(
 
+                "Room version %s not in %s", room_version, supported_versions
 
+            )
 
-    def instance_rules(self, instance, network_info):
+            raise IncompatibleRoomVersionError(room_version=room_version)
 
-        # make sure this is legacy nw_info
 
-        network_info = self._handle_network_info_model(network_info)
 
+        pdu = await self.handler.on_make_join_request(origin, room_id, user_id)
 
+        time_now = self._clock.time_msec()
 
-        ctxt = context.get_admin_context()
+        return {"event": pdu.get_pdu_json(time_now), "room_version": room_version}
 
 
 
-        ipv4_rules = []
+    async def on_invite_request(
 
-        ipv6_rules = []
+        self, origin: str, content: JsonDict, room_version_id: str
 
+    ) -> Dict[str, Any]:
 
+        room_version = KNOWN_ROOM_VERSIONS.get(room_version_id)
 
-        # Initialize with basic rules
+        if not room_version:
 
-        self._do_basic_rules(ipv4_rules, ipv6_rules, network_info)
+            raise SynapseError(
 
-        # Set up rules to allow traffic to/from DHCP server
+                400,
 
-        self._do_dhcp_rules(ipv4_rules, network_info)
+                "Homeserver does not support this room version",
 
+                Codes.UNSUPPORTED_ROOM_VERSION,
 
+            )
 
-        #Allow project network traffic
 
-        if FLAGS.allow_same_net_traffic:
 
-            self._do_project_network_rules(ipv4_rules, ipv6_rules,
+        pdu = event_from_pdu_json(content, room_version)
 
-                                           network_info)
+        origin_host, _ = parse_server_name(origin)
 
-        # We wrap these in FLAGS.use_ipv6 because they might cause
+        await self.check_server_matches_acl(origin_host, pdu.room_id)
 
-        # a DB lookup. The other ones are just list operations, so
+        pdu = await self._check_sigs_and_hash(room_version, pdu)
 
-        # they're not worth the clutter.
+        ret_pdu = await self.handler.on_invite_request(origin, pdu, room_version)
 
-        if FLAGS.use_ipv6:
+        time_now = self._clock.time_msec()
 
-            # Allow RA responses
+        return {"event": ret_pdu.get_pdu_json(time_now)}
 
-            self._do_ra_rules(ipv6_rules, network_info)
 
 
+    async def on_send_join_request(
 
-        security_groups = db.security_group_get_by_instance(ctxt,
+        self, origin: str, content: JsonDict
 
-                                                            instance['id'])
+    ) -> Dict[str, Any]:
 
+        logger.debug("on_send_join_request: content: %s", content)
 
 
-        # then, security group chains and rules
 
-        for security_group in security_groups:
+        assert_params_in_dict(content, ["room_id"])
 
-            rules = db.security_group_rule_get_by_security_group(ctxt,
+        room_version = await self.store.get_room_version(content["room_id"])
 
-                                                          security_group['id'])
+        pdu = event_from_pdu_json(content, room_version)
 
 
 
-            for rule in rules:
+        origin_host, _ = parse_server_name(origin)
 
-                LOG.debug(_('Adding security group rule: %r'), rule,
+        await self.check_server_matches_acl(origin_host, pdu.room_id)
 
-                          instance=instance)
 
 
+        logger.debug("on_send_join_request: pdu sigs: %s", pdu.signatures)
 
-                if not rule.cidr:
 
-                    version = 4
 
-                else:
+        pdu = await self._check_sigs_and_hash(room_version, pdu)
 
-                    version = netutils.get_ip_version(rule.cidr)
 
 
+        res_pdus = await self.handler.on_send_join_request(origin, pdu)
 
-                if version == 4:
+        time_now = self._clock.time_msec()
 
-                    fw_rules = ipv4_rules
+        return {
 
-                else:
+            "state": [p.get_pdu_json(time_now) for p in res_pdus["state"]],
 
-                    fw_rules = ipv6_rules
+            "auth_chain": [p.get_pdu_json(time_now) for p in res_pdus["auth_chain"]],
 
+        }
 
 
-                protocol = rule.protocol.lower()
 
-                if version == 6 and protocol == 'icmp':
+    async def on_make_leave_request(
 
-                    protocol = 'icmpv6'
+        self, origin: str, room_id: str, user_id: str
 
+    ) -> Dict[str, Any]:
 
+        origin_host, _ = parse_server_name(origin)
 
-                args = ['-j ACCEPT']
+        await self.check_server_matches_acl(origin_host, room_id)
 
-                if protocol:
+        pdu = await self.handler.on_make_leave_request(origin, room_id, user_id)
 
-                    args += ['-p', protocol]
 
 
+        room_version = await self.store.get_room_version_id(room_id)
 
-                if protocol in ['udp', 'tcp']:
 
-                    args += self._build_tcp_udp_rule(rule, version)
 
-                elif protocol == 'icmp':
+        time_now = self._clock.time_msec()
 
-                    args += self._build_icmp_rule(rule, version)
+        return {"event": pdu.get_pdu_json(time_now), "room_version": room_version}
 
-                if rule.cidr:
 
-                    LOG.debug('Using cidr %r', rule.cidr, instance=instance)
 
-                    args += ['-s', rule.cidr]
+    async def on_send_leave_request(self, origin: str, content: JsonDict) -> dict:
 
-                    fw_rules += [' '.join(args)]
+        logger.debug("on_send_leave_request: content: %s", content)
 
-                else:
 
-                    if rule['grantee_group']:
 
-                        # FIXME(jkoelker) This needs to be ported up into
+        assert_params_in_dict(content, ["room_id"])
 
-                        #                 the compute manager which already
+        room_version = await self.store.get_room_version(content["room_id"])
 
-                        #                 has access to a nw_api handle,
+        pdu = event_from_pdu_json(content, room_version)
 
-                        #                 and should be the only one making
 
-                        #                 making rpc calls.
 
-                        import nova.network
+        origin_host, _ = parse_server_name(origin)
 
-                        nw_api = nova.network.API()
+        await self.check_server_matches_acl(origin_host, pdu.room_id)
 
-                        for instance in rule['grantee_group']['instances']:
 
-                            nw_info = nw_api.get_instance_nw_info(ctxt,
 
-                                                                  instance)
+        logger.debug("on_send_leave_request: pdu sigs: %s", pdu.signatures)
 
 
 
-                            ips = [ip['address']
+        pdu = await self._check_sigs_and_hash(room_version, pdu)
 
-                                for ip in nw_info.fixed_ips()
 
-                                    if ip['version'] == version]
 
+        await self.handler.on_send_leave_request(origin, pdu)
 
+        return {}
 
-                            LOG.debug('ips: %r', ips, instance=instance)
 
-                            for ip in ips:
 
-                                subrule = args + ['-s %s' % ip]
+    async def on_event_auth(
 
-                                fw_rules += [' '.join(subrule)]
+        self, origin: str, room_id: str, event_id: str
 
+    ) -> Tuple[int, Dict[str, Any]]:
 
+        with (await self._server_linearizer.queue((origin, room_id))):
 
-                LOG.debug('Using fw_rules: %r', fw_rules, instance=instance)
+            origin_host, _ = parse_server_name(origin)
 
+            await self.check_server_matches_acl(origin_host, room_id)
 
 
-        ipv4_rules += ['-j $sg-fallback']
 
-        ipv6_rules += ['-j $sg-fallback']
+            time_now = self._clock.time_msec()
 
+            auth_pdus = await self.handler.on_event_auth(event_id)
 
+            res = {"auth_chain": [a.get_pdu_json(time_now) for a in auth_pdus]}
 
-        return ipv4_rules, ipv6_rules
+        return 200, res
 
 
 
-    def instance_filter_exists(self, instance, network_info):
+    @log_function
 
-        pass
+    async def on_query_client_keys(
 
+        self, origin: str, content: Dict[str, str]
 
+    ) -> Tuple[int, Dict[str, Any]]:
 
-    def refresh_security_group_members(self, security_group):
+        return await self.on_query_request("client_keys", content)
 
-        self.do_refresh_security_group_rules(security_group)
 
-        self.iptables.apply()
 
+    async def on_query_user_devices(
 
+        self, origin: str, user_id: str
 
-    def refresh_security_group_rules(self, security_group):
+    ) -> Tuple[int, Dict[str, Any]]:
 
-        self.do_refresh_security_group_rules(security_group)
+        keys = await self.device_handler.on_federation_query_user_devices(user_id)
 
-        self.iptables.apply()
+        return 200, keys
 
 
 
-    @utils.synchronized('iptables', external=True)
+    @trace
 
-    def do_refresh_security_group_rules(self, security_group):
+    async def on_claim_client_keys(
 
-        for instance in self.instances.values():
+        self, origin: str, content: JsonDict
 
-            self.remove_filters_for_instance(instance)
+    ) -> Dict[str, Any]:
 
-            self.add_filters_for_instance(instance)
+        query = []
 
+        for user_id, device_keys in content.get("one_time_keys", {}).items():
 
+            for device_id, algorithm in device_keys.items():
 
-    def refresh_provider_fw_rules(self):
+                query.append((user_id, device_id, algorithm))
 
-        """See :class:`FirewallDriver` docs."""
 
-        self._do_refresh_provider_fw_rules()
 
-        self.iptables.apply()
+        log_kv({"message": "Claiming one time keys.", "user, device pairs": query})
 
+        results = await self.store.claim_e2e_one_time_keys(query)
 
 
-    @utils.synchronized('iptables', external=True)
 
-    def _do_refresh_provider_fw_rules(self):
+        json_result = {}  # type: Dict[str, Dict[str, dict]]
 
-        """Internal, synchronized version of refresh_provider_fw_rules."""
+        for user_id, device_keys in results.items():
 
-        self._purge_provider_fw_rules()
+            for device_id, keys in device_keys.items():
 
-        self._build_provider_fw_rules()
+                for key_id, json_str in keys.items():
 
+                    json_result.setdefault(user_id, {})[device_id] = {
 
+                        key_id: json_decoder.decode(json_str)
 
-    def _purge_provider_fw_rules(self):
+                    }
 
-        """Remove all rules from the provider chains."""
 
-        self.iptables.ipv4['filter'].empty_chain('provider')
 
-        if FLAGS.use_ipv6:
+        logger.info(
 
-            self.iptables.ipv6['filter'].empty_chain('provider')
+            "Claimed one-time-keys: %s",
 
+            ",".join(
 
+                (
 
-    def _build_provider_fw_rules(self):
+                    "%s for %s:%s" % (key_id, user_id, device_id)
 
-        """Create all rules for the provider IP DROPs."""
+                    for user_id, user_keys in json_result.items()
 
-        self.iptables.ipv4['filter'].add_chain('provider')
+                    for device_id, device_keys in user_keys.items()
 
-        if FLAGS.use_ipv6:
+                    for key_id, _ in device_keys.items()
 
-            self.iptables.ipv6['filter'].add_chain('provider')
+                )
 
-        ipv4_rules, ipv6_rules = self._provider_rules()
+            ),
 
-        for rule in ipv4_rules:
+        )
 
-            self.iptables.ipv4['filter'].add_rule('provider', rule)
 
 
+        return {"one_time_keys": json_result}
 
-        if FLAGS.use_ipv6:
 
-            for rule in ipv6_rules:
 
-                self.iptables.ipv6['filter'].add_rule('provider', rule)
+    async def on_get_missing_events(
 
+        self,
 
+        origin: str,
 
-    @staticmethod
+        room_id: str,
 
-    def _provider_rules():
+        earliest_events: List[str],
 
-        """Generate a list of rules from provider for IP4 & IP6."""
+        latest_events: List[str],
 
-        ctxt = context.get_admin_context()
+        limit: int,
 
-        ipv4_rules = []
+    ) -> Dict[str, list]:
 
-        ipv6_rules = []
+        with (await self._server_linearizer.queue((origin, room_id))):
 
-        rules = db.provider_fw_rule_get_all(ctxt)
+            origin_host, _ = parse_server_name(origin)
 
-        for rule in rules:
+            await self.check_server_matches_acl(origin_host, room_id)
 
-            LOG.debug(_('Adding provider rule: %s'), rule['cidr'])
 
-            version = netutils.get_ip_version(rule['cidr'])
 
-            if version == 4:
+            logger.debug(
 
-                fw_rules = ipv4_rules
+                "on_get_missing_events: earliest_events: %r, latest_events: %r,"
+
+                " limit: %d",
+
+                earliest_events,
+
+                latest_events,
+
+                limit,
+
+            )
+
+
+
+            missing_events = await self.handler.on_get_missing_events(
+
+                origin, room_id, earliest_events, latest_events, limit
+
+            )
+
+
+
+            if len(missing_events) < 5:
+
+                logger.debug(
+
+                    "Returning %d events: %r", len(missing_events), missing_events
+
+                )
 
             else:
 
-                fw_rules = ipv6_rules
+                logger.debug("Returning %d events", len(missing_events))
 
 
 
-            protocol = rule['protocol']
-
-            if version == 6 and protocol == 'icmp':
-
-                protocol = 'icmpv6'
+            time_now = self._clock.time_msec()
 
 
 
-            args = ['-p', protocol, '-s', rule['cidr']]
+        return {"events": [ev.get_pdu_json(time_now) for ev in missing_events]}
 
 
 
-            if protocol in ['udp', 'tcp']:
+    @log_function
 
-                if rule['from_port'] == rule['to_port']:
+    async def on_openid_userinfo(self, token: str) -> Optional[str]:
 
-                    args += ['--dport', '%s' % (rule['from_port'],)]
+        ts_now_ms = self._clock.time_msec()
 
-                else:
-
-                    args += ['-m', 'multiport',
-
-                             '--dports', '%s:%s' % (rule['from_port'],
-
-                                                    rule['to_port'])]
-
-            elif protocol == 'icmp':
-
-                icmp_type = rule['from_port']
-
-                icmp_code = rule['to_port']
+        return await self.store.get_user_id_for_open_id_token(token, ts_now_ms)
 
 
 
-                if icmp_type == -1:
+    def _transaction_from_pdus(self, pdu_list: List[EventBase]) -> Transaction:
 
-                    icmp_type_arg = None
+        """Returns a new Transaction containing the given PDUs suitable for
 
-                else:
+        transmission.
 
-                    icmp_type_arg = '%s' % icmp_type
+        """
 
-                    if not icmp_code == -1:
+        time_now = self._clock.time_msec()
 
-                        icmp_type_arg += '/%s' % icmp_code
+        pdus = [p.get_pdu_json(time_now) for p in pdu_list]
 
+        return Transaction(
 
+            origin=self.server_name,
 
-                if icmp_type_arg:
+            pdus=pdus,
 
-                    if version == 4:
+            origin_server_ts=int(time_now),
 
-                        args += ['-m', 'icmp', '--icmp-type',
+            destination=None,
 
-                                 icmp_type_arg]
-
-                    elif version == 6:
-
-                        args += ['-m', 'icmp6', '--icmpv6-type',
-
-                                 icmp_type_arg]
-
-            args += ['-j DROP']
-
-            fw_rules += [' '.join(args)]
-
-        return ipv4_rules, ipv6_rules
+        )
 
 
 
+    async def _handle_received_pdu(self, origin: str, pdu: EventBase) -> None:
 
-
-class NoopFirewallDriver(object):
-
-    """Firewall driver which just provides No-op methods."""
-
-    def __init__(*args, **kwargs):
-
-        pass
+        """ Process a PDU received in a federation /send/ transaction.
 
 
 
-    def _noop(*args, **kwargs):
+        If the event is invalid, then this method throws a FederationError.
 
-        pass
+        (The error will then be logged and sent back to the sender (which
 
+        probably won't do anything with it), and other events in the
 
-
-    def __getattr__(self, key):
-
-        return self._noop
+        transaction will be processed as normal).
 
 
 
-    def instance_filter_exists(self, instance, network_info):
+        It is likely that we'll then receive other events which refer to
 
-        return True
+        this rejected_event in their prev_events, etc.  When that happens,
+
+        we'll attempt to fetch the rejected event again, which will presumably
+
+        fail, so those second-generation events will also get rejected.
+
+
+
+        Eventually, we get to the point where there are more than 10 events
+
+        between any new events and the original rejected event. Since we
+
+        only try to backfill 10 events deep on received pdu, we then accept the
+
+        new event, possibly introducing a discontinuity in the DAG, with new
+
+        forward extremities, so normal service is approximately returned,
+
+        until we try to backfill across the discontinuity.
+
+
+
+        Args:
+
+            origin: server which sent the pdu
+
+            pdu: received pdu
+
+
+
+        Raises: FederationError if the signatures / hash do not match, or
+
+            if the event was unacceptable for any other reason (eg, too large,
+
+            too many prev_events, couldn't find the prev_events)
+
+        """
+
+        # check that it's actually being sent from a valid destination to
+
+        # workaround bug #1753 in 0.18.5 and 0.18.6
+
+        if origin != get_domain_from_id(pdu.sender):
+
+            # We continue to accept join events from any server; this is
+
+            # necessary for the federation join dance to work correctly.
+
+            # (When we join over federation, the "helper" server is
+
+            # responsible for sending out the join event, rather than the
+
+            # origin. See bug #1893. This is also true for some third party
+
+            # invites).
+
+            if not (
+
+                pdu.type == "m.room.member"
+
+                and pdu.content
+
+                and pdu.content.get("membership", None)
+
+                in (Membership.JOIN, Membership.INVITE)
+
+            ):
+
+                logger.info(
+
+                    "Discarding PDU %s from invalid origin %s", pdu.event_id, origin
+
+                )
+
+                return
+
+            else:
+
+                logger.info("Accepting join PDU %s from %s", pdu.event_id, origin)
+
+
+
+        # We've already checked that we know the room version by this point
+
+        room_version = await self.store.get_room_version(pdu.room_id)
+
+
+
+        # Check signature.
+
+        try:
+
+            pdu = await self._check_sigs_and_hash(room_version, pdu)
+
+        except SynapseError as e:
+
+            raise FederationError("ERROR", e.code, e.msg, affected=pdu.event_id)
+
+
+
+        await self.handler.on_receive_pdu(origin, pdu, sent_to_us_directly=True)
+
+
+
+    def __str__(self):
+
+        return "<ReplicationLayer(%s)>" % self.server_name
+
+
+
+    async def exchange_third_party_invite(
+
+        self, sender_user_id: str, target_user_id: str, room_id: str, signed: Dict
+
+    ):
+
+        ret = await self.handler.exchange_third_party_invite(
+
+            sender_user_id, target_user_id, room_id, signed
+
+        )
+
+        return ret
+
+
+
+    async def on_exchange_third_party_invite_request(self, event_dict: Dict):
+
+        ret = await self.handler.on_exchange_third_party_invite_request(event_dict)
+
+        return ret
+
+
+
+    async def check_server_matches_acl(self, server_name: str, room_id: str):
+
+        """Check if the given server is allowed by the server ACLs in the room
+
+
+
+        Args:
+
+            server_name: name of server, *without any port part*
+
+            room_id: ID of the room to check
+
+
+
+        Raises:
+
+            AuthError if the server does not match the ACL
+
+        """
+
+        state_ids = await self.store.get_current_state_ids(room_id)
+
+        acl_event_id = state_ids.get((EventTypes.ServerACL, ""))
+
+
+
+        if not acl_event_id:
+
+            return
+
+
+
+        acl_event = await self.store.get_event(acl_event_id)
+
+        if server_matches_acl_event(server_name, acl_event):
+
+            return
+
+
+
+        raise AuthError(code=403, msg="Server is banned from room")
+
+
+
+
+
+def server_matches_acl_event(server_name: str, acl_event: EventBase) -> bool:
+
+    """Check if the given server is allowed by the ACL event
+
+
+
+    Args:
+
+        server_name: name of server, without any port part
+
+        acl_event: m.room.server_acl event
+
+
+
+    Returns:
+
+        True if this server is allowed by the ACLs
+
+    """
+
+    logger.debug("Checking %s against acl %s", server_name, acl_event.content)
+
+
+
+    # first of all, check if literal IPs are blocked, and if so, whether the
+
+    # server name is a literal IP
+
+    allow_ip_literals = acl_event.content.get("allow_ip_literals", True)
+
+    if not isinstance(allow_ip_literals, bool):
+
+        logger.warning("Ignoring non-bool allow_ip_literals flag")
+
+        allow_ip_literals = True
+
+    if not allow_ip_literals:
+
+        # check for ipv6 literals. These start with '['.
+
+        if server_name[0] == "[":
+
+            return False
+
+
+
+        # check for ipv4 literals. We can just lift the routine from twisted.
+
+        if isIPAddress(server_name):
+
+            return False
+
+
+
+    # next,  check the deny list
+
+    deny = acl_event.content.get("deny", [])
+
+    if not isinstance(deny, (list, tuple)):
+
+        logger.warning("Ignoring non-list deny ACL %s", deny)
+
+        deny = []
+
+    for e in deny:
+
+        if _acl_entry_matches(server_name, e):
+
+            # logger.info("%s matched deny rule %s", server_name, e)
+
+            return False
+
+
+
+    # then the allow list.
+
+    allow = acl_event.content.get("allow", [])
+
+    if not isinstance(allow, (list, tuple)):
+
+        logger.warning("Ignoring non-list allow ACL %s", allow)
+
+        allow = []
+
+    for e in allow:
+
+        if _acl_entry_matches(server_name, e):
+
+            # logger.info("%s matched allow rule %s", server_name, e)
+
+            return True
+
+
+
+    # everything else should be rejected.
+
+    # logger.info("%s fell through", server_name)
+
+    return False
+
+
+
+
+
+def _acl_entry_matches(server_name: str, acl_entry: Any) -> bool:
+
+    if not isinstance(acl_entry, str):
+
+        logger.warning(
+
+            "Ignoring non-str ACL entry '%s' (is %s)", acl_entry, type(acl_entry)
+
+        )
+
+        return False
+
+    regex = glob_to_regex(acl_entry)
+
+    return bool(regex.match(server_name))
+
+
+
+
+
+class FederationHandlerRegistry:
+
+    """Allows classes to register themselves as handlers for a given EDU or
+
+    query type for incoming federation traffic.
+
+    """
+
+
+
+    def __init__(self, hs: "HomeServer"):
+
+        self.config = hs.config
+
+        self.http_client = hs.get_simple_http_client()
+
+        self.clock = hs.get_clock()
+
+        self._instance_name = hs.get_instance_name()
+
+
+
+        # These are safe to load in monolith mode, but will explode if we try
+
+        # and use them. However we have guards before we use them to ensure that
+
+        # we don't route to ourselves, and in monolith mode that will always be
+
+        # the case.
+
+        self._get_query_client = ReplicationGetQueryRestServlet.make_client(hs)
+
+        self._send_edu = ReplicationFederationSendEduRestServlet.make_client(hs)
+
+
+
+        self.edu_handlers = (
+
+            {}
+
+        )  # type: Dict[str, Callable[[str, dict], Awaitable[None]]]
+
+        self.query_handlers = {}  # type: Dict[str, Callable[[dict], Awaitable[None]]]
+
+
+
+        # Map from type to instance name that we should route EDU handling to.
+
+        self._edu_type_to_instance = {}  # type: Dict[str, str]
+
+
+
+    def register_edu_handler(
+
+        self, edu_type: str, handler: Callable[[str, JsonDict], Awaitable[None]]
+
+    ):
+
+        """Sets the handler callable that will be used to handle an incoming
+
+        federation EDU of the given type.
+
+
+
+        Args:
+
+            edu_type: The type of the incoming EDU to register handler for
+
+            handler: A callable invoked on incoming EDU
+
+                of the given type. The arguments are the origin server name and
+
+                the EDU contents.
+
+        """
+
+        if edu_type in self.edu_handlers:
+
+            raise KeyError("Already have an EDU handler for %s" % (edu_type,))
+
+
+
+        logger.info("Registering federation EDU handler for %r", edu_type)
+
+
+
+        self.edu_handlers[edu_type] = handler
+
+
+
+    def register_query_handler(
+
+        self, query_type: str, handler: Callable[[dict], defer.Deferred]
+
+    ):
+
+        """Sets the handler callable that will be used to handle an incoming
+
+        federation query of the given type.
+
+
+
+        Args:
+
+            query_type: Category name of the query, which should match
+
+                the string used by make_query.
+
+            handler: Invoked to handle
+
+                incoming queries of this type. The return will be yielded
+
+                on and the result used as the response to the query request.
+
+        """
+
+        if query_type in self.query_handlers:
+
+            raise KeyError("Already have a Query handler for %s" % (query_type,))
+
+
+
+        logger.info("Registering federation query handler for %r", query_type)
+
+
+
+        self.query_handlers[query_type] = handler
+
+
+
+    def register_instance_for_edu(self, edu_type: str, instance_name: str):
+
+        """Register that the EDU handler is on a different instance than master.
+
+        """
+
+        self._edu_type_to_instance[edu_type] = instance_name
+
+
+
+    async def on_edu(self, edu_type: str, origin: str, content: dict):
+
+        if not self.config.use_presence and edu_type == "m.presence":
+
+            return
+
+
+
+        # Check if we have a handler on this instance
+
+        handler = self.edu_handlers.get(edu_type)
+
+        if handler:
+
+            with start_active_span_from_edu(content, "handle_edu"):
+
+                try:
+
+                    await handler(origin, content)
+
+                except SynapseError as e:
+
+                    logger.info("Failed to handle edu %r: %r", edu_type, e)
+
+                except Exception:
+
+                    logger.exception("Failed to handle edu %r", edu_type)
+
+            return
+
+
+
+        # Check if we can route it somewhere else that isn't us
+
+        route_to = self._edu_type_to_instance.get(edu_type, "master")
+
+        if route_to != self._instance_name:
+
+            try:
+
+                await self._send_edu(
+
+                    instance_name=route_to,
+
+                    edu_type=edu_type,
+
+                    origin=origin,
+
+                    content=content,
+
+                )
+
+            except SynapseError as e:
+
+                logger.info("Failed to handle edu %r: %r", edu_type, e)
+
+            except Exception:
+
+                logger.exception("Failed to handle edu %r", edu_type)
+
+            return
+
+
+
+        # Oh well, let's just log and move on.
+
+        logger.warning("No handler registered for EDU type %s", edu_type)
+
+
+
+    async def on_query(self, query_type: str, args: dict):
+
+        handler = self.query_handlers.get(query_type)
+
+        if handler:
+
+            return await handler(args)
+
+
+
+        # Check if we can route it somewhere else that isn't us
+
+        if self._instance_name == "master":
+
+            return await self._get_query_client(query_type=query_type, args=args)
+
+
+
+        # Uh oh, no handler! Let's raise an exception so the request returns an
+
+        # error.
+
+        logger.warning("No handler registered for query type %s", query_type)
+
+        raise NotFoundError("No handler for Query type '%s'" % (query_type,))

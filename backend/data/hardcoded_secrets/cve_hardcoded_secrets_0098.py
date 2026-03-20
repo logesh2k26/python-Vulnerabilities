@@ -2,128 +2,128 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-from django.contrib.postgres.fields import ArrayField, JSONField
+#     Copyright 2014 Netflix, Inc.
 
-from django.db.models.aggregates import Aggregate
+#
 
+#     Licensed under the Apache License, Version 2.0 (the "License");
 
+#     you may not use this file except in compliance with the License.
 
-from .mixins import OrderableAggMixin
+#     You may obtain a copy of the License at
 
+#
 
+#         http://www.apache.org/licenses/LICENSE-2.0
 
-__all__ = [
+#
 
-    'ArrayAgg', 'BitAnd', 'BitOr', 'BoolAnd', 'BoolOr', 'JSONBAgg', 'StringAgg',
+#     Unless required by applicable law or agreed to in writing, software
 
-]
+#     distributed under the License is distributed on an "AS IS" BASIS,
 
+#     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 
+#     See the License for the specific language governing permissions and
 
+#     limitations under the License.
 
+from setuptools import setup
 
-class ArrayAgg(OrderableAggMixin, Aggregate):
 
-    function = 'ARRAY_AGG'
 
-    template = '%(function)s(%(distinct)s%(expressions)s %(ordering)s)'
+setup(
 
-    allow_distinct = True
+    name='security_monkey',
 
+    version='0.8.0',
 
+    long_description=__doc__,
 
-    @property
+    packages=['security_monkey'],
 
-    def output_field(self):
+    include_package_data=True,
 
-        return ArrayField(self.source_expressions[0].output_field)
+    zip_safe=False,
 
+    install_requires=[
 
+        'APScheduler==2.1.2',
 
-    def convert_value(self, value, expression, connection):
+        'Flask==0.10.1',
 
-        if not value:
+        'Flask-Login==0.2.10',
 
-            return []
+        'Flask-Mail==0.9.0',
 
-        return value
+        'Flask-Migrate==1.3.1',
 
+        'Flask-Principal==0.4.0',
 
+        'Flask-RESTful==0.3.3',
 
+        'Flask-SQLAlchemy==1.0',
 
+        'Flask-Script==0.6.3',
 
-class BitAnd(Aggregate):
+        'Flask-Security==1.7.4',
 
-    function = 'BIT_AND'
+        'Flask-WTF==0.9.5',
 
+        'Jinja2==2.8',
 
+        'SQLAlchemy==0.9.2',
 
+        'boto>=2.41.0',
 
+        'ipaddr==2.1.11',
 
-class BitOr(Aggregate):
+        'itsdangerous==0.23',
 
-    function = 'BIT_OR'
+        'psycopg2==2.5.2',
 
+        'bcrypt==2.0.0',
 
+        'Sphinx==1.2.2',
 
+        'gunicorn==18.0',
 
+        'cryptography==1.3.2',
 
-class BoolAnd(Aggregate):
+        'boto3>=1.4.2',
 
-    function = 'BOOL_AND'
+        'botocore>=1.4.81',
 
+        'dpath==1.3.2',
 
+        'pyyaml==3.11',
 
+        'jira==0.32',
 
+        'cloudaux>=1.0.6',
 
-class BoolOr(Aggregate):
+        'joblib>=0.9.4',
 
-    function = 'BOOL_OR'
+        'pyjwt>=1.01',
 
+    ],
 
+    extras_require = {
 
+        'onelogin': ['python-saml>=2.2.0'],
 
+        'tests': [
 
-class JSONBAgg(Aggregate):
+            'nose==1.3.0',
 
-    function = 'JSONB_AGG'
+            'mock==1.0.1',
 
-    output_field = JSONField()
+            'moto==0.4.30',
 
+            'freezegun>=0.3.7'
 
+        ]
 
-    def convert_value(self, value, expression, connection):
+    }
 
-        if not value:
-
-            return []
-
-        return value
-
-
-
-
-
-class StringAgg(OrderableAggMixin, Aggregate):
-
-    function = 'STRING_AGG'
-
-    template = "%(function)s(%(distinct)s%(expressions)s, '%(delimiter)s'%(ordering)s)"
-
-    allow_distinct = True
-
-
-
-    def __init__(self, expression, delimiter, **extra):
-
-        super().__init__(expression, delimiter=delimiter, **extra)
-
-
-
-    def convert_value(self, value, expression, connection):
-
-        if not value:
-
-            return ''
-
-        return value
+)

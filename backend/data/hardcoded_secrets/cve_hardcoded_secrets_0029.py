@@ -2,402 +2,1112 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
+# SPDX-License-Identifier: EUPL-1.2
+
+# Copyright (C) 2019 - 2020 Dimpact
+
+import datetime
+
+import os
 
 
 
-# Copyright 2010 United States Government as represented by the
+from django.urls import reverse_lazy
 
-# Administrator of the National Aeronautics and Space Administration.
 
-# All Rights Reserved.
+
+import git
+
+import sentry_sdk
+
+from sentry_sdk.integrations import django, redis
+
+
+
+# NLX directory urls
+
+from openzaak.config.constants import NLXDirectories
+
+
+
+from ...utils.monitoring import filter_sensitive_data
+
+from .api import *  # noqa
+
+from .environ import config
+
+from .plugins import PLUGIN_INSTALLED_APPS
+
+
+
+# Build paths inside the project, so further paths can be defined relative to
+
+# the code root.
+
+DJANGO_PROJECT_DIR = os.path.abspath(
+
+    os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir)
+
+)
+
+BASE_DIR = os.path.abspath(
+
+    os.path.join(DJANGO_PROJECT_DIR, os.path.pardir, os.path.pardir)
+
+)
+
+
 
 #
 
-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
-
-#    not use this file except in compliance with the License. You may obtain
-
-#    a copy of the License at
+# Core Django settings
 
 #
 
-#         http://www.apache.org/licenses/LICENSE-2.0
+SITE_ID = config("SITE_ID", default=1)
+
+
+
+# SECURITY WARNING: keep the secret key used in production secret!
+
+SECRET_KEY = config("SECRET_KEY")
+
+
+
+# NEVER run with DEBUG=True in production-like environments
+
+DEBUG = config("DEBUG", default=False)
+
+
+
+# = domains we're running on
+
+ALLOWED_HOSTS = config("ALLOWED_HOSTS", default="", split=True)
+
+
+
+IS_HTTPS = config("IS_HTTPS", default=not DEBUG)
+
+
+
+# Internationalization
+
+# https://docs.djangoproject.com/en/2.0/topics/i18n/
+
+
+
+LANGUAGE_CODE = "nl-nl"
+
+
+
+TIME_ZONE = "UTC"  # note: this *may* affect the output of DRF datetimes
+
+
+
+USE_I18N = True
+
+
+
+USE_L10N = True
+
+
+
+USE_TZ = True
+
+
+
+USE_THOUSAND_SEPARATOR = True
+
+
 
 #
 
-#    Unless required by applicable law or agreed to in writing, software
+# DATABASE and CACHING setup
 
-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#
 
-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+DATABASES = {
 
-#    License for the specific language governing permissions and limitations
+    "default": {
 
-#    under the License.
+        "ENGINE": "django.contrib.gis.db.backends.postgis",
 
+        "NAME": config("DB_NAME", "openzaak"),
 
+        "USER": config("DB_USER", "openzaak"),
 
-"""Quotas for instances, volumes, and floating ips."""
+        "PASSWORD": config("DB_PASSWORD", "openzaak"),
 
+        "HOST": config("DB_HOST", "localhost"),
 
-
-from nova import db
-
-from nova.openstack.common import cfg
-
-from nova import flags
-
-
-
-
-
-quota_opts = [
-
-    cfg.IntOpt('quota_instances',
-
-               default=10,
-
-               help='number of instances allowed per project'),
-
-    cfg.IntOpt('quota_cores',
-
-               default=20,
-
-               help='number of instance cores allowed per project'),
-
-    cfg.IntOpt('quota_ram',
-
-               default=50 * 1024,
-
-               help='megabytes of instance ram allowed per project'),
-
-    cfg.IntOpt('quota_volumes',
-
-               default=10,
-
-               help='number of volumes allowed per project'),
-
-    cfg.IntOpt('quota_gigabytes',
-
-               default=1000,
-
-               help='number of volume gigabytes allowed per project'),
-
-    cfg.IntOpt('quota_floating_ips',
-
-               default=10,
-
-               help='number of floating ips allowed per project'),
-
-    cfg.IntOpt('quota_metadata_items',
-
-               default=128,
-
-               help='number of metadata items allowed per instance'),
-
-    cfg.IntOpt('quota_injected_files',
-
-               default=5,
-
-               help='number of injected files allowed'),
-
-    cfg.IntOpt('quota_injected_file_content_bytes',
-
-               default=10 * 1024,
-
-               help='number of bytes allowed per injected file'),
-
-    cfg.IntOpt('quota_injected_file_path_bytes',
-
-               default=255,
-
-               help='number of bytes allowed per injected file path'),
-
-    ]
-
-
-
-FLAGS = flags.FLAGS
-
-FLAGS.register_opts(quota_opts)
-
-
-
-
-
-quota_resources = ['metadata_items', 'injected_file_content_bytes',
-
-        'volumes', 'gigabytes', 'ram', 'floating_ips', 'instances',
-
-        'injected_files', 'cores']
-
-
-
-
-
-def _get_default_quotas():
-
-    defaults = {
-
-        'instances': FLAGS.quota_instances,
-
-        'cores': FLAGS.quota_cores,
-
-        'ram': FLAGS.quota_ram,
-
-        'volumes': FLAGS.quota_volumes,
-
-        'gigabytes': FLAGS.quota_gigabytes,
-
-        'floating_ips': FLAGS.quota_floating_ips,
-
-        'metadata_items': FLAGS.quota_metadata_items,
-
-        'injected_files': FLAGS.quota_injected_files,
-
-        'injected_file_content_bytes':
-
-            FLAGS.quota_injected_file_content_bytes,
+        "PORT": config("DB_PORT", 5432),
 
     }
 
-    # -1 in the quota flags means unlimited
+}
 
-    return defaults
 
 
+CACHES = {
 
+    "default": {
 
+        "BACKEND": "django_redis.cache.RedisCache",
 
-def get_class_quotas(context, quota_class, defaults=None):
+        "LOCATION": f"redis://{config('CACHE_DEFAULT', 'localhost:6379/0')}",
 
-    """Update defaults with the quota class values."""
+        "OPTIONS": {
 
+            "CLIENT_CLASS": "django_redis.client.DefaultClient",
 
+            "IGNORE_EXCEPTIONS": True,
 
-    if not defaults:
+        },
 
-        defaults = _get_default_quotas()
+    },
 
+    "axes": {
 
+        "BACKEND": "django_redis.cache.RedisCache",
 
-    quota = db.quota_class_get_all_by_name(context, quota_class)
+        "LOCATION": f"redis://{config('CACHE_AXES', 'localhost:6379/0')}",
 
-    for key in defaults.keys():
+        "OPTIONS": {
 
-        if key in quota:
+            "CLIENT_CLASS": "django_redis.client.DefaultClient",
 
-            defaults[key] = quota[key]
+            "IGNORE_EXCEPTIONS": True,
 
+        },
 
+    },
 
-    return defaults
+}
 
 
 
+#
 
+# APPLICATIONS enabled for this project
 
-def get_project_quotas(context, project_id):
+#
 
-    defaults = _get_default_quotas()
+INSTALLED_APPS = [
 
-    if context.quota_class:
+    # Note: contenttypes should be first, see Django ticket #10827
 
-        get_class_quotas(context, context.quota_class, defaults)
+    "django.contrib.contenttypes",
 
-    quota = db.quota_get_all_by_project(context, project_id)
+    "django.contrib.auth",
 
-    for key in defaults.keys():
+    "django.contrib.sessions",
 
-        if key in quota:
+    # Note: If enabled, at least one Site object is required
 
-            defaults[key] = quota[key]
+    "django.contrib.sites",
 
-    return defaults
+    "django.contrib.messages",
 
+    "django.contrib.staticfiles",
 
+    # Optional applications.
 
+    "ordered_model",
 
+    "django_admin_index",
 
-def _get_request_allotment(requested, used, quota):
+    "django.contrib.admin",
 
-    if quota == -1:
+    "django.contrib.gis",
 
-        return requested
+    # 'django.contrib.admindocs',
 
-    return quota - used
+    # 'django.contrib.humanize',
 
+    # External applications.
 
+    "axes",
 
+    "django_auth_adfs",
 
+    "django_auth_adfs_db",
 
-def allowed_instances(context, requested_instances, instance_type):
+    "django_filters",
 
-    """Check quota and return min(requested_instances, allowed_instances)."""
+    "django_db_logger",
 
-    project_id = context.project_id
+    "corsheaders",
 
-    context = context.elevated()
+    "extra_views",
 
-    requested_cores = requested_instances * instance_type['vcpus']
+    "vng_api_common",  # before drf_yasg to override the management command
 
-    requested_ram = requested_instances * instance_type['memory_mb']
+    "vng_api_common.authorizations",
 
-    usage = db.instance_data_get_for_project(context, project_id)
+    "vng_api_common.audittrails",
 
-    used_instances, used_cores, used_ram = usage
+    "vng_api_common.notifications",
 
-    quota = get_project_quotas(context, project_id)
+    "nlx_url_rewriter",
 
-    allowed_instances = _get_request_allotment(requested_instances,
+    "drf_yasg",
 
-                                               used_instances,
+    "rest_framework",
 
-                                               quota['instances'])
+    "rest_framework_gis",
 
-    allowed_cores = _get_request_allotment(requested_cores, used_cores,
+    "django_markup",
 
-                                           quota['cores'])
+    "solo",
 
-    allowed_ram = _get_request_allotment(requested_ram, used_ram, quota['ram'])
+    "sniplates",
 
-    if instance_type['vcpus']:
+    "privates",
 
-        allowed_instances = min(allowed_instances,
+    "django_better_admin_arrayfield.apps.DjangoBetterAdminArrayfieldConfig",
 
-                                allowed_cores // instance_type['vcpus'])
+    "django_loose_fk",
 
-    if instance_type['memory_mb']:
+    "zgw_consumers",
 
-        allowed_instances = min(allowed_instances,
+    "drc_cmis",
 
-                                allowed_ram // instance_type['memory_mb'])
+    # Project applications.
 
+    "openzaak",
 
+    "openzaak.accounts",
 
-    return min(requested_instances, allowed_instances)
+    "openzaak.utils",
 
+    "openzaak.components.autorisaties",
 
+    "openzaak.components.zaken",
 
+    "openzaak.components.besluiten",
 
+    "openzaak.components.documenten",
 
-def allowed_volumes(context, requested_volumes, size):
+    "openzaak.components.catalogi",
 
-    """Check quota and return min(requested_volumes, allowed_volumes)."""
+    "openzaak.config",
 
-    project_id = context.project_id
+    "openzaak.selectielijst",
 
-    context = context.elevated()
+    "openzaak.notifications",
 
-    size = int(size)
+] + PLUGIN_INSTALLED_APPS
 
-    requested_gigabytes = requested_volumes * size
 
-    used_volumes, used_gigabytes = db.volume_data_get_for_project(context,
 
-                                                                  project_id)
+MIDDLEWARE = [
 
-    quota = get_project_quotas(context, project_id)
+    "django.middleware.security.SecurityMiddleware",
 
-    allowed_volumes = _get_request_allotment(requested_volumes, used_volumes,
+    "openzaak.utils.middleware.LogHeadersMiddleware",
 
-                                             quota['volumes'])
+    "django.contrib.sessions.middleware.SessionMiddleware",
 
-    allowed_gigabytes = _get_request_allotment(requested_gigabytes,
+    # 'django.middleware.locale.LocaleMiddleware',
 
-                                               used_gigabytes,
+    "django.middleware.common.CommonMiddleware",
 
-                                               quota['gigabytes'])
+    "django.middleware.csrf.CsrfViewMiddleware",
 
-    if size != 0:
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
 
-        allowed_volumes = min(allowed_volumes,
+    "openzaak.components.autorisaties.middleware.AuthMiddleware",
 
-                              int(allowed_gigabytes // size))
+    "django.contrib.messages.middleware.MessageMiddleware",
 
-    return min(requested_volumes, allowed_volumes)
+    "django.middleware.clickjacking.XFrameOptionsMiddleware",
 
+    "corsheaders.middleware.CorsMiddleware",
 
+    "openzaak.utils.middleware.APIVersionHeaderMiddleware",
 
+    "openzaak.utils.middleware.EnabledMiddleware",
 
+]
 
-def allowed_floating_ips(context, requested_floating_ips):
 
-    """Check quota and return min(requested, allowed) floating ips."""
 
-    project_id = context.project_id
+ROOT_URLCONF = "openzaak.urls"
 
-    context = context.elevated()
 
-    used_floating_ips = db.floating_ip_count_by_project(context, project_id)
 
-    quota = get_project_quotas(context, project_id)
+# List of callables that know how to import templates from various sources.
 
-    allowed_floating_ips = _get_request_allotment(requested_floating_ips,
+TEMPLATE_LOADERS = (
 
-                                                  used_floating_ips,
+    "django.template.loaders.filesystem.Loader",
 
-                                                  quota['floating_ips'])
+    "django.template.loaders.app_directories.Loader",
 
-    return min(requested_floating_ips, allowed_floating_ips)
+)
 
 
 
+TEMPLATES = [
 
+    {
 
-def _calculate_simple_quota(context, resource, requested):
+        "BACKEND": "django.template.backends.django.DjangoTemplates",
 
-    """Check quota for resource; return min(requested, allowed)."""
+        "DIRS": [os.path.join(DJANGO_PROJECT_DIR, "templates")],
 
-    quota = get_project_quotas(context, context.project_id)
+        "APP_DIRS": False,  # conflicts with explicity specifying the loaders
 
-    allowed = _get_request_allotment(requested, 0, quota[resource])
+        "OPTIONS": {
 
-    return min(requested, allowed)
+            "context_processors": [
 
+                "django.template.context_processors.debug",
 
+                "django.template.context_processors.request",
 
+                "django.contrib.auth.context_processors.auth",
 
+                "django.contrib.messages.context_processors.messages",
 
-def allowed_metadata_items(context, requested_metadata_items):
+                "openzaak.utils.context_processors.settings",
 
-    """Return the number of metadata items allowed."""
+                "django_admin_index.context_processors.dashboard",
 
-    return _calculate_simple_quota(context, 'metadata_items',
+            ],
 
-                                   requested_metadata_items)
+            "loaders": TEMPLATE_LOADERS,
 
+        },
 
+    }
 
+]
 
 
-def allowed_injected_files(context, requested_injected_files):
 
-    """Return the number of injected files allowed."""
+WSGI_APPLICATION = "openzaak.wsgi.application"
 
-    return _calculate_simple_quota(context, 'injected_files',
 
-                                   requested_injected_files)
 
+# Translations
 
+LOCALE_PATHS = (os.path.join(DJANGO_PROJECT_DIR, "conf", "locale"),)
 
 
 
-def allowed_injected_file_content_bytes(context, requested_bytes):
+#
 
-    """Return the number of bytes allowed per injected file content."""
+# SERVING of static and media files
 
-    resource = 'injected_file_content_bytes'
+#
 
-    return _calculate_simple_quota(context, resource, requested_bytes)
 
 
+STATIC_URL = "/static/"
 
 
 
-def allowed_injected_file_path_bytes(context):
+STATIC_ROOT = os.path.join(BASE_DIR, "static")
 
-    """Return the number of bytes allowed in an injected file path."""
 
-    return FLAGS.quota_injected_file_path_bytes
+
+# Additional locations of static files
+
+STATICFILES_DIRS = [os.path.join(DJANGO_PROJECT_DIR, "static")]
+
+
+
+# List of finder classes that know how to find static files in
+
+# various locations.
+
+STATICFILES_FINDERS = [
+
+    "django.contrib.staticfiles.finders.FileSystemFinder",
+
+    "django.contrib.staticfiles.finders.AppDirectoriesFinder",
+
+]
+
+
+
+MEDIA_ROOT = os.path.join(BASE_DIR, "media")
+
+
+
+MEDIA_URL = "/media/"
+
+
+
+#
+
+# Sending EMAIL
+
+#
+
+EMAIL_HOST = config("EMAIL_HOST", default="localhost")
+
+EMAIL_PORT = config(
+
+    "EMAIL_PORT", default=25
+
+)  # disabled on Google Cloud, use 487 instead
+
+EMAIL_HOST_USER = config("EMAIL_HOST_USER", default="")
+
+EMAIL_HOST_PASSWORD = config("EMAIL_HOST_PASSWORD", default="")
+
+EMAIL_USE_TLS = config("EMAIL_USE_TLS", default=False)
+
+EMAIL_TIMEOUT = 10
+
+
+
+DEFAULT_FROM_EMAIL = "openzaak@example.com"
+
+
+
+#
+
+# LOGGING
+
+#
+
+LOG_STDOUT = config("LOG_STDOUT", default=False)
+
+
+
+LOGGING_DIR = os.path.join(BASE_DIR, "log")
+
+
+
+LOGGING = {
+
+    "version": 1,
+
+    "disable_existing_loggers": False,
+
+    "formatters": {
+
+        "verbose": {
+
+            "format": "%(asctime)s %(levelname)s %(name)s %(module)s %(process)d %(thread)d  %(message)s"
+
+        },
+
+        "timestamped": {"format": "%(asctime)s %(levelname)s %(name)s  %(message)s"},
+
+        "simple": {"format": "%(levelname)s  %(message)s"},
+
+        "performance": {"format": "%(asctime)s %(process)d | %(thread)d | %(message)s"},
+
+    },
+
+    "filters": {
+
+        "require_debug_false": {"()": "django.utils.log.RequireDebugFalse"},
+
+        "failed_notification": {
+
+            "()": "openzaak.notifications.filters.FailedNotificationFilter"
+
+        },
+
+    },
+
+    "handlers": {
+
+        "mail_admins": {
+
+            "level": "ERROR",
+
+            "filters": ["require_debug_false"],
+
+            "class": "django.utils.log.AdminEmailHandler",
+
+        },
+
+        "null": {"level": "DEBUG", "class": "logging.NullHandler"},
+
+        "console": {
+
+            "level": "DEBUG",
+
+            "class": "logging.StreamHandler",
+
+            "formatter": "timestamped",
+
+        },
+
+        "django": {
+
+            "level": "DEBUG",
+
+            "class": "logging.handlers.RotatingFileHandler",
+
+            "filename": os.path.join(LOGGING_DIR, "django.log"),
+
+            "formatter": "verbose",
+
+            "maxBytes": 1024 * 1024 * 10,  # 10 MB
+
+            "backupCount": 10,
+
+        },
+
+        "project": {
+
+            "level": "DEBUG",
+
+            "class": "logging.handlers.RotatingFileHandler",
+
+            "filename": os.path.join(LOGGING_DIR, "openzaak.log"),
+
+            "formatter": "verbose",
+
+            "maxBytes": 1024 * 1024 * 10,  # 10 MB
+
+            "backupCount": 10,
+
+        },
+
+        "performance": {
+
+            "level": "INFO",
+
+            "class": "logging.handlers.RotatingFileHandler",
+
+            "filename": os.path.join(LOGGING_DIR, "performance.log"),
+
+            "formatter": "performance",
+
+            "maxBytes": 1024 * 1024 * 10,  # 10 MB
+
+            "backupCount": 10,
+
+        },
+
+        "requests": {
+
+            "level": "DEBUG",
+
+            "class": "logging.handlers.RotatingFileHandler",
+
+            "filename": os.path.join(LOGGING_DIR, "requests.log"),
+
+            "formatter": "timestamped",
+
+            "maxBytes": 1024 * 1024 * 10,  # 10 MB
+
+            "backupCount": 10,
+
+        },
+
+        "failed_notification": {
+
+            "level": "DEBUG",
+
+            "filters": ["failed_notification"],
+
+            "class": "openzaak.notifications.handlers.DatabaseLogHandler",
+
+        },
+
+    },
+
+    "loggers": {
+
+        "openzaak": {
+
+            "handlers": ["project"] if not LOG_STDOUT else ["console"],
+
+            "level": "INFO",
+
+            "propagate": True,
+
+        },
+
+        "openzaak.utils.middleware": {
+
+            "handlers": ["requests"] if not LOG_STDOUT else ["console"],
+
+            "level": "DEBUG",
+
+            "propagate": False,
+
+        },
+
+        "vng_api_common": {"handlers": ["console"], "level": "INFO", "propagate": True},
+
+        "django.request": {
+
+            "handlers": ["django"] if not LOG_STDOUT else ["console"],
+
+            "level": "ERROR",
+
+            "propagate": True,
+
+        },
+
+        "django.template": {
+
+            "handlers": ["console"],
+
+            "level": "INFO",
+
+            "propagate": True,
+
+        },
+
+        "vng_api_common.notifications.viewsets": {
+
+            "handlers": [
+
+                "failed_notification",  # always log this to the database!
+
+                "project" if not LOG_STDOUT else "console",
+
+            ],
+
+            "level": "WARNING",
+
+            "propagate": True,
+
+        },
+
+    },
+
+}
+
+
+
+
+
+#
+
+# AUTH settings - user accounts, passwords, backends...
+
+#
+
+AUTH_USER_MODEL = "accounts.User"
+
+
+
+AUTH_PASSWORD_VALIDATORS = [
+
+    {
+
+        "NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"
+
+    },
+
+    {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator"},
+
+    {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
+
+    {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
+
+]
+
+
+
+
+
+# Allow logging in with both username+password and email+password
+
+AUTHENTICATION_BACKENDS = [
+
+    "openzaak.accounts.backends.UserModelEmailBackend",
+
+    "django.contrib.auth.backends.ModelBackend",
+
+    "django_auth_adfs_db.backends.AdfsAuthCodeBackend",
+
+]
+
+
+
+SESSION_COOKIE_NAME = "openzaak_sessionid"
+
+SESSION_ENGINE = "django.contrib.sessions.backends.cache"
+
+
+
+LOGIN_URL = reverse_lazy("admin:login")
+
+LOGIN_REDIRECT_URL = reverse_lazy("admin:index")
+
+
+
+#
+
+# SECURITY settings
+
+#
+
+SESSION_COOKIE_SECURE = IS_HTTPS
+
+SESSION_COOKIE_HTTPONLY = True
+
+
+
+CSRF_COOKIE_SECURE = IS_HTTPS
+
+
+
+X_FRAME_OPTIONS = "DENY"
+
+
+
+#
+
+# Silenced checks
+
+#
+
+SILENCED_SYSTEM_CHECKS = ["rest_framework.W001"]
+
+
+
+#
+
+# Custom settings
+
+#
+
+PROJECT_NAME = "Open Zaak"
+
+SITE_TITLE = "API dashboard"
+
+
+
+ENVIRONMENT = None
+
+ENVIRONMENT_SHOWN_IN_ADMIN = True
+
+
+
+# settings for uploading large files
+
+MIN_UPLOAD_SIZE = config("MIN_UPLOAD_SIZE", 4 * 2 ** 30)
+
+
+
+# urls for OAS3 specifications
+
+SPEC_URL = {
+
+    "zaken": os.path.join(
+
+        BASE_DIR, "src", "openzaak", "components", "zaken", "openapi.yaml"
+
+    ),
+
+    "besluiten": os.path.join(
+
+        BASE_DIR, "src", "openzaak", "components", "besluiten", "openapi.yaml"
+
+    ),
+
+    "documenten": os.path.join(
+
+        BASE_DIR, "src", "openzaak", "components", "documenten", "openapi.yaml"
+
+    ),
+
+    "catalogi": os.path.join(
+
+        BASE_DIR, "src", "openzaak", "components", "catalogi", "openapi.yaml"
+
+    ),
+
+    "autorisaties": os.path.join(
+
+        BASE_DIR, "src", "openzaak", "components", "autorisaties", "openapi.yaml"
+
+    ),
+
+}
+
+
+
+# Generating the schema, depending on the component
+
+subpath = config("SUBPATH", None)
+
+if subpath:
+
+    if not subpath.startswith("/"):
+
+        subpath = f"/{subpath}"
+
+    SUBPATH = subpath
+
+
+
+if "GIT_SHA" in os.environ:
+
+    GIT_SHA = config("GIT_SHA", "")
+
+# in docker (build) context, there is no .git directory
+
+elif os.path.exists(os.path.join(BASE_DIR, ".git")):
+
+    repo = git.Repo(search_parent_directories=True)
+
+    GIT_SHA = repo.head.object.hexsha
+
+else:
+
+    GIT_SHA = None
+
+
+
+RELEASE = config("RELEASE", GIT_SHA)
+
+
+
+##############################
+
+#                            #
+
+# 3RD PARTY LIBRARY SETTINGS #
+
+#                            #
+
+##############################
+
+
+
+#
+
+# AUTH-ADFS
+
+#
+
+AUTH_ADFS = {"SETTINGS_CLASS": "django_auth_adfs_db.settings.Settings"}
+
+
+
+#
+
+# DJANGO-AXES
+
+#
+
+AXES_CACHE = "axes"  # refers to CACHES setting
+
+AXES_LOGIN_FAILURE_LIMIT = 5  # Default: 3
+
+AXES_LOCK_OUT_AT_FAILURE = True  # Default: True
+
+AXES_USE_USER_AGENT = False  # Default: False
+
+AXES_COOLOFF_TIME = datetime.timedelta(minutes=5)  # One hour
+
+AXES_BEHIND_REVERSE_PROXY = IS_HTTPS  # We have either Ingress or Nginx
+
+AXES_ONLY_USER_FAILURES = (
+
+    False  # Default: False (you might want to block on username rather than IP)
+
+)
+
+AXES_LOCK_OUT_BY_COMBINATION_USER_AND_IP = (
+
+    False  # Default: False (you might want to block on username and IP)
+
+)
+
+
+
+#
+
+# DJANGO-HIJACK
+
+#
+
+HIJACK_LOGIN_REDIRECT_URL = reverse_lazy("home")
+
+HIJACK_LOGOUT_REDIRECT_URL = reverse_lazy("admin:accounts_user_changelist")
+
+HIJACK_REGISTER_ADMIN = False
+
+# This is a CSRF-security risk.
+
+# See: http://django-hijack.readthedocs.io/en/latest/configuration/#allowing-get-method-for-hijack-views
+
+HIJACK_ALLOW_GET_REQUESTS = True
+
+
+
+#
+
+# DJANGO-CORS-MIDDLEWARE
+
+#
+
+CORS_ORIGIN_ALLOW_ALL = True
+
+CORS_ALLOW_HEADERS = (
+
+    "x-requested-with",
+
+    "content-type",
+
+    "accept",
+
+    "origin",
+
+    "authorization",
+
+    "x-csrftoken",
+
+    "user-agent",
+
+    "accept-encoding",
+
+    "accept-crs",
+
+    "content-crs",
+
+)
+
+
+
+#
+
+# DJANGO-PRIVATES -- safely serve files after authorization
+
+#
+
+PRIVATE_MEDIA_ROOT = os.path.join(BASE_DIR, "private-media")
+
+PRIVATE_MEDIA_URL = "/private-media/"
+
+
+
+# requires an nginx container running in front
+
+SENDFILE_BACKEND = config("SENDFILE_BACKEND", "django_sendfile.backends.nginx")
+
+SENDFILE_ROOT = PRIVATE_MEDIA_ROOT
+
+SENDFILE_URL = PRIVATE_MEDIA_URL
+
+
+
+#
+
+# DJANGO-LOOSE-FK -- handle internal and external API resources
+
+#
+
+DEFAULT_LOOSE_FK_LOADER = "openzaak.loaders.AuthorizedRequestsLoader"
+
+
+
+#
+
+# RAVEN/SENTRY - error monitoring
+
+#
+
+SENTRY_DSN = config("SENTRY_DSN", None)
+
+
+
+SENTRY_SDK_INTEGRATIONS = [
+
+    django.DjangoIntegration(),
+
+    redis.RedisIntegration(),
+
+]
+
+
+
+if SENTRY_DSN:
+
+    SENTRY_CONFIG = {
+
+        "dsn": SENTRY_DSN,
+
+        "release": RELEASE or "RELEASE not set",
+
+    }
+
+
+
+    sentry_sdk.init(
+
+        **SENTRY_CONFIG,
+
+        integrations=SENTRY_SDK_INTEGRATIONS,
+
+        send_default_pii=True,
+
+        before_send=filter_sensitive_data,
+
+    )
+
+
+
+#
+
+# DJANGO-ADMIN-INDEX
+
+#
+
+ADMIN_INDEX_SHOW_REMAINING_APPS_TO_SUPERUSERS = False
+
+ADMIN_INDEX_AUTO_CREATE_APP_GROUP = False
+
+
+
+#
+
+# OpenZaak configuration
+
+#
+
+
+
+OPENZAAK_API_CONTACT_EMAIL = "support@maykinmedia.nl"
+
+OPENZAAK_API_CONTACT_URL = "https://www.maykinmedia.nl"
+
+STORE_FAILED_NOTIFS = True
+
+
+
+# Expiry time in seconds for JWT
+
+JWT_EXPIRY = config("JWT_EXPIRY", default=3600)
+
+
+
+NLX_DIRECTORY_URLS = {
+
+    NLXDirectories.demo: "https://directory.demo.nlx.io/",
+
+    NLXDirectories.preprod: "https://directory.preprod.nlx.io/",
+
+    NLXDirectories.prod: "https://directory.prod.nlx.io/",
+
+}
+
+
+
+CUSTOM_CLIENT_FETCHER = "openzaak.utils.auth.get_client"
+
+
+
+CMIS_ENABLED = config("CMIS_ENABLED", default=False)
+
+CMIS_MAPPER_FILE = config(
+
+    "CMIS_MAPPER_FILE", default=os.path.join(BASE_DIR, "config", "cmis_mapper.json")
+
+)

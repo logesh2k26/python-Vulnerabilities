@@ -2,976 +2,1674 @@
 # Safety: safe
 # Category: safe
 
-#!/usr/bin/python
+# vim: ft=python fileencoding=utf-8 sts=4 sw=4 et:
 
-# -*- coding: utf-8 -*-
 
 
+# Copyright 2016-2018 Florian Bruhin (The Compiler) <mail@qutebrowser.org>
 
-# Copyright: (c) 2016, Yanis Guenane <yanis+ansible@guenane.org>
+#
 
-# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
+# This file is part of qutebrowser.
 
+#
 
+# qutebrowser is free software: you can redistribute it and/or modify
 
-from __future__ import absolute_import, division, print_function
+# it under the terms of the GNU General Public License as published by
 
-__metaclass__ = type
+# the Free Software Foundation, either version 3 of the License, or
 
+# (at your option) any later version.
 
+#
 
+# qutebrowser is distributed in the hope that it will be useful,
 
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
 
-DOCUMENTATION = r'''
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 
----
+# GNU General Public License for more details.
 
-module: openssl_publickey
+#
 
-short_description: Generate an OpenSSL public key from its private key.
+# You should have received a copy of the GNU General Public License
 
-description:
+# along with qutebrowser.  If not, see <http://www.gnu.org/licenses/>.
 
-    - This module allows one to (re)generate OpenSSL public keys from their private keys.
 
-    - Keys are generated in PEM or OpenSSH format.
 
-    - "The module can use the cryptography Python library, or the pyOpenSSL Python
+"""Wrapper over our (QtWebKit) WebView."""
 
-      library. By default, it tries to detect which one is available. This can be
 
-      overridden with the I(select_crypto_backend) option. When I(format) is C(OpenSSH),
 
-      the C(cryptography) backend has to be used. Please note that the PyOpenSSL backend
+import re
 
-      was deprecated in Ansible 2.9 and will be removed in community.crypto 2.0.0."
+import functools
 
-requirements:
+import xml.etree.ElementTree
 
-    - Either cryptography >= 1.2.3 (older versions might work as well)
 
-    - Or pyOpenSSL >= 16.0.0
 
-    - Needs cryptography >= 1.4 if I(format) is C(OpenSSH)
+from PyQt5.QtCore import (pyqtSlot, Qt, QEvent, QUrl, QPoint, QTimer, QSizeF,
 
-author:
+                          QSize)
 
-    - Yanis Guenane (@Spredzy)
+from PyQt5.QtGui import QKeyEvent, QIcon
 
-    - Felix Fontein (@felixfontein)
+from PyQt5.QtWebKitWidgets import QWebPage, QWebFrame
 
-options:
+from PyQt5.QtWebKit import QWebSettings
 
-    state:
+from PyQt5.QtPrintSupport import QPrinter
 
-        description:
 
-            - Whether the public key should exist or not, taking action if the state is different from what is stated.
 
-        type: str
+from qutebrowser.browser import browsertab, shared
 
-        default: present
+from qutebrowser.browser.webkit import (webview, tabhistory, webkitelem,
 
-        choices: [ absent, present ]
+                                        webkitsettings)
 
-    force:
+from qutebrowser.utils import qtutils, usertypes, utils, log, debug
 
-        description:
+from qutebrowser.qt import sip
 
-            - Should the key be regenerated even it it already exists.
 
-        type: bool
 
-        default: no
 
-    format:
 
-        description:
+class WebKitAction(browsertab.AbstractAction):
 
-            - The format of the public key.
 
-        type: str
 
-        default: PEM
+    """QtWebKit implementations related to web actions."""
 
-        choices: [ OpenSSH, PEM ]
 
-    path:
 
-        description:
+    action_class = QWebPage
 
-            - Name of the file in which the generated TLS/SSL public key will be written.
+    action_base = QWebPage.WebAction
 
-        type: path
 
-        required: true
 
-    privatekey_path:
+    def exit_fullscreen(self):
 
-        description:
+        raise browsertab.UnsupportedOperationError
 
-            - Path to the TLS/SSL private key from which to generate the public key.
 
-            - Either I(privatekey_path) or I(privatekey_content) must be specified, but not both.
 
-              If I(state) is C(present), one of them is required.
+    def save_page(self):
 
-        type: path
+        """Save the current page."""
 
-    privatekey_content:
+        raise browsertab.UnsupportedOperationError
 
-        description:
 
-            - The content of the TLS/SSL private key from which to generate the public key.
 
-            - Either I(privatekey_path) or I(privatekey_content) must be specified, but not both.
+    def show_source(self, pygments=False):
 
-              If I(state) is C(present), one of them is required.
+        self._show_source_pygments()
 
-        type: str
 
-        version_added: '1.0.0'
 
-    privatekey_passphrase:
 
-        description:
 
-            - The passphrase for the private key.
+class WebKitPrinting(browsertab.AbstractPrinting):
 
-        type: str
 
-    backup:
 
-        description:
+    """QtWebKit implementations related to printing."""
 
-            - Create a backup file including a timestamp so you can get the original
 
-              public key back if you overwrote it with a different one by accident.
 
-        type: bool
+    def check_pdf_support(self):
 
-        default: no
+        pass
 
-    select_crypto_backend:
 
-        description:
 
-            - Determines which crypto backend to use.
+    def check_printer_support(self):
 
-            - The default choice is C(auto), which tries to use C(cryptography) if available, and falls back to C(pyopenssl).
+        pass
 
-            - If set to C(pyopenssl), will try to use the L(pyOpenSSL,https://pypi.org/project/pyOpenSSL/) library.
 
-            - If set to C(cryptography), will try to use the L(cryptography,https://cryptography.io/) library.
 
-        type: str
+    def check_preview_support(self):
 
-        default: auto
+        pass
 
-        choices: [ auto, cryptography, pyopenssl ]
 
-    return_content:
 
-        description:
+    def to_pdf(self, filename):
 
-            - If set to C(yes), will return the (current or generated) public key's content as I(publickey).
+        printer = QPrinter()
 
-        type: bool
+        printer.setOutputFileName(filename)
 
-        default: no
+        self.to_printer(printer)
 
-        version_added: '1.0.0'
 
-extends_documentation_fragment:
 
-- files
+    def to_printer(self, printer, callback=None):
 
-seealso:
+        self._widget.print(printer)
 
-- module: community.crypto.x509_certificate
+        # Can't find out whether there was an error...
 
-- module: community.crypto.openssl_csr
+        if callback is not None:
 
-- module: community.crypto.openssl_dhparam
+            callback(True)
 
-- module: community.crypto.openssl_pkcs12
 
-- module: community.crypto.openssl_privatekey
 
-'''
 
 
+class WebKitSearch(browsertab.AbstractSearch):
 
-EXAMPLES = r'''
 
-- name: Generate an OpenSSL public key in PEM format
 
-  community.crypto.openssl_publickey:
+    """QtWebKit implementations related to searching on the page."""
 
-    path: /etc/ssl/public/ansible.com.pem
 
-    privatekey_path: /etc/ssl/private/ansible.com.pem
 
+    def __init__(self, parent=None):
 
+        super().__init__(parent)
 
-- name: Generate an OpenSSL public key in PEM format from an inline key
+        self._flags = QWebPage.FindFlags(0)
 
-  community.crypto.openssl_publickey:
 
-    path: /etc/ssl/public/ansible.com.pem
 
-    privatekey_content: "{{ private_key_content }}"
+    def _call_cb(self, callback, found, text, flags, caller):
 
+        """Call the given callback if it's non-None.
 
 
-- name: Generate an OpenSSL public key in OpenSSH v2 format
 
-  community.crypto.openssl_publickey:
+        Delays the call via a QTimer so the website is re-rendered in between.
 
-    path: /etc/ssl/public/ansible.com.pem
 
-    privatekey_path: /etc/ssl/private/ansible.com.pem
 
-    format: OpenSSH
+        Args:
 
+            callback: What to call
 
+            found: If the text was found
 
-- name: Generate an OpenSSL public key with a passphrase protected private key
+            text: The text searched for
 
-  community.crypto.openssl_publickey:
+            flags: The flags searched with
 
-    path: /etc/ssl/public/ansible.com.pem
+            caller: Name of the caller.
 
-    privatekey_path: /etc/ssl/private/ansible.com.pem
+        """
 
-    privatekey_passphrase: ansible
+        found_text = 'found' if found else "didn't find"
 
+        # Removing FindWrapsAroundDocument to get the same logging as with
 
+        # QtWebEngine
 
-- name: Force regenerate an OpenSSL public key if it already exists
+        debug_flags = debug.qflags_key(
 
-  community.crypto.openssl_publickey:
+            QWebPage, flags & ~QWebPage.FindWrapsAroundDocument,
 
-    path: /etc/ssl/public/ansible.com.pem
+            klass=QWebPage.FindFlag)
 
-    privatekey_path: /etc/ssl/private/ansible.com.pem
+        if debug_flags != '0x0000':
 
-    force: yes
-
-
-
-- name: Remove an OpenSSL public key
-
-  community.crypto.openssl_publickey:
-
-    path: /etc/ssl/public/ansible.com.pem
-
-    state: absent
-
-'''
-
-
-
-RETURN = r'''
-
-privatekey:
-
-    description:
-
-    - Path to the TLS/SSL private key the public key was generated from.
-
-    - Will be C(none) if the private key has been provided in I(privatekey_content).
-
-    returned: changed or success
-
-    type: str
-
-    sample: /etc/ssl/private/ansible.com.pem
-
-format:
-
-    description: The format of the public key (PEM, OpenSSH, ...).
-
-    returned: changed or success
-
-    type: str
-
-    sample: PEM
-
-filename:
-
-    description: Path to the generated TLS/SSL public key file.
-
-    returned: changed or success
-
-    type: str
-
-    sample: /etc/ssl/public/ansible.com.pem
-
-fingerprint:
-
-    description:
-
-    - The fingerprint of the public key. Fingerprint will be generated for each hashlib.algorithms available.
-
-    - Requires PyOpenSSL >= 16.0 for meaningful output.
-
-    returned: changed or success
-
-    type: dict
-
-    sample:
-
-      md5: "84:75:71:72:8d:04:b5:6c:4d:37:6d:66:83:f5:4c:29"
-
-      sha1: "51:cc:7c:68:5d:eb:41:43:88:7e:1a:ae:c7:f8:24:72:ee:71:f6:10"
-
-      sha224: "b1:19:a6:6c:14:ac:33:1d:ed:18:50:d3:06:5c:b2:32:91:f1:f1:52:8c:cb:d5:75:e9:f5:9b:46"
-
-      sha256: "41:ab:c7:cb:d5:5f:30:60:46:99:ac:d4:00:70:cf:a1:76:4f:24:5d:10:24:57:5d:51:6e:09:97:df:2f:de:c7"
-
-      sha384: "85:39:50:4e:de:d9:19:33:40:70:ae:10:ab:59:24:19:51:c3:a2:e4:0b:1c:b1:6e:dd:b3:0c:d9:9e:6a:46:af:da:18:f8:ef:ae:2e:c0:9a:75:2c:9b:b3:0f:3a:5f:3d"
-
-      sha512: "fd:ed:5e:39:48:5f:9f:fe:7f:25:06:3f:79:08:cd:ee:a5:e7:b3:3d:13:82:87:1f:84:e1:f5:c7:28:77:53:94:86:56:38:69:f0:d9:35:22:01:1e:a6:60:...:0f:9b"
-
-backup_file:
-
-    description: Name of backup file created.
-
-    returned: changed and if I(backup) is C(yes)
-
-    type: str
-
-    sample: /path/to/publickey.pem.2019-03-09@11:22~
-
-publickey:
-
-    description: The (current or generated) public key's content.
-
-    returned: if I(state) is C(present) and I(return_content) is C(yes)
-
-    type: str
-
-    version_added: '1.0.0'
-
-'''
-
-
-
-import os
-
-import traceback
-
-
-
-from distutils.version import LooseVersion
-
-
-
-from ansible.module_utils.basic import AnsibleModule, missing_required_lib
-
-from ansible.module_utils._text import to_native
-
-
-
-from ansible_collections.community.crypto.plugins.module_utils.io import (
-
-    load_file_if_exists,
-
-    write_file,
-
-)
-
-
-
-from ansible_collections.community.crypto.plugins.module_utils.crypto.basic import (
-
-    OpenSSLObjectError,
-
-    OpenSSLBadPassphraseError,
-
-)
-
-
-
-from ansible_collections.community.crypto.plugins.module_utils.crypto.support import (
-
-    OpenSSLObject,
-
-    load_privatekey,
-
-    get_fingerprint,
-
-)
-
-
-
-MINIMAL_PYOPENSSL_VERSION = '16.0.0'
-
-MINIMAL_CRYPTOGRAPHY_VERSION = '1.2.3'
-
-MINIMAL_CRYPTOGRAPHY_VERSION_OPENSSH = '1.4'
-
-
-
-PYOPENSSL_IMP_ERR = None
-
-try:
-
-    import OpenSSL
-
-    from OpenSSL import crypto
-
-    PYOPENSSL_VERSION = LooseVersion(OpenSSL.__version__)
-
-except ImportError:
-
-    PYOPENSSL_IMP_ERR = traceback.format_exc()
-
-    PYOPENSSL_FOUND = False
-
-else:
-
-    PYOPENSSL_FOUND = True
-
-
-
-CRYPTOGRAPHY_IMP_ERR = None
-
-try:
-
-    import cryptography
-
-    from cryptography.hazmat.backends import default_backend
-
-    from cryptography.hazmat.primitives import serialization as crypto_serialization
-
-    CRYPTOGRAPHY_VERSION = LooseVersion(cryptography.__version__)
-
-except ImportError:
-
-    CRYPTOGRAPHY_IMP_ERR = traceback.format_exc()
-
-    CRYPTOGRAPHY_FOUND = False
-
-else:
-
-    CRYPTOGRAPHY_FOUND = True
-
-
-
-
-
-class PublicKeyError(OpenSSLObjectError):
-
-    pass
-
-
-
-
-
-class PublicKey(OpenSSLObject):
-
-
-
-    def __init__(self, module, backend):
-
-        super(PublicKey, self).__init__(
-
-            module.params['path'],
-
-            module.params['state'],
-
-            module.params['force'],
-
-            module.check_mode
-
-        )
-
-        self.format = module.params['format']
-
-        self.privatekey_path = module.params['privatekey_path']
-
-        self.privatekey_content = module.params['privatekey_content']
-
-        if self.privatekey_content is not None:
-
-            self.privatekey_content = self.privatekey_content.encode('utf-8')
-
-        self.privatekey_passphrase = module.params['privatekey_passphrase']
-
-        self.privatekey = None
-
-        self.publickey_bytes = None
-
-        self.return_content = module.params['return_content']
-
-        self.fingerprint = {}
-
-        self.backend = backend
-
-
-
-        self.backup = module.params['backup']
-
-        self.backup_file = None
-
-
-
-    def _create_publickey(self, module):
-
-        self.privatekey = load_privatekey(
-
-            path=self.privatekey_path,
-
-            content=self.privatekey_content,
-
-            passphrase=self.privatekey_passphrase,
-
-            backend=self.backend
-
-        )
-
-        if self.backend == 'cryptography':
-
-            if self.format == 'OpenSSH':
-
-                return self.privatekey.public_key().public_bytes(
-
-                    crypto_serialization.Encoding.OpenSSH,
-
-                    crypto_serialization.PublicFormat.OpenSSH
-
-                )
-
-            else:
-
-                return self.privatekey.public_key().public_bytes(
-
-                    crypto_serialization.Encoding.PEM,
-
-                    crypto_serialization.PublicFormat.SubjectPublicKeyInfo
-
-                )
+            flag_text = 'with flags {}'.format(debug_flags)
 
         else:
 
+            flag_text = ''
+
+        log.webview.debug(' '.join([caller, found_text, text, flag_text])
+
+                          .strip())
+
+        if callback is not None:
+
+            QTimer.singleShot(0, functools.partial(callback, found))
+
+
+
+    def clear(self):
+
+        self.search_displayed = False
+
+        # We first clear the marked text, then the highlights
+
+        self._widget.findText('')
+
+        self._widget.findText('', QWebPage.HighlightAllOccurrences)
+
+
+
+    def search(self, text, *, ignore_case='never', reverse=False,
+
+               result_cb=None):
+
+        # Don't go to next entry on duplicate search
+
+        if self.text == text and self.search_displayed:
+
+            log.webview.debug("Ignoring duplicate search request"
+
+                              " for {}".format(text))
+
+            return
+
+
+
+        # Clear old search results, this is done automatically on QtWebEngine.
+
+        self.clear()
+
+
+
+        self.text = text
+
+        self.search_displayed = True
+
+        self._flags = QWebPage.FindWrapsAroundDocument
+
+        if self._is_case_sensitive(ignore_case):
+
+            self._flags |= QWebPage.FindCaseSensitively
+
+        if reverse:
+
+            self._flags |= QWebPage.FindBackward
+
+        # We actually search *twice* - once to highlight everything, then again
+
+        # to get a mark so we can navigate.
+
+        found = self._widget.findText(text, self._flags)
+
+        self._widget.findText(text,
+
+                              self._flags | QWebPage.HighlightAllOccurrences)
+
+        self._call_cb(result_cb, found, text, self._flags, 'search')
+
+
+
+    def next_result(self, *, result_cb=None):
+
+        self.search_displayed = True
+
+        found = self._widget.findText(self.text, self._flags)
+
+        self._call_cb(result_cb, found, self.text, self._flags, 'next_result')
+
+
+
+    def prev_result(self, *, result_cb=None):
+
+        self.search_displayed = True
+
+        # The int() here makes sure we get a copy of the flags.
+
+        flags = QWebPage.FindFlags(int(self._flags))
+
+        if flags & QWebPage.FindBackward:
+
+            flags &= ~QWebPage.FindBackward
+
+        else:
+
+            flags |= QWebPage.FindBackward
+
+        found = self._widget.findText(self.text, flags)
+
+        self._call_cb(result_cb, found, self.text, flags, 'prev_result')
+
+
+
+
+
+class WebKitCaret(browsertab.AbstractCaret):
+
+
+
+    """QtWebKit implementations related to moving the cursor/selection."""
+
+
+
+    @pyqtSlot(usertypes.KeyMode)
+
+    def _on_mode_entered(self, mode):
+
+        if mode != usertypes.KeyMode.caret:
+
+            return
+
+
+
+        self.selection_enabled = self._widget.hasSelection()
+
+        self.selection_toggled.emit(self.selection_enabled)
+
+        settings = self._widget.settings()
+
+        settings.setAttribute(QWebSettings.CaretBrowsingEnabled, True)
+
+
+
+        if self._widget.isVisible():
+
+            # Sometimes the caret isn't immediately visible, but unfocusing
+
+            # and refocusing it fixes that.
+
+            self._widget.clearFocus()
+
+            self._widget.setFocus(Qt.OtherFocusReason)
+
+
+
+            # Move the caret to the first element in the viewport if there
+
+            # isn't any text which is already selected.
+
+            #
+
+            # Note: We can't use hasSelection() here, as that's always
+
+            # true in caret mode.
+
+            if not self.selection_enabled:
+
+                self._widget.page().currentFrame().evaluateJavaScript(
+
+                    utils.read_file('javascript/position_caret.js'))
+
+
+
+    @pyqtSlot(usertypes.KeyMode)
+
+    def _on_mode_left(self, _mode):
+
+        settings = self._widget.settings()
+
+        if settings.testAttribute(QWebSettings.CaretBrowsingEnabled):
+
+            if self.selection_enabled and self._widget.hasSelection():
+
+                # Remove selection if it exists
+
+                self._widget.triggerPageAction(QWebPage.MoveToNextChar)
+
+            settings.setAttribute(QWebSettings.CaretBrowsingEnabled, False)
+
+            self.selection_enabled = False
+
+
+
+    def move_to_next_line(self, count=1):
+
+        if not self.selection_enabled:
+
+            act = QWebPage.MoveToNextLine
+
+        else:
+
+            act = QWebPage.SelectNextLine
+
+        for _ in range(count):
+
+            self._widget.triggerPageAction(act)
+
+
+
+    def move_to_prev_line(self, count=1):
+
+        if not self.selection_enabled:
+
+            act = QWebPage.MoveToPreviousLine
+
+        else:
+
+            act = QWebPage.SelectPreviousLine
+
+        for _ in range(count):
+
+            self._widget.triggerPageAction(act)
+
+
+
+    def move_to_next_char(self, count=1):
+
+        if not self.selection_enabled:
+
+            act = QWebPage.MoveToNextChar
+
+        else:
+
+            act = QWebPage.SelectNextChar
+
+        for _ in range(count):
+
+            self._widget.triggerPageAction(act)
+
+
+
+    def move_to_prev_char(self, count=1):
+
+        if not self.selection_enabled:
+
+            act = QWebPage.MoveToPreviousChar
+
+        else:
+
+            act = QWebPage.SelectPreviousChar
+
+        for _ in range(count):
+
+            self._widget.triggerPageAction(act)
+
+
+
+    def move_to_end_of_word(self, count=1):
+
+        if not self.selection_enabled:
+
+            act = [QWebPage.MoveToNextWord]
+
+            if utils.is_windows:  # pragma: no cover
+
+                act.append(QWebPage.MoveToPreviousChar)
+
+        else:
+
+            act = [QWebPage.SelectNextWord]
+
+            if utils.is_windows:  # pragma: no cover
+
+                act.append(QWebPage.SelectPreviousChar)
+
+        for _ in range(count):
+
+            for a in act:
+
+                self._widget.triggerPageAction(a)
+
+
+
+    def move_to_next_word(self, count=1):
+
+        if not self.selection_enabled:
+
+            act = [QWebPage.MoveToNextWord]
+
+            if not utils.is_windows:  # pragma: no branch
+
+                act.append(QWebPage.MoveToNextChar)
+
+        else:
+
+            act = [QWebPage.SelectNextWord]
+
+            if not utils.is_windows:  # pragma: no branch
+
+                act.append(QWebPage.SelectNextChar)
+
+        for _ in range(count):
+
+            for a in act:
+
+                self._widget.triggerPageAction(a)
+
+
+
+    def move_to_prev_word(self, count=1):
+
+        if not self.selection_enabled:
+
+            act = QWebPage.MoveToPreviousWord
+
+        else:
+
+            act = QWebPage.SelectPreviousWord
+
+        for _ in range(count):
+
+            self._widget.triggerPageAction(act)
+
+
+
+    def move_to_start_of_line(self):
+
+        if not self.selection_enabled:
+
+            act = QWebPage.MoveToStartOfLine
+
+        else:
+
+            act = QWebPage.SelectStartOfLine
+
+        self._widget.triggerPageAction(act)
+
+
+
+    def move_to_end_of_line(self):
+
+        if not self.selection_enabled:
+
+            act = QWebPage.MoveToEndOfLine
+
+        else:
+
+            act = QWebPage.SelectEndOfLine
+
+        self._widget.triggerPageAction(act)
+
+
+
+    def move_to_start_of_next_block(self, count=1):
+
+        if not self.selection_enabled:
+
+            act = [QWebPage.MoveToNextLine,
+
+                   QWebPage.MoveToStartOfBlock]
+
+        else:
+
+            act = [QWebPage.SelectNextLine,
+
+                   QWebPage.SelectStartOfBlock]
+
+        for _ in range(count):
+
+            for a in act:
+
+                self._widget.triggerPageAction(a)
+
+
+
+    def move_to_start_of_prev_block(self, count=1):
+
+        if not self.selection_enabled:
+
+            act = [QWebPage.MoveToPreviousLine,
+
+                   QWebPage.MoveToStartOfBlock]
+
+        else:
+
+            act = [QWebPage.SelectPreviousLine,
+
+                   QWebPage.SelectStartOfBlock]
+
+        for _ in range(count):
+
+            for a in act:
+
+                self._widget.triggerPageAction(a)
+
+
+
+    def move_to_end_of_next_block(self, count=1):
+
+        if not self.selection_enabled:
+
+            act = [QWebPage.MoveToNextLine,
+
+                   QWebPage.MoveToEndOfBlock]
+
+        else:
+
+            act = [QWebPage.SelectNextLine,
+
+                   QWebPage.SelectEndOfBlock]
+
+        for _ in range(count):
+
+            for a in act:
+
+                self._widget.triggerPageAction(a)
+
+
+
+    def move_to_end_of_prev_block(self, count=1):
+
+        if not self.selection_enabled:
+
+            act = [QWebPage.MoveToPreviousLine, QWebPage.MoveToEndOfBlock]
+
+        else:
+
+            act = [QWebPage.SelectPreviousLine, QWebPage.SelectEndOfBlock]
+
+        for _ in range(count):
+
+            for a in act:
+
+                self._widget.triggerPageAction(a)
+
+
+
+    def move_to_start_of_document(self):
+
+        if not self.selection_enabled:
+
+            act = QWebPage.MoveToStartOfDocument
+
+        else:
+
+            act = QWebPage.SelectStartOfDocument
+
+        self._widget.triggerPageAction(act)
+
+
+
+    def move_to_end_of_document(self):
+
+        if not self.selection_enabled:
+
+            act = QWebPage.MoveToEndOfDocument
+
+        else:
+
+            act = QWebPage.SelectEndOfDocument
+
+        self._widget.triggerPageAction(act)
+
+
+
+    def toggle_selection(self):
+
+        self.selection_enabled = not self.selection_enabled
+
+        self.selection_toggled.emit(self.selection_enabled)
+
+
+
+    def drop_selection(self):
+
+        self._widget.triggerPageAction(QWebPage.MoveToNextChar)
+
+
+
+    def selection(self, callback):
+
+        callback(self._widget.selectedText())
+
+
+
+    def follow_selected(self, *, tab=False):
+
+        if QWebSettings.globalSettings().testAttribute(
+
+                QWebSettings.JavascriptEnabled):
+
+            if tab:
+
+                self._tab.data.override_target = usertypes.ClickTarget.tab
+
+            self._tab.run_js_async("""
+
+                const aElm = document.activeElement;
+
+                if (window.getSelection().anchorNode) {
+
+                    window.getSelection().anchorNode.parentNode.click();
+
+                } else if (aElm && aElm !== document.body) {
+
+                    aElm.click();
+
+                }
+
+            """)
+
+        else:
+
+            selection = self._widget.selectedHtml()
+
+            if not selection:
+
+                # Getting here may mean we crashed, but we can't do anything
+
+                # about that until this commit is released:
+
+                # https://github.com/annulen/webkit/commit/0e75f3272d149bc64899c161f150eb341a2417af
+
+                # TODO find a way to check if something is focused
+
+                self._follow_enter(tab)
+
+                return
+
             try:
 
-                return crypto.dump_publickey(crypto.FILETYPE_PEM, self.privatekey)
+                selected_element = xml.etree.ElementTree.fromstring(
 
-            except AttributeError as dummy:
+                    '<html>{}</html>'.format(selection)).find('a')
 
-                raise PublicKeyError('You need to have PyOpenSSL>=16.0.0 to generate public keys')
+            except xml.etree.ElementTree.ParseError:
 
+                raise browsertab.WebTabError('Could not parse selected '
 
+                                             'element!')
 
-    def generate(self, module):
 
-        """Generate the public key."""
 
+            if selected_element is not None:
 
+                try:
 
-        if self.privatekey_content is None and not os.path.exists(self.privatekey_path):
+                    url = selected_element.attrib['href']
 
-            raise PublicKeyError(
+                except KeyError:
 
-                'The private key %s does not exist' % self.privatekey_path
+                    raise browsertab.WebTabError('Anchor element without '
 
-            )
+                                                 'href!')
 
+                url = self._tab.url().resolved(QUrl(url))
 
+                if tab:
 
-        if not self.check(module, perms_required=False) or self.force:
-
-            try:
-
-                publickey_content = self._create_publickey(module)
-
-                if self.return_content:
-
-                    self.publickey_bytes = publickey_content
-
-
-
-                if self.backup:
-
-                    self.backup_file = module.backup_local(self.path)
-
-                write_file(module, publickey_content)
-
-
-
-                self.changed = True
-
-            except OpenSSLBadPassphraseError as exc:
-
-                raise PublicKeyError(exc)
-
-            except (IOError, OSError) as exc:
-
-                raise PublicKeyError(exc)
-
-
-
-        self.fingerprint = get_fingerprint(
-
-            path=self.privatekey_path,
-
-            content=self.privatekey_content,
-
-            passphrase=self.privatekey_passphrase,
-
-            backend=self.backend,
-
-        )
-
-        file_args = module.load_file_common_arguments(module.params)
-
-        if module.set_fs_attributes_if_different(file_args, False):
-
-            self.changed = True
-
-
-
-    def check(self, module, perms_required=True):
-
-        """Ensure the resource is in its desired state."""
-
-
-
-        state_and_perms = super(PublicKey, self).check(module, perms_required)
-
-
-
-        def _check_privatekey():
-
-            if self.privatekey_content is None and not os.path.exists(self.privatekey_path):
-
-                return False
-
-
-
-            try:
-
-                with open(self.path, 'rb') as public_key_fh:
-
-                    publickey_content = public_key_fh.read()
-
-                if self.return_content:
-
-                    self.publickey_bytes = publickey_content
-
-                if self.backend == 'cryptography':
-
-                    if self.format == 'OpenSSH':
-
-                        # Read and dump public key. Makes sure that the comment is stripped off.
-
-                        current_publickey = crypto_serialization.load_ssh_public_key(publickey_content, backend=default_backend())
-
-                        publickey_content = current_publickey.public_bytes(
-
-                            crypto_serialization.Encoding.OpenSSH,
-
-                            crypto_serialization.PublicFormat.OpenSSH
-
-                        )
-
-                    else:
-
-                        current_publickey = crypto_serialization.load_pem_public_key(publickey_content, backend=default_backend())
-
-                        publickey_content = current_publickey.public_bytes(
-
-                            crypto_serialization.Encoding.PEM,
-
-                            crypto_serialization.PublicFormat.SubjectPublicKeyInfo
-
-                        )
+                    self._tab.new_tab_requested.emit(url)
 
                 else:
 
-                    publickey_content = crypto.dump_publickey(
+                    self._tab.openurl(url)
 
-                        crypto.FILETYPE_PEM,
 
-                        crypto.load_publickey(crypto.FILETYPE_PEM, publickey_content)
 
-                    )
 
-            except Exception as dummy:
 
-                return False
+class WebKitZoom(browsertab.AbstractZoom):
 
 
 
-            try:
+    """QtWebKit implementations related to zooming."""
 
-                desired_publickey = self._create_publickey(module)
 
-            except OpenSSLBadPassphraseError as exc:
 
-                raise PublicKeyError(exc)
+    def _set_factor_internal(self, factor):
 
+        self._widget.setZoomFactor(factor)
 
 
-            return publickey_content == desired_publickey
 
 
 
-        if not state_and_perms:
+class WebKitScroller(browsertab.AbstractScroller):
 
-            return state_and_perms
 
 
+    """QtWebKit implementations related to scrolling."""
 
-        return _check_privatekey()
 
 
+    # FIXME:qtwebengine When to use the main frame, when the current one?
 
-    def remove(self, module):
 
-        if self.backup:
 
-            self.backup_file = module.backup_local(self.path)
+    def pos_px(self):
 
-        super(PublicKey, self).remove(module)
+        return self._widget.page().mainFrame().scrollPosition()
 
 
 
-    def dump(self):
+    def pos_perc(self):
 
-        """Serialize the object into a dictionary."""
+        return self._widget.scroll_pos
 
 
 
-        result = {
+    def to_point(self, point):
 
-            'privatekey': self.privatekey_path,
+        self._widget.page().mainFrame().setScrollPosition(point)
 
-            'filename': self.path,
 
-            'format': self.format,
 
-            'changed': self.changed,
+    def to_anchor(self, name):
 
-            'fingerprint': self.fingerprint,
+        self._widget.page().mainFrame().scrollToAnchor(name)
 
-        }
 
-        if self.backup_file:
 
-            result['backup_file'] = self.backup_file
+    def delta(self, x=0, y=0):
 
-        if self.return_content:
+        qtutils.check_overflow(x, 'int')
 
-            if self.publickey_bytes is None:
+        qtutils.check_overflow(y, 'int')
 
-                self.publickey_bytes = load_file_if_exists(self.path, ignore_errors=True)
+        self._widget.page().mainFrame().scroll(x, y)
 
-            result['publickey'] = self.publickey_bytes.decode('utf-8') if self.publickey_bytes else None
 
 
+    def delta_page(self, x=0.0, y=0.0):
 
-        return result
+        if y.is_integer():
 
+            y = int(y)
 
+            if y == 0:
 
+                pass
 
+            elif y < 0:
 
-def main():
+                self.page_up(count=-y)
 
+            elif y > 0:
 
+                self.page_down(count=y)
 
-    module = AnsibleModule(
+            y = 0
 
-        argument_spec=dict(
+        if x == 0 and y == 0:
 
-            state=dict(type='str', default='present', choices=['present', 'absent']),
+            return
 
-            force=dict(type='bool', default=False),
+        size = self._widget.page().mainFrame().geometry()
 
-            path=dict(type='path', required=True),
+        self.delta(x * size.width(), y * size.height())
 
-            privatekey_path=dict(type='path'),
 
-            privatekey_content=dict(type='str', no_log=True),
 
-            format=dict(type='str', default='PEM', choices=['OpenSSH', 'PEM']),
+    def to_perc(self, x=None, y=None):
 
-            privatekey_passphrase=dict(type='str', no_log=True),
+        if x is None and y == 0:
 
-            backup=dict(type='bool', default=False),
+            self.top()
 
-            select_crypto_backend=dict(type='str', choices=['auto', 'pyopenssl', 'cryptography'], default='auto'),
+        elif x is None and y == 100:
 
-            return_content=dict(type='bool', default=False),
-
-        ),
-
-        supports_check_mode=True,
-
-        add_file_common_args=True,
-
-        required_if=[('state', 'present', ['privatekey_path', 'privatekey_content'], True)],
-
-        mutually_exclusive=(
-
-            ['privatekey_path', 'privatekey_content'],
-
-        ),
-
-    )
-
-
-
-    minimal_cryptography_version = MINIMAL_CRYPTOGRAPHY_VERSION
-
-    if module.params['format'] == 'OpenSSH':
-
-        minimal_cryptography_version = MINIMAL_CRYPTOGRAPHY_VERSION_OPENSSH
-
-
-
-    backend = module.params['select_crypto_backend']
-
-    if backend == 'auto':
-
-        # Detection what is possible
-
-        can_use_cryptography = CRYPTOGRAPHY_FOUND and CRYPTOGRAPHY_VERSION >= LooseVersion(minimal_cryptography_version)
-
-        can_use_pyopenssl = PYOPENSSL_FOUND and PYOPENSSL_VERSION >= LooseVersion(MINIMAL_PYOPENSSL_VERSION)
-
-
-
-        # Decision
-
-        if can_use_cryptography:
-
-            backend = 'cryptography'
-
-        elif can_use_pyopenssl:
-
-            if module.params['format'] == 'OpenSSH':
-
-                module.fail_json(
-
-                    msg=missing_required_lib('cryptography >= {0}'.format(MINIMAL_CRYPTOGRAPHY_VERSION_OPENSSH)),
-
-                    exception=CRYPTOGRAPHY_IMP_ERR
-
-                )
-
-            backend = 'pyopenssl'
-
-
-
-        # Success?
-
-        if backend == 'auto':
-
-            module.fail_json(msg=("Can't detect any of the required Python libraries "
-
-                                  "cryptography (>= {0}) or PyOpenSSL (>= {1})").format(
-
-                                      minimal_cryptography_version,
-
-                                      MINIMAL_PYOPENSSL_VERSION))
-
-
-
-    if module.params['format'] == 'OpenSSH' and backend != 'cryptography':
-
-        module.fail_json(msg="Format OpenSSH requires the cryptography backend.")
-
-
-
-    if backend == 'pyopenssl':
-
-        if not PYOPENSSL_FOUND:
-
-            module.fail_json(msg=missing_required_lib('pyOpenSSL >= {0}'.format(MINIMAL_PYOPENSSL_VERSION)),
-
-                             exception=PYOPENSSL_IMP_ERR)
-
-        module.deprecate('The module is using the PyOpenSSL backend. This backend has been deprecated',
-
-                         version='2.0.0', collection_name='community.crypto')
-
-    elif backend == 'cryptography':
-
-        if not CRYPTOGRAPHY_FOUND:
-
-            module.fail_json(msg=missing_required_lib('cryptography >= {0}'.format(minimal_cryptography_version)),
-
-                             exception=CRYPTOGRAPHY_IMP_ERR)
-
-
-
-    base_dir = os.path.dirname(module.params['path']) or '.'
-
-    if not os.path.isdir(base_dir):
-
-        module.fail_json(
-
-            name=base_dir,
-
-            msg="The directory '%s' does not exist or the file is not a directory" % base_dir
-
-        )
-
-
-
-    try:
-
-        public_key = PublicKey(module, backend)
-
-
-
-        if public_key.state == 'present':
-
-            if module.check_mode:
-
-                result = public_key.dump()
-
-                result['changed'] = module.params['force'] or not public_key.check(module)
-
-                module.exit_json(**result)
-
-
-
-            public_key.generate(module)
+            self.bottom()
 
         else:
 
-            if module.check_mode:
+            for val, orientation in [(x, Qt.Horizontal), (y, Qt.Vertical)]:
 
-                result = public_key.dump()
+                if val is not None:
 
-                result['changed'] = os.path.exists(module.params['path'])
+                    frame = self._widget.page().mainFrame()
 
-                module.exit_json(**result)
+                    maximum = frame.scrollBarMaximum(orientation)
 
+                    if maximum == 0:
 
+                        continue
 
-            public_key.remove(module)
+                    pos = int(maximum * val / 100)
 
+                    pos = qtutils.check_overflow(pos, 'int', fatal=False)
 
-
-        result = public_key.dump()
-
-        module.exit_json(**result)
-
-    except OpenSSLObjectError as exc:
-
-        module.fail_json(msg=to_native(exc))
+                    frame.setScrollBarValue(orientation, pos)
 
 
 
+    def _key_press(self, key, count=1, getter_name=None, direction=None):
+
+        frame = self._widget.page().mainFrame()
+
+        getter = None if getter_name is None else getattr(frame, getter_name)
 
 
-if __name__ == '__main__':
 
-    main()
+        # FIXME:qtwebengine needed?
+
+        # self._widget.setFocus()
+
+
+
+        for _ in range(min(count, 5000)):
+
+            # Abort scrolling if the minimum/maximum was reached.
+
+            if (getter is not None and
+
+                    frame.scrollBarValue(direction) == getter(direction)):
+
+                return
+
+            self._tab.key_press(key)
+
+
+
+    def up(self, count=1):
+
+        self._key_press(Qt.Key_Up, count, 'scrollBarMinimum', Qt.Vertical)
+
+
+
+    def down(self, count=1):
+
+        self._key_press(Qt.Key_Down, count, 'scrollBarMaximum', Qt.Vertical)
+
+
+
+    def left(self, count=1):
+
+        self._key_press(Qt.Key_Left, count, 'scrollBarMinimum', Qt.Horizontal)
+
+
+
+    def right(self, count=1):
+
+        self._key_press(Qt.Key_Right, count, 'scrollBarMaximum', Qt.Horizontal)
+
+
+
+    def top(self):
+
+        self._key_press(Qt.Key_Home)
+
+
+
+    def bottom(self):
+
+        self._key_press(Qt.Key_End)
+
+
+
+    def page_up(self, count=1):
+
+        self._key_press(Qt.Key_PageUp, count, 'scrollBarMinimum', Qt.Vertical)
+
+
+
+    def page_down(self, count=1):
+
+        self._key_press(Qt.Key_PageDown, count, 'scrollBarMaximum',
+
+                        Qt.Vertical)
+
+
+
+    def at_top(self):
+
+        return self.pos_px().y() == 0
+
+
+
+    def at_bottom(self):
+
+        frame = self._widget.page().currentFrame()
+
+        return self.pos_px().y() >= frame.scrollBarMaximum(Qt.Vertical)
+
+
+
+
+
+class WebKitHistory(browsertab.AbstractHistory):
+
+
+
+    """QtWebKit implementations related to page history."""
+
+
+
+    def current_idx(self):
+
+        return self._history.currentItemIndex()
+
+
+
+    def can_go_back(self):
+
+        return self._history.canGoBack()
+
+
+
+    def can_go_forward(self):
+
+        return self._history.canGoForward()
+
+
+
+    def _item_at(self, i):
+
+        return self._history.itemAt(i)
+
+
+
+    def _go_to_item(self, item):
+
+        self._tab.predicted_navigation.emit(item.url())
+
+        self._history.goToItem(item)
+
+
+
+    def serialize(self):
+
+        return qtutils.serialize(self._history)
+
+
+
+    def deserialize(self, data):
+
+        return qtutils.deserialize(data, self._history)
+
+
+
+    def load_items(self, items):
+
+        if items:
+
+            self._tab.predicted_navigation.emit(items[-1].url)
+
+
+
+        stream, _data, user_data = tabhistory.serialize(items)
+
+        qtutils.deserialize_stream(stream, self._history)
+
+        for i, data in enumerate(user_data):
+
+            self._history.itemAt(i).setUserData(data)
+
+        cur_data = self._history.currentItem().userData()
+
+        if cur_data is not None:
+
+            if 'zoom' in cur_data:
+
+                self._tab.zoom.set_factor(cur_data['zoom'])
+
+            if ('scroll-pos' in cur_data and
+
+                    self._tab.scroller.pos_px() == QPoint(0, 0)):
+
+                QTimer.singleShot(0, functools.partial(
+
+                    self._tab.scroller.to_point, cur_data['scroll-pos']))
+
+
+
+
+
+class WebKitElements(browsertab.AbstractElements):
+
+
+
+    """QtWebKit implemementations related to elements on the page."""
+
+
+
+    def find_css(self, selector, callback, *, only_visible=False):
+
+        mainframe = self._widget.page().mainFrame()
+
+        if mainframe is None:
+
+            raise browsertab.WebTabError("No frame focused!")
+
+
+
+        elems = []
+
+        frames = webkitelem.get_child_frames(mainframe)
+
+        for f in frames:
+
+            for elem in f.findAllElements(selector):
+
+                elems.append(webkitelem.WebKitElement(elem, tab=self._tab))
+
+
+
+        if only_visible:
+
+            # pylint: disable=protected-access
+
+            elems = [e for e in elems if e._is_visible(mainframe)]
+
+            # pylint: enable=protected-access
+
+
+
+        callback(elems)
+
+
+
+    def find_id(self, elem_id, callback):
+
+        def find_id_cb(elems):
+
+            """Call the real callback with the found elements."""
+
+            if not elems:
+
+                callback(None)
+
+            else:
+
+                callback(elems[0])
+
+
+
+        # Escape non-alphanumeric characters in the selector
+
+        # https://www.w3.org/TR/CSS2/syndata.html#value-def-identifier
+
+        elem_id = re.sub(r'[^a-zA-Z0-9_-]', r'\\\g<0>', elem_id)
+
+        self.find_css('#' + elem_id, find_id_cb)
+
+
+
+    def find_focused(self, callback):
+
+        frame = self._widget.page().currentFrame()
+
+        if frame is None:
+
+            callback(None)
+
+            return
+
+
+
+        elem = frame.findFirstElement('*:focus')
+
+        if elem.isNull():
+
+            callback(None)
+
+        else:
+
+            callback(webkitelem.WebKitElement(elem, tab=self._tab))
+
+
+
+    def find_at_pos(self, pos, callback):
+
+        assert pos.x() >= 0
+
+        assert pos.y() >= 0
+
+        frame = self._widget.page().frameAt(pos)
+
+        if frame is None:
+
+            # This happens when we click inside the webview, but not actually
+
+            # on the QWebPage - for example when clicking the scrollbar
+
+            # sometimes.
+
+            log.webview.debug("Hit test at {} but frame is None!".format(pos))
+
+            callback(None)
+
+            return
+
+
+
+        # You'd think we have to subtract frame.geometry().topLeft() from the
+
+        # position, but it seems QWebFrame::hitTestContent wants a position
+
+        # relative to the QWebView, not to the frame. This makes no sense to
+
+        # me, but it works this way.
+
+        hitresult = frame.hitTestContent(pos)
+
+        if hitresult.isNull():
+
+            # For some reason, the whole hit result can be null sometimes (e.g.
+
+            # on doodle menu links).
+
+            log.webview.debug("Hit test result is null!")
+
+            callback(None)
+
+            return
+
+
+
+        try:
+
+            elem = webkitelem.WebKitElement(hitresult.element(), tab=self._tab)
+
+        except webkitelem.IsNullError:
+
+            # For some reason, the hit result element can be a null element
+
+            # sometimes (e.g. when clicking the timetable fields on
+
+            # http://www.sbb.ch/ ).
+
+            log.webview.debug("Hit test result element is null!")
+
+            callback(None)
+
+            return
+
+
+
+        callback(elem)
+
+
+
+
+
+class WebKitAudio(browsertab.AbstractAudio):
+
+
+
+    """Dummy handling of audio status for QtWebKit."""
+
+
+
+    def set_muted(self, muted: bool):
+
+        raise browsertab.WebTabError('Muting is not supported on QtWebKit!')
+
+
+
+    def is_muted(self):
+
+        return False
+
+
+
+    def is_recently_audible(self):
+
+        return False
+
+
+
+
+
+class WebKitTab(browsertab.AbstractTab):
+
+
+
+    """A QtWebKit tab in the browser."""
+
+
+
+    def __init__(self, *, win_id, mode_manager, private, parent=None):
+
+        super().__init__(win_id=win_id, mode_manager=mode_manager,
+
+                         private=private, parent=parent)
+
+        widget = webview.WebView(win_id=win_id, tab_id=self.tab_id,
+
+                                 private=private, tab=self)
+
+        if private:
+
+            self._make_private(widget)
+
+        self.history = WebKitHistory(self)
+
+        self.scroller = WebKitScroller(self, parent=self)
+
+        self.caret = WebKitCaret(mode_manager=mode_manager,
+
+                                 tab=self, parent=self)
+
+        self.zoom = WebKitZoom(tab=self, parent=self)
+
+        self.search = WebKitSearch(parent=self)
+
+        self.printing = WebKitPrinting(tab=self)
+
+        self.elements = WebKitElements(tab=self)
+
+        self.action = WebKitAction(tab=self)
+
+        self.audio = WebKitAudio(parent=self)
+
+        # We're assigning settings in _set_widget
+
+        self.settings = webkitsettings.WebKitSettings(settings=None)
+
+        self._set_widget(widget)
+
+        self._connect_signals()
+
+        self.backend = usertypes.Backend.QtWebKit
+
+
+
+    def _install_event_filter(self):
+
+        self._widget.installEventFilter(self._mouse_event_filter)
+
+
+
+    def _make_private(self, widget):
+
+        settings = widget.settings()
+
+        settings.setAttribute(QWebSettings.PrivateBrowsingEnabled, True)
+
+
+
+    def openurl(self, url, *, predict=True):
+
+        self._openurl_prepare(url, predict=predict)
+
+        self._widget.openurl(url)
+
+
+
+    def url(self, requested=False):
+
+        frame = self._widget.page().mainFrame()
+
+        if requested:
+
+            return frame.requestedUrl()
+
+        else:
+
+            return frame.url()
+
+
+
+    def dump_async(self, callback, *, plain=False):
+
+        frame = self._widget.page().mainFrame()
+
+        if plain:
+
+            callback(frame.toPlainText())
+
+        else:
+
+            callback(frame.toHtml())
+
+
+
+    def run_js_async(self, code, callback=None, *, world=None):
+
+        if world is not None and world != usertypes.JsWorld.jseval:
+
+            log.webview.warning("Ignoring world ID {}".format(world))
+
+        document_element = self._widget.page().mainFrame().documentElement()
+
+        result = document_element.evaluateJavaScript(code)
+
+        if callback is not None:
+
+            callback(result)
+
+
+
+    def icon(self):
+
+        return self._widget.icon()
+
+
+
+    def shutdown(self):
+
+        self._widget.shutdown()
+
+
+
+    def reload(self, *, force=False):
+
+        if force:
+
+            action = QWebPage.ReloadAndBypassCache
+
+        else:
+
+            action = QWebPage.Reload
+
+        self._widget.triggerPageAction(action)
+
+
+
+    def stop(self):
+
+        self._widget.stop()
+
+
+
+    def title(self):
+
+        return self._widget.title()
+
+
+
+    def clear_ssl_errors(self):
+
+        self.networkaccessmanager().clear_all_ssl_errors()
+
+
+
+    def key_press(self, key, modifier=Qt.NoModifier):
+
+        press_evt = QKeyEvent(QEvent.KeyPress, key, modifier, 0, 0, 0)
+
+        release_evt = QKeyEvent(QEvent.KeyRelease, key, modifier,
+
+                                0, 0, 0)
+
+        self.send_event(press_evt)
+
+        self.send_event(release_evt)
+
+
+
+    @pyqtSlot()
+
+    def _on_history_trigger(self):
+
+        url = self.url()
+
+        requested_url = self.url(requested=True)
+
+        self.add_history_item.emit(url, requested_url, self.title())
+
+
+
+    def set_html(self, html, base_url=QUrl()):
+
+        self._widget.setHtml(html, base_url)
+
+
+
+    def networkaccessmanager(self):
+
+        return self._widget.page().networkAccessManager()
+
+
+
+    def user_agent(self):
+
+        page = self._widget.page()
+
+        return page.userAgentForUrl(self.url())
+
+
+
+    @pyqtSlot()
+
+    def _on_load_started(self):
+
+        super()._on_load_started()
+
+        self.networkaccessmanager().netrc_used = False
+
+        # Make sure the icon is cleared when navigating to a page without one.
+
+        self.icon_changed.emit(QIcon())
+
+
+
+    @pyqtSlot()
+
+    def _on_frame_load_finished(self):
+
+        """Make sure we emit an appropriate status when loading finished.
+
+
+
+        While Qt has a bool "ok" attribute for loadFinished, it always is True
+
+        when using error pages... See
+
+        https://github.com/qutebrowser/qutebrowser/issues/84
+
+        """
+
+        self._on_load_finished(not self._widget.page().error_occurred)
+
+
+
+    @pyqtSlot()
+
+    def _on_webkit_icon_changed(self):
+
+        """Emit iconChanged with a QIcon like QWebEngineView does."""
+
+        if sip.isdeleted(self._widget):
+
+            log.webview.debug("Got _on_webkit_icon_changed for deleted view!")
+
+            return
+
+        self.icon_changed.emit(self._widget.icon())
+
+
+
+    @pyqtSlot(QWebFrame)
+
+    def _on_frame_created(self, frame):
+
+        """Connect the contentsSizeChanged signal of each frame."""
+
+        # FIXME:qtwebengine those could theoretically regress:
+
+        # https://github.com/qutebrowser/qutebrowser/issues/152
+
+        # https://github.com/qutebrowser/qutebrowser/issues/263
+
+        frame.contentsSizeChanged.connect(self._on_contents_size_changed)
+
+
+
+    @pyqtSlot(QSize)
+
+    def _on_contents_size_changed(self, size):
+
+        self.contents_size_changed.emit(QSizeF(size))
+
+
+
+    @pyqtSlot(usertypes.NavigationRequest)
+
+    def _on_navigation_request(self, navigation):
+
+        super()._on_navigation_request(navigation)
+
+        if not navigation.accepted:
+
+            return
+
+
+
+        log.webview.debug("target {} override {}".format(
+
+            self.data.open_target, self.data.override_target))
+
+
+
+        if self.data.override_target is not None:
+
+            target = self.data.override_target
+
+            self.data.override_target = None
+
+        else:
+
+            target = self.data.open_target
+
+
+
+        if (navigation.navigation_type == navigation.Type.link_clicked and
+
+                target != usertypes.ClickTarget.normal):
+
+            tab = shared.get_tab(self.win_id, target)
+
+            tab.openurl(navigation.url)
+
+            self.data.open_target = usertypes.ClickTarget.normal
+
+            navigation.accepted = False
+
+
+
+        if navigation.is_main_frame:
+
+            self.settings.update_for_url(navigation.url)
+
+
+
+    @pyqtSlot('QNetworkReply*')
+
+    def _on_ssl_errors(self, reply):
+
+        self._insecure_hosts.add(reply.url().host())
+
+
+
+    def _connect_signals(self):
+
+        view = self._widget
+
+        page = view.page()
+
+        frame = page.mainFrame()
+
+        page.windowCloseRequested.connect(self.window_close_requested)
+
+        page.linkHovered.connect(self.link_hovered)
+
+        page.loadProgress.connect(self._on_load_progress)
+
+        frame.loadStarted.connect(self._on_load_started)
+
+        view.scroll_pos_changed.connect(self.scroller.perc_changed)
+
+        view.titleChanged.connect(self.title_changed)
+
+        view.urlChanged.connect(self._on_url_changed)
+
+        view.shutting_down.connect(self.shutting_down)
+
+        page.networkAccessManager().sslErrors.connect(self._on_ssl_errors)
+
+        frame.loadFinished.connect(self._on_frame_load_finished)
+
+        view.iconChanged.connect(self._on_webkit_icon_changed)
+
+        page.frameCreated.connect(self._on_frame_created)
+
+        frame.contentsSizeChanged.connect(self._on_contents_size_changed)
+
+        frame.initialLayoutCompleted.connect(self._on_history_trigger)
+
+        page.navigation_request.connect(self._on_navigation_request)
+
+
+
+    def event_target(self):
+
+        return self._widget

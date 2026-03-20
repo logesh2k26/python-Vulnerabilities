@@ -2,712 +2,858 @@
 # Safety: safe
 # Category: safe
 
-# Copyright 2012 OpenStack LLC
+from __future__ import absolute_import
 
-#
+import re
 
-# Licensed under the Apache License, Version 2.0 (the "License"); you may
+import datetime
 
-# not use this file except in compliance with the License. You may obtain
+import logging
 
-# a copy of the License at
+import os
 
-#
+import socket
 
-#      http://www.apache.org/licenses/LICENSE-2.0
+from socket import error as SocketError, timeout as SocketTimeout
 
-#
+import warnings
 
-# Unless required by applicable law or agreed to in writing, software
+from .packages import six
 
-# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+from .packages.six.moves.http_client import HTTPConnection as _HTTPConnection
 
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-
-# License for the specific language governing permissions and limitations
-
-# under the License.
+from .packages.six.moves.http_client import HTTPException  # noqa: F401
 
 
 
-import time
+try:  # Compiled with SSL?
 
-import uuid
-
-
-
-import default_fixtures
+    import ssl
 
 
 
-from keystone import config
+    BaseSSLError = ssl.SSLError
 
-from keystone import exception
+except (ImportError, AttributeError):  # Platform-specific: No SSL.
 
-from keystone import identity
+    ssl = None
 
-from keystone import service
 
-from keystone import test
 
-from keystone.identity.backends import kvs as kvs_identity
+    class BaseSSLError(BaseException):
 
-from keystone.openstack.common import timeutils
+        pass
 
 
 
 
 
-CONF = config.CONF
+try:
+
+    # Python 3: not a no-op, we're adding this to the namespace so it can be imported.
+
+    ConnectionError = ConnectionError
+
+except NameError:
+
+    # Python 2
+
+    class ConnectionError(Exception):
+
+        pass
 
 
 
 
 
-def _build_user_auth(token=None, username=None,
+from .exceptions import (
 
-                     password=None, tenant_name=None):
+    NewConnectionError,
 
-    """Build auth dictionary.
+    ConnectTimeoutError,
+
+    SubjectAltNameWarning,
+
+    SystemTimeWarning,
+
+)
+
+from .packages.ssl_match_hostname import match_hostname, CertificateError
 
 
 
-    It will create an auth dictionary based on all the arguments
+from .util.ssl_ import (
 
-    that it receives.
+    resolve_cert_reqs,
+
+    resolve_ssl_version,
+
+    assert_fingerprint,
+
+    create_urllib3_context,
+
+    ssl_wrap_socket,
+
+)
+
+
+
+
+
+from .util import connection
+
+
+
+from ._collections import HTTPHeaderDict
+
+
+
+log = logging.getLogger(__name__)
+
+
+
+port_by_scheme = {"http": 80, "https": 443}
+
+
+
+# When it comes time to update this value as a part of regular maintenance
+
+# (ie test_recent_date is failing) update it to ~6 months before the current date.
+
+RECENT_DATE = datetime.date(2019, 1, 1)
+
+
+
+_CONTAINS_CONTROL_CHAR_RE = re.compile(r"[^-!#$%&'*+.^_`|~0-9a-zA-Z]")
+
+
+
+
+
+class DummyConnection(object):
+
+    """Used to detect a failed ConnectionCls import."""
+
+
+
+    pass
+
+
+
+
+
+class HTTPConnection(_HTTPConnection, object):
 
     """
 
-    auth_json = {}
+    Based on httplib.HTTPConnection but provides an extra constructor
 
-    if token is not None:
-
-        auth_json['token'] = token
-
-    if username or password:
-
-        auth_json['passwordCredentials'] = {}
-
-    if username is not None:
-
-        auth_json['passwordCredentials']['username'] = username
-
-    if password is not None:
-
-        auth_json['passwordCredentials']['password'] = password
-
-    if tenant_name is not None:
-
-        auth_json['tenantName'] = tenant_name
-
-    return auth_json
+    backwards-compatibility layer between older and newer Pythons.
 
 
 
+    Additional keyword parameters are used to configure attributes of the connection.
 
-
-class TokenControllerTest(test.TestCase):
-
-    def setUp(self):
-
-        super(TokenControllerTest, self).setUp()
-
-        self.identity_api = kvs_identity.Identity()
-
-        self.load_fixtures(default_fixtures)
-
-        self.api = service.TokenController()
+    Accepted parameters include:
 
 
 
-    def assertEqualTokens(self, a, b):
+      - ``strict``: See the documentation on :class:`urllib3.connectionpool.HTTPConnectionPool`
 
-        """Assert that two tokens are equal.
+      - ``source_address``: Set the source address for the current connection.
+
+      - ``socket_options``: Set specific options on the underlying socket. If not specified, then
+
+        defaults are loaded from ``HTTPConnection.default_socket_options`` which includes disabling
+
+        Nagle's algorithm (sets TCP_NODELAY to 1) unless the connection is behind a proxy.
 
 
 
-        Compare two tokens except for their ids. This also truncates
+        For example, if you wish to enable TCP Keep Alive in addition to the defaults,
 
-        the time in the comparison.
+        you might pass::
+
+
+
+            HTTPConnection.default_socket_options + [
+
+                (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+
+            ]
+
+
+
+        Or you may want to disable the defaults by passing an empty list (e.g., ``[]``).
+
+    """
+
+
+
+    default_port = port_by_scheme["http"]
+
+
+
+    #: Disable Nagle's algorithm by default.
+
+    #: ``[(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)]``
+
+    default_socket_options = [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)]
+
+
+
+    #: Whether this connection verifies the host's certificate.
+
+    is_verified = False
+
+
+
+    def __init__(self, *args, **kw):
+
+        if not six.PY2:
+
+            kw.pop("strict", None)
+
+
+
+        # Pre-set source_address.
+
+        self.source_address = kw.get("source_address")
+
+
+
+        #: The socket options provided by the user. If no options are
+
+        #: provided, we use the default options.
+
+        self.socket_options = kw.pop("socket_options", self.default_socket_options)
+
+
+
+        _HTTPConnection.__init__(self, *args, **kw)
+
+
+
+    @property
+
+    def host(self):
 
         """
 
-        def normalize(token):
+        Getter method to remove any trailing dots that indicate the hostname is an FQDN.
 
-            token['access']['token']['id'] = 'dummy'
 
-            del token['access']['token']['expires']
 
-            del token['access']['token']['issued_at']
+        In general, SSL certificates don't include the trailing dot indicating a
 
-            return token
+        fully-qualified domain name, and thus, they don't validate properly when
 
+        checked against a domain name that includes the dot. In addition, some
 
+        servers may not expect to receive the trailing dot when provided.
 
-        self.assertCloseEnoughForGovernmentWork(
 
-            timeutils.parse_isotime(a['access']['token']['expires']),
 
-            timeutils.parse_isotime(b['access']['token']['expires']))
+        However, the hostname with trailing dot is critical to DNS resolution; doing a
 
-        self.assertCloseEnoughForGovernmentWork(
+        lookup with the trailing dot will properly only resolve the appropriate FQDN,
 
-            timeutils.parse_isotime(a['access']['token']['issued_at']),
+        whereas a lookup without a trailing dot will search the system's search domain
 
-            timeutils.parse_isotime(b['access']['token']['issued_at']))
+        list. Thus, it's important to keep the original host around for use only in
 
-        return self.assertDictEqual(normalize(a), normalize(b))
+        those cases where it's appropriate (i.e., when doing DNS lookup to establish the
 
+        actual TCP connection across which we're going to send HTTP requests).
 
+        """
 
+        return self._dns_host.rstrip(".")
 
 
-class AuthBadRequests(TokenControllerTest):
 
-    def setUp(self):
+    @host.setter
 
-        super(AuthBadRequests, self).setUp()
+    def host(self, value):
 
+        """
 
+        Setter for the `host` property.
 
-    def test_no_external_auth(self):
 
-        """Verify that _authenticate_external() raises exception if
 
-        not applicable"""
+        We assume that only urllib3 uses the _dns_host attribute; httplib itself
 
-        self.assertRaises(
+        only uses `host`, and it seems reasonable that other libraries follow suit.
 
-            service.ExternalAuthNotApplicable,
+        """
 
-            self.api._authenticate_external,
+        self._dns_host = value
 
-            {}, {})
 
 
+    def _new_conn(self):
 
-    def test_no_token_in_auth(self):
+        """ Establish a socket connection and set nodelay settings on it.
 
-        """Verity that _authenticate_token() raises exception if no token"""
 
-        self.assertRaises(
 
-            exception.ValidationError,
+        :return: New socket connection.
 
-            self.api._authenticate_token,
+        """
 
-            None, {})
+        extra_kw = {}
 
+        if self.source_address:
 
+            extra_kw["source_address"] = self.source_address
 
-    def test_no_credentials_in_auth(self):
 
-        """Verity that _authenticate_local() raises exception if no creds"""
 
-        self.assertRaises(
+        if self.socket_options:
 
-            exception.ValidationError,
+            extra_kw["socket_options"] = self.socket_options
 
-            self.api._authenticate_local,
 
-            None, {})
 
+        try:
 
+            conn = connection.create_connection(
 
-    def test_authenticate_blank_request_body(self):
+                (self._dns_host, self.port), self.timeout, **extra_kw
 
-        """Verify sending empty json dict raises the right exception."""
+            )
 
-        self.assertRaises(exception.ValidationError, self.api.authenticate,
 
-                          {}, {})
 
+        except SocketTimeout:
 
+            raise ConnectTimeoutError(
 
-    def test_authenticate_blank_auth(self):
+                self,
 
-        """Verify sending blank 'auth' raises the right exception."""
+                "Connection to %s timed out. (connect timeout=%s)"
 
-        body_dict = _build_user_auth()
+                % (self.host, self.timeout),
 
-        self.assertRaises(exception.ValidationError, self.api.authenticate,
+            )
 
-                          {}, body_dict)
 
 
+        except SocketError as e:
 
-    def test_authenticate_invalid_auth_content(self):
+            raise NewConnectionError(
 
-        """Verify sending invalid 'auth' raises the right exception."""
+                self, "Failed to establish a new connection: %s" % e
 
-        self.assertRaises(exception.ValidationError, self.api.authenticate,
+            )
 
-                          {}, {'auth': 'abcd'})
 
 
+        return conn
 
 
 
-class AuthWithToken(TokenControllerTest):
+    def _prepare_conn(self, conn):
 
-    def setUp(self):
+        self.sock = conn
 
-        super(AuthWithToken, self).setUp()
+        # Google App Engine's httplib does not define _tunnel_host
 
+        if getattr(self, "_tunnel_host", None):
 
+            # TODO: Fix tunnel so it doesn't depend on self.sock state.
 
-    def test_unscoped_token(self):
+            self._tunnel()
 
-        """Verify getting an unscoped token with password creds"""
+            # Mark this connection as not reusable
 
-        body_dict = _build_user_auth(username='FOO',
+            self.auto_open = 0
 
-                                     password='foo2')
 
-        unscoped_token = self.api.authenticate({}, body_dict)
 
-        tenant = unscoped_token["access"]["token"].get("tenant", None)
+    def connect(self):
 
-        self.assertEqual(tenant, None)
+        conn = self._new_conn()
 
+        self._prepare_conn(conn)
 
 
-    def test_auth_invalid_token(self):
 
-        """Verify exception is raised if invalid token"""
+    def putrequest(self, method, url, *args, **kwargs):
 
-        body_dict = _build_user_auth(token={"id": uuid.uuid4().hex})
+        """Send a request to the server"""
 
-        self.assertRaises(
+        match = _CONTAINS_CONTROL_CHAR_RE.search(method)
 
-            exception.Unauthorized,
+        if match:
 
-            self.api.authenticate,
+            raise ValueError(
 
-            {}, body_dict)
+                "Method cannot contain non-token characters %r (found at least %r)"
 
+                % (method, match.group())
 
+            )
 
-    def test_auth_bad_formatted_token(self):
 
-        """Verify exception is raised if invalid token"""
 
-        body_dict = _build_user_auth(token={})
+        return _HTTPConnection.putrequest(self, method, url, *args, **kwargs)
 
-        self.assertRaises(
 
-            exception.ValidationError,
 
-            self.api.authenticate,
+    def request_chunked(self, method, url, body=None, headers=None):
 
-            {}, body_dict)
+        """
 
+        Alternative to the common request method, which sends the
 
+        body with chunked encoding and not as one block
 
-    def test_auth_unscoped_token_no_tenant(self):
+        """
 
-        """Verify getting an unscoped token with an unscoped token"""
+        headers = HTTPHeaderDict(headers if headers is not None else {})
 
-        body_dict = _build_user_auth(
+        skip_accept_encoding = "accept-encoding" in headers
 
-            username='FOO',
+        skip_host = "host" in headers
 
-            password='foo2')
+        self.putrequest(
 
-        unscoped_token = self.api.authenticate({}, body_dict)
+            method, url, skip_accept_encoding=skip_accept_encoding, skip_host=skip_host
 
+        )
 
+        for header, value in headers.items():
 
-        body_dict = _build_user_auth(
+            self.putheader(header, value)
 
-            token=unscoped_token["access"]["token"])
+        if "transfer-encoding" not in headers:
 
-        unscoped_token_2 = self.api.authenticate({}, body_dict)
+            self.putheader("Transfer-Encoding", "chunked")
 
+        self.endheaders()
 
 
-        self.assertEqualTokens(unscoped_token, unscoped_token_2)
 
+        if body is not None:
 
+            stringish_types = six.string_types + (bytes,)
 
-    def test_auth_unscoped_token_tenant(self):
+            if isinstance(body, stringish_types):
 
-        """Verify getting a token in a tenant with an unscoped token"""
+                body = (body,)
 
-        # Get an unscoped tenant
+            for chunk in body:
 
-        body_dict = _build_user_auth(
+                if not chunk:
 
-            username='FOO',
+                    continue
 
-            password='foo2')
+                if not isinstance(chunk, bytes):
 
-        unscoped_token = self.api.authenticate({}, body_dict)
+                    chunk = chunk.encode("utf8")
 
-        # Get a token on BAR tenant using the unscoped tenant
+                len_str = hex(len(chunk))[2:]
 
-        body_dict = _build_user_auth(
+                self.send(len_str.encode("utf-8"))
 
-            token=unscoped_token["access"]["token"],
+                self.send(b"\r\n")
 
-            tenant_name="BAR")
+                self.send(chunk)
 
-        scoped_token = self.api.authenticate({}, body_dict)
+                self.send(b"\r\n")
 
 
 
-        tenant = scoped_token["access"]["token"]["tenant"]
+        # After the if clause, to always have a closed body
 
-        self.assertEquals(tenant["id"], self.tenant_bar['id'])
+        self.send(b"0\r\n\r\n")
 
 
 
 
 
-class AuthWithPasswordCredentials(TokenControllerTest):
+class HTTPSConnection(HTTPConnection):
 
-    def setUp(self):
+    default_port = port_by_scheme["https"]
 
-        super(AuthWithPasswordCredentials, self).setUp()
 
 
+    ssl_version = None
 
-    def test_auth_invalid_user(self):
 
-        """Verify exception is raised if invalid user"""
 
-        body_dict = _build_user_auth(
+    def __init__(
 
-            username=uuid.uuid4().hex,
+        self,
 
-            password=uuid.uuid4().hex)
+        host,
 
-        self.assertRaises(
+        port=None,
 
-            exception.Unauthorized,
+        key_file=None,
 
-            self.api.authenticate,
+        cert_file=None,
 
-            {}, body_dict)
+        key_password=None,
 
+        strict=None,
 
+        timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
 
-    def test_auth_valid_user_invalid_password(self):
+        ssl_context=None,
 
-        """Verify exception is raised if invalid password"""
+        server_hostname=None,
 
-        body_dict = _build_user_auth(
+        **kw
 
-            username="FOO",
+    ):
 
-            password=uuid.uuid4().hex)
 
-        self.assertRaises(
 
-            exception.Unauthorized,
+        HTTPConnection.__init__(self, host, port, strict=strict, timeout=timeout, **kw)
 
-            self.api.authenticate,
 
-            {}, body_dict)
 
+        self.key_file = key_file
 
+        self.cert_file = cert_file
 
-    def test_auth_empty_password(self):
+        self.key_password = key_password
 
-        """Verify exception is raised if empty password"""
+        self.ssl_context = ssl_context
 
-        body_dict = _build_user_auth(
+        self.server_hostname = server_hostname
 
-            username="FOO",
 
-            password="")
 
-        self.assertRaises(
+        # Required property for Google AppEngine 1.9.0 which otherwise causes
 
-            exception.Unauthorized,
+        # HTTPS requests to go out as HTTP. (See Issue #356)
 
-            self.api.authenticate,
+        self._protocol = "https"
 
-            {}, body_dict)
 
 
 
-    def test_auth_no_password(self):
 
-        """Verify exception is raised if empty password"""
+class VerifiedHTTPSConnection(HTTPSConnection):
 
-        body_dict = _build_user_auth(username="FOO")
+    """
 
-        self.assertRaises(
+    Based on httplib.HTTPSConnection but wraps the socket with
 
-            exception.ValidationError,
+    SSL certification.
 
-            self.api.authenticate,
+    """
 
-            {}, body_dict)
 
 
+    cert_reqs = None
 
-    def test_authenticate_blank_password_credentials(self):
+    ca_certs = None
 
-        """Verify sending empty json dict as passwordCredentials raises the
+    ca_cert_dir = None
 
-        right exception."""
+    ssl_version = None
 
-        body_dict = {'passwordCredentials': {}, 'tenantName': 'demo'}
+    assert_fingerprint = None
 
-        self.assertRaises(exception.ValidationError, self.api.authenticate,
 
-                          {}, body_dict)
 
+    def set_cert(
 
+        self,
 
-    def test_authenticate_no_username(self):
+        key_file=None,
 
-        """Verify skipping username raises the right exception."""
+        cert_file=None,
 
-        body_dict = _build_user_auth(password="pass",
+        cert_reqs=None,
 
-                                     tenant_name="demo")
+        key_password=None,
 
-        self.assertRaises(exception.ValidationError, self.api.authenticate,
+        ca_certs=None,
 
-                          {}, body_dict)
+        assert_hostname=None,
 
+        assert_fingerprint=None,
 
+        ca_cert_dir=None,
 
+    ):
 
+        """
 
-class AuthWithRemoteUser(TokenControllerTest):
+        This method should only be called once, before the connection is used.
 
-    def setUp(self):
+        """
 
-        super(AuthWithRemoteUser, self).setUp()
+        # If cert_reqs is not provided we'll assume CERT_REQUIRED unless we also
 
+        # have an SSLContext object in which case we'll use its verify_mode.
 
+        if cert_reqs is None:
 
-    def test_unscoped_remote_authn(self):
+            if self.ssl_context is not None:
 
-        """Verify getting an unscoped token with external authn"""
+                cert_reqs = self.ssl_context.verify_mode
 
-        body_dict = _build_user_auth(
+            else:
 
-            username='FOO',
+                cert_reqs = resolve_cert_reqs(None)
 
-            password='foo2')
 
-        local_token = self.api.authenticate(
 
-            {}, body_dict)
+        self.key_file = key_file
 
+        self.cert_file = cert_file
 
+        self.cert_reqs = cert_reqs
 
-        body_dict = _build_user_auth()
+        self.key_password = key_password
 
-        remote_token = self.api.authenticate(
+        self.assert_hostname = assert_hostname
 
-            {'REMOTE_USER': 'FOO'}, body_dict)
+        self.assert_fingerprint = assert_fingerprint
 
+        self.ca_certs = ca_certs and os.path.expanduser(ca_certs)
 
+        self.ca_cert_dir = ca_cert_dir and os.path.expanduser(ca_cert_dir)
 
-        self.assertEqualTokens(local_token, remote_token)
 
 
+    def connect(self):
 
-    def test_unscoped_remote_authn_jsonless(self):
+        # Add certificate verification
 
-        """Verify that external auth with invalid request fails"""
+        conn = self._new_conn()
 
-        self.assertRaises(
+        hostname = self.host
 
-            exception.ValidationError,
 
-            self.api.authenticate,
 
-            {'REMOTE_USER': 'FOO'},
+        # Google App Engine's httplib does not define _tunnel_host
 
-            None)
+        if getattr(self, "_tunnel_host", None):
 
+            self.sock = conn
 
+            # Calls self._set_hostport(), so self.host is
 
-    def test_scoped_remote_authn(self):
+            # self._tunnel_host below.
 
-        """Verify getting a token with external authn"""
+            self._tunnel()
 
-        body_dict = _build_user_auth(
+            # Mark this connection as not reusable
 
-            username='FOO',
+            self.auto_open = 0
 
-            password='foo2',
 
-            tenant_name='BAR')
 
-        local_token = self.api.authenticate(
+            # Override the host with the one we're requesting data from.
 
-            {}, body_dict)
+            hostname = self._tunnel_host
 
 
 
-        body_dict = _build_user_auth(
+        server_hostname = hostname
 
-            tenant_name='BAR')
+        if self.server_hostname is not None:
 
-        remote_token = self.api.authenticate(
+            server_hostname = self.server_hostname
 
-            {'REMOTE_USER': 'FOO'}, body_dict)
 
 
+        is_time_off = datetime.date.today() < RECENT_DATE
 
-        self.assertEqualTokens(local_token, remote_token)
+        if is_time_off:
 
+            warnings.warn(
 
+                (
 
-    def test_scoped_nometa_remote_authn(self):
+                    "System time is way off (before {0}). This will probably "
 
-        """Verify getting a token with external authn and no metadata"""
+                    "lead to SSL verification errors"
 
-        body_dict = _build_user_auth(
+                ).format(RECENT_DATE),
 
-            username='TWO',
+                SystemTimeWarning,
 
-            password='two2',
+            )
 
-            tenant_name='BAZ')
 
-        local_token = self.api.authenticate(
 
-            {}, body_dict)
+        # Wrap socket using verification with the root certs in
 
+        # trusted_root_certs
 
+        default_ssl_context = False
 
-        body_dict = _build_user_auth(tenant_name='BAZ')
+        if self.ssl_context is None:
 
-        remote_token = self.api.authenticate(
+            default_ssl_context = True
 
-            {'REMOTE_USER': 'TWO'}, body_dict)
+            self.ssl_context = create_urllib3_context(
 
+                ssl_version=resolve_ssl_version(self.ssl_version),
 
+                cert_reqs=resolve_cert_reqs(self.cert_reqs),
 
-        self.assertEqualTokens(local_token, remote_token)
+            )
 
 
 
-    def test_scoped_remote_authn_invalid_user(self):
+        context = self.ssl_context
 
-        """Verify that external auth with invalid user fails"""
+        context.verify_mode = resolve_cert_reqs(self.cert_reqs)
 
-        body_dict = _build_user_auth(tenant_name="BAR")
 
-        self.assertRaises(
 
-            exception.Unauthorized,
+        # Try to load OS default certs if none are given.
 
-            self.api.authenticate,
+        # Works well on Windows (requires Python3.4+)
 
-            {'REMOTE_USER': uuid.uuid4().hex},
+        if (
 
-            body_dict)
+            not self.ca_certs
 
+            and not self.ca_cert_dir
 
+            and default_ssl_context
 
+            and hasattr(context, "load_default_certs")
 
+        ):
 
-class TokenExpirationTest(test.TestCase):
+            context.load_default_certs()
 
-    def setUp(self):
 
-        super(TokenExpirationTest, self).setUp()
 
-        self.identity_api = kvs_identity.Identity()
+        self.sock = ssl_wrap_socket(
 
-        self.load_fixtures(default_fixtures)
+            sock=conn,
 
-        self.api = service.TokenController()
+            keyfile=self.key_file,
 
+            certfile=self.cert_file,
 
+            key_password=self.key_password,
 
-    def _maintain_token_expiration(self):
+            ca_certs=self.ca_certs,
 
-        """Token expiration should be maintained after re-auth & validation."""
+            ca_cert_dir=self.ca_cert_dir,
 
-        r = self.api.authenticate(
+            server_hostname=server_hostname,
 
-            {},
+            ssl_context=context,
 
-            auth={
+        )
 
-                'passwordCredentials': {
 
-                    'username': self.user_foo['name'],
 
-                    'password': self.user_foo['password']
+        if self.assert_fingerprint:
 
-                }
+            assert_fingerprint(
 
-            })
+                self.sock.getpeercert(binary_form=True), self.assert_fingerprint
 
-        unscoped_token_id = r['access']['token']['id']
+            )
 
-        original_expiration = r['access']['token']['expires']
+        elif (
 
+            context.verify_mode != ssl.CERT_NONE
 
+            and not getattr(context, "check_hostname", False)
 
-        time.sleep(0.5)
+            and self.assert_hostname is not False
 
+        ):
 
+            # While urllib3 attempts to always turn off hostname matching from
 
-        r = self.api.validate_token(
+            # the TLS library, this cannot always be done. So we check whether
 
-            dict(is_admin=True, query_string={}),
+            # the TLS Library still thinks it's matching hostnames.
 
-            token_id=unscoped_token_id)
+            cert = self.sock.getpeercert()
 
-        self.assertEqual(original_expiration, r['access']['token']['expires'])
+            if not cert.get("subjectAltName", ()):
 
+                warnings.warn(
 
+                    (
 
-        time.sleep(0.5)
+                        "Certificate for {0} has no `subjectAltName`, falling back to check for a "
 
+                        "`commonName` for now. This feature is being removed by major browsers and "
 
+                        "deprecated by RFC 2818. (See https://github.com/urllib3/urllib3/issues/497 "
 
-        r = self.api.authenticate(
+                        "for details.)".format(hostname)
 
-            {},
+                    ),
 
-            auth={
+                    SubjectAltNameWarning,
 
-                'token': {
+                )
 
-                    'id': unscoped_token_id,
+            _match_hostname(cert, self.assert_hostname or server_hostname)
 
-                },
 
-                'tenantId': self.tenant_bar['id'],
 
-            })
+        self.is_verified = (
 
-        scoped_token_id = r['access']['token']['id']
+            context.verify_mode == ssl.CERT_REQUIRED
 
-        self.assertEqual(original_expiration, r['access']['token']['expires'])
+            or self.assert_fingerprint is not None
 
+        )
 
 
-        time.sleep(0.5)
 
 
 
-        r = self.api.validate_token(
+def _match_hostname(cert, asserted_hostname):
 
-            dict(is_admin=True, query_string={}),
+    try:
 
-            token_id=scoped_token_id)
+        match_hostname(cert, asserted_hostname)
 
-        self.assertEqual(original_expiration, r['access']['token']['expires'])
+    except CertificateError as e:
 
+        log.warning(
 
+            "Certificate did not match expected hostname: %s. Certificate: %s",
 
-    def test_maintain_uuid_token_expiration(self):
+            asserted_hostname,
 
-        self.opt_in_group('signing', token_format='UUID')
+            cert,
 
-        self._maintain_token_expiration()
+        )
+
+        # Add cert to exception and reraise so client code can inspect
+
+        # the cert when catching the exception, if they want to
+
+        e._peer_cert = cert
+
+        raise
+
+
+
+
+
+if ssl:
+
+    # Make a copy for testing.
+
+    UnverifiedHTTPSConnection = HTTPSConnection
+
+    HTTPSConnection = VerifiedHTTPSConnection
+
+else:
+
+    HTTPSConnection = DummyConnection

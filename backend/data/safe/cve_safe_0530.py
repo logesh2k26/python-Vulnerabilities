@@ -2,228 +2,684 @@
 # Safety: safe
 # Category: safe
 
-import getopt
+import pytest
 
-from subprocess import Popen, PIPE
+import json
 
-import sys
 
 
+from enum import Enum, unique
 
-import Bcfg2.Server.Admin
 
 
+from indy.did import create_and_store_my_did, key_for_local_did
 
 
 
-class Viz(Bcfg2.Server.Admin.MetadataCore):
+from plenum.common.constants import (
 
-    __shorthelp__ = "Produce graphviz diagrams of metadata structures"
+    TRUSTEE, STEWARD, NYM, TXN_TYPE, TARGET_NYM, VERKEY, ROLE,
 
-    __longhelp__ = (__shorthelp__ + "\n\nbcfg2-admin viz [--includehosts] "
+    CURRENT_PROTOCOL_VERSION)
 
-                                    "[--includebundles] [--includekey] "
+from plenum.common.exceptions import UnauthorizedClientRequest
 
-                                    "[--only-client clientname] "
+from plenum.common.signer_did import DidSigner
 
-                                    "[-o output.<ext>]\n")
+from plenum.common.member.member import Member
 
-    __usage__ = ("bcfg2-admin viz [options]\n\n"
+from plenum.test.helper import sdk_gen_request, sdk_sign_request_objects
 
-                 "     %-32s%s\n"
 
-                 "     %-32s%s\n"
 
-                 "     %-32s%s\n"
+from indy_common.types import Request
 
-                 "     %-32s%s\n"
+from indy_common.roles import Roles
 
-                 "     %-32s%s\n" %
 
-                ("-H, --includehosts",
 
-                 "include hosts in the viz output",
+from indy_node.test.helper import createUuidIdentifierAndFullVerkey
 
-                 "-b, --includebundles",
 
-                 "include bundles in the viz output",
 
-                 "-k, --includekey",
 
-                 "show a key for different digraph shapes",
 
-                 "-c, --only-client <clientname>",
+#   TODO
 
-                 "show only the groups, bundles for the named client",
+#   - more specific string patterns for auth exc check
 
-                 "-o, --outfile <file>",
 
-                 "write viz output to an output file"))
 
 
 
-    colors = ['steelblue1', 'chartreuse', 'gold', 'magenta',
+class DID(object):
 
-              'indianred1', 'limegreen', 'orange1', 'lightblue2',
+    def __init__(self, did=None, role=Roles.IDENTITY_OWNER, verkey=None, creator=None, wallet_handle=None):
 
-              'green1', 'blue1', 'yellow1', 'darkturquoise', 'gray66']
+        self.did = did
 
+        self.role = role
 
+        self.verkey = verkey
 
-    plugin_blacklist = ['DBStats', 'Snapshots', 'Cfg', 'Pkgmgr', 'Packages',
+        self.creator = creator
 
-                        'Rules', 'Account', 'Decisions', 'Deps', 'Git', 'Svn',
+        self.wallet_handle = wallet_handle
 
-                        'Fossil', 'Bzr', 'Bundler', 'TGenshi', 'SGenshi',
 
-                        'Base']
 
+    @property
 
+    def wallet_did(self):
 
-    def __init__(self, cfile):
+        return (self.wallet_handle, self.did)
 
 
 
-        Bcfg2.Server.Admin.MetadataCore.__init__(self, cfile,
 
-                                                 self.__usage__,
 
-                                                 pblacklist=self.plugin_blacklist)
+@unique
 
+class EnumBase(Enum):
 
+    def __str__(self):
 
-    def __call__(self, args):
+        return self.name
 
-        Bcfg2.Server.Admin.MetadataCore.__call__(self, args)
 
-        # First get options to the 'viz' subcommand
 
-        try:
 
-            opts, args = getopt.getopt(args, 'Hbkc:o:',
 
-                                       ['includehosts', 'includebundles',
+ActionIds = Enum('ActionIds', 'add edit', type=EnumBase)
 
-                                        'includekey', 'only-client=', 'outfile='])
 
-        except getopt.GetoptError:
 
-            msg = sys.exc_info()[1]
+# params for addition:
 
-            print(msg)
+# - signer:
 
-            print(self.__longhelp__)
+#   - role: Roles
 
-            raise SystemExit(1)
+# - dest:
 
+#   - verkey in NYM: omitted, None, val
 
+#   - role: Roles, omitted
 
-        hset = False
+NYMAddDestRoles = Enum(
 
-        bset = False
+    'NYMAddDestRoles',
 
-        kset = False
+    [(r.name, r.value) for r in Roles] + [('omitted', 'omitted')],
 
-        only_client = None
+    type=EnumBase)
 
-        outputfile = False
 
-        for opt, arg in opts:
 
-            if opt in ("-H", "--includehosts"):
+NYMAddDestVerkeys = Enum('NYMAddDestVerkeys', 'none val omitted', type=EnumBase)
 
-                hset = True
 
-            elif opt in ("-b", "--includebundles"):
 
-                bset = True
+# params for edition:
 
-            elif opt in ("-k", "--includekey"):
+# - signer:
 
-                kset = True
+#   - [self, creator] + [other], where other = any of Roles
 
-            elif opt in ("-c", "--only-client"):
+# - dest:
 
-                only_client = arg
+#   - role in ledger: Roles
 
-            elif opt in ("-o", "--outfile"):
+#   - verkey in ledger: None, val
 
-                outputfile = arg
+#   - role: Roles, omitted
 
+#   - verkey in NYM: same, new (not None), demote(None), omitted
 
+LedgerDIDVerkeys = Enum('LedgerDIDVerkeys', 'none val', type=EnumBase)
 
-        data = self.Visualize(self.get_repo_path(), hset, bset,
+LedgerDIDRoles = Roles
 
-                              kset, only_client, outputfile)
 
-        print(data)
 
-        raise SystemExit(0)
+NYMEditSignerTypes = Enum(
 
+    'NYMEditSignerTypes',
 
+    [(r.name, r.value) for r in Roles] + [('self', 'self'), ('creator', 'creator')],
 
-    def Visualize(self, repopath, hosts=False,
+    type=EnumBase
 
-                  bundles=False, key=False, only_client=None, output=False):
+)
 
-        """Build visualization of groups file."""
 
-        if output:
 
-            format = output.split('.')[-1]
+NYMEditDestRoles = NYMAddDestRoles
+
+NYMEditDestVerkeys = Enum('NYMEditDestVerkeys', 'same new demote omitted', type=EnumBase)
+
+
+
+dids = {}
+
+did_editor_others = {}
+
+did_provisioners = did_editor_others
+
+
+
+
+
+# FIXTURES
+
+
+
+
+
+@pytest.fixture(scope="module")
+
+def trustee(looper, sdk_wallet_trustee):
+
+    wh, did = sdk_wallet_trustee
+
+    verkey = looper.loop.run_until_complete(key_for_local_did(wh, did))
+
+    return DID(did=did, role=Roles.TRUSTEE, verkey=verkey, wallet_handle=wh)
+
+
+
+
+
+@pytest.fixture(scope="module")
+
+def poolTxnData(looper, poolTxnData, trustee):
+
+    global dids
+
+    global did_editor_others
+
+
+
+    # TODO non-Trustee creators
+
+
+
+    data = poolTxnData
+
+
+
+    def _add_did(role, did_name, with_verkey=True):
+
+        nonlocal data
+
+
+
+        data['seeds'][did_name] = did_name + '0' * (32 - len(did_name))
+
+        t_sgnr = DidSigner(seed=data['seeds'][did_name].encode())
+
+        verkey = t_sgnr.full_verkey if with_verkey else None
+
+        data['txns'].append(
+
+            Member.nym_txn(nym=t_sgnr.identifier,
+
+                           verkey=verkey,
+
+                           role=role.value,
+
+                           name=did_name,
+
+                           creator=trustee.did)
+
+        )
+
+
+
+        if verkey:
+
+            (sdk_did, sdk_verkey) = looper.loop.run_until_complete(
+
+                create_and_store_my_did(
+
+                    trustee.wallet_handle,
+
+                    json.dumps({'seed': data['seeds'][did_name]}))
+
+            )
+
+
+
+        return DID(
+
+            did=t_sgnr.identifier, role=role, verkey=verkey,
+
+            creator=trustee, wallet_handle=trustee.wallet_handle
+
+        )
+
+
+
+    params = [(dr, dv) for dr in LedgerDIDRoles for dv in LedgerDIDVerkeys]
+
+    for (dr, dv) in params:
+
+        dids[(dr, dv)] = _add_did(
+
+            dr, "{}-{}".format(dr.name, dv.name),
+
+            with_verkey=(dv == LedgerDIDVerkeys.val)
+
+        )
+
+
+
+    for dr in Roles:
+
+        did_editor_others[dr] = _add_did(dr, "{}-other".format(dr.name))
+
+
+
+    return data
+
+
+
+
+
+@pytest.fixture(scope="module", params=list(Roles))
+
+def provisioner_role(request):
+
+    return request.param
+
+
+
+
+
+@pytest.fixture(scope="module")
+
+def provisioner(poolTxnData, provisioner_role):
+
+    return did_provisioners[provisioner_role]
+
+
+
+
+
+@pytest.fixture(scope="module", params=list(NYMAddDestRoles))
+
+def nym_add_dest_role(request):
+
+    return request.param
+
+
+
+
+
+@pytest.fixture(scope="module", params=list(NYMAddDestVerkeys))
+
+def nym_add_dest_verkey(request):
+
+    return request.param
+
+
+
+
+
+@pytest.fixture(scope="function")
+
+def add_op(nym_add_dest_role, nym_add_dest_verkey):
+
+    did, verkey = createUuidIdentifierAndFullVerkey()
+
+
+
+    op = {
+
+        TXN_TYPE: NYM,
+
+        TARGET_NYM: did,
+
+        ROLE: nym_add_dest_role.value,
+
+        VERKEY: verkey
+
+    }
+
+
+
+    if nym_add_dest_role == NYMAddDestRoles.omitted:
+
+        del op[ROLE]
+
+
+
+    if nym_add_dest_verkey == NYMAddDestVerkeys.omitted:
+
+        del op[VERKEY]
+
+
+
+    return op
+
+
+
+
+
+@pytest.fixture(scope="module", params=list(LedgerDIDRoles))
+
+def edited_ledger_role(request):
+
+    return request.param
+
+
+
+
+
+@pytest.fixture(scope="module", params=list(LedgerDIDVerkeys))
+
+def edited_ledger_verkey(request):
+
+    return request.param
+
+
+
+
+
+@pytest.fixture(scope="function")
+
+def edited(edited_ledger_role, edited_ledger_verkey):
+
+    return dids[(edited_ledger_role, edited_ledger_verkey)]
+
+
+
+
+
+@pytest.fixture(scope="module", params=list(NYMEditDestRoles))
+
+def edited_nym_role(request):
+
+    return request.param
+
+
+
+
+
+@pytest.fixture(scope="module", params=list(NYMEditDestVerkeys))
+
+def edited_nym_verkey(request):
+
+    return request.param
+
+
+
+
+
+@pytest.fixture(scope="module", params=list(NYMEditSignerTypes))
+
+def editor_type(request):
+
+    return request.param
+
+
+
+
+
+@pytest.fixture(scope="function")
+
+def editor(editor_type, edited):
+
+    if editor_type == NYMEditSignerTypes.self:
+
+        return edited
+
+    elif editor_type == NYMEditSignerTypes.creator:
+
+        return edited.creator
+
+    else:
+
+        return did_editor_others[Roles(editor_type.value)]
+
+
+
+
+
+@pytest.fixture(scope="function")
+
+def edit_op(edited, edited_nym_role, edited_nym_verkey):
+
+    op = {
+
+        TXN_TYPE: NYM,
+
+        TARGET_NYM: edited.did,
+
+    }
+
+
+
+    if edited_nym_role != NYMEditDestRoles.omitted:
+
+        op[ROLE] = edited_nym_role.value
+
+
+
+    if edited_nym_verkey == NYMEditDestVerkeys.same:
+
+        op[VERKEY] = edited.verkey
+
+    elif edited_nym_verkey == NYMEditDestVerkeys.new:
+
+        _, op[VERKEY] = createUuidIdentifierAndFullVerkey()
+
+    elif edited_nym_verkey == NYMEditDestVerkeys.demote:
+
+        if edited.verkey is None:
+
+            return None  # pass that case since it is covered by `same` case as well
 
         else:
 
-            format = 'png'
+            op[VERKEY] = None
 
 
 
-        cmd = ["dot", "-T", format]
+    return op
 
-        if output:
 
-            cmd.extend(["-o", output])
 
-        dotpipe = Popen(cmd, stdin=PIPE, stdout=PIPE, close_fds=True)
 
-        try:
 
-            dotpipe.stdin.write("digraph groups {\n")
+# TEST HELPERS
 
-        except:
 
-            print("write to dot process failed. Is graphviz installed?")
 
-            raise SystemExit(1)
+def auth_check(action_id, signer, op, did_ledger=None):
 
-        dotpipe.stdin.write('\trankdir="LR";\n')
+    op_role = Roles(op[ROLE]) if ROLE in op else None
 
-        dotpipe.stdin.write(self.metadata.viz(hosts, bundles,
 
-                                              key, only_client, self.colors))
 
-        if key:
+    def check_promotion():
 
-            dotpipe.stdin.write("\tsubgraph cluster_key {\n")
+        # omitted role means IDENTITY_OWNER
 
-            dotpipe.stdin.write('''\tstyle="filled";\n''')
+        if op_role in (None, Roles.IDENTITY_OWNER):
 
-            dotpipe.stdin.write('''\tcolor="lightblue";\n''')
+            return signer.role in (Roles.TRUSTEE, Roles.STEWARD, Roles.ENDORSER)
 
-            dotpipe.stdin.write('''\tBundle [ shape="septagon" ];\n''')
+        elif op_role in (Roles.TRUSTEE, Roles.STEWARD):
 
-            dotpipe.stdin.write('''\tGroup [shape="ellipse"];\n''')
+            return signer.role == Roles.TRUSTEE
 
-            dotpipe.stdin.write('''\tProfile [style="bold", shape="ellipse"];\n''')
+        elif op_role in (Roles.ENDORSER, Roles.NETWORK_MONITOR):
 
-            dotpipe.stdin.write('''\tHblock [label="Host1|Host2|Host3", shape="record"];\n''')
+            return signer.role in (Roles.TRUSTEE, Roles.STEWARD)
 
-            dotpipe.stdin.write('''\tlabel="Key";\n''')
 
-            dotpipe.stdin.write("\t}\n")
 
-        dotpipe.stdin.write("}\n")
+    def check_demotion():
 
-        dotpipe.stdin.close()
+        if did_ledger.role in (Roles.TRUSTEE, Roles.STEWARD):
 
-        return dotpipe.stdout.read()
+            return signer.role == Roles.TRUSTEE
+
+        elif did_ledger.role == Roles.ENDORSER:
+
+            return (signer.role == Roles.TRUSTEE)
+
+            # FIXME INDY-1968: uncomment when the task is addressed
+
+            # return ((signer.role == Roles.TRUSTEE) or
+
+            #        (signer.role == Roles.ENDORSER and
+
+            #            is_self and is_owner))
+
+        elif did_ledger.role == Roles.NETWORK_MONITOR:
+
+            return signer.role in (Roles.TRUSTEE, Roles.STEWARD)
+
+
+
+    if action_id == ActionIds.add:
+
+        return check_promotion()
+
+
+
+    elif action_id == ActionIds.edit:
+
+        # is_self = signer.did == did_ledger.did
+
+        is_owner = signer == (did_ledger if did_ledger.verkey is not None else
+
+        did_ledger.creator)
+
+
+
+        if (VERKEY in op) and (not is_owner):
+
+            return False
+
+
+
+        if ROLE in op:
+
+            if op_role == did_ledger.role:
+
+                # FIXME INDY-1969: related to the task
+
+                return is_owner  # TODO what is a case here, is it correctly designed
+
+
+
+            elif op_role == Roles.IDENTITY_OWNER:  # demotion of existent DID
+
+                return check_demotion()
+
+
+
+            elif did_ledger.role == Roles.IDENTITY_OWNER:  # promotion of existent DID
+
+                return check_promotion()
+
+
+
+            else:  # role updating: demotion + promotion
+
+                return (check_demotion() and check_promotion())
+
+        else:
+
+            return True
+
+
+
+    return False
+
+
+
+
+
+def sign_and_validate(looper, node, action_id, signer, op, did_ledger=None):
+
+    req_obj = sdk_gen_request(op, protocol_version=CURRENT_PROTOCOL_VERSION,
+
+                              identifier=signer.did)
+
+    s_req = sdk_sign_request_objects(looper, signer.wallet_did, [req_obj])[0]
+
+
+
+    request = Request(**json.loads(s_req))
+
+
+
+    if auth_check(action_id, signer, op, did_ledger):
+
+        node.write_manager.dynamic_validation(request, 0)
+
+    else:
+
+        with pytest.raises(UnauthorizedClientRequest):
+
+            node.write_manager.dynamic_validation(request, 0)
+
+
+
+
+
+# TESTS
+
+# Note. some fixtures are referred explicitly just to make test nodeid names predictable
+
+
+
+def test_nym_add(
+
+        provisioner_role, nym_add_dest_role, nym_add_dest_verkey,
+
+        looper, txnPoolNodeSet,
+
+        provisioner, add_op):
+
+    sign_and_validate(looper, txnPoolNodeSet[0], ActionIds.add, provisioner, add_op)
+
+
+
+
+
+def test_nym_edit(
+
+        edited_ledger_role, edited_ledger_verkey, editor_type,
+
+        edited_nym_role, edited_nym_verkey,
+
+        looper, txnPoolNodeSet,
+
+        editor, edited, edit_op):
+
+    if edit_op is None:  # might be None, means a duplicate test case
+
+        return
+
+
+
+    if editor.verkey is None:  # skip that as well since it doesn't make sense
+
+        return
+
+
+
+    if not ROLE in edit_op:  # skip if the update operation doesn't changes neither role nor verkey
+
+        if not VERKEY in edit_op:
+
+            return
+
+
+
+    sign_and_validate(looper, txnPoolNodeSet[0], ActionIds.edit, editor, edit_op, did_ledger=edited)

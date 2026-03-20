@@ -2,472 +2,1082 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-import datetime
+# Copyright (C) 2002-2007 Python Software Foundation
 
-import decimal
-
-import unicodedata
-
-from importlib import import_module
+# Contact: email-sig@python.org
 
 
 
-from django.conf import settings
-
-from django.utils import dateformat, datetime_safe, numberformat, six
-
-from django.utils.encoding import force_str
-
-from django.utils.functional import lazy
-
-from django.utils.safestring import mark_safe
-
-from django.utils.translation import (
-
-    check_for_language, get_language, to_locale,
-
-)
+"""Email address parsing code.
 
 
 
-# format_cache is a mapping from (format_type, lang) to the format string.
+Lifted directly from rfc822.py.  This should eventually be rewritten.
 
-# By using the cache, it is possible to avoid running get_format_modules
-
-# repeatedly.
-
-_format_cache = {}
-
-_format_modules_cache = {}
+"""
 
 
 
-ISO_INPUT_FORMATS = {
+__all__ = [
 
-    'DATE_INPUT_FORMATS': ['%Y-%m-%d'],
+    'mktime_tz',
 
-    'TIME_INPUT_FORMATS': ['%H:%M:%S', '%H:%M:%S.%f', '%H:%M'],
+    'parsedate',
 
-    'DATETIME_INPUT_FORMATS': [
+    'parsedate_tz',
 
-        '%Y-%m-%d %H:%M:%S',
+    'quote',
 
-        '%Y-%m-%d %H:%M:%S.%f',
-
-        '%Y-%m-%d %H:%M',
-
-        '%Y-%m-%d'
-
-    ],
-
-}
+    ]
 
 
 
-
-
-def reset_format_cache():
-
-    """Clear any cached formats.
+import time, calendar
 
 
 
-    This method is provided primarily for testing purposes,
+SPACE = ' '
 
-    so that the effects of cached formats can be removed.
+EMPTYSTRING = ''
+
+COMMASPACE = ', '
+
+
+
+# Parse a date field
+
+_monthnames = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul',
+
+               'aug', 'sep', 'oct', 'nov', 'dec',
+
+               'january', 'february', 'march', 'april', 'may', 'june', 'july',
+
+               'august', 'september', 'october', 'november', 'december']
+
+
+
+_daynames = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']
+
+
+
+# The timezone table does not include the military time zones defined
+
+# in RFC822, other than Z.  According to RFC1123, the description in
+
+# RFC822 gets the signs wrong, so we can't rely on any such time
+
+# zones.  RFC1123 recommends that numeric timezone indicators be used
+
+# instead of timezone names.
+
+
+
+_timezones = {'UT':0, 'UTC':0, 'GMT':0, 'Z':0,
+
+              'AST': -400, 'ADT': -300,  # Atlantic (used in Canada)
+
+              'EST': -500, 'EDT': -400,  # Eastern
+
+              'CST': -600, 'CDT': -500,  # Central
+
+              'MST': -700, 'MDT': -600,  # Mountain
+
+              'PST': -800, 'PDT': -700   # Pacific
+
+              }
+
+
+
+
+
+def parsedate_tz(data):
+
+    """Convert a date string to a time tuple.
+
+
+
+    Accounts for military timezones.
 
     """
 
-    global _format_cache, _format_modules_cache
+    res = _parsedate_tz(data)
 
-    _format_cache = {}
-
-    _format_modules_cache = {}
-
-
-
-
-
-def iter_format_modules(lang, format_module_path=None):
-
-    """
-
-    Does the heavy lifting of finding format modules.
-
-    """
-
-    if not check_for_language(lang):
+    if not res:
 
         return
 
+    if res[9] is None:
 
+        res[9] = 0
 
-    if format_module_path is None:
-
-        format_module_path = settings.FORMAT_MODULE_PATH
-
-
-
-    format_locations = []
-
-    if format_module_path:
-
-        if isinstance(format_module_path, six.string_types):
-
-            format_module_path = [format_module_path]
-
-        for path in format_module_path:
-
-            format_locations.append(path + '.%s')
-
-    format_locations.append('django.conf.locale.%s')
-
-    locale = to_locale(lang)
-
-    locales = [locale]
-
-    if '_' in locale:
-
-        locales.append(locale.split('_')[0])
-
-    for location in format_locations:
-
-        for loc in locales:
-
-            try:
-
-                yield import_module('%s.formats' % (location % loc))
-
-            except ImportError:
-
-                pass
+    return tuple(res)
 
 
 
+def _parsedate_tz(data):
+
+    """Convert date to extended time tuple.
 
 
-def get_format_modules(lang=None, reverse=False):
+
+    The last (additional) element is the time zone offset in seconds, except if
+
+    the timezone was specified as -0000.  In that case the last element is
+
+    None.  This indicates a UTC timestamp that explicitly declaims knowledge of
+
+    the source timezone, as opposed to a +0000 timestamp that indicates the
+
+    source timezone really was UTC.
+
+
 
     """
 
-    Returns a list of the format modules found
+    if not data:
 
-    """
+        return
 
-    if lang is None:
+    data = data.split()
 
-        lang = get_language()
+    # The FWS after the comma after the day-of-week is optional, so search and
 
-    modules = _format_modules_cache.setdefault(lang, list(iter_format_modules(lang, settings.FORMAT_MODULE_PATH)))
+    # adjust for this.
 
-    if reverse:
+    if data[0].endswith(',') or data[0].lower() in _daynames:
 
-        return list(reversed(modules))
+        # There's a dayname here. Skip it
 
-    return modules
-
-
-
-
-
-def get_format(format_type, lang=None, use_l10n=None):
-
-    """
-
-    For a specific format type, returns the format for the current
-
-    language (locale), defaults to the format in the settings.
-
-    format_type is the name of the format, e.g. 'DATE_FORMAT'
-
-
-
-    If use_l10n is provided and is not None, that will force the value to
-
-    be localized (or not), overriding the value of settings.USE_L10N.
-
-    """
-
-    format_type = force_str(format_type)
-
-    if use_l10n or (use_l10n is None and settings.USE_L10N):
-
-        if lang is None:
-
-            lang = get_language()
-
-        cache_key = (format_type, lang)
-
-        try:
-
-            cached = _format_cache[cache_key]
-
-            if cached is not None:
-
-                return cached
-
-            else:
-
-                # Return the general setting by default
-
-                return getattr(settings, format_type)
-
-        except KeyError:
-
-            for module in get_format_modules(lang):
-
-                try:
-
-                    val = getattr(module, format_type)
-
-                    for iso_input in ISO_INPUT_FORMATS.get(format_type, ()):
-
-                        if iso_input not in val:
-
-                            if isinstance(val, tuple):
-
-                                val = list(val)
-
-                            val.append(iso_input)
-
-                    _format_cache[cache_key] = val
-
-                    return val
-
-                except AttributeError:
-
-                    pass
-
-            _format_cache[cache_key] = None
-
-    return getattr(settings, format_type)
-
-
-
-get_format_lazy = lazy(get_format, six.text_type, list, tuple)
-
-
-
-
-
-def date_format(value, format=None, use_l10n=None):
-
-    """
-
-    Formats a datetime.date or datetime.datetime object using a
-
-    localizable format
-
-
-
-    If use_l10n is provided and is not None, that will force the value to
-
-    be localized (or not), overriding the value of settings.USE_L10N.
-
-    """
-
-    return dateformat.format(value, get_format(format or 'DATE_FORMAT', use_l10n=use_l10n))
-
-
-
-
-
-def time_format(value, format=None, use_l10n=None):
-
-    """
-
-    Formats a datetime.time object using a localizable format
-
-
-
-    If use_l10n is provided and is not None, that will force the value to
-
-    be localized (or not), overriding the value of settings.USE_L10N.
-
-    """
-
-    return dateformat.time_format(value, get_format(format or 'TIME_FORMAT', use_l10n=use_l10n))
-
-
-
-
-
-def number_format(value, decimal_pos=None, use_l10n=None, force_grouping=False):
-
-    """
-
-    Formats a numeric value using localization settings
-
-
-
-    If use_l10n is provided and is not None, that will force the value to
-
-    be localized (or not), overriding the value of settings.USE_L10N.
-
-    """
-
-    if use_l10n or (use_l10n is None and settings.USE_L10N):
-
-        lang = get_language()
+        del data[0]
 
     else:
 
-        lang = None
+        i = data[0].rfind(',')
 
-    return numberformat.format(
+        if i >= 0:
 
-        value,
+            data[0] = data[0][i+1:]
 
-        get_format('DECIMAL_SEPARATOR', lang, use_l10n=use_l10n),
+    if len(data) == 3: # RFC 850 date, deprecated
 
-        decimal_pos,
+        stuff = data[0].split('-')
 
-        get_format('NUMBER_GROUPING', lang, use_l10n=use_l10n),
+        if len(stuff) == 3:
 
-        get_format('THOUSAND_SEPARATOR', lang, use_l10n=use_l10n),
+            data = stuff + data[1:]
 
-        force_grouping=force_grouping
+    if len(data) == 4:
 
-    )
+        s = data[3]
+
+        i = s.find('+')
+
+        if i == -1:
+
+            i = s.find('-')
+
+        if i > 0:
+
+            data[3:] = [s[:i], s[i:]]
+
+        else:
+
+            data.append('') # Dummy tz
+
+    if len(data) < 5:
+
+        return None
+
+    data = data[:5]
+
+    [dd, mm, yy, tm, tz] = data
+
+    mm = mm.lower()
+
+    if mm not in _monthnames:
+
+        dd, mm = mm, dd.lower()
+
+        if mm not in _monthnames:
+
+            return None
+
+    mm = _monthnames.index(mm) + 1
+
+    if mm > 12:
+
+        mm -= 12
+
+    if dd[-1] == ',':
+
+        dd = dd[:-1]
+
+    i = yy.find(':')
+
+    if i > 0:
+
+        yy, tm = tm, yy
+
+    if yy[-1] == ',':
+
+        yy = yy[:-1]
+
+    if not yy[0].isdigit():
+
+        yy, tz = tz, yy
+
+    if tm[-1] == ',':
+
+        tm = tm[:-1]
+
+    tm = tm.split(':')
+
+    if len(tm) == 2:
+
+        [thh, tmm] = tm
+
+        tss = '0'
+
+    elif len(tm) == 3:
+
+        [thh, tmm, tss] = tm
+
+    elif len(tm) == 1 and '.' in tm[0]:
+
+        # Some non-compliant MUAs use '.' to separate time elements.
+
+        tm = tm[0].split('.')
+
+        if len(tm) == 2:
+
+            [thh, tmm] = tm
+
+            tss = 0
+
+        elif len(tm) == 3:
+
+            [thh, tmm, tss] = tm
+
+    else:
+
+        return None
+
+    try:
+
+        yy = int(yy)
+
+        dd = int(dd)
+
+        thh = int(thh)
+
+        tmm = int(tmm)
+
+        tss = int(tss)
+
+    except ValueError:
+
+        return None
+
+    # Check for a yy specified in two-digit format, then convert it to the
+
+    # appropriate four-digit format, according to the POSIX standard. RFC 822
+
+    # calls for a two-digit yy, but RFC 2822 (which obsoletes RFC 822)
+
+    # mandates a 4-digit yy. For more information, see the documentation for
+
+    # the time module.
+
+    if yy < 100:
+
+        # The year is between 1969 and 1999 (inclusive).
+
+        if yy > 68:
+
+            yy += 1900
+
+        # The year is between 2000 and 2068 (inclusive).
+
+        else:
+
+            yy += 2000
+
+    tzoffset = None
+
+    tz = tz.upper()
+
+    if tz in _timezones:
+
+        tzoffset = _timezones[tz]
+
+    else:
+
+        try:
+
+            tzoffset = int(tz)
+
+        except ValueError:
+
+            pass
+
+        if tzoffset==0 and tz.startswith('-'):
+
+            tzoffset = None
+
+    # Convert a timezone offset into seconds ; -0500 -> -18000
+
+    if tzoffset:
+
+        if tzoffset < 0:
+
+            tzsign = -1
+
+            tzoffset = -tzoffset
+
+        else:
+
+            tzsign = 1
+
+        tzoffset = tzsign * ( (tzoffset//100)*3600 + (tzoffset % 100)*60)
+
+    # Daylight Saving Time flag is set to -1, since DST is unknown.
+
+    return [yy, mm, dd, thh, tmm, tss, 0, 1, -1, tzoffset]
 
 
 
 
 
-def localize(value, use_l10n=None):
+def parsedate(data):
+
+    """Convert a time string to a time tuple."""
+
+    t = parsedate_tz(data)
+
+    if isinstance(t, tuple):
+
+        return t[:9]
+
+    else:
+
+        return t
+
+
+
+
+
+def mktime_tz(data):
+
+    """Turn a 10-tuple as returned by parsedate_tz() into a POSIX timestamp."""
+
+    if data[9] is None:
+
+        # No zone info, so localtime is better assumption than GMT
+
+        return time.mktime(data[:8] + (-1,))
+
+    else:
+
+        t = calendar.timegm(data)
+
+        return t - data[9]
+
+
+
+
+
+def quote(str):
+
+    """Prepare string to be used in a quoted string.
+
+
+
+    Turns backslash and double quote characters into quoted pairs.  These
+
+    are the only characters that need to be quoted inside a quoted string.
+
+    Does not add the surrounding double quotes.
 
     """
 
-    Checks if value is a localizable type (date, number...) and returns it
-
-    formatted as a string using current locale format.
-
-
-
-    If use_l10n is provided and is not None, that will force the value to
-
-    be localized (or not), overriding the value of settings.USE_L10N.
-
-    """
-
-    if isinstance(value, six.string_types):  # Handle strings first for performance reasons.
-
-        return value
-
-    elif isinstance(value, bool):  # Make sure booleans don't get treated as numbers
-
-        return mark_safe(six.text_type(value))
-
-    elif isinstance(value, (decimal.Decimal, float) + six.integer_types):
-
-        return number_format(value, use_l10n=use_l10n)
-
-    elif isinstance(value, datetime.datetime):
-
-        return date_format(value, 'DATETIME_FORMAT', use_l10n=use_l10n)
-
-    elif isinstance(value, datetime.date):
-
-        return date_format(value, use_l10n=use_l10n)
-
-    elif isinstance(value, datetime.time):
-
-        return time_format(value, 'TIME_FORMAT', use_l10n=use_l10n)
-
-    return value
+    return str.replace('\\', '\\\\').replace('"', '\\"')
 
 
 
 
 
-def localize_input(value, default=None):
+class AddrlistClass:
+
+    """Address parser class by Ben Escoto.
+
+
+
+    To understand what this class does, it helps to have a copy of RFC 2822 in
+
+    front of you.
+
+
+
+    Note: this class interface is deprecated and may be removed in the future.
+
+    Use email.utils.AddressList instead.
 
     """
 
-    Checks if an input value is a localizable type and returns it
 
-    formatted with the appropriate formatting string of the current locale.
 
-    """
+    def __init__(self, field):
 
-    if isinstance(value, six.string_types):  # Handle strings first for performance reasons.
-
-        return value
-
-    elif isinstance(value, (decimal.Decimal, float) + six.integer_types):
-
-        return number_format(value)
-
-    elif isinstance(value, datetime.datetime):
-
-        value = datetime_safe.new_datetime(value)
-
-        format = force_str(default or get_format('DATETIME_INPUT_FORMATS')[0])
-
-        return value.strftime(format)
-
-    elif isinstance(value, datetime.date):
-
-        value = datetime_safe.new_date(value)
-
-        format = force_str(default or get_format('DATE_INPUT_FORMATS')[0])
-
-        return value.strftime(format)
-
-    elif isinstance(value, datetime.time):
-
-        format = force_str(default or get_format('TIME_INPUT_FORMATS')[0])
-
-        return value.strftime(format)
-
-    return value
+        """Initialize a new instance.
 
 
 
+        `field' is an unparsed address header field, containing
+
+        one or more addresses.
+
+        """
+
+        self.specials = '()<>@,:;.\"[]'
+
+        self.pos = 0
+
+        self.LWS = ' \t'
+
+        self.CR = '\r\n'
+
+        self.FWS = self.LWS + self.CR
+
+        self.atomends = self.specials + self.LWS + self.CR
+
+        # Note that RFC 2822 now specifies `.' as obs-phrase, meaning that it
+
+        # is obsolete syntax.  RFC 2822 requires that we recognize obsolete
+
+        # syntax, so allow dots in phrases.
+
+        self.phraseends = self.atomends.replace('.', '')
+
+        self.field = field
+
+        self.commentlist = []
 
 
-def sanitize_separators(value):
 
-    """
+    def gotonext(self):
 
-    Sanitizes a value according to the current decimal and
+        """Skip white space and extract comments."""
 
-    thousand separator setting. Used with form field input.
+        wslist = []
 
-    """
+        while self.pos < len(self.field):
 
-    if settings.USE_L10N and isinstance(value, six.string_types):
+            if self.field[self.pos] in self.LWS + '\n\r':
 
-        parts = []
+                if self.field[self.pos] not in '\n\r':
 
-        decimal_separator = get_format('DECIMAL_SEPARATOR')
+                    wslist.append(self.field[self.pos])
 
-        if decimal_separator in value:
+                self.pos += 1
 
-            value, decimals = value.split(decimal_separator, 1)
+            elif self.field[self.pos] == '(':
 
-            parts.append(decimals)
-
-        if settings.USE_THOUSAND_SEPARATOR:
-
-            thousand_sep = get_format('THOUSAND_SEPARATOR')
-
-            if thousand_sep == '.' and value.count('.') == 1 and len(value.split('.')[-1]) != 3:
-
-                # Special case where we suspect a dot meant decimal separator (see #22171)
-
-                pass
+                self.commentlist.append(self.getcomment())
 
             else:
 
-                for replacement in {
+                break
 
-                        thousand_sep, unicodedata.normalize('NFKD', thousand_sep)}:
+        return EMPTYSTRING.join(wslist)
 
-                    value = value.replace(replacement, '')
 
-        parts.append(value)
 
-        value = '.'.join(reversed(parts))
+    def getaddrlist(self):
 
-    return value
+        """Parse all addresses.
+
+
+
+        Returns a list containing all of the addresses.
+
+        """
+
+        result = []
+
+        while self.pos < len(self.field):
+
+            ad = self.getaddress()
+
+            if ad:
+
+                result += ad
+
+            else:
+
+                result.append(('', ''))
+
+        return result
+
+
+
+    def getaddress(self):
+
+        """Parse the next address."""
+
+        self.commentlist = []
+
+        self.gotonext()
+
+
+
+        oldpos = self.pos
+
+        oldcl = self.commentlist
+
+        plist = self.getphraselist()
+
+
+
+        self.gotonext()
+
+        returnlist = []
+
+
+
+        if self.pos >= len(self.field):
+
+            # Bad email address technically, no domain.
+
+            if plist:
+
+                returnlist = [(SPACE.join(self.commentlist), plist[0])]
+
+
+
+        elif self.field[self.pos] in '.@':
+
+            # email address is just an addrspec
+
+            # this isn't very efficient since we start over
+
+            self.pos = oldpos
+
+            self.commentlist = oldcl
+
+            addrspec = self.getaddrspec()
+
+            returnlist = [(SPACE.join(self.commentlist), addrspec)]
+
+
+
+        elif self.field[self.pos] == ':':
+
+            # address is a group
+
+            returnlist = []
+
+
+
+            fieldlen = len(self.field)
+
+            self.pos += 1
+
+            while self.pos < len(self.field):
+
+                self.gotonext()
+
+                if self.pos < fieldlen and self.field[self.pos] == ';':
+
+                    self.pos += 1
+
+                    break
+
+                returnlist = returnlist + self.getaddress()
+
+
+
+        elif self.field[self.pos] == '<':
+
+            # Address is a phrase then a route addr
+
+            routeaddr = self.getrouteaddr()
+
+
+
+            if self.commentlist:
+
+                returnlist = [(SPACE.join(plist) + ' (' +
+
+                               ' '.join(self.commentlist) + ')', routeaddr)]
+
+            else:
+
+                returnlist = [(SPACE.join(plist), routeaddr)]
+
+
+
+        else:
+
+            if plist:
+
+                returnlist = [(SPACE.join(self.commentlist), plist[0])]
+
+            elif self.field[self.pos] in self.specials:
+
+                self.pos += 1
+
+
+
+        self.gotonext()
+
+        if self.pos < len(self.field) and self.field[self.pos] == ',':
+
+            self.pos += 1
+
+        return returnlist
+
+
+
+    def getrouteaddr(self):
+
+        """Parse a route address (Return-path value).
+
+
+
+        This method just skips all the route stuff and returns the addrspec.
+
+        """
+
+        if self.field[self.pos] != '<':
+
+            return
+
+
+
+        expectroute = False
+
+        self.pos += 1
+
+        self.gotonext()
+
+        adlist = ''
+
+        while self.pos < len(self.field):
+
+            if expectroute:
+
+                self.getdomain()
+
+                expectroute = False
+
+            elif self.field[self.pos] == '>':
+
+                self.pos += 1
+
+                break
+
+            elif self.field[self.pos] == '@':
+
+                self.pos += 1
+
+                expectroute = True
+
+            elif self.field[self.pos] == ':':
+
+                self.pos += 1
+
+            else:
+
+                adlist = self.getaddrspec()
+
+                self.pos += 1
+
+                break
+
+            self.gotonext()
+
+
+
+        return adlist
+
+
+
+    def getaddrspec(self):
+
+        """Parse an RFC 2822 addr-spec."""
+
+        aslist = []
+
+
+
+        self.gotonext()
+
+        while self.pos < len(self.field):
+
+            preserve_ws = True
+
+            if self.field[self.pos] == '.':
+
+                if aslist and not aslist[-1].strip():
+
+                    aslist.pop()
+
+                aslist.append('.')
+
+                self.pos += 1
+
+                preserve_ws = False
+
+            elif self.field[self.pos] == '"':
+
+                aslist.append('"%s"' % quote(self.getquote()))
+
+            elif self.field[self.pos] in self.atomends:
+
+                if aslist and not aslist[-1].strip():
+
+                    aslist.pop()
+
+                break
+
+            else:
+
+                aslist.append(self.getatom())
+
+            ws = self.gotonext()
+
+            if preserve_ws and ws:
+
+                aslist.append(ws)
+
+
+
+        if self.pos >= len(self.field) or self.field[self.pos] != '@':
+
+            return EMPTYSTRING.join(aslist)
+
+
+
+        aslist.append('@')
+
+        self.pos += 1
+
+        self.gotonext()
+
+        return EMPTYSTRING.join(aslist) + self.getdomain()
+
+
+
+    def getdomain(self):
+
+        """Get the complete domain name from an address."""
+
+        sdlist = []
+
+        while self.pos < len(self.field):
+
+            if self.field[self.pos] in self.LWS:
+
+                self.pos += 1
+
+            elif self.field[self.pos] == '(':
+
+                self.commentlist.append(self.getcomment())
+
+            elif self.field[self.pos] == '[':
+
+                sdlist.append(self.getdomainliteral())
+
+            elif self.field[self.pos] == '.':
+
+                self.pos += 1
+
+                sdlist.append('.')
+
+            elif self.field[self.pos] in self.atomends:
+
+                break
+
+            else:
+
+                sdlist.append(self.getatom())
+
+        return EMPTYSTRING.join(sdlist)
+
+
+
+    def getdelimited(self, beginchar, endchars, allowcomments=True):
+
+        """Parse a header fragment delimited by special characters.
+
+
+
+        `beginchar' is the start character for the fragment.
+
+        If self is not looking at an instance of `beginchar' then
+
+        getdelimited returns the empty string.
+
+
+
+        `endchars' is a sequence of allowable end-delimiting characters.
+
+        Parsing stops when one of these is encountered.
+
+
+
+        If `allowcomments' is non-zero, embedded RFC 2822 comments are allowed
+
+        within the parsed fragment.
+
+        """
+
+        if self.field[self.pos] != beginchar:
+
+            return ''
+
+
+
+        slist = ['']
+
+        quote = False
+
+        self.pos += 1
+
+        while self.pos < len(self.field):
+
+            if quote:
+
+                slist.append(self.field[self.pos])
+
+                quote = False
+
+            elif self.field[self.pos] in endchars:
+
+                self.pos += 1
+
+                break
+
+            elif allowcomments and self.field[self.pos] == '(':
+
+                slist.append(self.getcomment())
+
+                continue        # have already advanced pos from getcomment
+
+            elif self.field[self.pos] == '\\':
+
+                quote = True
+
+            else:
+
+                slist.append(self.field[self.pos])
+
+            self.pos += 1
+
+
+
+        return EMPTYSTRING.join(slist)
+
+
+
+    def getquote(self):
+
+        """Get a quote-delimited fragment from self's field."""
+
+        return self.getdelimited('"', '"\r', False)
+
+
+
+    def getcomment(self):
+
+        """Get a parenthesis-delimited fragment from self's field."""
+
+        return self.getdelimited('(', ')\r', True)
+
+
+
+    def getdomainliteral(self):
+
+        """Parse an RFC 2822 domain-literal."""
+
+        return '[%s]' % self.getdelimited('[', ']\r', False)
+
+
+
+    def getatom(self, atomends=None):
+
+        """Parse an RFC 2822 atom.
+
+
+
+        Optional atomends specifies a different set of end token delimiters
+
+        (the default is to use self.atomends).  This is used e.g. in
+
+        getphraselist() since phrase endings must not include the `.' (which
+
+        is legal in phrases)."""
+
+        atomlist = ['']
+
+        if atomends is None:
+
+            atomends = self.atomends
+
+
+
+        while self.pos < len(self.field):
+
+            if self.field[self.pos] in atomends:
+
+                break
+
+            else:
+
+                atomlist.append(self.field[self.pos])
+
+            self.pos += 1
+
+
+
+        return EMPTYSTRING.join(atomlist)
+
+
+
+    def getphraselist(self):
+
+        """Parse a sequence of RFC 2822 phrases.
+
+
+
+        A phrase is a sequence of words, which are in turn either RFC 2822
+
+        atoms or quoted-strings.  Phrases are canonicalized by squeezing all
+
+        runs of continuous whitespace into one space.
+
+        """
+
+        plist = []
+
+
+
+        while self.pos < len(self.field):
+
+            if self.field[self.pos] in self.FWS:
+
+                self.pos += 1
+
+            elif self.field[self.pos] == '"':
+
+                plist.append(self.getquote())
+
+            elif self.field[self.pos] == '(':
+
+                self.commentlist.append(self.getcomment())
+
+            elif self.field[self.pos] in self.phraseends:
+
+                break
+
+            else:
+
+                plist.append(self.getatom(self.phraseends))
+
+
+
+        return plist
+
+
+
+class AddressList(AddrlistClass):
+
+    """An AddressList encapsulates a list of parsed RFC 2822 addresses."""
+
+    def __init__(self, field):
+
+        AddrlistClass.__init__(self, field)
+
+        if field:
+
+            self.addresslist = self.getaddrlist()
+
+        else:
+
+            self.addresslist = []
+
+
+
+    def __len__(self):
+
+        return len(self.addresslist)
+
+
+
+    def __add__(self, other):
+
+        # Set union
+
+        newaddr = AddressList(None)
+
+        newaddr.addresslist = self.addresslist[:]
+
+        for x in other.addresslist:
+
+            if not x in self.addresslist:
+
+                newaddr.addresslist.append(x)
+
+        return newaddr
+
+
+
+    def __iadd__(self, other):
+
+        # Set union, in-place
+
+        for x in other.addresslist:
+
+            if not x in self.addresslist:
+
+                self.addresslist.append(x)
+
+        return self
+
+
+
+    def __sub__(self, other):
+
+        # Set difference
+
+        newaddr = AddressList(None)
+
+        for x in self.addresslist:
+
+            if not x in other.addresslist:
+
+                newaddr.addresslist.append(x)
+
+        return newaddr
+
+
+
+    def __isub__(self, other):
+
+        # Set difference, in-place
+
+        for x in other.addresslist:
+
+            if x in self.addresslist:
+
+                self.addresslist.remove(x)
+
+        return self
+
+
+
+    def __getitem__(self, index):
+
+        # Make indexing, slices, and 'in' work
+
+        return self.addresslist[index]

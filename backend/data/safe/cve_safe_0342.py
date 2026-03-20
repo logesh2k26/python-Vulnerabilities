@@ -1,203 +1,157 @@
 # Source: CVEFixes dataset
-# Safety: safe
+# Safety: vulnerable
 # Category: safe
 
-# -*- coding: utf-8 -*-
+from Products.CMFCore.URLTool import URLTool as BaseTool
 
+from Products.CMFCore.utils import getToolByName
 
+from AccessControl import ClassSecurityInfo
 
-# Copyright 2014-2015 OpenMarket Ltd
+from App.class_init import InitializeClass
 
-#
+from Products.CMFPlone.PloneBaseTool import PloneBaseTool
 
-# Licensed under the Apache License, Version 2.0 (the "License");
 
-# you may not use this file except in compliance with the License.
 
-# You may obtain a copy of the License at
+from posixpath import normpath
 
-#
+from urlparse import urlparse, urljoin
 
-#     http://www.apache.org/licenses/LICENSE-2.0
+import re
 
-#
 
-# Unless required by applicable law or agreed to in writing, software
 
-# distributed under the License is distributed on an "AS IS" BASIS,
 
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 
-# See the License for the specific language governing permissions and
+class URLTool(PloneBaseTool, BaseTool):
 
-# limitations under the License.
 
 
+    meta_type = 'Plone URL Tool'
 
-import logging
+    security = ClassSecurityInfo()
 
-import socket
+    toolicon = 'skins/plone_images/link_icon.png'
 
-import random
 
-import smtplib
 
-import email.utils
+    security.declarePublic('isURLInPortal')
 
-import string
+    def isURLInPortal(self, url, context=None):
 
-import twisted.python.log
+        """ Check if a given url is on the same host and contains the portal
 
-import cgi
+            path.  Used to ensure that login forms can determine relevant
 
-import urllib
+            referrers (i.e. in portal).  Also return true for some relative
 
+            urls if context is passed in to allow for url parsing. When context
 
+            is not provided, assume that relative urls are in the portal. It is
 
-import email.utils
+            assumed that http://portal is the same portal as https://portal.
 
 
 
-from sydent.util import time_msec
+            External sites listed in 'allow_external_login_sites' of
 
+            site_properties are also considered within the portal to allow for
 
+            single sign on.
 
-logger = logging.getLogger(__name__)
+        """
 
+        # sanitize url
 
+        url = re.sub('^[\x00-\x20]+', '', url).strip()
 
 
 
-def sendEmail(sydent, templateName, mailTo, substitutions):
+        p_url = self()
 
-        mailFrom = sydent.cfg.get('email', 'email.from')
 
-        mailTemplateFile = sydent.cfg.get('email', templateName)
 
+        _, u_host, u_path, _, _, _ = urlparse(url)
 
+        if not u_host and not u_path.startswith('/'):
 
-        myHostname = sydent.cfg.get('email', 'email.hostname')
+            if context is None:
 
-        if myHostname == '':
+                return True  # old behavior
 
-            myHostname = socket.getfqdn()
+            if not context.isPrincipiaFolderish:
 
-        midRandom = "".join([random.choice(string.ascii_letters) for _ in range(16)])
-
-        messageid = "<%d%s@%s>" % (time_msec(), midRandom, myHostname)
-
-
-
-        allSubstitutions = {}
-
-        allSubstitutions.update(substitutions)
-
-        allSubstitutions.update({
-
-            'messageid': messageid,
-
-            'date': email.utils.formatdate(localtime=False),
-
-            'to': mailTo,
-
-            'from': mailFrom,
-
-        })
-
-
-
-        for k,v in allSubstitutions.items():
-
-            allSubstitutions[k] = v.decode('utf8')
-
-            allSubstitutions[k+"_forhtml"] = cgi.escape(v.decode('utf8'))
-
-            allSubstitutions[k+"_forurl"] = urllib.quote(v)
-
-
-
-        mailString = open(mailTemplateFile).read().decode('utf8') % allSubstitutions
-
-        parsedFrom = email.utils.parseaddr(mailFrom)[1]
-
-        parsedTo = email.utils.parseaddr(mailTo)[1]
-
-        if parsedFrom == '' or parsedTo == '':
-
-            logger.info("Couldn't parse from / to address %s / %s", mailFrom, mailTo)
-
-            raise EmailAddressException()
-
-
-
-        mailServer = sydent.cfg.get('email', 'email.smtphost')
-
-        mailPort = sydent.cfg.get('email', 'email.smtpport')
-
-        mailUsername = sydent.cfg.get('email', 'email.smtpusername')
-
-        mailPassword = sydent.cfg.get('email', 'email.smtppassword')
-
-        mailTLSMode = sydent.cfg.get('email', 'email.tlsmode')
-
-        logger.info("Sending mail to %s with mail server: %s" % (mailTo, mailServer,))
-
-        try:
-
-            if mailTLSMode == 'SSL' or mailTLSMode == 'TLS':
-
-                smtp = smtplib.SMTP_SSL(mailServer, mailPort, myHostname)
-
-            elif mailTLSMode == 'STARTTLS':
-
-                smtp = smtplib.SMTP(mailServer, mailPort, myHostname)
-
-                smtp.starttls()
+                useurl = context.aq_parent.absolute_url()
 
             else:
 
-                smtp = smtplib.SMTP(mailServer, mailPort, myHostname)
+                useurl = context.absolute_url()
 
-            if mailUsername != '':
+        else:
 
-                smtp.login(mailUsername, mailPassword)
+            useurl = p_url  # when u_path.startswith('/')
 
+        if not useurl.endswith('/'):
 
-
-            # We're using the parsing above to do basic validation, but instead of
-
-            # failing it may munge the address it returns. So we should *not* use
-
-            # that parsed address, as it may not match any validation done
-
-            # elsewhere.
-
-            smtp.sendmail(mailFrom, mailTo, mailString.encode('utf-8'))
-
-            smtp.quit()
-
-        except Exception as origException:
-
-            twisted.python.log.err()
-
-            ese = EmailSendException()
-
-            ese.cause = origException
-
-            raise ese
+            useurl += '/'
 
 
 
+        # urljoin to current url to get an absolute path
 
-
-class EmailAddressException(Exception):
-
-    pass
-
+        _, u_host, u_path, _, _, _ = urlparse(urljoin(useurl, url))
 
 
 
+        # normalise to end with a '/' so /foobar is not considered within /foo
 
-class EmailSendException(Exception):
+        if not u_path:
 
-    pass
+            u_path = '/'
+
+        else:
+
+            u_path = normpath(u_path)
+
+            if not u_path.endswith('/'):
+
+                u_path += '/'
+
+        _, host, path, _, _, _ = urlparse(p_url)
+
+        if not path.endswith('/'):
+
+            path += '/'
+
+        if host == u_host and u_path.startswith(path):
+
+            return True
+
+
+
+        props = getToolByName(self, 'portal_properties').site_properties
+
+        for external_site in props.getProperty('allow_external_login_sites', []):
+
+            _, host, path, _, _, _ = urlparse(external_site)
+
+            if not path.endswith('/'):
+
+                path += '/'
+
+            if host == u_host and u_path.startswith(path):
+
+                return True
+
+        return False
+
+
+
+
+
+URLTool.__doc__ = BaseTool.__doc__
+
+
+
+InitializeClass(URLTool)

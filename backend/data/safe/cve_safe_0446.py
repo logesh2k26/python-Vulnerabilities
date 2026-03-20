@@ -2,756 +2,1104 @@
 # Safety: safe
 # Category: safe
 
-"""
+from __future__ import unicode_literals
 
-.. module: security_monkey.sso.views
 
-    :platform: Unix
-
-    :copyright: (c) 2015 by Netflix Inc., see AUTHORS for more
-
-    :license: Apache, see LICENSE for more details.
-
-.. moduleauthor:: Patrick Kelley <patrick@netflix.com>
-
-"""
-
-import jwt
 
 import base64
 
-import requests
+import binascii
+
+import hashlib
+
+import importlib
+
+import warnings
+
+from collections import OrderedDict
 
 
 
-from flask import Blueprint, current_app, redirect, request
+from django.conf import settings
+
+from django.core.exceptions import ImproperlyConfigured
+
+from django.core.signals import setting_changed
+
+from django.dispatch import receiver
+
+from django.utils import lru_cache
+
+from django.utils.crypto import (
+
+    constant_time_compare, get_random_string, pbkdf2,
+
+)
+
+from django.utils.encoding import force_bytes, force_str, force_text
+
+from django.utils.module_loading import import_string
+
+from django.utils.translation import ugettext_noop as _
 
 
 
-from flask.ext.restful import reqparse, Resource, Api
+UNUSABLE_PASSWORD_PREFIX = '!'  # This will never be a valid encoded hash
 
-from flask.ext.principal import Identity, identity_changed
-
-from flask_security.utils import login_user
-
-
-
-try:
-
-    from onelogin.saml2.auth import OneLogin_Saml2_Auth
-
-    from onelogin.saml2.utils import OneLogin_Saml2_Utils
-
-    onelogin_import_success = True
-
-except ImportError:
-
-    onelogin_import_success = False
-
-
-
-from .service import fetch_token_header_payload, get_rsa_public_key
-
-
-
-from security_monkey.datastore import User
-
-from security_monkey import db, rbac
-
-
-
-from urlparse import urlparse
-
-
-
-mod = Blueprint('sso', __name__)
-
-api = Api(mod)
+UNUSABLE_PASSWORD_SUFFIX_LENGTH = 40  # number of random chars to add after UNUSABLE_PASSWORD_PREFIX
 
 
 
 
 
-from flask_security.utils import validate_redirect_url
+def is_password_usable(encoded):
+
+    if encoded is None or encoded.startswith(UNUSABLE_PASSWORD_PREFIX):
+
+        return False
+
+    try:
+
+        identify_hasher(encoded)
+
+    except ValueError:
+
+        return False
+
+    return True
 
 
 
 
 
-class Ping(Resource):
+def check_password(password, encoded, setter=None, preferred='default'):
 
     """
 
-    This class serves as an example of how one might implement an SSO provider for use with Security Monkey. In
+    Returns a boolean of whether the raw password matches the three
 
-    this example we use a OpenIDConnect authentication flow, that is essentially OAuth2 underneath.
+    part encoded digest.
+
+
+
+    If setter is specified, it'll be called when you need to
+
+    regenerate the password.
 
     """
 
-    decorators = [rbac.allow(["anonymous"], ["GET", "POST"])]
+    if password is None or not is_password_usable(encoded):
 
-    def __init__(self):
+        return False
 
-        self.reqparse = reqparse.RequestParser()
 
-        super(Ping, self).__init__()
 
+    preferred = get_hasher(preferred)
 
+    hasher = identify_hasher(encoded)
 
-    def get(self):
 
-        return self.post()
 
+    hasher_changed = hasher.algorithm != preferred.algorithm
 
+    must_update = hasher_changed or preferred.must_update(encoded)
 
-    def post(self):
+    is_correct = hasher.verify(password, encoded)
 
-        if "ping" not in current_app.config.get("ACTIVE_PROVIDERS"):
 
-            return "Ping is not enabled in the config.  See the ACTIVE_PROVIDERS section.", 404
 
+    # If the hasher didn't change (we don't protect against enumeration if it
 
+    # does) and the password should get updated, try to close the timing gap
 
-        default_state = 'clientId,{client_id},redirectUri,{redirectUri},return_to,{return_to}'.format(
+    # between the work factor of the current encoded password and the default
 
-            client_id=current_app.config.get('PING_CLIENT_ID'),
+    # work factor.
 
-            redirectUri=current_app.config.get('PING_REDIRECT_URI'),
+    if not is_correct and not hasher_changed and must_update:
 
-            return_to=current_app.config.get('WEB_PATH')
+        hasher.harden_runtime(password, encoded)
 
-        )
 
-        self.reqparse.add_argument('code', type=str, required=True)
 
-        self.reqparse.add_argument('state', type=str, required=False, default=default_state)
+    if setter and is_correct and must_update:
 
+        setter(password)
 
+    return is_correct
 
-        args = self.reqparse.parse_args()
 
-        client_id = args['state'].split(',')[1]
 
-        redirect_uri = args['state'].split(',')[3]
 
-        return_to = args['state'].split(',')[5]
 
+def make_password(password, salt=None, hasher='default'):
 
+    """
 
-        if not validate_redirect_url(return_to):
+    Turn a plain-text password into a hash for database storage
 
-            return_to = current_app.config.get('WEB_PATH')
 
 
+    Same as encode() but generates a new random salt.
 
-        # take the information we have received from the provider to create a new request
+    If password is None then a concatenation of
 
-        params = {
+    UNUSABLE_PASSWORD_PREFIX and a random string will be returned
 
-            'client_id': client_id,
+    which disallows logins. Additional random string reduces chances
 
-            'grant_type': 'authorization_code',
+    of gaining access to staff or superuser accounts.
 
-            'scope': 'openid email profile address',
+    See ticket #20079 for more info.
 
-            'redirect_uri': redirect_uri,
+    """
 
-            'code': args['code']
+    if password is None:
 
-        }
+        return UNUSABLE_PASSWORD_PREFIX + get_random_string(UNUSABLE_PASSWORD_SUFFIX_LENGTH)
 
+    hasher = get_hasher(hasher)
 
 
-        # you can either discover these dynamically or simply configure them
 
-        access_token_url = current_app.config.get('PING_ACCESS_TOKEN_URL')
+    if not salt:
 
-        user_api_url = current_app.config.get('PING_USER_API_URL')
+        salt = hasher.salt()
 
 
 
-        # the secret and cliendId will be given to you when you signup for the provider
+    return hasher.encode(password, salt)
 
-        basic = base64.b64encode(bytes('{0}:{1}'.format(client_id, current_app.config.get("PING_SECRET"))))
 
-        headers = {'Authorization': 'Basic {0}'.format(basic.decode('utf-8'))}
 
 
 
-        # exchange authorization code for access token.
+@lru_cache.lru_cache()
 
-        r = requests.post(access_token_url, headers=headers, params=params)
+def get_hashers():
 
-        id_token = r.json()['id_token']
+    hashers = []
 
-        access_token = r.json()['access_token']
+    for hasher_path in settings.PASSWORD_HASHERS:
 
+        hasher_cls = import_string(hasher_path)
 
+        hasher = hasher_cls()
 
-        # fetch token public key
+        if not getattr(hasher, 'algorithm'):
 
-        header_data = fetch_token_header_payload(id_token)[0]
+            raise ImproperlyConfigured("hasher doesn't specify an "
 
-        jwks_url = current_app.config.get('PING_JWKS_URL')
+                                       "algorithm name: %s" % hasher_path)
 
+        hashers.append(hasher)
 
+    return hashers
 
-        # retrieve the key material as specified by the token header
 
-        r = requests.get(jwks_url)
 
-        for key in r.json()['keys']:
 
-            if key['kid'] == header_data['kid']:
 
-                secret = get_rsa_public_key(key['n'], key['e'])
+@lru_cache.lru_cache()
 
-                algo = header_data['alg']
+def get_hashers_by_algorithm():
 
-                break
+    return {hasher.algorithm: hasher for hasher in get_hashers()}
 
-        else:
 
-            return dict(message='Key not found'), 403
 
 
 
-        # validate your token based on the key it was signed with
+@receiver(setting_changed)
+
+def reset_hashers(**kwargs):
+
+    if kwargs['setting'] == 'PASSWORD_HASHERS':
+
+        get_hashers.cache_clear()
+
+        get_hashers_by_algorithm.cache_clear()
+
+
+
+
+
+def get_hasher(algorithm='default'):
+
+    """
+
+    Returns an instance of a loaded password hasher.
+
+
+
+    If algorithm is 'default', the default hasher will be returned.
+
+    This function will also lazy import hashers specified in your
+
+    settings file if needed.
+
+    """
+
+    if hasattr(algorithm, 'algorithm'):
+
+        return algorithm
+
+
+
+    elif algorithm == 'default':
+
+        return get_hashers()[0]
+
+
+
+    else:
+
+        hashers = get_hashers_by_algorithm()
 
         try:
 
-            current_app.logger.debug(id_token)
+            return hashers[algorithm]
 
-            current_app.logger.debug(secret)
+        except KeyError:
 
-            current_app.logger.debug(algo)
+            raise ValueError("Unknown password hashing algorithm '%s'. "
 
-            jwt.decode(id_token, secret.decode('utf-8'), algorithms=[algo], audience=client_id)
+                             "Did you specify it in the PASSWORD_HASHERS "
 
-        except jwt.DecodeError:
+                             "setting?" % algorithm)
 
-            return dict(message='Token is invalid'), 403
 
-        except jwt.ExpiredSignatureError:
 
-            return dict(message='Token has expired'), 403
 
-        except jwt.InvalidTokenError:
 
-            return dict(message='Token is invalid'), 403
+def identify_hasher(encoded):
 
+    """
 
+    Returns an instance of a loaded password hasher.
 
-        user_params = dict(access_token=access_token, schema='profile')
 
 
+    Identifies hasher algorithm by examining encoded hash, and calls
 
-        # retrieve information about the current user.
+    get_hasher() to return hasher. Raises ValueError if
 
-        r = requests.get(user_api_url, params=user_params)
+    algorithm cannot be identified, or if hasher is not loaded.
 
-        profile = r.json()
+    """
 
+    # Ancient versions of Django created plain MD5 passwords and accepted
 
+    # MD5 passwords with an empty salt.
 
-        user = User.query.filter(User.email==profile['email']).first()
+    if ((len(encoded) == 32 and '$' not in encoded) or
 
+            (len(encoded) == 37 and encoded.startswith('md5$$'))):
 
+        algorithm = 'unsalted_md5'
 
-        # if we get an sso user create them an account
+    # Ancient versions of Django accepted SHA1 passwords with an empty salt.
 
-        if not user:
+    elif len(encoded) == 46 and encoded.startswith('sha1$$'):
 
-            user = User(
+        algorithm = 'unsalted_sha1'
 
-                email=profile['email'],
+    else:
 
-                active=True,
+        algorithm = encoded.split('$', 1)[0]
 
-                role='View'
+    return get_hasher(algorithm)
 
-                # profile_picture=profile.get('thumbnailPhotoUrl')
 
-            )
 
-            db.session.add(user)
 
-            db.session.commit()
 
-            db.session.refresh(user)
+def mask_hash(hash, show=6, char="*"):
 
+    """
 
+    Returns the given hash, with only the first ``show`` number shown. The
 
-        # Tell Flask-Principal the identity changed
+    rest are masked with ``char`` for security reasons.
 
-        identity_changed.send(current_app._get_current_object(), identity=Identity(user.id))
+    """
 
-        login_user(user)
+    masked = hash[:show]
 
+    masked += char * len(hash[show:])
 
+    return masked
 
-        return redirect(return_to, code=302)
 
 
 
 
+class BasePasswordHasher(object):
 
-class Google(Resource):
+    """
 
-    decorators = [rbac.allow(["anonymous"], ["GET", "POST"])]
+    Abstract base class for password hashers
 
-    def __init__(self):
 
-        self.reqparse = reqparse.RequestParser()
 
-        super(Google, self).__init__()
+    When creating your own hasher, you need to override algorithm,
 
+    verify(), encode() and safe_summary().
 
 
-    def get(self):
 
-        return self.post()
+    PasswordHasher objects are immutable.
 
+    """
 
+    algorithm = None
 
-    def post(self):
+    library = None
 
-        if "google" not in current_app.config.get("ACTIVE_PROVIDERS"):
 
-            return "Google is not enabled in the config.  See the ACTIVE_PROVIDERS section.", 404
 
+    def _load_library(self):
 
+        if self.library is not None:
 
-        default_state = 'clientId,{client_id},redirectUri,{redirectUri},return_to,{return_to}'.format(
+            if isinstance(self.library, (tuple, list)):
 
-            client_id=current_app.config.get("GOOGLE_CLIENT_ID"),
-
-            redirectUri=api.url_for(Google),
-
-            return_to=current_app.config.get('WEB_PATH')
-
-        )
-
-        self.reqparse.add_argument('code', type=str, required=True)
-
-        self.reqparse.add_argument('state', type=str, required=False, default=default_state)
-
-
-
-        args = self.reqparse.parse_args()
-
-        client_id = args['state'].split(',')[1]
-
-        redirect_uri = args['state'].split(',')[3]
-
-        return_to = args['state'].split(',')[5]
-
-
-
-        if not validate_redirect_url(return_to):
-
-            return_to = current_app.config.get('WEB_PATH')
-
-
-
-        access_token_url = 'https://accounts.google.com/o/oauth2/token'
-
-        people_api_url = 'https://www.googleapis.com/plus/v1/people/me/openIdConnect'
-
-
-
-        args = self.reqparse.parse_args()
-
-
-
-        # Step 1. Exchange authorization code for access token
-
-        payload = {
-
-            'client_id': client_id,
-
-            'grant_type': 'authorization_code',
-
-            'redirect_uri': redirect_uri,
-
-            'code': args['code'],
-
-            'client_secret': current_app.config.get('GOOGLE_SECRET')
-
-        }
-
-
-
-        r = requests.post(access_token_url, data=payload)
-
-        token = r.json()
-
-
-
-        # Step 1bis. Validate (some information of) the id token (if necessary)
-
-        google_hosted_domain = current_app.config.get("GOOGLE_HOSTED_DOMAIN")
-
-        if google_hosted_domain is not None:
-
-            current_app.logger.debug('We need to verify that the token was issued for this hosted domain: %s ' % (google_hosted_domain))
-
-
-
-	    # Get the JSON Web Token
-
-            id_token = r.json()['id_token']
-
-            current_app.logger.debug('The id_token is: %s' % (id_token))
-
-
-
-            # Extract the payload
-
-            (header_data, payload_data) = fetch_token_header_payload(id_token)
-
-            current_app.logger.debug('id_token.header_data: %s' % (header_data))
-
-            current_app.logger.debug('id_token.payload_data: %s' % (payload_data))
-
-
-
-            token_hd = payload_data.get('hd')
-
-            if token_hd != google_hosted_domain:
-
-                current_app.logger.debug('Verification failed: %s != %s' % (token_hd, google_hosted_domain))
-
-                return dict(message='Token is invalid %s' % token), 403
-
-            current_app.logger.debug('Verification passed')
-
-
-
-        # Step 2. Retrieve information about the current user
-
-        headers = {'Authorization': 'Bearer {0}'.format(token['access_token'])}
-
-
-
-        r = requests.get(people_api_url, headers=headers)
-
-        profile = r.json()
-
-
-
-        user = User.query.filter(User.email == profile['email']).first()
-
-
-
-        # if we get an sso user create them an account
-
-        if not user:
-
-            user = User(
-
-                email=profile['email'],
-
-                active=True,
-
-                role='View'
-
-                # profile_picture=profile.get('thumbnailPhotoUrl')
-
-            )
-
-            db.session.add(user)
-
-            db.session.commit()
-
-            db.session.refresh(user)
-
-
-
-        # Tell Flask-Principal the identity changed
-
-        identity_changed.send(current_app._get_current_object(), identity=Identity(user.id))
-
-        login_user(user)
-
-
-
-        return redirect(return_to, code=302)
-
-
-
-
-
-class OneLogin(Resource):
-
-    decorators = [rbac.allow(["anonymous"], ["GET", "POST"])]
-
-    def __init__(self):
-
-        self.reqparse = reqparse.RequestParser()
-
-        self.req = OneLogin.prepare_from_flask_request(request)
-
-        super(OneLogin, self).__init__()
-
-
-
-    @staticmethod
-
-    def prepare_from_flask_request(req):
-
-        url_data = urlparse(req.url)
-
-        return {
-
-            'http_host': req.host,
-
-            'server_port': url_data.port,
-
-            'script_name': req.path,
-
-            'get_data': req.args.copy(),
-
-            'post_data': req.form.copy(),
-
-            'https': ("on" if current_app.config.get("ONELOGIN_HTTPS") else "off")
-
-    }
-
-
-
-    def get(self):
-
-        return self.post()
-
-
-
-    def _consumer(self, auth):
-
-        auth.process_response()
-
-        errors = auth.get_errors()
-
-        if not errors:
-
-            if auth.is_authenticated:
-
-                return True
+                name, mod_path = self.library
 
             else:
 
-                return False
+                mod_path = self.library
+
+            try:
+
+                module = importlib.import_module(mod_path)
+
+            except ImportError as e:
+
+                raise ValueError("Couldn't load %r algorithm library: %s" %
+
+                                 (self.__class__.__name__, e))
+
+            return module
+
+        raise ValueError("Hasher %r doesn't specify a library attribute" %
+
+                         self.__class__.__name__)
+
+
+
+    def salt(self):
+
+        """
+
+        Generates a cryptographically secure nonce salt in ASCII
+
+        """
+
+        return get_random_string()
+
+
+
+    def verify(self, password, encoded):
+
+        """
+
+        Checks if the given password is correct
+
+        """
+
+        raise NotImplementedError('subclasses of BasePasswordHasher must provide a verify() method')
+
+
+
+    def encode(self, password, salt):
+
+        """
+
+        Creates an encoded database value
+
+
+
+        The result is normally formatted as "algorithm$salt$hash" and
+
+        must be fewer than 128 characters.
+
+        """
+
+        raise NotImplementedError('subclasses of BasePasswordHasher must provide an encode() method')
+
+
+
+    def safe_summary(self, encoded):
+
+        """
+
+        Returns a summary of safe values
+
+
+
+        The result is a dictionary and will be used where the password field
+
+        must be displayed to construct a safe representation of the password.
+
+        """
+
+        raise NotImplementedError('subclasses of BasePasswordHasher must provide a safe_summary() method')
+
+
+
+    def must_update(self, encoded):
+
+        return False
+
+
+
+    def harden_runtime(self, password, encoded):
+
+        """
+
+        Bridge the runtime gap between the work factor supplied in `encoded`
+
+        and the work factor suggested by this hasher.
+
+
+
+        Taking PBKDF2 as an example, if `encoded` contains 20000 iterations and
+
+        `self.iterations` is 30000, this method should run password through
+
+        another 10000 iterations of PBKDF2. Similar approaches should exist
+
+        for any hasher that has a work factor. If not, this method should be
+
+        defined as a no-op to silence the warning.
+
+        """
+
+        warnings.warn('subclasses of BasePasswordHasher should provide a harden_runtime() method')
+
+
+
+
+
+class PBKDF2PasswordHasher(BasePasswordHasher):
+
+    """
+
+    Secure password hashing using the PBKDF2 algorithm (recommended)
+
+
+
+    Configured to use PBKDF2 + HMAC + SHA256.
+
+    The result is a 64 byte binary string.  Iterations may be changed
+
+    safely but you must rename the algorithm if you change SHA256.
+
+    """
+
+    algorithm = "pbkdf2_sha256"
+
+    iterations = 30000
+
+    digest = hashlib.sha256
+
+
+
+    def encode(self, password, salt, iterations=None):
+
+        assert password is not None
+
+        assert salt and '$' not in salt
+
+        if not iterations:
+
+            iterations = self.iterations
+
+        hash = pbkdf2(password, salt, iterations, digest=self.digest)
+
+        hash = base64.b64encode(hash).decode('ascii').strip()
+
+        return "%s$%d$%s$%s" % (self.algorithm, iterations, salt, hash)
+
+
+
+    def verify(self, password, encoded):
+
+        algorithm, iterations, salt, hash = encoded.split('$', 3)
+
+        assert algorithm == self.algorithm
+
+        encoded_2 = self.encode(password, salt, int(iterations))
+
+        return constant_time_compare(encoded, encoded_2)
+
+
+
+    def safe_summary(self, encoded):
+
+        algorithm, iterations, salt, hash = encoded.split('$', 3)
+
+        assert algorithm == self.algorithm
+
+        return OrderedDict([
+
+            (_('algorithm'), algorithm),
+
+            (_('iterations'), iterations),
+
+            (_('salt'), mask_hash(salt)),
+
+            (_('hash'), mask_hash(hash)),
+
+        ])
+
+
+
+    def must_update(self, encoded):
+
+        algorithm, iterations, salt, hash = encoded.split('$', 3)
+
+        return int(iterations) != self.iterations
+
+
+
+    def harden_runtime(self, password, encoded):
+
+        algorithm, iterations, salt, hash = encoded.split('$', 3)
+
+        extra_iterations = self.iterations - int(iterations)
+
+        if extra_iterations > 0:
+
+            self.encode(password, salt, extra_iterations)
+
+
+
+
+
+class PBKDF2SHA1PasswordHasher(PBKDF2PasswordHasher):
+
+    """
+
+    Alternate PBKDF2 hasher which uses SHA1, the default PRF
+
+    recommended by PKCS #5. This is compatible with other
+
+    implementations of PBKDF2, such as openssl's
+
+    PKCS5_PBKDF2_HMAC_SHA1().
+
+    """
+
+    algorithm = "pbkdf2_sha1"
+
+    digest = hashlib.sha1
+
+
+
+
+
+class BCryptSHA256PasswordHasher(BasePasswordHasher):
+
+    """
+
+    Secure password hashing using the bcrypt algorithm (recommended)
+
+
+
+    This is considered by many to be the most secure algorithm but you
+
+    must first install the bcrypt library.  Please be warned that
+
+    this library depends on native C code and might cause portability
+
+    issues.
+
+    """
+
+    algorithm = "bcrypt_sha256"
+
+    digest = hashlib.sha256
+
+    library = ("bcrypt", "bcrypt")
+
+    rounds = 12
+
+
+
+    def salt(self):
+
+        bcrypt = self._load_library()
+
+        return bcrypt.gensalt(self.rounds)
+
+
+
+    def encode(self, password, salt):
+
+        bcrypt = self._load_library()
+
+        # Hash the password prior to using bcrypt to prevent password
+
+        # truncation as described in #20138.
+
+        if self.digest is not None:
+
+            # Use binascii.hexlify() because a hex encoded bytestring is
+
+            # Unicode on Python 3.
+
+            password = binascii.hexlify(self.digest(force_bytes(password)).digest())
 
         else:
 
-            current_app.logger.error('Error processing %s' % (', '.join(errors)))
+            password = force_bytes(password)
 
-            return False
 
 
+        data = bcrypt.hashpw(password, salt)
 
-    def post(self):
+        return "%s$%s" % (self.algorithm, force_text(data))
 
-        if "onelogin" not in current_app.config.get("ACTIVE_PROVIDERS"):
 
-            return "Onelogin is not enabled in the config.  See the ACTIVE_PROVIDERS section.", 404
 
-        auth = OneLogin_Saml2_Auth(self.req, current_app.config.get("ONELOGIN_SETTINGS"))
+    def verify(self, password, encoded):
 
+        algorithm, data = encoded.split('$', 1)
 
+        assert algorithm == self.algorithm
 
-        self.reqparse.add_argument('return_to', required=False, default=current_app.config.get('WEB_PATH'))
+        encoded_2 = self.encode(password, force_bytes(data))
 
-        self.reqparse.add_argument('acs', required=False)
+        return constant_time_compare(encoded, encoded_2)
 
-        self.reqparse.add_argument('sls', required=False)
 
 
+    def safe_summary(self, encoded):
 
-        args = self.reqparse.parse_args()
+        algorithm, empty, algostr, work_factor, data = encoded.split('$', 4)
 
+        assert algorithm == self.algorithm
 
+        salt, checksum = data[:22], data[22:]
 
-        return_to = args['return_to']
+        return OrderedDict([
 
+            (_('algorithm'), algorithm),
 
+            (_('work factor'), work_factor),
 
-        if args['acs'] != None:
+            (_('salt'), mask_hash(salt)),
 
-            # valids the SAML response and checks if successfully authenticated
+            (_('checksum'), mask_hash(checksum)),
 
-            if self._consumer(auth):
+        ])
 
-                email = auth.get_attribute(current_app.config.get("ONELOGIN_EMAIL_FIELD"))[0]
 
-                user = User.query.filter(User.email == email).first()
 
+    def must_update(self, encoded):
 
+        algorithm, empty, algostr, rounds, data = encoded.split('$', 4)
 
-                # if we get an sso user create them an account
+        return int(rounds) != self.rounds
 
-                if not user:
 
-                    user = User(
 
-                        email=email,
+    def harden_runtime(self, password, encoded):
 
-                        active=True,
+        _, data = encoded.split('$', 1)
 
-                        role=current_app.config.get('ONELOGIN_DEFAULT_ROLE')
+        salt = data[:29]  # Length of the salt in bcrypt.
 
-                        # profile_picture=profile.get('thumbnailPhotoUrl')
+        rounds = data.split('$')[2]
 
-                    )
+        # work factor is logarithmic, adding one doubles the load.
 
-                    db.session.add(user)
+        diff = 2**(self.rounds - int(rounds)) - 1
 
-                    db.session.commit()
+        while diff > 0:
 
-                    db.session.refresh(user)
+            self.encode(password, force_bytes(salt))
 
+            diff -= 1
 
 
-                # Tell Flask-Principal the identity changed
 
-                identity_changed.send(current_app._get_current_object(), identity=Identity(user.id))
 
-                login_user(user)
 
+class BCryptPasswordHasher(BCryptSHA256PasswordHasher):
 
+    """
 
-                self_url = OneLogin_Saml2_Utils.get_self_url(self.req)
+    Secure password hashing using the bcrypt algorithm
 
-                if 'RelayState' in request.form and self_url != request.form['RelayState']:
 
-                    return redirect(auth.redirect_to(request.form['RelayState']), code=302)
 
-                else:  
+    This is considered by many to be the most secure algorithm but you
 
-                    return redirect(current_app.config.get('BASE_URL'), code=302)
+    must first install the bcrypt library.  Please be warned that
 
-            else:
+    this library depends on native C code and might cause portability
 
-                return dict(message='OneLogin authentication failed.'), 403
+    issues.
 
-        elif args['sls'] != None:
 
-            return dict(message='OneLogin SLS not implemented yet.'), 405
 
-        else:
+    This hasher does not first hash the password which means it is subject to
 
-            return redirect(auth.login(return_to=return_to))
+    the 72 character bcrypt password truncation, most use cases should prefer
 
+    the BCryptSHA256PasswordHasher.
 
 
 
+    See: https://code.djangoproject.com/ticket/20138
 
-class Providers(Resource):
+    """
 
-    decorators = [rbac.allow(["anonymous"], ["GET"])]
+    algorithm = "bcrypt"
 
-    def __init__(self):
+    digest = None
 
-        super(Providers, self).__init__()
 
 
 
-    def get(self):
 
-        active_providers = []
+class SHA1PasswordHasher(BasePasswordHasher):
 
+    """
 
+    The SHA1 password hashing algorithm (not recommended)
 
-        for provider in current_app.config.get("ACTIVE_PROVIDERS"):
+    """
 
-            provider = provider.lower()
+    algorithm = "sha1"
 
 
 
-            if provider == "ping":
+    def encode(self, password, salt):
 
-                active_providers.append({
+        assert password is not None
 
-                    'name': current_app.config.get("PING_NAME"),
+        assert salt and '$' not in salt
 
-                    'url': current_app.config.get('PING_REDIRECT_URI'),
+        hash = hashlib.sha1(force_bytes(salt + password)).hexdigest()
 
-                    'redirectUri': current_app.config.get("PING_REDIRECT_URI"),
+        return "%s$%s$%s" % (self.algorithm, salt, hash)
 
-                    'clientId': current_app.config.get("PING_CLIENT_ID"),
 
-                    'responseType': 'code',
 
-                    'scope': ['openid', 'profile', 'email'],
+    def verify(self, password, encoded):
 
-                    'scopeDelimiter': ' ',
+        algorithm, salt, hash = encoded.split('$', 2)
 
-                    'authorizationEndpoint': current_app.config.get("PING_AUTH_ENDPOINT"),
+        assert algorithm == self.algorithm
 
-                    'requiredUrlParams': ['scope'],
+        encoded_2 = self.encode(password, salt)
 
-                    'type': '2.0'
+        return constant_time_compare(encoded, encoded_2)
 
-                })
 
-            elif provider == "google":
 
-                google_provider = {
+    def safe_summary(self, encoded):
 
-                    'name': 'google',
+        algorithm, salt, hash = encoded.split('$', 2)
 
-                    'clientId': current_app.config.get("GOOGLE_CLIENT_ID"),
+        assert algorithm == self.algorithm
 
-                    'url': api.url_for(Google, _external=True, _scheme='https'),
+        return OrderedDict([
 
-                    'redirectUri': api.url_for(Google, _external=True, _scheme='https'),
+            (_('algorithm'), algorithm),
 
-                    'authorizationEndpoint': current_app.config.get("GOOGLE_AUTH_ENDPOINT"),
+            (_('salt'), mask_hash(salt, show=2)),
 
-                    'scope': ['openid email'],
+            (_('hash'), mask_hash(hash)),
 
-                    'responseType': 'code'
+        ])
 
-                }
 
-                google_hosted_domain = current_app.config.get("GOOGLE_HOSTED_DOMAIN")
 
-                if google_hosted_domain is not None:
+    def harden_runtime(self, password, encoded):
 
-                    google_provider['hd'] = google_hosted_domain
+        pass
 
-                active_providers.append(google_provider)
 
-            elif provider == "onelogin":
 
-                active_providers.append({
 
-                    'name': 'OneLogin',
 
-                    'authorizationEndpoint': api.url_for(OneLogin)
+class MD5PasswordHasher(BasePasswordHasher):
 
-                })
+    """
 
-            else:
+    The Salted MD5 password hashing algorithm (not recommended)
 
-                raise Exception("Unknown authentication provider: {0}".format(provider))
+    """
 
+    algorithm = "md5"
 
 
-        return active_providers
 
+    def encode(self, password, salt):
 
+        assert password is not None
 
+        assert salt and '$' not in salt
 
+        hash = hashlib.md5(force_bytes(salt + password)).hexdigest()
 
-api.add_resource(Ping, '/auth/ping', endpoint='ping')
+        return "%s$%s$%s" % (self.algorithm, salt, hash)
 
-api.add_resource(Google, '/auth/google', endpoint='google')
 
-api.add_resource(Providers, '/auth/providers', endpoint='providers')
 
+    def verify(self, password, encoded):
 
+        algorithm, salt, hash = encoded.split('$', 2)
 
-if onelogin_import_success:
+        assert algorithm == self.algorithm
 
-    api.add_resource(OneLogin, '/auth/onelogin', endpoint='onelogin')
+        encoded_2 = self.encode(password, salt)
+
+        return constant_time_compare(encoded, encoded_2)
+
+
+
+    def safe_summary(self, encoded):
+
+        algorithm, salt, hash = encoded.split('$', 2)
+
+        assert algorithm == self.algorithm
+
+        return OrderedDict([
+
+            (_('algorithm'), algorithm),
+
+            (_('salt'), mask_hash(salt, show=2)),
+
+            (_('hash'), mask_hash(hash)),
+
+        ])
+
+
+
+    def harden_runtime(self, password, encoded):
+
+        pass
+
+
+
+
+
+class UnsaltedSHA1PasswordHasher(BasePasswordHasher):
+
+    """
+
+    Very insecure algorithm that you should *never* use; stores SHA1 hashes
+
+    with an empty salt.
+
+
+
+    This class is implemented because Django used to accept such password
+
+    hashes. Some older Django installs still have these values lingering
+
+    around so we need to handle and upgrade them properly.
+
+    """
+
+    algorithm = "unsalted_sha1"
+
+
+
+    def salt(self):
+
+        return ''
+
+
+
+    def encode(self, password, salt):
+
+        assert salt == ''
+
+        hash = hashlib.sha1(force_bytes(password)).hexdigest()
+
+        return 'sha1$$%s' % hash
+
+
+
+    def verify(self, password, encoded):
+
+        encoded_2 = self.encode(password, '')
+
+        return constant_time_compare(encoded, encoded_2)
+
+
+
+    def safe_summary(self, encoded):
+
+        assert encoded.startswith('sha1$$')
+
+        hash = encoded[6:]
+
+        return OrderedDict([
+
+            (_('algorithm'), self.algorithm),
+
+            (_('hash'), mask_hash(hash)),
+
+        ])
+
+
+
+    def harden_runtime(self, password, encoded):
+
+        pass
+
+
+
+
+
+class UnsaltedMD5PasswordHasher(BasePasswordHasher):
+
+    """
+
+    Incredibly insecure algorithm that you should *never* use; stores unsalted
+
+    MD5 hashes without the algorithm prefix, also accepts MD5 hashes with an
+
+    empty salt.
+
+
+
+    This class is implemented because Django used to store passwords this way
+
+    and to accept such password hashes. Some older Django installs still have
+
+    these values lingering around so we need to handle and upgrade them
+
+    properly.
+
+    """
+
+    algorithm = "unsalted_md5"
+
+
+
+    def salt(self):
+
+        return ''
+
+
+
+    def encode(self, password, salt):
+
+        assert salt == ''
+
+        return hashlib.md5(force_bytes(password)).hexdigest()
+
+
+
+    def verify(self, password, encoded):
+
+        if len(encoded) == 37 and encoded.startswith('md5$$'):
+
+            encoded = encoded[5:]
+
+        encoded_2 = self.encode(password, '')
+
+        return constant_time_compare(encoded, encoded_2)
+
+
+
+    def safe_summary(self, encoded):
+
+        return OrderedDict([
+
+            (_('algorithm'), self.algorithm),
+
+            (_('hash'), mask_hash(encoded, show=3)),
+
+        ])
+
+
+
+    def harden_runtime(self, password, encoded):
+
+        pass
+
+
+
+
+
+class CryptPasswordHasher(BasePasswordHasher):
+
+    """
+
+    Password hashing using UNIX crypt (not recommended)
+
+
+
+    The crypt module is not supported on all platforms.
+
+    """
+
+    algorithm = "crypt"
+
+    library = "crypt"
+
+
+
+    def salt(self):
+
+        return get_random_string(2)
+
+
+
+    def encode(self, password, salt):
+
+        crypt = self._load_library()
+
+        assert len(salt) == 2
+
+        data = crypt.crypt(force_str(password), salt)
+
+        # we don't need to store the salt, but Django used to do this
+
+        return "%s$%s$%s" % (self.algorithm, '', data)
+
+
+
+    def verify(self, password, encoded):
+
+        crypt = self._load_library()
+
+        algorithm, salt, data = encoded.split('$', 2)
+
+        assert algorithm == self.algorithm
+
+        return constant_time_compare(data, crypt.crypt(force_str(password), data))
+
+
+
+    def safe_summary(self, encoded):
+
+        algorithm, salt, data = encoded.split('$', 2)
+
+        assert algorithm == self.algorithm
+
+        return OrderedDict([
+
+            (_('algorithm'), algorithm),
+
+            (_('salt'), salt),
+
+            (_('hash'), mask_hash(data, show=3)),
+
+        ])
+
+
+
+    def harden_runtime(self, password, encoded):
+
+        pass

@@ -2,1292 +2,2372 @@
 # Safety: safe
 # Category: safe
 
-import os
+# -*- coding: utf-8 -*-
 
-import shutil
+#    Copyright (C) 2017-2018 CIRCL Computer Incident Response Center Luxembourg (smile gie)
+
+#    Copyright (C) 2017-2018 Christian Studer
+
+#
+
+#    This program is free software: you can redistribute it and/or modify
+
+#    it under the terms of the GNU Affero General Public License as
+
+#    published by the Free Software Foundation, either version 3 of the
+
+#    License, or (at your option) any later version.
+
+#
+
+#    This program is distributed in the hope that it will be useful,
+
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+
+#    GNU Affero General Public License for more details.
+
+#
+
+#    You should have received a copy of the GNU Affero General Public License
+
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+
 
 import sys
 
+import json
 
+import os
 
-from PIL import Image
+import time
 
-from PIL._util import py3
+import uuid
 
+import base64
 
+import stix2misp_mapping
 
-from .helper import PillowTestCase, hopper, unittest
+import stix.extensions.marking.ais
 
+from operator import attrgetter
 
+from pymisp import MISPEvent, MISPObject, MISPAttribute, __path__
 
+from stix.core import STIXPackage
 
+from collections import defaultdict
 
-class TestImage(PillowTestCase):
 
-    def test_image_modes_success(self):
 
-        for mode in [
+cybox_to_misp_object = {"Account": "credential", "AutonomousSystem": "asn",
 
-            "1",
+                        "EmailMessage": "email", "NetworkConnection": "network-connection",
 
-            "P",
+                        "NetworkSocket": "network-socket", "Process": "process",
 
-            "PA",
+                        "x509Certificate": "x509", "Whois": "whois"}
 
-            "L",
 
-            "LA",
 
-            "La",
+threat_level_mapping = {'High': '1', 'Medium': '2', 'Low': '3', 'Undefined': '4'}
 
-            "F",
 
-            "I",
 
-            "I;16",
+descFilename = os.path.join(__path__[0], 'data/describeTypes.json')
 
-            "I;16L",
+with open(descFilename, 'r') as f:
 
-            "I;16B",
+    categories = json.loads(f.read())['result'].get('categories')
 
-            "I;16N",
 
-            "RGB",
 
-            "RGBX",
+class StixParser():
 
-            "RGBA",
+    def __init__(self):
 
-            "RGBa",
+        super(StixParser, self).__init__()
 
-            "CMYK",
+        self.misp_event = MISPEvent()
 
-            "YCbCr",
+        self.misp_event['Galaxy'] = []
 
-            "LAB",
+        self.references = defaultdict(list)
 
-            "HSV",
 
-        ]:
 
-            Image.new(mode, (1, 1))
+    ################################################################################
 
+    ##            LOADING & UTILITY FUNCTIONS USED BY BOTH SUBCLASSES.            ##
 
+    ################################################################################
 
-    def test_image_modes_fail(self):
 
-        for mode in [
 
-            "",
+    # Load data from STIX document, and other usefull data
 
-            "bad",
+    def load_event(self, args, filename, from_misp, stix_version):
 
-            "very very long",
+        self.outputname = '{}.json'.format(filename)
 
-            "BGR;15",
+        try:
 
-            "BGR;16",
+            event_distribution = args[0]
 
-            "BGR;24",
+            if not isinstance(event_distribution, int):
 
-            "BGR;32",
+                event_distribution = int(event_distribution) if event_distribution.isdigit() else 5
 
-        ]:
+        except IndexError:
 
-            with self.assertRaises(ValueError) as e:
+            event_distribution = 5
 
-                Image.new(mode, (1, 1))
+        try:
 
-            self.assertEqual(str(e.exception), "unrecognized image mode")
+            attribute_distribution = args[1]
 
+            if attribute_distribution == 'event':
 
+                attribute_distribution = event_distribution
 
-    def test_sanity(self):
+            elif not isinstance(attribute_distribution, int):
 
+                attribute_distribution = int(attribute_distribution) if attribute_distribution.isdigit() else event_distribution
 
+        except IndexError:
 
-        im = Image.new("L", (100, 100))
+            attribute_distribution = event_distribution
 
-        self.assertEqual(repr(im)[:45], "<PIL.Image.Image image mode=L size=100x100 at")
+        self.misp_event.distribution = event_distribution
 
-        self.assertEqual(im.mode, "L")
+        self.__attribute_distribution = attribute_distribution
 
-        self.assertEqual(im.size, (100, 100))
+        self.from_misp = from_misp
 
+        self.load_mapping()
 
 
-        im = Image.new("RGB", (100, 100))
 
-        self.assertEqual(repr(im)[:45], "<PIL.Image.Image image mode=RGB size=100x100 ")
+    # Convert the MISP event we create from the STIX document into json format
 
-        self.assertEqual(im.mode, "RGB")
+    # and write it in the output file
 
-        self.assertEqual(im.size, (100, 100))
+    def saveFile(self):
 
+        eventDict = self.misp_event.to_json()
 
+        with open(self.outputname, 'wt', encoding='utf-8') as f:
 
-        Image.new("L", (100, 100), None)
+            f.write(eventDict)
 
-        im2 = Image.new("L", (100, 100), 0)
 
-        im3 = Image.new("L", (100, 100), "black")
 
+    # Load the mapping dictionary for STIX object types
 
+    def load_mapping(self):
 
-        self.assertEqual(im2.getcolors(), [(10000, 0)])
+        self.attribute_types_mapping = {
 
-        self.assertEqual(im3.getcolors(), [(10000, 0)])
+            "AccountObjectType": self.handle_credential,
 
+            'AddressObjectType': self.handle_address,
 
+            "ArtifactObjectType": self.handle_attachment,
 
-        self.assertRaises(ValueError, Image.new, "X", (100, 100))
+            "ASObjectType": self.handle_as,
 
-        self.assertRaises(ValueError, Image.new, "", (100, 100))
+            "CustomObjectType": self.handle_custom,
 
-        # self.assertRaises(MemoryError, Image.new, "L", (1000000, 1000000))
+            "DNSRecordObjectType": self.handle_dns,
 
+            'DomainNameObjectType': self.handle_domain_or_url,
 
+            'EmailMessageObjectType': self.handle_email_attribute,
 
-    def test_width_height(self):
+            'FileObjectType': self.handle_file,
 
-        im = Image.new("RGB", (1, 2))
+            'HostnameObjectType': self.handle_hostname,
 
-        self.assertEqual(im.width, 1)
+            'HTTPSessionObjectType': self.handle_http,
 
-        self.assertEqual(im.height, 2)
+            'MutexObjectType': self.handle_mutex,
 
+            'NetworkConnectionObjectType': self.handle_network_connection,
 
+            'NetworkSocketObjectType': self.handle_network_socket,
 
-        with self.assertRaises(AttributeError):
+            'PDFFileObjectType': self.handle_file,
 
-            im.size = (3, 4)
+            'PortObjectType': self.handle_port,
 
+            'ProcessObjectType': self.handle_process,
 
+            'SocketAddressObjectType': self.handle_socket_address,
 
-    def test_invalid_image(self):
+            'SystemObjectType': self.handle_system,
 
-        if py3:
+            'URIObjectType': self.handle_domain_or_url,
 
-            import io
+            "WhoisObjectType": self.handle_whois,
 
+            "WindowsFileObjectType": self.handle_file,
 
+            'WindowsRegistryKeyObjectType': self.handle_regkey,
 
-            im = io.BytesIO(b"")
+            "WindowsExecutableFileObjectType": self.handle_pe,
+
+            "WindowsServiceObjectType": self.handle_windows_service,
+
+            "X509CertificateObjectType": self.handle_x509
+
+        }
+
+
+
+        self.marking_mapping = {
+
+            'AIS:AISMarkingStructure': self.parse_AIS_marking,
+
+            'tlpMarking:TLPMarkingStructureType': self.parse_TLP_marking
+
+        }
+
+
+
+    def parse_marking(self, handling):
+
+        tags = []
+
+        if hasattr(handling, 'marking_structures') and handling.marking_structures:
+
+            for marking in handling.marking_structures:
+
+                try:
+
+                    tags.extend(self.marking_mapping[marking._XSI_TYPE](marking))
+
+                except KeyError:
+
+                    print(marking._XSI_TYPE, file=sys.stderr)
+
+                    continue
+
+        return tags
+
+
+
+    def set_distribution(self):
+
+        for attribute in self.misp_event.attributes:
+
+            attribute.distribution = self.__attribute_distribution
+
+        for misp_object in self.misp_event.objects:
+
+            misp_object.distribution = self.__attribute_distribution
+
+            for attribute in misp_object.attributes:
+
+                attribute.distribution = self.__attribute_distribution
+
+
+
+    # Make references between objects
+
+    def build_references(self):
+
+        for misp_object in self.misp_event.objects:
+
+            object_uuid = misp_object.uuid
+
+            if object_uuid in self.references:
+
+                for reference in self.references[object_uuid]:
+
+                    misp_object.add_reference(reference['idref'], reference['relationship'])
+
+
+
+    # Set info & title values in the new MISP event
+
+    def get_event_info(self):
+
+        info = "Imported from external STIX event"
+
+        try:
+
+            try:
+
+                title = self.event.stix_header.title
+
+            except AttributeError:
+
+                title = self.event.title
+
+            if title:
+
+                info = title
+
+        except AttributeError:
+
+            pass
+
+        return info
+
+
+
+    # Get timestamp & date values in the new MISP event
+
+    def get_timestamp_and_date(self):
+
+        stix_date = self.event.timestamp
+
+        try:
+
+            date = stix_date.split("T")[0]
+
+        except AttributeError:
+
+            date = stix_date
+
+        return date, self.getTimestampfromDate(stix_date)
+
+
+
+    # Translate date into timestamp
+
+    @staticmethod
+
+    def getTimestampfromDate(date):
+
+        try:
+
+            try:
+
+                dt = date.split('+')[0]
+
+                d = int(time.mktime(time.strptime(dt, "%Y-%m-%d %H:%M:%S")))
+
+            except ValueError:
+
+                dt = date.split('.')[0]
+
+                d = int(time.mktime(time.strptime(dt, "%Y-%m-%d %H:%M:%S")))
+
+        except AttributeError:
+
+            d = int(time.mktime(date.timetuple()))
+
+        return d
+
+
+
+    ################################################################################
+
+    ##           STIX OBJECTS PARSING FUNCTIONS USED BY BOTH SUBCLASSES           ##
+
+    ################################################################################
+
+
+
+    # Define type & value of an attribute or object in MISP
+
+    def handle_attribute_type(self, properties, is_object=False, title=None, observable_id=None):
+
+        xsi_type = properties._XSI_TYPE
+
+        # try:
+
+        args = [properties]
+
+        if xsi_type in ("FileObjectType", "PDFFileObjectType", "WindowsFileObjectType"):
+
+            args.append(is_object)
+
+        elif xsi_type == "ArtifactObjectType":
+
+            args.append(title)
+
+        return self.attribute_types_mapping[xsi_type](*args)
+
+        # except AttributeError:
+
+        #     # ATM USED TO TEST TYPES
+
+        #     print("Unparsed type: {}".format(xsi_type))
+
+        #     sys.exit(1)
+
+
+
+    # Return type & value of an ip address attribute
+
+    @staticmethod
+
+    def handle_address(properties):
+
+        if properties.is_source:
+
+            ip_type = "ip-src"
 
         else:
 
-            import StringIO
+            ip_type = "ip-dst"
 
+        return ip_type, properties.address_value.value, "ip"
 
 
-            im = StringIO.StringIO("")
 
-        self.assertRaises(IOError, Image.open, im)
+    def handle_as(self, properties):
 
+        attributes = self.fetch_attributes_with_partial_key_parsing(properties, stix2misp_mapping._as_mapping)
 
+        return attributes[0] if len(attributes) == 1 else ('asn', self.return_attributes(attributes), '')
 
-    def test_bad_mode(self):
 
-        self.assertRaises(ValueError, Image.open, "filename", "bad mode")
 
+    # Return type & value of an attachment attribute
 
+    @staticmethod
 
-    @unittest.skipUnless(Image.HAS_PATHLIB, "requires pathlib/pathlib2")
+    def handle_attachment(properties, title):
 
-    def test_pathlib(self):
+        if properties.hashes:
 
-        from PIL.Image import Path
+            return "malware-sample", "{}|{}".format(title, properties.hashes[0], properties.raw_artifact.value)
 
+        return stix2misp_mapping.eventTypes[properties._XSI_TYPE]['type'], title, properties.raw_artifact.value
 
 
-        im = Image.open(Path("Tests/images/multipage-mmap.tiff"))
 
-        self.assertEqual(im.mode, "P")
+    # Return type & attributes of a credential object
 
-        self.assertEqual(im.size, (10, 10))
+    def handle_credential(self, properties):
 
+        attributes = []
 
+        if properties.description:
 
-        im = Image.open(Path("Tests/images/hopper.jpg"))
+            attributes.append(["text", properties.description.value, "text"])
 
-        self.assertEqual(im.mode, "RGB")
+        if properties.authentication:
 
-        self.assertEqual(im.size, (128, 128))
+            for authentication in properties.authentication:
 
+                attributes += self.fetch_attributes_with_key_parsing(authentication, stix2misp_mapping._credential_authentication_mapping)
 
+        if properties.custom_properties:
 
-        temp_file = self.tempfile("temp.jpg")
+            for prop in properties.custom_properties:
 
-        if os.path.exists(temp_file):
+                if prop.name in stix2misp_mapping._credential_custom_types:
 
-            os.remove(temp_file)
+                    attributes.append(['text', prop.value, prop.name])
 
-        im.save(Path(temp_file))
+        return attributes[0] if len(attributes) == 1 else ("credential", self.return_attributes(attributes), "")
 
 
 
-    def test_fp_name(self):
+    # Return type & attributes of a dns object
 
-        temp_file = self.tempfile("temp.jpg")
+    def handle_dns(self, properties):
 
+        relation = []
 
+        if properties.domain_name:
 
-        class FP(object):
+            relation.append(["domain", str(properties.domain_name.value), ""])
 
-            def write(a, b):
+        if properties.ip_address:
 
-                pass
+            relation.append(["ip-dst", str(properties.ip_address.value), ""])
 
+        if relation:
 
+            if len(relation) == '2':
 
-        fp = FP()
+                domain = relation[0][1]
 
-        fp.name = temp_file
+                ip = relattion[1][1]
 
+                attributes = [["text", domain, "rrname"], ["text", ip, "rdata"]]
 
+                rrtype = "AAAA" if ":" in ip else "A"
 
-        im = hopper()
+                attributes.append(["text", rrtype, "rrtype"])
 
-        im.save(fp)
+                return "passive-dns", self.return_attributes(attributes), ""
 
+            return relation[0]
 
 
-    def test_tempfile(self):
 
-        # see #1460, pathlib support breaks tempfile.TemporaryFile on py27
+    # Return type & value of a domain or url attribute
 
-        # Will error out on save on 3.0.0
+    @staticmethod
 
-        import tempfile
+    def handle_domain_or_url(properties):
 
+        event_types = stix2misp_mapping.eventTypes[properties._XSI_TYPE]
 
+        return event_types['type'], properties.value.value, event_types['relation']
 
-        im = hopper()
 
-        with tempfile.TemporaryFile() as fp:
 
-            im.save(fp, "JPEG")
+    # Return type & value of an email attribute
 
-            fp.seek(0)
+    def handle_email_attribute(self, properties):
 
-            reloaded = Image.open(fp)
+        if properties.header:
 
-            self.assert_image_similar(im, reloaded, 20)
+            header = properties.header
 
+            attributes = self.fetch_attributes_with_key_parsing(header, stix2misp_mapping._email_mapping)
 
+            if header.to:
 
-    def test_unknown_extension(self):
+                for to in header.to:
 
-        im = hopper()
+                    attributes.append(["email-dst", to.address_value.value, "to"])
 
-        temp_file = self.tempfile("temp.unknown")
+            if header.cc:
 
-        self.assertRaises(ValueError, im.save, temp_file)
+                for cc in header.cc:
 
+                    attributes.append(["email-dst", cc.address_value.value, "cc"])
 
+        else:
 
-    def test_internals(self):
+            attributes = []
 
-        im = Image.new("L", (100, 100))
+        if properties.attachments:
 
-        im.readonly = 1
+            attributes.append(self.handle_email_attachment(properties.parent))
 
-        im._copy()
+        return attributes[0] if len(attributes) == 1 else ("email", self.return_attributes(attributes), "")
 
-        self.assertFalse(im.readonly)
 
 
+    # Return type & value of an email attachment
 
-        im.readonly = 1
+    @staticmethod
 
-        im.paste(0, (0, 0, 100, 100))
+    def handle_email_attachment(indicator_object):
 
-        self.assertFalse(im.readonly)
+        properties = indicator_object.related_objects[0].properties
 
+        return ["email-attachment", properties.file_name.value, "attachment"]
 
 
-    @unittest.skipIf(
 
-        sys.platform.startswith("win32"), "Test requires opening tempfile twice"
+    # Return type & attributes of a file object
 
-    )
+    def handle_file(self, properties, is_object):
 
-    def test_readonly_save(self):
+        b_hash, b_file = False, False
 
-        temp_file = self.tempfile("temp.bmp")
+        attributes = []
 
-        shutil.copy("Tests/images/rgb32bf-rgba.bmp", temp_file)
+        if properties.hashes:
 
+            b_hash = True
 
+            for h in properties.hashes:
 
-        im = Image.open(temp_file)
+                attributes.append(self.handle_hashes_attribute(h))
 
-        self.assertTrue(im.readonly)
+        if properties.file_name:
 
-        im.save(temp_file)
+            value = properties.file_name.value
 
+            if value:
 
+                b_file = True
 
-    def test_dump(self):
+                attribute_type, relation = stix2misp_mapping.eventTypes[properties._XSI_TYPE]
 
-        im = Image.new("L", (10, 10))
+                attributes.append([attribute_type, value, relation])
 
-        im._dump(self.tempfile("temp_L.ppm"))
+        attributes.extend(self.fetch_attributes_with_keys(properties, stix2misp_mapping._file_mapping))
 
+        if len(attributes) == 1:
 
+            attribute = attributes[0]
 
-        im = Image.new("RGB", (10, 10))
+            return attribute[0] if attribute[2] != "fullpath" else "filename", attribute[1], ""
 
-        im._dump(self.tempfile("temp_RGB.ppm"))
+        if len(attributes) == 2:
 
+            if b_hash and b_file:
 
+                return self.handle_filename_object(attributes, is_object)
 
-        im = Image.new("HSV", (10, 10))
+            path, filename = self.handle_filename_path_case(attributes)
 
-        self.assertRaises(ValueError, im._dump, self.tempfile("temp_HSV.ppm"))
+            if path and filename:
 
+                attribute_value = "{}\\{}".format(path, filename)
 
+                if '\\' in filename and path == filename:
 
-    def test_comparison_with_other_type(self):
+                    attribute_value = filename
 
-        # Arrange
+                return "filename", attribute_value, ""
 
-        item = Image.new("RGB", (25, 25), "#000")
+        return "file", self.return_attributes(attributes), ""
 
-        num = 12
 
 
+    # Determine path & filename from a complete path or filename attribute
 
-        # Act/Assert
+    @staticmethod
 
-        # Shouldn't cause AttributeError (#774)
+    def handle_filename_path_case(attributes):
 
-        self.assertFalse(item is None)
+        path, filename = [""] * 2
 
-        self.assertFalse(item == num)
+        if attributes[0][2] == 'filename' and attributes[1][2] == 'path':
 
+            path = attributes[1][1]
 
+            filename = attributes[0][1]
 
-    def test_expand_x(self):
+        elif attributes[0][2] == 'path' and attributes[1][2] == 'filename':
 
-        # Arrange
+            path = attributes[0][1]
 
-        im = hopper()
+            filename = attributes[1][1]
 
-        orig_size = im.size
+        return path, filename
 
-        xmargin = 5
 
 
+    # Return the appropriate type & value when we have 1 filename & 1 hash value
 
-        # Act
+    @staticmethod
 
-        im = im._expand(xmargin)
+    def handle_filename_object(attributes, is_object):
 
+        for attribute in attributes:
 
+            attribute_type, attribute_value, _ = attribute
 
-        # Assert
+            if attribute_type == "filename":
 
-        self.assertEqual(im.size[0], orig_size[0] + 2 * xmargin)
-
-        self.assertEqual(im.size[1], orig_size[1] + 2 * xmargin)
-
-
-
-    def test_expand_xy(self):
-
-        # Arrange
-
-        im = hopper()
-
-        orig_size = im.size
-
-        xmargin = 5
-
-        ymargin = 3
-
-
-
-        # Act
-
-        im = im._expand(xmargin, ymargin)
-
-
-
-        # Assert
-
-        self.assertEqual(im.size[0], orig_size[0] + 2 * xmargin)
-
-        self.assertEqual(im.size[1], orig_size[1] + 2 * ymargin)
-
-
-
-    def test_getbands(self):
-
-        # Assert
-
-        self.assertEqual(hopper("RGB").getbands(), ("R", "G", "B"))
-
-        self.assertEqual(hopper("YCbCr").getbands(), ("Y", "Cb", "Cr"))
-
-
-
-    def test_getchannel_wrong_params(self):
-
-        im = hopper()
-
-
-
-        self.assertRaises(ValueError, im.getchannel, -1)
-
-        self.assertRaises(ValueError, im.getchannel, 3)
-
-        self.assertRaises(ValueError, im.getchannel, "Z")
-
-        self.assertRaises(ValueError, im.getchannel, "1")
-
-
-
-    def test_getchannel(self):
-
-        im = hopper("YCbCr")
-
-        Y, Cb, Cr = im.split()
-
-
-
-        self.assert_image_equal(Y, im.getchannel(0))
-
-        self.assert_image_equal(Y, im.getchannel("Y"))
-
-        self.assert_image_equal(Cb, im.getchannel(1))
-
-        self.assert_image_equal(Cb, im.getchannel("Cb"))
-
-        self.assert_image_equal(Cr, im.getchannel(2))
-
-        self.assert_image_equal(Cr, im.getchannel("Cr"))
-
-
-
-    def test_getbbox(self):
-
-        # Arrange
-
-        im = hopper()
-
-
-
-        # Act
-
-        bbox = im.getbbox()
-
-
-
-        # Assert
-
-        self.assertEqual(bbox, (0, 0, 128, 128))
-
-
-
-    def test_ne(self):
-
-        # Arrange
-
-        im1 = Image.new("RGB", (25, 25), "black")
-
-        im2 = Image.new("RGB", (25, 25), "white")
-
-
-
-        # Act / Assert
-
-        self.assertNotEqual(im1, im2)
-
-
-
-    def test_alpha_composite(self):
-
-        # https://stackoverflow.com/questions/3374878
-
-        # Arrange
-
-        from PIL import ImageDraw
-
-
-
-        expected_colors = sorted(
-
-            [
-
-                (1122, (128, 127, 0, 255)),
-
-                (1089, (0, 255, 0, 255)),
-
-                (3300, (255, 0, 0, 255)),
-
-                (1156, (170, 85, 0, 192)),
-
-                (1122, (0, 255, 0, 128)),
-
-                (1122, (255, 0, 0, 128)),
-
-                (1089, (0, 255, 0, 0)),
-
-            ]
-
-        )
-
-
-
-        dst = Image.new("RGBA", size=(100, 100), color=(0, 255, 0, 255))
-
-        draw = ImageDraw.Draw(dst)
-
-        draw.rectangle((0, 33, 100, 66), fill=(0, 255, 0, 128))
-
-        draw.rectangle((0, 67, 100, 100), fill=(0, 255, 0, 0))
-
-        src = Image.new("RGBA", size=(100, 100), color=(255, 0, 0, 255))
-
-        draw = ImageDraw.Draw(src)
-
-        draw.rectangle((33, 0, 66, 100), fill=(255, 0, 0, 128))
-
-        draw.rectangle((67, 0, 100, 100), fill=(255, 0, 0, 0))
-
-
-
-        # Act
-
-        img = Image.alpha_composite(dst, src)
-
-
-
-        # Assert
-
-        img_colors = sorted(img.getcolors())
-
-        self.assertEqual(img_colors, expected_colors)
-
-
-
-    def test_alpha_inplace(self):
-
-        src = Image.new("RGBA", (128, 128), "blue")
-
-
-
-        over = Image.new("RGBA", (128, 128), "red")
-
-        mask = hopper("L")
-
-        over.putalpha(mask)
-
-
-
-        target = Image.alpha_composite(src, over)
-
-
-
-        # basic
-
-        full = src.copy()
-
-        full.alpha_composite(over)
-
-        self.assert_image_equal(full, target)
-
-
-
-        # with offset down to right
-
-        offset = src.copy()
-
-        offset.alpha_composite(over, (64, 64))
-
-        self.assert_image_equal(
-
-            offset.crop((64, 64, 127, 127)), target.crop((0, 0, 63, 63))
-
-        )
-
-        self.assertEqual(offset.size, (128, 128))
-
-
-
-        # offset and crop
-
-        box = src.copy()
-
-        box.alpha_composite(over, (64, 64), (0, 0, 32, 32))
-
-        self.assert_image_equal(box.crop((64, 64, 96, 96)), target.crop((0, 0, 32, 32)))
-
-        self.assert_image_equal(box.crop((96, 96, 128, 128)), src.crop((0, 0, 32, 32)))
-
-        self.assertEqual(box.size, (128, 128))
-
-
-
-        # source point
-
-        source = src.copy()
-
-        source.alpha_composite(over, (32, 32), (32, 32, 96, 96))
-
-
-
-        self.assert_image_equal(
-
-            source.crop((32, 32, 96, 96)), target.crop((32, 32, 96, 96))
-
-        )
-
-        self.assertEqual(source.size, (128, 128))
-
-
-
-        # errors
-
-        self.assertRaises(ValueError, source.alpha_composite, over, "invalid source")
-
-        self.assertRaises(
-
-            ValueError, source.alpha_composite, over, (0, 0), "invalid destination"
-
-        )
-
-        self.assertRaises(ValueError, source.alpha_composite, over, 0)
-
-        self.assertRaises(ValueError, source.alpha_composite, over, (0, 0), 0)
-
-        self.assertRaises(ValueError, source.alpha_composite, over, (0, -1))
-
-        self.assertRaises(ValueError, source.alpha_composite, over, (0, 0), (0, -1))
-
-
-
-    def test_registered_extensions_uninitialized(self):
-
-        # Arrange
-
-        Image._initialized = 0
-
-        extension = Image.EXTENSION
-
-        Image.EXTENSION = {}
-
-
-
-        # Act
-
-        Image.registered_extensions()
-
-
-
-        # Assert
-
-        self.assertEqual(Image._initialized, 2)
-
-
-
-        # Restore the original state and assert
-
-        Image.EXTENSION = extension
-
-        self.assertTrue(Image.EXTENSION)
-
-
-
-    def test_registered_extensions(self):
-
-        # Arrange
-
-        # Open an image to trigger plugin registration
-
-        Image.open("Tests/images/rgb.jpg")
-
-
-
-        # Act
-
-        extensions = Image.registered_extensions()
-
-
-
-        # Assert
-
-        self.assertTrue(extensions)
-
-        for ext in [".cur", ".icns", ".tif", ".tiff"]:
-
-            self.assertIn(ext, extensions)
-
-
-
-    def test_effect_mandelbrot(self):
-
-        # Arrange
-
-        size = (512, 512)
-
-        extent = (-3, -2.5, 2, 2.5)
-
-        quality = 100
-
-
-
-        # Act
-
-        im = Image.effect_mandelbrot(size, extent, quality)
-
-
-
-        # Assert
-
-        self.assertEqual(im.size, (512, 512))
-
-        im2 = Image.open("Tests/images/effect_mandelbrot.png")
-
-        self.assert_image_equal(im, im2)
-
-
-
-    def test_effect_mandelbrot_bad_arguments(self):
-
-        # Arrange
-
-        size = (512, 512)
-
-        # Get coordinates the wrong way round:
-
-        extent = (+3, +2.5, -2, -2.5)
-
-        # Quality < 2:
-
-        quality = 1
-
-
-
-        # Act/Assert
-
-        self.assertRaises(ValueError, Image.effect_mandelbrot, size, extent, quality)
-
-
-
-    def test_effect_noise(self):
-
-        # Arrange
-
-        size = (100, 100)
-
-        sigma = 128
-
-
-
-        # Act
-
-        im = Image.effect_noise(size, sigma)
-
-
-
-        # Assert
-
-        self.assertEqual(im.size, (100, 100))
-
-        self.assertEqual(im.mode, "L")
-
-        p0 = im.getpixel((0, 0))
-
-        p1 = im.getpixel((0, 1))
-
-        p2 = im.getpixel((0, 2))
-
-        p3 = im.getpixel((0, 3))
-
-        p4 = im.getpixel((0, 4))
-
-        self.assert_not_all_same([p0, p1, p2, p3, p4])
-
-
-
-    def test_effect_spread(self):
-
-        # Arrange
-
-        im = hopper()
-
-        distance = 10
-
-
-
-        # Act
-
-        im2 = im.effect_spread(distance)
-
-
-
-        # Assert
-
-        self.assertEqual(im.size, (128, 128))
-
-        im3 = Image.open("Tests/images/effect_spread.png")
-
-        self.assert_image_similar(im2, im3, 110)
-
-
-
-    def test_check_size(self):
-
-        # Checking that the _check_size function throws value errors
-
-        # when we want it to.
-
-        with self.assertRaises(ValueError):
-
-            Image.new("RGB", 0)  # not a tuple
-
-        with self.assertRaises(ValueError):
-
-            Image.new("RGB", (0,))  # Tuple too short
-
-        with self.assertRaises(ValueError):
-
-            Image.new("RGB", (-1, -1))  # w,h < 0
-
-
-
-        # this should pass with 0 sized images, #2259
-
-        im = Image.new("L", (0, 0))
-
-        self.assertEqual(im.size, (0, 0))
-
-
-
-        im = Image.new("L", (0, 100))
-
-        self.assertEqual(im.size, (0, 100))
-
-
-
-        im = Image.new("L", (100, 0))
-
-        self.assertEqual(im.size, (100, 0))
-
-
-
-        self.assertTrue(Image.new("RGB", (1, 1)))
-
-        # Should pass lists too
-
-        i = Image.new("RGB", [1, 1])
-
-        self.assertIsInstance(i.size, tuple)
-
-
-
-    def test_storage_neg(self):
-
-        # Storage.c accepted negative values for xsize, ysize.  Was
-
-        # test_neg_ppm, but the core function for that has been
-
-        # removed Calling directly into core to test the error in
-
-        # Storage.c, rather than the size check above
-
-
-
-        with self.assertRaises(ValueError):
-
-            Image.core.fill("RGB", (2, -2), (0, 0, 0))
-
-
-
-    def test_offset_not_implemented(self):
-
-        # Arrange
-
-        im = hopper()
-
-
-
-        # Act / Assert
-
-        self.assertRaises(NotImplementedError, im.offset, None)
-
-
-
-    def test_fromstring(self):
-
-        self.assertRaises(NotImplementedError, Image.fromstring)
-
-
-
-    def test_linear_gradient_wrong_mode(self):
-
-        # Arrange
-
-        wrong_mode = "RGB"
-
-
-
-        # Act / Assert
-
-        self.assertRaises(ValueError, Image.linear_gradient, wrong_mode)
-
-
-
-    def test_linear_gradient(self):
-
-
-
-        # Arrange
-
-        target_file = "Tests/images/linear_gradient.png"
-
-        for mode in ["L", "P"]:
-
-
-
-            # Act
-
-            im = Image.linear_gradient(mode)
-
-
-
-            # Assert
-
-            self.assertEqual(im.size, (256, 256))
-
-            self.assertEqual(im.mode, mode)
-
-            self.assertEqual(im.getpixel((0, 0)), 0)
-
-            self.assertEqual(im.getpixel((255, 255)), 255)
-
-            target = Image.open(target_file).convert(mode)
-
-            self.assert_image_equal(im, target)
-
-
-
-    def test_radial_gradient_wrong_mode(self):
-
-        # Arrange
-
-        wrong_mode = "RGB"
-
-
-
-        # Act / Assert
-
-        self.assertRaises(ValueError, Image.radial_gradient, wrong_mode)
-
-
-
-    def test_radial_gradient(self):
-
-
-
-        # Arrange
-
-        target_file = "Tests/images/radial_gradient.png"
-
-        for mode in ["L", "P"]:
-
-
-
-            # Act
-
-            im = Image.radial_gradient(mode)
-
-
-
-            # Assert
-
-            self.assertEqual(im.size, (256, 256))
-
-            self.assertEqual(im.mode, mode)
-
-            self.assertEqual(im.getpixel((0, 0)), 255)
-
-            self.assertEqual(im.getpixel((128, 128)), 0)
-
-            target = Image.open(target_file).convert(mode)
-
-            self.assert_image_equal(im, target)
-
-
-
-    def test_register_extensions(self):
-
-        test_format = "a"
-
-        exts = ["b", "c"]
-
-        for ext in exts:
-
-            Image.register_extension(test_format, ext)
-
-        ext_individual = Image.EXTENSION.copy()
-
-        for ext in exts:
-
-            del Image.EXTENSION[ext]
-
-
-
-        Image.register_extensions(test_format, exts)
-
-        ext_multiple = Image.EXTENSION.copy()
-
-        for ext in exts:
-
-            del Image.EXTENSION[ext]
-
-
-
-        self.assertEqual(ext_individual, ext_multiple)
-
-
-
-    def test_remap_palette(self):
-
-        # Test illegal image mode
-
-        im = hopper()
-
-        self.assertRaises(ValueError, im.remap_palette, None)
-
-
-
-    def test__new(self):
-
-        from PIL import ImagePalette
-
-
-
-        im = hopper("RGB")
-
-        im_p = hopper("P")
-
-
-
-        blank_p = Image.new("P", (10, 10))
-
-        blank_pa = Image.new("PA", (10, 10))
-
-        blank_p.palette = None
-
-        blank_pa.palette = None
-
-
-
-        def _make_new(base_image, im, palette_result=None):
-
-            new_im = base_image._new(im)
-
-            self.assertEqual(new_im.mode, im.mode)
-
-            self.assertEqual(new_im.size, im.size)
-
-            self.assertEqual(new_im.info, base_image.info)
-
-            if palette_result is not None:
-
-                self.assertEqual(new_im.palette.tobytes(), palette_result.tobytes())
+                filename_value = attribute_value
 
             else:
 
-                self.assertIsNone(new_im.palette)
+                hash_type, hash_value = attribute_type, attribute_value
+
+        value = "{}|{}".format(filename_value,  hash_value)
+
+        if is_object:
+
+            # file object attributes cannot be filename|hash, so it is malware-sample
+
+            attr_type = "malware-sample"
+
+            return attr_type, value, attr_type
+
+        # it could be malware-sample as well, but STIX is losing this information
+
+        return "filename|{}".format(hash_type), value, ""
 
 
 
-        _make_new(im, im_p, im_p.palette)
+    # Return type & value of a hash attribute
 
-        _make_new(im_p, im, None)
+    @staticmethod
 
-        _make_new(im, blank_p, ImagePalette.ImagePalette())
+    def handle_hashes_attribute(properties):
 
-        _make_new(im, blank_pa, ImagePalette.ImagePalette())
+        hash_type = properties.type_.value.lower()
 
+        try:
 
+            hash_value = properties.simple_hash_value.value
 
-    def test_p_from_rgb_rgba(self):
+        except AttributeError:
 
-        for mode, color in [
+            hash_value = properties.fuzzy_hash_value.value
 
-            ("RGB", "#DDEEFF"),
-
-            ("RGB", (221, 238, 255)),
-
-            ("RGBA", (221, 238, 255, 255)),
-
-        ]:
-
-            im = Image.new("P", (100, 100), color)
-
-            expected = Image.new(mode, (100, 100), color)
-
-            self.assert_image_equal(im.convert(mode), expected)
+        return hash_type, hash_value, hash_type
 
 
 
-    def test_no_resource_warning_on_save(self):
+    # Return type & value of a hostname attribute
 
-        # https://github.com/python-pillow/Pillow/issues/835
+    @staticmethod
 
-        # Arrange
+    def handle_hostname(properties):
 
-        test_file = "Tests/images/hopper.png"
+        event_types = stix2misp_mapping.eventTypes[properties._XSI_TYPE]
 
-        temp_file = self.tempfile("temp.jpg")
-
-
-
-        # Act/Assert
-
-        with Image.open(test_file) as im:
-
-            self.assert_warning(None, im.save, temp_file)
+        return event_types['type'], properties.hostname_value.value, event_types['relation']
 
 
 
-    def test_load_on_nonexclusive_multiframe(self):
+    # Return type & value of a http request attribute
 
-        with open("Tests/images/frozenpond.mpo", "rb") as fp:
+    @staticmethod
+
+    def handle_http(properties):
+
+        client_request = properties.http_request_response[0].http_client_request
+
+        if client_request.http_request_header:
+
+            request_header = client_request.http_request_header
+
+            if request_header.parsed_header:
+
+                value = request_header.parsed_header.user_agent.value
+
+                return "user-agent", value, "user-agent"
+
+            elif request_header.raw_header:
+
+                value = request_header.raw_header.value
+
+                return "http-method", value, "method"
+
+        elif client_request.http_request_line:
+
+            value = client_request.http_request_line.http_method.value
+
+            return "http-method", value, "method"
 
 
 
-            def act(fp):
+    # Return type & value of a mutex attribute
 
-                im = Image.open(fp)
+    @staticmethod
 
-                im.load()
+    def handle_mutex(properties):
 
+        event_types = stix2misp_mapping.eventTypes[properties._XSI_TYPE]
 
-
-            act(fp)
-
-
-
-            with Image.open(fp) as im:
-
-                im.load()
+        return event_types['type'], properties.name.value, event_types['relation']
 
 
 
-            self.assertFalse(fp.closed)
+    # Return type & attributes of a network connection object
+
+    def handle_network_connection(self, properties):
+
+        attributes = self.fetch_attributes_from_sockets(properties, stix2misp_mapping._network_connection_addresses)
+
+        for prop in ('layer3_protocol', 'layer4_protocol', 'layer7_protocol'):
+
+            if getattr(properties, prop):
+
+                attributes.append(['text', attrgetter("{}.value".format(prop))(properties), prop.replace('_', '-')])
+
+        if attributes:
+
+            return "network-connection", self.return_attributes(attributes), ""
 
 
 
-    def test_overrun(self):
+    # Return type & attributes of a network socket objet
 
-        for file in [
+    def handle_network_socket(self, properties):
 
-            "fli_overrun.bin",
+        attributes = self.fetch_attributes_from_sockets(properties, stix2misp_mapping._network_socket_addresses)
 
-            "sgi_overrun.bin",
+        attributes.extend(self.fetch_attributes_with_keys(properties, stix2misp_mapping._network_socket_mapping))
 
-            "sgi_overrun_expandrow.bin",
+        for prop in ('is_listening', 'is_blocking'):
 
-            "sgi_overrun_expandrow2.bin",
+            if getattr(properties, prop):
 
-            "pcx_overrun.bin",
+                attributes.append(["text", prop.split('_')[1], "state"])
 
-            "pcx_overrun2.bin",
+        if attributes:
 
-        ]:
+            return "network-socket", self.return_attributes(attributes), ""
 
-            im = Image.open(os.path.join("Tests/images", file))
+
+
+    # Return type & value of a port attribute
+
+    @staticmethod
+
+    def handle_port(*kwargs):
+
+        properties = kwargs[0]
+
+        event_types = stix2misp_mapping.eventTypes[properties._XSI_TYPE]
+
+        relation = event_types['relation']
+
+        if len(kwargs) > 1:
+
+            observable_id = kwargs[1]
+
+            if "srcPort" in observable_id:
+
+                relation = "src-{}".format(relation)
+
+            elif "dstPort" in observable_id:
+
+                relation = "dst-{}".format(relation)
+
+        return event_types['type'], properties.port_value.value, relation
+
+
+
+    # Return type & attributes of a process object
+
+    def handle_process(self, properties):
+
+        attributes = self.fetch_attributes_with_partial_key_parsing(properties, stix2misp_mapping._process_mapping)
+
+        if properties.child_pid_list:
+
+            for child in properties.child_pid_list:
+
+                attributes.append(["text", child.value, "child-pid"])
+
+        # if properties.port_list:
+
+        #     for port in properties.port_list:
+
+        #         attributes.append(["src-port", port.port_value.value, "port"])
+
+        if properties.network_connection_list:
+
+            references = []
+
+            for connection in properties.network_connection_list:
+
+                object_name, object_attributes, _ = self.handle_network_connection(connection)
+
+                object_uuid = str(uuid.uuid4())
+
+                misp_object = MISPObject(object_name)
+
+                misp_object.uuid = object_uuid
+
+                for attribute in object_attributes:
+
+                    misp_object.add_attribute(**attribute)
+
+                references.append(object_uuid)
+
+            return "process", self.return_attributes(attributes), {"process_uuid": references}
+
+        return "process", self.return_attributes(attributes), ""
+
+
+
+    # Return type & value of a regkey attribute
+
+    def handle_regkey(self, properties):
+
+        attributes = self.fetch_attributes_with_partial_key_parsing(properties, stix2misp_mapping._regkey_mapping)
+
+        if properties.values:
+
+            values = properties.values
+
+            value = values[0]
+
+            attributes += self.fetch_attributes_with_partial_key_parsing(value, stix2misp_mapping._regkey_value_mapping)
+
+        if len(attributes) in (2,3):
+
+            d_regkey = {key: value for (_, value, key) in attributes}
+
+            if 'hive' in d_regkey and 'key' in d_regkey:
+
+                regkey = "{}\\{}".format(d_regkey['hive'], d_regkey['key'])
+
+                if 'data' in d_regkey:
+
+                    return "regkey|value", "{} | {}".format(regkey, d_regkey['data']), ""
+
+                return "regkey", regkey, ""
+
+        return "registry-key", self.return_attributes(attributes), ""
+
+
+
+    @staticmethod
+
+    def handle_socket(attributes, socket, s_type):
+
+        for prop, mapping in stix2misp_mapping._socket_mapping.items():
+
+            if getattr(socket, prop):
+
+                attribute_type, properties_key, relation = mapping
+
+                attribute_type, relation = [elem.format(s_type) for elem in (attribute_type, relation)]
+
+                attributes.append([attribute_type, attrgetter('{}.{}.value'.format(prop, properties_key))(socket), relation])
+
+
+
+    # Parse a socket address object in order to return type & value
+
+    # of a composite attribute ip|port or hostname|port
+
+    def handle_socket_address(self, properties):
+
+        if properties.ip_address:
+
+            type1, value1, _ = self.handle_address(properties.ip_address)
+
+        elif properties.hostname:
+
+            type1 = "hostname"
+
+            value1 = properties.hostname.hostname_value.value
+
+        return "{}|port".format(type1), "{}|{}".format(value1, properties.port.port_value.value), ""
+
+
+
+    # Parse a system object to extract a mac-address attribute
+
+    @staticmethod
+
+    def handle_system(properties):
+
+        if properties.network_interface_list:
+
+            return "mac-address", str(properties.network_interface_list[0].mac), ""
+
+
+
+    # Parse a whois object:
+
+    # Return type & attributes of a whois object if we have the required fields
+
+    # Otherwise create attributes and return type & value of the last attribute to avoid crashing the parent function
+
+    def handle_whois(self, properties):
+
+        attributes = self.fetch_attributes_with_key_parsing(properties, stix2misp_mapping._whois_mapping)
+
+        required_one_of = True if attributes else False
+
+        if properties.registrants:
+
+            registrant = properties.registrants[0]
+
+            attributes += self.fetch_attributes_with_key_parsing(registrant, stix2misp_mapping._whois_registrant_mapping)
+
+        if properties.creation_date:
+
+            attributes.append(["datetime", properties.creation_date.value.strftime('%Y-%m-%d'), "creation-date"])
+
+            required_one_of = True
+
+        if properties.updated_date:
+
+            attributes.append(["datetime", properties.updated_date.value.strftime('%Y-%m-%d'), "modification-date"])
+
+        if properties.expiration_date:
+
+            attributes.append(["datetime", properties.expiration_date.value.strftime('%Y-%m-%d'), "expiration-date"])
+
+        if properties.nameservers:
+
+            for nameserver in properties.nameservers:
+
+                attributes.append(["hostname", nameserver.value.value, "nameserver"])
+
+        if properties.remarks:
+
+            attribute_type = "text"
+
+            relation = "comment" if attributes else attribute_type
+
+            attributes.append([attribute_type, properties.remarks.value, relation])
+
+            required_one_of = True
+
+        # Testing if we have the required attribute types for Object whois
+
+        if required_one_of:
+
+            # if yes, we return the object type and the attributes
+
+            return "whois", self.return_attributes(attributes), ""
+
+        # otherwise, attributes are added in the event, and one attribute is returned to not make the function crash
+
+        if len(attributes) == 1:
+
+            return attributes[0]
+
+        last_attribute = attributes.pop(-1)
+
+        for attribute in attributes:
+
+            attribute_type, attribute_value, attribute_relation = attribute
+
+            misp_attributes = {"comment": "Whois {}".format(attribute_relation)}
+
+            self.misp_event.add_attribute(attribute_type, attribute_value, **misp_attributes)
+
+        return last_attribute
+
+
+
+    # Return type & value of a windows service object
+
+    @staticmethod
+
+    def handle_windows_service(properties):
+
+        if properties.name:
+
+            return "windows-service-name", properties.name.value, ""
+
+
+
+    def handle_x509(self, properties):
+
+        attributes = self.handle_x509_certificate(properties.certificate) if properties.certificate else []
+
+        if properties.raw_certificate:
+
+            raw = properties.raw_certificate.value
 
             try:
 
-                im.load()
+                relation = "raw-base64" if raw == base64.b64encode(base64.b64decode(raw)).strip() else "pem"
 
-                self.assertFail()
+            except Exception:
 
-            except IOError as e:
+                relation = "pem"
 
-                self.assertEqual(str(e), "buffer overrun when reading image file")
+            attributes.append(["text", raw, relation])
+
+        if properties.certificate_signature:
+
+            signature = properties.certificate_signature
+
+            attribute_type = "x509-fingerprint-{}".format(signature.signature_algorithm.value.lower())
+
+            attributes.append([attribute_type, signature.signature.value, attribute_type])
+
+        return "x509", self.return_attributes(attributes), ""
 
 
 
-        with Image.open("Tests/images/fli_overrun2.bin") as im:
+    @staticmethod
+
+    def handle_x509_certificate(certificate):
+
+        attributes = []
+
+        if certificate.validity:
+
+            validity = certificate.validity
+
+            for prop in stix2misp_mapping._x509_datetime_types:
+
+                if getattr(validity, prop):
+
+                    attributes.append(['datetime', attrgetter('{}.value'.format(prop))(validity), 'validity-{}'.format(prop.replace('_', '-'))])
+
+        if certificate.subject_public_key:
+
+            subject_pubkey = certificate.subject_public_key
+
+            if subject_pubkey.rsa_public_key:
+
+                rsa_pubkey = subject_pubkey.rsa_public_key
+
+                for prop in stix2misp_mapping._x509__x509_pubkey_types:
+
+                    if getattr(rsa_pubkey, prop):
+
+                        attributes.append(['text', attrgetter('{}.value'.format(prop))(rsa_pubkey), 'pubkey-info-{}'.format(prop)])
+
+            if subject_pubkey.public_key_algorithm:
+
+                attributes.append(["text", subject_pubkey.public_key_algorithm.value, "pubkey-info-algorithm"])
+
+        for prop in stix2misp_mapping._x509_certificate_types:
+
+            if getattr(certificate, prop):
+
+                attributes.append(['text', attrgetter('{}.value'.format(prop))(certificate), prop.replace('_', '-')])
+
+        return attributes
+
+
+
+    # Return type & attributes of the file defining a portable executable object
+
+    def handle_pe(self, properties):
+
+        pe_uuid = self.parse_pe(properties)
+
+        file_type, file_value, _ = self.handle_file(properties, False)
+
+        return file_type, file_value, pe_uuid
+
+
+
+    # Parse attributes of a portable executable, create the corresponding object,
+
+    # and return its uuid to build the reference for the file object generated at the same time
+
+    def parse_pe(self, properties):
+
+        misp_object = MISPObject('pe')
+
+        filename = properties.file_name.value
+
+        for attr in ('internal-filename', 'original-filename'):
+
+            misp_object.add_attribute(**dict(zip(('type', 'value', 'object_relation'),('filename', filename, attr))))
+
+        if properties.headers:
+
+            headers = properties.headers
+
+            header_object = MISPObject('pe-section')
+
+            if headers.entropy:
+
+                header_object.add_attribute(**{"type": "float", "object_relation": "entropy",
+
+                                               "value": headers.entropy.value.value})
+
+            file_header = headers.file_header
+
+            misp_object.add_attribute(**{"type": "counter", "object_relation": "number-sections",
+
+                                         "value": file_header.number_of_sections.value})
+
+            for h in file_header.hashes:
+
+                hash_type, hash_value, hash_relation = self.handle_hashes_attribute(h)
+
+                header_object.add_attribute(**{"type": hash_type, "value": hash_value, "object_relation": hash_relation})
+
+            if file_header.size_of_optional_header:
+
+                header_object.add_attribute(**{"type": "size-in-bytes", "object_relation": "size-in-bytes",
+
+                                               "value": file_header.size_of_optional_header.value})
+
+            self.misp_event.add_object(**header_object)
+
+            misp_object.add_reference(header_object.uuid, 'header-of')
+
+        if properties.sections:
+
+            for section in properties.sections:
+
+                section_uuid = self.parse_pe_section(section)
+
+                misp_object.add_reference(section_uuid, 'included-in')
+
+        self.misp_event.add_object(**misp_object)
+
+        return {"pe_uuid": misp_object.uuid}
+
+
+
+    # Parse attributes of a portable executable section, create the corresponding object,
+
+    # and return its uuid to build the reference for the pe object generated at the same time
+
+    def parse_pe_section(self, section):
+
+        section_object = MISPObject('pe-section')
+
+        header_hashes = section.header_hashes
+
+        for h in header_hashes:
+
+            hash_type, hash_value, hash_relation = self.handle_hashes_attribute(h)
+
+            section_object.add_attribute(**{"type": hash_type, "value": hash_value, "object_relation": hash_relation})
+
+        if section.entropy:
+
+            section_object.add_attribute(**{"type": "float", "object_relation": "entropy",
+
+                                            "value": section.entropy.value.value})
+
+        if section.section_header:
+
+            section_header = section.section_header
+
+            section_object.add_attribute(**{"type": "text", "object_relation": "name",
+
+                                            "value": section_header.name.value})
+
+            section_object.add_attribute(**{"type": "size-in-bytes", "object_relation": "size-in-bytes",
+
+                                            "value": section_header.size_of_raw_data.value})
+
+        self.misp_event.add_object(**section_object)
+
+        return section_object.uuid
+
+
+
+    ################################################################################
+
+    ##             MARKINGS PARSING FUNCTIONS USED BY BOTH SUBCLASSES             ##
+
+    ################################################################################
+
+
+
+    def parse_AIS_marking(self, marking):
+
+        tags = []
+
+        if hasattr(marking, 'is_proprietary') and marking.is_proprietary:
+
+            proprietary = "Is"
+
+            marking = marking.is_proprietary
+
+        elif hasattr(marking, 'not_proprietary') and marking.not_proprietary:
+
+            proprietary = "Not"
+
+            marking = marking.not_proprietary
+
+        else:
+
+            return
+
+        mapping = stix2misp_mapping._AIS_marking_mapping
+
+        prefix = mapping['prefix']
+
+        tags.append('{}{}'.format(prefix, mapping['proprietary'].format(proprietary)))
+
+        if hasattr(marking, 'cisa_proprietary'):
 
             try:
 
-                im.seek(1)
+                cisa_proprietary = marking.cisa_proprietary.numerator
 
-                self.assertFail()
+                cisa_proprietary = 'true' if cisa_proprietary == 1 else 'false'
 
-            except IOError as e:
+                tags.append('{}{}'.format(prefix, mapping['cisa_proprietary'].format(cisa_proprietary)))
 
-                self.assertEqual(str(e), "buffer overrun when reading image file")
+            except AttributeError:
 
+                pass
 
+        for ais_field in ('ais_consent', 'tlp_marking'):
 
+            if hasattr(marking, ais_field) and getattr(marking, ais_field):
 
+                key, tag = mapping[ais_field]
 
-class MockEncoder(object):
+                tags.append('{}{}'.format(prefix, tag.format(getattr(getattr(marking, ais_field), key))))
 
-    pass
-
-
-
-
-
-def mock_encode(*args):
-
-    encoder = MockEncoder()
-
-    encoder.args = args
-
-    return encoder
+        return tags
 
 
 
+    def parse_TLP_marking(self, marking):
 
-
-class TestRegistry(PillowTestCase):
-
-    def test_encode_registry(self):
-
-
-
-        Image.register_encoder("MOCK", mock_encode)
-
-        self.assertIn("MOCK", Image.ENCODERS)
+        return ['tlp:{}'.format(marking.color.lower())]
 
 
 
-        enc = Image._getencoder("RGB", "MOCK", ("args",), extra=("extra",))
+    ################################################################################
+
+    ##          FUNCTIONS HANDLING PARSED DATA, USED BY BOTH SUBCLASSES.          ##
+
+    ################################################################################
 
 
 
-        self.assertIsInstance(enc, MockEncoder)
+    # The value returned by the indicators or observables parser is of type str or int
 
-        self.assertEqual(enc.args, ("RGB", "args", "extra"))
+    # Thus we can add an attribute in the MISP event with the type & value
+
+    def handle_attribute_case(self, attribute_type, attribute_value, data, attribute):
+
+        if attribute_type == 'attachment':
+
+            attribute['data'] = data
+
+        elif attribute_type == 'text':
+
+            attribute['comment'] = data
+
+        self.misp_event.add_attribute(attribute_type, attribute_value, **attribute)
 
 
 
-    def test_encode_registry_fail(self):
+    # The value returned by the indicators or observables parser is a list of dictionaries
 
-        self.assertRaises(
+    # These dictionaries are the attributes we add in an object, itself added in the MISP event
 
-            IOError,
+    def handle_object_case(self, attribute_type, attribute_value, compl_data, to_ids=False, object_uuid=None):
 
-            Image._getencoder,
+        misp_object = MISPObject(attribute_type)
 
-            "RGB",
+        if object_uuid:
 
-            "DoesNotExist",
+            misp_object.uuid = object_uuid
 
-            ("args",),
+        for attribute in attribute_value:
 
-            extra=("extra",),
+            attribute['to_ids'] = to_ids
 
-        )
+            misp_object.add_attribute(**attribute)
+
+        if isinstance(compl_data, dict):
+
+            # if some complementary data is a dictionary containing an uuid,
+
+            # it means we are using it to add an object reference
+
+            if "pe_uuid" in compl_data:
+
+                misp_object.add_reference(compl_data['pe_uuid'], 'included-in')
+
+            if "process_uuid" in compl_data:
+
+                for uuid in compl_data["process_uuid"]:
+
+                    misp_object.add_reference(uuid, 'connected-to')
+
+        self.misp_event.add_object(**misp_object)
+
+
+
+    ################################################################################
+
+    ##              UTILITY FUNCTIONS USED BY PARSING FUNCTION ABOVE              ##
+
+    ################################################################################
+
+
+
+    def fetch_attributes_from_sockets(self, properties, mapping_dict):
+
+        attributes = []
+
+        for prop, s_type in zip(mapping_dict, stix2misp_mapping._s_types):
+
+            address_property = getattr(properties, prop)
+
+            if address_property:
+
+                self.handle_socket(attributes, address_property, s_type)
+
+        return attributes
+
+
+
+    @staticmethod
+
+    def fetch_attributes_with_keys(properties, mapping_dict):
+
+        attributes = []
+
+        for prop, mapping in mapping_dict.items():
+
+            if getattr(properties,prop):
+
+                attribute_type, properties_key, relation = mapping
+
+                attributes.append([attribute_type, attrgetter(properties_key)(properties), relation])
+
+        return attributes
+
+
+
+    @staticmethod
+
+    def fetch_attributes_with_key_parsing(properties, mapping_dict):
+
+        attributes = []
+
+        for prop, mapping in mapping_dict.items():
+
+            if getattr(properties, prop):
+
+                attribute_type, properties_key, relation = mapping
+
+                attributes.append([attribute_type, attrgetter('{}.{}'.format(prop, properties_key))(properties), relation])
+
+        return attributes
+
+
+
+    @staticmethod
+
+    def fetch_attributes_with_partial_key_parsing(properties, mapping_dict):
+
+        attributes = []
+
+        for prop, mapping in mapping_dict.items():
+
+            if getattr(properties, prop):
+
+                attribute_type, relation = mapping
+
+                attributes.append([attribute_type, attrgetter('{}.value'.format(prop))(properties), relation])
+
+        return attributes
+
+
+
+    # Extract the uuid from a stix id
+
+    @staticmethod
+
+    def fetch_uuid(object_id):
+
+        try:
+
+            return "-".join(object_id.split("-")[-5:])
+
+        except Exception:
+
+            return str(uuid.uuid4())
+
+
+
+    # Return the attributes that will be added in a MISP object as a list of dictionaries
+
+    @staticmethod
+
+    def return_attributes(attributes):
+
+        return_attributes = []
+
+        for attribute in attributes:
+
+            return_attributes.append(dict(zip(('type', 'value', 'object_relation'), attribute)))
+
+        return return_attributes
+
+
+
+
+
+class StixFromMISPParser(StixParser):
+
+    def __init__(self):
+
+        super(StixFromMISPParser, self).__init__()
+
+        self.dates = []
+
+        self.timestamps = []
+
+        self.titles = []
+
+
+
+    def build_misp_dict(self, event):
+
+        for item in event.related_packages.related_package:
+
+            package = item.item
+
+            self.event = package.incidents[0]
+
+            self.set_timestamp_and_date()
+
+            self.set_event_info()
+
+            if self.event.related_indicators:
+
+                for indicator in self.event.related_indicators.indicator:
+
+                    self.parse_misp_indicator(indicator)
+
+            if self.event.related_observables:
+
+                for observable in self.event.related_observables.observable:
+
+                    self.parse_misp_observable(observable)
+
+            if self.event.history:
+
+                self.parse_journal_entries()
+
+            if self.event.information_source and self.event.information_source.references:
+
+                for reference in self.event.information_source.references:
+
+                    self.misp_event.add_attribute(**{'type': 'link', 'value': reference})
+
+            if package.ttps:
+
+                for ttp in package.ttps.ttps:
+
+                    if ttp.exploit_targets:
+
+                        self.parse_vulnerability(ttp.exploit_targets.exploit_target)
+
+                    # if ttp.handling:
+
+                    #     self.parse_tlp_marking(ttp.handling)
+
+        self.set_distribution()
+
+
+
+    # Return type & attributes (or value) of a Custom Object
+
+    def handle_custom(self, properties):
+
+        custom_properties = properties.custom_properties
+
+        attributes = []
+
+        for prop in custom_properties:
+
+            attribute_type, relation = prop.name.split(': ')
+
+            attribute_type = attribute_type.split(' ')[1]
+
+            attributes.append([attribute_type, prop.value, relation])
+
+        if len(attributes) > 1:
+
+            name = custom_properties[0].name.split(' ')[0]
+
+            return name, self.return_attributes(attributes), ""
+
+        return attributes[0]
+
+
+
+    def parse_journal_entries(self):
+
+        for entry in self.event.history.history_items:
+
+            journal_entry = entry.journal_entry.value
+
+            try:
+
+                entry_type, entry_value = journal_entry.split(': ')
+
+                if entry_type == "MISP Tag":
+
+                    self.parse_tag(entry_value)
+
+                elif entry_type.startswith('attribute['):
+
+                    _, category, attribute_type = entry_type.split('[')
+
+                    self.misp_event.add_attribute(**{'type': attribute_type[:-1], 'category': category[:-1], 'value': entry_value})
+
+                elif entry_type == "Event Threat Level":
+
+                    self.misp_event.threat_level_id = threat_level_mapping[entry_value]
+
+            except ValueError:
+
+                continue
+
+
+
+    # Parse indicators of a STIX document coming from our exporter
+
+    def parse_misp_indicator(self, indicator):
+
+        # define is an indicator will be imported as attribute or object
+
+        if indicator.relationship in categories:
+
+            self.parse_misp_attribute_indicator(indicator)
+
+        else:
+
+            self.parse_misp_object_indicator(indicator)
+
+
+
+    def parse_misp_observable(self, observable):
+
+        if observable.relationship in categories:
+
+            self.parse_misp_attribute_observable(observable)
+
+        else:
+
+            self.parse_misp_object_observable(observable)
+
+
+
+    # Parse STIX objects that we know will give MISP attributes
+
+    def parse_misp_attribute_indicator(self, indicator):
+
+        misp_attribute = {'to_ids': True, 'category': str(indicator.relationship),
+
+                          'uuid': self.fetch_uuid(indicator.id_)}
+
+        item = indicator.item
+
+        misp_attribute['timestamp'] = self.getTimestampfromDate(item.timestamp)
+
+        if item.observable:
+
+            observable = item.observable
+
+            self.parse_misp_attribute(observable, misp_attribute, to_ids=True)
+
+
+
+    def parse_misp_attribute_observable(self, observable):
+
+        misp_attribute = {'to_ids': False, 'category': str(observable.relationship),
+
+                          'uuid': self.fetch_uuid(observable.id_)}
+
+        if observable.item:
+
+            self.parse_misp_attribute(observable.item, misp_attribute)
+
+
+
+    def parse_misp_attribute(self, observable, misp_attribute, to_ids=False):
+
+        try:
+
+            properties = observable.object_.properties
+
+            if properties:
+
+                attribute_type, attribute_value, compl_data = self.handle_attribute_type(properties)
+
+                if isinstance(attribute_value, (str, int)):
+
+                    self.handle_attribute_case(attribute_type, attribute_value, compl_data, misp_attribute)
+
+                else:
+
+                    self.handle_object_case(attribute_type, attribute_value, compl_data, to_ids=to_ids)
+
+        except AttributeError:
+
+            attribute_dict = {}
+
+            for observables in observable.observable_composition.observables:
+
+                properties = observables.object_.properties
+
+                attribute_type, attribute_value, _ = self.handle_attribute_type(properties, observable_id=observable.id_)
+
+                attribute_dict[attribute_type] = attribute_value
+
+            attribute_type, attribute_value = self.composite_type(attribute_dict)
+
+            self.misp_event.add_attribute(attribute_type, attribute_value, **misp_attribute)
+
+
+
+    # Return type & value of a composite attribute in MISP
+
+    @staticmethod
+
+    def composite_type(attributes):
+
+        if "port" in attributes:
+
+            if "ip-src" in attributes:
+
+                return "ip-src|port", "{}|{}".format(attributes["ip-src"], attributes["port"])
+
+            elif "ip-dst" in attributes:
+
+                return "ip-dst|port", "{}|{}".format(attributes["ip-dst"], attributes["port"])
+
+            elif "hostname" in attributes:
+
+                return "hostname|port", "{}|{}".format(attributes["hostname"], attributes["port"])
+
+        elif "domain" in attributes:
+
+            if "ip-src" in attributes:
+
+                ip_value = attributes["ip-src"]
+
+            elif "ip-dst" in attributes:
+
+                ip_value = attributes["ip-dst"]
+
+            return "domain|ip", "{}|{}".format(attributes["domain"], ip_value)
+
+
+
+    # Parse STIX object that we know will give MISP objects
+
+    def parse_misp_object_indicator(self, indicator):
+
+        object_type = str(indicator.relationship)
+
+        item = indicator.item
+
+        name = item.title.split(' ')[0]
+
+        if name not in ('passive-dns'):
+
+            self.fill_misp_object(item, name, to_ids=True)
+
+        else:
+
+            if object_type != "misc":
+
+                print("Unparsed Object type: {}".format(name), file=sys.stderr)
+
+
+
+    def parse_misp_object_observable(self, observable):
+
+        object_type = str(observable.relationship)
+
+        observable = observable.item
+
+        observable_id = observable.id_
+
+        if object_type == "file":
+
+            name = "registry-key" if "WinRegistryKey" in observable_id else "file"
+
+        elif object_type == "network":
+
+            if "Custom" in observable_id:
+
+                name = observable_id.split("Custom")[0].split(":")[1]
+
+            elif "ObservableComposition" in observable_id:
+
+                name = observable_id.split("_")[0].split(":")[1]
+
+            else:
+
+                name = cybox_to_misp_object[observable_id.split('-')[0].split(':')[1]]
+
+        else:
+
+            name = cybox_to_misp_object[observable_id.split('-')[0].split(':')[1]]
+
+        try:
+
+            self.fill_misp_object(observable, name)
+
+        except Exception:
+
+            print("Unparsed Object type: {}".format(observable.to_json()), file=sys.stderr)
+
+
+
+    # Create a MISP object, its attributes, and add it in the MISP event
+
+    def fill_misp_object(self, item, name, to_ids=False):
+
+        uuid = self.fetch_uuid(item.id_)
+
+        try:
+
+            misp_object = MISPObject(name)
+
+            misp_object.uuid = uuid
+
+            if to_ids:
+
+                observables = item.observable.observable_composition.observables
+
+                misp_object.timestamp = self.getTimestampfromDate(item.timestamp)
+
+            else:
+
+                observables = item.observable_composition.observables
+
+            for observable in observables:
+
+                properties = observable.object_.properties
+
+                misp_attribute = MISPAttribute()
+
+                misp_attribute.type, misp_attribute.value, misp_attribute.object_relation = self.handle_attribute_type(properties, is_object=True, observable_id=observable.id_)
+
+                misp_attribute.to_ids = to_ids
+
+                misp_object.add_attribute(**misp_attribute)
+
+            self.misp_event.add_object(**misp_object)
+
+        except AttributeError:
+
+            properties = item.observable.object_.properties if to_ids else item.object_.properties
+
+            self.parse_observable(properties, to_ids, uuid)
+
+
+
+    # Create a MISP attribute and add it in its MISP object
+
+    def parse_observable(self, properties, to_ids, uuid):
+
+        attribute_type, attribute_value, compl_data = self.handle_attribute_type(properties)
+
+        if isinstance(attribute_value, (str, int)):
+
+            attribute = {'to_ids': to_ids, 'uuid': uuid}
+
+            self.handle_attribute_case(attribute_type, attribute_value, compl_data, attribute)
+
+        else:
+
+            self.handle_object_case(attribute_type, attribute_value, compl_data, to_ids=to_ids, object_uuid=uuid)
+
+
+
+    def parse_tag(self, entry):
+
+        if entry.startswith('misp-galaxy:'):
+
+            tag_type, value = entry.split('=')
+
+            galaxy_type = tag_type.split(':')[1]
+
+            cluster = {'type': galaxy_type, 'value': value[1:-1], 'tag_name': entry}
+
+            self.misp_event['Galaxy'].append({'type': galaxy_type, 'GalaxyCluster': [cluster]})
+
+        self.misp_event.add_tag(entry)
+
+
+
+    def parse_vulnerability(self, exploit_targets):
+
+        for exploit_target in exploit_targets:
+
+            if exploit_target.item:
+
+                for vulnerability in exploit_target.item.vulnerabilities:
+
+                    self.misp_event.add_attribute(**{'type': 'vulnerability', 'value': vulnerability.cve_id})
+
+
+
+    def set_event_info(self):
+
+        info = self.get_event_info()
+
+        self.titles.append(info)
+
+
+
+    def set_timestamp_and_date(self):
+
+        if self.event.timestamp:
+
+            date, timestamp = self.get_timestamp_and_date()
+
+            self.dates.append(date)
+
+            self.timestamps.append(timestamp)
+
+
+
+
+
+class ExternalStixParser(StixParser):
+
+    def __init__(self):
+
+        super(ExternalStixParser, self).__init__()
+
+        self.dns_objects = defaultdict(dict)
+
+        self.dns_ips = []
+
+
+
+    def build_misp_dict(self, event):
+
+        self.event = event
+
+        self.set_timestamp_and_date()
+
+        self.set_event_info()
+
+        header = self.event.stix_header
+
+        if hasattr(header, 'description') and hasattr(header.description, 'value'):
+
+            self.misp_event.add_attribute(**{'type': 'comment', 'value': header.description.value,
+
+                                             'comment': 'Imported from STIX header description'})
+
+        if hasattr(header, 'handling') and header.handling:
+
+            for handling in header.handling:
+
+                tags = self.parse_marking(handling)
+
+                for tag in  tags:
+
+                    self.misp_event.add_tag(tag)
+
+        if self.event.indicators:
+
+            self.parse_external_indicators(self.event.indicators)
+
+        if self.event.observables:
+
+            self.parse_external_observable(self.event.observables.observables)
+
+        if self.event.ttps:
+
+            self.parse_ttps(self.event.ttps.ttps)
+
+        if self.event.courses_of_action:
+
+            self.parse_coa(self.event.courses_of_action)
+
+        if self.dns_objects:
+
+            self.resolve_dns_objects()
+
+        self.set_distribution()
+
+        if self.references:
+
+            self.build_references()
+
+
+
+    def set_event_info(self):
+
+        info =  self.get_event_info()
+
+        self.misp_event.info = str(info)
+
+
+
+    def set_timestamp_and_date(self):
+
+        if self.event.timestamp:
+
+            date, timestamp = self.get_timestamp_and_date()
+
+            self.misp_event.date = date
+
+            self.misp_event.timestamp = timestamp
+
+
+
+    # Return type & attributes (or value) of a Custom Object
+
+    def handle_custom(self, properties):
+
+        custom_properties = properties.custom_properties
+
+        if len(custom_properties) > 1:
+
+            for prop in custom_properties[:-1]:
+
+                misp_attribute = {'type': 'text', 'value': prop.value, 'comment': prop.name}
+
+                self.misp_event.add_attribute(**misp_attribute)
+
+        to_return = custom_properties[-1]
+
+        return 'text', to_return.value, to_return.name
+
+
+
+    # Parse the courses of action field of an external STIX document
+
+    def parse_coa(self, courses_of_action):
+
+        for coa in courses_of_action:
+
+            misp_object = MISPObject('course-of-action')
+
+            if coa.title:
+
+                attribute = {'type': 'text', 'object_relation': 'name',
+
+                             'value': coa.title}
+
+                misp_object.add_attribute(**attribute)
+
+            for prop, properties_key in stix2misp_mapping._coa_mapping.items():
+
+                if getattr(coa, prop):
+
+                    attribute = {'type': 'text', 'object_relation': prop.replace('_', ''),
+
+                                 'value': attrgetter('{}.{}'.format(prop, properties_key))(coa)}
+
+                    misp_object.add_attribute(**attribute)
+
+            if coa.parameter_observables:
+
+                for observable in coa.parameter_observables.observables:
+
+                    properties = observable.object_.properties
+
+                    attribute = MISPAttribute()
+
+                    attribute.type, attribute.value, _ = self.handle_attribute_type(properties)
+
+                    referenced_uuid = str(uuid.uuid4())
+
+                    attribute.uuid = referenced_uuid
+
+                    self.misp_event.add_attribute(**attribute)
+
+                    misp_object.add_reference(referenced_uuid, 'observable', None, **attribute)
+
+            self.misp_event.add_object(**misp_object)
+
+
+
+    # Parse description of an external indicator or observable and add it in the MISP event as an attribute
+
+    def parse_description(self, stix_object):
+
+        if stix_object.description:
+
+            misp_attribute = {}
+
+            if stix_object.timestamp:
+
+                misp_attribute['timestamp'] = self.getTimestampfromDate(stix_object.timestamp)
+
+            self.misp_event.add_attribute("text", stix_object.description.value, **misp_attribute)
+
+
+
+    # Parse indicators of an external STIX document
+
+    def parse_external_indicators(self, indicators):
+
+        for indicator in indicators:
+
+            self.parse_external_single_indicator(indicator)
+
+
+
+    def parse_external_single_indicator(self, indicator):
+
+        if hasattr(indicator, 'observable') and indicator.observable:
+
+            observable = indicator.observable
+
+            if hasattr(observable, 'object_') and observable.object_:
+
+                uuid = self.fetch_uuid(observable.object_.id_)
+
+                try:
+
+                    properties = observable.object_.properties
+
+                    if properties:
+
+                        attribute_type, attribute_value, compl_data = self.handle_attribute_type(properties)
+
+                        if isinstance(attribute_value, (str, int)):
+
+                            # if the returned value is a simple value, we build an attribute
+
+                            attribute = {'to_ids': True, 'uuid': uuid}
+
+                            if indicator.timestamp:
+
+                                attribute['timestamp'] = self.getTimestampfromDate(indicator.timestamp)
+
+                            if hasattr(observable, 'handling') and observable.handling:
+
+                                attribute['Tag'] = []
+
+                                for handling in observable.handling:
+
+                                    attribute['Tag'].extend(self.parse_marking(handling))
+
+                            parsed = self.special_parsing(observable.object_, attribute_type, attribute_value, attribute, uuid)
+
+                            if parsed is not None:
+
+                                return
+
+                            self.handle_attribute_case(attribute_type, attribute_value, compl_data, attribute)
+
+                        else:
+
+                            # otherwise, it is a dictionary of attributes, so we build an object
+
+                            self.handle_object_case(attribute_type, attribute_value, compl_data, to_ids=True, object_uuid=uuid)
+
+                except AttributeError:
+
+                    self.parse_description(indicator)
+
+        if hasattr(indicator, 'related_indicators') and indicator.related_indicators:
+
+            for related_indicator in indicator.related_indicators:
+
+                self.parse_external_single_indicator(related_indicator.item)
+
+
+
+    # Parse observables of an external STIX document
+
+    def parse_external_observable(self, observables):
+
+        for observable in observables:
+
+            title = observable.title
+
+            observable_object = observable.object_
+
+            try:
+
+                properties = observable_object.properties
+
+            except AttributeError:
+
+                self.parse_description(observable)
+
+                continue
+
+            if properties:
+
+                try:
+
+                    attribute_type, attribute_value, compl_data = self.handle_attribute_type(properties, title=title)
+
+                except KeyError:
+
+                    # print("Error with an object of type: {}\n{}".format(properties._XSI_TYPE, observable.to_json()))
+
+                    continue
+
+                object_uuid = self.fetch_uuid(observable_object.id_)
+
+                if isinstance(attribute_value, (str, int)):
+
+                    # if the returned value is a simple value, we build an attribute
+
+                    attribute = {'to_ids': False, 'uuid': object_uuid}
+
+                    if hasattr(observable, 'handling') and observable.handling:
+
+                        attribute['Tag'] = []
+
+                        for handling in observable.handling:
+
+                            attribute['Tag'].extend(self.parse_marking(handling))
+
+                    parsed = self.special_parsing(observable_object, attribute_type, attribute_value, attribute, object_uuid)
+
+                    if parsed is not None:
+
+                        continue
+
+                    self.handle_attribute_case(attribute_type, attribute_value, compl_data, attribute)
+
+                else:
+
+                    # otherwise, it is a dictionary of attributes, so we build an object
+
+                    if attribute_value:
+
+                        self.handle_object_case(attribute_type, attribute_value, compl_data, object_uuid=object_uuid)
+
+                    if observable_object.related_objects:
+
+                        for related_object in observable_object.related_objects:
+
+                            relationship = related_object.relationship.value.lower().replace('_', '-')
+
+                            self.references[object_uuid].append({"idref": self.fetch_uuid(related_object.idref),
+
+                                                                 "relationship": relationship})
+
+
+
+    # Parse the ttps field of an external STIX document
+
+    def parse_ttps(self, ttps):
+
+        for ttp in ttps:
+
+            if ttp.behavior and ttp.behavior.malware_instances:
+
+                mi = ttp.behavior.malware_instances[0]
+
+                if mi.types:
+
+                    mi_type = mi.types[0].value
+
+                    galaxy = {'type': mi_type}
+
+                    cluster = defaultdict(dict)
+
+                    cluster['type'] = mi_type
+
+                    if mi.description:
+
+                        cluster['description'] = mi.description.value
+
+                    cluster['value'] = ttp.title
+
+                    if mi.names:
+
+                        synonyms = []
+
+                        for name in mi.names:
+
+                            synonyms.append(name.value)
+
+                        cluster['meta']['synonyms'] = synonyms
+
+                    galaxy['GalaxyCluster'] = [cluster]
+
+                    self.misp_event['Galaxy'].append(galaxy)
+
+
+
+    # Parse a DNS object
+
+    def resolve_dns_objects(self):
+
+        for domain, domain_dict in self.dns_objects['domain'].items():
+
+            ip_reference = domain_dict['related']
+
+            domain_attribute = domain_dict['data']
+
+            if ip_reference in self.dns_objects['ip']:
+
+                misp_object = MISPObject('passive-dns')
+
+                domain_attribute['object_relation'] = "rrname"
+
+                misp_object.add_attribute(**domain_attribute)
+
+                ip = self.dns_objects['ip'][ip_reference]['value']
+
+                ip_attribute = {"type": "text", "value": ip, "object_relation": "rdata"}
+
+                misp_object.add_attribute(**ip_attribute)
+
+                rrtype = "AAAA" if ":" in ip else "A"
+
+                rrtype_attribute = {"type": "text", "value": rrtype, "object_relation": "rrtype"}
+
+                misp_object.add_attribute(**rrtype_attribute)
+
+                self.misp_event.add_object(**misp_object)
+
+            else:
+
+                self.misp_event.add_attribute(**domain_attribute)
+
+        for ip, ip_dict in self.dns_objects['ip'].items():
+
+            if ip not in self.dns_ips:
+
+                self.misp_event.add_attribute(**ip_dict)
+
+
+
+    def special_parsing(self, observable_object, attribute_type, attribute_value, attribute, uuid):
+
+        if observable_object.related_objects:
+
+            related_objects = observable_object.related_objects
+
+            if attribute_type == "url" and len(related_objects) == 1 and related_objects[0].relationship.value == "Resolved_To":
+
+                related_ip = self.fetch_uuid(related_objects[0].idref)
+
+                self.dns_objects['domain'][uuid] = {"related": related_ip,
+
+                                                    "data": {"type": "text", "value": attribute_value}}
+
+                if related_ip not in self.dns_ips:
+
+                    self.dns_ips.append(related_ip)
+
+                return 1
+
+        if attribute_type in ('ip-src', 'ip-dst'):
+
+            attribute['type'] = attribute_type
+
+            attribute['value'] = attribute_value
+
+            self.dns_objects['ip'][uuid] = attribute
+
+            return 2
+
+
+
+
+
+def generate_event(filename):
+
+    try:
+
+        return STIXPackage.from_xml(filename)
+
+    except Exception:
+
+        try:
+
+            import maec
+
+            print(2)
+
+        except ImportError:
+
+            print(3)
+
+        sys.exit(0)
+
+
+
+def main(args):
+
+    filename = '{}/tmp/{}'.format(os.path.dirname(args[0]), args[1])
+
+    event = generate_event(filename)
+
+    title = event.stix_header.title
+
+    from_misp = (title is not None and "Export from " in title and "MISP" in title)
+
+    stix_parser = StixFromMISPParser() if from_misp else ExternalStixParser()
+
+    stix_parser.load_event(args[2:], filename, from_misp, event.version)
+
+    stix_parser.build_misp_dict(event)
+
+    stix_parser.saveFile()
+
+    print(1)
+
+
+
+if __name__ == "__main__":
+
+    main(sys.argv)

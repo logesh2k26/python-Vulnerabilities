@@ -2,526 +2,204 @@
 # Safety: safe
 # Category: safe
 
-"""
-
-Custom Authenticator to use GitLab OAuth with JupyterHub
-
-"""
+# -*- coding: utf-8 -*-
 
 
 
+##############################################################################
+
+#                        2011 E2OpenPlugins                                  #
+
+#                                                                            #
+
+#  This file is open source software; you can redistribute it and/or modify  #
+
+#     it under the terms of the GNU General Public License version 2 as      #
+
+#               published by the Free Software Foundation.                   #
+
+#                                                                            #
+
+##############################################################################
 
 
-import json
 
 import os
 
 import re
 
-import sys
+import glob
 
-import warnings
+from urllib import quote
 
-from urllib.parse import quote
+import json
 
 
 
-from tornado.auth import OAuth2Mixin
+from twisted.web import static, resource, http
 
-from tornado import web
 
 
+from Components.config import config
 
-from tornado.escape import url_escape
+from Tools.Directories import fileExists
 
-from tornado.httputil import url_concat
+from utilities import lenient_force_utf_8, sanitise_filename_slashes
 
-from tornado.httpclient import HTTPRequest, AsyncHTTPClient
 
 
 
-from jupyterhub.auth import LocalAuthenticator
 
+def new_getRequestHostname(self):
 
+	host = self.getHeader(b'host')
 
-from traitlets import Set, CUnicode, Unicode, default, observe
+	if host:
 
+		if host[0]=='[':
 
+			return host.split(']',1)[0] + "]"
 
-from .oauth2 import OAuthLoginHandler, OAuthenticator
+		return host.split(':', 1)[0].encode('ascii')
 
+	return self.getHost().host.encode('ascii')
 
 
 
+http.Request.getRequestHostname = new_getRequestHostname
 
-def _api_headers(access_token):
 
-    return {
 
-        "Accept": "application/json",
 
-        "User-Agent": "JupyterHub",
 
-        "Authorization": "Bearer {}".format(access_token),
+class FileController(resource.Resource):
 
-    }
+	def render(self, request):
 
+		action = "download"
 
+		if "action" in request.args:
 
+			action = request.args["action"][0]
 
 
-class GitLabOAuthenticator(OAuthenticator):
 
-    # see gitlab_scopes.md for details about scope config
+		if "file" in request.args:
 
-    # set scopes via config, e.g.
+			filename = lenient_force_utf_8(request.args["file"][0])
 
-    # c.GitLabOAuthenticator.scope = ['read_user']
+			filename = sanitise_filename_slashes(os.path.realpath(filename))
 
 
 
-    _deprecated_oauth_aliases = {
+			if not os.path.exists(filename):
 
-        "gitlab_group_whitelist": ("allowed_gitlab_groups", "0.12.0"),
+				return "File '%s' not found" % (filename)
 
-        "gitlab_project_id_whitelist": ("allowed_project_ids", "0.12.0"),
 
-        **OAuthenticator._deprecated_oauth_aliases,
 
-    }
+			if action == "stream":
 
+				name = "stream"
 
+				if "name" in request.args:
 
-    login_service = "GitLab"
+					name = request.args["name"][0]
 
 
 
-    client_id_env = 'GITLAB_CLIENT_ID'
+				port = config.OpenWebif.port.value
 
-    client_secret_env = 'GITLAB_CLIENT_SECRET'
+				proto = 'http'
 
+				if request.isSecure():
 
+					port = config.OpenWebif.https_port.value
 
-    gitlab_url = Unicode("https://gitlab.com", config=True)
+					proto = 'https'
 
+				ourhost = request.getHeader('host')
 
+				m = re.match('.+\:(\d+)$', ourhost)
 
-    @default("gitlab_url")
+				if m is not None:
 
-    def _default_gitlab_url(self):
+					port = m.group(1)
 
-        """get default gitlab url from env"""
 
-        gitlab_url = os.getenv('GITLAB_URL')
 
-        gitlab_host = os.getenv('GITLAB_HOST')
+				response = "#EXTM3U\n#EXTVLCOPT--http-reconnect=true\n#EXTINF:-1,%s\n%s://%s:%s/file?action=download&file=%s" % (name, proto, request.getRequestHostname(), port, quote(filename))
 
+				request.setHeader("Content-Disposition", 'attachment;filename="%s.m3u"' % name)
 
+				request.setHeader("Content-Type", "application/x-mpegurl")
 
-        if not gitlab_url and gitlab_host:
+				return response
 
-            warnings.warn(
+			elif action == "delete":
 
-                'Use of GITLAB_HOST might be deprecated in the future. '
+				request.setResponseCode(http.OK)
 
-                'Rename GITLAB_HOST environment variable to GITLAB_URL.',
+				return "TODO: DELETE FILE: %s" % (filename)
 
-                PendingDeprecationWarning,
+			elif action == "download":
 
-            )
+				request.setHeader("Content-Disposition", "attachment;filename=\"%s\"" % (filename.split('/')[-1]))
 
-            if gitlab_host.startswith(('https:', 'http:')):
+				rfile = static.File(filename, defaultType = "application/octet-stream")
 
-                gitlab_url = gitlab_host
+				return rfile.render(request)
 
-            else:
+			else: 
 
-                # Hides common mistake of users which set the GITLAB_HOST
+				return "wrong action parameter"
 
-                # without a protocol specification.
 
-                gitlab_url = 'https://{0}'.format(gitlab_host)
 
-                warnings.warn(
+		if "dir" in request.args:
 
-                    'The https:// prefix has been added to GITLAB_HOST.'
+			path = request.args["dir"][0]
 
-                    'Set GITLAB_URL="{0}" instead.'.format(gitlab_host)
+			pattern = '*'
 
-                )
+			data = []
 
+			if "pattern" in request.args:
 
+				pattern = request.args["pattern"][0]
 
-        # default to gitlab.com
+			directories = []
 
-        if not gitlab_url:
+			files = []
 
-            gitlab_url = 'https://gitlab.com'
+			if fileExists(path):
 
+				try:
 
+					files = glob.glob(path+'/'+pattern)
 
-        return gitlab_url
+				except:
 
+					files = []
 
+				files.sort()
 
-    gitlab_api_version = CUnicode('4', config=True)
+				tmpfiles = files[:]
 
+				for x in tmpfiles:
 
+					if os.path.isdir(x):
 
-    @default('gitlab_api_version')
+						directories.append(x + '/')
 
-    def _gitlab_api_version_default(self):
+						files.remove(x)
 
-        return os.environ.get('GITLAB_API_VERSION') or '4'
+				data.append({"result": True,"dirs": directories,"files": files})
 
+			else:
 
+				data.append({"result": False,"message": "path %s not exits" % (path)})
 
-    gitlab_api = Unicode(config=True)
+			request.setHeader("content-type", "application/json; charset=utf-8")
 
-
-
-    @default("gitlab_api")
-
-    def _default_gitlab_api(self):
-
-        return '%s/api/v%s' % (self.gitlab_url, self.gitlab_api_version)
-
-
-
-    @default("authorize_url")
-
-    def _authorize_url_default(self):
-
-        return "%s/oauth/authorize" % self.gitlab_url
-
-
-
-    @default("token_url")
-
-    def _token_url_default(self):
-
-        return "%s/oauth/access_token" % self.gitlab_url
-
-
-
-    gitlab_group_whitelist = Set(help="Deprecated, use `GitLabOAuthenticator.allowed_gitlab_groups`", config=True,)
-
-
-
-    allowed_gitlab_groups = Set(
-
-        config=True, help="Automatically allow members of selected groups"
-
-    )
-
-
-
-    gitlab_project_id_whitelist = Set(help="Deprecated, use `GitLabOAuthenticator.allowed_project_ids`", config=True,)
-
-
-
-    allowed_project_ids = Set(
-
-        config=True,
-
-        help="Automatically allow members with Developer access to selected project ids",
-
-    )
-
-
-
-    gitlab_version = None
-
-
-
-    async def authenticate(self, handler, data=None):
-
-        code = handler.get_argument("code")
-
-        # TODO: Configure the curl_httpclient for tornado
-
-        http_client = AsyncHTTPClient()
-
-
-
-        # Exchange the OAuth code for a GitLab Access Token
-
-        #
-
-        # See: https://github.com/gitlabhq/gitlabhq/blob/master/doc/api/oauth2.md
-
-
-
-        # GitLab specifies a POST request yet requires URL parameters
-
-        params = dict(
-
-            client_id=self.client_id,
-
-            client_secret=self.client_secret,
-
-            code=code,
-
-            grant_type="authorization_code",
-
-            redirect_uri=self.get_callback_url(handler),
-
-        )
-
-
-
-        validate_server_cert = self.validate_server_cert
-
-
-
-        url = url_concat("%s/oauth/token" % self.gitlab_url, params)
-
-
-
-        req = HTTPRequest(
-
-            url,
-
-            method="POST",
-
-            headers={"Accept": "application/json"},
-
-            validate_cert=validate_server_cert,
-
-            body='',  # Body is required for a POST...
-
-        )
-
-
-
-        resp = await http_client.fetch(req)
-
-        resp_json = json.loads(resp.body.decode('utf8', 'replace'))
-
-
-
-        access_token = resp_json['access_token']
-
-
-
-        # memoize gitlab version for class lifetime
-
-        if self.gitlab_version is None:
-
-            self.gitlab_version = await self._get_gitlab_version(access_token)
-
-            self.member_api_variant = 'all/' if self.gitlab_version >= [12, 4] else ''
-
-
-
-        # Determine who the logged in user is
-
-        req = HTTPRequest(
-
-            "%s/user" % self.gitlab_api,
-
-            method="GET",
-
-            validate_cert=validate_server_cert,
-
-            headers=_api_headers(access_token),
-
-        )
-
-        resp = await http_client.fetch(req)
-
-        resp_json = json.loads(resp.body.decode('utf8', 'replace'))
-
-
-
-        username = resp_json["username"]
-
-        user_id = resp_json["id"]
-
-        is_admin = resp_json.get("is_admin", False)
-
-
-
-        # Check if user is a member of any allowed groups or projects.
-
-        # These checks are performed here, as it requires `access_token`.
-
-        user_in_group = user_in_project = False
-
-        is_group_specified = is_project_id_specified = False
-
-
-
-        if self.allowed_gitlab_groups:
-
-            is_group_specified = True
-
-            user_in_group = await self._check_membership_allowed_groups(user_id, access_token)
-
-
-
-        # We skip project_id check if user is in allowed group.
-
-        if self.allowed_project_ids and not user_in_group:
-
-            is_project_id_specified = True
-
-            user_in_project = await self._check_membership_allowed_project_ids(
-
-                user_id, access_token
-
-            )
-
-
-
-        no_config_specified = not (is_group_specified or is_project_id_specified)
-
-
-
-        if (
-
-            (is_group_specified and user_in_group)
-
-            or (is_project_id_specified and user_in_project)
-
-            or no_config_specified
-
-        ):
-
-            return {
-
-                'name': username,
-
-                'auth_state': {'access_token': access_token, 'gitlab_user': resp_json},
-
-            }
-
-        else:
-
-            self.log.warning("%s not in group or project allowed list", username)
-
-            return None
-
-
-
-    async def _get_gitlab_version(self, access_token):
-
-        url = '%s/version' % self.gitlab_api
-
-        req = HTTPRequest(
-
-            url,
-
-            method="GET",
-
-            headers=_api_headers(access_token),
-
-            validate_cert=self.validate_server_cert,
-
-        )
-
-        resp = await AsyncHTTPClient().fetch(req, raise_error=True)
-
-        resp_json = json.loads(resp.body.decode('utf8', 'replace'))
-
-        version_strings = resp_json['version'].split('-')[0].split('.')[:3]
-
-        version_ints = list(map(int, version_strings))
-
-        return version_ints
-
-
-
-    async def _check_membership_allowed_groups(self, user_id, access_token):
-
-        http_client = AsyncHTTPClient()
-
-        headers = _api_headers(access_token)
-
-        # Check if user is a member of any group in the allowed list
-
-        for group in map(url_escape, self.allowed_gitlab_groups):
-
-            url = "%s/groups/%s/members/%s%d" % (
-
-                self.gitlab_api,
-
-                quote(group, safe=''),
-
-                self.member_api_variant,
-
-                user_id,
-
-            )
-
-            req = HTTPRequest(url, method="GET", headers=headers)
-
-            resp = await http_client.fetch(req, raise_error=False)
-
-            if resp.code == 200:
-
-                return True  # user _is_ in group
-
-        return False
-
-
-
-    async def _check_membership_allowed_project_ids(self, user_id, access_token):
-
-        http_client = AsyncHTTPClient()
-
-        headers = _api_headers(access_token)
-
-        # Check if user has developer access to any project in the allowed list
-
-        for project in self.allowed_project_ids:
-
-            url = "%s/projects/%s/members/%s%d" % (
-
-                self.gitlab_api,
-
-                project,
-
-                self.member_api_variant,
-
-                user_id,
-
-            )
-
-            req = HTTPRequest(url, method="GET", headers=headers)
-
-            resp = await http_client.fetch(req, raise_error=False)
-
-
-
-            if resp.body:
-
-                resp_json = json.loads(resp.body.decode('utf8', 'replace'))
-
-                access_level = resp_json.get('access_level', 0)
-
-
-
-                # We only allow access level Developer and above
-
-                # Reference: https://docs.gitlab.com/ee/api/members.html
-
-                if resp.code == 200 and access_level >= 30:
-
-                    return True
-
-        return False
-
-
-
-
-
-class LocalGitLabOAuthenticator(LocalAuthenticator, GitLabOAuthenticator):
-
-
-
-    """A version that mixes in local system user creation"""
-
-
-
-    pass
+			return json.dumps(data, indent=2)

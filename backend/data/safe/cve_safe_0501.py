@@ -2,522 +2,306 @@
 # Safety: safe
 # Category: safe
 
-import functools
+# Copyright 2012 OpenStack LLC
 
-import random
+#
 
-import re
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
 
-from typing import Union
+# not use this file except in compliance with the License. You may obtain
 
+# a copy of the License at
 
+#
 
-import aiohttp
+#      http://www.apache.org/licenses/LICENSE-2.0
 
-import discord
+#
 
-import inflection
+# Unless required by applicable law or agreed to in writing, software
 
-from redbot.core import bot, Config, checks, commands
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-from redbot.core.i18n import get_locale
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
-from redbot.core.utils.chat_formatting import italics
+# License for the specific language governing permissions and limitations
 
-
-
-from .helpers import *
-
-
-
-fmt_re = re.compile(r"{(?:0|user)(?:\.([^\{]+))?}")
+# under the License.
 
 
 
+import time
 
 
-class Act(commands.Cog):
+
+import default_fixtures
+
+
+
+from keystone import config
+
+from keystone import exception
+
+from keystone import service
+
+from keystone import test
+
+from keystone.identity.backends import kvs as kvs_identity
+
+
+
+
+
+CONF = config.CONF
+
+
+
+
+
+def _build_user_auth(token=None, user_id=None, username=None,
+
+                     password=None, tenant_id=None, tenant_name=None):
+
+    """Build auth dictionary.
+
+
+
+    It will create an auth dictionary based on all the arguments
+
+    that it receives.
 
     """
 
-    This cog makes all commands, e.g. [p]fluff, into valid commands if
+    auth_json = {}
 
-    you command the bot to act on a user, e.g. [p]fluff [botname].
+    if token is not None:
 
-    """
+        auth_json['token'] = token
 
+    if username or password:
 
+        auth_json['passwordCredentials'] = {}
 
-    __author__ = "Zephyrkul"
+    if username is not None:
 
+        auth_json['passwordCredentials']['username'] = username
 
+    if user_id is not None:
 
-    async def red_get_data_for_user(self, *, user_id):
+        auth_json['passwordCredentials']['userId'] = user_id
 
-        return {}  # No data to get
+    if password is not None:
 
+        auth_json['passwordCredentials']['password'] = password
 
+    if tenant_name is not None:
 
-    async def red_delete_data_for_user(self, *, requester, user_id):
+        auth_json['tenantName'] = tenant_name
 
-        pass  # No data to delete
+    if tenant_id is not None:
 
+        auth_json['tenantId'] = tenant_id
 
+    return auth_json
 
-    def __init__(self, bot: bot.Red):
 
-        super().__init__()
 
-        self.bot = bot
 
-        self.config = Config.get_conf(self, identifier=2_113_674_295, force_registration=True)
 
-        self.config.register_global(custom={}, tenorkey=None)
+class TokenExpirationTest(test.TestCase):
 
-        self.config.register_guild(custom={})
+    def setUp(self):
 
-        self.try_after = None
+        super(TokenExpirationTest, self).setUp()
 
+        self.identity_api = kvs_identity.Identity()
 
+        self.load_fixtures(default_fixtures)
 
-    async def initialize(self, bot: bot.Red):
+        self.api = service.TokenController()
 
-        # temporary backwards compatibility
 
-        key = await self.config.tenorkey()
 
-        if not key:
+    def _maintain_token_expiration(self):
 
-            return
+        """Token expiration should be maintained after re-auth & validation."""
 
-        await bot.set_shared_api_tokens("tenor", api_key=key)
+        r = self.api.authenticate(
 
-        await self.config.tenorkey.clear()
+            {},
 
+            auth={
 
+                'passwordCredentials': {
 
-    @staticmethod
+                    'username': self.user_foo['name'],
 
-    def repl(target: discord.Member, match: re.Match):
+                    'password': self.user_foo['password']
 
-        if attr := match.group(1):
+                }
 
-            print(attr)
+            })
 
-            if attr.startswith("_") or "." in attr:
+        unscoped_token_id = r['access']['token']['id']
 
-                return str(target)
+        original_expiration = r['access']['token']['expires']
 
-            try:
 
-                return str(getattr(target, attr))
 
-            except AttributeError:
+        time.sleep(0.5)
 
-                return str(target)
 
-        return str(target)
 
+        r = self.api.validate_token(
 
+            dict(is_admin=True, query_string={}),
 
-    @commands.command(hidden=True)
+            token_id=unscoped_token_id)
 
-    async def act(self, ctx: commands.Context, *, target: Union[discord.Member, str] = None):
+        self.assertEqual(original_expiration, r['access']['token']['expires'])
 
-        """
 
-        Acts on the specified user.
 
-        """
+        time.sleep(0.5)
 
-        if not target or isinstance(target, str):
 
-            return  # no help text
 
+        r = self.api.authenticate(
 
+            {},
 
-        try:
+            auth={
 
-            if not ctx.guild:
+                'token': {
 
-                raise KeyError()
+                    'id': unscoped_token_id,
 
-            message = await self.config.guild(ctx.guild).get_raw("custom", ctx.invoked_with)
+                },
 
-        except KeyError:
+                'tenantId': self.tenant_bar['id'],
 
-            try:
+            })
 
-                message = await self.config.get_raw("custom", ctx.invoked_with)
+        scoped_token_id = r['access']['token']['id']
 
-            except KeyError:
+        self.assertEqual(original_expiration, r['access']['token']['expires'])
 
-                message = NotImplemented
 
 
+        time.sleep(0.5)
 
-        if message is None:  # ignored command
 
-            return
 
-        elif message is NotImplemented:  # default
+        r = self.api.validate_token(
 
-            # humanize action text
+            dict(is_admin=True, query_string={}),
 
-            action = inflection.humanize(ctx.invoked_with).split()
+            token_id=scoped_token_id)
 
-            iverb = -1
+        self.assertEqual(original_expiration, r['access']['token']['expires'])
 
 
 
-            for cycle in range(2):
+    def test_maintain_uuid_token_expiration(self):
 
-                if iverb > -1:
+        self.opt_in_group('signing', token_format='UUID')
 
-                    break
+        self._maintain_token_expiration()
 
-                for i, act in enumerate(action):
 
-                    act = act.lower()
 
-                    if (
 
-                        act in NOLY_ADV
 
-                        or act in CONJ
+class AuthTest(test.TestCase):
 
-                        or (act.endswith("ly") and act not in LY_VERBS)
+    def setUp(self):
 
-                        or (not cycle and act in SOFT_VERBS)
+        super(AuthTest, self).setUp()
 
-                    ):
 
-                        continue
 
-                    action[i] = inflection.pluralize(action[i])
+        CONF.identity.driver = 'keystone.identity.backends.kvs.Identity'
 
-                    iverb = max(iverb, i)
+        self.load_backends()
 
+        self.load_fixtures(default_fixtures)
 
+        self.api = service.TokenController()
 
-            if iverb < 0:
 
-                return
 
-            action.insert(iverb + 1, target.mention)
+    def test_authenticate_user_id_too_large(self):
 
-            message = italics(" ".join(action))
+        """Verify sending large 'userId' raises the right exception."""
 
-        else:
+        body_dict = _build_user_auth(user_id='0' * 65, username='FOO',
 
-            assert isinstance(message, str)
+                                     password='foo2')
 
-            message = fmt_re.sub(functools.partial(self.repl, target), message)
+        self.assertRaises(exception.ValidationSizeError, self.api.authenticate,
 
+                          {}, body_dict)
 
 
-        # add reaction gif
 
-        if self.try_after and ctx.message.created_at < self.try_after:
+    def test_authenticate_username_too_large(self):
 
-            return await ctx.send(message)
+        """Verify sending large 'username' raises the right exception."""
 
-        if not await ctx.embed_requested():
+        body_dict = _build_user_auth(username='0' * 65, password='foo2')
 
-            return await ctx.send(message)
+        self.assertRaises(exception.ValidationSizeError, self.api.authenticate,
 
-        key = (await ctx.bot.get_shared_api_tokens("tenor")).get("api_key")
+                          {}, body_dict)
 
-        if not key:
 
-            return await ctx.send(message)
 
-        async with aiohttp.request(
+    def test_authenticate_tenant_id_too_large(self):
 
-            "GET",
+        """Verify sending large 'tenantId' raises the right exception."""
 
-            "https://api.tenor.com/v1/search",
+        body_dict = _build_user_auth(username='FOO', password='foo2',
 
-            params={
+                                     tenant_id='0' * 65)
 
-                "q": ctx.invoked_with,
+        self.assertRaises(exception.ValidationSizeError, self.api.authenticate,
 
-                "key": key,
+                          {}, body_dict)
 
-                "anon_id": str(ctx.author.id ^ ctx.me.id),
 
-                "media_filter": "minimal",
 
-                "contentfilter": "off" if getattr(ctx.channel, "nsfw", False) else "low",
+    def test_authenticate_tenant_name_too_large(self):
 
-                "ar_range": "wide",
+        """Verify sending large 'tenantName' raises the right exception."""
 
-                "limit": "8",
+        body_dict = _build_user_auth(username='FOO', password='foo2',
 
-                "locale": get_locale(),
+                                     tenant_name='0' * 65)
 
-            },
+        self.assertRaises(exception.ValidationSizeError, self.api.authenticate,
 
-        ) as response:
+                          {}, body_dict)
 
-            json: dict
 
-            if response.status == 429:
 
-                self.try_after = ctx.message.created_at + 30
+    def test_authenticate_token_too_large(self):
 
-                json = {}
+        """Verify sending large 'token' raises the right exception."""
 
-            elif response.status >= 400:
+        body_dict = _build_user_auth(token={'id': '0' * 8193})
 
-                json = {}
+        self.assertRaises(exception.ValidationSizeError, self.api.authenticate,
 
-            else:
+                          {}, body_dict)
 
-                json = await response.json()
 
-        if not json.get("results"):
 
-            return await ctx.send(message)
+    def test_authenticate_password_too_large(self):
 
-        message = f"{message}\n\n{random.choice(json['results'])['itemurl']}"
+        """Verify sending large 'password' raises the right exception."""
 
-        await ctx.send(
+        body_dict = _build_user_auth(username='FOO', password='0' * 8193)
 
-            message,
+        self.assertRaises(exception.ValidationSizeError, self.api.authenticate,
 
-            allowed_mentions=discord.AllowedMentions(
-
-                users=False if target in ctx.message.mentions else [target]
-
-            ),
-
-        )
-
-
-
-    @commands.group()
-
-    @checks.is_owner()
-
-    async def actset(self, ctx: commands.Context):
-
-        """
-
-        Configure various settings for the act cog.
-
-        """
-
-
-
-    @actset.group(aliases=["custom"], invoke_without_command=True)
-
-    @checks.admin_or_permissions(manage_guild=True)
-
-    @commands.guild_only()
-
-    async def customize(self, ctx: commands.Context, command: str.lower, *, response: str = None):
-
-        """
-
-        Customize the response to an action.
-
-
-
-        You can use {0} or {user} to dynamically replace with the specified target of the action.
-
-        Formats like {0.name} or {0.mention} can also be used.
-
-        """
-
-        if not response:
-
-            await self.config.guild(ctx.guild).clear_raw("custom", command)
-
-            await ctx.tick()
-
-        else:
-
-            await self.config.guild(ctx.guild).set_raw("custom", command, value=response)
-
-            await ctx.send(
-
-                fmt_re.sub(functools.partial(self.repl, ctx.author), response),
-
-                allowed_mentions=discord.AllowedMentions(users=False),
-
-            )
-
-
-
-    @customize.command(name="global")
-
-    @checks.is_owner()
-
-    async def customize_global(
-
-        self, ctx: commands.Context, command: str.lower, *, response: str = None
-
-    ):
-
-        """
-
-        Globally customize the response to an action.
-
-
-
-        You can use {0} or {user} to dynamically replace with the specified target of the action.
-
-        Formats like {0.name} or {0.mention} can also be used.
-
-        """
-
-        if not response:
-
-            await self.config.clear_raw("custom", command)
-
-        else:
-
-            await self.config.set_raw("custom", command, value=response)
-
-        await ctx.tick()
-
-
-
-    @actset.group(invoke_without_command=True)
-
-    @checks.admin_or_permissions(manage_guild=True)
-
-    @commands.guild_only()
-
-    async def ignore(self, ctx: commands.Context, command: str.lower):
-
-        """
-
-        Ignore or unignore the specified action.
-
-
-
-        The bot will no longer respond to these actions.
-
-        """
-
-        try:
-
-            custom = await self.config.guild(ctx.guild).get_raw("custom", command)
-
-        except KeyError:
-
-            custom = NotImplemented
-
-        if custom is None:
-
-            await self.config.guild(ctx.guild).clear_raw("custom", command)
-
-            await ctx.send("I will no longer ignore the {command} action".format(command=command))
-
-        else:
-
-            await self.config.guild(ctx.guild).set_raw("custom", command, value=None)
-
-            await ctx.send("I will now ignore the {command} action".format(command=command))
-
-
-
-    @ignore.command(name="global")
-
-    @checks.is_owner()
-
-    async def ignore_global(self, ctx: commands.Context, command: str.lower):
-
-        """
-
-        Globally ignore or unignore the specified action.
-
-
-
-        The bot will no longer respond to these actions.
-
-        """
-
-        try:
-
-            await self.config.get_raw("custom", command)
-
-        except KeyError:
-
-            await self.config.set_raw("custom", command, value=None)
-
-        else:
-
-            await self.config.clear_raw("custom", command)
-
-        await ctx.tick()
-
-
-
-    @actset.command()
-
-    @checks.is_owner()
-
-    async def tenorkey(self, ctx: commands.Context):
-
-        """
-
-        Sets a Tenor GIF API key to enable reaction gifs with act commands.
-
-
-
-        You can obtain a key from here: https://tenor.com/developer/dashboard
-
-        """
-
-        instructions = [
-
-            "Go to the Tenor developer dashboard: https://tenor.com/developer/dashboard",
-
-            "Log in or sign up if you haven't already.",
-
-            "Click `+ Create new app` and fill out the form.",
-
-            "Copy the key from the app you just created.",
-
-            "Give the key to Red with this command:\n"
-
-            f"`{ctx.prefix}set api tenor api_key your_api_key`\n"
-
-            "Replace `your_api_key` with the key you just got.\n"
-
-            "Everything else should be the same.",
-
-        ]
-
-        instructions = [f"**{i}.** {v}" for i, v in enumerate(instructions, 1)]
-
-        await ctx.maybe_send_embed("\n".join(instructions))
-
-
-
-    @commands.Cog.listener()
-
-    async def on_command_error(
-
-        self, ctx: commands.Context, error: commands.CommandError, unhandled_by_cog: bool = False
-
-    ):
-
-        if ctx.command == self.act:
-
-            return
-
-        if isinstance(error, commands.UserFeedbackCheckFailure):
-
-            # UserFeedbackCheckFailure inherits from CheckFailure
-
-            return
-
-        elif isinstance(error, (commands.CheckFailure, commands.CommandNotFound)):
-
-            ctx.command = self.act
-
-            await ctx.bot.invoke(ctx)
+                          {}, body_dict)

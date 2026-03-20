@@ -2,550 +2,370 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# -*- coding: utf-8 -*-
+from canari.maltego.entities import Unknown, Hashtag
 
-# Copyright 2019 The Matrix.org Foundation C.I.C.
+from canari.maltego.transform import Transform
 
-#
+from MISP_maltego.transforms.common.entities import MISPGalaxy
 
-# Licensed under the Apache License, Version 2.0 (the "License");
+from MISP_maltego.transforms.common.util import check_update, get_misp_connection, event_to_entity, object_to_entity, get_attribute_in_event, get_attribute_in_object, attribute_to_entity, get_entity_property, search_galaxy_cluster, galaxycluster_to_entity, tag_matches_note_prefix
 
-# you may not use this file except in compliance with the License.
+from canari.maltego.message import LinkDirection, Bookmark
 
-# You may obtain a copy of the License at
 
-#
 
-#     http://www.apache.org/licenses/LICENSE-2.0
+__author__ = 'Christophe Vandeplas'
 
-#
+__copyright__ = 'Copyright 2018, MISP_maltego Project'
 
-# Unless required by applicable law or agreed to in writing, software
+__credits__ = []
 
-# distributed under the License is distributed on an "AS IS" BASIS,
 
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 
-# See the License for the specific language governing permissions and
+__license__ = 'AGPLv3'
 
-# limitations under the License.
+__version__ = '0.1'
 
-import logging
+__maintainer__ = 'Christophe Vandeplas'
 
-from unittest import TestCase
+__email__ = 'christophe@vandeplas.com'
 
+__status__ = 'Development'
 
 
-from synapse.api.constants import EventTypes
 
-from synapse.api.errors import AuthError, Codes, SynapseError
 
-from synapse.api.room_versions import RoomVersions
 
-from synapse.events import EventBase
+class SearchInMISP(Transform):
 
-from synapse.federation.federation_base import event_from_pdu_json
+    """Search an attribute, event in MISP, allowing the use of % at the front and end"""
 
-from synapse.logging.context import LoggingContext, run_in_background
+    input_type = Unknown
 
-from synapse.rest import admin
+    display_name = 'Search in MISP'
 
-from synapse.rest.client.v1 import login, room
+    remote = True
 
 
 
-from tests import unittest
+    def do_transform(self, request, response, config):
 
+        response += check_update(config)
 
+        link_label = 'Search result'
 
-logger = logging.getLogger(__name__)
 
 
+        if 'properties.mispevent' in request.entity.fields:
 
+            misp = get_misp_connection(config, request.parameters)
 
+            # if event_id
 
-class FederationTestCase(unittest.HomeserverTestCase):
+            try:
 
-    servlets = [
+                if request.entity.value == '0':
 
-        admin.register_servlets,
+                    return response
 
-        login.register_servlets,
+                eventid = int(request.entity.value)
 
-        room.register_servlets,
+                events_json = misp.search(controller='events', eventid=eventid, with_attachments=False)
 
-    ]
+                for e in events_json:
 
+                    response += event_to_entity(e, link_label=link_label, link_direction=LinkDirection.OutputToInput)
 
+                return response
 
-    def make_homeserver(self, reactor, clock):
+            except ValueError:
 
-        hs = self.setup_test_homeserver(http_client=None)
+                pass
 
-        self.handler = hs.get_federation_handler()
+            # if event_info string as value
 
-        self.store = hs.get_datastore()
+            events_json = misp.search(controller='events', eventinfo=request.entity.value, with_attachments=False)
 
-        return hs
+            for e in events_json:
 
+                response += event_to_entity(e, link_label=link_label, link_direction=LinkDirection.OutputToInput)
 
+            return response
 
-    def test_exchange_revoked_invite(self):
 
-        user_id = self.register_user("kermit", "test")
 
-        tok = self.login("kermit", "test")
+        # From galaxy or Hashtag
 
+        if 'properties.mispgalaxy' in request.entity.fields or 'properties.temp' in request.entity.fields:
 
+            if request.entity.value == '-':
 
-        room_id = self.helper.create_room_as(room_creator=user_id, tok=tok)
+                return response
 
+            # First search in galaxies
 
+            keyword = get_entity_property(request.entity, 'Temp')
 
-        # Send a 3PID invite event with an empty body so it's considered as a revoked one.
+            if not keyword:
 
-        invite_token = "sometoken"
+                keyword = request.entity.value
 
-        self.helper.send_state(
+            # assume the user is searching for a cluster based on a substring.
 
-            room_id=room_id,
+            # Search in the list for those that match and return galaxy entities'
 
-            event_type=EventTypes.ThirdPartyInvite,
+            potential_clusters = search_galaxy_cluster(keyword)
 
-            state_key=invite_token,
+            # LATER check if duplicates are possible
 
-            body={},
+            if potential_clusters:
 
-            tok=tok,
+                for potential_cluster in potential_clusters:
 
-        )
+                    new_entity = galaxycluster_to_entity(potential_cluster, link_label=link_label)
 
+                    # LATER support the type_filter - unfortunately this is not possible, we need Canari to tell us the original entity type
 
+                    if isinstance(new_entity, MISPGalaxy):
 
-        d = self.handler.on_exchange_third_party_invite_request(
+                        response += new_entity
 
-            room_id=room_id,
 
-            event_dict={
 
-                "type": EventTypes.Member,
+            # from Hashtag search also in tags
 
-                "room_id": room_id,
+            if 'properties.temp' in request.entity.fields:
 
-                "sender": user_id,
+                keyword = get_entity_property(request.entity, 'Temp')
 
-                "state_key": "@someone:example.org",
+                if not keyword:
 
-                "content": {
+                    keyword = request.entity.value
 
-                    "membership": "invite",
+                misp = get_misp_connection(config, request.parameters)
 
-                    "third_party_invite": {
+                result = misp.direct_call('tags/search', {'name': keyword})
 
-                        "display_name": "alice",
+                for t in result:
 
-                        "signed": {
+                    # skip misp-galaxies as we have processed them earlier on
 
-                            "mxid": "@alice:localhost",
+                    if t['Tag']['name'].startswith('misp-galaxy'):
 
-                            "token": invite_token,
+                        continue
 
-                            "signatures": {
+                    # In this case we do not filter away those we add as notes, as people might want to pivot on it explicitly.
 
-                                "magic.forest": {
+                    response += Hashtag(t['Tag']['name'], link_label=link_label, bookmark=Bookmark.Green)
 
-                                    "ed25519:3": "fQpGIW1Snz+pwLZu6sTy2aHy/DYWWTspTJRPyNp0PKkymfIsNffysMl6ObMMFdIJhk6g6pwlIqZ54rxo8SLmAg"
 
-                                }
 
-                            },
+            return response
 
-                        },
 
-                    },
 
-                },
+        # for all other normal entities
 
-            },
+        misp = get_misp_connection(config, request.parameters)
 
-        )
+        events_json = misp.search(controller='events', value=request.entity.value, with_attachments=False)
 
+        # we need to do really rebuild the Entity from scratch as request.entity is of type Unknown
 
+        for e in events_json:
 
-        failure = self.get_failure(d, AuthError).value
+            # find the value as attribute
 
+            attr = get_attribute_in_event(e, request.entity.value, substring=True)
 
+            if attr:
 
-        self.assertEqual(failure.code, 403, failure)
+                for item in attribute_to_entity(attr, only_self=True):
 
-        self.assertEqual(failure.errcode, Codes.FORBIDDEN, failure)
+                    response += item
 
-        self.assertEqual(failure.msg, "You are not invited to this room.")
+            # find the value as object, and return the object
 
+            if 'Object' in e['Event']:
 
+                for o in e['Event']['Object']:
 
-    def test_rejected_message_event_state(self):
+                    if get_attribute_in_object(o, attribute_value=request.entity.value, substring=True).get('value'):
 
-        """
+                        response += object_to_entity(o, link_label=link_label)
 
-        Check that we store the state group correctly for rejected non-state events.
 
 
+        return response
 
-        Regression test for #6289.
 
-        """
 
-        OTHER_SERVER = "otherserver"
+# placeholder for https://github.com/MISP/MISP-maltego/issues/11
 
-        OTHER_USER = "@otheruser:" + OTHER_SERVER
+# waiting for support of CIDR search through the REST API
 
+# @EnableDebugWindow
 
+# class NetblockToAttributes(Transform):
 
-        # create the room
+#     display_name = 'to MISP Attributes'
 
-        user_id = self.register_user("kermit", "test")
+#     input_type = Netblock
 
-        tok = self.login("kermit", "test")
+#     remote = True
 
-        room_id = self.helper.create_room_as(room_creator=user_id, tok=tok)
 
-        room_version = self.get_success(self.store.get_room_version(room_id))
 
+#     def do_transform(self, request, response, config):
 
+#         maltego_misp_attribute = request.entity
 
-        # pretend that another server has joined
+#         misp = get_misp_connection(config, request.parameters)
 
-        join_event = self._build_and_send_join_event(OTHER_SERVER, OTHER_USER, room_id)
+#         import ipaddress
 
+#         ip_start, ip_end = maltego_misp_attribute.value.split('-')
 
+#         # LATER make this work with IPv4 and IPv6
 
-        # check the state group
+#         # automagically detect the different CIDRs
 
-        sg = self.successResultOf(
+#         cidrs = ipaddress.summarize_address_range(ipaddress.IPv4Address(ip_start), ipaddress.IPv4Address(ip_end))
 
-            self.store._get_state_group_for_event(join_event.event_id)
+#         for cidr in cidrs:
 
-        )
+#             print(str(cidr))
 
+#             attr_json = misp.search(controller='attributes', value=str(cidr), with_attachments=False)
 
+#             print(attr_json)
 
-        # build and send an event which will be rejected
+#         return response
 
-        ev = event_from_pdu_json(
 
-            {
 
-                "type": EventTypes.Message,
 
-                "content": {},
 
-                "room_id": room_id,
+class AttributeToEvent(Transform):
 
-                "sender": "@yetanotheruser:" + OTHER_SERVER,
+    input_type = Unknown
 
-                "depth": join_event["depth"] + 1,
+    display_name = 'to MISP Event'
 
-                "prev_events": [join_event.event_id],
+    remote = True
 
-                "auth_events": [],
 
-                "origin_server_ts": self.clock.time_msec(),
 
-            },
+    def do_transform(self, request, response, config):
 
-            room_version,
+        response += check_update(config)
 
-        )
+        # skip some Entities
 
+        skip = ['properties.mispevent']
 
+        for i in skip:
 
-        with LoggingContext(request="send_rejected"):
+            if i in request.entity.fields:
 
-            d = run_in_background(self.handler.on_receive_pdu, OTHER_SERVER, ev)
+                return response
 
-        self.get_success(d)
 
 
+        if 'ipv4-range' in request.entity.fields:
 
-        # that should have been rejected
+            # placeholder for https://github.com/MISP/MISP-maltego/issues/11
 
-        e = self.get_success(self.store.get_event(ev.event_id, allow_rejected=True))
+            pass
 
-        self.assertIsNotNone(e.rejected_reason)
 
 
+        misp = get_misp_connection(config, request.parameters)
 
-        # ... and the state group should be the same as before
+        # from Galaxy
 
-        sg2 = self.successResultOf(self.store._get_state_group_for_event(ev.event_id))
+        if 'properties.mispgalaxy' in request.entity.fields:
 
+            tag_name = get_entity_property(request.entity, 'tag_name')
 
+            if not tag_name:
 
-        self.assertEqual(sg, sg2)
+                tag_name = request.entity.value
 
+            events_json = misp.search(controller='events', tags=tag_name, with_attachments=False)
 
+            for e in events_json:
 
-    def test_rejected_state_event_state(self):
+                response += event_to_entity(e, link_direction=LinkDirection.OutputToInput)
 
-        """
+            return response
 
-        Check that we store the state group correctly for rejected state events.
+        # from Object
 
+        elif 'properties.mispobject' in request.entity.fields:
 
+            if request.entity.fields.get('event_id'):
 
-        Regression test for #6289.
+                events_json = misp.search(controller='events', eventid=request.entity.fields.get('event_id').value, with_attachments=False)
 
-        """
+                for e in events_json:
 
-        OTHER_SERVER = "otherserver"
+                    response += event_to_entity(e, link_direction=LinkDirection.OutputToInput)
 
-        OTHER_USER = "@otheruser:" + OTHER_SERVER
+                return response
 
+            else:
 
+                return response
 
-        # create the room
+        # from Hashtag
 
-        user_id = self.register_user("kermit", "test")
+        elif 'properties.temp' in request.entity.fields:
 
-        tok = self.login("kermit", "test")
+            tag_name = get_entity_property(request.entity, 'Temp')
 
-        room_id = self.helper.create_room_as(room_creator=user_id, tok=tok)
+            if not tag_name:
 
-        room_version = self.get_success(self.store.get_room_version(room_id))
+                tag_name = request.entity.value
 
+            events_json = misp.search(controller='events', tags=tag_name, with_attachments=False)
 
+            for e in events_json:
 
-        # pretend that another server has joined
+                response += event_to_entity(e, link_direction=LinkDirection.OutputToInput)
 
-        join_event = self._build_and_send_join_event(OTHER_SERVER, OTHER_USER, room_id)
+            return response
 
+        # standard Entities (normal attributes)
 
+        else:
 
-        # check the state group
+            events_json = misp.search(controller='events', value=request.entity.value, with_attachments=False)
 
-        sg = self.successResultOf(
 
-            self.store._get_state_group_for_event(join_event.event_id)
 
-        )
+        # return the MISPEvent or MISPObject of the attribute
 
+        for e in events_json:
 
+            # find the value as attribute
 
-        # build and send an event which will be rejected
+            attr = get_attribute_in_event(e, request.entity.value)
 
-        ev = event_from_pdu_json(
+            if attr:
 
-            {
+                response += event_to_entity(e, link_direction=LinkDirection.OutputToInput)
 
-                "type": "org.matrix.test",
+            # find the value as object
 
-                "state_key": "test_key",
+            if 'Object' in e['Event']:
 
-                "content": {},
+                for o in e['Event']['Object']:
 
-                "room_id": room_id,
+                    if get_attribute_in_object(o, attribute_value=request.entity.value).get('value'):
 
-                "sender": "@yetanotheruser:" + OTHER_SERVER,
+                        response += object_to_entity(o, link_direction=LinkDirection.OutputToInput)
 
-                "depth": join_event["depth"] + 1,
 
-                "prev_events": [join_event.event_id],
 
-                "auth_events": [],
-
-                "origin_server_ts": self.clock.time_msec(),
-
-            },
-
-            room_version,
-
-        )
-
-
-
-        with LoggingContext(request="send_rejected"):
-
-            d = run_in_background(self.handler.on_receive_pdu, OTHER_SERVER, ev)
-
-        self.get_success(d)
-
-
-
-        # that should have been rejected
-
-        e = self.get_success(self.store.get_event(ev.event_id, allow_rejected=True))
-
-        self.assertIsNotNone(e.rejected_reason)
-
-
-
-        # ... and the state group should be the same as before
-
-        sg2 = self.successResultOf(self.store._get_state_group_for_event(ev.event_id))
-
-
-
-        self.assertEqual(sg, sg2)
-
-
-
-    def _build_and_send_join_event(self, other_server, other_user, room_id):
-
-        join_event = self.get_success(
-
-            self.handler.on_make_join_request(other_server, room_id, other_user)
-
-        )
-
-        # the auth code requires that a signature exists, but doesn't check that
-
-        # signature... go figure.
-
-        join_event.signatures[other_server] = {"x": "y"}
-
-        with LoggingContext(request="send_join"):
-
-            d = run_in_background(
-
-                self.handler.on_send_join_request, other_server, join_event
-
-            )
-
-        self.get_success(d)
-
-
-
-        # sanity-check: the room should show that the new user is a member
-
-        r = self.get_success(self.store.get_current_state_ids(room_id))
-
-        self.assertEqual(r[(EventTypes.Member, other_user)], join_event.event_id)
-
-
-
-        return join_event
-
-
-
-
-
-class EventFromPduTestCase(TestCase):
-
-    def test_valid_json(self):
-
-        """Valid JSON should be turned into an event."""
-
-        ev = event_from_pdu_json(
-
-            {
-
-                "type": EventTypes.Message,
-
-                "content": {"bool": True, "null": None, "int": 1, "str": "foobar"},
-
-                "room_id": "!room:test",
-
-                "sender": "@user:test",
-
-                "depth": 1,
-
-                "prev_events": [],
-
-                "auth_events": [],
-
-                "origin_server_ts": 1234,
-
-            },
-
-            RoomVersions.V6,
-
-        )
-
-
-
-        self.assertIsInstance(ev, EventBase)
-
-
-
-    def test_invalid_numbers(self):
-
-        """Invalid values for an integer should be rejected, all floats should be rejected."""
-
-        for value in [
-
-            -(2 ** 53),
-
-            2 ** 53,
-
-            1.0,
-
-            float("inf"),
-
-            float("-inf"),
-
-            float("nan"),
-
-        ]:
-
-            with self.assertRaises(SynapseError):
-
-                event_from_pdu_json(
-
-                    {
-
-                        "type": EventTypes.Message,
-
-                        "content": {"foo": value},
-
-                        "room_id": "!room:test",
-
-                        "sender": "@user:test",
-
-                        "depth": 1,
-
-                        "prev_events": [],
-
-                        "auth_events": [],
-
-                        "origin_server_ts": 1234,
-
-                    },
-
-                    RoomVersions.V6,
-
-                )
-
-
-
-    def test_invalid_nested(self):
-
-        """List and dictionaries are recursively searched."""
-
-        with self.assertRaises(SynapseError):
-
-            event_from_pdu_json(
-
-                {
-
-                    "type": EventTypes.Message,
-
-                    "content": {"foo": [{"bar": 2 ** 56}]},
-
-                    "room_id": "!room:test",
-
-                    "sender": "@user:test",
-
-                    "depth": 1,
-
-                    "prev_events": [],
-
-                    "auth_events": [],
-
-                    "origin_server_ts": 1234,
-
-                },
-
-                RoomVersions.V6,
-
-            )
+        return response

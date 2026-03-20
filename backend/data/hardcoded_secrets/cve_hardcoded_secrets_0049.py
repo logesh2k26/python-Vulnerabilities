@@ -2,280 +2,452 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-"""Test the kernels service API."""
+import unittest
 
+import os
 
+from getpass import getuser
 
-import json
 
-import requests
 
+# import lshell specifics
 
+from lshell.shellcmd import ShellCmd
 
-from IPython.html.utils import url_path_join
+from lshell.checkconfig import CheckConfig
 
-from IPython.html.tests.launchnotebook import NotebookTestBase, assert_http_error
+from lshell.utils import get_aliases, updateprompt
 
+from lshell.variables import builtins_list
 
+from lshell import builtins
 
-class KernelAPI(object):
+from lshell import sec
 
-    """Wrapper for kernel REST API requests"""
 
-    def __init__(self, base_url):
 
-        self.base_url = base_url
+TOPDIR = '%s/../' % os.path.dirname(os.path.realpath(__file__))
 
 
 
-    def _req(self, verb, path, body=None):
 
-        response = requests.request(verb,
 
-                url_path_join(self.base_url, 'api/kernels', path), data=body)
+class TestFunctions(unittest.TestCase):
 
+    args = ['--config=%s/etc/lshell.conf' % TOPDIR, "--quiet=1"]
 
+    userconf = CheckConfig(args).returnconf()
 
-        if 400 <= response.status_code < 600:
+    shell = ShellCmd(userconf, args)
 
-            try:
 
-                response.reason = response.json()['message']
 
-            except:
+    def test_01_checksecure_doublequote(self):
 
-                pass
+        """ U01 | quoted text should not be forbidden """
 
-        response.raise_for_status()
+        INPUT = 'ls -E "1|2" tmp/test'
 
+        return self.assertEqual(sec.check_secure(INPUT, self.userconf)[0], 0)
 
 
-        return response
 
+    def test_02_checksecure_simplequote(self):
 
+        """ U02 | quoted text should not be forbidden """
 
-    def list(self):
+        INPUT = "ls -E '1|2' tmp/test"
 
-        return self._req('GET', '')
+        return self.assertEqual(sec.check_secure(INPUT, self.userconf)[0], 0)
 
 
 
-    def get(self, id):
+    def test_03_checksecure_doublepipe(self):
 
-        return self._req('GET', id)
+        """ U03 | double pipes should be allowed, even if pipe is forbidden """
 
+        args = self.args + ["--forbidden=['|']"]
 
+        userconf = CheckConfig(args).returnconf()
 
-    def start(self, name='python'):
+        INPUT = "ls || ls"
 
-        body = json.dumps({'name': name})
+        return self.assertEqual(sec.check_secure(INPUT, userconf)[0], 0)
 
-        return self._req('POST', '', body)
 
 
+    def test_04_checksecure_forbiddenpipe(self):
 
-    def shutdown(self, id):
+        """ U04 | forbid pipe, should return 1 """
 
-        return self._req('DELETE', id)
+        args = self.args + ["--forbidden=['|']"]
 
+        userconf = CheckConfig(args).returnconf()
 
+        INPUT = "ls | ls"
 
-    def interrupt(self, id):
+        return self.assertEqual(sec.check_secure(INPUT, userconf)[0], 1)
 
-        return self._req('POST', url_path_join(id, 'interrupt'))
 
 
+    def test_05_checksecure_forbiddenchar(self):
 
-    def restart(self, id):
+        """ U05 | forbid character, should return 1 """
 
-        return self._req('POST', url_path_join(id, 'restart'))
+        args = self.args + ["--forbidden=['l']"]
 
+        userconf = CheckConfig(args).returnconf()
 
+        INPUT = "ls"
 
-class KernelAPITest(NotebookTestBase):
+        return self.assertEqual(sec.check_secure(INPUT, userconf)[0], 1)
 
-    """Test the kernels web service API"""
 
-    def setUp(self):
 
-        self.kern_api = KernelAPI(self.base_url())
+    def test_06_checksecure_sudo_command(self):
 
+        """ U06 | quoted text should not be forbidden """
 
+        INPUT = "sudo ls"
 
-    def tearDown(self):
+        return self.assertEqual(sec.check_secure(INPUT, self.userconf)[0], 1)
 
-        for k in self.kern_api.list().json():
 
-            self.kern_api.shutdown(k['id'])
 
+    def test_07_checksecure_notallowed_command(self):
 
+        """ U07 | forbidden command, should return 1 """
 
-    def test__no_kernels(self):
+        args = self.args + ["--allowed=['ls']"]
 
-        """Make sure there are no kernels running at the start"""
+        userconf = CheckConfig(args).returnconf()
 
-        kernels = self.kern_api.list().json()
+        INPUT = "ll"
 
-        self.assertEqual(kernels, [])
+        return self.assertEqual(sec.check_secure(INPUT, userconf)[0], 1)
 
 
 
-    def test_default_kernel(self):
+    def test_08_checkpath_notallowed_path(self):
 
-        # POST request
+        """ U08 | forbidden command, should return 1 """
 
-        r = self.kern_api._req('POST', '')
+        args = self.args + ["--path=['/home', '/var']"]
 
-        kern1 = r.json()
+        userconf = CheckConfig(args).returnconf()
 
-        self.assertEqual(r.headers['location'], '/api/kernels/' + kern1['id'])
+        INPUT = "cd /tmp"
 
-        self.assertEqual(r.status_code, 201)
+        return self.assertEqual(sec.check_path(INPUT, userconf)[0], 1)
 
-        self.assertIsInstance(kern1, dict)
 
 
+    def test_09_checkpath_notallowed_path_completion(self):
 
-        self.assertEqual(r.headers['Content-Security-Policy'], (
+        """ U09 | forbidden command, should return 1 """
 
-                            "frame-ancestors 'self'; "
+        args = self.args + ["--path=['/home', '/var']"]
 
-                            "report-uri /api/security/csp-report;"
+        userconf = CheckConfig(args).returnconf()
 
-        ))
+        INPUT = "cd /tmp/"
 
+        return self.assertEqual(sec.check_path(INPUT,
 
+                                               userconf,
 
-    def test_main_kernel_handler(self):
+                                               completion=1)[0], 1)
 
-        # POST request
 
-        r = self.kern_api.start()
 
-        kern1 = r.json()
+    def test_10_checkpath_dollarparenthesis(self):
 
-        self.assertEqual(r.headers['location'], '/api/kernels/' + kern1['id'])
+        """ U10 | when $() is allowed, return 0 if path allowed """
 
-        self.assertEqual(r.status_code, 201)
+        args = self.args + ["--forbidden=[';', '&', '|','`','>','<', '${']"]
 
-        self.assertIsInstance(kern1, dict)
+        userconf = CheckConfig(args).returnconf()
 
+        INPUT = "echo $(echo aze)"
 
+        return self.assertEqual(sec.check_path(INPUT, userconf)[0], 0)
 
-        self.assertEqual(r.headers['Content-Security-Policy'], (
 
-                            "frame-ancestors 'self'; "
 
-                            "report-uri /api/security/csp-report;"
+    def test_11_checkconfig_configoverwrite(self):
 
-        ))
+        """ U12 | forbid ';', then check_secure should return 1 """
 
+        args = ['--config=%s/etc/lshell.conf' % TOPDIR, '--strict=123']
 
+        userconf = CheckConfig(args).returnconf()
 
-        # GET request
+        return self.assertEqual(userconf['strict'], 123)
 
-        r = self.kern_api.list()
 
-        self.assertEqual(r.status_code, 200)
 
-        assert isinstance(r.json(), list)
+    def test_12_overssh(self):
 
-        self.assertEqual(r.json()[0]['id'], kern1['id'])
+        """ U12 | command over ssh """
 
-        self.assertEqual(r.json()[0]['name'], kern1['name'])
+        args = self.args + ["--overssh=['exit']", '-c exit']
 
+        os.environ['SSH_CLIENT'] = '8.8.8.8 36000 22'
 
+        if 'SSH_TTY' in os.environ:
 
-        # create another kernel and check that they both are added to the
+            os.environ.pop('SSH_TTY')
 
-        # list of kernels from a GET request
+        with self.assertRaises(SystemExit) as cm:
 
-        kern2 = self.kern_api.start().json()
+            CheckConfig(args).returnconf()
 
-        assert isinstance(kern2, dict)
+        return self.assertEqual(cm.exception.code, 0)
 
-        r = self.kern_api.list()
 
-        kernels = r.json()
 
-        self.assertEqual(r.status_code, 200)
+    def test_13_multiple_aliases_with_separator(self):
 
-        assert isinstance(kernels, list)
+        """ U13 | multiple aliases using &&, || and ; separators """
 
-        self.assertEqual(len(kernels), 2)
+        # enable &, | and ; characters
 
+        aliases = {'foo': 'foo -l', 'bar': 'open'}
 
+        INPUT = "foo; fooo  ;bar&&foo  &&   foo | bar||bar   ||     foo"
 
-        # Interrupt a kernel
+        return self.assertEqual(get_aliases(INPUT, aliases),
 
-        r = self.kern_api.interrupt(kern2['id'])
+                                ' foo -l; fooo  ; open&& foo -l  '
 
-        self.assertEqual(r.status_code, 204)
+                                '&& foo -l | open|| open   || foo -l')
 
 
 
-        # Restart a kernel
+    def test_14_sudo_all_commands_expansion(self):
 
-        r = self.kern_api.restart(kern2['id'])
+        """ U14 | sudo_commands set to 'all' is equal to allowed variable """
 
-        self.assertEqual(r.headers['Location'], '/api/kernels/'+kern2['id'])
+        args = self.args + ["--sudo_commands=all"]
 
-        rekern = r.json()
+        userconf = CheckConfig(args).returnconf()
 
-        self.assertEqual(rekern['id'], kern2['id'])
+        # exclude internal and sudo(8) commands
 
-        self.assertEqual(rekern['name'], kern2['name'])
+        exclude = builtins_list + ['sudo']
 
+        allowed = [x for x in userconf['allowed'] if x not in exclude]
 
+        # sort lists to compare
 
-    def test_kernel_handler(self):
+        userconf['sudo_commands'].sort()
 
-        # GET kernel with given id
+        allowed.sort()
 
-        kid = self.kern_api.start().json()['id']
+        return self.assertEqual(allowed, userconf['sudo_commands'])
 
-        r = self.kern_api.get(kid)
 
-        kern1 = r.json()
 
-        self.assertEqual(r.status_code, 200)
+    def test_15_allowed_ld_preload_cmd(self):
 
-        assert isinstance(kern1, dict)
+        """ U15 | all allowed commands should be prepended with LD_PRELOAD """
 
-        self.assertIn('id', kern1)
+        args = self.args + ["--allowed=['echo','export']"]
 
-        self.assertEqual(kern1['id'], kid)
+        userconf = CheckConfig(args).returnconf()
 
+        # sort lists to compare
 
+        return self.assertEqual(userconf['aliases']['echo'],
 
-        # Request a bad kernel id and check that a JSON
+                                'LD_PRELOAD=%s echo' % userconf['path_noexec'])
 
-        # message is returned!
 
-        bad_id = '111-111-111-111-111'
 
-        with assert_http_error(404, 'Kernel does not exist: ' + bad_id):
+    def test_16_allowed_ld_preload_builtin(self):
 
-            self.kern_api.get(bad_id)
+        """ U16 | builtin commands should NOT be prepended with LD_PRELOAD """
 
+        args = self.args + ["--allowed=['echo','export']"]
 
+        userconf = CheckConfig(args).returnconf()
 
-        # DELETE kernel with id
+        # verify that export is not automatically added to the aliases (i.e.
 
-        r = self.kern_api.shutdown(kid)
+        # prepended with LD_PRELOAD)
 
-        self.assertEqual(r.status_code, 204)
+        return self.assertNotIn('export', userconf['aliases'])
 
-        kernels = self.kern_api.list().json()
 
-        self.assertEqual(kernels, [])
 
+    def test_17_allowed_exec_cmd(self):
 
+        """ U17 | allowed_shell_escape should NOT be prepended with LD_PRELOAD
 
-        # Request to delete a non-existent kernel id
+            The command should not be added to the aliases variable
 
-        bad_id = '111-111-111-111-111'
+        """
 
-        with assert_http_error(404, 'Kernel does not exist: ' + bad_id):
+        args = self.args + ["--allowed_shell_escape=['echo']"]
 
-            self.kern_api.shutdown(bad_id)
+        userconf = CheckConfig(args).returnconf()
+
+        # sort lists to compare
+
+        return self.assertNotIn('echo', userconf['aliases'])
+
+
+
+    def test_18_forbidden_environment(self):
+
+        """ U18 | unsafe environment are forbidden
+
+        """
+
+        INPUT = 'export LD_PRELOAD=/lib64/ld-2.21.so'
+
+        args = INPUT
+
+        retcode = builtins.export(args)[0]
+
+        return self.assertEqual(retcode, 1)
+
+
+
+    def test_19_allowed_environment(self):
+
+        """ U19 | other environment are accepted
+
+        """
+
+        INPUT = 'export MY_PROJECT_VERSION=43'
+
+        args = INPUT
+
+        retcode = builtins.export(args)[0]
+
+        return self.assertEqual(retcode, 0)
+
+
+
+    def test_20_winscp_allowed_commands(self):
+
+        """ U20 | when winscp is enabled, new allowed commands are automatically
+
+            added (see man).
+
+        """
+
+        args = self.args + ["--allowed=[]", "--winscp=1"]
+
+        userconf = CheckConfig(args).returnconf()
+
+        # sort lists to compare, except 'export'
+
+        exclude = list(set(builtins_list) - set(['export']))
+
+        expected = exclude + ['scp', 'env', 'pwd', 'groups',
+
+                              'unset', 'unalias']
+
+        expected.sort()
+
+        allowed = userconf['allowed']
+
+        allowed.sort()
+
+        return self.assertEqual(allowed, expected)
+
+
+
+    def test_21_winscp_allowed_semicolon(self):
+
+        """ U21 | when winscp is enabled, use of semicolon is allowed """
+
+        args = self.args + ["--forbidden=[';']", "--winscp=1"]
+
+        userconf = CheckConfig(args).returnconf()
+
+        # sort lists to compare
+
+        return self.assertNotIn(';', userconf['forbidden'])
+
+
+
+    def test_22_prompt_short_0(self):
+
+        """ U22 | short_prompt = 0 should show dir compared to home dir """
+
+        expected = '%s:~/foo$ ' % getuser()
+
+        args = self.args + ['--prompt_short=0']
+
+        userconf = CheckConfig(args).returnconf()
+
+        currentpath = "%s/foo" % userconf['home_path']
+
+        prompt = updateprompt(currentpath, userconf)
+
+        # sort lists to compare
+
+        return self.assertEqual(prompt, expected)
+
+
+
+    def test_23_prompt_short_1(self):
+
+        """ U23 | short_prompt = 1 should show only current dir """
+
+        expected = '%s: foo$ ' % getuser()
+
+        args = self.args + ['--prompt_short=1']
+
+        userconf = CheckConfig(args).returnconf()
+
+        currentpath = "%s/foo" % userconf['home_path']
+
+        prompt = updateprompt(currentpath, userconf)
+
+        # sort lists to compare
+
+        return self.assertEqual(prompt, expected)
+
+
+
+    def test_24_prompt_short_2(self):
+
+        """ U24 | short_prompt = 2 should show full dir path """
+
+        expected = '%s: %s$ ' % (getuser(), os.getcwd())
+
+        args = self.args + ['--prompt_short=2']
+
+        userconf = CheckConfig(args).returnconf()
+
+        currentpath = "%s/foo" % userconf['home_path']
+
+        prompt = updateprompt(currentpath, userconf)
+
+        # sort lists to compare
+
+        return self.assertEqual(prompt, expected)
+
+
+
+    def test_25_disable_ld_preload(self):
+
+        """ U25 | empty path_noexec should disable LD_PRELOAD """
+
+        args = self.args + ["--allowed=['echo','export']", "--path_noexec=''"]
+
+        userconf = CheckConfig(args).returnconf()
+
+        # verify that no alias was created containing LD_PRELOAD
+
+        return self.assertNotIn('echo', userconf['aliases'])
+
+
+
+if __name__ == "__main__":
+
+    unittest.main()

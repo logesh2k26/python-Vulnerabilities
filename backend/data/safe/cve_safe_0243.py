@@ -2,1466 +2,602 @@
 # Safety: safe
 # Category: safe
 
-# Copyright 2012 OpenStack LLC.
+import os
 
-# All Rights Reserved.
+import os.path
 
-#
+import tempfile
 
-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+import shutil
 
-#    not use this file except in compliance with the License. You may obtain
+from nose.tools import eq_
 
-#    a copy of the License at
+from build_pack_utils import utils
 
-#
+from compile_helpers import setup_webdir_if_it_doesnt_exist
 
-#         http://www.apache.org/licenses/LICENSE-2.0
+from compile_helpers import convert_php_extensions
 
-#
+from compile_helpers import is_web_app
 
-#    Unless required by applicable law or agreed to in writing, software
+from compile_helpers import find_stand_alone_app_to_run
 
-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+from compile_helpers import load_manifest
 
-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+from compile_helpers import find_all_php_versions
 
-#    License for the specific language governing permissions and limitations
+from compile_helpers import validate_php_version
 
-#    under the License.
+from compile_helpers import setup_log_dir
 
 
 
-import copy
 
-import datetime
 
-import json
+class TestCompileHelpers(object):
 
-import re
+    def setUp(self):
 
-import urllib
+        self.build_dir = tempfile.mkdtemp(prefix='build-')
 
+        self.cache_dir = tempfile.mkdtemp(prefix='cache-')
 
+        os.rmdir(self.build_dir)  # delete otherwise copytree complains
 
-import webob.exc
+        os.rmdir(self.cache_dir)  # cache dir does not exist normally
 
 
 
-from glance.api import policy
+    def tearDown(self):
 
-import glance.api.v2 as v2
+        if os.path.exists(self.build_dir):
 
-from glance.common import exception
+            shutil.rmtree(self.build_dir)
 
-from glance.common import utils
+        if os.path.exists(self.cache_dir):
 
-from glance.common import wsgi
+            shutil.rmtree(self.cache_dir)
 
-import glance.db
+        for name in os.listdir(os.environ['TMPDIR']):
 
-import glance.notifier
+            if name.startswith('httpd-') and name.endswith('.gz'):
 
-from glance.openstack.common import cfg
+                os.remove(os.path.join(os.environ['TMPDIR'], name))
 
-import glance.openstack.common.log as logging
+            if name.startswith('php-') and name.endswith('.gz'):
 
-from glance.openstack.common import timeutils
+                os.remove(os.path.join(os.environ['TMPDIR'], name))
 
-import glance.schema
 
-import glance.store
 
+    def assert_exists(self, *args):
 
+        eq_(True, os.path.exists(os.path.join(*args)),
 
+            "Does not exists: %s" % os.path.join(*args))
 
 
-LOG = logging.getLogger(__name__)
 
+    def test_setup_log_dir(self):
 
+        eq_(False, os.path.exists(os.path.join(self.build_dir, 'logs')))
 
-CONF = cfg.CONF
+        setup_log_dir({
 
+            'BUILD_DIR': self.build_dir
 
+        })
 
+        self.assert_exists(self.build_dir, 'logs')
 
 
-class ImagesController(object):
 
-    def __init__(self, db_api=None, policy_enforcer=None, notifier=None,
+    def test_setup_if_webdir_exists(self):
 
-            store_api=None):
+        shutil.copytree('tests/data/app-1', self.build_dir)
 
-        self.db_api = db_api or glance.db.get_api()
+        setup_webdir_if_it_doesnt_exist(utils.FormattedDict({
 
-        self.db_api.configure_db()
+            'BUILD_DIR': self.build_dir,
 
-        self.policy = policy_enforcer or policy.Enforcer()
+            'WEBDIR': 'htdocs',
 
-        self.notifier = notifier or glance.notifier.Notifier()
+            'LIBDIR': 'lib'
 
-        self.store_api = store_api or glance.store
+        }))
 
-        self.store_api.create_stores()
+        self.assert_exists(self.build_dir, 'htdocs')
 
+        self.assert_exists(self.build_dir, 'htdocs', 'index.php')
 
+        self.assert_exists(self.build_dir, 'htdocs', 'info.php')
 
-    def _enforce(self, req, action):
+        self.assert_exists(self.build_dir, 'htdocs',
 
-        """Authorize an action against our policies"""
+                           'technical-difficulties1.jpg')
 
-        try:
+        self.assert_exists(self.build_dir, '.bp-config')
 
-            self.policy.enforce(req.context, action, {})
+        self.assert_exists(self.build_dir, '.bp-config', 'options.json')
 
-        except exception.Forbidden:
+        self.assert_exists(self.build_dir, '.bp-config', 'httpd', 'extra',
 
-            raise webob.exc.HTTPForbidden()
+                           'httpd-remoteip.conf')
 
+        eq_(2, len(os.listdir(self.build_dir)))
 
+        eq_(3, len(os.listdir(os.path.join(self.build_dir, 'htdocs'))))
 
-    def _normalize_properties(self, image):
 
-        """Convert the properties from the stored format to a dict
 
+    def test_setup_if_custom_webdir_exists(self):
 
+        shutil.copytree('tests/data/app-6', self.build_dir)
 
-        The db api returns a list of dicts that look like
+        setup_webdir_if_it_doesnt_exist(utils.FormattedDict({
 
-        {'name': <key>, 'value': <value>}, while it expects a format
+            'BUILD_DIR': self.build_dir,
 
-        like {<key>: <value>} in image create and update calls. This
+            'WEBDIR': 'public',
 
-        function takes the extra step that the db api should be
+            'LIBDIR': 'lib'
 
-        responsible for in the image get calls.
+        }))
 
+        self.assert_exists(self.build_dir, 'public')
 
+        self.assert_exists(self.build_dir, 'public', 'index.php')
 
-        The db api will also return deleted image properties that must
+        self.assert_exists(self.build_dir, 'public', 'info.php')
 
-        be filtered out.
+        self.assert_exists(self.build_dir, 'public',
 
-        """
+                           'technical-difficulties1.jpg')
 
-        properties = [(p['name'], p['value'])
+        self.assert_exists(self.build_dir, '.bp-config')
 
-                      for p in image['properties'] if not p['deleted']]
+        self.assert_exists(self.build_dir, '.bp-config', 'options.json')
 
-        image['properties'] = dict(properties)
+        self.assert_exists(self.build_dir, '.bp-config', 'httpd', 'extra',
 
-        return image
+                           'httpd-remoteip.conf')
 
+        eq_(3, len(os.listdir(self.build_dir)))
 
+        eq_(3, len(os.listdir(os.path.join(self.build_dir, 'public'))))
 
-    def _extract_tags(self, image):
 
-        try:
 
-            #NOTE(bcwaldon): cast to set to make the list unique, then
+    def test_setup_if_htdocs_does_not_exist(self):
 
-            # cast back to list since that's a more sane response type
+        shutil.copytree('tests/data/app-2', self.build_dir)
 
-            return list(set(image.pop('tags')))
+        setup_webdir_if_it_doesnt_exist(utils.FormattedDict({
 
-        except KeyError:
+            'BUILD_DIR': self.build_dir,
 
-            pass
+            'WEBDIR': 'htdocs',
 
+            'LIBDIR': 'lib'
 
+        }))
 
-    def _append_tags(self, context, image):
+        self.assert_exists(self.build_dir, 'htdocs')
 
-        image['tags'] = self.db_api.image_tag_get_all(context, image['id'])
+        self.assert_exists(self.build_dir, 'htdocs', 'index.php')
 
-        return image
+        self.assert_exists(self.build_dir, 'htdocs', 'info.php')
 
+        self.assert_exists(self.build_dir, 'htdocs',
 
+                           'technical-difficulties1.jpg')
 
-    @utils.mutating
+        self.assert_exists(self.build_dir, '.bp-config')
 
-    def create(self, req, image):
+        self.assert_exists(self.build_dir, '.bp-config', 'options.json')
 
-        self._enforce(req, 'add_image')
+        self.assert_exists(self.build_dir, '.bp-config', 'httpd', 'extra',
 
-        is_public = image.get('is_public')
+                           'httpd-remoteip.conf')
 
-        if is_public:
+        eq_(2, len(os.listdir(self.build_dir)))
 
-            self._enforce(req, 'publicize_image')
+        eq_(3, len(os.listdir(os.path.join(self.build_dir, 'htdocs'))))
 
-        image['owner'] = req.context.owner
 
-        image['status'] = 'queued'
 
+    def test_setup_if_htdocs_does_not_exist_but_library_does(self):
 
+        shutil.copytree('tests/data/app-7', self.build_dir)
 
-        tags = self._extract_tags(image)
+        setup_webdir_if_it_doesnt_exist(utils.FormattedDict({
 
+            'BUILD_DIR': self.build_dir,
 
+            'WEBDIR': 'htdocs',
 
-        image = dict(self.db_api.image_create(req.context, image))
+            'LIBDIR': 'lib'
 
+        }))
 
+        self.assert_exists(self.build_dir, 'htdocs')
 
-        if tags is not None:
+        self.assert_exists(self.build_dir, 'htdocs', 'index.php')
 
-            self.db_api.image_tag_set_all(req.context, image['id'], tags)
+        self.assert_exists(self.build_dir, 'htdocs', 'info.php')
 
-            image['tags'] = tags
+        self.assert_exists(self.build_dir, 'htdocs',
 
-        else:
+                           'technical-difficulties1.jpg')
 
-            image['tags'] = []
+        self.assert_exists(self.build_dir, 'htdocs', 'library')
 
+        self.assert_exists(self.build_dir, 'htdocs', 'library', 'junk.php')
 
+        self.assert_exists(self.build_dir, 'lib')
 
-        v2.update_image_read_acl(req, self.store_api, self.db_api, image)
+        self.assert_exists(self.build_dir, 'lib', 'test.php')
 
-        image = self._normalize_properties(dict(image))
+        self.assert_exists(self.build_dir, '.bp-config')
 
-        self.notifier.info('image.update', image)
+        self.assert_exists(self.build_dir, '.bp-config', 'options.json')
 
-        return image
+        self.assert_exists(self.build_dir, '.bp-config', 'httpd', 'extra',
 
+                           'httpd-remoteip.conf')
 
+        eq_(4, len(os.listdir(self.build_dir)))
 
-    def index(self, req, marker=None, limit=None, sort_key='created_at',
+        eq_(4, len(os.listdir(os.path.join(self.build_dir, 'htdocs'))))
 
-              sort_dir='desc', filters={}):
 
-        self._enforce(req, 'get_images')
 
-        filters['deleted'] = False
+    def test_setup_if_custom_webdir_does_not_exist(self):
 
-        #NOTE(bcwaldon): is_public=True gets public images and those
+        shutil.copytree('tests/data/app-2', self.build_dir)
 
-        # owned by the authenticated tenant
+        setup_webdir_if_it_doesnt_exist(utils.FormattedDict({
 
-        result = {}
+            'BUILD_DIR': self.build_dir,
 
-        filters.setdefault('is_public', True)
+            'WEBDIR': 'public',
 
-        if limit is None:
+            'LIBDIR': 'lib'
 
-            limit = CONF.limit_param_default
+        }))
 
-        limit = min(CONF.api_limit_max, limit)
+        self.assert_exists(self.build_dir, 'public')
 
+        self.assert_exists(self.build_dir, 'public', 'index.php')
 
+        self.assert_exists(self.build_dir, 'public', 'info.php')
 
-        try:
+        self.assert_exists(self.build_dir, 'public',
 
-            images = self.db_api.image_get_all(req.context, filters=filters,
+                           'technical-difficulties1.jpg')
 
-                                               marker=marker, limit=limit,
+        self.assert_exists(self.build_dir, '.bp-config')
 
-                                               sort_key=sort_key,
+        self.assert_exists(self.build_dir, '.bp-config', 'options.json')
 
-                                               sort_dir=sort_dir)
+        self.assert_exists(self.build_dir, '.bp-config', 'httpd', 'extra',
 
-            if len(images) != 0 and len(images) == limit:
+                           'httpd-remoteip.conf')
 
-                result['next_marker'] = images[-1]['id']
+        eq_(2, len(os.listdir(self.build_dir)))
 
-        except exception.InvalidFilterRangeValue as e:
+        eq_(3, len(os.listdir(os.path.join(self.build_dir, 'public'))))
 
-            raise webob.exc.HTTPBadRequest(explanation=unicode(e))
 
-        except exception.InvalidSortKey as e:
 
-            raise webob.exc.HTTPBadRequest(explanation=unicode(e))
+    def test_setup_if_htdocs_does_not_exist_with_extensions(self):
 
-        except exception.NotFound as e:
+        shutil.copytree('tests/data/app-4', self.build_dir)
 
-            raise webob.exc.HTTPBadRequest(explanation=unicode(e))
+        setup_webdir_if_it_doesnt_exist(utils.FormattedDict({
 
-        images = [self._normalize_properties(dict(image)) for image in images]
+            'BUILD_DIR': self.build_dir,
 
-        result['images'] = [self._append_tags(req.context, image)
+            'WEBDIR': 'htdocs',
 
-                            for image in images]
+            'LIBDIR': 'lib'
 
-        return result
+        }))
 
+        self.assert_exists(self.build_dir, 'htdocs')
 
+        self.assert_exists(self.build_dir, 'htdocs', 'index.php')
 
-    def _get_image(self, context, image_id):
+        self.assert_exists(self.build_dir, 'htdocs', 'info.php')
 
-        try:
+        self.assert_exists(self.build_dir, 'htdocs',
 
-            return self.db_api.image_get(context, image_id)
+                           'technical-difficulties1.jpg')
 
-        except (exception.NotFound, exception.Forbidden):
+        self.assert_exists(self.build_dir, '.bp-config')
 
-            raise webob.exc.HTTPNotFound()
+        self.assert_exists(self.build_dir, '.bp-config', 'options.json')
 
+        self.assert_exists(self.build_dir, '.bp-config', 'httpd', 'extra',
 
+                           'httpd-remoteip.conf')
 
-    def show(self, req, image_id):
+        self.assert_exists(self.build_dir, '.bp')
 
-        self._enforce(req, 'get_image')
+        self.assert_exists(self.build_dir, '.bp', 'logs')
 
-        image = self._get_image(req.context, image_id)
+        self.assert_exists(self.build_dir, '.bp', 'logs', 'some.log')
 
-        image = self._normalize_properties(dict(image))
+        self.assert_exists(self.build_dir, '.extensions')
 
-        return self._append_tags(req.context, image)
+        self.assert_exists(self.build_dir, '.extensions', 'some-ext')
 
+        self.assert_exists(self.build_dir, '.extensions', 'some-ext',
 
+                           'extension.py')
 
-    @utils.mutating
+        eq_(4, len(os.listdir(self.build_dir)))
 
-    def update(self, req, image_id, changes):
+        eq_(3, len(os.listdir(os.path.join(self.build_dir, 'htdocs'))))
 
-        self._enforce(req, 'modify_image')
 
-        context = req.context
 
-        try:
+    def test_setup_if_custom_webdir_does_not_exist_with_extensions(self):
 
-            image = self.db_api.image_get(context, image_id)
+        shutil.copytree('tests/data/app-4', self.build_dir)
 
-        except (exception.NotFound, exception.Forbidden):
+        setup_webdir_if_it_doesnt_exist(utils.FormattedDict({
 
-            msg = ("Failed to find image %(image_id)s to update" % locals())
+            'BUILD_DIR': self.build_dir,
 
-            LOG.info(msg)
+            'WEBDIR': 'public',
 
-            raise webob.exc.HTTPNotFound(explanation=msg)
+            'LIBDIR': 'lib'
 
+        }))
 
+        self.assert_exists(self.build_dir, 'public')
 
-        image = self._normalize_properties(dict(image))
+        self.assert_exists(self.build_dir, 'public', 'index.php')
 
-        updates = self._extract_updates(req, image, changes)
+        self.assert_exists(self.build_dir, 'public', 'info.php')
 
+        self.assert_exists(self.build_dir, 'public',
 
+                           'technical-difficulties1.jpg')
 
-        tags = None
+        self.assert_exists(self.build_dir, '.bp-config')
 
-        if len(updates) > 0:
+        self.assert_exists(self.build_dir, '.bp-config', 'options.json')
 
-            tags = self._extract_tags(updates)
+        self.assert_exists(self.build_dir, '.bp-config', 'httpd', 'extra',
 
-            purge_props = 'properties' in updates
+                           'httpd-remoteip.conf')
 
-            try:
+        self.assert_exists(self.build_dir, '.bp')
 
-                image = self.db_api.image_update(context, image_id, updates,
+        self.assert_exists(self.build_dir, '.bp', 'logs')
 
-                                                 purge_props)
+        self.assert_exists(self.build_dir, '.bp', 'logs', 'some.log')
 
-            except (exception.NotFound, exception.Forbidden):
+        self.assert_exists(self.build_dir, '.extensions')
 
-                raise webob.exc.HTTPNotFound()
+        self.assert_exists(self.build_dir, '.extensions', 'some-ext')
 
-            image = self._normalize_properties(dict(image))
+        self.assert_exists(self.build_dir, '.extensions', 'some-ext',
 
+                           'extension.py')
 
+        eq_(4, len(os.listdir(self.build_dir)))
 
-        v2.update_image_read_acl(req, self.store_api, self.db_api, image)
+        eq_(3, len(os.listdir(os.path.join(self.build_dir, 'public'))))
 
 
 
-        if tags is not None:
+    def test_system_files_not_moved_into_webdir(self):
 
-            self.db_api.image_tag_set_all(req.context, image_id, tags)
+        shutil.copytree('tests/data/app-with-all-possible-system-files-that-should-not-move', self.build_dir)
 
-            image['tags'] = tags
+        setup_webdir_if_it_doesnt_exist(utils.FormattedDict({
 
-        else:
+            'BUILD_DIR': self.build_dir,
 
-            self._append_tags(req.context, image)
+            'WEBDIR': 'htdocs',
 
+            'LIBDIR': 'lib'
 
+        }))
 
-        self.notifier.info('image.update', image)
+        self.assert_exists(self.build_dir, '.bp')
 
-        return image
+        self.assert_exists(self.build_dir, '.extensions')
 
+        self.assert_exists(self.build_dir, '.bp-config')
 
+        self.assert_exists(self.build_dir, 'manifest.yml')
 
-    def _extract_updates(self, req, image, changes):
+        self.assert_exists(self.build_dir, '.profile.d')
 
-        """ Determine the updates to pass to the database api.
+        self.assert_exists(self.build_dir, '.profile')
 
 
 
-        Given the current image, convert a list of changes to be made
+    def test_setup_if_htdocs_with_stand_alone_app(self):
 
-        into the corresponding update dictionary that should be passed to
+        shutil.copytree('tests/data/app-5', self.build_dir)
 
-        db_api.image_update.
+        setup_webdir_if_it_doesnt_exist(utils.FormattedDict({
 
+            'BUILD_DIR': self.build_dir,
 
+            'WEB_SERVER': 'none'
 
-        Changes have the following parts
+        }))
 
-        op    - 'add' a new attribute, 'replace' an existing attribute, or
+        self.assert_exists(self.build_dir, 'app.php')
 
-                'remove' an existing attribute.
+        eq_(1, len(os.listdir(self.build_dir)))
 
-        path  - A list of path parts for determining which attribute the
 
-                the operation applies to.
 
-        value - For 'add' and 'replace', the new value the attribute should
+    def test_convert_php_extensions_55(self):
 
-                assume.
+        ctx = {
 
+            'PHP_VERSION': '5.5.x',
 
+            'PHP_EXTENSIONS': ['mod1', 'mod2', 'mod3'],
 
-        For the current use case, there are two types of valid paths. For base
-
-        attributes (fields stored directly on the Image object) the path
-
-        must take the form ['<attribute name>']. These attributes are always
-
-        present so the only valid operation on them is 'replace'. For image
-
-        properties, the path takes the form ['properties', '<property name>']
-
-        and all operations are valid.
-
-
-
-        Future refactoring should simplify this code by hardening the image
-
-        abstraction such that database details such as how image properties
-
-        are stored do not have any influence here.
-
-        """
-
-        updates = {}
-
-        property_updates = image['properties']
-
-        for change in changes:
-
-            path = change['path']
-
-            if len(path) == 1:
-
-                assert change['op'] == 'replace'
-
-                key = change['path'][0]
-
-                if key == 'is_public' and change['value']:
-
-                    self._enforce(req, 'publicize_image')
-
-                updates[key] = change['value']
-
-            else:
-
-                assert len(path) == 2
-
-                assert path[0] == 'properties'
-
-                update_method_name = '_do_%s_property' % change['op']
-
-                assert hasattr(self, update_method_name)
-
-                update_method = getattr(self, update_method_name)
-
-                update_method(property_updates, change)
-
-                updates['properties'] = property_updates
-
-        return updates
-
-
-
-    def _do_replace_property(self, updates, change):
-
-        """ Replace a single image property, ensuring it's present. """
-
-        key = change['path'][1]
-
-        if key not in updates:
-
-            msg = _("Property %s does not exist.")
-
-            raise webob.exc.HTTPConflict(msg % key)
-
-        updates[key] = change['value']
-
-
-
-    def _do_add_property(self, updates, change):
-
-        """ Add a new image property, ensuring it does not already exist. """
-
-        key = change['path'][1]
-
-        if key in updates:
-
-            msg = _("Property %s already present.")
-
-            raise webob.exc.HTTPConflict(msg % key)
-
-        updates[key] = change['value']
-
-
-
-    def _do_remove_property(self, updates, change):
-
-        """ Remove an image property, ensuring it's present. """
-
-        key = change['path'][1]
-
-        if key not in updates:
-
-            msg = _("Property %s does not exist.")
-
-            raise webob.exc.HTTPConflict(msg % key)
-
-        del updates[key]
-
-
-
-    @utils.mutating
-
-    def delete(self, req, image_id):
-
-        self._enforce(req, 'delete_image')
-
-        image = self._get_image(req.context, image_id)
-
-
-
-        if image['protected']:
-
-            msg = _("Unable to delete as image %(image_id)s is protected"
-
-                    % locals())
-
-            raise webob.exc.HTTPForbidden(explanation=msg)
-
-
-
-        if image['location'] and CONF.delayed_delete:
-
-            status = 'pending_delete'
-
-        else:
-
-            status = 'deleted'
-
-
-
-        try:
-
-            self.db_api.image_update(req.context, image_id, {'status': status})
-
-            self.db_api.image_destroy(req.context, image_id)
-
-
-
-            if image['location']:
-
-                if CONF.delayed_delete:
-
-                    self.store_api.schedule_delayed_delete_from_backend(
-
-                                    image['location'], id)
-
-                else:
-
-                    self.store_api.safe_delete_from_backend(image['location'],
-
-                                                            req.context, id)
-
-        except (exception.NotFound, exception.Forbidden):
-
-            msg = ("Failed to find image %(image_id)s to delete" % locals())
-
-            LOG.info(msg)
-
-            raise webob.exc.HTTPNotFound()
-
-        else:
-
-            self.notifier.info('image.delete', image)
-
-
-
-
-
-class RequestDeserializer(wsgi.JSONRequestDeserializer):
-
-
-
-    _readonly_properties = ['created_at', 'updated_at', 'status', 'checksum',
-
-            'size', 'direct_url', 'self', 'file', 'schema']
-
-    _reserved_properties = ['owner', 'is_public', 'location',
-
-            'deleted', 'deleted_at']
-
-    _base_properties = ['checksum', 'created_at', 'container_format',
-
-            'disk_format', 'id', 'min_disk', 'min_ram', 'name', 'size',
-
-            'status', 'tags', 'updated_at', 'visibility', 'protected']
-
-
-
-    def __init__(self, schema=None):
-
-        super(RequestDeserializer, self).__init__()
-
-        self.schema = schema or get_schema()
-
-
-
-    def _parse_image(self, request):
-
-        body = self._get_request_body(request)
-
-        try:
-
-            self.schema.validate(body)
-
-        except exception.InvalidObject as e:
-
-            raise webob.exc.HTTPBadRequest(explanation=unicode(e))
-
-
-
-        # Ensure all specified properties are allowed
-
-        self._check_readonly(body)
-
-        self._check_reserved(body)
-
-
-
-        # Create a dict of base image properties, with user- and deployer-
-
-        # defined properties contained in a 'properties' dictionary
-
-        image = {'properties': body}
-
-        for key in self._base_properties:
-
-            try:
-
-                image[key] = image['properties'].pop(key)
-
-            except KeyError:
-
-                pass
-
-
-
-        if 'visibility' in image:
-
-            image['is_public'] = image.pop('visibility') == 'public'
-
-
-
-        return {'image': image}
-
-
-
-    def _get_request_body(self, request):
-
-        output = super(RequestDeserializer, self).default(request)
-
-        if not 'body' in output:
-
-            msg = _('Body expected in request.')
-
-            raise webob.exc.HTTPBadRequest(explanation=msg)
-
-        return output['body']
-
-
-
-    @classmethod
-
-    def _check_readonly(cls, image):
-
-        for key in cls._readonly_properties:
-
-            if key in image:
-
-                msg = "Attribute \'%s\' is read-only." % key
-
-                raise webob.exc.HTTPForbidden(explanation=unicode(msg))
-
-
-
-    @classmethod
-
-    def _check_reserved(cls, image):
-
-        for key in cls._reserved_properties:
-
-            if key in image:
-
-                msg = "Attribute \'%s\' is reserved." % key
-
-                raise webob.exc.HTTPForbidden(explanation=unicode(msg))
-
-
-
-    def create(self, request):
-
-        return self._parse_image(request)
-
-
-
-    def _get_change_operation(self, raw_change):
-
-        op = None
-
-        for key in ['replace', 'add', 'remove']:
-
-            if key in raw_change:
-
-                if op is not None:
-
-                    msg = _('Operation objects must contain only one member'
-
-                            ' named "add", "remove", or "replace".')
-
-                    raise webob.exc.HTTPBadRequest(explanation=msg)
-
-                op = key
-
-        if op is None:
-
-            msg = _('Operation objects must contain exactly one member'
-
-                    ' named "add", "remove", or "replace".')
-
-            raise webob.exc.HTTPBadRequest(explanation=msg)
-
-        return op
-
-
-
-    def _get_change_path(self, raw_change, op):
-
-        key = self._decode_json_pointer(raw_change[op])
-
-        if key in self._readonly_properties:
-
-            msg = "Attribute \'%s\' is read-only." % key
-
-            raise webob.exc.HTTPForbidden(explanation=unicode(msg))
-
-        if key in self._reserved_properties:
-
-            msg = "Attribute \'%s\' is reserved." % key
-
-            raise webob.exc.HTTPForbidden(explanation=unicode(msg))
-
-
-
-        # For image properties, we need to put "properties" at the beginning
-
-        if key not in self._base_properties:
-
-            return ['properties', key]
-
-        return [key]
-
-
-
-    def _decode_json_pointer(self, pointer):
-
-        """ Parse a json pointer.
-
-
-
-        Json Pointers are defined in
-
-        http://tools.ietf.org/html/draft-pbryan-zyp-json-pointer .
-
-        The pointers use '/' for separation between object attributes, such
-
-        that '/A/B' would evaluate to C in {"A": {"B": "C"}}. A '/' character
-
-        in an attribute name is encoded as "~1" and a '~' character is encoded
-
-        as "~0".
-
-        """
-
-        self._validate_json_pointer(pointer)
-
-        return pointer.lstrip('/').replace('~1', '/').replace('~0', '~')
-
-
-
-    def _validate_json_pointer(self, pointer):
-
-        """ Validate a json pointer.
-
-
-
-        We only accept a limited form of json pointers. Specifically, we do
-
-        not allow multiple levels of indirection, so there can only be one '/'
-
-        in the pointer, located at the start of the string.
-
-        """
-
-        if not pointer.startswith('/'):
-
-            msg = _('Pointer `%s` does not start with "/".' % pointer)
-
-            raise webob.exc.HTTPBadRequest(explanation=msg)
-
-        if '/' in pointer[1:]:
-
-            msg = _('Pointer `%s` contains more than one "/".' % pointer)
-
-            raise webob.exc.HTTPBadRequest(explanation=msg)
-
-        if re.match('~[^01]', pointer):
-
-            msg = _('Pointer `%s` contains "~" not part of'
-
-                    ' a recognized escape sequence.' % pointer)
-
-            raise webob.exc.HTTPBadRequest(explanation=msg)
-
-
-
-    def _get_change_value(self, raw_change, op):
-
-        if 'value' not in raw_change:
-
-            msg = _('Operation "%s" requires a member named "value".')
-
-            raise webob.exc.HTTPBadRequest(explanation=msg % op)
-
-        return raw_change['value']
-
-
-
-    def _validate_change(self, change):
-
-        if change['op'] == 'delete':
-
-            return
-
-        partial_image = {change['path'][-1]: change['value']}
-
-        try:
-
-            self.schema.validate(partial_image)
-
-        except exception.InvalidObject as e:
-
-            raise webob.exc.HTTPBadRequest(explanation=unicode(e))
-
-
-
-    def update(self, request):
-
-        changes = []
-
-        valid_content_types = [
-
-            'application/openstack-images-v2.0-json-patch'
-
-        ]
-
-        if request.content_type not in valid_content_types:
-
-            headers = {'Accept-Patch': ','.join(valid_content_types)}
-
-            raise webob.exc.HTTPUnsupportedMediaType(headers=headers)
-
-        body = self._get_request_body(request)
-
-        if not isinstance(body, list):
-
-            msg = _('Request body must be a JSON array of operation objects.')
-
-            raise webob.exc.HTTPBadRequest(explanation=msg)
-
-        for raw_change in body:
-
-            if not isinstance(raw_change, dict):
-
-                msg = _('Operations must be JSON objects.')
-
-                raise webob.exc.HTTPBadRequest(explanation=msg)
-
-            op = self._get_change_operation(raw_change)
-
-            path = self._get_change_path(raw_change, op)
-
-            change = {'op': op, 'path': path}
-
-            if not op == 'remove':
-
-                change['value'] = self._get_change_value(raw_change, op)
-
-                self._validate_change(change)
-
-                if change['path'] == ['visibility']:
-
-                    change['path'] = ['is_public']
-
-                    change['value'] = change['value'] == 'public'
-
-            changes.append(change)
-
-        return {'changes': changes}
-
-
-
-    def _validate_limit(self, limit):
-
-        try:
-
-            limit = int(limit)
-
-        except ValueError:
-
-            msg = _("limit param must be an integer")
-
-            raise webob.exc.HTTPBadRequest(explanation=msg)
-
-
-
-        if limit < 0:
-
-            msg = _("limit param must be positive")
-
-            raise webob.exc.HTTPBadRequest(explanation=msg)
-
-
-
-        return limit
-
-
-
-    def _validate_sort_dir(self, sort_dir):
-
-        if sort_dir not in ['asc', 'desc']:
-
-            msg = _('Invalid sort direction: %s' % sort_dir)
-
-            raise webob.exc.HTTPBadRequest(explanation=msg)
-
-
-
-        return sort_dir
-
-
-
-    def _get_filters(self, filters):
-
-        visibility = filters.pop('visibility', None)
-
-        if visibility:
-
-            if visibility in ['public', 'private']:
-
-                filters['is_public'] = visibility == 'public'
-
-            else:
-
-                msg = _('Invalid visibility value: %s') % visibility
-
-                raise webob.exc.HTTPBadRequest(explanation=msg)
-
-
-
-        return filters
-
-
-
-    def index(self, request):
-
-        params = request.params.copy()
-
-        limit = params.pop('limit', None)
-
-        marker = params.pop('marker', None)
-
-        sort_dir = params.pop('sort_dir', 'desc')
-
-        query_params = {
-
-            'sort_key': params.pop('sort_key', 'created_at'),
-
-            'sort_dir': self._validate_sort_dir(sort_dir),
-
-            'filters': self._get_filters(params),
+            'ZEND_EXTENSIONS': ['zmod1', 'zmod2']
 
         }
 
+        convert_php_extensions(ctx)
 
+        eq_('extension=mod1.so\nextension=mod2.so\nextension=mod3.so',
 
-        if marker is not None:
+            ctx['PHP_EXTENSIONS'])
 
-            query_params['marker'] = marker
+        eq_('zend_extension="zmod1.so"\nzend_extension="zmod2.so"',
 
+            ctx['ZEND_EXTENSIONS'])
 
 
-        if limit is not None:
 
-            query_params['limit'] = self._validate_limit(limit)
+    def test_convert_php_extensions_55_none(self):
 
+        ctx = {
 
+            'PHP_VERSION': '5.5.x',
 
-        return query_params
+            'PHP_EXTENSIONS': [],
 
-
-
-
-
-class ResponseSerializer(wsgi.JSONResponseSerializer):
-
-    def __init__(self, schema=None):
-
-        super(ResponseSerializer, self).__init__()
-
-        self.schema = schema or get_schema()
-
-
-
-    def _get_image_href(self, image, subcollection=''):
-
-        base_href = '/v2/images/%s' % image['id']
-
-        if subcollection:
-
-            base_href = '%s/%s' % (base_href, subcollection)
-
-        return base_href
-
-
-
-    def _get_image_links(self, image):
-
-        return [
-
-            {'rel': 'self', 'href': self._get_image_href(image)},
-
-            {'rel': 'file', 'href': self._get_image_href(image, 'file')},
-
-            {'rel': 'describedby', 'href': '/v2/schemas/image'},
-
-        ]
-
-
-
-    def _format_image(self, image):
-
-        #NOTE(bcwaldon): merge the contained properties dict with the
-
-        # top-level image object
-
-        image_view = image['properties']
-
-        attributes = ['id', 'name', 'disk_format', 'container_format',
-
-                      'size', 'status', 'checksum', 'tags', 'protected',
-
-                      'created_at', 'updated_at', 'min_ram', 'min_disk']
-
-        for key in attributes:
-
-            image_view[key] = image[key]
-
-
-
-        location = image['location']
-
-        if CONF.show_image_direct_url and location is not None:
-
-            image_view['direct_url'] = location
-
-
-
-        visibility = 'public' if image['is_public'] else 'private'
-
-        image_view['visibility'] = visibility
-
-
-
-        image_view['self'] = self._get_image_href(image)
-
-        image_view['file'] = self._get_image_href(image, 'file')
-
-        image_view['schema'] = '/v2/schemas/image'
-
-
-
-        self._serialize_datetimes(image_view)
-
-        image_view = self.schema.filter(image_view)
-
-
-
-        return image_view
-
-
-
-    @staticmethod
-
-    def _serialize_datetimes(image):
-
-        for (key, value) in image.iteritems():
-
-            if isinstance(value, datetime.datetime):
-
-                image[key] = timeutils.isotime(value)
-
-
-
-    def create(self, response, image):
-
-        response.status_int = 201
-
-        body = json.dumps(self._format_image(image), ensure_ascii=False)
-
-        response.unicode_body = unicode(body)
-
-        response.content_type = 'application/json'
-
-        response.location = self._get_image_href(image)
-
-
-
-    def show(self, response, image):
-
-        body = json.dumps(self._format_image(image), ensure_ascii=False)
-
-        response.unicode_body = unicode(body)
-
-        response.content_type = 'application/json'
-
-
-
-    def update(self, response, image):
-
-        body = json.dumps(self._format_image(image), ensure_ascii=False)
-
-        response.unicode_body = unicode(body)
-
-        response.content_type = 'application/json'
-
-
-
-    def index(self, response, result):
-
-        params = dict(response.request.params)
-
-        params.pop('marker', None)
-
-        query = urllib.urlencode(params)
-
-        body = {
-
-               'images': [self._format_image(i) for i in result['images']],
-
-               'first': '/v2/images',
-
-               'schema': '/v2/schemas/images',
+            'ZEND_EXTENSIONS': []
 
         }
 
-        if query:
+        convert_php_extensions(ctx)
 
-            body['first'] = '%s?%s' % (body['first'], query)
+        eq_('', ctx['PHP_EXTENSIONS'])
 
-        if 'next_marker' in result:
+        eq_('', ctx['ZEND_EXTENSIONS'])
 
-            params['marker'] = result['next_marker']
 
-            next_query = urllib.urlencode(params)
 
-            body['next'] = '/v2/images?%s' % next_query
+    def test_convert_php_extensions_55_one(self):
 
-        response.unicode_body = unicode(json.dumps(body, ensure_ascii=False))
+        ctx = {
 
-        response.content_type = 'application/json'
+            'PHP_VERSION': '5.5.x',
 
+            'PHP_EXTENSIONS': ['mod1'],
 
+            'ZEND_EXTENSIONS': ['zmod1']
 
-    def delete(self, response, result):
+        }
 
-        response.status_int = 204
+        convert_php_extensions(ctx)
 
+        eq_('zend_extension="zmod1.so"',
 
+            ctx['ZEND_EXTENSIONS'])
 
 
 
-_BASE_PROPERTIES = {
+    def test_is_web_app(self):
 
-    'id': {
+        ctx = {}
 
-        'type': 'string',
+        eq_(True, is_web_app(ctx))
 
-        'description': 'An identifier for the image',
+        ctx['WEB_SERVER'] = 'nginx'
 
-        'pattern': ('^([0-9a-fA-F]){8}-([0-9a-fA-F]){4}-([0-9a-fA-F]){4}'
+        eq_(True, is_web_app(ctx))
 
-                    '-([0-9a-fA-F]){4}-([0-9a-fA-F]){12}$'),
+        ctx['WEB_SERVER'] = 'httpd'
 
-    },
+        eq_(True, is_web_app(ctx))
 
-    'name': {
+        ctx['WEB_SERVER'] = 'none'
 
-        'type': 'string',
+        eq_(False, is_web_app(ctx))
 
-        'description': 'Descriptive name for the image',
 
-        'maxLength': 255,
 
-    },
+    def test_find_stand_alone_app_to_run_app_start_cmd(self):
 
-    'status': {
+        ctx = {'APP_START_CMD': "echo 'Hello World!'"}
 
-      'type': 'string',
+        eq_("echo 'Hello World!'", find_stand_alone_app_to_run(ctx))
 
-      'description': 'Status of the image',
+        results = ('app.php', 'main.php', 'run.php', 'start.php', 'app.php')
 
-      'enum': ['queued', 'saving', 'active', 'killed',
+        for i, res in enumerate(results):
 
-               'deleted', 'pending_delete'],
+            ctx = {'BUILD_DIR': 'tests/data/standalone/test%d' % (i + 1)}
 
-    },
+            eq_(res, find_stand_alone_app_to_run(ctx))
 
-    'visibility': {
 
-        'type': 'string',
 
-        'description': 'Scope of image accessibility',
+    def test_load_manifest(self):
 
-        'enum': ['public', 'private'],
+        ctx = {'BP_DIR': '.'}
 
-    },
+        manifest = load_manifest(ctx)
 
-    'protected': {
+        assert manifest is not None
 
-        'type': 'boolean',
+        assert 'dependencies' in manifest.keys()
 
-        'description': 'If true, image will not be deletable.',
+        assert 'language' in manifest.keys()
 
-    },
+        assert 'url_to_dependency_map' in manifest.keys()
 
-    'checksum': {
+        assert 'exclude_files' in manifest.keys()
 
-        'type': 'string',
 
-        'description': 'md5 hash of image contents.',
 
-        'type': 'string',
+    def test_find_all_php_versions(self):
 
-        'maxLength': 32,
+        ctx = {'BP_DIR': '.'}
 
-    },
+        manifest = load_manifest(ctx)
 
-    'size': {
+        dependencies = manifest['dependencies']
 
-        'type': 'integer',
+        versions = find_all_php_versions(dependencies)
 
-        'description': 'Size of image file in bytes',
+        eq_(2, len([v for v in versions if v.startswith('5.5.')]))
 
-    },
+        eq_(2, len([v for v in versions if v.startswith('5.6.')]))
 
-    'container_format': {
 
-        'type': 'string',
 
-        'description': '',
+    def test_validate_php_version(self):
 
-        'type': 'string',
+        ctx = {
 
-        'enum': ['bare', 'ovf', 'ami', 'aki', 'ari'],
+            'ALL_PHP_VERSIONS': ['5.5.31', '5.5.30'],
 
-    },
+            'PHP_55_LATEST': '5.5.31',
 
-    'disk_format': {
+            'PHP_VERSION': '5.5.30'
 
-        'type': 'string',
+        }
 
-        'description': '',
+        validate_php_version(ctx)
 
-        'type': 'string',
+        eq_('5.5.30', ctx['PHP_VERSION'])
 
-        'enum': ['raw', 'vhd', 'vmdk', 'vdi', 'iso', 'qcow2',
+        ctx['PHP_VERSION'] = '5.5.29'
 
-                 'aki', 'ari', 'ami'],
+        validate_php_version(ctx)
 
-    },
+        eq_('5.5.31', ctx['PHP_VERSION'])
 
-    'created_at': {
+        ctx['PHP_VERSION'] = '5.5.30'
 
-        'type': 'string',
+        validate_php_version(ctx)
 
-        'description': 'Date and time of image registration',
-
-        #TODO(bcwaldon): our jsonschema library doesn't seem to like the
-
-        # format attribute, figure out why!
-
-        #'format': 'date-time',
-
-    },
-
-    'updated_at': {
-
-        'type': 'string',
-
-        'description': 'Date and time of the last image modification',
-
-        #'format': 'date-time',
-
-    },
-
-    'tags': {
-
-        'type': 'array',
-
-        'description': 'List of strings related to the image',
-
-        'items': {
-
-            'type': 'string',
-
-            'maxLength': 255,
-
-        },
-
-    },
-
-    'direct_url': {
-
-        'type': 'string',
-
-        'description': 'URL to access the image file kept in external store',
-
-    },
-
-    'min_ram': {
-
-        'type': 'integer',
-
-        'description': 'Amount of ram (in MB) required to boot image.',
-
-    },
-
-    'min_disk': {
-
-        'type': 'integer',
-
-        'description': 'Amount of disk space (in GB) required to boot image.',
-
-    },
-
-    'self': {'type': 'string'},
-
-    'file': {'type': 'string'},
-
-    'schema': {'type': 'string'},
-
-}
-
-
-
-_BASE_LINKS = [
-
-    {'rel': 'self', 'href': '{self}'},
-
-    {'rel': 'enclosure', 'href': '{file}'},
-
-    {'rel': 'describedby', 'href': '{schema}'},
-
-]
-
-
-
-
-
-def get_schema(custom_properties=None):
-
-    properties = copy.deepcopy(_BASE_PROPERTIES)
-
-    links = copy.deepcopy(_BASE_LINKS)
-
-    if CONF.allow_additional_image_properties:
-
-        schema = glance.schema.PermissiveSchema('image', properties, links)
-
-    else:
-
-        schema = glance.schema.Schema('image', properties)
-
-    schema.merge_properties(custom_properties or {})
-
-    return schema
-
-
-
-
-
-def get_collection_schema(custom_properties=None):
-
-    image_schema = get_schema(custom_properties)
-
-    return glance.schema.CollectionSchema('images', image_schema)
-
-
-
-
-
-def load_custom_properties():
-
-    """Find the schema properties files and load them into a dict."""
-
-    filename = 'schema-image.json'
-
-    match = CONF.find_file(filename)
-
-    if match:
-
-        schema_file = open(match)
-
-        schema_data = schema_file.read()
-
-        return json.loads(schema_data)
-
-    else:
-
-        msg = _('Could not find schema properties file %s. Continuing '
-
-                'without custom properties')
-
-        LOG.warn(msg % filename)
-
-        return {}
-
-
-
-
-
-def create_resource(custom_properties=None):
-
-    """Images resource factory method"""
-
-    schema = get_schema(custom_properties)
-
-    deserializer = RequestDeserializer(schema)
-
-    serializer = ResponseSerializer(schema)
-
-    controller = ImagesController()
-
-    return wsgi.Resource(controller, deserializer, serializer)
+        eq_('5.5.30', ctx['PHP_VERSION'])

@@ -4,482 +4,670 @@
 
 # -*- coding: utf-8 -*-
 
-from __future__ import absolute_import, print_function, division
+'''
+
+    feedgen.ext.geo_entry
+
+    ~~~~~~~~~~~~~~~~~~~
+
+
+
+    Extends the FeedGenerator to produce Simple GeoRSS feeds.
+
+
+
+    :copyright: 2017, Bob Breznak <bob.breznak@gmail.com>
+
+
+
+    :license: FreeBSD and LGPL, see license.* for more details.
+
+'''
+
+import numbers
+
+import warnings
+
+
+
+from lxml import etree
+
+from feedgen.ext.base import BaseEntryExtension
 
 
 
 
 
-# standard library dependencies
-
-try:
-
-    # prefer lxml as it supports XPath
-
-    from lxml import etree
-
-except ImportError:
-
-    import xml.etree.ElementTree as etree
-
-
-
-from operator import attrgetter
-
-import itertools
-
-from petl.compat import string_types, text_type
-
-
-
-
-
-# internal dependencies
-
-from petl.util.base import Table
-
-from petl.io.sources import read_source_from_arg
-
-
-
-
-
-def fromxml(source, *args, **kwargs):
+class GeoRSSPolygonInteriorWarning(Warning):
 
     """
 
-    Extract data from an XML file. E.g.::
+    Simple placeholder for warning about ignored polygon interiors.
 
 
 
-        >>> import petl as etl
+    Stores the original geom on a ``geom`` attribute (if required warnings are
 
-        >>> # setup a file to demonstrate with
-
-        ... d = '''<table>
-
-        ...     <tr>
-
-        ...         <td>foo</td><td>bar</td>
-
-        ...     </tr>
-
-        ...     <tr>
-
-        ...         <td>a</td><td>1</td>
-
-        ...     </tr>
-
-        ...     <tr>
-
-        ...         <td>b</td><td>2</td>
-
-        ...     </tr>
-
-        ...     <tr>
-
-        ...         <td>c</td><td>2</td>
-
-        ...     </tr>
-
-        ... </table>'''
-
-        >>> with open('example1.xml', 'w') as f:
-
-        ...     f.write(d)
-
-        ...
-
-        212
-
-        >>> table1 = etl.fromxml('example1.xml', 'tr', 'td')
-
-        >>> table1
-
-        +-----+-----+
-
-        | foo | bar |
-
-        +=====+=====+
-
-        | 'a' | '1' |
-
-        +-----+-----+
-
-        | 'b' | '2' |
-
-        +-----+-----+
-
-        | 'c' | '2' |
-
-        +-----+-----+
-
-
-
-
-
-    If the data values are stored in an attribute, provide the attribute
-
-    name as an extra positional argument::
-
-
-
-        >>> d = '''<table>
-
-        ...     <tr>
-
-        ...         <td v='foo'/><td v='bar'/>
-
-        ...     </tr>
-
-        ...     <tr>
-
-        ...         <td v='a'/><td v='1'/>
-
-        ...     </tr>
-
-        ...     <tr>
-
-        ...         <td v='b'/><td v='2'/>
-
-        ...     </tr>
-
-        ...     <tr>
-
-        ...         <td v='c'/><td v='2'/>
-
-        ...     </tr>
-
-        ... </table>'''
-
-        >>> with open('example2.xml', 'w') as f:
-
-        ...     f.write(d)
-
-        ...
-
-        220
-
-        >>> table2 = etl.fromxml('example2.xml', 'tr', 'td', 'v')
-
-        >>> table2
-
-        +-----+-----+
-
-        | foo | bar |
-
-        +=====+=====+
-
-        | 'a' | '1' |
-
-        +-----+-----+
-
-        | 'b' | '2' |
-
-        +-----+-----+
-
-        | 'c' | '2' |
-
-        +-----+-----+
-
-
-
-    Data values can also be extracted by providing a mapping of field
-
-    names to element paths::
-
-
-
-        >>> d = '''<table>
-
-        ...     <row>
-
-        ...         <foo>a</foo><baz><bar v='1'/><bar v='3'/></baz>
-
-        ...     </row>
-
-        ...     <row>
-
-        ...         <foo>b</foo><baz><bar v='2'/></baz>
-
-        ...     </row>
-
-        ...     <row>
-
-        ...         <foo>c</foo><baz><bar v='2'/></baz>
-
-        ...     </row>
-
-        ... </table>'''
-
-        >>> with open('example3.xml', 'w') as f:
-
-        ...     f.write(d)
-
-        ...
-
-        223
-
-        >>> table3 = etl.fromxml('example3.xml', 'row',
-
-        ...                      {'foo': 'foo', 'bar': ('baz/bar', 'v')})
-
-        >>> table3
-
-        +------------+-----+
-
-        | bar        | foo |
-
-        +============+=====+
-
-        | ('1', '3') | 'a' |
-
-        +------------+-----+
-
-        | '2'        | 'b' |
-
-        +------------+-----+
-
-        | '2'        | 'c' |
-
-        +------------+-----+
-
-
-
-    If `lxml <http://lxml.de/>`_ is installed, full XPath expressions can be
-
-    used.
-
-
-
-    Note that the implementation is currently **not** streaming, i.e.,
-
-    the whole document is loaded into memory.
-
-
-
-    If multiple elements match a given field, all values are reported as a
-
-    tuple.
-
-
-
-    If there is more than one element name used for row values, a tuple
-
-    or list of paths can be provided, e.g.,
-
-    ``fromxml('example.html', './/tr', ('th', 'td'))``.
-
-
+    raised as errors).
 
     """
 
 
 
-    source = read_source_from_arg(source)
+    def __init__(self, geom, *args, **kwargs):
 
-    return XmlView(source, *args, **kwargs)
+        self.geom = geom
 
+        super(GeoRSSPolygonInteriorWarning, self).__init__(*args, **kwargs)
 
 
 
+    def __str__(self):
 
-class XmlView(Table):
+        return '{:d} interiors of polygon ignored'.format(
 
+            len(self.geom.__geo_interface__['coordinates']) - 1
 
+        )  # ignore exterior in count
 
-    def __init__(self, source, *args, **kwargs):
 
-        self.source = source
 
-        self.args = args
 
-        if len(args) == 2 and isinstance(args[1], (string_types, tuple, list)):
 
-            self.rmatch = args[0]
+class GeoRSSGeometryError(ValueError):
 
-            self.vmatch = args[1]
+    """
 
-            self.vdict = None
+    Subclass of ValueError for a GeoRSS geometry error
 
-            self.attr = None
 
-        elif len(args) == 2 and isinstance(args[1], dict):
 
-            self.rmatch = args[0]
+    Only some geometries are supported in Simple GeoRSS, so if not raise an
 
-            self.vmatch = None
+    error. Offending geometry is stored on the ``geom`` attribute.
 
-            self.vdict = args[1]
+    """
 
-            self.attr = None
 
-        elif len(args) == 3:
 
-            self.rmatch = args[0]
+    def __init__(self, geom, *args, **kwargs):
 
-            self.vmatch = args[1]
+        self.geom = geom
 
-            self.vdict = None
+        super(GeoRSSGeometryError, self).__init__(*args, **kwargs)
 
-            self.attr = args[2]
 
-        else:
 
-            assert False, 'bad parameters'
+    def __str__(self):
 
-        self.missing = kwargs.get('missing', None)
+        msg = "Geometry of type '{}' not in Point, Linestring or Polygon"
 
+        return msg.format(
 
+            self.geom.__geo_interface__['type']
 
-    def __iter__(self):
+        )
 
-        vmatch = self.vmatch
 
-        vdict = self.vdict
 
 
 
-        with self.source.open('rb') as xmlf:
+class GeoEntryExtension(BaseEntryExtension):
 
+    '''FeedEntry extension for Simple GeoRSS.
 
+    '''
 
-            tree = etree.parse(xmlf)
 
-            if not hasattr(tree, 'iterfind'):
 
-                # Python 2.6 compatibility
+    def __init__(self):
 
-                tree.iterfind = tree.findall
+        '''Simple GeoRSS tag'''
 
+        # geometries
 
+        self.__point = None
 
-            if vmatch is not None:
+        self.__line = None
 
-                # simple case, all value paths are the same
+        self.__polygon = None
 
-                for rowelm in tree.iterfind(self.rmatch):
+        self.__box = None
 
-                    if self.attr is None:
 
-                        getv = attrgetter('text')
 
-                    else:
+        # additional properties
 
-                        getv = lambda e: e.get(self.attr)
+        self.__featuretypetag = None
 
-                    if isinstance(vmatch, string_types):
+        self.__relationshiptag = None
 
-                        # match only one path
+        self.__featurename = None
 
-                        velms = rowelm.findall(vmatch)
 
-                    else:
 
-                        # match multiple paths
+        # elevation
 
-                        velms = itertools.chain(*[rowelm.findall(enm)
+        self.__elev = None
 
-                                                  for enm in vmatch])
+        self.__floor = None
 
-                    yield tuple(getv(velm)
 
-                                for velm in velms)
 
+        # radius
 
+        self.__radius = None
 
-            else:
 
-                # difficult case, deal with different paths for each field
 
+    def extend_file(self, entry):
 
+        '''Add additional fields to an RSS item.
 
-                # determine output header
 
-                flds = tuple(sorted(map(text_type, vdict.keys())))
 
-                yield flds
+        :param feed: The RSS item XML element to use.
 
+        '''
 
 
-                # setup value getters
 
-                vmatches = dict()
+        GEO_NS = 'http://www.georss.org/georss'
 
-                vgetters = dict()
 
-                for f in flds:
 
-                    vmatch = self.vdict[f]
+        if self.__point:
 
-                    if isinstance(vmatch, string_types):
+            point = etree.SubElement(entry, '{%s}point' % GEO_NS)
 
-                        # match element path
+            point.text = self.__point
 
-                        vmatches[f] = vmatch
 
-                        vgetters[f] = element_text_getter(self.missing)
 
-                    else:
+        if self.__line:
 
-                        # match element path and attribute name
+            line = etree.SubElement(entry, '{%s}line' % GEO_NS)
 
-                        vmatches[f] = vmatch[0]
+            line.text = self.__line
 
-                        attr = vmatch[1]
 
-                        vgetters[f] = attribute_text_getter(attr, self.missing)
 
+        if self.__polygon:
 
+            polygon = etree.SubElement(entry, '{%s}polygon' % GEO_NS)
 
-                # determine data rows
+            polygon.text = self.__polygon
 
-                for rowelm in tree.iterfind(self.rmatch):
 
-                    yield tuple(vgetters[f](rowelm.findall(vmatches[f]))
 
-                                for f in flds)
+        if self.__box:
 
+            box = etree.SubElement(entry, '{%s}box' % GEO_NS)
 
+            box.text = self.__box
 
 
 
-def element_text_getter(missing):
+        if self.__featuretypetag:
 
-    def _get(v):
+            featuretypetag = etree.SubElement(
 
-        if len(v) > 1:
+                entry,
 
-            return tuple(e.text for e in v)
+                '{%s}featuretypetag' % GEO_NS
 
-        elif len(v) == 1:
+            )
 
-            return v[0].text
+            featuretypetag.text = self.__featuretypetag
 
-        else:
 
-            return missing
 
-    return _get
+        if self.__relationshiptag:
 
+            relationshiptag = etree.SubElement(
 
+                entry,
 
+                '{%s}relationshiptag' % GEO_NS
 
+            )
 
-def attribute_text_getter(attr, missing):
+            relationshiptag.text = self.__relationshiptag
 
-    def _get(v):
 
-        if len(v) > 1:
 
-            return tuple(e.get(attr) for e in v)
+        if self.__featurename:
 
-        elif len(v) == 1:
+            featurename = etree.SubElement(entry, '{%s}featurename' % GEO_NS)
 
-            return v[0].get(attr)
+            featurename.text = self.__featurename
 
-        else:
 
-            return missing
 
-    return _get
+        if self.__elev:
+
+            elevation = etree.SubElement(entry, '{%s}elev' % GEO_NS)
+
+            elevation.text = str(self.__elev)
+
+
+
+        if self.__floor:
+
+            floor = etree.SubElement(entry, '{%s}floor' % GEO_NS)
+
+            floor.text = str(self.__floor)
+
+
+
+        if self.__radius:
+
+            radius = etree.SubElement(entry, '{%s}radius' % GEO_NS)
+
+            radius.text = str(self.__radius)
+
+
+
+        return entry
+
+
+
+    def extend_rss(self, entry):
+
+        return self.extend_file(entry)
+
+
+
+    def extend_atom(self, entry):
+
+        return self.extend_file(entry)
+
+
+
+    def point(self, point=None):
+
+        '''Get or set the georss:point of the entry.
+
+
+
+        :param point: The GeoRSS formatted point (i.e. "42.36 -71.05")
+
+        :returns: The current georss:point of the entry.
+
+        '''
+
+
+
+        if point is not None:
+
+            self.__point = point
+
+
+
+        return self.__point
+
+
+
+    def line(self, line=None):
+
+        '''Get or set the georss:line of the entry
+
+
+
+        :param point: The GeoRSS formatted line (i.e. "45.256 -110.45 46.46
+
+                      -109.48 43.84 -109.86")
+
+        :return: The current georss:line of the entry
+
+        '''
+
+        if line is not None:
+
+            self.__line = line
+
+
+
+        return self.__line
+
+
+
+    def polygon(self, polygon=None):
+
+        '''Get or set the georss:polygon of the entry
+
+
+
+        :param polygon: The GeoRSS formatted polygon (i.e. "45.256 -110.45
+
+                        46.46 -109.48 43.84 -109.86 45.256 -110.45")
+
+        :return: The current georss:polygon of the entry
+
+        '''
+
+        if polygon is not None:
+
+            self.__polygon = polygon
+
+
+
+        return self.__polygon
+
+
+
+    def box(self, box=None):
+
+        '''
+
+        Get or set the georss:box of the entry
+
+
+
+        :param box: The GeoRSS formatted box (i.e. "42.943 -71.032 43.039
+
+                    -69.856")
+
+        :return: The current georss:box of the entry
+
+        '''
+
+        if box is not None:
+
+            self.__box = box
+
+
+
+        return self.__box
+
+
+
+    def featuretypetag(self, featuretypetag=None):
+
+        '''
+
+        Get or set the georss:featuretypetag of the entry
+
+
+
+        :param featuretypetag: The GeoRSS feaaturertyptag (e.g. "city")
+
+        :return: The current georss:featurertypetag
+
+        '''
+
+        if featuretypetag is not None:
+
+            self.__featuretypetag = featuretypetag
+
+
+
+        return self.__featuretypetag
+
+
+
+    def relationshiptag(self, relationshiptag=None):
+
+        '''
+
+        Get or set the georss:relationshiptag of the entry
+
+
+
+        :param relationshiptag: The GeoRSS relationshiptag (e.g.
+
+                                "is-centred-at")
+
+        :return: the current georss:relationshiptag
+
+        '''
+
+        if relationshiptag is not None:
+
+            self.__relationshiptag = relationshiptag
+
+
+
+        return self.__relationshiptag
+
+
+
+    def featurename(self, featurename=None):
+
+        '''
+
+        Get or set the georss:featurename of the entry
+
+
+
+        :param featuretypetag: The GeoRSS featurename (e.g. "Footscray")
+
+        :return: the current georss:featurename
+
+        '''
+
+        if featurename is not None:
+
+            self.__featurename = featurename
+
+
+
+        return self.__featurename
+
+
+
+    def elev(self, elev=None):
+
+        '''
+
+        Get or set the georss:elev of the entry
+
+
+
+        :param elev: The GeoRSS elevation (e.g. 100.3)
+
+        :type elev: numbers.Number
+
+        :return: the current georss:elev
+
+        '''
+
+        if elev is not None:
+
+            if not isinstance(elev, numbers.Number):
+
+                raise ValueError("elev tag must be numeric: {}".format(elev))
+
+
+
+            self.__elev = elev
+
+
+
+        return self.__elev
+
+
+
+    def floor(self, floor=None):
+
+        '''
+
+        Get or set the georss:floor of the entry
+
+
+
+        :param floor: The GeoRSS floor (e.g. 4)
+
+        :type floor: int
+
+        :return: the current georss:floor
+
+        '''
+
+        if floor is not None:
+
+            if not isinstance(floor, int):
+
+                raise ValueError("floor tag must be int: {}".format(floor))
+
+
+
+            self.__floor = floor
+
+
+
+        return self.__floor
+
+
+
+    def radius(self, radius=None):
+
+        '''
+
+        Get or set the georss:radius of the entry
+
+
+
+        :param radius: The GeoRSS radius (e.g. 100.3)
+
+        :type radius: numbers.Number
+
+        :return: the current georss:radius
+
+        '''
+
+        if radius is not None:
+
+            if not isinstance(radius, numbers.Number):
+
+                raise ValueError(
+
+                    "radius tag must be numeric: {}".format(radius)
+
+                )
+
+
+
+            self.__radius = radius
+
+
+
+        return self.__radius
+
+
+
+    def geom_from_geo_interface(self, geom):
+
+        '''
+
+        Generate a georss geometry from some Python object with a
+
+        ``__geo_interface__`` property (see the `geo_interface specification by
+
+        Sean Gillies`_geointerface )
+
+
+
+        Note only a subset of GeoJSON (see `geojson.org`_geojson ) can be
+
+        easily converted to GeoRSS:
+
+
+
+        - Point
+
+        - LineString
+
+        - Polygon (if there are holes / donuts in the polygons a warning will
+
+          be generaated
+
+
+
+        Other GeoJson types will raise a ``ValueError``.
+
+
+
+        .. note:: The geometry is assumed to be x, y as longitude, latitude in
+
+           the WGS84 projection.
+
+
+
+        .. _geointerface: https://gist.github.com/sgillies/2217756
+
+        .. _geojson: https://geojson.org/
+
+
+
+        :param geom: Geometry object with a __geo_interface__ property
+
+        :return: the formatted GeoRSS geometry
+
+        '''
+
+        geojson = geom.__geo_interface__
+
+
+
+        if geojson['type'] not in ('Point', 'LineString', 'Polygon'):
+
+            raise GeoRSSGeometryError(geom)
+
+
+
+        if geojson['type'] == 'Point':
+
+
+
+            coords = '{:f} {:f}'.format(
+
+                geojson['coordinates'][1],  # latitude is y
+
+                geojson['coordinates'][0]
+
+            )
+
+            return self.point(coords)
+
+
+
+        elif geojson['type'] == 'LineString':
+
+
+
+            coords = ' '.join(
+
+                '{:f} {:f}'.format(vertex[1], vertex[0])
+
+                for vertex in
+
+                geojson['coordinates']
+
+            )
+
+            return self.line(coords)
+
+
+
+        elif geojson['type'] == 'Polygon':
+
+
+
+            if len(geojson['coordinates']) > 1:
+
+                warnings.warn(GeoRSSPolygonInteriorWarning(geom))
+
+
+
+            coords = ' '.join(
+
+                '{:f} {:f}'.format(vertex[1], vertex[0])
+
+                for vertex in
+
+                geojson['coordinates'][0]
+
+            )
+
+            return self.polygon(coords)

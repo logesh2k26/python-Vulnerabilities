@@ -2,120 +2,204 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-import base64
+import os
 
+from unittest.mock import patch
 
 
 
+import logging
 
-def calculate_at_hash(access_token, hash_alg):
+from pytest import fixture, mark
 
-    """Helper method for calculating an access token
+from traitlets.config import Config
 
-    hash, as described in http://openid.net/specs/openid-connect-core-1_0.html#CodeIDToken
 
 
+from ..bitbucket import BitbucketOAuthenticator
 
-    Its value is the base64url encoding of the left-most half of the hash of the octets
 
-    of the ASCII representation of the access_token value, where the hash algorithm
 
-    used is the hash algorithm used in the alg Header Parameter of the ID Token's JOSE
+from .mocks import setup_oauth_mock
 
-    Header. For instance, if the alg is RS256, hash the access_token value with SHA-256,
 
-    then take the left-most 128 bits and base64url encode them. The at_hash value is a
 
-    case sensitive string.
 
 
+def user_model(username):
 
-    Args:
+    """Return a user model"""
 
-        access_token (str): An access token string.
+    return {
 
-        hash_alg (callable): A callable returning a hash object, e.g. hashlib.sha256
+        'username': username,
 
+    }
 
 
-    """
 
-    hash_digest = hash_alg(access_token.encode('utf-8')).digest()
+@fixture
 
-    cut_at = int(len(hash_digest) / 2)
+def bitbucket_client(client):
 
-    truncated = hash_digest[:cut_at]
+    setup_oauth_mock(client,
 
-    at_hash = base64url_encode(truncated)
+        host=['bitbucket.org', 'api.bitbucket.org'],
 
-    return at_hash.decode('utf-8')
+        access_token_path='/site/oauth2/access_token',
 
+        user_path='/2.0/user',
 
+    )
 
+    return client
 
 
-def base64url_decode(input):
 
-    """Helper method to base64url_decode a string.
 
 
+async def test_bitbucket(bitbucket_client):
 
-    Args:
+    authenticator = BitbucketOAuthenticator()
 
-        input (str): A base64url_encoded string to decode.
+    handler = bitbucket_client.handler_for_user(user_model('yorba'))
 
+    user_info = await authenticator.authenticate(handler)
 
+    assert sorted(user_info) == ['auth_state', 'name']
 
-    """
+    name = user_info['name']
 
-    rem = len(input) % 4
+    assert name == 'yorba'
 
+    auth_state = user_info['auth_state']
 
+    assert 'access_token' in auth_state
 
-    if rem > 0:
+    assert 'bitbucket_user' in auth_state
 
-        input += b'=' * (4 - rem)
 
 
 
-    return base64.urlsafe_b64decode(input)
 
+async def test_allowed_teams(bitbucket_client):
 
+    client = bitbucket_client
 
+    authenticator = BitbucketOAuthenticator()
 
+    authenticator.allowed_teams = ['blue']
 
-def base64url_encode(input):
 
-    """Helper method to base64url_encode a string.
 
+    teams = {
 
+        'red': ['grif', 'simmons', 'donut', 'sarge', 'lopez'],
 
-    Args:
+        'blue': ['tucker', 'caboose', 'burns', 'sheila', 'texas'],
 
-        input (str): A base64url_encoded string to encode.
+    }
 
+    def list_teams(request):
 
+        token = request.headers['Authorization'].split(None, 1)[1]
 
-    """
+        username = client.access_tokens[token]['username']
 
-    return base64.urlsafe_b64encode(input).replace(b'=', b'')
+        values = []
 
+        for team, members in teams.items():
 
+            if username in members:
 
+                values.append({'username': team})
 
+        return {
 
-def timedelta_total_seconds(delta):
+            'values': values
 
-    """Helper method to determine the total number of seconds
+        }
 
-    from a timedelta.
 
 
+    client.hosts['api.bitbucket.org'].append(
 
-    Args:
+        ('/2.0/teams', list_teams)
 
-        delta (timedelta): A timedelta to convert to seconds.
+    )
 
-    """
 
-    return delta.days * 24 * 60 * 60 + delta.seconds
+
+    handler = client.handler_for_user(user_model('caboose'))
+
+    user_info = await authenticator.authenticate(handler)
+
+    name = user_info['name']
+
+    assert name == 'caboose'
+
+
+
+    handler = client.handler_for_user(user_model('donut'))
+
+    name = await authenticator.authenticate(handler)
+
+    assert name is None
+
+
+
+    # reverse it, just to be safe
+
+    authenticator.allowed_teams = ['red']
+
+
+
+    handler = client.handler_for_user(user_model('caboose'))
+
+    name = await authenticator.authenticate(handler)
+
+    assert name is None
+
+
+
+    handler = client.handler_for_user(user_model('donut'))
+
+    user_info = await authenticator.authenticate(handler)
+
+    name = user_info['name']
+
+    assert name == 'donut'
+
+
+
+def test_deprecated_config(caplog):
+
+    cfg = Config()
+
+    cfg.BitbucketOAuthenticator.team_whitelist = ['red']
+
+
+
+    log = logging.getLogger("testlog")
+
+    authenticator = BitbucketOAuthenticator(config=cfg, log=log)
+
+    assert caplog.record_tuples == [
+
+        (
+
+            log.name,
+
+            logging.WARNING,
+
+            'BitbucketOAuthenticator.team_whitelist is deprecated in BitbucketOAuthenticator 0.12.0, use '
+
+            'BitbucketOAuthenticator.allowed_teams instead',
+
+        )
+
+    ]
+
+
+
+    assert authenticator.allowed_teams == {"red"}

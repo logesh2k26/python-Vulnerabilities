@@ -2,948 +2,1282 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-import os
-
-import re
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
 
 
 
-from django.conf import global_settings, settings
+# Copyright 2012 OpenStack LLC
 
-from django.contrib.sites.models import Site, RequestSite
+#
 
-from django.contrib.auth.models import User
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
 
-from django.core import mail
+# not use this file except in compliance with the License. You may obtain
 
-from django.core.urlresolvers import reverse, NoReverseMatch
+# a copy of the License at
 
-from django.http import QueryDict
+#
 
-from django.utils.encoding import force_text
+#      http://www.apache.org/licenses/LICENSE-2.0
 
-from django.utils.html import escape
+#
 
-from django.utils.http import urlquote
+# Unless required by applicable law or agreed to in writing, software
 
-from django.test import TestCase
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-from django.test.utils import override_settings
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
+# License for the specific language governing permissions and limitations
 
-
-from django.contrib.auth import SESSION_KEY, REDIRECT_FIELD_NAME
-
-from django.contrib.auth.forms import (AuthenticationForm, PasswordChangeForm,
-
-                SetPasswordForm, PasswordResetForm)
-
-from django.contrib.auth.tests.utils import skipIfCustomUser
+# under the License.
 
 
 
+"""Main entry point into the Identity service."""
 
 
-@override_settings(
 
-    LANGUAGES=(
+import uuid
 
-        ('en', 'English'),
+import urllib
 
-    ),
+import urlparse
 
-    LANGUAGE_CODE='en',
 
-    TEMPLATE_LOADERS=global_settings.TEMPLATE_LOADERS,
 
-    TEMPLATE_DIRS=(
+from keystone import config
 
-        os.path.join(os.path.dirname(__file__), 'templates'),
+from keystone import exception
 
-    ),
+from keystone import policy
 
-    USE_TZ=False,
+from keystone import token
 
-    PASSWORD_HASHERS=('django.contrib.auth.hashers.SHA1PasswordHasher',),
+from keystone.common import logging
 
-)
+from keystone.common import manager
 
-class AuthViewsTestCase(TestCase):
+from keystone.common import wsgi
+
+
+
+
+
+CONF = config.CONF
+
+
+
+LOG = logging.getLogger(__name__)
+
+
+
+
+
+class Manager(manager.Manager):
+
+    """Default pivot point for the Identity backend.
+
+
+
+    See :mod:`keystone.common.manager.Manager` for more details on how this
+
+    dynamically calls the backend.
+
+
 
     """
 
-    Helper base class for all the follow test cases.
-
-    """
-
-    fixtures = ['authtestdata.json']
-
-    urls = 'django.contrib.auth.tests.urls'
 
 
+    def __init__(self):
 
-    def login(self, password='password'):
-
-        response = self.client.post('/login/', {
-
-            'username': 'testclient',
-
-            'password': password,
-
-            })
-
-        self.assertEqual(response.status_code, 302)
-
-        self.assertTrue(response['Location'].endswith(settings.LOGIN_REDIRECT_URL))
-
-        self.assertTrue(SESSION_KEY in self.client.session)
-
-
-
-    def assertContainsEscaped(self, response, text, **kwargs):
-
-        return self.assertContains(response, escape(force_text(text)), **kwargs)
+        super(Manager, self).__init__(CONF.identity.driver)
 
 
 
 
 
-@skipIfCustomUser
+class Driver(object):
 
-class AuthViewNamedURLTests(AuthViewsTestCase):
-
-    urls = 'django.contrib.auth.urls'
+    """Interface description for an Identity driver."""
 
 
 
-    def test_named_urls(self):
+    def authenticate(self, user_id=None, tenant_id=None, password=None):
 
-        "Named URLs should be reversible"
+        """Authenticate a given user, tenant and password.
 
-        expected_named_urls = [
 
-            ('login', [], {}),
 
-            ('logout', [], {}),
+        Returns: (user, tenant, metadata).
 
-            ('password_change', [], {}),
 
-            ('password_change_done', [], {}),
 
-            ('password_reset', [], {}),
+        """
 
-            ('password_reset_done', [], {}),
+        raise exception.NotImplemented()
 
-            ('password_reset_confirm', [], {
 
-                'uidb36': 'aaaaaaa',
 
-                'token': '1111-aaaaa',
+    def get_tenant(self, tenant_id):
 
-            }),
+        """Get a tenant by id.
 
-            ('password_reset_complete', [], {}),
 
-        ]
 
-        for name, args, kwargs in expected_named_urls:
+        Returns: tenant_ref or None.
+
+
+
+        """
+
+        raise exception.NotImplemented()
+
+
+
+    def get_tenant_by_name(self, tenant_name):
+
+        """Get a tenant by name.
+
+
+
+        Returns: tenant_ref or None.
+
+
+
+        """
+
+        raise exception.NotImplemented()
+
+
+
+    def get_user(self, user_id):
+
+        """Get a user by id.
+
+
+
+        Returns: user_ref or None.
+
+
+
+        """
+
+        raise exception.NotImplemented()
+
+
+
+    def get_user_by_name(self, user_name):
+
+        """Get a user by name.
+
+
+
+        Returns: user_ref or None.
+
+
+
+        """
+
+        raise exception.NotImplemented()
+
+
+
+    def get_role(self, role_id):
+
+        """Get a role by id.
+
+
+
+        Returns: role_ref or None.
+
+
+
+        """
+
+        raise exception.NotImplemented()
+
+
+
+    def list_users(self):
+
+        """List all users in the system.
+
+
+
+        NOTE(termie): I'd prefer if this listed only the users for a given
+
+                      tenant.
+
+
+
+        Returns: a list of user_refs or an empty list.
+
+
+
+        """
+
+        raise exception.NotImplemented()
+
+
+
+    def list_roles(self):
+
+        """List all roles in the system.
+
+
+
+        Returns: a list of role_refs or an empty list.
+
+
+
+        """
+
+        raise exception.NotImplemented()
+
+
+
+    # NOTE(termie): seven calls below should probably be exposed by the api
+
+    #               more clearly when the api redesign happens
+
+    def add_user_to_tenant(self, tenant_id, user_id):
+
+        raise exception.NotImplemented()
+
+
+
+    def remove_user_from_tenant(self, tenant_id, user_id):
+
+        raise exception.NotImplemented()
+
+
+
+    def get_all_tenants(self):
+
+        raise exception.NotImplemented()
+
+
+
+    def get_tenants_for_user(self, user_id):
+
+        """Get the tenants associated with a given user.
+
+
+
+        Returns: a list of tenant ids.
+
+
+
+        """
+
+        raise exception.NotImplemented()
+
+
+
+    def get_roles_for_user_and_tenant(self, user_id, tenant_id):
+
+        """Get the roles associated with a user within given tenant.
+
+
+
+        Returns: a list of role ids.
+
+
+
+        """
+
+        raise exception.NotImplemented()
+
+
+
+    def add_role_to_user_and_tenant(self, user_id, tenant_id, role_id):
+
+        """Add a role to a user within given tenant."""
+
+        raise exception.NotImplemented()
+
+
+
+    def remove_role_from_user_and_tenant(self, user_id, tenant_id, role_id):
+
+        """Remove a role from a user within given tenant."""
+
+        raise exception.NotImplemented()
+
+
+
+    # user crud
+
+    def create_user(self, user_id, user):
+
+        raise exception.NotImplemented()
+
+
+
+    def update_user(self, user_id, user):
+
+        raise exception.NotImplemented()
+
+
+
+    def delete_user(self, user_id):
+
+        raise exception.NotImplemented()
+
+
+
+    # tenant crud
+
+    def create_tenant(self, tenant_id, tenant):
+
+        raise exception.NotImplemented()
+
+
+
+    def update_tenant(self, tenant_id, tenant):
+
+        raise exception.NotImplemented()
+
+
+
+    def delete_tenant(self, tenant_id, tenant):
+
+        raise exception.NotImplemented()
+
+
+
+    # metadata crud
+
+
+
+    def get_metadata(self, user_id, tenant_id):
+
+        raise exception.NotImplemented()
+
+
+
+    def create_metadata(self, user_id, tenant_id, metadata):
+
+        raise exception.NotImplemented()
+
+
+
+    def update_metadata(self, user_id, tenant_id, metadata):
+
+        raise exception.NotImplemented()
+
+
+
+    def delete_metadata(self, user_id, tenant_id, metadata):
+
+        raise exception.NotImplemented()
+
+
+
+    # role crud
+
+    def create_role(self, role_id, role):
+
+        raise exception.NotImplemented()
+
+
+
+    def update_role(self, role_id, role):
+
+        raise exception.NotImplemented()
+
+
+
+    def delete_role(self, role_id):
+
+        raise exception.NotImplemented()
+
+
+
+
+
+class PublicRouter(wsgi.ComposableRouter):
+
+    def add_routes(self, mapper):
+
+        tenant_controller = TenantController()
+
+        mapper.connect('/tenants',
+
+                       controller=tenant_controller,
+
+                       action='get_tenants_for_token',
+
+                       conditions=dict(methods=['GET']))
+
+
+
+
+
+class AdminRouter(wsgi.ComposableRouter):
+
+    def add_routes(self, mapper):
+
+        # Tenant Operations
+
+        tenant_controller = TenantController()
+
+        mapper.connect('/tenants',
+
+                       controller=tenant_controller,
+
+                       action='get_all_tenants',
+
+                       conditions=dict(method=['GET']))
+
+        mapper.connect('/tenants/{tenant_id}',
+
+                       controller=tenant_controller,
+
+                       action='get_tenant',
+
+                       conditions=dict(method=['GET']))
+
+
+
+        # User Operations
+
+        user_controller = UserController()
+
+        mapper.connect('/users/{user_id}',
+
+                       controller=user_controller,
+
+                       action='get_user',
+
+                       conditions=dict(method=['GET']))
+
+
+
+        # Role Operations
+
+        roles_controller = RoleController()
+
+        mapper.connect('/tenants/{tenant_id}/users/{user_id}/roles',
+
+                       controller=roles_controller,
+
+                       action='get_user_roles',
+
+                       conditions=dict(method=['GET']))
+
+        mapper.connect('/users/{user_id}/roles',
+
+                       controller=roles_controller,
+
+                       action='get_user_roles',
+
+                       conditions=dict(method=['GET']))
+
+
+
+
+
+class TenantController(wsgi.Application):
+
+    def __init__(self):
+
+        self.identity_api = Manager()
+
+        self.policy_api = policy.Manager()
+
+        self.token_api = token.Manager()
+
+        super(TenantController, self).__init__()
+
+
+
+    def get_all_tenants(self, context, **kw):
+
+        """Gets a list of all tenants for an admin user."""
+
+        self.assert_admin(context)
+
+        tenant_refs = self.identity_api.get_tenants(context)
+
+        params = {
+
+            'limit': context['query_string'].get('limit'),
+
+            'marker': context['query_string'].get('marker'),
+
+        }
+
+        return self._format_tenant_list(tenant_refs, **params)
+
+
+
+    def get_tenants_for_token(self, context, **kw):
+
+        """Get valid tenants for token based on token used to authenticate.
+
+
+
+        Pulls the token from the context, validates it and gets the valid
+
+        tenants for the user in the token.
+
+
+
+        Doesn't care about token scopedness.
+
+
+
+        """
+
+        try:
+
+            token_ref = self.token_api.get_token(context=context,
+
+                                                 token_id=context['token_id'])
+
+        except exception.NotFound:
+
+            raise exception.Unauthorized()
+
+
+
+        user_ref = token_ref['user']
+
+        tenant_ids = self.identity_api.get_tenants_for_user(
+
+                context, user_ref['id'])
+
+        tenant_refs = []
+
+        for tenant_id in tenant_ids:
+
+            tenant_refs.append(self.identity_api.get_tenant(
+
+                    context=context,
+
+                    tenant_id=tenant_id))
+
+        params = {
+
+            'limit': context['query_string'].get('limit'),
+
+            'marker': context['query_string'].get('marker'),
+
+        }
+
+        return self._format_tenant_list(tenant_refs, **params)
+
+
+
+    def get_tenant(self, context, tenant_id):
+
+        # TODO(termie): this stuff should probably be moved to middleware
+
+        self.assert_admin(context)
+
+        tenant = self.identity_api.get_tenant(context, tenant_id)
+
+        if tenant is None:
+
+            raise exception.TenantNotFound(tenant_id=tenant_id)
+
+
+
+        return {'tenant': tenant}
+
+
+
+    # CRUD Extension
+
+    def create_tenant(self, context, tenant):
+
+        tenant_ref = self._normalize_dict(tenant)
+
+
+
+        if not 'name' in tenant_ref or not tenant_ref['name']:
+
+            msg = 'Name field is required and cannot be empty'
+
+            raise exception.ValidationError(message=msg)
+
+
+
+        self.assert_admin(context)
+
+        tenant_id = (tenant_ref.get('id')
+
+                     and tenant_ref.get('id')
+
+                     or uuid.uuid4().hex)
+
+        tenant_ref['id'] = tenant_id
+
+
+
+        tenant = self.identity_api.create_tenant(
+
+                context, tenant_id, tenant_ref)
+
+        return {'tenant': tenant}
+
+
+
+    def update_tenant(self, context, tenant_id, tenant):
+
+        self.assert_admin(context)
+
+        if self.identity_api.get_tenant(context, tenant_id) is None:
+
+            raise exception.TenantNotFound(tenant_id=tenant_id)
+
+
+
+        tenant_ref = self.identity_api.update_tenant(
+
+                context, tenant_id, tenant)
+
+        return {'tenant': tenant_ref}
+
+
+
+    def delete_tenant(self, context, tenant_id, **kw):
+
+        self.assert_admin(context)
+
+        if self.identity_api.get_tenant(context, tenant_id) is None:
+
+            raise exception.TenantNotFound(tenant_id=tenant_id)
+
+
+
+        self.identity_api.delete_tenant(context, tenant_id)
+
+
+
+    def get_tenant_users(self, context, tenant_id, **kw):
+
+        self.assert_admin(context)
+
+        if self.identity_api.get_tenant(context, tenant_id) is None:
+
+            raise exception.TenantNotFound(tenant_id=tenant_id)
+
+
+
+        user_refs = self.identity_api.get_tenant_users(context, tenant_id)
+
+        return {'users': user_refs}
+
+
+
+    def _format_tenant_list(self, tenant_refs, **kwargs):
+
+        marker = kwargs.get('marker')
+
+        page_idx = 0
+
+        if marker is not None:
+
+            for (marker_idx, tenant) in enumerate(tenant_refs):
+
+                if tenant['id'] == marker:
+
+                    # we start pagination after the marker
+
+                    page_idx = marker_idx + 1
+
+                    break
+
+            else:
+
+                msg = 'Marker could not be found'
+
+                raise exception.ValidationError(message=msg)
+
+
+
+        limit = kwargs.get('limit')
+
+        if limit is not None:
 
             try:
 
-                reverse(name, args=args, kwargs=kwargs)
+                limit = int(limit)
 
-            except NoReverseMatch:
+                if limit < 0:
 
-                self.fail("Reversal of url named '%s' failed with NoReverseMatch" % name)
+                    raise AssertionError()
 
+            except (ValueError, AssertionError):
 
+                msg = 'Invalid limit value'
 
+                raise exception.ValidationError(message=msg)
 
 
-@skipIfCustomUser
 
-class PasswordResetTest(AuthViewsTestCase):
+        tenant_refs = tenant_refs[page_idx:limit]
 
 
 
-    def test_email_not_found(self):
+        for x in tenant_refs:
 
-        "Error is raised if the provided email address isn't currently registered"
+            if 'enabled' not in x:
 
-        response = self.client.get('/password_reset/')
+                x['enabled'] = True
 
-        self.assertEqual(response.status_code, 200)
+        o = {'tenants': tenant_refs,
 
-        response = self.client.post('/password_reset/', {'email': 'not_a_real_email@email.com'})
+             'tenants_links': []}
 
-        self.assertContainsEscaped(response, PasswordResetForm.error_messages['unknown'])
+        return o
 
-        self.assertEqual(len(mail.outbox), 0)
 
 
 
-    def test_email_found(self):
 
-        "Email is sent if a valid email address is provided for password reset"
+class UserController(wsgi.Application):
 
-        response = self.client.post('/password_reset/', {'email': 'staffmember@example.com'})
+    def __init__(self):
 
-        self.assertEqual(response.status_code, 302)
+        self.identity_api = Manager()
 
-        self.assertEqual(len(mail.outbox), 1)
+        self.policy_api = policy.Manager()
 
-        self.assertTrue("http://" in mail.outbox[0].body)
+        self.token_api = token.Manager()
 
-        self.assertEqual(settings.DEFAULT_FROM_EMAIL, mail.outbox[0].from_email)
+        super(UserController, self).__init__()
 
 
 
-    def test_email_found_custom_from(self):
+    def get_user(self, context, user_id):
 
-        "Email is sent if a valid email address is provided for password reset when a custom from_email is provided."
+        self.assert_admin(context)
 
-        response = self.client.post('/password_reset_from_email/', {'email': 'staffmember@example.com'})
+        user_ref = self.identity_api.get_user(context, user_id)
 
-        self.assertEqual(response.status_code, 302)
+        if not user_ref:
 
-        self.assertEqual(len(mail.outbox), 1)
+            raise exception.UserNotFound(user_id=user_id)
 
-        self.assertEqual("staffmember@example.com", mail.outbox[0].from_email)
 
 
+        return {'user': user_ref}
 
-    def _test_confirm_start(self):
 
-        # Start by creating the email
 
-        response = self.client.post('/password_reset/', {'email': 'staffmember@example.com'})
+    def get_users(self, context):
 
-        self.assertEqual(response.status_code, 302)
+        # NOTE(termie): i can't imagine that this really wants all the data
 
-        self.assertEqual(len(mail.outbox), 1)
+        #               about every single user in the system...
 
-        return self._read_signup_email(mail.outbox[0])
+        self.assert_admin(context)
 
+        user_refs = self.identity_api.list_users(context)
 
+        return {'users': user_refs}
 
-    def _read_signup_email(self, email):
 
-        urlmatch = re.search(r"https?://[^/]*(/.*reset/\S*)", email.body)
 
-        self.assertTrue(urlmatch is not None, "No URL found in sent email")
+    # CRUD extension
 
-        return urlmatch.group(), urlmatch.groups()[0]
+    def create_user(self, context, user):
 
+        user = self._normalize_dict(user)
 
+        self.assert_admin(context)
 
-    def test_confirm_valid(self):
 
-        url, path = self._test_confirm_start()
 
-        response = self.client.get(path)
+        if not 'name' in user or not user['name']:
 
-        # redirect to a 'complete' page:
+            msg = 'Name field is required and cannot be empty'
 
-        self.assertContains(response, "Please enter your new password")
+            raise exception.ValidationError(message=msg)
 
 
 
-    def test_confirm_invalid(self):
+        tenant_id = user.get('tenantId', None)
 
-        url, path = self._test_confirm_start()
+        if (tenant_id is not None
 
-        # Let's munge the token in the path, but keep the same length,
+                and self.identity_api.get_tenant(context, tenant_id) is None):
 
-        # in case the URLconf will reject a different length.
+            raise exception.TenantNotFound(tenant_id=tenant_id)
 
-        path = path[:-5] + ("0" * 4) + path[-1]
+        user_id = uuid.uuid4().hex
 
+        user_ref = user.copy()
 
+        user_ref['id'] = user_id
 
-        response = self.client.get(path)
+        new_user_ref = self.identity_api.create_user(
 
-        self.assertContains(response, "The password reset link was invalid")
+                context, user_id, user_ref)
 
+        if tenant_id:
 
+            self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
 
-    def test_confirm_invalid_user(self):
+        return {'user': new_user_ref}
 
-        # Ensure that we get a 200 response for a non-existant user, not a 404
 
-        response = self.client.get('/reset/123456-1-1/')
 
-        self.assertContains(response, "The password reset link was invalid")
+    def update_user(self, context, user_id, user):
 
+        # NOTE(termie): this is really more of a patch than a put
 
+        self.assert_admin(context)
 
-    def test_confirm_overflow_user(self):
+        if self.identity_api.get_user(context, user_id) is None:
 
-        # Ensure that we get a 200 response for a base36 user id that overflows int
+            raise exception.UserNotFound(user_id=user_id)
 
-        response = self.client.get('/reset/zzzzzzzzzzzzz-1-1/')
 
-        self.assertContains(response, "The password reset link was invalid")
 
+        user_ref = self.identity_api.update_user(context, user_id, user)
 
 
-    def test_confirm_invalid_post(self):
 
-        # Same as test_confirm_invalid, but trying
+        # If the password was changed or the user was disabled we clear tokens
 
-        # to do a POST instead.
+        if user.get('password') or not user.get('enabled', True):
 
-        url, path = self._test_confirm_start()
+            try:
 
-        path = path[:-5] + ("0" * 4) + path[-1]
+                for token_id in self.token_api.list_tokens(context, user_id):
 
+                    self.token_api.delete_token(context, token_id)
 
+            except exception.NotImplemented:
 
-        self.client.post(path, {
+                # The users status has been changed but tokens remain valid for
 
-            'new_password1': 'anewpassword',
+                # backends that can't list tokens for users
 
-            'new_password2': ' anewpassword',
+                LOG.warning('User %s status has changed, but existing tokens '
 
-        })
+                            'remain valid' % user_id)
 
-        # Check the password has not been changed
+        return {'user': user_ref}
 
-        u = User.objects.get(email='staffmember@example.com')
 
-        self.assertTrue(not u.check_password("anewpassword"))
 
+    def delete_user(self, context, user_id):
 
+        self.assert_admin(context)
 
-    def test_confirm_complete(self):
+        if self.identity_api.get_user(context, user_id) is None:
 
-        url, path = self._test_confirm_start()
+            raise exception.UserNotFound(user_id=user_id)
 
-        response = self.client.post(path, {'new_password1': 'anewpassword',
 
-                                           'new_password2': 'anewpassword'})
 
-        # It redirects us to a 'complete' page:
+        self.identity_api.delete_user(context, user_id)
 
-        self.assertEqual(response.status_code, 302)
 
-        # Check the password has been changed
 
-        u = User.objects.get(email='staffmember@example.com')
+    def set_user_enabled(self, context, user_id, user):
 
-        self.assertTrue(u.check_password("anewpassword"))
+        return self.update_user(context, user_id, user)
 
 
 
-        # Check we can't use the link again
+    def set_user_password(self, context, user_id, user):
 
-        response = self.client.get(path)
+        return self.update_user(context, user_id, user)
 
-        self.assertContains(response, "The password reset link was invalid")
 
 
+    def update_user_tenant(self, context, user_id, user):
 
-    def test_confirm_different_passwords(self):
+        """Update the default tenant."""
 
-        url, path = self._test_confirm_start()
+        # ensure that we're a member of that tenant
 
-        response = self.client.post(path, {'new_password1': 'anewpassword',
+        tenant_id = user.get('tenantId')
 
-                                           'new_password2': 'x'})
+        self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
 
-        self.assertContainsEscaped(response, SetPasswordForm.error_messages['password_mismatch'])
+        return self.update_user(context, user_id, user)
 
 
 
 
 
-@override_settings(AUTH_USER_MODEL='auth.CustomUser')
+class RoleController(wsgi.Application):
 
-class CustomUserPasswordResetTest(AuthViewsTestCase):
+    def __init__(self):
 
-    fixtures = ['custom_user.json']
+        self.identity_api = Manager()
 
+        self.token_api = token.Manager()
 
+        self.policy_api = policy.Manager()
 
-    def _test_confirm_start(self):
+        super(RoleController, self).__init__()
 
-        # Start by creating the email
 
-        response = self.client.post('/password_reset/', {'email': 'staffmember@example.com'})
 
-        self.assertEqual(response.status_code, 302)
+    # COMPAT(essex-3)
 
-        self.assertEqual(len(mail.outbox), 1)
+    def get_user_roles(self, context, user_id, tenant_id=None):
 
-        return self._read_signup_email(mail.outbox[0])
+        """Get the roles for a user and tenant pair.
 
 
 
-    def _read_signup_email(self, email):
+        Since we're trying to ignore the idea of user-only roles we're
 
-        urlmatch = re.search(r"https?://[^/]*(/.*reset/\S*)", email.body)
+        not implementing them in hopes that the idea will die off.
 
-        self.assertTrue(urlmatch is not None, "No URL found in sent email")
 
-        return urlmatch.group(), urlmatch.groups()[0]
 
+        """
 
+        if tenant_id is None:
 
-    def test_confirm_valid_custom_user(self):
+            raise exception.NotImplemented(message='User roles not supported: '
 
-        url, path = self._test_confirm_start()
+                                                   'tenant ID required')
 
-        response = self.client.get(path)
 
-        # redirect to a 'complete' page:
 
-        self.assertContains(response, "Please enter your new password")
+        user = self.identity_api.get_user(context, user_id)
 
+        if user is None:
 
+            raise exception.UserNotFound(user_id=user_id)
 
+        tenant = self.identity_api.get_tenant(context, tenant_id)
 
+        if tenant is None:
 
-@skipIfCustomUser
+            raise exception.TenantNotFound(tenant_id=tenant_id)
 
-class ChangePasswordTest(AuthViewsTestCase):
 
 
+        roles = self.identity_api.get_roles_for_user_and_tenant(
 
-    def fail_login(self, password='password'):
+                context, user_id, tenant_id)
 
-        response = self.client.post('/login/', {
+        return {'roles': [self.identity_api.get_role(context, x)
 
-            'username': 'testclient',
+                          for x in roles]}
 
-            'password': password,
 
-        })
 
-        self.assertContainsEscaped(response, AuthenticationForm.error_messages['invalid_login'])
+    # CRUD extension
 
+    def get_role(self, context, role_id):
 
+        self.assert_admin(context)
 
-    def logout(self):
+        role_ref = self.identity_api.get_role(context, role_id)
 
-        response = self.client.get('/logout/')
+        if not role_ref:
 
+            raise exception.RoleNotFound(role_id=role_id)
 
+        return {'role': role_ref}
 
-    def test_password_change_fails_with_invalid_old_password(self):
 
-        self.login()
 
-        response = self.client.post('/password_change/', {
+    def create_role(self, context, role):
 
-            'old_password': 'donuts',
+        role = self._normalize_dict(role)
 
-            'new_password1': 'password1',
+        self.assert_admin(context)
 
-            'new_password2': 'password1',
 
-        })
 
-        self.assertContainsEscaped(response, PasswordChangeForm.error_messages['password_incorrect'])
+        if not 'name' in role or not role['name']:
 
+            msg = 'Name field is required and cannot be empty'
 
+            raise exception.ValidationError(message=msg)
 
-    def test_password_change_fails_with_mismatched_passwords(self):
 
-        self.login()
 
-        response = self.client.post('/password_change/', {
+        role_id = uuid.uuid4().hex
 
-            'old_password': 'password',
+        role['id'] = role_id
 
-            'new_password1': 'password1',
+        role_ref = self.identity_api.create_role(context, role_id, role)
 
-            'new_password2': 'donuts',
+        return {'role': role_ref}
 
-        })
 
-        self.assertContainsEscaped(response, SetPasswordForm.error_messages['password_mismatch'])
 
+    def delete_role(self, context, role_id):
 
+        self.assert_admin(context)
 
-    def test_password_change_succeeds(self):
+        self.get_role(context, role_id)
 
-        self.login()
+        self.identity_api.delete_role(context, role_id)
 
-        response = self.client.post('/password_change/', {
 
-            'old_password': 'password',
 
-            'new_password1': 'password1',
+    def get_roles(self, context):
 
-            'new_password2': 'password1',
+        self.assert_admin(context)
 
-        })
+        roles = self.identity_api.list_roles(context)
 
-        self.assertEqual(response.status_code, 302)
+        # TODO(termie): probably inefficient at some point
 
-        self.assertTrue(response['Location'].endswith('/password_change/done/'))
+        return {'roles': roles}
 
-        self.fail_login()
 
-        self.login(password='password1')
 
+    def add_role_to_user(self, context, user_id, role_id, tenant_id=None):
 
+        """Add a role to a user and tenant pair.
 
-    def test_password_change_done_succeeds(self):
 
-        self.login()
 
-        response = self.client.post('/password_change/', {
+        Since we're trying to ignore the idea of user-only roles we're
 
-            'old_password': 'password',
+        not implementing them in hopes that the idea will die off.
 
-            'new_password1': 'password1',
 
-            'new_password2': 'password1',
 
-        })
+        """
 
-        self.assertEqual(response.status_code, 302)
+        self.assert_admin(context)
 
-        self.assertTrue(response['Location'].endswith('/password_change/done/'))
+        if tenant_id is None:
 
+            raise exception.NotImplemented(message='User roles not supported: '
 
+                                                   'tenant_id required')
 
-    def test_password_change_done_fails(self):
+        if self.identity_api.get_user(context, user_id) is None:
 
-        with self.settings(LOGIN_URL='/login/'):
+            raise exception.UserNotFound(user_id=user_id)
 
-            response = self.client.get('/password_change/done/')
+        if self.identity_api.get_tenant(context, tenant_id) is None:
 
-            self.assertEqual(response.status_code, 302)
+            raise exception.TenantNotFound(tenant_id=tenant_id)
 
-            self.assertTrue(response['Location'].endswith('/login/?next=/password_change/done/'))
+        if self.identity_api.get_role(context, role_id) is None:
 
+            raise exception.RoleNotFound(role_id=role_id)
 
 
 
+        # This still has the weird legacy semantics that adding a role to
 
-@skipIfCustomUser
+        # a user also adds them to a tenant
 
-class LoginTest(AuthViewsTestCase):
+        self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
 
+        self.identity_api.add_role_to_user_and_tenant(
 
+                context, user_id, tenant_id, role_id)
 
-    def test_current_site_in_context_after_login(self):
+        role_ref = self.identity_api.get_role(context, role_id)
 
-        response = self.client.get(reverse('django.contrib.auth.views.login'))
+        return {'role': role_ref}
 
-        self.assertEqual(response.status_code, 200)
 
-        if Site._meta.installed:
 
-            site = Site.objects.get_current()
+    def remove_role_from_user(self, context, user_id, role_id, tenant_id=None):
 
-            self.assertEqual(response.context['site'], site)
+        """Remove a role from a user and tenant pair.
 
-            self.assertEqual(response.context['site_name'], site.name)
 
-        else:
 
-            self.assertIsInstance(response.context['site'], RequestSite)
+        Since we're trying to ignore the idea of user-only roles we're
 
-        self.assertTrue(isinstance(response.context['form'], AuthenticationForm),
+        not implementing them in hopes that the idea will die off.
 
-                     'Login form is not an AuthenticationForm')
 
 
+        """
 
-    def test_security_check(self, password='password'):
+        self.assert_admin(context)
 
-        login_url = reverse('django.contrib.auth.views.login')
+        if tenant_id is None:
 
+            raise exception.NotImplemented(message='User roles not supported: '
 
+                                                   'tenant_id required')
 
-        # Those URLs should not pass the security check
+        if self.identity_api.get_user(context, user_id) is None:
 
-        for bad_url in ('http://example.com',
+            raise exception.UserNotFound(user_id=user_id)
 
-                        'https://example.com',
+        if self.identity_api.get_tenant(context, tenant_id) is None:
 
-                        'ftp://exampel.com',
+            raise exception.TenantNotFound(tenant_id=tenant_id)
 
-                        '//example.com'):
+        if self.identity_api.get_role(context, role_id) is None:
 
+            raise exception.RoleNotFound(role_id=role_id)
 
 
-            nasty_url = '%(url)s?%(next)s=%(bad_url)s' % {
 
-                'url': login_url,
+        # This still has the weird legacy semantics that adding a role to
 
-                'next': REDIRECT_FIELD_NAME,
+        # a user also adds them to a tenant, so we must follow up on that
 
-                'bad_url': urlquote(bad_url),
+        self.identity_api.remove_role_from_user_and_tenant(
 
-            }
+                context, user_id, tenant_id, role_id)
 
-            response = self.client.post(nasty_url, {
+        roles = self.identity_api.get_roles_for_user_and_tenant(
 
-                'username': 'testclient',
+                context, user_id, tenant_id)
 
-                'password': password,
+        if not roles:
 
-            })
+            self.identity_api.remove_user_from_tenant(
 
-            self.assertEqual(response.status_code, 302)
+                    context, tenant_id, user_id)
 
-            self.assertFalse(bad_url in response['Location'],
+        return
 
-                             "%s should be blocked" % bad_url)
 
 
+    # COMPAT(diablo): CRUD extension
 
-        # These URLs *should* still pass the security check
+    def get_role_refs(self, context, user_id):
 
-        for good_url in ('/view/?param=http://example.com',
+        """Ultimate hack to get around having to make role_refs first-class.
 
-                         '/view/?param=https://example.com',
 
-                         '/view?param=ftp://exampel.com',
 
-                         'view/?param=//example.com',
+        This will basically iterate over the various roles the user has in
 
-                         'https:///',
+        all tenants the user is a member of and create fake role_refs where
 
-                         '//testserver/',
+        the id encodes the user-tenant-role information so we can look
 
-                         '/url%20with%20spaces/'):  # see ticket #12534
+        up the appropriate data when we need to delete them.
 
-            safe_url = '%(url)s?%(next)s=%(good_url)s' % {
 
-                'url': login_url,
 
-                'next': REDIRECT_FIELD_NAME,
+        """
 
-                'good_url': urlquote(good_url),
+        self.assert_admin(context)
 
-            }
+        # Ensure user exists by getting it first.
 
-            response = self.client.post(safe_url, {
+        self.identity_api.get_user(context, user_id)
 
-                    'username': 'testclient',
+        tenant_ids = self.identity_api.get_tenants_for_user(context, user_id)
 
-                    'password': password,
+        o = []
 
-            })
+        for tenant_id in tenant_ids:
 
-            self.assertEqual(response.status_code, 302)
+            role_ids = self.identity_api.get_roles_for_user_and_tenant(
 
-            self.assertTrue(good_url in response['Location'],
+                    context, user_id, tenant_id)
 
-                            "%s should be allowed" % good_url)
+            for role_id in role_ids:
 
+                ref = {'roleId': role_id,
 
+                       'tenantId': tenant_id,
 
+                       'userId': user_id}
 
+                ref['id'] = urllib.urlencode(ref)
 
-@skipIfCustomUser
+                o.append(ref)
 
-class LoginURLSettings(AuthViewsTestCase):
+        return {'roles': o}
 
 
 
-    def setUp(self):
+    # COMPAT(diablo): CRUD extension
 
-        super(LoginURLSettings, self).setUp()
+    def create_role_ref(self, context, user_id, role):
 
-        self.old_LOGIN_URL = settings.LOGIN_URL
+        """This is actually used for adding a user to a tenant.
 
 
 
-    def tearDown(self):
+        In the legacy data model adding a user to a tenant required setting
 
-        super(LoginURLSettings, self).tearDown()
+        a role.
 
-        settings.LOGIN_URL = self.old_LOGIN_URL
 
 
+        """
 
-    def get_login_required_url(self, login_url):
+        self.assert_admin(context)
 
-        settings.LOGIN_URL = login_url
+        # TODO(termie): for now we're ignoring the actual role
 
-        response = self.client.get('/login_required/')
+        tenant_id = role.get('tenantId')
 
-        self.assertEqual(response.status_code, 302)
+        role_id = role.get('roleId')
 
-        return response['Location']
+        self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
 
+        self.identity_api.add_role_to_user_and_tenant(
 
+                context, user_id, tenant_id, role_id)
 
-    def test_standard_login_url(self):
+        role_ref = self.identity_api.get_role(context, role_id)
 
-        login_url = '/login/'
+        return {'role': role_ref}
 
-        login_required_url = self.get_login_required_url(login_url)
 
-        querystring = QueryDict('', mutable=True)
 
-        querystring['next'] = '/login_required/'
+    # COMPAT(diablo): CRUD extension
 
-        self.assertEqual(login_required_url, 'http://testserver%s?%s' %
+    def delete_role_ref(self, context, user_id, role_ref_id):
 
-                         (login_url, querystring.urlencode('/')))
+        """This is actually used for deleting a user from a tenant.
 
 
 
-    def test_remote_login_url(self):
+        In the legacy data model removing a user from a tenant required
 
-        login_url = 'http://remote.example.com/login'
+        deleting a role.
 
-        login_required_url = self.get_login_required_url(login_url)
 
-        querystring = QueryDict('', mutable=True)
 
-        querystring['next'] = 'http://testserver/login_required/'
+        To emulate this, we encode the tenant and role in the role_ref_id,
 
-        self.assertEqual(login_required_url,
+        and if this happens to be the last role for the user-tenant pair,
 
-                         '%s?%s' % (login_url, querystring.urlencode('/')))
+        we remove the user from the tenant.
 
 
 
-    def test_https_login_url(self):
+        """
 
-        login_url = 'https:///login/'
+        self.assert_admin(context)
 
-        login_required_url = self.get_login_required_url(login_url)
+        # TODO(termie): for now we're ignoring the actual role
 
-        querystring = QueryDict('', mutable=True)
+        role_ref_ref = urlparse.parse_qs(role_ref_id)
 
-        querystring['next'] = 'http://testserver/login_required/'
+        tenant_id = role_ref_ref.get('tenantId')[0]
 
-        self.assertEqual(login_required_url,
+        role_id = role_ref_ref.get('roleId')[0]
 
-                         '%s?%s' % (login_url, querystring.urlencode('/')))
+        self.identity_api.remove_role_from_user_and_tenant(
 
+                context, user_id, tenant_id, role_id)
 
+        roles = self.identity_api.get_roles_for_user_and_tenant(
 
-    def test_login_url_with_querystring(self):
+                context, user_id, tenant_id)
 
-        login_url = '/login/?pretty=1'
+        if not roles:
 
-        login_required_url = self.get_login_required_url(login_url)
+            self.identity_api.remove_user_from_tenant(
 
-        querystring = QueryDict('pretty=1', mutable=True)
-
-        querystring['next'] = '/login_required/'
-
-        self.assertEqual(login_required_url, 'http://testserver/login/?%s' %
-
-                         querystring.urlencode('/'))
-
-
-
-    def test_remote_login_url_with_next_querystring(self):
-
-        login_url = 'http://remote.example.com/login/'
-
-        login_required_url = self.get_login_required_url('%s?next=/default/' %
-
-                                                         login_url)
-
-        querystring = QueryDict('', mutable=True)
-
-        querystring['next'] = 'http://testserver/login_required/'
-
-        self.assertEqual(login_required_url, '%s?%s' % (login_url,
-
-                                                    querystring.urlencode('/')))
-
-
-
-
-
-@skipIfCustomUser
-
-class LogoutTest(AuthViewsTestCase):
-
-
-
-    def confirm_logged_out(self):
-
-        self.assertTrue(SESSION_KEY not in self.client.session)
-
-
-
-    def test_logout_default(self):
-
-        "Logout without next_page option renders the default template"
-
-        self.login()
-
-        response = self.client.get('/logout/')
-
-        self.assertContains(response, 'Logged out')
-
-        self.confirm_logged_out()
-
-
-
-    def test_14377(self):
-
-        # Bug 14377
-
-        self.login()
-
-        response = self.client.get('/logout/')
-
-        self.assertTrue('site' in response.context)
-
-
-
-    def test_logout_with_overridden_redirect_url(self):
-
-        # Bug 11223
-
-        self.login()
-
-        response = self.client.get('/logout/next_page/')
-
-        self.assertEqual(response.status_code, 302)
-
-        self.assertTrue(response['Location'].endswith('/somewhere/'))
-
-
-
-        response = self.client.get('/logout/next_page/?next=/login/')
-
-        self.assertEqual(response.status_code, 302)
-
-        self.assertTrue(response['Location'].endswith('/login/'))
-
-
-
-        self.confirm_logged_out()
-
-
-
-    def test_logout_with_next_page_specified(self):
-
-        "Logout with next_page option given redirects to specified resource"
-
-        self.login()
-
-        response = self.client.get('/logout/next_page/')
-
-        self.assertEqual(response.status_code, 302)
-
-        self.assertTrue(response['Location'].endswith('/somewhere/'))
-
-        self.confirm_logged_out()
-
-
-
-    def test_logout_with_redirect_argument(self):
-
-        "Logout with query string redirects to specified resource"
-
-        self.login()
-
-        response = self.client.get('/logout/?next=/login/')
-
-        self.assertEqual(response.status_code, 302)
-
-        self.assertTrue(response['Location'].endswith('/login/'))
-
-        self.confirm_logged_out()
-
-
-
-    def test_logout_with_custom_redirect_argument(self):
-
-        "Logout with custom query string redirects to specified resource"
-
-        self.login()
-
-        response = self.client.get('/logout/custom_query/?follow=/somewhere/')
-
-        self.assertEqual(response.status_code, 302)
-
-        self.assertTrue(response['Location'].endswith('/somewhere/'))
-
-        self.confirm_logged_out()
-
-
-
-    def test_security_check(self, password='password'):
-
-        logout_url = reverse('django.contrib.auth.views.logout')
-
-
-
-        # Those URLs should not pass the security check
-
-        for bad_url in ('http://example.com',
-
-                        'https://example.com',
-
-                        'ftp://exampel.com',
-
-                        '//example.com'):
-
-            nasty_url = '%(url)s?%(next)s=%(bad_url)s' % {
-
-                'url': logout_url,
-
-                'next': REDIRECT_FIELD_NAME,
-
-                'bad_url': urlquote(bad_url),
-
-            }
-
-            self.login()
-
-            response = self.client.get(nasty_url)
-
-            self.assertEqual(response.status_code, 302)
-
-            self.assertFalse(bad_url in response['Location'],
-
-                             "%s should be blocked" % bad_url)
-
-            self.confirm_logged_out()
-
-
-
-        # These URLs *should* still pass the security check
-
-        for good_url in ('/view/?param=http://example.com',
-
-                         '/view/?param=https://example.com',
-
-                         '/view?param=ftp://exampel.com',
-
-                         'view/?param=//example.com',
-
-                         'https:///',
-
-                         '//testserver/',
-
-                         '/url%20with%20spaces/'):  # see ticket #12534
-
-            safe_url = '%(url)s?%(next)s=%(good_url)s' % {
-
-                'url': logout_url,
-
-                'next': REDIRECT_FIELD_NAME,
-
-                'good_url': urlquote(good_url),
-
-            }
-
-            self.login()
-
-            response = self.client.get(safe_url)
-
-            self.assertEqual(response.status_code, 302)
-
-            self.assertTrue(good_url in response['Location'],
-
-                            "%s should be allowed" % good_url)
-
-            self.confirm_logged_out()
+                    context, tenant_id, user_id)

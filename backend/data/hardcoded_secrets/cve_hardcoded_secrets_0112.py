@@ -2,510 +2,374 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-import urlparse
+"""Tornado handlers for nbconvert."""
 
 
 
-from django.conf import settings
+# Copyright (c) Jupyter Development Team.
 
-from django.core.urlresolvers import reverse
-
-from django.http import HttpResponseRedirect, QueryDict
-
-from django.shortcuts import render_to_response
-
-from django.template import RequestContext
-
-from django.utils.http import base36_to_int
-
-from django.utils.translation import ugettext as _
-
-from django.views.decorators.cache import never_cache
-
-from django.views.decorators.csrf import csrf_protect
+# Distributed under the terms of the Modified BSD License.
 
 
 
-# Avoid shadowing the login() and logout() views below.
+import io
 
-from django.contrib.auth import REDIRECT_FIELD_NAME, login as auth_login, logout as auth_logout
+import os
 
-from django.contrib.auth.decorators import login_required
-
-from django.contrib.auth.forms import AuthenticationForm, PasswordResetForm, SetPasswordForm, PasswordChangeForm
-
-from django.contrib.auth.models import User
-
-from django.contrib.auth.tokens import default_token_generator
-
-from django.contrib.sites.models import get_current_site
+import zipfile
 
 
 
+from tornado import web, escape
+
+from tornado.log import app_log
 
 
-@csrf_protect
 
-@never_cache
+from ..base.handlers import (
 
-def login(request, template_name='registration/login.html',
+    IPythonHandler, FilesRedirectHandler,
 
-          redirect_field_name=REDIRECT_FIELD_NAME,
+    path_regex,
 
-          authentication_form=AuthenticationForm,
+)
 
-          current_app=None, extra_context=None):
+from nbformat import from_dict
+
+
+
+from ipython_genutils.py3compat import cast_bytes
+
+from ipython_genutils import text
+
+
+
+def find_resource_files(output_files_dir):
+
+    files = []
+
+    for dirpath, dirnames, filenames in os.walk(output_files_dir):
+
+        files.extend([os.path.join(dirpath, f) for f in filenames])
+
+    return files
+
+
+
+def respond_zip(handler, name, output, resources):
+
+    """Zip up the output and resource files and respond with the zip file.
+
+
+
+    Returns True if it has served a zip file, False if there are no resource
+
+    files, in which case we serve the plain output file.
 
     """
 
-    Displays the login form and handles the login action.
+    # Check if we have resource files we need to zip
 
-    """
+    output_files = resources.get('outputs', None)
 
-    redirect_to = request.REQUEST.get(redirect_field_name, '')
+    if not output_files:
 
+        return False
 
 
-    if request.method == "POST":
 
-        form = authentication_form(data=request.POST)
+    # Headers
 
-        if form.is_valid():
+    zip_filename = os.path.splitext(name)[0] + '.zip'
 
-            netloc = urlparse.urlparse(redirect_to)[1]
+    handler.set_attachment_header(zip_filename)
 
+    handler.set_header('Content-Type', 'application/zip')
 
+    handler.set_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
 
-            # Use default setting if redirect_to is empty
 
-            if not redirect_to:
 
-                redirect_to = settings.LOGIN_REDIRECT_URL
+    # Prepare the zip file
 
+    buffer = io.BytesIO()
 
+    zipf = zipfile.ZipFile(buffer, mode='w', compression=zipfile.ZIP_DEFLATED)
 
-            # Security check -- don't allow redirection to a different
+    output_filename = os.path.splitext(name)[0] + resources['output_extension']
 
-            # host.
+    zipf.writestr(output_filename, cast_bytes(output, 'utf-8'))
 
-            elif netloc and netloc != request.get_host():
+    for filename, data in output_files.items():
 
-                redirect_to = settings.LOGIN_REDIRECT_URL
+        zipf.writestr(os.path.basename(filename), data)
 
+    zipf.close()
 
 
-            # Okay, security checks complete. Log the user in.
 
-            auth_login(request, form.get_user())
+    handler.finish(buffer.getvalue())
 
+    return True
 
 
-            if request.session.test_cookie_worked():
 
-                request.session.delete_test_cookie()
+def get_exporter(format, **kwargs):
 
+    """get an exporter, raising appropriate errors"""
 
-
-            return HttpResponseRedirect(redirect_to)
-
-    else:
-
-        form = authentication_form(request)
-
-
-
-    request.session.set_test_cookie()
-
-
-
-    current_site = get_current_site(request)
-
-
-
-    context = {
-
-        'form': form,
-
-        redirect_field_name: redirect_to,
-
-        'site': current_site,
-
-        'site_name': current_site.name,
-
-    }
-
-    context.update(extra_context or {})
-
-    return render_to_response(template_name, context,
-
-                              context_instance=RequestContext(request, current_app=current_app))
-
-
-
-def logout(request, next_page=None,
-
-           template_name='registration/logged_out.html',
-
-           redirect_field_name=REDIRECT_FIELD_NAME,
-
-           current_app=None, extra_context=None):
-
-    """
-
-    Logs out the user and displays 'You are logged out' message.
-
-    """
-
-    auth_logout(request)
-
-    redirect_to = request.REQUEST.get(redirect_field_name, '')
-
-    if redirect_to:
-
-        netloc = urlparse.urlparse(redirect_to)[1]
-
-        # Security check -- don't allow redirection to a different host.
-
-        if not (netloc and netloc != request.get_host()):
-
-            return HttpResponseRedirect(redirect_to)
-
-
-
-    if next_page is None:
-
-        current_site = get_current_site(request)
-
-        context = {
-
-            'site': current_site,
-
-            'site_name': current_site.name,
-
-            'title': _('Logged out')
-
-        }
-
-        context.update(extra_context or {})
-
-        return render_to_response(template_name, context,
-
-                                  context_instance=RequestContext(request, current_app=current_app))
-
-    else:
-
-        # Redirect to this page until the session has been cleared.
-
-        return HttpResponseRedirect(next_page or request.path)
-
-
-
-def logout_then_login(request, login_url=None, current_app=None, extra_context=None):
-
-    """
-
-    Logs out the user if he is logged in. Then redirects to the log-in page.
-
-    """
-
-    if not login_url:
-
-        login_url = settings.LOGIN_URL
-
-    return logout(request, login_url, current_app=current_app, extra_context=extra_context)
-
-
-
-def redirect_to_login(next, login_url=None,
-
-                      redirect_field_name=REDIRECT_FIELD_NAME):
-
-    """
-
-    Redirects the user to the login page, passing the given 'next' page
-
-    """
-
-    if not login_url:
-
-        login_url = settings.LOGIN_URL
-
-
-
-    login_url_parts = list(urlparse.urlparse(login_url))
-
-    if redirect_field_name:
-
-        querystring = QueryDict(login_url_parts[4], mutable=True)
-
-        querystring[redirect_field_name] = next
-
-        login_url_parts[4] = querystring.urlencode(safe='/')
-
-
-
-    return HttpResponseRedirect(urlparse.urlunparse(login_url_parts))
-
-
-
-# 4 views for password reset:
-
-# - password_reset sends the mail
-
-# - password_reset_done shows a success message for the above
-
-# - password_reset_confirm checks the link the user clicked and
-
-#   prompts for a new password
-
-# - password_reset_complete shows a success message for the above
-
-
-
-@csrf_protect
-
-def password_reset(request, is_admin_site=False,
-
-                   template_name='registration/password_reset_form.html',
-
-                   email_template_name='registration/password_reset_email.html',
-
-                   password_reset_form=PasswordResetForm,
-
-                   token_generator=default_token_generator,
-
-                   post_reset_redirect=None,
-
-                   from_email=None,
-
-                   current_app=None,
-
-                   extra_context=None):
-
-    if post_reset_redirect is None:
-
-        post_reset_redirect = reverse('django.contrib.auth.views.password_reset_done')
-
-    if request.method == "POST":
-
-        form = password_reset_form(request.POST)
-
-        if form.is_valid():
-
-            opts = {
-
-                'use_https': request.is_secure(),
-
-                'token_generator': token_generator,
-
-                'from_email': from_email,
-
-                'email_template_name': email_template_name,
-
-                'request': request,
-
-            }
-
-            if is_admin_site:
-
-                opts = dict(opts, domain_override=request.META['HTTP_HOST'])
-
-            form.save(**opts)
-
-            return HttpResponseRedirect(post_reset_redirect)
-
-    else:
-
-        form = password_reset_form()
-
-    context = {
-
-        'form': form,
-
-    }
-
-    context.update(extra_context or {})
-
-    return render_to_response(template_name, context,
-
-                              context_instance=RequestContext(request, current_app=current_app))
-
-
-
-def password_reset_done(request,
-
-                        template_name='registration/password_reset_done.html',
-
-                        current_app=None, extra_context=None):
-
-    context = {}
-
-    context.update(extra_context or {})
-
-    return render_to_response(template_name, context,
-
-                              context_instance=RequestContext(request, current_app=current_app))
-
-
-
-# Doesn't need csrf_protect since no-one can guess the URL
-
-@never_cache
-
-def password_reset_confirm(request, uidb36=None, token=None,
-
-                           template_name='registration/password_reset_confirm.html',
-
-                           token_generator=default_token_generator,
-
-                           set_password_form=SetPasswordForm,
-
-                           post_reset_redirect=None,
-
-                           current_app=None, extra_context=None):
-
-    """
-
-    View that checks the hash in a password reset link and presents a
-
-    form for entering a new password.
-
-    """
-
-    assert uidb36 is not None and token is not None # checked by URLconf
-
-    if post_reset_redirect is None:
-
-        post_reset_redirect = reverse('django.contrib.auth.views.password_reset_complete')
+    # if this fails, will raise 500
 
     try:
 
-        uid_int = base36_to_int(uidb36)
+        from nbconvert.exporters.base import get_exporter
 
-        user = User.objects.get(id=uid_int)
+    except ImportError as e:
 
-    except (ValueError, User.DoesNotExist):
-
-        user = None
+        raise web.HTTPError(500, "Could not import nbconvert: %s" % e)
 
 
 
-    if user is not None and token_generator.check_token(user, token):
+    try:
 
-        validlink = True
+        Exporter = get_exporter(format)
 
-        if request.method == 'POST':
+    except KeyError:
 
-            form = set_password_form(user, request.POST)
+        # should this be 400?
 
-            if form.is_valid():
+        raise web.HTTPError(404, u"No exporter for format: %s" % format)
 
-                form.save()
 
-                return HttpResponseRedirect(post_reset_redirect)
+
+    try:
+
+        return Exporter(**kwargs)
+
+    except Exception as e:
+
+        app_log.exception("Could not construct Exporter: %s", Exporter)
+
+        raise web.HTTPError(500, "Could not construct Exporter: %s" % e)
+
+
+
+class NbconvertFileHandler(IPythonHandler):
+
+
+
+    SUPPORTED_METHODS = ('GET',)
+
+
+
+    @web.authenticated
+
+    def get(self, format, path):
+
+
+
+        exporter = get_exporter(format, config=self.config, log=self.log)
+
+
+
+        path = path.strip('/')
+
+        # If the notebook relates to a real file (default contents manager),
+
+        # give its path to nbconvert.
+
+        if hasattr(self.contents_manager, '_get_os_path'):
+
+            os_path = self.contents_manager._get_os_path(path)
+
+            ext_resources_dir, basename = os.path.split(os_path)
 
         else:
 
-            form = set_password_form(None)
-
-    else:
-
-        validlink = False
-
-        form = None
-
-    context = {
-
-        'form': form,
-
-        'validlink': validlink,
-
-    }
-
-    context.update(extra_context or {})
-
-    return render_to_response(template_name, context,
-
-                              context_instance=RequestContext(request, current_app=current_app))
+            ext_resources_dir = None
 
 
 
-def password_reset_complete(request,
+        model = self.contents_manager.get(path=path)
 
-                            template_name='registration/password_reset_complete.html',
+        name = model['name']
 
-                            current_app=None, extra_context=None):
+        if model['type'] != 'notebook':
 
-    context = {
+            # not a notebook, redirect to files
 
-        'login_url': settings.LOGIN_URL
-
-    }
-
-    context.update(extra_context or {})
-
-    return render_to_response(template_name, context,
-
-                              context_instance=RequestContext(request, current_app=current_app))
+            return FilesRedirectHandler.redirect_to_files(self, path)
 
 
 
-@csrf_protect
-
-@login_required
-
-def password_change(request,
-
-                    template_name='registration/password_change_form.html',
-
-                    post_change_redirect=None,
-
-                    password_change_form=PasswordChangeForm,
-
-                    current_app=None, extra_context=None):
-
-    if post_change_redirect is None:
-
-        post_change_redirect = reverse('django.contrib.auth.views.password_change_done')
-
-    if request.method == "POST":
-
-        form = password_change_form(user=request.user, data=request.POST)
-
-        if form.is_valid():
-
-            form.save()
-
-            return HttpResponseRedirect(post_change_redirect)
-
-    else:
-
-        form = password_change_form(user=request.user)
-
-    context = {
-
-        'form': form,
-
-    }
-
-    context.update(extra_context or {})
-
-    return render_to_response(template_name, context,
-
-                              context_instance=RequestContext(request, current_app=current_app))
+        nb = model['content']
 
 
 
-def password_change_done(request,
+        self.set_header('Last-Modified', model['last_modified'])
 
-                         template_name='registration/password_change_done.html',
 
-                         current_app=None, extra_context=None):
 
-    context = {}
+        # create resources dictionary
 
-    context.update(extra_context or {})
+        mod_date = model['last_modified'].strftime(text.date_format)
 
-    return render_to_response(template_name, context,
+        nb_title = os.path.splitext(name)[0]
 
-                              context_instance=RequestContext(request, current_app=current_app))
+
+
+        resource_dict = {
+
+            "metadata": {
+
+                "name": nb_title,
+
+                "modified_date": mod_date
+
+            },
+
+            "config_dir": self.application.settings['config_dir']
+
+        }
+
+
+
+        if ext_resources_dir:
+
+            resource_dict['metadata']['path'] = ext_resources_dir
+
+
+
+        try:
+
+            output, resources = exporter.from_notebook_node(
+
+                nb,
+
+                resources=resource_dict
+
+            )
+
+        except Exception as e:
+
+            self.log.exception("nbconvert failed: %s", e)
+
+            raise web.HTTPError(500, "nbconvert failed: %s" % e)
+
+
+
+        if respond_zip(self, name, output, resources):
+
+            return
+
+
+
+        # Force download if requested
+
+        if self.get_argument('download', 'false').lower() == 'true':
+
+            filename = os.path.splitext(name)[0] + resources['output_extension']
+
+            self.set_attachment_header(filename)
+
+
+
+        # MIME type
+
+        if exporter.output_mimetype:
+
+            self.set_header('Content-Type',
+
+                            '%s; charset=utf-8' % exporter.output_mimetype)
+
+
+
+        self.set_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
+
+        self.finish(output)
+
+
+
+class NbconvertPostHandler(IPythonHandler):
+
+    SUPPORTED_METHODS = ('POST',)
+
+
+
+    @web.authenticated
+
+    def post(self, format):
+
+        exporter = get_exporter(format, config=self.config)
+
+
+
+        model = self.get_json_body()
+
+        name = model.get('name', 'notebook.ipynb')
+
+        nbnode = from_dict(model['content'])
+
+
+
+        try:
+
+            output, resources = exporter.from_notebook_node(nbnode, resources={
+
+                "metadata": {"name": name[:name.rfind('.')],},
+
+                "config_dir": self.application.settings['config_dir'],
+
+            })
+
+        except Exception as e:
+
+            raise web.HTTPError(500, "nbconvert failed: %s" % e)
+
+
+
+        if respond_zip(self, name, output, resources):
+
+            return
+
+
+
+        # MIME type
+
+        if exporter.output_mimetype:
+
+            self.set_header('Content-Type',
+
+                            '%s; charset=utf-8' % exporter.output_mimetype)
+
+
+
+        self.finish(output)
+
+
+
+
+
+#-----------------------------------------------------------------------------
+
+# URL to handler mappings
+
+#-----------------------------------------------------------------------------
+
+
+
+_format_regex = r"(?P<format>\w+)"
+
+
+
+
+
+default_handlers = [
+
+    (r"/nbconvert/%s" % _format_regex, NbconvertPostHandler),
+
+    (r"/nbconvert/%s%s" % (_format_regex, path_regex),
+
+         NbconvertFileHandler),
+
+]

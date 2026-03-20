@@ -2,638 +2,442 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# Authors:
+# -*- coding: utf-8 -*-
 
-#     Endi S. Dewata <edewata@redhat.com>
+from wagtail.core.models import Page
 
-#
+from wagtail.tests.testapp.models import (
 
-# This program is free software; you can redistribute it and/or modify
+    FormField, FormFieldWithCustomSubmission, FormPage, FormPageWithCustomSubmission,
 
-# it under the terms of the Lesser GNU General Public License as published by
+    FormPageWithRedirect, RedirectFormField)
 
-# the Free Software Foundation; either version 3 of the License or
 
-# (at your option) any later version.
 
-#
 
-# This program is distributed in the hope that it will be useful,
 
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
+def make_form_page(**kwargs):
 
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    kwargs.setdefault('title', "Contact us")
 
-# GNU Lesser General Public License for more details.
+    kwargs.setdefault('slug', "contact-us")
 
-#
+    kwargs.setdefault('to_address', "to@email.com")
 
-# You should have received a copy of the GNU Lesser General Public License
+    kwargs.setdefault('from_address', "from@email.com")
 
-#  along with this program; if not, write to the Free Software Foundation,
+    kwargs.setdefault('subject', "The subject")
 
-# Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
-#
 
-# Copyright (C) 2013 Red Hat, Inc.
+    home_page = Page.objects.get(url_path='/home/')
 
-# All rights reserved.
+    form_page = home_page.add_child(instance=FormPage(**kwargs))
 
-#
 
 
+    FormField.objects.create(
 
-from __future__ import absolute_import
+        page=form_page,
 
-from __future__ import print_function
+        sort_order=1,
 
+        label="Your email",
 
+        field_type='email',
 
-import functools
+        required=True,
 
-import inspect
+    )
 
-import logging
+    FormField.objects.create(
 
-import ssl
+        page=form_page,
 
-import warnings
+        sort_order=2,
 
+        label="Your message",
 
+        field_type='multiline',
 
-import requests
+        required=True,
 
-from requests import adapters
+    )
 
-try:
+    FormField.objects.create(
 
-    from requests.packages.urllib3.exceptions import InsecureRequestWarning
+        page=form_page,
 
-except ImportError:
+        sort_order=3,
 
-    from urllib3.exceptions import InsecureRequestWarning
+        label="Your choices",
 
+        field_type='checkboxes',
 
+        required=False,
 
-logger = logging.getLogger(__name__)
+        choices='foo,bar,baz',
 
+    )
 
 
 
+    return form_page
 
-def catch_insecure_warning(func):
 
-    """Temporary silence InsecureRequestWarning
 
 
 
-    PKIConnection is not able to verify HTTPS connections yet. This decorator
+def make_form_page_with_custom_submission(**kwargs):
 
-    catches the warning.
+    kwargs.setdefault('title', "Contact us")
 
+    kwargs.setdefault('intro', "<p>Boring intro text</p>")
 
+    kwargs.setdefault('thank_you_text', "<p>Thank you for your patience!</p>")
 
-    :see: https://fedorahosted.org/pki/ticket/1253
+    kwargs.setdefault('slug', "contact-us")
 
-    """
+    kwargs.setdefault('to_address', "to@email.com")
 
-    @functools.wraps(func)
+    kwargs.setdefault('from_address', "from@email.com")
 
-    def wrapper(self, *args, **kwargs):
+    kwargs.setdefault('subject', "The subject")
 
-        with warnings.catch_warnings():
 
-            warnings.simplefilter('ignore', InsecureRequestWarning)
 
-            return func(self, *args, **kwargs)
+    home_page = Page.objects.get(url_path='/home/')
 
-    return wrapper
+    form_page = home_page.add_child(instance=FormPageWithCustomSubmission(**kwargs))
 
 
 
+    FormFieldWithCustomSubmission.objects.create(
 
+        page=form_page,
 
-class SSLContextAdapter(adapters.HTTPAdapter):
+        sort_order=1,
 
-    """Custom SSLContext Adapter for requests
+        label="Your email",
 
-    """
+        field_type='email',
 
-    def init_poolmanager(self, connections, maxsize,
+        required=True,
 
-                         block=adapters.DEFAULT_POOLBLOCK, **pool_kwargs):
+    )
 
-        context = ssl.SSLContext(
+    FormFieldWithCustomSubmission.objects.create(
 
-            ssl.PROTOCOL_TLS  # pylint: disable=no-member
+        page=form_page,
 
-        )
+        sort_order=2,
 
+        label="Your message",
 
+        field_type='multiline',
 
-        # Enable post handshake authentication for TLS 1.3
+        required=True,
 
-        if getattr(context, "post_handshake_auth", None) is not None:
+    )
 
-            context.post_handshake_auth = True
+    FormFieldWithCustomSubmission.objects.create(
 
+        page=form_page,
 
+        sort_order=3,
 
-        pool_kwargs['ssl_context'] = context
+        label="Your choices",
 
-        return super().init_poolmanager(
+        field_type='checkboxes',
 
-            connections, maxsize, block, **pool_kwargs
+        required=False,
 
-        )
+        choices='foo,bar,baz',
 
+    )
 
 
 
+    return form_page
 
-class PKIConnection:
 
-    """
 
-    Class to encapsulate the connection between the client and a Dogtag
 
-    subsystem.
 
-    """
+def make_form_page_with_redirect(**kwargs):
 
+    kwargs.setdefault('title', "Contact us")
 
+    kwargs.setdefault('slug', "contact-us")
 
-    def __init__(self, protocol='http', hostname='localhost', port='8080',
+    kwargs.setdefault('to_address', "to@email.com")
 
-                 subsystem=None, accept='application/json',
+    kwargs.setdefault('from_address', "from@email.com")
 
-                 trust_env=None, verify=False):
+    kwargs.setdefault('subject', "The subject")
 
-        """
 
-        Set the parameters for a python-requests based connection to a
 
-        Dogtag subsystem.
 
-        :param protocol: http or https
 
-        :type protocol: str
+    home_page = Page.objects.get(url_path='/home/')
 
-        :param hostname: hostname of server
+    kwargs.setdefault('thank_you_redirect_page', home_page)
 
-        :type hostname: str
+    form_page = home_page.add_child(instance=FormPageWithRedirect(**kwargs))
 
-        :param port: port of server
+    # form_page.thank_you_redirect_page = home_page
 
-        :type port: str
 
-        :param subsystem: Subsystem name: ca, kra, ocsp, tks, tps.
 
-           DEPRECATED: https://www.dogtagpki.org/wiki/PKI_10.8_Python_Changes
+    RedirectFormField.objects.create(
 
-        :type subsystem: str
+        page=form_page,
 
-        :param accept: value of accept header.  Supported values are usually
+        sort_order=1,
 
-           'application/json' or 'application/xml'
+        label="Your email",
 
-        :type accept: str
+        field_type='email',
 
-        :param trust_env: use environment variables for http proxy and other
+        required=True,
 
-           requests settings (default: yes)
+    )
 
-        :type trust_env: bool, None
+    RedirectFormField.objects.create(
 
-        :param verify: verify TLS/SSL connections and configure CA certs
+        page=form_page,
 
-           (default: no)
+        sort_order=2,
 
-        :type verify: None, bool, str
+        label="Your message",
 
-        :return: PKIConnection object.
+        field_type='multiline',
 
-        """
+        required=True,
 
+    )
 
+    RedirectFormField.objects.create(
 
-        self.protocol = protocol
+        page=form_page,
 
-        self.hostname = hostname
+        sort_order=3,
 
-        self.port = port
+        label="Your choices",
 
-        self.subsystem = subsystem
+        field_type='checkboxes',
 
+        required=False,
 
+        choices='foo,bar,baz',
 
-        self.rootURI = self.protocol + '://' + self.hostname + ':' + self.port
+    )
 
 
 
-        if subsystem is not None:
+    return form_page
 
-            logger.warning(
 
-                '%s:%s: The subsystem in PKIConnection.__init__() has been deprecated '
 
-                '(https://www.dogtagpki.org/wiki/PKI_10.8_Python_Changes).',
 
-                inspect.stack()[1].filename, inspect.stack()[1].lineno)
 
-            self.serverURI = self.rootURI + '/' + subsystem
+def make_types_test_form_page(**kwargs):
 
-        else:
+    kwargs.setdefault('title', "Contact us")
 
-            self.serverURI = self.rootURI
+    kwargs.setdefault('slug', "contact-us")
 
+    kwargs.setdefault('to_address', "to@email.com")
 
+    kwargs.setdefault('from_address', "from@email.com")
 
-        self.session = requests.Session()
+    kwargs.setdefault('subject', "The subject")
 
-        self.session.mount("https://", SSLContextAdapter())
 
-        self.session.trust_env = trust_env
 
-        self.session.verify = verify
+    home_page = Page.objects.get(url_path='/home/')
 
+    form_page = home_page.add_child(instance=FormPage(**kwargs))
 
 
-        if accept:
 
-            self.session.headers.update({'Accept': accept})
+    FormField.objects.create(
 
+        page=form_page,
 
+        sort_order=1,
 
-    def authenticate(self, username=None, password=None):
+        label="Single line text",
 
-        """
+        field_type='singleline',
 
-        Set the parameters used for authentication if username/password is to
+        required=False,
 
-        be used.  Both username and password must not be None.
+    )
 
-        Note that this method only sets the parameters.  Actual authentication
+    FormField.objects.create(
 
-        occurs when the connection is attempted,
+        page=form_page,
 
+        sort_order=2,
 
+        label="Multiline",
 
-        :param username: username to authenticate connection
+        field_type='multiline',
 
-        :param password: password to authenticate connection
+        required=False,
 
-        :return: None
+    )
 
-        """
+    FormField.objects.create(
 
-        if username is not None and password is not None:
+        page=form_page,
 
-            self.session.auth = (username, password)
+        sort_order=3,
 
+        label="Email",
 
+        field_type='email',
 
-    def set_authentication_cert(self, pem_cert_path, pem_key_path=None):
+        required=False,
 
-        """
+    )
 
-        Set the path to the PEM file containing the certificate and private key
+    FormField.objects.create(
 
-        for the client certificate to be used for authentication to the server,
+        page=form_page,
 
-        when client certificate authentication is required. The private key may
+        sort_order=4,
 
-        optionally be stored in a different path.
+        label="Number",
 
+        field_type='number',
 
+        required=False,
 
-        :param pem_cert_path: path to the PEM file
+    )
 
-        :type pem_cert_path: str
+    FormField.objects.create(
 
-        :param pem_key_path: path to the PEM-formatted private key file
+        page=form_page,
 
-        :type pem_key_path: str
+        sort_order=5,
 
-        :return: None
+        label="URL",
 
-        :raises: Exception if path is empty or None.
+        field_type='url',
 
-        """
+        required=False,
 
-        if pem_cert_path is None:
+    )
 
-            raise Exception("No path for the certificate specified.")
+    FormField.objects.create(
 
-        if len(str(pem_cert_path)) == 0:
+        page=form_page,
 
-            raise Exception("No path for the certificate specified.")
+        sort_order=6,
 
-        if pem_key_path is not None:
+        label="Checkbox",
 
-            self.session.cert = (pem_cert_path, pem_key_path)
+        field_type='checkbox',
 
-        else:
+        required=False,
 
-            self.session.cert = pem_cert_path
+    )
 
+    FormField.objects.create(
 
+        page=form_page,
 
-    @catch_insecure_warning
+        sort_order=7,
 
-    def get(self, path, headers=None, params=None, payload=None,
+        label="Checkboxes",
 
-            use_root_uri=False, timeout=None):
+        field_type='checkboxes',
 
-        """
+        required=False,
 
-        Uses python-requests to issue a GET request to the server.
+        choices='foo,bar,baz',
 
+    )
 
+    FormField.objects.create(
 
-        :param path: path URI for the GET request
+        page=form_page,
 
-        :type path: str
+        sort_order=8,
 
-        :param headers: headers for the GET request
+        label="Drop down",
 
-        :type headers: dict
+        field_type='dropdown',
 
-        :param params: Query parameters for the GET request
+        required=False,
 
-        :type params: dict or bytes
+        choices='spam,ham,eggs',
 
-        :param payload: data to be sent in the body of the request
+    )
 
-        :type payload: dict, bytes, file-like object
+    FormField.objects.create(
 
-        :param use_root_uri: use root URI instead of subsystem URI as base
+        page=form_page,
 
-        :type use_root_uri: boolean
+        sort_order=9,
 
-        :returns: request.response -- response from the server
+        label="Multiple select",
 
-        :raises: Exception from python-requests in case the GET was not
+        field_type='multiselect',
 
-            successful, or returns an error code.
+        required=False,
 
-        """
+        choices='qux,quux,quuz,corge',
 
-        if use_root_uri:
+    )
 
-            logger.warning(
+    FormField.objects.create(
 
-                '%s:%s: The use_root_uri in PKIConnection.get() has been deprecated '
+        page=form_page,
 
-                '(https://www.dogtagpki.org/wiki/PKI_10.8_Python_Changes).',
+        sort_order=10,
 
-                inspect.stack()[1].filename, inspect.stack()[1].lineno)
+        label="Radio buttons",
 
-            target_path = self.rootURI + path
+        field_type='radio',
 
-        else:
+        required=False,
 
-            target_path = self.serverURI + path
+        choices='wibble,wobble,wubble',
 
+    )
 
+    FormField.objects.create(
 
-        r = self.session.get(
+        page=form_page,
 
-            target_path,
+        sort_order=11,
 
-            headers=headers,
+        label="Date",
 
-            params=params,
+        field_type='date',
 
-            data=payload,
+        required=False,
 
-            timeout=timeout,
+    )
 
-        )
+    FormField.objects.create(
 
-        r.raise_for_status()
+        page=form_page,
 
-        return r
+        sort_order=12,
 
+        label="Datetime",
 
+        field_type='datetime',
 
-    @catch_insecure_warning
+        required=False,
 
-    def post(self, path, payload, headers=None, params=None,
+    )
 
-             use_root_uri=False):
 
-        """
 
-        Uses python-requests to issue a POST request to the server.
-
-
-
-        :param path: path URI for the POST request
-
-        :type path: str
-
-        :param payload: data to be sent in the body of the request
-
-        :type payload: dict, bytes, file-like object
-
-        :param headers: headers for the POST request
-
-        :type headers: dict
-
-        :param params: Query parameters for the POST request
-
-        :type params: dict or bytes
-
-        :param use_root_uri: use root URI instead of subsystem URI as base
-
-        :type use_root_uri: boolean
-
-        :returns: request.response -- response from the server
-
-        :raises: Exception from python-requests in case the POST was not
-
-            successful, or returns an error code.
-
-        """
-
-        if use_root_uri:
-
-            logger.warning(
-
-                '%s:%s: The use_root_uri in PKIConnection.post() has been deprecated '
-
-                '(https://www.dogtagpki.org/wiki/PKI_10.8_Python_Changes).',
-
-                inspect.stack()[1].filename, inspect.stack()[1].lineno)
-
-            target_path = self.rootURI + path
-
-        else:
-
-            target_path = self.serverURI + path
-
-
-
-        r = self.session.post(
-
-            target_path,
-
-            data=payload,
-
-            headers=headers,
-
-            params=params)
-
-        r.raise_for_status()
-
-        return r
-
-
-
-    @catch_insecure_warning
-
-    def put(self, path, payload, headers=None, use_root_uri=False):
-
-        """
-
-        Uses python-requests to issue a PUT request to the server.
-
-
-
-        :param path: path URI for the PUT request
-
-        :type path: str
-
-        :param payload: data to be sent in the body of the request
-
-        :type payload: dict, bytes, file-like object
-
-        :param headers: headers for the PUT request
-
-        :type headers: dict
-
-        :param use_root_uri: use root URI instead of subsystem URI as base
-
-        :type use_root_uri: boolean
-
-        :returns: request.response -- response from the server
-
-        :raises: Exception from python-requests in case the PUT was not
-
-            successful, or returns an error code.
-
-        """
-
-        if use_root_uri:
-
-            logger.warning(
-
-                '%s:%s: The use_root_uri in PKIConnection.put() has been deprecated '
-
-                '(https://www.dogtagpki.org/wiki/PKI_10.8_Python_Changes).',
-
-                inspect.stack()[1].filename, inspect.stack()[1].lineno)
-
-            target_path = self.rootURI + path
-
-        else:
-
-            target_path = self.serverURI + path
-
-
-
-        r = self.session.put(target_path, payload, headers=headers)
-
-        r.raise_for_status()
-
-        return r
-
-
-
-    @catch_insecure_warning
-
-    def delete(self, path, headers=None, use_root_uri=False):
-
-        """
-
-        Uses python-requests to issue a DEL request to the server.
-
-
-
-        :param path: path URI for the DEL request
-
-        :type path: str
-
-        :param headers: headers for the DEL request
-
-        :type headers: dict
-
-        :param use_root_uri: use root URI instead of subsystem URI as base
-
-        :type use_root_uri: boolean
-
-        :returns: request.response -- response from the server
-
-        :raises: Exception from python-requests in case the DEL was not
-
-            successful, or returns an error code.
-
-        """
-
-        if use_root_uri:
-
-            logger.warning(
-
-                '%s:%s: The use_root_uri in PKIConnection.delete() has been deprecated '
-
-                '(https://www.dogtagpki.org/wiki/PKI_10.8_Python_Changes).',
-
-                inspect.stack()[1].filename, inspect.stack()[1].lineno)
-
-            target_path = self.rootURI + path
-
-        else:
-
-            target_path = self.serverURI + path
-
-
-
-        r = self.session.delete(target_path, headers=headers)
-
-        r.raise_for_status()
-
-        return r
-
-
-
-
-
-def main():
-
-    """
-
-    Test code for the PKIConnection class.
-
-    :return: None
-
-    """
-
-    conn = PKIConnection()
-
-    headers = {'Content-type': 'application/json',
-
-               'Accept': 'application/json'}
-
-    conn.set_authentication_cert('/root/temp4.pem')
-
-    print(conn.get("", headers).json())
-
-
-
-
-
-if __name__ == "__main__":
-
-    main()
+    return form_page

@@ -61,7 +61,7 @@ class VulnerabilityInference:
     def _load_pretrained(self):
         if settings.MODEL_PATH.exists():
             try:
-                state_dict = torch.load(settings.MODEL_PATH, map_location=DEVICE)
+                state_dict = torch.load(settings.MODEL_PATH, map_location=DEVICE, weights_only=True)
                 self.model.load_state_dict(state_dict)
                 logger.info("Loaded pretrained model weights")
             except Exception as e:

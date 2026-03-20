@@ -2,812 +2,380 @@
 # Safety: safe
 # Category: safe
 
-# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+
+
+
+# Copyright 2012 OpenStack LLC
 
 #
 
-# Copyright © 2012 - 2016 Michal Čihař <michal@cihar.com>
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
+
+# not use this file except in compliance with the License. You may obtain
+
+# a copy of the License at
 
 #
 
-# This file is part of Weblate <https://weblate.org/>
+#      http://www.apache.org/licenses/LICENSE-2.0
 
 #
 
-# This program is free software: you can redistribute it and/or modify
+# Unless required by applicable law or agreed to in writing, software
 
-# it under the terms of the GNU General Public License as published by
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-# the Free Software Foundation, either version 3 of the License, or
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
-# (at your option) any later version.
+# License for the specific language governing permissions and limitations
 
-#
+# under the License.
 
-# This program is distributed in the hope that it will be useful,
 
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
 
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+import gettext
 
-# GNU General Public License for more details.
+import os
 
-#
+import sys
 
-# You should have received a copy of the GNU General Public License
 
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-#
+from keystone.common import logging
 
+from keystone.openstack.common import cfg
 
 
-"""
 
-Tests for user handling.
 
-"""
 
+gettext.install('keystone', unicode=1)
 
 
-import json
 
 
 
-import httpretty
+CONF = cfg.CONF
 
-from six.moves.urllib.parse import parse_qs, urlparse
 
 
 
-from django.contrib.auth.models import User
 
-from django.core.urlresolvers import reverse
+def setup_logging(conf):
 
-from django.core import mail
+    """
 
-from django.test import TestCase
+    Sets up the logging options for a log with supplied name
 
-from django.test.utils import override_settings
 
 
+    :param conf: a cfg.ConfOpts object
 
-import social.apps.django_app.utils
+    """
 
 
 
-from weblate.accounts.models import VerifiedEmail
+    if conf.log_config:
 
-from weblate.trans.tests.test_views import RegistrationTestMixin
+        # Use a logging configuration file for all settings...
 
-from weblate.trans.tests import OverrideSettings
+        if os.path.exists(conf.log_config):
 
+            logging.config.fileConfig(conf.log_config)
 
+            return
 
-REGISTRATION_DATA = {
+        else:
 
-    'username': 'username',
+            raise RuntimeError('Unable to locate specified logging '
 
-    'email': 'noreply-weblate@example.org',
+                               'config file: %s' % conf.log_config)
 
-    'first_name': 'First Last',
 
-    'captcha_id': '00',
 
-    'captcha': '9999'
+    root_logger = logging.root
 
-}
+    if conf.debug:
 
+        root_logger.setLevel(logging.DEBUG)
 
+    elif conf.verbose:
 
-GH_BACKENDS = (
+        root_logger.setLevel(logging.INFO)
 
-    'weblate.accounts.auth.EmailAuth',
+    else:
 
-    'social.backends.github.GithubOAuth2',
+        root_logger.setLevel(logging.WARNING)
 
-    'weblate.accounts.auth.WeblateUserBackend',
 
-)
 
+    formatter = logging.Formatter(conf.log_format, conf.log_date_format)
 
 
 
-
-class RegistrationTest(TestCase, RegistrationTestMixin):
-
-    clear_cookie = False
-
-
-
-    def assert_registration(self, match=None):
-
-        url = self.assert_registration_mailbox(match)
-
-
-
-        if self.clear_cookie and 'sessionid' in self.client.cookies:
-
-            del self.client.cookies['sessionid']
-
-
-
-        # Confirm account
-
-        response = self.client.get(url, follow=True)
-
-        self.assertRedirects(
-
-            response,
-
-            reverse('password')
-
-        )
-
-
-
-    @OverrideSettings(REGISTRATION_CAPTCHA=True)
-
-    def test_register_captcha(self):
-
-        # Enable captcha
-
-
-
-        response = self.client.post(
-
-            reverse('register'),
-
-            REGISTRATION_DATA
-
-        )
-
-        self.assertContains(
-
-            response,
-
-            'Please check your math and try again.'
-
-        )
-
-
-
-    @OverrideSettings(REGISTRATION_OPEN=False)
-
-    def test_register_closed(self):
-
-        # Disable registration
-
-        response = self.client.post(
-
-            reverse('register'),
-
-            REGISTRATION_DATA
-
-        )
-
-        self.assertContains(
-
-            response,
-
-            'Sorry, but registrations on this site are disabled.'
-
-        )
-
-
-
-    @OverrideSettings(REGISTRATION_OPEN=True)
-
-    @OverrideSettings(REGISTRATION_CAPTCHA=False)
-
-    def test_register(self):
-
-        # Disable captcha
-
-        response = self.client.post(
-
-            reverse('register'),
-
-            REGISTRATION_DATA
-
-        )
-
-        # Check we did succeed
-
-        self.assertRedirects(response, reverse('email-sent'))
-
-
-
-        # Confirm account
-
-        self.assert_registration()
-
-
-
-        # Set password
-
-        response = self.client.post(
-
-            reverse('password'),
-
-            {
-
-                'password1': 'password',
-
-                'password2': 'password',
-
-            }
-
-        )
-
-        self.assertRedirects(response, reverse('profile'))
-
-
-
-        # Check we can access home (was redirected to password change)
-
-        response = self.client.get(reverse('home'))
-
-        self.assertContains(response, 'First Last')
-
-
-
-        user = User.objects.get(username='username')
-
-        # Verify user is active
-
-        self.assertTrue(user.is_active)
-
-        # Verify stored first/last name
-
-        self.assertEqual(user.first_name, 'First Last')
-
-
-
-    @OverrideSettings(REGISTRATION_OPEN=True)
-
-    @OverrideSettings(REGISTRATION_CAPTCHA=False)
-
-    def test_double_register(self):
-
-        """Test double registration from single browser"""
-
-
-
-        # First registration
-
-        response = self.client.post(
-
-            reverse('register'),
-
-            REGISTRATION_DATA
-
-        )
-
-        first_url = self.assert_registration_mailbox()
-
-        mail.outbox.pop()
-
-
-
-        # Second registration
-
-        data = REGISTRATION_DATA.copy()
-
-        data['email'] = 'noreply@example.net'
-
-        data['username'] = 'second'
-
-        response = self.client.post(
-
-            reverse('register'),
-
-            data,
-
-        )
-
-        second_url = self.assert_registration_mailbox()
-
-        mail.outbox.pop()
-
-
-
-        # Confirm first account
-
-        response = self.client.get(first_url, follow=True)
-
-        self.assertRedirects(
-
-            response,
-
-            reverse('password')
-
-        )
-
-        self.client.get(reverse('logout'))
-
-
-
-        # Confirm second account
-
-        response = self.client.get(second_url, follow=True)
-
-        self.assertRedirects(
-
-            response,
-
-            reverse('password')
-
-        )
-
-
-
-    @OverrideSettings(REGISTRATION_OPEN=True)
-
-    @OverrideSettings(REGISTRATION_CAPTCHA=False)
-
-    def test_register_missing(self):
-
-        # Disable captcha
-
-        response = self.client.post(
-
-            reverse('register'),
-
-            REGISTRATION_DATA
-
-        )
-
-        # Check we did succeed
-
-        self.assertRedirects(response, reverse('email-sent'))
-
-
-
-        # Confirm account
-
-        url = self.assert_registration_mailbox()
-
-
-
-        # Remove session ID from URL
-
-        url = url.split('&id=')[0]
-
-
-
-        # Confirm account
-
-        response = self.client.get(url, follow=True)
-
-        self.assertRedirects(response, reverse('login'))
-
-        self.assertContains(response, 'Failed to verify your registration')
-
-
-
-    def test_reset(self):
-
-        '''
-
-        Test for password reset.
-
-        '''
-
-        User.objects.create_user('testuser', 'test@example.com', 'x')
-
-
-
-        response = self.client.get(
-
-            reverse('password_reset'),
-
-        )
-
-        self.assertContains(response, 'Reset my password')
-
-        response = self.client.post(
-
-            reverse('password_reset'),
-
-            {
-
-                'email': 'test@example.com'
-
-            }
-
-        )
-
-        self.assertRedirects(response, reverse('email-sent'))
-
-
-
-        self.assert_registration('[Weblate] Password reset on Weblate')
-
-
-
-    def test_reset_nonexisting(self):
-
-        '''
-
-        Test for password reset.
-
-        '''
-
-        response = self.client.get(
-
-            reverse('password_reset'),
-
-        )
-
-        self.assertContains(response, 'Reset my password')
-
-        response = self.client.post(
-
-            reverse('password_reset'),
-
-            {
-
-                'email': 'test@example.com'
-
-            }
-
-        )
-
-        self.assertRedirects(response, reverse('email-sent'))
-
-        self.assertEqual(len(mail.outbox), 0)
-
-
-
-    def test_reset_twice(self):
-
-        '''
-
-        Test for password reset.
-
-        '''
-
-        User.objects.create_user('testuser', 'test@example.com', 'x')
-
-        User.objects.create_user('testuser2', 'test2@example.com', 'x')
-
-
-
-        response = self.client.post(
-
-            reverse('password_reset'),
-
-            {'email': 'test@example.com'}
-
-        )
-
-        self.assertRedirects(response, reverse('email-sent'))
-
-        self.assert_registration('[Weblate] Password reset on Weblate')
-
-        sent_mail = mail.outbox.pop()
-
-        self.assertEqual(['test@example.com'], sent_mail.to)
-
-
-
-        response = self.client.post(
-
-            reverse('password_reset'),
-
-            {'email': 'test2@example.com'}
-
-        )
-
-        self.assertRedirects(response, reverse('email-sent'))
-
-        self.assert_registration('[Weblate] Password reset on Weblate')
-
-        sent_mail = mail.outbox.pop()
-
-        self.assertEqual(['test2@example.com'], sent_mail.to)
-
-
-
-    def test_wrong_username(self):
-
-        data = REGISTRATION_DATA.copy()
-
-        data['username'] = ''
-
-        response = self.client.post(
-
-            reverse('register'),
-
-            data
-
-        )
-
-        self.assertContains(
-
-            response,
-
-            'This field is required.',
-
-        )
-
-
-
-    def test_wrong_mail(self):
-
-        data = REGISTRATION_DATA.copy()
-
-        data['email'] = 'x'
-
-        response = self.client.post(
-
-            reverse('register'),
-
-            data
-
-        )
-
-        self.assertContains(
-
-            response,
-
-            'Enter a valid email address.'
-
-        )
-
-
-
-    def test_spam(self):
-
-        data = REGISTRATION_DATA.copy()
-
-        data['content'] = 'x'
-
-        response = self.client.post(
-
-            reverse('register'),
-
-            data
-
-        )
-
-        self.assertContains(
-
-            response,
-
-            'Invalid value'
-
-        )
-
-
-
-    def test_add_mail(self):
-
-        # Create user
-
-        self.test_register()
-
-        mail.outbox.pop()
-
-
-
-        # Check adding email page
-
-        response = self.client.get(
-
-            reverse('email_login')
-
-        )
-
-        self.assertContains(response, 'Register email')
-
-
-
-        # Try invalid address first
-
-        response = self.client.post(
-
-            reverse('email_login'),
-
-            {'email': 'invalid'},
-
-        )
-
-        self.assertContains(response, 'has-error')
-
-
-
-        # Add email account
-
-        response = self.client.post(
-
-            reverse('email_login'),
-
-            {'email': 'second@example.net'},
-
-            follow=True,
-
-        )
-
-        self.assertRedirects(response, reverse('email-sent'))
-
-
-
-        # Verify confirmation mail
-
-        url = self.assert_registration_mailbox()
-
-        response = self.client.get(url, follow=True)
-
-        self.assertRedirects(
-
-            response, '{0}#auth'.format(reverse('profile'))
-
-        )
-
-
-
-        # Check database models
-
-        user = User.objects.get(username='username')
-
-        self.assertEqual(
-
-            VerifiedEmail.objects.filter(social__user=user).count(), 2
-
-        )
-
-        self.assertTrue(
-
-            VerifiedEmail.objects.filter(
-
-                social__user=user, email='second@example.net'
-
-            ).exists()
-
-        )
-
-
-
-    @httpretty.activate
-
-    @override_settings(AUTHENTICATION_BACKENDS=GH_BACKENDS)
-
-    def test_github(self):
-
-        """Test GitHub integration"""
+    if conf.use_syslog:
 
         try:
 
-            # psa creates copy of settings...
+            facility = getattr(logging.SysLogHandler,
 
-            orig_backends = social.apps.django_app.utils.BACKENDS
+                               conf.syslog_log_facility)
 
-            social.apps.django_app.utils.BACKENDS = GH_BACKENDS
+        except AttributeError:
 
+            raise ValueError(_('Invalid syslog facility'))
 
 
-            httpretty.register_uri(
 
-                httpretty.POST,
+        handler = logging.SysLogHandler(address='/dev/log',
 
-                'https://github.com/login/oauth/access_token',
+                                        facility=facility)
 
-                body=json.dumps({
+    elif conf.log_file:
 
-                    'access_token': '123',
+        logfile = conf.log_file
 
-                    'token_type': 'bearer',
+        if conf.log_dir:
 
-                })
+            logfile = os.path.join(conf.log_dir, logfile)
 
-            )
+        handler = logging.WatchedFileHandler(logfile)
 
-            httpretty.register_uri(
+    else:
 
-                httpretty.GET,
+        handler = logging.StreamHandler(sys.stdout)
 
-                'https://api.github.com/user',
 
-                body=json.dumps({
 
-                    'email': 'foo@example.net',
+    handler.setFormatter(formatter)
 
-                    'login': 'weblate',
+    root_logger.addHandler(handler)
 
-                    'id': 1,
 
-                    'name': 'Weblate',
 
-                }),
 
-            )
 
-            httpretty.register_uri(
+def register_str(*args, **kw):
 
-                httpretty.GET,
+    conf = kw.pop('conf', CONF)
 
-                'https://api.github.com/user/emails',
+    group = kw.pop('group', None)
 
-                body=json.dumps([
+    return conf.register_opt(cfg.StrOpt(*args, **kw), group=group)
 
-                    {
 
-                        'email': 'noreply2@example.org',
 
-                        'verified': False,
 
-                        'primary': False,
 
-                    }, {
+def register_cli_str(*args, **kw):
 
-                        'email': 'noreply-weblate@example.org',
+    conf = kw.pop('conf', CONF)
 
-                        'verified': True,
+    group = kw.pop('group', None)
 
-                        'primary': True
+    return conf.register_cli_opt(cfg.StrOpt(*args, **kw), group=group)
 
-                    }
 
-                ])
 
-            )
 
-            response = self.client.get(
 
-                reverse('social:begin', args=('github',))
+def register_bool(*args, **kw):
 
-            )
+    conf = kw.pop('conf', CONF)
 
-            self.assertEqual(response.status_code, 302)
+    group = kw.pop('group', None)
 
-            self.assertTrue(
+    return conf.register_opt(cfg.BoolOpt(*args, **kw), group=group)
 
-                response['Location'].startswith(
 
-                    'https://github.com/login/oauth/authorize'
 
-                )
 
-            )
 
-            query = parse_qs(urlparse(response['Location']).query)
+def register_cli_bool(*args, **kw):
 
-            return_query = parse_qs(urlparse(query['redirect_uri'][0]).query)
+    conf = kw.pop('conf', CONF)
 
-            response = self.client.get(
+    group = kw.pop('group', None)
 
-                reverse('social:complete', args=('github',)),
+    return conf.register_cli_opt(cfg.BoolOpt(*args, **kw), group=group)
 
-                {
 
-                    'state': query['state'][0],
 
-                    'redirect_state': return_query['redirect_state'][0],
 
-                    'code': 'XXX'
 
-                },
+def register_int(*args, **kw):
 
-                follow=True
+    conf = kw.pop('conf', CONF)
 
-            )
+    group = kw.pop('group', None)
 
-            user = User.objects.get(username='weblate')
+    return conf.register_opt(cfg.IntOpt(*args, **kw), group=group)
 
-            self.assertEqual(user.first_name, 'Weblate')
 
-            self.assertEqual(user.email, 'noreply-weblate@example.org')
 
-        finally:
 
-            social.apps.django_app.utils.BACKENDS = orig_backends
 
+def register_cli_int(*args, **kw):
 
+    conf = kw.pop('conf', CONF)
 
+    group = kw.pop('group', None)
 
+    return conf.register_cli_opt(cfg.IntOpt(*args, **kw), group=group)
 
-class NoCookieRegistrationTest(RegistrationTest):
 
-    clear_cookie = True
+
+register_str('admin_token', default='ADMIN')
+
+register_str('bind_host', default='0.0.0.0')
+
+register_str('compute_port', default=8774)
+
+register_str('admin_port', default=35357)
+
+register_str('public_port', default=5000)
+
+register_str('onready')
+
+register_str('auth_admin_prefix', default='')
+
+register_int('max_param_size', default=64)
+
+# we allow tokens to be a bit larger to accomidate PKI
+
+register_int('max_token_size', default=8192)
+
+
+
+#ssl options
+
+register_bool('enable', group='ssl', default=False)
+
+register_str('certfile', group='ssl', default=None)
+
+register_str('keyfile', group='ssl', default=None)
+
+register_str('ca_certs', group='ssl', default=None)
+
+register_bool('cert_required', group='ssl', default=False)
+
+#signing options
+
+register_str('token_format', group='signing',
+
+             default="UUID")
+
+register_str('certfile', group='signing',
+
+             default="/etc/keystone/ssl/certs/signing_cert.pem")
+
+register_str('keyfile', group='signing',
+
+             default="/etc/keystone/ssl/private/signing_key.pem")
+
+register_str('ca_certs', group='signing',
+
+             default="/etc/keystone/ssl/certs/ca.pem")
+
+register_int('key_size', group='signing', default=1024)
+
+register_int('valid_days', group='signing', default=3650)
+
+register_str('ca_password', group='signing', default=None)
+
+
+
+
+
+# sql options
+
+register_str('connection', group='sql', default='sqlite:///keystone.db')
+
+register_int('idle_timeout', group='sql', default=200)
+
+
+
+
+
+register_str('driver', group='catalog',
+
+             default='keystone.catalog.backends.sql.Catalog')
+
+register_str('driver', group='identity',
+
+             default='keystone.identity.backends.sql.Identity')
+
+register_str('driver', group='policy',
+
+             default='keystone.policy.backends.rules.Policy')
+
+register_str('driver', group='token',
+
+             default='keystone.token.backends.kvs.Token')
+
+register_str('driver', group='ec2',
+
+             default='keystone.contrib.ec2.backends.kvs.Ec2')
+
+register_str('driver', group='stats',
+
+             default='keystone.contrib.stats.backends.kvs.Stats')
+
+
+
+#ldap
+
+register_str('url', group='ldap', default='ldap://localhost')
+
+register_str('user', group='ldap', default='dc=Manager,dc=example,dc=com')
+
+register_str('password', group='ldap', default='freeipa4all')
+
+register_str('suffix', group='ldap', default='cn=example,cn=com')
+
+register_bool('use_dumb_member', group='ldap', default=False)
+
+register_str('user_name_attribute', group='ldap', default='sn')
+
+
+
+
+
+register_str('user_tree_dn', group='ldap', default=None)
+
+register_str('user_objectclass', group='ldap', default='inetOrgPerson')
+
+register_str('user_id_attribute', group='ldap', default='cn')
+
+
+
+register_str('tenant_tree_dn', group='ldap', default=None)
+
+register_str('tenant_objectclass', group='ldap', default='groupOfNames')
+
+register_str('tenant_id_attribute', group='ldap', default='cn')
+
+register_str('tenant_member_attribute', group='ldap', default='member')
+
+register_str('tenant_name_attribute', group='ldap', default='ou')
+
+
+
+register_str('role_tree_dn', group='ldap', default=None)
+
+register_str('role_objectclass', group='ldap', default='organizationalRole')
+
+register_str('role_id_attribute', group='ldap', default='cn')
+
+register_str('role_member_attribute', group='ldap', default='roleOccupant')
+
+
+
+#pam
+
+register_str('url', group='pam', default=None)
+
+register_str('userid', group='pam', default=None)
+
+register_str('password', group='pam', default=None)

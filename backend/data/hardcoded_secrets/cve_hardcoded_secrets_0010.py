@@ -2,256 +2,156 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-import base64
+"""
+
+This module handles loading and using lookatme_contriba modules
 
 
 
-from django.test import override_settings, SimpleTestCase
+Contrib modules are directly used 
 
-from mock import create_autospec, ANY
-
-
-
-from anymail.exceptions import AnymailInsecureWebhookWarning
-
-from anymail.signals import tracking, inbound
-
-
-
-from .utils import AnymailTestMixin, ClientWithCsrfChecks
+"""
 
 
 
 
 
-def event_handler(sender, event, esp_name, **kwargs):
-
-    """Prototypical webhook signal handler"""
-
-    pass
+import contextlib
 
 
 
 
 
-@override_settings(ANYMAIL={'WEBHOOK_AUTHORIZATION': 'username:password'})
+from lookatme.exceptions import IgnoredByContrib
 
-class WebhookTestCase(AnymailTestMixin, SimpleTestCase):
+from . import terminal
 
-    """Base for testing webhooks
+from . import file_loader
 
 
 
-    - connects webhook signal handlers
 
-    - sets up basic auth by default (since most ESP webhooks warn if it's not enabled)
+
+CONTRIB_MODULES = [
+
+    terminal,
+
+    file_loader,
+
+]
+
+
+
+
+
+def load_contribs(contrib_names):
+
+    """Load all contrib modules specified by ``contrib_names``. These should
+
+    all be namespaced packages under the ``lookatmecontrib`` namespace. E.g.
+
+    ``lookatmecontrib.calendar`` would be an extension provided by a
+
+    contrib module, and would be added to an ``extensions`` list in a slide's
+
+    YAML header as ``calendar``.
 
     """
 
+    if contrib_names is None:
 
+        return
 
-    client_class = ClientWithCsrfChecks
 
 
+    errors = []
 
-    def setUp(self):
+    for contrib_name in contrib_names:
 
-        super(WebhookTestCase, self).setUp()
+        module_name = f"lookatme.contrib.{contrib_name}"
 
-        # Use correct basic auth by default (individual tests can override):
+        try:
 
-        self.set_basic_auth()
+            mod = __import__(module_name, fromlist=[contrib_name])
 
+            CONTRIB_MODULES.append(mod)
 
+        except Exception as e:
 
-        # Install mocked signal handlers
+            errors.append(str(e))
 
-        self.tracking_handler = create_autospec(event_handler)
 
-        tracking.connect(self.tracking_handler)
 
-        self.addCleanup(tracking.disconnect, self.tracking_handler)
+    if len(errors) > 0:
 
+        raise Exception(
 
+            "Error loading one or more extensions:\n\n" + "\n".join(errors),
 
-        self.inbound_handler = create_autospec(event_handler)
+        )
 
-        inbound.connect(self.inbound_handler)
 
-        self.addCleanup(inbound.disconnect, self.inbound_handler)
 
 
 
-    def set_basic_auth(self, username='username', password='password'):
+def contrib_first(fn):
 
-        """Set basic auth for all subsequent test client requests"""
+    """A decorator that allows contrib modules to override default behavior
 
-        credentials = base64.b64encode("{}:{}".format(username, password).encode('utf-8')).decode('utf-8')
+    of lookatme. E.g., a contrib module may override how a table is displayed
 
-        self.client.defaults['HTTP_AUTHORIZATION'] = "Basic {}".format(credentials)
+    to enable sorting, or enable displaying images rendered with ANSII color
 
+    codes and box drawing characters, etc.
 
 
-    def clear_basic_auth(self):
 
-        self.client.defaults.pop('HTTP_AUTHORIZATION', None)
+    Contrib modules may ignore chances to override default behavior by raising
 
-
-
-    def assert_handler_called_once_with(self, mockfn, *expected_args, **expected_kwargs):
-
-        """Verifies mockfn was called with expected_args and at least expected_kwargs.
-
-
-
-        Ignores *additional* actual kwargs (which might be added by Django signal dispatch).
-
-        (This differs from mock.assert_called_once_with.)
-
-
-
-        Returns the actual kwargs.
-
-        """
-
-        self.assertEqual(mockfn.call_count, 1)
-
-        actual_args, actual_kwargs = mockfn.call_args
-
-        self.assertEqual(actual_args, expected_args)
-
-        for key, expected_value in expected_kwargs.items():
-
-            if expected_value is ANY:
-
-                self.assertIn(key, actual_kwargs)
-
-            else:
-
-                self.assertEqual(actual_kwargs[key], expected_value)
-
-        return actual_kwargs
-
-
-
-    def get_kwargs(self, mockfn):
-
-        """Return the kwargs passed to the most recent call to mockfn"""
-
-        self.assertIsNotNone(mockfn.call_args)  # mockfn hasn't been called yet
-
-        actual_args, actual_kwargs = mockfn.call_args
-
-        return actual_kwargs
-
-
-
-
-
-# noinspection PyUnresolvedReferences
-
-class WebhookBasicAuthTestsMixin(object):
-
-    """Common test cases for webhook basic authentication.
-
-
-
-    Instantiate for each ESP's webhooks by:
-
-    - mixing into WebhookTestCase
-
-    - defining call_webhook to invoke the ESP's webhook
+    the ``lookatme.contrib.IgnoredByContrib`` exception.
 
     """
 
-
-
-    should_warn_if_no_auth = True  # subclass set False if other webhook verification used
-
-
-
-    def call_webhook(self):
-
-        # Concrete test cases should call a webhook via self.client.post,
-
-        # and return the response
-
-        raise NotImplementedError()
+    fn_name = fn.__name__
 
 
 
-    @override_settings(ANYMAIL={})  # Clear the WEBHOOK_AUTH settings from superclass
+    @contextlib.wraps(fn)
 
-    def test_warns_if_no_auth(self):
+    def inner(*args, **kwargs):
 
-        if self.should_warn_if_no_auth:
+        for mod in CONTRIB_MODULES:
 
-            with self.assertWarns(AnymailInsecureWebhookWarning):
+            if not hasattr(mod, fn_name):
 
-                response = self.call_webhook()
+                continue
 
-        else:
+            try:
 
-            with self.assertDoesNotWarn(AnymailInsecureWebhookWarning):
+                return getattr(mod, fn_name)(*args, **kwargs)
 
-                response = self.call_webhook()
+            except IgnoredByContrib:
 
-        self.assertEqual(response.status_code, 200)
-
-
-
-    def test_verifies_basic_auth(self):
-
-        response = self.call_webhook()
-
-        self.assertEqual(response.status_code, 200)
+                pass
 
 
 
-    def test_verifies_bad_auth(self):
-
-        self.set_basic_auth('baduser', 'wrongpassword')
-
-        response = self.call_webhook()
-
-        self.assertEqual(response.status_code, 400)
+        return fn(*args, **kwargs)
 
 
 
-    def test_verifies_missing_auth(self):
-
-        self.clear_basic_auth()
-
-        response = self.call_webhook()
-
-        self.assertEqual(response.status_code, 400)
+    return inner
 
 
 
-    @override_settings(ANYMAIL={'WEBHOOK_AUTHORIZATION': ['cred1:pass1', 'cred2:pass2']})
-
-    def test_supports_credential_rotation(self):
-
-        """You can supply a list of basic auth credentials, and any is allowed"""
-
-        self.set_basic_auth('cred1', 'pass1')
-
-        response = self.call_webhook()
-
-        self.assertEqual(response.status_code, 200)
 
 
+def shutdown_contribs():
 
-        self.set_basic_auth('cred2', 'pass2')
+    """Call the shutdown function on all contrib modules
 
-        response = self.call_webhook()
+    """
 
-        self.assertEqual(response.status_code, 200)
+    for mod in CONTRIB_MODULES:
 
-
-
-        self.set_basic_auth('baduser', 'wrongpassword')
-
-        response = self.call_webhook()
-
-        self.assertEqual(response.status_code, 400)
+        getattr(mod, "shutdown", lambda: 1)()

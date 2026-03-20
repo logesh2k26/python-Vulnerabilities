@@ -2,162 +2,356 @@
 # Safety: safe
 # Category: safe
 
-from Products.CMFCore.URLTool import URLTool as BaseTool
+from __future__ import absolute_import, division, print_function, with_statement
 
-from Products.CMFCore.utils import getToolByName
 
-from AccessControl import ClassSecurityInfo
 
-from App.class_init import InitializeClass
+import traceback
 
-from Products.CMFPlone.PloneBaseTool import PloneBaseTool
 
 
+from tornado.concurrent import Future
 
-from posixpath import normpath
+from tornado.httpclient import HTTPError, HTTPRequest
 
-from urlparse import urlparse, urljoin
+from tornado.log import gen_log
 
-import re
+from tornado.testing import AsyncHTTPTestCase, gen_test, bind_unused_port, ExpectLog
 
+from tornado.test.util import unittest, skipOnTravis
 
+from tornado.web import Application, RequestHandler
 
 
 
-class URLTool(PloneBaseTool, BaseTool):
+try:
 
+    import tornado.websocket
 
+    from tornado.util import _websocket_mask_python
 
-    meta_type = 'Plone URL Tool'
+except ImportError:
 
-    security = ClassSecurityInfo()
+    # The unittest module presents misleading errors on ImportError
 
-    toolicon = 'skins/plone_images/link_icon.png'
+    # (it acts as if websocket_test could not be found, hiding the underlying
 
+    # error).  If we get an ImportError here (which could happen due to
 
+    # TORNADO_EXTENSION=1), print some extra information before failing.
 
-    security.declarePublic('isURLInPortal')
+    traceback.print_exc()
 
-    def isURLInPortal(self, url, context=None):
+    raise
 
-        """ Check if a given url is on the same host and contains the portal
 
-            path.  Used to ensure that login forms can determine relevant
 
-            referrers (i.e. in portal).  Also return true for some relative
+from tornado.websocket import WebSocketHandler, websocket_connect, WebSocketError
 
-            urls if context is passed in to allow for url parsing. When context
 
-            is not provided, assume that relative urls are in the portal. It is
 
-            assumed that http://portal is the same portal as https://portal.
+try:
 
+    from tornado import speedups
 
+except ImportError:
 
-            External sites listed in 'allow_external_login_sites' of
+    speedups = None
 
-            site_properties are also considered within the portal to allow for
 
-            single sign on.
 
-        """
 
-        # sanitize url
 
-        url = re.sub('^[\x00-\x20]+', '', url).strip()
+class TestWebSocketHandler(WebSocketHandler):
 
-        if ('<script' in url or '%3Cscript' in url or 'javascript:' in url or
+    """Base class for testing handlers that exposes the on_close event.
 
-                'javascript%3A' in url):
 
-            return False
 
+    This allows for deterministic cleanup of the associated socket.
 
+    """
 
-        p_url = self()
+    def initialize(self, close_future):
 
+        self.close_future = close_future
 
 
-        _, u_host, u_path, _, _, _ = urlparse(url)
 
-        if not u_host and not u_path.startswith('/'):
+    def on_close(self):
 
-            if context is None:
+        self.close_future.set_result(None)
 
-                return True  # old behavior
 
-            if not context.isPrincipiaFolderish:
 
-                useurl = context.aq_parent.absolute_url()
 
-            else:
 
-                useurl = context.absolute_url()
+class EchoHandler(TestWebSocketHandler):
 
-        else:
+    def on_message(self, message):
 
-            useurl = p_url  # when u_path.startswith('/')
+        self.write_message(message, isinstance(message, bytes))
 
-        if not useurl.endswith('/'):
 
-            useurl += '/'
 
 
 
-        # urljoin to current url to get an absolute path
+class HeaderHandler(TestWebSocketHandler):
 
-        _, u_host, u_path, _, _, _ = urlparse(urljoin(useurl, url))
+    def open(self):
 
+        self.write_message(self.request.headers.get('X-Test', ''))
 
 
-        # normalise to end with a '/' so /foobar is not considered within /foo
 
-        if not u_path:
 
-            u_path = '/'
 
-        else:
+class NonWebSocketHandler(RequestHandler):
 
-            u_path = normpath(u_path)
+    def get(self):
 
-            if not u_path.endswith('/'):
+        self.write('ok')
 
-                u_path += '/'
 
-        _, host, path, _, _, _ = urlparse(p_url)
 
-        if not path.endswith('/'):
 
-            path += '/'
 
-        if host == u_host and u_path.startswith(path):
+class WebSocketTest(AsyncHTTPTestCase):
 
-            return True
+    def get_app(self):
 
+        self.close_future = Future()
 
+        return Application([
 
-        props = getToolByName(self, 'portal_properties').site_properties
+            ('/echo', EchoHandler, dict(close_future=self.close_future)),
 
-        for external_site in props.getProperty('allow_external_login_sites', []):
+            ('/non_ws', NonWebSocketHandler),
 
-            _, host, path, _, _, _ = urlparse(external_site)
+            ('/header', HeaderHandler, dict(close_future=self.close_future)),
 
-            if not path.endswith('/'):
+        ])
 
-                path += '/'
 
-            if host == u_host and u_path.startswith(path):
 
-                return True
+    @gen_test
 
-        return False
+    def test_websocket_gen(self):
 
+        ws = yield websocket_connect(
 
+            'ws://localhost:%d/echo' % self.get_http_port(),
 
+            io_loop=self.io_loop)
 
+        ws.write_message('hello')
 
-URLTool.__doc__ = BaseTool.__doc__
+        response = yield ws.read_message()
 
+        self.assertEqual(response, 'hello')
 
+        ws.close()
 
-InitializeClass(URLTool)
+        yield self.close_future
+
+
+
+    def test_websocket_callbacks(self):
+
+        websocket_connect(
+
+            'ws://localhost:%d/echo' % self.get_http_port(),
+
+            io_loop=self.io_loop, callback=self.stop)
+
+        ws = self.wait().result()
+
+        ws.write_message('hello')
+
+        ws.read_message(self.stop)
+
+        response = self.wait().result()
+
+        self.assertEqual(response, 'hello')
+
+        ws.close()
+
+        yield self.close_future
+
+
+
+    @gen_test
+
+    def test_websocket_http_fail(self):
+
+        with self.assertRaises(HTTPError) as cm:
+
+            yield websocket_connect(
+
+                'ws://localhost:%d/notfound' % self.get_http_port(),
+
+                io_loop=self.io_loop)
+
+        self.assertEqual(cm.exception.code, 404)
+
+
+
+    @gen_test
+
+    def test_websocket_http_success(self):
+
+        with self.assertRaises(WebSocketError):
+
+            yield websocket_connect(
+
+                'ws://localhost:%d/non_ws' % self.get_http_port(),
+
+                io_loop=self.io_loop)
+
+
+
+    @skipOnTravis
+
+    @gen_test
+
+    def test_websocket_network_timeout(self):
+
+        sock, port = bind_unused_port()
+
+        sock.close()
+
+        with self.assertRaises(HTTPError) as cm:
+
+            with ExpectLog(gen_log, ".*"):
+
+                yield websocket_connect(
+
+                    'ws://localhost:%d/' % port,
+
+                    io_loop=self.io_loop,
+
+                    connect_timeout=0.01)
+
+        self.assertEqual(cm.exception.code, 599)
+
+
+
+    @gen_test
+
+    def test_websocket_network_fail(self):
+
+        sock, port = bind_unused_port()
+
+        sock.close()
+
+        with self.assertRaises(HTTPError) as cm:
+
+            with ExpectLog(gen_log, ".*"):
+
+                yield websocket_connect(
+
+                    'ws://localhost:%d/' % port,
+
+                    io_loop=self.io_loop,
+
+                    connect_timeout=3600)
+
+        self.assertEqual(cm.exception.code, 599)
+
+
+
+    @gen_test
+
+    def test_websocket_close_buffered_data(self):
+
+        ws = yield websocket_connect(
+
+            'ws://localhost:%d/echo' % self.get_http_port())
+
+        ws.write_message('hello')
+
+        ws.write_message('world')
+
+        ws.stream.close()
+
+        yield self.close_future
+
+
+
+    @gen_test
+
+    def test_websocket_headers(self):
+
+        # Ensure that arbitrary headers can be passed through websocket_connect.
+
+        ws = yield websocket_connect(
+
+            HTTPRequest('ws://localhost:%d/header' % self.get_http_port(),
+
+                        headers={'X-Test': 'hello'}))
+
+        response = yield ws.read_message()
+
+        self.assertEqual(response, 'hello')
+
+        ws.close()
+
+        yield self.close_future
+
+
+
+
+
+class MaskFunctionMixin(object):
+
+    # Subclasses should define self.mask(mask, data)
+
+    def test_mask(self):
+
+        self.assertEqual(self.mask(b'abcd', b''), b'')
+
+        self.assertEqual(self.mask(b'abcd', b'b'), b'\x03')
+
+        self.assertEqual(self.mask(b'abcd', b'54321'), b'TVPVP')
+
+        self.assertEqual(self.mask(b'ZXCV', b'98765432'), b'c`t`olpd')
+
+        # Include test cases with \x00 bytes (to ensure that the C
+
+        # extension isn't depending on null-terminated strings) and
+
+        # bytes with the high bit set (to smoke out signedness issues).
+
+        self.assertEqual(self.mask(b'\x00\x01\x02\x03',
+
+                                   b'\xff\xfb\xfd\xfc\xfe\xfa'),
+
+                         b'\xff\xfa\xff\xff\xfe\xfb')
+
+        self.assertEqual(self.mask(b'\xff\xfb\xfd\xfc',
+
+                                   b'\x00\x01\x02\x03\x04\x05'),
+
+                         b'\xff\xfa\xff\xff\xfb\xfe')
+
+
+
+
+
+class PythonMaskFunctionTest(MaskFunctionMixin, unittest.TestCase):
+
+    def mask(self, mask, data):
+
+        return _websocket_mask_python(mask, data)
+
+
+
+
+
+@unittest.skipIf(speedups is None, "tornado.speedups module not present")
+
+class CythonMaskFunctionTest(MaskFunctionMixin, unittest.TestCase):
+
+    def mask(self, mask, data):
+
+        return speedups.websocket_mask(mask, data)

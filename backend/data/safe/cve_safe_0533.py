@@ -2,684 +2,672 @@
 # Safety: safe
 # Category: safe
 
-import pytest
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-import json
 
 
+# Copyright 2010 United States Government as represented by the
 
-from enum import Enum, unique
+# Administrator of the National Aeronautics and Space Administration.
 
+# All Rights Reserved.
 
+#
 
-from indy.did import create_and_store_my_did, key_for_local_did
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
 
+#    not use this file except in compliance with the License. You may obtain
 
+#    a copy of the License at
 
-from plenum.common.constants import (
+#
 
-    TRUSTEE, STEWARD, NYM, TXN_TYPE, TARGET_NYM, VERKEY, ROLE,
+#         http://www.apache.org/licenses/LICENSE-2.0
 
-    CURRENT_PROTOCOL_VERSION)
+#
 
-from plenum.common.exceptions import UnauthorizedClientRequest
+#    Unless required by applicable law or agreed to in writing, software
 
-from plenum.common.signer_did import DidSigner
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-from plenum.common.member.member import Member
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
-from plenum.test.helper import sdk_gen_request, sdk_sign_request_objects
+#    License for the specific language governing permissions and limitations
 
+#    under the License.
 
 
-from indy_common.types import Request
 
-from indy_common.roles import Roles
+"""Proxy AMI-related calls from cloud controller to objectstore service."""
 
 
 
-from indy_node.test.helper import createUuidIdentifierAndFullVerkey
+import binascii
 
+import os
 
+import shutil
 
+import tarfile
 
+import tempfile
 
-#   TODO
+from xml.etree import ElementTree
 
-#   - more specific string patterns for auth exc check
 
 
+import boto.s3.connection
 
+import eventlet
 
 
-class DID(object):
 
-    def __init__(self, did=None, role=Roles.IDENTITY_OWNER, verkey=None, creator=None, wallet_handle=None):
+from nova import crypto
 
-        self.did = did
+from nova import exception
 
-        self.role = role
+from nova import flags
 
-        self.verkey = verkey
+from nova import image
 
-        self.creator = creator
+from nova import log as logging
 
-        self.wallet_handle = wallet_handle
+from nova import utils
 
+from nova.image import service
 
+from nova.api.ec2 import ec2utils
 
-    @property
 
-    def wallet_did(self):
 
-        return (self.wallet_handle, self.did)
 
 
+LOG = logging.getLogger("nova.image.s3")
 
+FLAGS = flags.FLAGS
 
+flags.DEFINE_string('image_decryption_dir', '/tmp',
 
-@unique
+                    'parent dir for tempdir used for image decryption')
 
-class EnumBase(Enum):
+flags.DEFINE_string('s3_access_key', 'notchecked',
 
-    def __str__(self):
+                    'access key to use for s3 server for images')
 
-        return self.name
+flags.DEFINE_string('s3_secret_key', 'notchecked',
 
+                    'secret key to use for s3 server for images')
 
 
 
 
-ActionIds = Enum('ActionIds', 'add edit', type=EnumBase)
 
+class S3ImageService(service.BaseImageService):
 
+    """Wraps an existing image service to support s3 based register."""
 
-# params for addition:
 
-# - signer:
 
-#   - role: Roles
+    def __init__(self, service=None, *args, **kwargs):
 
-# - dest:
+        self.service = service or image.get_default_image_service()
 
-#   - verkey in NYM: omitted, None, val
+        self.service.__init__(*args, **kwargs)
 
-#   - role: Roles, omitted
 
-NYMAddDestRoles = Enum(
 
-    'NYMAddDestRoles',
+    def create(self, context, metadata, data=None):
 
-    [(r.name, r.value) for r in Roles] + [('omitted', 'omitted')],
+        """Create an image.
 
-    type=EnumBase)
 
 
+        metadata['properties'] should contain image_location.
 
-NYMAddDestVerkeys = Enum('NYMAddDestVerkeys', 'none val omitted', type=EnumBase)
 
 
+        """
 
-# params for edition:
+        image = self._s3_create(context, metadata)
 
-# - signer:
+        return image
 
-#   - [self, creator] + [other], where other = any of Roles
 
-# - dest:
 
-#   - role in ledger: Roles
+    def delete(self, context, image_id):
 
-#   - verkey in ledger: None, val
+        self.service.delete(context, image_id)
 
-#   - role: Roles, omitted
 
-#   - verkey in NYM: same, new (not None), demote(None), omitted
 
-LedgerDIDVerkeys = Enum('LedgerDIDVerkeys', 'none val', type=EnumBase)
+    def update(self, context, image_id, metadata, data=None):
 
-LedgerDIDRoles = Roles
+        image = self.service.update(context, image_id, metadata, data)
 
+        return image
 
 
-NYMEditSignerTypes = Enum(
 
-    'NYMEditSignerTypes',
+    def index(self, context):
 
-    [(r.name, r.value) for r in Roles] + [('self', 'self'), ('creator', 'creator')],
+        return self.service.index(context)
 
-    type=EnumBase
 
-)
 
+    def detail(self, context):
 
+        return self.service.detail(context)
 
-NYMEditDestRoles = NYMAddDestRoles
 
-NYMEditDestVerkeys = Enum('NYMEditDestVerkeys', 'same new demote omitted', type=EnumBase)
 
+    def show(self, context, image_id):
 
+        return self.service.show(context, image_id)
 
-dids = {}
 
-did_editor_others = {}
 
-did_provisioners = did_editor_others
+    def show_by_name(self, context, name):
 
+        return self.service.show_by_name(context, name)
 
 
 
+    @staticmethod
 
-# FIXTURES
+    def _conn(context):
 
+        # NOTE(vish): access and secret keys for s3 server are not
 
+        #             checked in nova-objectstore
 
+        access = FLAGS.s3_access_key
 
+        secret = FLAGS.s3_secret_key
 
-@pytest.fixture(scope="module")
+        calling = boto.s3.connection.OrdinaryCallingFormat()
 
-def trustee(looper, sdk_wallet_trustee):
+        return boto.s3.connection.S3Connection(aws_access_key_id=access,
 
-    wh, did = sdk_wallet_trustee
+                                               aws_secret_access_key=secret,
 
-    verkey = looper.loop.run_until_complete(key_for_local_did(wh, did))
+                                               is_secure=False,
 
-    return DID(did=did, role=Roles.TRUSTEE, verkey=verkey, wallet_handle=wh)
+                                               calling_format=calling,
 
+                                               port=FLAGS.s3_port,
 
+                                               host=FLAGS.s3_host)
 
 
 
-@pytest.fixture(scope="module")
+    @staticmethod
 
-def poolTxnData(looper, poolTxnData, trustee):
+    def _download_file(bucket, filename, local_dir):
 
-    global dids
+        key = bucket.get_key(filename)
 
-    global did_editor_others
+        local_filename = os.path.join(local_dir, os.path.basename(filename))
 
+        key.get_contents_to_filename(local_filename)
 
+        return local_filename
 
-    # TODO non-Trustee creators
 
 
+    def _s3_parse_manifest(self, context, metadata, manifest):
 
-    data = poolTxnData
+        manifest = ElementTree.fromstring(manifest)
 
+        image_format = 'ami'
 
+        image_type = 'machine'
 
-    def _add_did(role, did_name, with_verkey=True):
 
-        nonlocal data
 
+        try:
 
+            kernel_id = manifest.find('machine_configuration/kernel_id').text
 
-        data['seeds'][did_name] = did_name + '0' * (32 - len(did_name))
+            if kernel_id == 'true':
 
-        t_sgnr = DidSigner(seed=data['seeds'][did_name].encode())
+                image_format = 'aki'
 
-        verkey = t_sgnr.full_verkey if with_verkey else None
+                image_type = 'kernel'
 
-        data['txns'].append(
+                kernel_id = None
 
-            Member.nym_txn(nym=t_sgnr.identifier,
+        except Exception:
 
-                           verkey=verkey,
+            kernel_id = None
 
-                           role=role.value,
 
-                           name=did_name,
 
-                           creator=trustee.did)
+        try:
 
-        )
+            ramdisk_id = manifest.find('machine_configuration/ramdisk_id').text
 
+            if ramdisk_id == 'true':
 
+                image_format = 'ari'
 
-        if verkey:
+                image_type = 'ramdisk'
 
-            (sdk_did, sdk_verkey) = looper.loop.run_until_complete(
+                ramdisk_id = None
 
-                create_and_store_my_did(
+        except Exception:
 
-                    trustee.wallet_handle,
+            ramdisk_id = None
 
-                    json.dumps({'seed': data['seeds'][did_name]}))
 
-            )
 
+        try:
 
+            arch = manifest.find('machine_configuration/architecture').text
 
-        return DID(
+        except Exception:
 
-            did=t_sgnr.identifier, role=role, verkey=verkey,
+            arch = 'x86_64'
 
-            creator=trustee, wallet_handle=trustee.wallet_handle
 
-        )
 
+        # NOTE(yamahata):
 
+        # EC2 ec2-budlne-image --block-device-mapping accepts
 
-    params = [(dr, dv) for dr in LedgerDIDRoles for dv in LedgerDIDVerkeys]
+        # <virtual name>=<device name> where
 
-    for (dr, dv) in params:
+        # virtual name = {ami, root, swap, ephemeral<N>}
 
-        dids[(dr, dv)] = _add_did(
+        #                where N is no negative integer
 
-            dr, "{}-{}".format(dr.name, dv.name),
+        # device name = the device name seen by guest kernel.
 
-            with_verkey=(dv == LedgerDIDVerkeys.val)
+        # They are converted into
 
-        )
+        # block_device_mapping/mapping/{virtual, device}
 
+        #
 
+        # Do NOT confuse this with ec2-register's block device mapping
 
-    for dr in Roles:
+        # argument.
 
-        did_editor_others[dr] = _add_did(dr, "{}-other".format(dr.name))
+        mappings = []
 
+        try:
 
+            block_device_mapping = manifest.findall('machine_configuration/'
 
-    return data
+                                                    'block_device_mapping/'
 
+                                                    'mapping')
 
+            for bdm in block_device_mapping:
 
+                mappings.append({'virtual': bdm.find('virtual').text,
 
+                                 'device': bdm.find('device').text})
 
-@pytest.fixture(scope="module", params=list(Roles))
+        except Exception:
 
-def provisioner_role(request):
+            mappings = []
 
-    return request.param
 
 
+        properties = metadata['properties']
 
+        properties['project_id'] = context.project_id
 
+        properties['architecture'] = arch
 
-@pytest.fixture(scope="module")
 
-def provisioner(poolTxnData, provisioner_role):
 
-    return did_provisioners[provisioner_role]
+        if kernel_id:
 
+            properties['kernel_id'] = ec2utils.ec2_id_to_id(kernel_id)
 
 
 
+        if ramdisk_id:
 
-@pytest.fixture(scope="module", params=list(NYMAddDestRoles))
+            properties['ramdisk_id'] = ec2utils.ec2_id_to_id(ramdisk_id)
 
-def nym_add_dest_role(request):
 
-    return request.param
 
+        if mappings:
 
+            properties['mappings'] = mappings
 
 
 
-@pytest.fixture(scope="module", params=list(NYMAddDestVerkeys))
+        metadata.update({'disk_format': image_format,
 
-def nym_add_dest_verkey(request):
+                         'container_format': image_format,
 
-    return request.param
+                         'status': 'queued',
 
+                         'is_public': False,
 
+                         'properties': properties})
 
+        metadata['properties']['image_state'] = 'pending'
 
+        image = self.service.create(context, metadata)
 
-@pytest.fixture(scope="function")
+        return manifest, image
 
-def add_op(nym_add_dest_role, nym_add_dest_verkey):
 
-    did, verkey = createUuidIdentifierAndFullVerkey()
 
+    def _s3_create(self, context, metadata):
 
+        """Gets a manifext from s3 and makes an image."""
 
-    op = {
 
-        TXN_TYPE: NYM,
 
-        TARGET_NYM: did,
+        image_path = tempfile.mkdtemp(dir=FLAGS.image_decryption_dir)
 
-        ROLE: nym_add_dest_role.value,
 
-        VERKEY: verkey
 
-    }
+        image_location = metadata['properties']['image_location']
 
+        bucket_name = image_location.split('/')[0]
 
+        manifest_path = image_location[len(bucket_name) + 1:]
 
-    if nym_add_dest_role == NYMAddDestRoles.omitted:
+        bucket = self._conn(context).get_bucket(bucket_name)
 
-        del op[ROLE]
+        key = bucket.get_key(manifest_path)
 
+        manifest = key.get_contents_as_string()
 
 
-    if nym_add_dest_verkey == NYMAddDestVerkeys.omitted:
 
-        del op[VERKEY]
+        manifest, image = self._s3_parse_manifest(context, metadata, manifest)
 
+        image_id = image['id']
 
 
-    return op
 
+        def delayed_create():
 
+            """This handles the fetching and decrypting of the part files."""
 
+            log_vars = {'image_location': image_location,
 
+                        'image_path': image_path}
 
-@pytest.fixture(scope="module", params=list(LedgerDIDRoles))
+            metadata['properties']['image_state'] = 'downloading'
 
-def edited_ledger_role(request):
+            self.service.update(context, image_id, metadata)
 
-    return request.param
 
 
+            try:
 
+                parts = []
 
+                elements = manifest.find('image').getiterator('filename')
 
-@pytest.fixture(scope="module", params=list(LedgerDIDVerkeys))
+                for fn_element in elements:
 
-def edited_ledger_verkey(request):
+                    part = self._download_file(bucket,
 
-    return request.param
+                                               fn_element.text,
 
+                                               image_path)
 
+                    parts.append(part)
 
 
 
-@pytest.fixture(scope="function")
+                # NOTE(vish): this may be suboptimal, should we use cat?
 
-def edited(edited_ledger_role, edited_ledger_verkey):
+                enc_filename = os.path.join(image_path, 'image.encrypted')
 
-    return dids[(edited_ledger_role, edited_ledger_verkey)]
+                with open(enc_filename, 'w') as combined:
 
+                    for filename in parts:
 
+                        with open(filename) as part:
 
+                            shutil.copyfileobj(part, combined)
 
 
-@pytest.fixture(scope="module", params=list(NYMEditDestRoles))
 
-def edited_nym_role(request):
+            except Exception:
 
-    return request.param
+                LOG.exception(_("Failed to download %(image_location)s "
 
+                                "to %(image_path)s"), log_vars)
 
+                metadata['properties']['image_state'] = 'failed_download'
 
+                self.service.update(context, image_id, metadata)
 
+                return
 
-@pytest.fixture(scope="module", params=list(NYMEditDestVerkeys))
 
-def edited_nym_verkey(request):
 
-    return request.param
+            metadata['properties']['image_state'] = 'decrypting'
 
+            self.service.update(context, image_id, metadata)
 
 
 
+            try:
 
-@pytest.fixture(scope="module", params=list(NYMEditSignerTypes))
+                hex_key = manifest.find('image/ec2_encrypted_key').text
 
-def editor_type(request):
+                encrypted_key = binascii.a2b_hex(hex_key)
 
-    return request.param
+                hex_iv = manifest.find('image/ec2_encrypted_iv').text
 
+                encrypted_iv = binascii.a2b_hex(hex_iv)
 
 
 
+                # FIXME(vish): grab key from common service so this can run on
 
-@pytest.fixture(scope="function")
+                #              any host.
 
-def editor(editor_type, edited):
+                cloud_pk = crypto.key_path(context.project_id)
 
-    if editor_type == NYMEditSignerTypes.self:
 
-        return edited
 
-    elif editor_type == NYMEditSignerTypes.creator:
+                dec_filename = os.path.join(image_path, 'image.tar.gz')
 
-        return edited.creator
+                self._decrypt_image(enc_filename, encrypted_key,
 
-    else:
+                                    encrypted_iv, cloud_pk,
 
-        return did_editor_others[Roles(editor_type.value)]
+                                    dec_filename)
 
+            except Exception:
 
+                LOG.exception(_("Failed to decrypt %(image_location)s "
 
+                                "to %(image_path)s"), log_vars)
 
+                metadata['properties']['image_state'] = 'failed_decrypt'
 
-@pytest.fixture(scope="function")
+                self.service.update(context, image_id, metadata)
 
-def edit_op(edited, edited_nym_role, edited_nym_verkey):
+                return
 
-    op = {
 
-        TXN_TYPE: NYM,
 
-        TARGET_NYM: edited.did,
+            metadata['properties']['image_state'] = 'untarring'
 
-    }
+            self.service.update(context, image_id, metadata)
 
 
 
-    if edited_nym_role != NYMEditDestRoles.omitted:
+            try:
 
-        op[ROLE] = edited_nym_role.value
+                unz_filename = self._untarzip_image(image_path, dec_filename)
 
+            except Exception:
 
+                LOG.exception(_("Failed to untar %(image_location)s "
 
-    if edited_nym_verkey == NYMEditDestVerkeys.same:
+                                "to %(image_path)s"), log_vars)
 
-        op[VERKEY] = edited.verkey
+                metadata['properties']['image_state'] = 'failed_untar'
 
-    elif edited_nym_verkey == NYMEditDestVerkeys.new:
+                self.service.update(context, image_id, metadata)
 
-        _, op[VERKEY] = createUuidIdentifierAndFullVerkey()
+                return
 
-    elif edited_nym_verkey == NYMEditDestVerkeys.demote:
 
-        if edited.verkey is None:
 
-            return None  # pass that case since it is covered by `same` case as well
+            metadata['properties']['image_state'] = 'uploading'
 
-        else:
+            self.service.update(context, image_id, metadata)
 
-            op[VERKEY] = None
+            try:
 
+                with open(unz_filename) as image_file:
 
+                    self.service.update(context, image_id,
 
-    return op
+                                        metadata, image_file)
 
+            except Exception:
 
+                LOG.exception(_("Failed to upload %(image_location)s "
 
+                                "to %(image_path)s"), log_vars)
 
+                metadata['properties']['image_state'] = 'failed_upload'
 
-# TEST HELPERS
+                self.service.update(context, image_id, metadata)
 
+                return
 
 
-def auth_check(action_id, signer, op, did_ledger=None):
 
-    op_role = Roles(op[ROLE]) if ROLE in op else None
+            metadata['properties']['image_state'] = 'available'
 
+            metadata['status'] = 'active'
 
+            self.service.update(context, image_id, metadata)
 
-    def check_promotion():
 
-        # omitted role means IDENTITY_OWNER
 
-        if op_role in (None, Roles.IDENTITY_OWNER):
+            shutil.rmtree(image_path)
 
-            return signer.role in (Roles.TRUSTEE, Roles.STEWARD, Roles.ENDORSER)
 
-        elif op_role in (Roles.TRUSTEE, Roles.STEWARD):
 
-            return signer.role == Roles.TRUSTEE
+        eventlet.spawn_n(delayed_create)
 
-        elif op_role in (Roles.ENDORSER, Roles.NETWORK_MONITOR):
 
-            return signer.role in (Roles.TRUSTEE, Roles.STEWARD)
 
+        return image
 
 
-    def check_demotion():
 
-        if did_ledger.role in (Roles.TRUSTEE, Roles.STEWARD):
+    @staticmethod
 
-            return signer.role == Roles.TRUSTEE
+    def _decrypt_image(encrypted_filename, encrypted_key, encrypted_iv,
 
-        elif did_ledger.role == Roles.ENDORSER:
+                       cloud_private_key, decrypted_filename):
 
-            return (signer.role == Roles.TRUSTEE)
+        key, err = utils.execute('openssl',
 
-            # FIXME INDY-1968: uncomment when the task is addressed
+                                 'rsautl',
 
-            # return ((signer.role == Roles.TRUSTEE) or
+                                 '-decrypt',
 
-            #        (signer.role == Roles.ENDORSER and
+                                 '-inkey', '%s' % cloud_private_key,
 
-            #            is_self and is_owner))
+                                 process_input=encrypted_key,
 
-        elif did_ledger.role == Roles.NETWORK_MONITOR:
+                                 check_exit_code=False)
 
-            return signer.role in (Roles.TRUSTEE, Roles.STEWARD)
+        if err:
 
+            raise exception.Error(_('Failed to decrypt private key: %s')
 
+                                  % err)
 
-    if action_id == ActionIds.add:
+        iv, err = utils.execute('openssl',
 
-        return check_promotion()
+                                'rsautl',
 
+                                '-decrypt',
 
+                                '-inkey', '%s' % cloud_private_key,
 
-    elif action_id == ActionIds.edit:
+                                process_input=encrypted_iv,
 
-        # is_self = signer.did == did_ledger.did
+                                check_exit_code=False)
 
-        is_owner = signer == (did_ledger if did_ledger.verkey is not None else
+        if err:
 
-        did_ledger.creator)
+            raise exception.Error(_('Failed to decrypt initialization '
 
+                                    'vector: %s') % err)
 
 
-        if (VERKEY in op) and (not is_owner):
 
-            return False
+        _out, err = utils.execute('openssl', 'enc',
 
+                                  '-d', '-aes-128-cbc',
 
+                                  '-in', '%s' % (encrypted_filename,),
 
-        if ROLE in op:
+                                  '-K', '%s' % (key,),
 
-            if op_role == did_ledger.role:
+                                  '-iv', '%s' % (iv,),
 
-                # FIXME INDY-1969: related to the task
+                                  '-out', '%s' % (decrypted_filename,),
 
-                return is_owner  # TODO what is a case here, is it correctly designed
+                                  check_exit_code=False)
 
+        if err:
 
+            raise exception.Error(_('Failed to decrypt image file '
 
-            elif op_role == Roles.IDENTITY_OWNER:  # demotion of existent DID
+                                    '%(image_file)s: %(err)s') %
 
-                return check_demotion()
+                                    {'image_file': encrypted_filename,
 
+                                     'err': err})
 
 
-            elif did_ledger.role == Roles.IDENTITY_OWNER:  # promotion of existent DID
 
-                return check_promotion()
+    @staticmethod
 
+    def _test_for_malicious_tarball(path, filename):
 
+        """Raises exception if extracting tarball would escape extract path"""
 
-            else:  # role updating: demotion + promotion
+        tar_file = tarfile.open(filename, 'r|gz')
 
-                return (check_demotion() and check_promotion())
+        for n in tar_file.getnames():
 
-        else:
+            if not os.path.abspath(os.path.join(path, n)).startswith(path):
 
-            return True
+                tar_file.close()
 
+                raise exception.Error(_('Unsafe filenames in image'))
 
+        tar_file.close()
 
-    return False
 
 
+    @staticmethod
 
+    def _untarzip_image(path, filename):
 
+        S3ImageService._test_for_malicious_tarball(path, filename)
 
-def sign_and_validate(looper, node, action_id, signer, op, did_ledger=None):
+        tar_file = tarfile.open(filename, 'r|gz')
 
-    req_obj = sdk_gen_request(op, protocol_version=CURRENT_PROTOCOL_VERSION,
+        tar_file.extractall(path)
 
-                              identifier=signer.did)
+        image_file = tar_file.getnames()[0]
 
-    s_req = sdk_sign_request_objects(looper, signer.wallet_did, [req_obj])[0]
+        tar_file.close()
 
-
-
-    request = Request(**json.loads(s_req))
-
-
-
-    if auth_check(action_id, signer, op, did_ledger):
-
-        node.write_manager.dynamic_validation(request, 0)
-
-    else:
-
-        with pytest.raises(UnauthorizedClientRequest):
-
-            node.write_manager.dynamic_validation(request, 0)
-
-
-
-
-
-# TESTS
-
-# Note. some fixtures are referred explicitly just to make test nodeid names predictable
-
-
-
-def test_nym_add(
-
-        provisioner_role, nym_add_dest_role, nym_add_dest_verkey,
-
-        looper, txnPoolNodeSet,
-
-        provisioner, add_op):
-
-    sign_and_validate(looper, txnPoolNodeSet[0], ActionIds.add, provisioner, add_op)
-
-
-
-
-
-def test_nym_edit(
-
-        edited_ledger_role, edited_ledger_verkey, editor_type,
-
-        edited_nym_role, edited_nym_verkey,
-
-        looper, txnPoolNodeSet,
-
-        editor, edited, edit_op):
-
-    if edit_op is None:  # might be None, means a duplicate test case
-
-        return
-
-
-
-    if editor.verkey is None:  # skip that as well since it doesn't make sense
-
-        return
-
-
-
-    if not ROLE in edit_op:  # skip if the update operation doesn't changes neither role nor verkey
-
-        if not VERKEY in edit_op:
-
-            return
-
-
-
-    sign_and_validate(looper, txnPoolNodeSet[0], ActionIds.edit, editor, edit_op, did_ledger=edited)
+        return os.path.join(path, image_file)

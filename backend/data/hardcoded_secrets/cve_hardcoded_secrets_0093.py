@@ -2,1514 +2,1222 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-from __future__ import print_function
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
 
 
 
-import base64
+# Copyright 2012 OpenStack LLC
 
-import contextlib
+#
 
-import copy
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
 
-import email.utils
+# not use this file except in compliance with the License. You may obtain
 
-import functools
+# a copy of the License at
 
-import gzip
+#
 
-import hashlib
+#      http://www.apache.org/licenses/LICENSE-2.0
 
-import httplib2
+#
 
-import os
+# Unless required by applicable law or agreed to in writing, software
 
-import random
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-import re
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
-import shutil
+# License for the specific language governing permissions and limitations
 
-import six
+# under the License.
 
-import socket
 
-import ssl
 
-import struct
+"""Main entry point into the Identity service."""
 
-import sys
 
-import threading
 
-import time
+import uuid
 
-import traceback
+import urllib
 
-import zlib
+import urlparse
 
-from six.moves import http_client, queue
 
 
+from keystone import config
 
+from keystone import exception
 
+from keystone import policy
 
-DUMMY_URL = "http://127.0.0.1:1"
+from keystone import token
 
-DUMMY_HTTPS_URL = "https://127.0.0.1:2"
+from keystone.common import manager
 
+from keystone.common import wsgi
 
 
-tls_dir = os.path.join(os.path.dirname(__file__), "tls")
 
-CA_CERTS = os.path.join(tls_dir, "ca.pem")
 
-CA_UNUSED_CERTS = os.path.join(tls_dir, "ca_unused.pem")
 
-CLIENT_PEM = os.path.join(tls_dir, "client.pem")
+CONF = config.CONF
 
-CLIENT_ENCRYPTED_PEM = os.path.join(tls_dir, "client_encrypted.pem")
 
-SERVER_PEM = os.path.join(tls_dir, "server.pem")
 
-SERVER_CHAIN = os.path.join(tls_dir, "server_chain.pem")
 
 
+class Manager(manager.Manager):
 
+    """Default pivot point for the Identity backend.
 
 
-@contextlib.contextmanager
 
-def assert_raises(exc_type):
+    See :mod:`keystone.common.manager.Manager` for more details on how this
 
-    def _name(t):
+    dynamically calls the backend.
 
-        return getattr(t, "__name__", None) or str(t)
 
-
-
-    if not isinstance(exc_type, tuple):
-
-        exc_type = (exc_type,)
-
-    names = ", ".join(map(_name, exc_type))
-
-
-
-    try:
-
-        yield
-
-    except exc_type:
-
-        pass
-
-    else:
-
-        assert False, "Expected exception(s) {0}".format(names)
-
-
-
-
-
-class BufferedReader(object):
-
-    """io.BufferedReader with \r\n support
 
     """
 
 
-
-    def __init__(self, sock):
-
-        self._buf = b""
-
-        self._end = False
-
-        self._newline = b"\r\n"
-
-        self._sock = sock
-
-        if isinstance(sock, bytes):
-
-            self._sock = None
-
-            self._buf = sock
-
-
-
-    def _fill(self, target=1, more=None, untilend=False):
-
-        if more:
-
-            target = len(self._buf) + more
-
-        while untilend or (len(self._buf) < target):
-
-            # crutch to enable HttpRequest.from_bytes
-
-            if self._sock is None:
-
-                chunk = b""
-
-            else:
-
-                chunk = self._sock.recv(8 << 10)
-
-            # print('!!! recv', chunk)
-
-            if not chunk:
-
-                self._end = True
-
-                if untilend:
-
-                    return
-
-                else:
-
-                    raise EOFError
-
-            self._buf += chunk
-
-
-
-    def peek(self, size):
-
-        self._fill(target=size)
-
-        return self._buf[:size]
-
-
-
-    def read(self, size):
-
-        self._fill(target=size)
-
-        chunk, self._buf = self._buf[:size], self._buf[size:]
-
-        return chunk
-
-
-
-    def readall(self):
-
-        self._fill(untilend=True)
-
-        chunk, self._buf = self._buf, b""
-
-        return chunk
-
-
-
-    def readline(self):
-
-        while True:
-
-            i = self._buf.find(self._newline)
-
-            if i >= 0:
-
-                break
-
-            self._fill(more=1)
-
-        inext = i + len(self._newline)
-
-        line, self._buf = self._buf[:inext], self._buf[inext:]
-
-        return line
-
-
-
-
-
-def parse_http_message(kind, buf):
-
-    if buf._end:
-
-        return None
-
-    try:
-
-        start_line = buf.readline()
-
-    except EOFError:
-
-        return None
-
-    msg = kind()
-
-    msg.raw = start_line
-
-    if kind is HttpRequest:
-
-        assert re.match(
-
-            br".+ HTTP/\d\.\d\r\n$", start_line
-
-        ), "Start line does not look like HTTP request: " + repr(start_line)
-
-        msg.method, msg.uri, msg.proto = start_line.rstrip().decode().split(" ", 2)
-
-        assert msg.proto.startswith("HTTP/"), repr(start_line)
-
-    elif kind is HttpResponse:
-
-        assert re.match(
-
-            br"^HTTP/\d\.\d \d+ .+\r\n$", start_line
-
-        ), "Start line does not look like HTTP response: " + repr(start_line)
-
-        msg.proto, msg.status, msg.reason = start_line.rstrip().decode().split(" ", 2)
-
-        msg.status = int(msg.status)
-
-        assert msg.proto.startswith("HTTP/"), repr(start_line)
-
-    else:
-
-        raise Exception("Use HttpRequest or HttpResponse .from_{bytes,buffered}")
-
-    msg.version = msg.proto[5:]
-
-
-
-    while True:
-
-        line = buf.readline()
-
-        msg.raw += line
-
-        line = line.rstrip()
-
-        if not line:
-
-            break
-
-        t = line.decode().split(":", 1)
-
-        msg.headers[t[0].lower()] = t[1].lstrip()
-
-
-
-    content_length_string = msg.headers.get("content-length", "")
-
-    if content_length_string.isdigit():
-
-        content_length = int(content_length_string)
-
-        msg.body = msg.body_raw = buf.read(content_length)
-
-    elif msg.headers.get("transfer-encoding") == "chunked":
-
-        raise NotImplemented
-
-    elif msg.version == "1.0":
-
-        msg.body = msg.body_raw = buf.readall()
-
-    else:
-
-        msg.body = msg.body_raw = b""
-
-
-
-    msg.raw += msg.body_raw
-
-    return msg
-
-
-
-
-
-class HttpMessage(object):
 
     def __init__(self):
 
-        self.headers = {}
+        super(Manager, self).__init__(CONF.identity.driver)
 
 
 
-    @classmethod
 
-    def from_bytes(cls, bs):
 
-        buf = BufferedReader(bs)
+class Driver(object):
 
-        return parse_http_message(cls, buf)
+    """Interface description for an Identity driver."""
 
 
 
-    @classmethod
+    def authenticate(self, user_id=None, tenant_id=None, password=None):
 
-    def from_buffered(cls, buf):
+        """Authenticate a given user, tenant and password.
 
-        return parse_http_message(cls, buf)
 
 
+        Returns: (user, tenant, metadata).
 
-    def __repr__(self):
 
-        return "{} {}".format(self.__class__, repr(vars(self)))
 
+        """
 
+        raise exception.NotImplemented()
 
 
 
-class HttpRequest(HttpMessage):
+    def get_tenant(self, tenant_id):
 
-    pass
+        """Get a tenant by id.
 
 
 
+        Returns: tenant_ref or None.
 
 
-class HttpResponse(HttpMessage):
 
-    pass
+        """
 
+        raise exception.NotImplemented()
 
 
 
+    def get_tenant_by_name(self, tenant_name):
 
-class MockResponse(six.BytesIO):
+        """Get a tenant by name.
 
-    def __init__(self, body, **kwargs):
 
-        six.BytesIO.__init__(self, body)
 
-        self.headers = kwargs
+        Returns: tenant_ref or None.
 
 
 
-    def items(self):
+        """
 
-        return self.headers.items()
+        raise exception.NotImplemented()
 
 
 
-    def iteritems(self):
+    def get_user(self, user_id):
 
-        return six.iteritems(self.headers)
+        """Get a user by id.
 
 
 
+        Returns: user_ref or None.
 
 
-class MockHTTPConnection(object):
 
-    """This class is just a mock of httplib.HTTPConnection used for testing
+        """
 
-    """
+        raise exception.NotImplemented()
 
 
 
-    def __init__(
+    def get_user_by_name(self, user_name):
 
-        self,
+        """Get a user by name.
 
-        host,
 
-        port=None,
 
-        key_file=None,
+        Returns: user_ref or None.
 
-        cert_file=None,
 
-        strict=None,
 
-        timeout=None,
+        """
 
-        proxy_info=None,
+        raise exception.NotImplemented()
 
-    ):
 
-        self.host = host
 
-        self.port = port
+    def get_role(self, role_id):
 
-        self.timeout = timeout
+        """Get a role by id.
 
-        self.log = ""
 
-        self.sock = None
 
+        Returns: role_ref or None.
 
 
-    def set_debuglevel(self, level):
 
-        pass
+        """
 
+        raise exception.NotImplemented()
 
 
-    def connect(self):
 
-        "Connect to a host on a given port."
+    def list_users(self):
 
-        pass
+        """List all users in the system.
 
 
 
-    def close(self):
+        NOTE(termie): I'd prefer if this listed only the users for a given
 
-        pass
+                      tenant.
 
 
 
-    def request(self, method, request_uri, body, headers):
+        Returns: a list of user_refs or an empty list.
 
-        pass
 
 
+        """
 
-    def getresponse(self):
+        raise exception.NotImplemented()
 
-        return MockResponse(b"the body", status="200")
 
 
+    def list_roles(self):
 
+        """List all roles in the system.
 
 
-class MockHTTPBadStatusConnection(object):
 
-    """Mock of httplib.HTTPConnection that raises BadStatusLine.
+        Returns: a list of role_refs or an empty list.
 
-    """
 
 
+        """
 
-    num_calls = 0
+        raise exception.NotImplemented()
 
 
 
-    def __init__(
+    # NOTE(termie): seven calls below should probably be exposed by the api
 
-        self,
+    #               more clearly when the api redesign happens
 
-        host,
+    def add_user_to_tenant(self, tenant_id, user_id):
 
-        port=None,
+        raise exception.NotImplemented()
 
-        key_file=None,
 
-        cert_file=None,
 
-        strict=None,
+    def remove_user_from_tenant(self, tenant_id, user_id):
 
-        timeout=None,
+        raise exception.NotImplemented()
 
-        proxy_info=None,
 
-    ):
 
-        self.host = host
+    def get_all_tenants(self):
 
-        self.port = port
+        raise exception.NotImplemented()
 
-        self.timeout = timeout
 
-        self.log = ""
 
-        self.sock = None
+    def get_tenants_for_user(self, user_id):
 
-        MockHTTPBadStatusConnection.num_calls = 0
+        """Get the tenants associated with a given user.
 
 
 
-    def set_debuglevel(self, level):
+        Returns: a list of tenant ids.
 
-        pass
 
 
+        """
 
-    def connect(self):
+        raise exception.NotImplemented()
 
-        pass
 
 
+    def get_roles_for_user_and_tenant(self, user_id, tenant_id):
 
-    def close(self):
+        """Get the roles associated with a user within given tenant.
 
-        pass
 
 
+        Returns: a list of role ids.
 
-    def request(self, method, request_uri, body, headers):
 
-        pass
 
+        """
 
+        raise exception.NotImplemented()
 
-    def getresponse(self):
 
-        MockHTTPBadStatusConnection.num_calls += 1
 
-        raise http_client.BadStatusLine("")
+    def add_role_to_user_and_tenant(self, user_id, tenant_id, role_id):
 
+        """Add a role to a user within given tenant."""
 
+        raise exception.NotImplemented()
 
 
 
-@contextlib.contextmanager
+    def remove_role_from_user_and_tenant(self, user_id, tenant_id, role_id):
 
-def server_socket(fun, request_count=1, timeout=5, scheme="", tls=None):
+        """Remove a role from a user within given tenant."""
 
-    """Base socket server for tests.
+        raise exception.NotImplemented()
 
-    Likely you want to use server_request or other higher level helpers.
 
-    All arguments except fun can be passed to other server_* helpers.
 
+    # user crud
 
+    def create_user(self, user_id, user):
 
-    :param fun: fun(client_sock, tick) called after successful accept().
+        raise exception.NotImplemented()
 
-    :param request_count: test succeeds after exactly this number of requests, triggered by tick(request)
 
-    :param timeout: seconds.
 
-    :param scheme: affects yielded value
+    def update_user(self, user_id, user):
 
-        "" - build normal http/https URI.
+        raise exception.NotImplemented()
 
-        string - build normal URI using supplied scheme.
 
-        None - yield (addr, port) tuple.
 
-    :param tls:
+    def delete_user(self, user_id):
 
-        None (default) - plain HTTP.
+        raise exception.NotImplemented()
 
-        True - HTTPS with reasonable defaults. Likely you want httplib2.Http(ca_certs=tests.CA_CERTS)
 
-        string - path to custom server cert+key PEM file.
 
-        callable - function(context, listener, skip_errors) -> ssl_wrapped_listener
+    # tenant crud
 
-    """
+    def create_tenant(self, tenant_id, tenant):
 
-    gresult = [None]
+        raise exception.NotImplemented()
 
-    gcounter = [0]
 
-    tls_skip_errors = [
 
-        "TLSV1_ALERT_UNKNOWN_CA",
+    def update_tenant(self, tenant_id, tenant):
 
-    ]
+        raise exception.NotImplemented()
 
 
 
-    def tick(request):
+    def delete_tenant(self, tenant_id, tenant):
 
-        gcounter[0] += 1
+        raise exception.NotImplemented()
 
-        keep = True
 
-        keep &= gcounter[0] < request_count
 
-        if request is not None:
+    # metadata crud
 
-            keep &= request.headers.get("connection", "").lower() != "close"
 
-        return keep
 
+    def get_metadata(self, user_id, tenant_id):
 
+        raise exception.NotImplemented()
 
-    def server_socket_thread(srv):
+
+
+    def create_metadata(self, user_id, tenant_id, metadata):
+
+        raise exception.NotImplemented()
+
+
+
+    def update_metadata(self, user_id, tenant_id, metadata):
+
+        raise exception.NotImplemented()
+
+
+
+    def delete_metadata(self, user_id, tenant_id, metadata):
+
+        raise exception.NotImplemented()
+
+
+
+    # role crud
+
+    def create_role(self, role_id, role):
+
+        raise exception.NotImplemented()
+
+
+
+    def update_role(self, role_id, role):
+
+        raise exception.NotImplemented()
+
+
+
+    def delete_role(self, role_id):
+
+        raise exception.NotImplemented()
+
+
+
+
+
+class PublicRouter(wsgi.ComposableRouter):
+
+    def add_routes(self, mapper):
+
+        tenant_controller = TenantController()
+
+        mapper.connect('/tenants',
+
+                       controller=tenant_controller,
+
+                       action='get_tenants_for_token',
+
+                       conditions=dict(methods=['GET']))
+
+
+
+
+
+class AdminRouter(wsgi.ComposableRouter):
+
+    def add_routes(self, mapper):
+
+        # Tenant Operations
+
+        tenant_controller = TenantController()
+
+        mapper.connect('/tenants',
+
+                       controller=tenant_controller,
+
+                       action='get_all_tenants',
+
+                       conditions=dict(method=['GET']))
+
+        mapper.connect('/tenants/{tenant_id}',
+
+                       controller=tenant_controller,
+
+                       action='get_tenant',
+
+                       conditions=dict(method=['GET']))
+
+
+
+        # User Operations
+
+        user_controller = UserController()
+
+        mapper.connect('/users/{user_id}',
+
+                       controller=user_controller,
+
+                       action='get_user',
+
+                       conditions=dict(method=['GET']))
+
+
+
+        # Role Operations
+
+        roles_controller = RoleController()
+
+        mapper.connect('/tenants/{tenant_id}/users/{user_id}/roles',
+
+                       controller=roles_controller,
+
+                       action='get_user_roles',
+
+                       conditions=dict(method=['GET']))
+
+        mapper.connect('/users/{user_id}/roles',
+
+                       controller=user_controller,
+
+                       action='get_user_roles',
+
+                       conditions=dict(method=['GET']))
+
+
+
+
+
+class TenantController(wsgi.Application):
+
+    def __init__(self):
+
+        self.identity_api = Manager()
+
+        self.policy_api = policy.Manager()
+
+        self.token_api = token.Manager()
+
+        super(TenantController, self).__init__()
+
+
+
+    def get_all_tenants(self, context, **kw):
+
+        """Gets a list of all tenants for an admin user."""
+
+        self.assert_admin(context)
+
+        tenant_refs = self.identity_api.get_tenants(context)
+
+        params = {
+
+            'limit': context['query_string'].get('limit'),
+
+            'marker': context['query_string'].get('marker'),
+
+        }
+
+        return self._format_tenant_list(tenant_refs, **params)
+
+
+
+    def get_tenants_for_token(self, context, **kw):
+
+        """Get valid tenants for token based on token used to authenticate.
+
+
+
+        Pulls the token from the context, validates it and gets the valid
+
+        tenants for the user in the token.
+
+
+
+        Doesn't care about token scopedness.
+
+
+
+        """
 
         try:
 
-            while gcounter[0] < request_count:
+            token_ref = self.token_api.get_token(context=context,
 
-                try:
+                                                 token_id=context['token_id'])
 
-                    client, _ = srv.accept()
+        except exception.NotFound:
 
-                except ssl.SSLError as e:
+            raise exception.Unauthorized()
 
-                    if e.reason in tls_skip_errors:
 
-                        return
 
-                    raise
+        user_ref = token_ref['user']
 
+        tenant_ids = self.identity_api.get_tenants_for_user(
 
+                context, user_ref['id'])
 
-                try:
+        tenant_refs = []
 
-                    client.settimeout(timeout)
+        for tenant_id in tenant_ids:
 
-                    fun(client, tick)
+            tenant_refs.append(self.identity_api.get_tenant(
 
-                finally:
+                    context=context,
 
-                    try:
+                    tenant_id=tenant_id))
 
-                        client.shutdown(socket.SHUT_RDWR)
+        params = {
 
-                    except (IOError, socket.error):
+            'limit': context['query_string'].get('limit'),
 
-                        pass
+            'marker': context['query_string'].get('marker'),
 
-                    # FIXME: client.close() introduces connection reset by peer
+        }
 
-                    # at least in other/connection_close test
+        return self._format_tenant_list(tenant_refs, **params)
 
-                    # should not be a problem since socket would close upon garbage collection
 
-            if gcounter[0] > request_count:
 
-                gresult[0] = Exception(
+    def get_tenant(self, context, tenant_id):
 
-                    "Request count expected={0} actual={1}".format(
+        # TODO(termie): this stuff should probably be moved to middleware
 
-                        request_count, gcounter[0]
+        self.assert_admin(context)
 
-                    )
+        tenant = self.identity_api.get_tenant(context, tenant_id)
 
-                )
+        if tenant is None:
 
-        except Exception as e:
+            raise exception.TenantNotFound(tenant_id=tenant_id)
 
-            # traceback.print_exc caused IOError: concurrent operation on sys.stderr.close() under setup.py test
 
-            print(traceback.format_exc(), file=sys.stderr)
 
-            gresult[0] = e
+        return {'tenant': tenant}
 
 
 
-    bind_hostname = "localhost"
+    # CRUD Extension
 
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    def create_tenant(self, context, tenant):
 
-    server.bind((bind_hostname, 0))
+        tenant_ref = self._normalize_dict(tenant)
 
-    try:
+        self.assert_admin(context)
 
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        tenant_id = (tenant_ref.get('id')
 
-    except socket.error as ex:
+                     and tenant_ref.get('id')
 
-        print("non critical error on SO_REUSEADDR", ex)
+                     or uuid.uuid4().hex)
 
-    server.listen(10)
+        tenant_ref['id'] = tenant_id
 
-    server.settimeout(timeout)
 
-    server_port = server.getsockname()[1]
 
-    if tls is True:
+        tenant = self.identity_api.create_tenant(
 
-        tls = SERVER_CHAIN
+                context, tenant_id, tenant_ref)
 
-    if tls:
+        return {'tenant': tenant}
 
-        context = ssl_context()
 
-        if callable(tls):
 
-            context.load_cert_chain(SERVER_CHAIN)
+    def update_tenant(self, context, tenant_id, tenant):
 
-            server = tls(context, server, tls_skip_errors)
+        self.assert_admin(context)
 
-        else:
+        if self.identity_api.get_tenant(context, tenant_id) is None:
 
-            context.load_cert_chain(tls)
+            raise exception.TenantNotFound(tenant_id=tenant_id)
 
-            server = context.wrap_socket(server, server_side=True)
 
-    if scheme == "":
 
-        scheme = "https" if tls else "http"
+        tenant_ref = self.identity_api.update_tenant(
 
+                context, tenant_id, tenant)
 
+        return {'tenant': tenant_ref}
 
-    t = threading.Thread(target=server_socket_thread, args=(server,))
 
-    t.daemon = True
 
-    t.start()
+    def delete_tenant(self, context, tenant_id, **kw):
 
-    if scheme is None:
+        self.assert_admin(context)
 
-        yield (bind_hostname, server_port)
+        if self.identity_api.get_tenant(context, tenant_id) is None:
 
-    else:
+            raise exception.TenantNotFound(tenant_id=tenant_id)
 
-        yield u"{scheme}://{host}:{port}/".format(scheme=scheme, host=bind_hostname, port=server_port)
 
-    server.close()
 
-    t.join()
+        self.identity_api.delete_tenant(context, tenant_id)
 
-    if gresult[0] is not None:
 
-        raise gresult[0]
 
+    def get_tenant_users(self, context, tenant_id, **kw):
 
+        self.assert_admin(context)
 
+        if self.identity_api.get_tenant(context, tenant_id) is None:
 
+            raise exception.TenantNotFound(tenant_id=tenant_id)
 
-def server_yield(fun, **kwargs):
 
-    q = queue.Queue(1)
 
-    g = fun(q.get)
+        user_refs = self.identity_api.get_tenant_users(context, tenant_id)
 
+        return {'users': user_refs}
 
 
-    def server_yield_socket_handler(sock, tick):
 
-        buf = BufferedReader(sock)
+    def _format_tenant_list(self, tenant_refs, **kwargs):
 
-        i = 0
+        marker = kwargs.get('marker')
 
-        while True:
+        page_idx = 0
 
-            request = HttpRequest.from_buffered(buf)
+        if marker is not None:
 
-            if request is None:
+            for (marker_idx, tenant) in enumerate(tenant_refs):
 
-                break
+                if tenant['id'] == marker:
 
-            i += 1
+                    # we start pagination after the marker
 
-            request.client_sock = sock
+                    page_idx = marker_idx + 1
 
-            request.number = i
-
-            q.put(request)
-
-            response = six.next(g)
-
-            sock.sendall(response)
-
-            request.client_sock = None
-
-            if not tick(request):
-
-                break
-
-
-
-    return server_socket(server_yield_socket_handler, **kwargs)
-
-
-
-
-
-def server_request(request_handler, **kwargs):
-
-    def server_request_socket_handler(sock, tick):
-
-        buf = BufferedReader(sock)
-
-        i = 0
-
-        while True:
-
-            request = HttpRequest.from_buffered(buf)
-
-            if request is None:
-
-                break
-
-            # print("--- debug request\n" + request.raw.decode("ascii", "replace"))
-
-            i += 1
-
-            request.client_sock = sock
-
-            request.number = i
-
-            response = request_handler(request=request)
-
-            # print("--- debug response\n" + response.decode("ascii", "replace"))
-
-            sock.sendall(response)
-
-            request.client_sock = None
-
-            if not tick(request):
-
-                break
-
-
-
-    return server_socket(server_request_socket_handler, **kwargs)
-
-
-
-
-
-def server_const_bytes(response_content, **kwargs):
-
-    return server_request(lambda request: response_content, **kwargs)
-
-
-
-
-
-_http_kwargs = (
-
-    "proto",
-
-    "status",
-
-    "headers",
-
-    "body",
-
-    "add_content_length",
-
-    "add_date",
-
-    "add_etag",
-
-    "undefined_body_length",
-
-)
-
-
-
-
-
-def http_response_bytes(
-
-    proto="HTTP/1.1",
-
-    status="200 OK",
-
-    headers=None,
-
-    body=b"",
-
-    add_content_length=True,
-
-    add_date=False,
-
-    add_etag=False,
-
-    undefined_body_length=False,
-
-    **kwargs
-
-):
-
-    if undefined_body_length:
-
-        add_content_length = False
-
-    if headers is None:
-
-        headers = {}
-
-    if add_content_length:
-
-        headers.setdefault("content-length", str(len(body)))
-
-    if add_date:
-
-        headers.setdefault("date", email.utils.formatdate())
-
-    if add_etag:
-
-        headers.setdefault("etag", '"{0}"'.format(hashlib.md5(body).hexdigest()))
-
-    header_string = "".join("{0}: {1}\r\n".format(k, v) for k, v in headers.items())
-
-    if (
-
-        not undefined_body_length
-
-        and proto != "HTTP/1.0"
-
-        and "content-length" not in headers
-
-    ):
-
-        raise Exception(
-
-            "httplib2.tests.http_response_bytes: client could not figure response body length"
-
-        )
-
-    if str(status).isdigit():
-
-        status = "{} {}".format(status, http_client.responses[status])
-
-    response = (
-
-        "{proto} {status}\r\n{headers}\r\n".format(
-
-            proto=proto, status=status, headers=header_string
-
-        ).encode()
-
-        + body
-
-    )
-
-    return response
-
-
-
-
-
-def make_http_reflect(**kwargs):
-
-    assert "body" not in kwargs, "make_http_reflect will overwrite response " "body"
-
-
-
-    def fun(request):
-
-        kw = copy.deepcopy(kwargs)
-
-        kw["body"] = request.raw
-
-        response = http_response_bytes(**kw)
-
-        return response
-
-
-
-    return fun
-
-
-
-
-
-def server_route(routes, **kwargs):
-
-    response_404 = http_response_bytes(status="404 Not Found")
-
-    response_wildcard = routes.get("")
-
-
-
-    def handler(request):
-
-        target = routes.get(request.uri, response_wildcard) or response_404
-
-        if callable(target):
-
-            response = target(request=request)
-
-        else:
-
-            response = target
-
-        return response
-
-
-
-    return server_request(handler, **kwargs)
-
-
-
-
-
-def server_const_http(**kwargs):
-
-    response_kwargs = {k: kwargs.pop(k) for k in dict(kwargs) if k in _http_kwargs}
-
-    response = http_response_bytes(**response_kwargs)
-
-    return server_const_bytes(response, **kwargs)
-
-
-
-
-
-def server_list_http(responses, **kwargs):
-
-    i = iter(responses)
-
-
-
-    def handler(request):
-
-        return next(i)
-
-
-
-    kwargs.setdefault("request_count", len(responses))
-
-    return server_request(handler, **kwargs)
-
-
-
-
-
-def server_reflect(**kwargs):
-
-    response_kwargs = {k: kwargs.pop(k) for k in dict(kwargs) if k in _http_kwargs}
-
-    http_handler = make_http_reflect(**response_kwargs)
-
-    return server_request(http_handler, **kwargs)
-
-
-
-
-
-def http_parse_auth(s):
-
-    """https://tools.ietf.org/html/rfc7235#section-2.1
-
-    """
-
-    scheme, rest = s.split(" ", 1)
-
-    result = {}
-
-    while True:
-
-        m = httplib2.WWW_AUTH_RELAXED.search(rest)
-
-        if not m:
-
-            break
-
-        if len(m.groups()) == 3:
-
-            key, value, rest = m.groups()
-
-            result[key.lower()] = httplib2.UNQUOTE_PAIRS.sub(r"\1", value)
-
-    return result
-
-
-
-
-
-def store_request_response(out):
-
-    def wrapper(fun):
-
-        @functools.wraps(fun)
-
-        def wrapped(request, *a, **kw):
-
-            response_bytes = fun(request, *a, **kw)
-
-            if out is not None:
-
-                response = HttpResponse.from_bytes(response_bytes)
-
-                out.append((request, response))
-
-            return response_bytes
-
-
-
-        return wrapped
-
-
-
-    return wrapper
-
-
-
-
-
-def http_reflect_with_auth(
-
-    allow_scheme, allow_credentials, out_renew_nonce=None, out_requests=None
-
-):
-
-    """allow_scheme - 'basic', 'digest', etc allow_credentials - sequence of ('name', 'password') out_renew_nonce - None | [function]
-
-
-
-        Way to return nonce renew function to caller.
-
-        Kind of `out` parameter in some programming languages.
-
-        Allows to keep same signature for all handler builder functions.
-
-    out_requests - None | []
-
-        If set to list, every parsed request will be appended here.
-
-    """
-
-    glastnc = [None]
-
-    gnextnonce = [None]
-
-    gserver_nonce = [gen_digest_nonce(salt=b"n")]
-
-    realm = "httplib2 test"
-
-    server_opaque = gen_digest_nonce(salt=b"o")
-
-
-
-    def renew_nonce():
-
-        if gnextnonce[0]:
-
-            assert False, (
-
-                "previous nextnonce was not used, probably bug in " "test code"
-
-            )
-
-        gnextnonce[0] = gen_digest_nonce()
-
-        return gserver_nonce[0], gnextnonce[0]
-
-
-
-    if out_renew_nonce:
-
-        out_renew_nonce[0] = renew_nonce
-
-
-
-    def deny(**kwargs):
-
-        nonce_stale = kwargs.pop("nonce_stale", False)
-
-        if nonce_stale:
-
-            kwargs.setdefault("body", b"nonce stale")
-
-        if allow_scheme == "basic":
-
-            authenticate = 'basic realm="{realm}"'.format(realm=realm)
-
-        elif allow_scheme == "digest":
-
-            authenticate = (
-
-                'digest realm="{realm}", qop="auth"'
-
-                + ', nonce="{nonce}", opaque="{opaque}"'
-
-                + (", stale=true" if nonce_stale else "")
-
-            ).format(realm=realm, nonce=gserver_nonce[0], opaque=server_opaque)
-
-        else:
-
-            raise Exception("unknown allow_scheme={0}".format(allow_scheme))
-
-        deny_headers = {"www-authenticate": authenticate}
-
-        kwargs.setdefault("status", 401)
-
-        # supplied headers may overwrite generated ones
-
-        deny_headers.update(kwargs.get("headers", {}))
-
-        kwargs["headers"] = deny_headers
-
-        kwargs.setdefault("body", b"HTTP authorization required")
-
-        return http_response_bytes(**kwargs)
-
-
-
-    @store_request_response(out_requests)
-
-    def http_reflect_with_auth_handler(request):
-
-        auth_header = request.headers.get("authorization", "")
-
-        if not auth_header:
-
-            return deny()
-
-        if " " not in auth_header:
-
-            return http_response_bytes(
-
-                status=400, body=b"authorization header syntax error"
-
-            )
-
-        scheme, data = auth_header.split(" ", 1)
-
-        scheme = scheme.lower()
-
-        if scheme != allow_scheme:
-
-            return deny(body=b"must use different auth scheme")
-
-        if scheme == "basic":
-
-            decoded = base64.b64decode(data).decode()
-
-            username, password = decoded.split(":", 1)
-
-            if (username, password) in allow_credentials:
-
-                return make_http_reflect()(request)
+                    break
 
             else:
 
-                return deny(body=b"supplied credentials are not allowed")
+                msg = 'Marker could not be found'
 
-        elif scheme == "digest":
+                raise exception.ValidationError(message=msg)
 
-            server_nonce_old = gserver_nonce[0]
 
-            nextnonce = gnextnonce[0]
 
-            if nextnonce:
+        limit = kwargs.get('limit')
 
-                # server decided to change nonce, in this case, guided by caller test code
+        if limit is not None:
 
-                gserver_nonce[0] = nextnonce
+            try:
 
-                gnextnonce[0] = None
+                limit = int(limit)
 
-            server_nonce_current = gserver_nonce[0]
+                if limit < 0:
 
-            auth_info = http_parse_auth(data)
+                    raise AssertionError()
 
-            client_cnonce = auth_info.get("cnonce", "")
+            except (ValueError, AssertionError):
 
-            client_nc = auth_info.get("nc", "")
+                msg = 'Invalid limit value'
 
-            client_nonce = auth_info.get("nonce", "")
+                raise exception.ValidationError(message=msg)
 
-            client_opaque = auth_info.get("opaque", "")
 
-            client_qop = auth_info.get("qop", "auth").strip('"')
 
+        tenant_refs = tenant_refs[page_idx:limit]
 
 
-            # TODO: auth_info.get('algorithm', 'md5')
 
-            hasher = hashlib.md5
+        for x in tenant_refs:
 
+            if 'enabled' not in x:
 
+                x['enabled'] = True
 
-            # TODO: client_qop auth-int
+        o = {'tenants': tenant_refs,
 
-            ha2 = hasher(":".join((request.method, request.uri)).encode()).hexdigest()
+             'tenants_links': []}
 
+        return o
 
 
-            if client_nonce != server_nonce_current:
 
-                if client_nonce == server_nonce_old:
 
-                    return deny(nonce_stale=True)
 
-                return deny(body=b"invalid nonce")
+class UserController(wsgi.Application):
 
-            if not client_nc:
+    def __init__(self):
 
-                return deny(body=b"auth-info nc missing")
+        self.identity_api = Manager()
 
-            if client_opaque != server_opaque:
+        self.policy_api = policy.Manager()
 
-                return deny(
+        self.token_api = token.Manager()
 
-                    body="auth-info opaque mismatch expected={} actual={}".format(
+        super(UserController, self).__init__()
 
-                        server_opaque, client_opaque
 
-                    ).encode()
 
-                )
+    def get_user(self, context, user_id):
 
-            for allow_username, allow_password in allow_credentials:
+        self.assert_admin(context)
 
-                ha1 = hasher(
+        user_ref = self.identity_api.get_user(context, user_id)
 
-                    ":".join((allow_username, realm, allow_password)).encode()
+        if not user_ref:
 
-                ).hexdigest()
+            raise exception.UserNotFound(user_id=user_id)
 
-                allow_response = hasher(
 
-                    ":".join(
 
-                        (ha1, client_nonce, client_nc, client_cnonce, client_qop, ha2)
+        return {'user': user_ref}
 
-                    ).encode()
 
-                ).hexdigest()
 
-                rspauth_ha2 = hasher(":{}".format(request.uri).encode()).hexdigest()
+    def get_users(self, context):
 
-                rspauth = hasher(
+        # NOTE(termie): i can't imagine that this really wants all the data
 
-                    ":".join(
+        #               about every single user in the system...
 
-                        (
+        self.assert_admin(context)
 
-                            ha1,
+        user_refs = self.identity_api.list_users(context)
 
-                            client_nonce,
+        return {'users': user_refs}
 
-                            client_nc,
 
-                            client_cnonce,
 
-                            client_qop,
+    # CRUD extension
 
-                            rspauth_ha2,
+    def create_user(self, context, user):
 
-                        )
+        user = self._normalize_dict(user)
 
-                    ).encode()
+        self.assert_admin(context)
 
-                ).hexdigest()
+        tenant_id = user.get('tenantId', None)
 
-                if auth_info.get("response", "") == allow_response:
+        if (tenant_id is not None
 
-                    # TODO: fix or remove doubtful comment
+                and self.identity_api.get_tenant(context, tenant_id) is None):
 
-                    # do we need to save nc only on success?
+            raise exception.TenantNotFound(tenant_id=tenant_id)
 
-                    glastnc[0] = client_nc
+        user_id = uuid.uuid4().hex
 
-                    allow_headers = {
+        user_ref = user.copy()
 
-                        "authentication-info": " ".join(
+        user_ref['id'] = user_id
 
-                            (
+        new_user_ref = self.identity_api.create_user(
 
-                                'nextnonce="{}"'.format(nextnonce) if nextnonce else "",
+                context, user_id, user_ref)
 
-                                "qop={}".format(client_qop),
+        if tenant_id:
 
-                                'rspauth="{}"'.format(rspauth),
+            self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
 
-                                'cnonce="{}"'.format(client_cnonce),
+        return {'user': new_user_ref}
 
-                                "nc={}".format(client_nc),
 
-                            )
 
-                        ).strip()
+    def update_user(self, context, user_id, user):
 
-                    }
+        # NOTE(termie): this is really more of a patch than a put
 
-                    return make_http_reflect(headers=allow_headers)(request)
+        self.assert_admin(context)
 
-            return deny(body=b"supplied credentials are not allowed")
+        if self.identity_api.get_user(context, user_id) is None:
 
-        else:
+            raise exception.UserNotFound(user_id=user_id)
 
-            return http_response_bytes(
 
-                status=400,
 
-                body="unknown authorization scheme={0}".format(scheme).encode(),
+        user_ref = self.identity_api.update_user(context, user_id, user)
 
-            )
+        return {'user': user_ref}
 
 
 
-    return http_reflect_with_auth_handler
+    def delete_user(self, context, user_id):
 
+        self.assert_admin(context)
 
+        if self.identity_api.get_user(context, user_id) is None:
 
+            raise exception.UserNotFound(user_id=user_id)
 
 
-def get_cache_path():
 
-    default = "./_httplib2_test_cache"
+        self.identity_api.delete_user(context, user_id)
 
-    path = os.environ.get("httplib2_test_cache_path") or default
 
-    if os.path.exists(path):
 
-        shutil.rmtree(path)
+    def set_user_enabled(self, context, user_id, user):
 
-    return path
+        return self.update_user(context, user_id, user)
 
 
 
+    def set_user_password(self, context, user_id, user):
 
+        return self.update_user(context, user_id, user)
 
-def gen_digest_nonce(salt=b""):
 
-    t = struct.pack(">Q", int(time.time() * 1e9))
 
-    return base64.b64encode(t + b":" + hashlib.sha1(t + salt).digest()).decode()
+    def update_user_tenant(self, context, user_id, user):
 
+        """Update the default tenant."""
 
+        # ensure that we're a member of that tenant
 
+        tenant_id = user.get('tenantId')
 
+        self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
 
-def gen_password():
+        return self.update_user(context, user_id, user)
 
-    length = random.randint(8, 64)
 
-    return "".join(six.unichr(random.randint(0, 127)) for _ in range(length))
 
 
 
+class RoleController(wsgi.Application):
 
+    def __init__(self):
 
-def gzip_compress(bs):
+        self.identity_api = Manager()
 
-    # gzipobj = zlib.compressobj(9, zlib.DEFLATED, zlib.MAX_WBITS | 16)
+        self.token_api = token.Manager()
 
-    # result = gzipobj.compress(text) + gzipobj.flush()
+        self.policy_api = policy.Manager()
 
-    buf = six.BytesIO()
+        super(RoleController, self).__init__()
 
-    gf = gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=6)
 
-    gf.write(bs)
 
-    gf.close()
+    # COMPAT(essex-3)
 
-    return buf.getvalue()
+    def get_user_roles(self, context, user_id, tenant_id=None):
 
+        """Get the roles for a user and tenant pair.
 
 
 
+        Since we're trying to ignore the idea of user-only roles we're
 
-def gzip_decompress(bs):
+        not implementing them in hopes that the idea will die off.
 
-    return zlib.decompress(bs, zlib.MAX_WBITS | 16)
 
 
+        """
 
+        if tenant_id is None:
 
+            raise exception.NotImplemented(message='User roles not supported: '
 
-def deflate_compress(bs):
+                                                   'tenant ID required')
 
-    do = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
 
-    return do.compress(bs) + do.flush()
 
+        user = self.identity_api.get_user(context, user_id)
 
+        if user is None:
 
+            raise exception.UserNotFound(user_id=user_id)
 
+        tenant = self.identity_api.get_tenant(context, tenant_id)
 
-def deflate_decompress(bs):
+        if tenant is None:
 
-    return zlib.decompress(bs, -zlib.MAX_WBITS)
+            raise exception.TenantNotFound(tenant_id=tenant_id)
 
 
 
+        roles = self.identity_api.get_roles_for_user_and_tenant(
 
+                context, user_id, tenant_id)
 
-def ssl_context(protocol=None):
+        return {'roles': [self.identity_api.get_role(context, x)
 
-    """Workaround for old SSLContext() required protocol argument.
+                          for x in roles]}
 
-    """
 
-    if sys.version_info < (3, 5, 3):
 
-        return ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+    # CRUD extension
 
-    return ssl.SSLContext()
+    def get_role(self, context, role_id):
+
+        self.assert_admin(context)
+
+        role_ref = self.identity_api.get_role(context, role_id)
+
+        if not role_ref:
+
+            raise exception.RoleNotFound(role_id=role_id)
+
+        return {'role': role_ref}
+
+
+
+    def create_role(self, context, role):
+
+        role = self._normalize_dict(role)
+
+        self.assert_admin(context)
+
+        role_id = uuid.uuid4().hex
+
+        role['id'] = role_id
+
+        role_ref = self.identity_api.create_role(context, role_id, role)
+
+        return {'role': role_ref}
+
+
+
+    def delete_role(self, context, role_id):
+
+        self.assert_admin(context)
+
+        self.get_role(context, role_id)
+
+        self.identity_api.delete_role(context, role_id)
+
+
+
+    def get_roles(self, context):
+
+        self.assert_admin(context)
+
+        roles = self.identity_api.list_roles(context)
+
+        # TODO(termie): probably inefficient at some point
+
+        return {'roles': roles}
+
+
+
+    def add_role_to_user(self, context, user_id, role_id, tenant_id=None):
+
+        """Add a role to a user and tenant pair.
+
+
+
+        Since we're trying to ignore the idea of user-only roles we're
+
+        not implementing them in hopes that the idea will die off.
+
+
+
+        """
+
+        self.assert_admin(context)
+
+        if tenant_id is None:
+
+            raise exception.NotImplemented(message='User roles not supported: '
+
+                                                   'tenant_id required')
+
+        if self.identity_api.get_user(context, user_id) is None:
+
+            raise exception.UserNotFound(user_id=user_id)
+
+        if self.identity_api.get_tenant(context, tenant_id) is None:
+
+            raise exception.TenantNotFound(tenant_id=tenant_id)
+
+        if self.identity_api.get_role(context, role_id) is None:
+
+            raise exception.RoleNotFound(role_id=role_id)
+
+
+
+        # This still has the weird legacy semantics that adding a role to
+
+        # a user also adds them to a tenant
+
+        self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
+
+        self.identity_api.add_role_to_user_and_tenant(
+
+                context, user_id, tenant_id, role_id)
+
+        role_ref = self.identity_api.get_role(context, role_id)
+
+        return {'role': role_ref}
+
+
+
+    def remove_role_from_user(self, context, user_id, role_id, tenant_id=None):
+
+        """Remove a role from a user and tenant pair.
+
+
+
+        Since we're trying to ignore the idea of user-only roles we're
+
+        not implementing them in hopes that the idea will die off.
+
+
+
+        """
+
+        self.assert_admin(context)
+
+        if tenant_id is None:
+
+            raise exception.NotImplemented(message='User roles not supported: '
+
+                                                   'tenant_id required')
+
+        if self.identity_api.get_user(context, user_id) is None:
+
+            raise exception.UserNotFound(user_id=user_id)
+
+        if self.identity_api.get_tenant(context, tenant_id) is None:
+
+            raise exception.TenantNotFound(tenant_id=tenant_id)
+
+        if self.identity_api.get_role(context, role_id) is None:
+
+            raise exception.RoleNotFound(role_id=role_id)
+
+
+
+        # This still has the weird legacy semantics that adding a role to
+
+        # a user also adds them to a tenant, so we must follow up on that
+
+        self.identity_api.remove_role_from_user_and_tenant(
+
+                context, user_id, tenant_id, role_id)
+
+        roles = self.identity_api.get_roles_for_user_and_tenant(
+
+                context, user_id, tenant_id)
+
+        if not roles:
+
+            self.identity_api.remove_user_from_tenant(
+
+                    context, tenant_id, user_id)
+
+        return
+
+
+
+    # COMPAT(diablo): CRUD extension
+
+    def get_role_refs(self, context, user_id):
+
+        """Ultimate hack to get around having to make role_refs first-class.
+
+
+
+        This will basically iterate over the various roles the user has in
+
+        all tenants the user is a member of and create fake role_refs where
+
+        the id encodes the user-tenant-role information so we can look
+
+        up the appropriate data when we need to delete them.
+
+
+
+        """
+
+        self.assert_admin(context)
+
+        user_ref = self.identity_api.get_user(context, user_id)
+
+        tenant_ids = self.identity_api.get_tenants_for_user(context, user_id)
+
+        o = []
+
+        for tenant_id in tenant_ids:
+
+            role_ids = self.identity_api.get_roles_for_user_and_tenant(
+
+                    context, user_id, tenant_id)
+
+            for role_id in role_ids:
+
+                ref = {'roleId': role_id,
+
+                       'tenantId': tenant_id,
+
+                       'userId': user_id}
+
+                ref['id'] = urllib.urlencode(ref)
+
+                o.append(ref)
+
+        return {'roles': o}
+
+
+
+    # COMPAT(diablo): CRUD extension
+
+    def create_role_ref(self, context, user_id, role):
+
+        """This is actually used for adding a user to a tenant.
+
+
+
+        In the legacy data model adding a user to a tenant required setting
+
+        a role.
+
+
+
+        """
+
+        self.assert_admin(context)
+
+        # TODO(termie): for now we're ignoring the actual role
+
+        tenant_id = role.get('tenantId')
+
+        role_id = role.get('roleId')
+
+        self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
+
+        self.identity_api.add_role_to_user_and_tenant(
+
+                context, user_id, tenant_id, role_id)
+
+        role_ref = self.identity_api.get_role(context, role_id)
+
+        return {'role': role_ref}
+
+
+
+    # COMPAT(diablo): CRUD extension
+
+    def delete_role_ref(self, context, user_id, role_ref_id):
+
+        """This is actually used for deleting a user from a tenant.
+
+
+
+        In the legacy data model removing a user from a tenant required
+
+        deleting a role.
+
+
+
+        To emulate this, we encode the tenant and role in the role_ref_id,
+
+        and if this happens to be the last role for the user-tenant pair,
+
+        we remove the user from the tenant.
+
+
+
+        """
+
+        self.assert_admin(context)
+
+        # TODO(termie): for now we're ignoring the actual role
+
+        role_ref_ref = urlparse.parse_qs(role_ref_id)
+
+        tenant_id = role_ref_ref.get('tenantId')[0]
+
+        role_id = role_ref_ref.get('roleId')[0]
+
+        self.identity_api.remove_role_from_user_and_tenant(
+
+                context, user_id, tenant_id, role_id)
+
+        roles = self.identity_api.get_roles_for_user_and_tenant(
+
+                context, user_id, tenant_id)
+
+        if not roles:
+
+            self.identity_api.remove_user_from_tenant(
+
+                    context, tenant_id, user_id)

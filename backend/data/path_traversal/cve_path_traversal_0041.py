@@ -2,2196 +2,1446 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-# -*- coding: utf-8 -*-
+# Copyright 2012 OpenStack LLC.
 
-'''
+# All Rights Reserved.
 
-Zeromq transport classes
+#
 
-'''
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+
+#    not use this file except in compliance with the License. You may obtain
+
+#    a copy of the License at
+
+#
+
+#         http://www.apache.org/licenses/LICENSE-2.0
+
+#
+
+#    Unless required by applicable law or agreed to in writing, software
+
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+
+#    License for the specific language governing permissions and limitations
+
+#    under the License.
 
 
-
-# Import Python Libs
-
-from __future__ import absolute_import
-
-import os
-
-import sys
 
 import copy
 
-import errno
+import datetime
 
-import signal
+import json
 
-import hashlib
+import re
 
-import logging
+import urllib
 
-import weakref
 
-from random import randint
 
+import webob.exc
 
 
-# Import Salt Libs
 
-import salt.auth
+from glance.api import policy
 
-import salt.crypt
+import glance.api.v2 as v2
 
-import salt.utils
+from glance.common import exception
 
-import salt.utils.verify
+from glance.common import utils
 
-import salt.utils.event
+from glance.common import wsgi
 
-import salt.payload
+import glance.db
 
-import salt.transport.client
+import glance.notifier
 
-import salt.transport.server
+from glance.openstack.common import cfg
 
-import salt.transport.mixins.auth
+import glance.openstack.common.log as logging
 
-from salt.exceptions import SaltReqTimeoutError
+from glance.openstack.common import timeutils
 
+import glance.schema
 
+import glance.store
 
-import zmq
 
-import zmq.error
 
-import zmq.eventloop.ioloop
 
-# support pyzmq 13.0.x, TODO: remove once we force people to 14.0.x
 
-if not hasattr(zmq.eventloop.ioloop, 'ZMQIOLoop'):
+LOG = logging.getLogger(__name__)
 
-    zmq.eventloop.ioloop.ZMQIOLoop = zmq.eventloop.ioloop.IOLoop
 
-import zmq.eventloop.zmqstream
 
-try:
+CONF = cfg.CONF
 
-    import zmq.utils.monitor
 
-    HAS_ZMQ_MONITOR = True
 
-except ImportError:
 
-    HAS_ZMQ_MONITOR = False
 
+class ImagesController(object):
 
+    def __init__(self, db_api=None, policy_enforcer=None, notifier=None,
 
-# Import Tornado Libs
+                 store_api=None):
 
-import tornado
+        self.db_api = db_api or glance.db.get_api()
 
-import tornado.gen
+        self.db_api.configure_db()
 
-import tornado.concurrent
+        self.policy = policy_enforcer or policy.Enforcer()
 
+        self.notifier = notifier or glance.notifier.Notifier()
 
+        self.store_api = store_api or glance.store
 
-# Import third party libs
+        self.store_api.create_stores()
 
-import salt.ext.six as six
 
-try:
 
-    from Cryptodome.Cipher import PKCS1_OAEP
+    def _enforce(self, req, action):
 
-except ImportError:
-
-    from Crypto.Cipher import PKCS1_OAEP
-
-
-
-log = logging.getLogger(__name__)
-
-
-
-
-
-class AsyncZeroMQReqChannel(salt.transport.client.ReqChannel):
-
-    '''
-
-    Encapsulate sending routines to ZeroMQ.
-
-
-
-    ZMQ Channels default to 'crypt=aes'
-
-    '''
-
-    # This class is only a singleton per minion/master pair
-
-    # mapping of io_loop -> {key -> channel}
-
-    instance_map = weakref.WeakKeyDictionary()
-
-
-
-    def __new__(cls, opts, **kwargs):
-
-        '''
-
-        Only create one instance of channel per __key()
-
-        '''
-
-
-
-        # do we have any mapping for this io_loop
-
-        io_loop = kwargs.get('io_loop')
-
-        if io_loop is None:
-
-            zmq.eventloop.ioloop.install()
-
-            io_loop = tornado.ioloop.IOLoop.current()
-
-        if io_loop not in cls.instance_map:
-
-            cls.instance_map[io_loop] = weakref.WeakValueDictionary()
-
-        loop_instance_map = cls.instance_map[io_loop]
-
-
-
-        key = cls.__key(opts, **kwargs)
-
-        obj = loop_instance_map.get(key)
-
-        if obj is None:
-
-            log.debug('Initializing new AsyncZeroMQReqChannel for {0}'.format(key))
-
-            # we need to make a local variable for this, as we are going to store
-
-            # it in a WeakValueDictionary-- which will remove the item if no one
-
-            # references it-- this forces a reference while we return to the caller
-
-            obj = object.__new__(cls)
-
-            obj.__singleton_init__(opts, **kwargs)
-
-            loop_instance_map[key] = obj
-
-            log.trace('Inserted key into loop_instance_map id {0} for key {1} and process {2}'.format(id(loop_instance_map), key, os.getpid()))
-
-        else:
-
-            log.debug('Re-using AsyncZeroMQReqChannel for {0}'.format(key))
-
-        return obj
-
-
-
-    def __deepcopy__(self, memo):
-
-        cls = self.__class__
-
-        result = cls.__new__(cls, copy.deepcopy(self.opts, memo))  # pylint: disable=too-many-function-args
-
-        memo[id(self)] = result
-
-        for key in self.__dict__:
-
-            if key in ('_io_loop',):
-
-                continue
-
-                # The _io_loop has a thread Lock which will fail to be deep
-
-                # copied. Skip it because it will just be recreated on the
-
-                # new copy.
-
-            if key == 'message_client':
-
-                # Recreate the message client because it will fail to be deep
-
-                # copied. The reason is the same as the io_loop skip above.
-
-                setattr(result, key,
-
-                        AsyncReqMessageClientPool(result.opts,
-
-                                                  args=(result.opts, self.master_uri,),
-
-                                                  kwargs={'io_loop': self._io_loop}))
-
-
-
-                continue
-
-            setattr(result, key, copy.deepcopy(self.__dict__[key], memo))
-
-        return result
-
-
-
-    @classmethod
-
-    def __key(cls, opts, **kwargs):
-
-        return (opts['pki_dir'],     # where the keys are stored
-
-                opts['id'],          # minion ID
-
-                kwargs.get('master_uri', opts.get('master_uri')),  # master ID
-
-                kwargs.get('crypt', 'aes'),  # TODO: use the same channel for crypt
-
-                )
-
-
-
-    # has to remain empty for singletons, since __init__ will *always* be called
-
-    def __init__(self, opts, **kwargs):
-
-        pass
-
-
-
-    # an init for the singleton instance to call
-
-    def __singleton_init__(self, opts, **kwargs):
-
-        self.opts = dict(opts)
-
-        self.ttype = 'zeromq'
-
-
-
-        # crypt defaults to 'aes'
-
-        self.crypt = kwargs.get('crypt', 'aes')
-
-
-
-        if 'master_uri' in kwargs:
-
-            self.opts['master_uri'] = kwargs['master_uri']
-
-
-
-        self._io_loop = kwargs.get('io_loop')
-
-        if self._io_loop is None:
-
-            zmq.eventloop.ioloop.install()
-
-            self._io_loop = tornado.ioloop.IOLoop.current()
-
-
-
-        if self.crypt != 'clear':
-
-            # we don't need to worry about auth as a kwarg, since its a singleton
-
-            self.auth = salt.crypt.AsyncAuth(self.opts, io_loop=self._io_loop)
-
-        self.message_client = AsyncReqMessageClientPool(self.opts,
-
-                                                        args=(self.opts, self.master_uri,),
-
-                                                        kwargs={'io_loop': self._io_loop})
-
-
-
-    def __del__(self):
-
-        '''
-
-        Since the message_client creates sockets and assigns them to the IOLoop we have to
-
-        specifically destroy them, since we aren't the only ones with references to the FDs
-
-        '''
-
-        if hasattr(self, 'message_client'):
-
-            self.message_client.destroy()
-
-        else:
-
-            log.debug('No message_client attr for AsyncZeroMQReqChannel found. Not destroying sockets.')
-
-
-
-    @property
-
-    def master_uri(self):
-
-        return self.opts['master_uri']
-
-
-
-    def _package_load(self, load):
-
-        return {
-
-            'enc': self.crypt,
-
-            'load': load,
-
-        }
-
-
-
-    @tornado.gen.coroutine
-
-    def crypted_transfer_decode_dictentry(self, load, dictkey=None, tries=3, timeout=60):
-
-        if not self.auth.authenticated:
-
-            # Return controle back to the caller, continue when authentication succeeds
-
-            yield self.auth.authenticate()
-
-        # Return control to the caller. When send() completes, resume by populating ret with the Future.result
-
-        ret = yield self.message_client.send(
-
-            self._package_load(self.auth.crypticle.dumps(load)),
-
-            timeout=timeout,
-
-            tries=tries,
-
-        )
-
-        key = self.auth.get_keys()
-
-        cipher = PKCS1_OAEP.new(key)
-
-        if 'key' not in ret:
-
-            # Reauth in the case our key is deleted on the master side.
-
-            yield self.auth.authenticate()
-
-            ret = yield self.message_client.send(
-
-                self._package_load(self.auth.crypticle.dumps(load)),
-
-                timeout=timeout,
-
-                tries=tries,
-
-            )
-
-        aes = cipher.decrypt(ret['key'])
-
-        pcrypt = salt.crypt.Crypticle(self.opts, aes)
-
-        data = pcrypt.loads(ret[dictkey])
-
-        if six.PY3:
-
-            data = salt.transport.frame.decode_embedded_strs(data)
-
-        raise tornado.gen.Return(data)
-
-
-
-    @tornado.gen.coroutine
-
-    def _crypted_transfer(self, load, tries=3, timeout=60, raw=False):
-
-        '''
-
-        Send a load across the wire, with encryption
-
-
-
-        In case of authentication errors, try to renegotiate authentication
-
-        and retry the method.
-
-
-
-        Indeed, we can fail too early in case of a master restart during a
-
-        minion state execution call
-
-
-
-        :param dict load: A load to send across the wire
-
-        :param int tries: The number of times to make before failure
-
-        :param int timeout: The number of seconds on a response before failing
-
-        '''
-
-        @tornado.gen.coroutine
-
-        def _do_transfer():
-
-            # Yield control to the caller. When send() completes, resume by populating data with the Future.result
-
-            data = yield self.message_client.send(
-
-                self._package_load(self.auth.crypticle.dumps(load)),
-
-                timeout=timeout,
-
-                tries=tries,
-
-            )
-
-            # we may not have always data
-
-            # as for example for saltcall ret submission, this is a blind
-
-            # communication, we do not subscribe to return events, we just
-
-            # upload the results to the master
-
-            if data:
-
-                data = self.auth.crypticle.loads(data, raw)
-
-            if six.PY3 and not raw:
-
-                data = salt.transport.frame.decode_embedded_strs(data)
-
-            raise tornado.gen.Return(data)
-
-        if not self.auth.authenticated:
-
-            # Return control back to the caller, resume when authentication succeeds
-
-            yield self.auth.authenticate()
+        """Authorize an action against our policies"""
 
         try:
 
-            # We did not get data back the first time. Retry.
+            self.policy.enforce(req.context, action, {})
 
-            ret = yield _do_transfer()
+        except exception.Forbidden:
 
-        except salt.crypt.AuthenticationError:
+            raise webob.exc.HTTPForbidden()
 
-            # If auth error, return control back to the caller, continue when authentication succeeds
 
-            yield self.auth.authenticate()
 
-            ret = yield _do_transfer()
+    def _normalize_properties(self, image):
 
-        raise tornado.gen.Return(ret)
+        """Convert the properties from the stored format to a dict
 
 
 
-    @tornado.gen.coroutine
+        The db api returns a list of dicts that look like
 
-    def _uncrypted_transfer(self, load, tries=3, timeout=60):
+        {'name': <key>, 'value': <value>}, while it expects a format
 
-        '''
+        like {<key>: <value>} in image create and update calls. This
 
-        Send a load across the wire in cleartext
+        function takes the extra step that the db api should be
 
+        responsible for in the image get calls.
 
 
-        :param dict load: A load to send across the wire
 
-        :param int tries: The number of times to make before failure
+        The db api will also return deleted image properties that must
 
-        :param int timeout: The number of seconds on a response before failing
+        be filtered out.
 
-        '''
+        """
 
-        ret = yield self.message_client.send(
+        properties = [(p['name'], p['value'])
 
-            self._package_load(load),
+                      for p in image['properties'] if not p['deleted']]
 
-            timeout=timeout,
+        image['properties'] = dict(properties)
 
-            tries=tries,
+        return image
 
-        )
 
 
-
-        raise tornado.gen.Return(ret)
-
-
-
-    @tornado.gen.coroutine
-
-    def send(self, load, tries=3, timeout=60, raw=False):
-
-        '''
-
-        Send a request, return a future which will complete when we send the message
-
-        '''
-
-        if self.crypt == 'clear':
-
-            ret = yield self._uncrypted_transfer(load, tries=tries, timeout=timeout)
-
-        else:
-
-            ret = yield self._crypted_transfer(load, tries=tries, timeout=timeout, raw=raw)
-
-        raise tornado.gen.Return(ret)
-
-
-
-
-
-class AsyncZeroMQPubChannel(salt.transport.mixins.auth.AESPubClientMixin, salt.transport.client.AsyncPubChannel):
-
-    '''
-
-    A transport channel backed by ZeroMQ for a Salt Publisher to use to
-
-    publish commands to connected minions
-
-    '''
-
-    def __init__(self,
-
-                 opts,
-
-                 **kwargs):
-
-        self.opts = opts
-
-        self.ttype = 'zeromq'
-
-
-
-        self.io_loop = kwargs.get('io_loop')
-
-        if self.io_loop is None:
-
-            zmq.eventloop.ioloop.install()
-
-            self.io_loop = tornado.ioloop.IOLoop.current()
-
-
-
-        self.hexid = hashlib.sha1(six.b(self.opts['id'])).hexdigest()
-
-
-
-        self.auth = salt.crypt.AsyncAuth(self.opts, io_loop=self.io_loop)
-
-
-
-        self.serial = salt.payload.Serial(self.opts)
-
-
-
-        self.context = zmq.Context()
-
-        self._socket = self.context.socket(zmq.SUB)
-
-
-
-        if self.opts['zmq_filtering']:
-
-            # TODO: constants file for "broadcast"
-
-            self._socket.setsockopt(zmq.SUBSCRIBE, b'broadcast')
-
-            self._socket.setsockopt(zmq.SUBSCRIBE, self.hexid)
-
-        else:
-
-            self._socket.setsockopt(zmq.SUBSCRIBE, b'')
-
-
-
-        self._socket.setsockopt(zmq.IDENTITY, salt.utils.to_bytes(self.opts['id']))
-
-
-
-        # TODO: cleanup all the socket opts stuff
-
-        if hasattr(zmq, 'TCP_KEEPALIVE'):
-
-            self._socket.setsockopt(
-
-                zmq.TCP_KEEPALIVE, self.opts['tcp_keepalive']
-
-            )
-
-            self._socket.setsockopt(
-
-                zmq.TCP_KEEPALIVE_IDLE, self.opts['tcp_keepalive_idle']
-
-            )
-
-            self._socket.setsockopt(
-
-                zmq.TCP_KEEPALIVE_CNT, self.opts['tcp_keepalive_cnt']
-
-            )
-
-            self._socket.setsockopt(
-
-                zmq.TCP_KEEPALIVE_INTVL, self.opts['tcp_keepalive_intvl']
-
-            )
-
-
-
-        recon_delay = self.opts['recon_default']
-
-
-
-        if self.opts['recon_randomize']:
-
-            recon_delay = randint(self.opts['recon_default'],
-
-                                  self.opts['recon_default'] + self.opts['recon_max']
-
-                          )
-
-
-
-            log.debug("Generated random reconnect delay between '{0}ms' and '{1}ms' ({2})".format(
-
-                self.opts['recon_default'],
-
-                self.opts['recon_default'] + self.opts['recon_max'],
-
-                recon_delay)
-
-            )
-
-
-
-        log.debug("Setting zmq_reconnect_ivl to '{0}ms'".format(recon_delay))
-
-        self._socket.setsockopt(zmq.RECONNECT_IVL, recon_delay)
-
-
-
-        if hasattr(zmq, 'RECONNECT_IVL_MAX'):
-
-            log.debug("Setting zmq_reconnect_ivl_max to '{0}ms'".format(
-
-                self.opts['recon_default'] + self.opts['recon_max'])
-
-            )
-
-
-
-            self._socket.setsockopt(
-
-                zmq.RECONNECT_IVL_MAX, self.opts['recon_max']
-
-            )
-
-
-
-        if (self.opts['ipv6'] is True or ':' in self.opts['master_ip']) and hasattr(zmq, 'IPV4ONLY'):
-
-            # IPv6 sockets work for both IPv6 and IPv4 addresses
-
-            self._socket.setsockopt(zmq.IPV4ONLY, 0)
-
-
-
-        if HAS_ZMQ_MONITOR and self.opts['zmq_monitor']:
-
-            self._monitor = ZeroMQSocketMonitor(self._socket)
-
-            self._monitor.start_io_loop(self.io_loop)
-
-
-
-    def destroy(self):
-
-        if hasattr(self, '_monitor') and self._monitor is not None:
-
-            self._monitor.stop()
-
-            self._monitor = None
-
-        if hasattr(self, '_stream'):
-
-            # TODO: Optionally call stream.close() on newer pyzmq? Its broken on some
-
-            self._stream.io_loop.remove_handler(self._stream.socket)
-
-            self._stream.socket.close(0)
-
-        elif hasattr(self, '_socket'):
-
-            self._socket.close(0)
-
-        if hasattr(self, 'context') and self.context.closed is False:
-
-            self.context.term()
-
-
-
-    def __del__(self):
-
-        self.destroy()
-
-
-
-    # TODO: this is the time to see if we are connected, maybe use the req channel to guess?
-
-    @tornado.gen.coroutine
-
-    def connect(self):
-
-        if not self.auth.authenticated:
-
-            yield self.auth.authenticate()
-
-        self.publish_port = self.auth.creds['publish_port']
-
-        self._socket.connect(self.master_pub)
-
-
-
-    @property
-
-    def master_pub(self):
-
-        '''
-
-        Return the master publish port
-
-        '''
-
-        return 'tcp://{ip}:{port}'.format(ip=self.opts['master_ip'],
-
-                                          port=self.publish_port)
-
-
-
-    @tornado.gen.coroutine
-
-    def _decode_messages(self, messages):
-
-        '''
-
-        Take the zmq messages, decrypt/decode them into a payload
-
-
-
-        :param list messages: A list of messages to be decoded
-
-        '''
-
-        messages_len = len(messages)
-
-        # if it was one message, then its old style
-
-        if messages_len == 1:
-
-            payload = self.serial.loads(messages[0])
-
-        # 2 includes a header which says who should do it
-
-        elif messages_len == 2:
-
-            if messages[0] not in ('broadcast', self.hexid):
-
-                log.debug('Publish received for not this minion: {0}'.format(messages[0]))
-
-                raise tornado.gen.Return(None)
-
-            payload = self.serial.loads(messages[1])
-
-        else:
-
-            raise Exception(('Invalid number of messages ({0}) in zeromq pub'
-
-                             'message from master').format(len(messages_len)))
-
-        # Yield control back to the caller. When the payload has been decoded, assign
-
-        # the decoded payload to 'ret' and resume operation
-
-        ret = yield self._decode_payload(payload)
-
-        raise tornado.gen.Return(ret)
-
-
-
-    @property
-
-    def stream(self):
-
-        '''
-
-        Return the current zmqstream, creating one if necessary
-
-        '''
-
-        if not hasattr(self, '_stream'):
-
-            self._stream = zmq.eventloop.zmqstream.ZMQStream(self._socket, io_loop=self.io_loop)
-
-        return self._stream
-
-
-
-    def on_recv(self, callback):
-
-        '''
-
-        Register a callback for received messages (that we didn't initiate)
-
-
-
-        :param func callback: A function which should be called when data is received
-
-        '''
-
-        if callback is None:
-
-            return self.stream.on_recv(None)
-
-
-
-        @tornado.gen.coroutine
-
-        def wrap_callback(messages):
-
-            payload = yield self._decode_messages(messages)
-
-            if payload is not None:
-
-                callback(payload)
-
-        return self.stream.on_recv(wrap_callback)
-
-
-
-
-
-class ZeroMQReqServerChannel(salt.transport.mixins.auth.AESReqServerMixin, salt.transport.server.ReqServerChannel):
-
-
-
-    def __init__(self, opts):
-
-        salt.transport.server.ReqServerChannel.__init__(self, opts)
-
-        self._closing = False
-
-
-
-    def zmq_device(self):
-
-        '''
-
-        Multiprocessing target for the zmq queue device
-
-        '''
-
-        self.__setup_signals()
-
-        salt.utils.appendproctitle('MWorkerQueue')
-
-        self.context = zmq.Context(self.opts['worker_threads'])
-
-        # Prepare the zeromq sockets
-
-        self.uri = 'tcp://{interface}:{ret_port}'.format(**self.opts)
-
-        self.clients = self.context.socket(zmq.ROUTER)
-
-        if self.opts['ipv6'] is True and hasattr(zmq, 'IPV4ONLY'):
-
-            # IPv6 sockets work for both IPv6 and IPv4 addresses
-
-            self.clients.setsockopt(zmq.IPV4ONLY, 0)
-
-        self.clients.setsockopt(zmq.BACKLOG, self.opts.get('zmq_backlog', 1000))
-
-        if HAS_ZMQ_MONITOR and self.opts['zmq_monitor']:
-
-            # Socket monitor shall be used the only for debug  purposes so using threading doesn't look too bad here
-
-            import threading
-
-            self._monitor = ZeroMQSocketMonitor(self.clients)
-
-            t = threading.Thread(target=self._monitor.start_poll)
-
-            t.start()
-
-
-
-        self.workers = self.context.socket(zmq.DEALER)
-
-
-
-        if self.opts.get('ipc_mode', '') == 'tcp':
-
-            self.w_uri = 'tcp://127.0.0.1:{0}'.format(
-
-                self.opts.get('tcp_master_workers', 4515)
-
-                )
-
-        else:
-
-            self.w_uri = 'ipc://{0}'.format(
-
-                os.path.join(self.opts['sock_dir'], 'workers.ipc')
-
-                )
-
-
-
-        log.info('Setting up the master communication server')
-
-        self.clients.bind(self.uri)
-
-
-
-        self.workers.bind(self.w_uri)
-
-
-
-        while True:
-
-            if self.clients.closed or self.workers.closed:
-
-                break
-
-            try:
-
-                zmq.device(zmq.QUEUE, self.clients, self.workers)
-
-            except zmq.ZMQError as exc:
-
-                if exc.errno == errno.EINTR:
-
-                    continue
-
-                raise exc
-
-            except (KeyboardInterrupt, SystemExit):
-
-                break
-
-
-
-    def close(self):
-
-        '''
-
-        Cleanly shutdown the router socket
-
-        '''
-
-        if self._closing:
-
-            return
-
-        log.info('MWorkerQueue under PID %s is closing', os.getpid())
-
-        self._closing = True
-
-        if hasattr(self, '_monitor') and self._monitor is not None:
-
-            self._monitor.stop()
-
-            self._monitor = None
-
-        if hasattr(self, '_w_monitor') and self._w_monitor is not None:
-
-            self._w_monitor.stop()
-
-            self._w_monitor = None
-
-        if hasattr(self, 'clients') and self.clients.closed is False:
-
-            self.clients.close()
-
-        if hasattr(self, 'workers') and self.workers.closed is False:
-
-            self.workers.close()
-
-        if hasattr(self, 'stream'):
-
-            self.stream.close()
-
-        if hasattr(self, '_socket') and self._socket.closed is False:
-
-            self._socket.close()
-
-        if hasattr(self, 'context') and self.context.closed is False:
-
-            self.context.term()
-
-
-
-    def pre_fork(self, process_manager):
-
-        '''
-
-        Pre-fork we need to create the zmq router device
-
-
-
-        :param func process_manager: An instance of salt.utils.process.ProcessManager
-
-        '''
-
-        salt.transport.mixins.auth.AESReqServerMixin.pre_fork(self, process_manager)
-
-        process_manager.add_process(self.zmq_device)
-
-
-
-    def post_fork(self, payload_handler, io_loop):
-
-        '''
-
-        After forking we need to create all of the local sockets to listen to the
-
-        router
-
-
-
-        :param func payload_handler: A function to called to handle incoming payloads as
-
-                                     they are picked up off the wire
-
-        :param IOLoop io_loop: An instance of a Tornado IOLoop, to handle event scheduling
-
-        '''
-
-        self.payload_handler = payload_handler
-
-        self.io_loop = io_loop
-
-
-
-        self.context = zmq.Context(1)
-
-        self._socket = self.context.socket(zmq.REP)
-
-        if HAS_ZMQ_MONITOR and self.opts['zmq_monitor']:
-
-            # Socket monitor shall be used the only for debug  purposes so using threading doesn't look too bad here
-
-            import threading
-
-            self._w_monitor = ZeroMQSocketMonitor(self._socket)
-
-            t = threading.Thread(target=self._w_monitor.start_poll)
-
-            t.start()
-
-
-
-        if self.opts.get('ipc_mode', '') == 'tcp':
-
-            self.w_uri = 'tcp://127.0.0.1:{0}'.format(
-
-                self.opts.get('tcp_master_workers', 4515)
-
-                )
-
-        else:
-
-            self.w_uri = 'ipc://{0}'.format(
-
-                os.path.join(self.opts['sock_dir'], 'workers.ipc')
-
-                )
-
-        log.info('Worker binding to socket {0}'.format(self.w_uri))
-
-        self._socket.connect(self.w_uri)
-
-
-
-        salt.transport.mixins.auth.AESReqServerMixin.post_fork(self, payload_handler, io_loop)
-
-
-
-        self.stream = zmq.eventloop.zmqstream.ZMQStream(self._socket, io_loop=self.io_loop)
-
-        self.stream.on_recv_stream(self.handle_message)
-
-
-
-    @tornado.gen.coroutine
-
-    def handle_message(self, stream, payload):
-
-        '''
-
-        Handle incoming messages from underylying TCP streams
-
-
-
-        :stream ZMQStream stream: A ZeroMQ stream.
-
-        See http://zeromq.github.io/pyzmq/api/generated/zmq.eventloop.zmqstream.html
-
-
-
-        :param dict payload: A payload to process
-
-        '''
+    def _extract_tags(self, image):
 
         try:
 
-            payload = self.serial.loads(payload[0])
+            #NOTE(bcwaldon): cast to set to make the list unique, then
 
-            payload = self._decode_payload(payload)
+            # cast back to list since that's a more sane response type
 
-        except Exception as exc:
+            return list(set(image.pop('tags')))
 
-            exc_type = type(exc).__name__
-
-            if exc_type == 'AuthenticationError':
-
-                log.debug(
-
-                    'Minion failed to auth to master. Since the payload is '
-
-                    'encrypted, it is not known which minion failed to '
-
-                    'authenticate. It is likely that this is a transient '
-
-                    'failure due to the master rotating its public key.'
-
-                )
-
-            else:
-
-                log.error('Bad load from minion: %s: %s', exc_type, exc)
-
-            stream.send(self.serial.dumps('bad load'))
-
-            raise tornado.gen.Return()
-
-
-
-        # TODO helper functions to normalize payload?
-
-        if not isinstance(payload, dict) or not isinstance(payload.get('load'), dict):
-
-            log.error('payload and load must be a dict. Payload was: {0} and load was {1}'.format(payload, payload.get('load')))
-
-            stream.send(self.serial.dumps('payload and load must be a dict'))
-
-            raise tornado.gen.Return()
-
-
-
-        # intercept the "_auth" commands, since the main daemon shouldn't know
-
-        # anything about our key auth
-
-        if payload['enc'] == 'clear' and payload.get('load', {}).get('cmd') == '_auth':
-
-            stream.send(self.serial.dumps(self._auth(payload['load'])))
-
-            raise tornado.gen.Return()
-
-
-
-        # TODO: test
-
-        try:
-
-            # Take the payload_handler function that was registered when we created the channel
-
-            # and call it, returning control to the caller until it completes
-
-            ret, req_opts = yield self.payload_handler(payload)
-
-        except Exception as e:
-
-            # always attempt to return an error to the minion
-
-            stream.send('Some exception handling minion payload')
-
-            log.error('Some exception handling a payload from minion', exc_info=True)
-
-            raise tornado.gen.Return()
-
-
-
-        req_fun = req_opts.get('fun', 'send')
-
-        if req_fun == 'send_clear':
-
-            stream.send(self.serial.dumps(ret))
-
-        elif req_fun == 'send':
-
-            stream.send(self.serial.dumps(self.crypticle.dumps(ret)))
-
-        elif req_fun == 'send_private':
-
-            stream.send(self.serial.dumps(self._encrypt_private(ret,
-
-                                                                req_opts['key'],
-
-                                                                req_opts['tgt'],
-
-                                                                )))
-
-        else:
-
-            log.error('Unknown req_fun {0}'.format(req_fun))
-
-            # always attempt to return an error to the minion
-
-            stream.send('Server-side exception handling payload')
-
-        raise tornado.gen.Return()
-
-
-
-    def __setup_signals(self):
-
-        signal.signal(signal.SIGINT, self._handle_signals)
-
-        signal.signal(signal.SIGTERM, self._handle_signals)
-
-
-
-    def _handle_signals(self, signum, sigframe):
-
-        msg = '{0} received a '.format(self.__class__.__name__)
-
-        if signum == signal.SIGINT:
-
-            msg += 'SIGINT'
-
-        elif signum == signal.SIGTERM:
-
-            msg += 'SIGTERM'
-
-        msg += '. Exiting'
-
-        log.debug(msg)
-
-        self.close()
-
-        sys.exit(salt.defaults.exitcodes.EX_OK)
-
-
-
-
-
-def _set_tcp_keepalive(zmq_socket, opts):
-
-    '''
-
-    Ensure that TCP keepalives are set as specified in "opts".
-
-
-
-    Warning: Failure to set TCP keepalives on the salt-master can result in
-
-    not detecting the loss of a minion when the connection is lost or when
-
-    it's host has been terminated without first closing the socket.
-
-    Salt's Presence System depends on this connection status to know if a minion
-
-    is "present".
-
-
-
-    Warning: Failure to set TCP keepalives on minions can result in frequent or
-
-    unexpected disconnects!
-
-    '''
-
-    if hasattr(zmq, 'TCP_KEEPALIVE') and opts:
-
-        if 'tcp_keepalive' in opts:
-
-            zmq_socket.setsockopt(
-
-                zmq.TCP_KEEPALIVE, opts['tcp_keepalive']
-
-            )
-
-        if 'tcp_keepalive_idle' in opts:
-
-            zmq_socket.setsockopt(
-
-                zmq.TCP_KEEPALIVE_IDLE, opts['tcp_keepalive_idle']
-
-            )
-
-        if 'tcp_keepalive_cnt' in opts:
-
-            zmq_socket.setsockopt(
-
-                zmq.TCP_KEEPALIVE_CNT, opts['tcp_keepalive_cnt']
-
-            )
-
-        if 'tcp_keepalive_intvl' in opts:
-
-            zmq_socket.setsockopt(
-
-                zmq.TCP_KEEPALIVE_INTVL, opts['tcp_keepalive_intvl']
-
-            )
-
-
-
-
-
-class ZeroMQPubServerChannel(salt.transport.server.PubServerChannel):
-
-    '''
-
-    Encapsulate synchronous operations for a publisher channel
-
-    '''
-
-    def __init__(self, opts):
-
-        self.opts = opts
-
-        self.serial = salt.payload.Serial(self.opts)  # TODO: in init?
-
-        self.ckminions = salt.utils.minions.CkMinions(self.opts)
-
-
-
-    def connect(self):
-
-        return tornado.gen.sleep(5)
-
-
-
-    def _publish_daemon(self):
-
-        '''
-
-        Bind to the interface specified in the configuration file
-
-        '''
-
-        salt.utils.appendproctitle(self.__class__.__name__)
-
-        # Set up the context
-
-        context = zmq.Context(1)
-
-        # Prepare minion publish socket
-
-        pub_sock = context.socket(zmq.PUB)
-
-        _set_tcp_keepalive(pub_sock, self.opts)
-
-        # if 2.1 >= zmq < 3.0, we only have one HWM setting
-
-        try:
-
-            pub_sock.setsockopt(zmq.HWM, self.opts.get('pub_hwm', 1000))
-
-        # in zmq >= 3.0, there are separate send and receive HWM settings
-
-        except AttributeError:
-
-            # Set the High Water Marks. For more information on HWM, see:
-
-            # http://api.zeromq.org/4-1:zmq-setsockopt
-
-            pub_sock.setsockopt(zmq.SNDHWM, self.opts.get('pub_hwm', 1000))
-
-            pub_sock.setsockopt(zmq.RCVHWM, self.opts.get('pub_hwm', 1000))
-
-        if self.opts['ipv6'] is True and hasattr(zmq, 'IPV4ONLY'):
-
-            # IPv6 sockets work for both IPv6 and IPv4 addresses
-
-            pub_sock.setsockopt(zmq.IPV4ONLY, 0)
-
-        pub_sock.setsockopt(zmq.BACKLOG, self.opts.get('zmq_backlog', 1000))
-
-        pub_uri = 'tcp://{interface}:{publish_port}'.format(**self.opts)
-
-        # Prepare minion pull socket
-
-        pull_sock = context.socket(zmq.PULL)
-
-
-
-        if self.opts.get('ipc_mode', '') == 'tcp':
-
-            pull_uri = 'tcp://127.0.0.1:{0}'.format(
-
-                self.opts.get('tcp_master_publish_pull', 4514)
-
-                )
-
-        else:
-
-            pull_uri = 'ipc://{0}'.format(
-
-                os.path.join(self.opts['sock_dir'], 'publish_pull.ipc')
-
-                )
-
-        salt.utils.zeromq.check_ipc_path_max_len(pull_uri)
-
-
-
-        # Start the minion command publisher
-
-        log.info('Starting the Salt Publisher on {0}'.format(pub_uri))
-
-        pub_sock.bind(pub_uri)
-
-
-
-        # Securely create socket
-
-        log.info('Starting the Salt Puller on {0}'.format(pull_uri))
-
-        old_umask = os.umask(0o177)
-
-        try:
-
-            pull_sock.bind(pull_uri)
-
-        finally:
-
-            os.umask(old_umask)
-
-
-
-        try:
-
-            while True:
-
-                # Catch and handle EINTR from when this process is sent
-
-                # SIGUSR1 gracefully so we don't choke and die horribly
-
-                try:
-
-                    package = pull_sock.recv()
-
-                    unpacked_package = salt.payload.unpackage(package)
-
-                    if six.PY3:
-
-                        unpacked_package = salt.transport.frame.decode_embedded_strs(unpacked_package)
-
-                    payload = unpacked_package['payload']
-
-                    if self.opts['zmq_filtering']:
-
-                        # if you have a specific topic list, use that
-
-                        if 'topic_lst' in unpacked_package:
-
-                            for topic in unpacked_package['topic_lst']:
-
-                                # zmq filters are substring match, hash the topic
-
-                                # to avoid collisions
-
-                                htopic = hashlib.sha1(topic).hexdigest()
-
-                                pub_sock.send(htopic, flags=zmq.SNDMORE)
-
-                                pub_sock.send(payload)
-
-                                # otherwise its a broadcast
-
-                        else:
-
-                            # TODO: constants file for "broadcast"
-
-                            pub_sock.send('broadcast', flags=zmq.SNDMORE)
-
-                            pub_sock.send(payload)
-
-                    else:
-
-                        pub_sock.send(payload)
-
-                except zmq.ZMQError as exc:
-
-                    if exc.errno == errno.EINTR:
-
-                        continue
-
-                    raise exc
-
-
-
-        except KeyboardInterrupt:
-
-            # Cleanly close the sockets if we're shutting down
-
-            if pub_sock.closed is False:
-
-                pub_sock.setsockopt(zmq.LINGER, 1)
-
-                pub_sock.close()
-
-            if pull_sock.closed is False:
-
-                pull_sock.setsockopt(zmq.LINGER, 1)
-
-                pull_sock.close()
-
-            if context.closed is False:
-
-                context.term()
-
-
-
-    def pre_fork(self, process_manager):
-
-        '''
-
-        Do anything necessary pre-fork. Since this is on the master side this will
-
-        primarily be used to create IPC channels and create our daemon process to
-
-        do the actual publishing
-
-
-
-        :param func process_manager: A ProcessManager, from salt.utils.process.ProcessManager
-
-        '''
-
-        process_manager.add_process(self._publish_daemon)
-
-
-
-    def publish(self, load):
-
-        '''
-
-        Publish "load" to minions
-
-
-
-        :param dict load: A load to be sent across the wire to minions
-
-        '''
-
-        payload = {'enc': 'aes'}
-
-
-
-        crypticle = salt.crypt.Crypticle(self.opts, salt.master.SMaster.secrets['aes']['secret'].value)
-
-        payload['load'] = crypticle.dumps(load)
-
-        if self.opts['sign_pub_messages']:
-
-            master_pem_path = os.path.join(self.opts['pki_dir'], 'master.pem')
-
-            log.debug("Signing data packet")
-
-            payload['sig'] = salt.crypt.sign_message(master_pem_path, payload['load'])
-
-        # Send 0MQ to the publisher
-
-        context = zmq.Context(1)
-
-        pub_sock = context.socket(zmq.PUSH)
-
-        if self.opts.get('ipc_mode', '') == 'tcp':
-
-            pull_uri = 'tcp://127.0.0.1:{0}'.format(
-
-                self.opts.get('tcp_master_publish_pull', 4514)
-
-                )
-
-        else:
-
-            pull_uri = 'ipc://{0}'.format(
-
-                os.path.join(self.opts['sock_dir'], 'publish_pull.ipc')
-
-                )
-
-        pub_sock.connect(pull_uri)
-
-        int_payload = {'payload': self.serial.dumps(payload)}
-
-
-
-        # add some targeting stuff for lists only (for now)
-
-        if load['tgt_type'] == 'list':
-
-            int_payload['topic_lst'] = load['tgt']
-
-
-
-        # If zmq_filtering is enabled, target matching has to happen master side
-
-        match_targets = ["pcre", "glob", "list"]
-
-        if self.opts['zmq_filtering'] and load['tgt_type'] in match_targets:
-
-            # Fetch a list of minions that match
-
-            match_ids = self.ckminions.check_minions(load['tgt'],
-
-                                                     tgt_type=load['tgt_type'])
-
-
-
-            log.debug("Publish Side Match: {0}".format(match_ids))
-
-            # Send list of miions thru so zmq can target them
-
-            int_payload['topic_lst'] = match_ids
-
-
-
-        pub_sock.send(self.serial.dumps(int_payload))
-
-        pub_sock.close()
-
-        context.term()
-
-
-
-
-
-class AsyncReqMessageClientPool(salt.transport.MessageClientPool):
-
-    '''
-
-    Wrapper class of AsyncReqMessageClientPool to avoid blocking waiting while writing data to socket.
-
-    '''
-
-    def __init__(self, opts, args=None, kwargs=None):
-
-        super(AsyncReqMessageClientPool, self).__init__(AsyncReqMessageClient, opts, args=args, kwargs=kwargs)
-
-
-
-    def __del__(self):
-
-        self.destroy()
-
-
-
-    def destroy(self):
-
-        for message_client in self.message_clients:
-
-            message_client.destroy()
-
-        self.message_clients = []
-
-
-
-    def send(self, *args, **kwargs):
-
-        message_clients = sorted(self.message_clients, key=lambda x: len(x.send_queue))
-
-        return message_clients[0].send(*args, **kwargs)
-
-
-
-
-
-# TODO: unit tests!
-
-class AsyncReqMessageClient(object):
-
-    '''
-
-    This class wraps the underylying zeromq REQ socket and gives a future-based
-
-    interface to sending and recieving messages. This works around the primary
-
-    limitation of serialized send/recv on the underlying socket by queueing the
-
-    message sends in this class. In the future if we decide to attempt to multiplex
-
-    we can manage a pool of REQ/REP sockets-- but for now we'll just do them in serial
-
-    '''
-
-    def __init__(self, opts, addr, linger=0, io_loop=None):
-
-        '''
-
-        Create an asynchronous message client
-
-
-
-        :param dict opts: The salt opts dictionary
-
-        :param str addr: The interface IP address to bind to
-
-        :param int linger: The number of seconds to linger on a ZMQ socket. See
-
-                           http://api.zeromq.org/2-1:zmq-setsockopt [ZMQ_LINGER]
-
-        :param IOLoop io_loop: A Tornado IOLoop event scheduler [tornado.ioloop.IOLoop]
-
-        '''
-
-        self.opts = opts
-
-        self.addr = addr
-
-        self.linger = linger
-
-        if io_loop is None:
-
-            zmq.eventloop.ioloop.install()
-
-            tornado.ioloop.IOLoop.current()
-
-        else:
-
-            self.io_loop = io_loop
-
-
-
-        self.serial = salt.payload.Serial(self.opts)
-
-
-
-        self.context = zmq.Context()
-
-
-
-        # wire up sockets
-
-        self._init_socket()
-
-
-
-        self.send_queue = []
-
-        # mapping of message -> future
-
-        self.send_future_map = {}
-
-
-
-        self.send_timeout_map = {}  # message -> timeout
-
-
-
-    # TODO: timeout all in-flight sessions, or error
-
-    def destroy(self):
-
-        if hasattr(self, 'stream') and self.stream is not None:
-
-            # TODO: Optionally call stream.close() on newer pyzmq? It is broken on some.
-
-            if self.stream.socket:
-
-                self.stream.socket.close()
-
-            self.stream.io_loop.remove_handler(self.stream.socket)
-
-            # set this to None, more hacks for messed up pyzmq
-
-            self.stream.socket = None
-
-            self.stream = None
-
-            self.socket.close()
-
-        if self.context.closed is False:
-
-            self.context.term()
-
-
-
-    def __del__(self):
-
-        self.destroy()
-
-
-
-    def _init_socket(self):
-
-        if hasattr(self, 'stream'):
-
-            self.stream.close()  # pylint: disable=E0203
-
-            self.socket.close()  # pylint: disable=E0203
-
-            del self.stream
-
-            del self.socket
-
-
-
-        self.socket = self.context.socket(zmq.REQ)
-
-
-
-        # socket options
-
-        if hasattr(zmq, 'RECONNECT_IVL_MAX'):
-
-            self.socket.setsockopt(
-
-                zmq.RECONNECT_IVL_MAX, 5000
-
-            )
-
-
-
-        _set_tcp_keepalive(self.socket, self.opts)
-
-        if self.addr.startswith('tcp://['):
-
-            # Hint PF type if bracket enclosed IPv6 address
-
-            if hasattr(zmq, 'IPV6'):
-
-                self.socket.setsockopt(zmq.IPV6, 1)
-
-            elif hasattr(zmq, 'IPV4ONLY'):
-
-                self.socket.setsockopt(zmq.IPV4ONLY, 0)
-
-        self.socket.linger = self.linger
-
-        self.socket.connect(self.addr)
-
-        self.stream = zmq.eventloop.zmqstream.ZMQStream(self.socket, io_loop=self.io_loop)
-
-
-
-    @tornado.gen.coroutine
-
-    def _internal_send_recv(self):
-
-        while len(self.send_queue) > 0:
-
-            message = self.send_queue[0]
-
-            future = self.send_future_map.get(message, None)
-
-            if future is None:
-
-                # Timedout
-
-                del self.send_queue[0]
-
-                continue
-
-
-
-            # send
-
-            def mark_future(msg):
-
-                if not future.done():
-
-                    data = self.serial.loads(msg[0])
-
-                    future.set_result(data)
-
-            self.stream.on_recv(mark_future)
-
-            self.stream.send(message)
-
-
-
-            try:
-
-                ret = yield future
-
-            except:  # pylint: disable=W0702
-
-                self._init_socket()  # re-init the zmq socket (no other way in zmq)
-
-                del self.send_queue[0]
-
-                continue
-
-            del self.send_queue[0]
-
-            self.send_future_map.pop(message, None)
-
-            self.remove_message_timeout(message)
-
-
-
-    def remove_message_timeout(self, message):
-
-        if message not in self.send_timeout_map:
-
-            return
-
-        timeout = self.send_timeout_map.pop(message, None)
-
-        if timeout is not None:
-
-            # Hasn't been already timedout
-
-            self.io_loop.remove_timeout(timeout)
-
-
-
-    def timeout_message(self, message):
-
-        '''
-
-        Handle a message timeout by removing it from the sending queue
-
-        and informing the caller
-
-
-
-        :raises: SaltReqTimeoutError
-
-        '''
-
-        future = self.send_future_map.pop(message, None)
-
-        # In a race condition the message might have been sent by the time
-
-        # we're timing it out. Make sure the future is not None
-
-        if future is not None:
-
-            del self.send_timeout_map[message]
-
-            if future.attempts < future.tries:
-
-                future.attempts += 1
-
-                log.debug('SaltReqTimeoutError, retrying. ({0}/{1})'.format(future.attempts, future.tries))
-
-                self.send(
-
-                    message,
-
-                    timeout=future.timeout,
-
-                    tries=future.tries,
-
-                    future=future,
-
-                )
-
-
-
-            else:
-
-                future.set_exception(SaltReqTimeoutError('Message timed out'))
-
-
-
-    def send(self, message, timeout=None, tries=3, future=None, callback=None, raw=False):
-
-        '''
-
-        Return a future which will be completed when the message has a response
-
-        '''
-
-        if future is None:
-
-            future = tornado.concurrent.Future()
-
-            future.tries = tries
-
-            future.attempts = 0
-
-            future.timeout = timeout
-
-            # if a future wasn't passed in, we need to serialize the message
-
-            message = self.serial.dumps(message)
-
-        if callback is not None:
-
-            def handle_future(future):
-
-                response = future.result()
-
-                self.io_loop.add_callback(callback, response)
-
-            future.add_done_callback(handle_future)
-
-        # Add this future to the mapping
-
-        self.send_future_map[message] = future
-
-
-
-        if self.opts.get('detect_mode') is True:
-
-            timeout = 1
-
-
-
-        if timeout is not None:
-
-            send_timeout = self.io_loop.call_later(timeout, self.timeout_message, message)
-
-            self.send_timeout_map[message] = send_timeout
-
-
-
-        if len(self.send_queue) == 0:
-
-            self.io_loop.spawn_callback(self._internal_send_recv)
-
-
-
-        self.send_queue.append(message)
-
-
-
-        return future
-
-
-
-
-
-class ZeroMQSocketMonitor(object):
-
-    __EVENT_MAP = None
-
-
-
-    def __init__(self, socket):
-
-        '''
-
-        Create ZMQ monitor sockets
-
-
-
-        More information:
-
-            http://api.zeromq.org/4-0:zmq-socket-monitor
-
-        '''
-
-        self._socket = socket
-
-        self._monitor_socket = self._socket.get_monitor_socket()
-
-        self._monitor_stream = None
-
-
-
-    def start_io_loop(self, io_loop):
-
-        log.trace("Event monitor start!")
-
-        self._monitor_stream = zmq.eventloop.zmqstream.ZMQStream(self._monitor_socket, io_loop=io_loop)
-
-        self._monitor_stream.on_recv(self.monitor_callback)
-
-
-
-    def start_poll(self):
-
-        log.trace("Event monitor start!")
-
-        try:
-
-            while self._monitor_socket is not None and self._monitor_socket.poll():
-
-                msg = self._monitor_socket.recv_multipart()
-
-                self.monitor_callback(msg)
-
-        except (AttributeError, zmq.error.ContextTerminated):
-
-            # We cannot log here because we'll get an interrupted system call in trying
-
-            # to flush the logging buffer as we terminate
+        except KeyError:
 
             pass
 
 
 
-    @property
+    def _append_tags(self, context, image):
 
-    def event_map(self):
+        image['tags'] = self.db_api.image_tag_get_all(context, image['id'])
 
-        if ZeroMQSocketMonitor.__EVENT_MAP is None:
-
-            event_map = {}
-
-            for name in dir(zmq):
-
-                if name.startswith('EVENT_'):
-
-                    value = getattr(zmq, name)
-
-                    event_map[value] = name
-
-            ZeroMQSocketMonitor.__EVENT_MAP = event_map
-
-        return ZeroMQSocketMonitor.__EVENT_MAP
+        return image
 
 
 
-    def monitor_callback(self, msg):
+    @utils.mutating
 
-        evt = zmq.utils.monitor.parse_monitor_message(msg)
+    def create(self, req, image):
 
-        evt['description'] = self.event_map[evt['event']]
+        self._enforce(req, 'add_image')
 
-        log.debug("ZeroMQ event: {0}".format(evt))
+        is_public = image.get('is_public')
 
-        if evt['event'] == zmq.EVENT_MONITOR_STOPPED:
+        if is_public:
 
-            self.stop()
+            self._enforce(req, 'publicize_image')
+
+        image['owner'] = req.context.owner
+
+        image['status'] = 'queued'
 
 
 
-    def stop(self):
+        tags = self._extract_tags(image)
 
-        if self._socket is None:
+
+
+        image = dict(self.db_api.image_create(req.context, image))
+
+
+
+        if tags is not None:
+
+            self.db_api.image_tag_set_all(req.context, image['id'], tags)
+
+            image['tags'] = tags
+
+        else:
+
+            image['tags'] = []
+
+
+
+        image = self._normalize_properties(dict(image))
+
+        self.notifier.info('image.update', image)
+
+        return image
+
+
+
+    def index(self, req, marker=None, limit=None, sort_key='created_at',
+
+              sort_dir='desc', filters={}):
+
+        self._enforce(req, 'get_images')
+
+        filters['deleted'] = False
+
+        result = {}
+
+        if limit is None:
+
+            limit = CONF.limit_param_default
+
+        limit = min(CONF.api_limit_max, limit)
+
+
+
+        try:
+
+            images = self.db_api.image_get_all(req.context, filters=filters,
+
+                                               marker=marker, limit=limit,
+
+                                               sort_key=sort_key,
+
+                                               sort_dir=sort_dir)
+
+            if len(images) != 0 and len(images) == limit:
+
+                result['next_marker'] = images[-1]['id']
+
+        except exception.InvalidFilterRangeValue as e:
+
+            raise webob.exc.HTTPBadRequest(explanation=unicode(e))
+
+        except exception.InvalidSortKey as e:
+
+            raise webob.exc.HTTPBadRequest(explanation=unicode(e))
+
+        except exception.NotFound as e:
+
+            raise webob.exc.HTTPBadRequest(explanation=unicode(e))
+
+        images = [self._normalize_properties(dict(image)) for image in images]
+
+        result['images'] = [self._append_tags(req.context, image)
+
+                            for image in images]
+
+        return result
+
+
+
+    def _get_image(self, context, image_id):
+
+        try:
+
+            image = self.db_api.image_get(context, image_id)
+
+            if image['deleted']:
+
+                raise exception.NotFound()
+
+        except (exception.NotFound, exception.Forbidden):
+
+            raise webob.exc.HTTPNotFound()
+
+        else:
+
+            return dict(image)
+
+
+
+    def show(self, req, image_id):
+
+        self._enforce(req, 'get_image')
+
+        image = self._get_image(req.context, image_id)
+
+        image = self._normalize_properties(image)
+
+        return self._append_tags(req.context, image)
+
+
+
+    @utils.mutating
+
+    def update(self, req, image_id, changes):
+
+        self._enforce(req, 'modify_image')
+
+        context = req.context
+
+        image = self._get_image(context, image_id)
+
+        image = self._normalize_properties(image)
+
+        updates = self._extract_updates(req, image, changes)
+
+
+
+        tags = None
+
+        if len(updates) > 0:
+
+            tags = self._extract_tags(updates)
+
+            purge_props = 'properties' in updates
+
+            try:
+
+                image = self.db_api.image_update(context, image_id, updates,
+
+                                                 purge_props)
+
+            except (exception.NotFound, exception.Forbidden):
+
+                raise webob.exc.HTTPNotFound()
+
+            image = self._normalize_properties(dict(image))
+
+
+
+        if tags is not None:
+
+            self.db_api.image_tag_set_all(req.context, image_id, tags)
+
+            image['tags'] = tags
+
+        else:
+
+            self._append_tags(req.context, image)
+
+
+
+        self.notifier.info('image.update', image)
+
+        return image
+
+
+
+    def _extract_updates(self, req, image, changes):
+
+        """ Determine the updates to pass to the database api.
+
+
+
+        Given the current image, convert a list of changes to be made
+
+        into the corresponding update dictionary that should be passed to
+
+        db_api.image_update.
+
+
+
+        Changes have the following parts
+
+        op    - 'add' a new attribute, 'replace' an existing attribute, or
+
+                'remove' an existing attribute.
+
+        path  - A list of path parts for determining which attribute the
+
+                the operation applies to.
+
+        value - For 'add' and 'replace', the new value the attribute should
+
+                assume.
+
+
+
+        For the current use case, there are two types of valid paths. For base
+
+        attributes (fields stored directly on the Image object) the path
+
+        must take the form ['<attribute name>']. These attributes are always
+
+        present so the only valid operation on them is 'replace'. For image
+
+        properties, the path takes the form ['properties', '<property name>']
+
+        and all operations are valid.
+
+
+
+        Future refactoring should simplify this code by hardening the image
+
+        abstraction such that database details such as how image properties
+
+        are stored do not have any influence here.
+
+        """
+
+        updates = {}
+
+        property_updates = image['properties']
+
+        for change in changes:
+
+            path = change['path']
+
+            if len(path) == 1:
+
+                assert change['op'] == 'replace'
+
+                key = change['path'][0]
+
+                if key == 'is_public' and change['value']:
+
+                    self._enforce(req, 'publicize_image')
+
+                updates[key] = change['value']
+
+            else:
+
+                assert len(path) == 2
+
+                assert path[0] == 'properties'
+
+                update_method_name = '_do_%s_property' % change['op']
+
+                assert hasattr(self, update_method_name)
+
+                update_method = getattr(self, update_method_name)
+
+                update_method(property_updates, change)
+
+                updates['properties'] = property_updates
+
+        return updates
+
+
+
+    def _do_replace_property(self, updates, change):
+
+        """ Replace a single image property, ensuring it's present. """
+
+        key = change['path'][1]
+
+        if key not in updates:
+
+            msg = _("Property %s does not exist.")
+
+            raise webob.exc.HTTPConflict(msg % key)
+
+        updates[key] = change['value']
+
+
+
+    def _do_add_property(self, updates, change):
+
+        """ Add a new image property, ensuring it does not already exist. """
+
+        key = change['path'][1]
+
+        if key in updates:
+
+            msg = _("Property %s already present.")
+
+            raise webob.exc.HTTPConflict(msg % key)
+
+        updates[key] = change['value']
+
+
+
+    def _do_remove_property(self, updates, change):
+
+        """ Remove an image property, ensuring it's present. """
+
+        key = change['path'][1]
+
+        if key not in updates:
+
+            msg = _("Property %s does not exist.")
+
+            raise webob.exc.HTTPConflict(msg % key)
+
+        del updates[key]
+
+
+
+    @utils.mutating
+
+    def delete(self, req, image_id):
+
+        self._enforce(req, 'delete_image')
+
+        image = self._get_image(req.context, image_id)
+
+
+
+        if image['protected']:
+
+            msg = _("Unable to delete as image %(image_id)s is protected"
+
+                    % locals())
+
+            raise webob.exc.HTTPForbidden(explanation=msg)
+
+
+
+        status = 'deleted'
+
+        if image['location']:
+
+            if CONF.delayed_delete:
+
+                status = 'pending_delete'
+
+                self.store_api.schedule_delayed_delete_from_backend(
+
+                                image['location'], id)
+
+            else:
+
+                self.store_api.safe_delete_from_backend(image['location'],
+
+                                                        req.context, id)
+
+
+
+        try:
+
+            self.db_api.image_update(req.context, image_id, {'status': status})
+
+            self.db_api.image_destroy(req.context, image_id)
+
+        except (exception.NotFound, exception.Forbidden):
+
+            msg = ("Failed to find image %(image_id)s to delete" % locals())
+
+            LOG.info(msg)
+
+            raise webob.exc.HTTPNotFound()
+
+        else:
+
+            self.notifier.info('image.delete', image)
+
+
+
+
+
+class RequestDeserializer(wsgi.JSONRequestDeserializer):
+
+
+
+    _readonly_properties = ['created_at', 'updated_at', 'status', 'checksum',
+
+                            'size', 'direct_url', 'self', 'file', 'schema']
+
+    _reserved_properties = ['owner', 'is_public', 'location', 'deleted',
+
+                            'deleted_at']
+
+    _base_properties = ['checksum', 'created_at', 'container_format',
+
+                        'disk_format', 'id', 'min_disk', 'min_ram', 'name',
+
+                        'size', 'status', 'tags', 'updated_at', 'visibility',
+
+                        'protected']
+
+
+
+    def __init__(self, schema=None):
+
+        super(RequestDeserializer, self).__init__()
+
+        self.schema = schema or get_schema()
+
+
+
+    def _parse_image(self, request):
+
+        body = self._get_request_body(request)
+
+        try:
+
+            self.schema.validate(body)
+
+        except exception.InvalidObject as e:
+
+            raise webob.exc.HTTPBadRequest(explanation=unicode(e))
+
+
+
+        # Ensure all specified properties are allowed
+
+        self._check_readonly(body)
+
+        self._check_reserved(body)
+
+
+
+        # Create a dict of base image properties, with user- and deployer-
+
+        # defined properties contained in a 'properties' dictionary
+
+        image = {'properties': body}
+
+        for key in self._base_properties:
+
+            try:
+
+                image[key] = image['properties'].pop(key)
+
+            except KeyError:
+
+                pass
+
+
+
+        if 'visibility' in image:
+
+            image['is_public'] = image.pop('visibility') == 'public'
+
+
+
+        return {'image': image}
+
+
+
+    def _get_request_body(self, request):
+
+        output = super(RequestDeserializer, self).default(request)
+
+        if not 'body' in output:
+
+            msg = _('Body expected in request.')
+
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+        return output['body']
+
+
+
+    @classmethod
+
+    def _check_readonly(cls, image):
+
+        for key in cls._readonly_properties:
+
+            if key in image:
+
+                msg = "Attribute \'%s\' is read-only." % key
+
+                raise webob.exc.HTTPForbidden(explanation=unicode(msg))
+
+
+
+    @classmethod
+
+    def _check_reserved(cls, image):
+
+        for key in cls._reserved_properties:
+
+            if key in image:
+
+                msg = "Attribute \'%s\' is reserved." % key
+
+                raise webob.exc.HTTPForbidden(explanation=unicode(msg))
+
+
+
+    def create(self, request):
+
+        return self._parse_image(request)
+
+
+
+    def _get_change_operation(self, raw_change):
+
+        op = None
+
+        for key in ['replace', 'add', 'remove']:
+
+            if key in raw_change:
+
+                if op is not None:
+
+                    msg = _('Operation objects must contain only one member'
+
+                            ' named "add", "remove", or "replace".')
+
+                    raise webob.exc.HTTPBadRequest(explanation=msg)
+
+                op = key
+
+        if op is None:
+
+            msg = _('Operation objects must contain exactly one member'
+
+                    ' named "add", "remove", or "replace".')
+
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+        return op
+
+
+
+    def _get_change_path(self, raw_change, op):
+
+        key = self._decode_json_pointer(raw_change[op])
+
+        if key in self._readonly_properties:
+
+            msg = "Attribute \'%s\' is read-only." % key
+
+            raise webob.exc.HTTPForbidden(explanation=unicode(msg))
+
+        if key in self._reserved_properties:
+
+            msg = "Attribute \'%s\' is reserved." % key
+
+            raise webob.exc.HTTPForbidden(explanation=unicode(msg))
+
+
+
+        # For image properties, we need to put "properties" at the beginning
+
+        if key not in self._base_properties:
+
+            return ['properties', key]
+
+        return [key]
+
+
+
+    def _decode_json_pointer(self, pointer):
+
+        """ Parse a json pointer.
+
+
+
+        Json Pointers are defined in
+
+        http://tools.ietf.org/html/draft-pbryan-zyp-json-pointer .
+
+        The pointers use '/' for separation between object attributes, such
+
+        that '/A/B' would evaluate to C in {"A": {"B": "C"}}. A '/' character
+
+        in an attribute name is encoded as "~1" and a '~' character is encoded
+
+        as "~0".
+
+        """
+
+        self._validate_json_pointer(pointer)
+
+        return pointer.lstrip('/').replace('~1', '/').replace('~0', '~')
+
+
+
+    def _validate_json_pointer(self, pointer):
+
+        """ Validate a json pointer.
+
+
+
+        We only accept a limited form of json pointers. Specifically, we do
+
+        not allow multiple levels of indirection, so there can only be one '/'
+
+        in the pointer, located at the start of the string.
+
+        """
+
+        if not pointer.startswith('/'):
+
+            msg = _('Pointer `%s` does not start with "/".' % pointer)
+
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+        if '/' in pointer[1:]:
+
+            msg = _('Pointer `%s` contains more than one "/".' % pointer)
+
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+        if re.match('~[^01]', pointer):
+
+            msg = _('Pointer `%s` contains "~" not part of'
+
+                    ' a recognized escape sequence.' % pointer)
+
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+
+
+    def _get_change_value(self, raw_change, op):
+
+        if 'value' not in raw_change:
+
+            msg = _('Operation "%s" requires a member named "value".')
+
+            raise webob.exc.HTTPBadRequest(explanation=msg % op)
+
+        return raw_change['value']
+
+
+
+    def _validate_change(self, change):
+
+        if change['op'] == 'delete':
 
             return
 
-        self._socket.disable_monitor()
+        partial_image = {change['path'][-1]: change['value']}
 
-        self._socket = None
+        try:
 
-        self._monitor_socket = None
+            self.schema.validate(partial_image)
 
-        if self._monitor_stream is not None:
+        except exception.InvalidObject as e:
 
-            self._monitor_stream.close()
+            raise webob.exc.HTTPBadRequest(explanation=unicode(e))
 
-            self._monitor_stream = None
 
-        log.trace("Event monitor done!")
+
+    def update(self, request):
+
+        changes = []
+
+        valid_content_types = [
+
+            'application/openstack-images-v2.0-json-patch'
+
+        ]
+
+        if request.content_type not in valid_content_types:
+
+            headers = {'Accept-Patch': ','.join(valid_content_types)}
+
+            raise webob.exc.HTTPUnsupportedMediaType(headers=headers)
+
+        body = self._get_request_body(request)
+
+        if not isinstance(body, list):
+
+            msg = _('Request body must be a JSON array of operation objects.')
+
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+        for raw_change in body:
+
+            if not isinstance(raw_change, dict):
+
+                msg = _('Operations must be JSON objects.')
+
+                raise webob.exc.HTTPBadRequest(explanation=msg)
+
+            op = self._get_change_operation(raw_change)
+
+            path = self._get_change_path(raw_change, op)
+
+            change = {'op': op, 'path': path}
+
+            if not op == 'remove':
+
+                change['value'] = self._get_change_value(raw_change, op)
+
+                self._validate_change(change)
+
+                if change['path'] == ['visibility']:
+
+                    change['path'] = ['is_public']
+
+                    change['value'] = change['value'] == 'public'
+
+            changes.append(change)
+
+        return {'changes': changes}
+
+
+
+    def _validate_limit(self, limit):
+
+        try:
+
+            limit = int(limit)
+
+        except ValueError:
+
+            msg = _("limit param must be an integer")
+
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+
+
+        if limit < 0:
+
+            msg = _("limit param must be positive")
+
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+
+
+        return limit
+
+
+
+    def _validate_sort_dir(self, sort_dir):
+
+        if sort_dir not in ['asc', 'desc']:
+
+            msg = _('Invalid sort direction: %s' % sort_dir)
+
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+
+
+        return sort_dir
+
+
+
+    def _get_filters(self, filters):
+
+        visibility = filters.pop('visibility', None)
+
+        if visibility:
+
+            if visibility in ['public', 'private']:
+
+                filters['is_public'] = visibility == 'public'
+
+            else:
+
+                msg = _('Invalid visibility value: %s') % visibility
+
+                raise webob.exc.HTTPBadRequest(explanation=msg)
+
+
+
+        return filters
+
+
+
+    def index(self, request):
+
+        params = request.params.copy()
+
+        limit = params.pop('limit', None)
+
+        marker = params.pop('marker', None)
+
+        sort_dir = params.pop('sort_dir', 'desc')
+
+        query_params = {
+
+            'sort_key': params.pop('sort_key', 'created_at'),
+
+            'sort_dir': self._validate_sort_dir(sort_dir),
+
+            'filters': self._get_filters(params),
+
+        }
+
+
+
+        if marker is not None:
+
+            query_params['marker'] = marker
+
+
+
+        if limit is not None:
+
+            query_params['limit'] = self._validate_limit(limit)
+
+
+
+        return query_params
+
+
+
+
+
+class ResponseSerializer(wsgi.JSONResponseSerializer):
+
+    def __init__(self, schema=None):
+
+        super(ResponseSerializer, self).__init__()
+
+        self.schema = schema or get_schema()
+
+
+
+    def _get_image_href(self, image, subcollection=''):
+
+        base_href = '/v2/images/%s' % image['id']
+
+        if subcollection:
+
+            base_href = '%s/%s' % (base_href, subcollection)
+
+        return base_href
+
+
+
+    def _get_image_links(self, image):
+
+        return [
+
+            {'rel': 'self', 'href': self._get_image_href(image)},
+
+            {'rel': 'file', 'href': self._get_image_href(image, 'file')},
+
+            {'rel': 'describedby', 'href': '/v2/schemas/image'},
+
+        ]
+
+
+
+    def _format_image(self, image):
+
+        #NOTE(bcwaldon): merge the contained properties dict with the
+
+        # top-level image object
+
+        image_view = image['properties']
+
+        attributes = ['id', 'name', 'disk_format', 'container_format',
+
+                      'size', 'status', 'checksum', 'tags', 'protected',
+
+                      'created_at', 'updated_at', 'min_ram', 'min_disk']
+
+        for key in attributes:
+
+            image_view[key] = image[key]
+
+
+
+        location = image['location']
+
+        if CONF.show_image_direct_url and location is not None:
+
+            image_view['direct_url'] = location
+
+
+
+        visibility = 'public' if image['is_public'] else 'private'
+
+        image_view['visibility'] = visibility
+
+
+
+        image_view['self'] = self._get_image_href(image)
+
+        image_view['file'] = self._get_image_href(image, 'file')
+
+        image_view['schema'] = '/v2/schemas/image'
+
+
+
+        self._serialize_datetimes(image_view)
+
+        image_view = self.schema.filter(image_view)
+
+
+
+        return image_view
+
+
+
+    @staticmethod
+
+    def _serialize_datetimes(image):
+
+        for (key, value) in image.iteritems():
+
+            if isinstance(value, datetime.datetime):
+
+                image[key] = timeutils.isotime(value)
+
+
+
+    def create(self, response, image):
+
+        response.status_int = 201
+
+        body = json.dumps(self._format_image(image), ensure_ascii=False)
+
+        response.unicode_body = unicode(body)
+
+        response.content_type = 'application/json'
+
+        response.location = self._get_image_href(image)
+
+
+
+    def show(self, response, image):
+
+        body = json.dumps(self._format_image(image), ensure_ascii=False)
+
+        response.unicode_body = unicode(body)
+
+        response.content_type = 'application/json'
+
+
+
+    def update(self, response, image):
+
+        body = json.dumps(self._format_image(image), ensure_ascii=False)
+
+        response.unicode_body = unicode(body)
+
+        response.content_type = 'application/json'
+
+
+
+    def index(self, response, result):
+
+        params = dict(response.request.params)
+
+        params.pop('marker', None)
+
+        query = urllib.urlencode(params)
+
+        body = {
+
+            'images': [self._format_image(i) for i in result['images']],
+
+            'first': '/v2/images',
+
+            'schema': '/v2/schemas/images',
+
+        }
+
+        if query:
+
+            body['first'] = '%s?%s' % (body['first'], query)
+
+        if 'next_marker' in result:
+
+            params['marker'] = result['next_marker']
+
+            next_query = urllib.urlencode(params)
+
+            body['next'] = '/v2/images?%s' % next_query
+
+        response.unicode_body = unicode(json.dumps(body, ensure_ascii=False))
+
+        response.content_type = 'application/json'
+
+
+
+    def delete(self, response, result):
+
+        response.status_int = 204
+
+
+
+
+
+_BASE_PROPERTIES = {
+
+    'id': {
+
+        'type': 'string',
+
+        'description': 'An identifier for the image',
+
+        'pattern': ('^([0-9a-fA-F]){8}-([0-9a-fA-F]){4}-([0-9a-fA-F]){4}'
+
+                    '-([0-9a-fA-F]){4}-([0-9a-fA-F]){12}$'),
+
+    },
+
+    'name': {
+
+        'type': 'string',
+
+        'description': 'Descriptive name for the image',
+
+        'maxLength': 255,
+
+    },
+
+    'status': {
+
+        'type': 'string',
+
+        'description': 'Status of the image',
+
+        'enum': ['queued', 'saving', 'active', 'killed',
+
+                 'deleted', 'pending_delete'],
+
+    },
+
+    'visibility': {
+
+        'type': 'string',
+
+        'description': 'Scope of image accessibility',
+
+        'enum': ['public', 'private'],
+
+    },
+
+    'protected': {
+
+        'type': 'boolean',
+
+        'description': 'If true, image will not be deletable.',
+
+    },
+
+    'checksum': {
+
+        'type': 'string',
+
+        'description': 'md5 hash of image contents.',
+
+        'type': 'string',
+
+        'maxLength': 32,
+
+    },
+
+    'size': {
+
+        'type': 'integer',
+
+        'description': 'Size of image file in bytes',
+
+    },
+
+    'container_format': {
+
+        'type': 'string',
+
+        'description': '',
+
+        'type': 'string',
+
+        'enum': ['bare', 'ovf', 'ami', 'aki', 'ari'],
+
+    },
+
+    'disk_format': {
+
+        'type': 'string',
+
+        'description': '',
+
+        'type': 'string',
+
+        'enum': ['raw', 'vhd', 'vmdk', 'vdi', 'iso', 'qcow2',
+
+                 'aki', 'ari', 'ami'],
+
+    },
+
+    'created_at': {
+
+        'type': 'string',
+
+        'description': 'Date and time of image registration',
+
+        #TODO(bcwaldon): our jsonschema library doesn't seem to like the
+
+        # format attribute, figure out why!
+
+        #'format': 'date-time',
+
+    },
+
+    'updated_at': {
+
+        'type': 'string',
+
+        'description': 'Date and time of the last image modification',
+
+        #'format': 'date-time',
+
+    },
+
+    'tags': {
+
+        'type': 'array',
+
+        'description': 'List of strings related to the image',
+
+        'items': {
+
+            'type': 'string',
+
+            'maxLength': 255,
+
+        },
+
+    },
+
+    'direct_url': {
+
+        'type': 'string',
+
+        'description': 'URL to access the image file kept in external store',
+
+    },
+
+    'min_ram': {
+
+        'type': 'integer',
+
+        'description': 'Amount of ram (in MB) required to boot image.',
+
+    },
+
+    'min_disk': {
+
+        'type': 'integer',
+
+        'description': 'Amount of disk space (in GB) required to boot image.',
+
+    },
+
+    'self': {'type': 'string'},
+
+    'file': {'type': 'string'},
+
+    'schema': {'type': 'string'},
+
+}
+
+
+
+_BASE_LINKS = [
+
+    {'rel': 'self', 'href': '{self}'},
+
+    {'rel': 'enclosure', 'href': '{file}'},
+
+    {'rel': 'describedby', 'href': '{schema}'},
+
+]
+
+
+
+
+
+def get_schema(custom_properties=None):
+
+    properties = copy.deepcopy(_BASE_PROPERTIES)
+
+    links = copy.deepcopy(_BASE_LINKS)
+
+    if CONF.allow_additional_image_properties:
+
+        schema = glance.schema.PermissiveSchema('image', properties, links)
+
+    else:
+
+        schema = glance.schema.Schema('image', properties)
+
+    schema.merge_properties(custom_properties or {})
+
+    return schema
+
+
+
+
+
+def get_collection_schema(custom_properties=None):
+
+    image_schema = get_schema(custom_properties)
+
+    return glance.schema.CollectionSchema('images', image_schema)
+
+
+
+
+
+def load_custom_properties():
+
+    """Find the schema properties files and load them into a dict."""
+
+    filename = 'schema-image.json'
+
+    match = CONF.find_file(filename)
+
+    if match:
+
+        schema_file = open(match)
+
+        schema_data = schema_file.read()
+
+        return json.loads(schema_data)
+
+    else:
+
+        msg = _('Could not find schema properties file %s. Continuing '
+
+                'without custom properties')
+
+        LOG.warn(msg % filename)
+
+        return {}
+
+
+
+
+
+def create_resource(custom_properties=None):
+
+    """Images resource factory method"""
+
+    schema = get_schema(custom_properties)
+
+    deserializer = RequestDeserializer(schema)
+
+    serializer = ResponseSerializer(schema)
+
+    controller = ImagesController()
+
+    return wsgi.Resource(controller, deserializer, serializer)

@@ -2,1746 +2,1754 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-from __future__ import print_function
+# vim: ft=python fileencoding=utf-8 sts=4 sw=4 et:
 
 
 
-import distutils.version
+# Copyright 2016-2019 Florian Bruhin (The Compiler) <mail@qutebrowser.org>
 
-import io
+#
 
-import itertools
+# This file is part of qutebrowser.
 
-import logging
+#
 
-import os
+# qutebrowser is free software: you can redistribute it and/or modify
 
-from collections import namedtuple
+# it under the terms of the GNU General Public License as published by
 
-from ctypes import c_float
+# the Free Software Foundation, either version 3 of the License, or
 
+# (at your option) any later version.
 
+#
 
-from PIL import Image, TiffImagePlugin, TiffTags, features
+# qutebrowser is distributed in the hope that it will be useful,
 
-from PIL._util import py3
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
 
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 
+# GNU General Public License for more details.
 
-from .helper import PillowTestCase, hopper
+#
 
+# You should have received a copy of the GNU General Public License
 
-
-logger = logging.getLogger(__name__)
-
-
-
-
-
-class LibTiffTestCase(PillowTestCase):
-
-    def setUp(self):
-
-        if not features.check("libtiff"):
-
-            self.skipTest("tiff support not available")
+# along with qutebrowser.  If not, see <http://www.gnu.org/licenses/>.
 
 
 
-    def _assert_noerr(self, im):
-
-        """Helper tests that assert basic sanity about the g4 tiff reading"""
-
-        # 1 bit
-
-        self.assertEqual(im.mode, "1")
+"""Wrapper over our (QtWebKit) WebView."""
 
 
 
-        # Does the data actually load
+import re
 
-        im.load()
+import functools
 
-        im.getdata()
+import xml.etree.ElementTree
+
+
+
+from PyQt5.QtCore import pyqtSlot, Qt, QUrl, QPoint, QTimer, QSizeF, QSize
+
+from PyQt5.QtGui import QIcon
+
+from PyQt5.QtWebKitWidgets import QWebPage, QWebFrame
+
+from PyQt5.QtWebKit import QWebSettings
+
+from PyQt5.QtPrintSupport import QPrinter
+
+
+
+from qutebrowser.browser import browsertab, shared
+
+from qutebrowser.browser.webkit import (webview, tabhistory, webkitelem,
+
+                                        webkitsettings)
+
+from qutebrowser.utils import qtutils, usertypes, utils, log, debug
+
+from qutebrowser.qt import sip
+
+
+
+
+
+class WebKitAction(browsertab.AbstractAction):
+
+
+
+    """QtWebKit implementations related to web actions."""
+
+
+
+    action_class = QWebPage
+
+    action_base = QWebPage.WebAction
+
+
+
+    def exit_fullscreen(self):
+
+        raise browsertab.UnsupportedOperationError
+
+
+
+    def save_page(self):
+
+        """Save the current page."""
+
+        raise browsertab.UnsupportedOperationError
+
+
+
+    def show_source(self, pygments=False):
+
+        self._show_source_pygments()
+
+
+
+
+
+class WebKitPrinting(browsertab.AbstractPrinting):
+
+
+
+    """QtWebKit implementations related to printing."""
+
+
+
+    def check_pdf_support(self):
+
+        pass
+
+
+
+    def check_printer_support(self):
+
+        pass
+
+
+
+    def check_preview_support(self):
+
+        pass
+
+
+
+    def to_pdf(self, filename):
+
+        printer = QPrinter()
+
+        printer.setOutputFileName(filename)
+
+        self.to_printer(printer)
+
+
+
+    def to_printer(self, printer, callback=None):
+
+        self._widget.print(printer)
+
+        # Can't find out whether there was an error...
+
+        if callback is not None:
+
+            callback(True)
+
+
+
+
+
+class WebKitSearch(browsertab.AbstractSearch):
+
+
+
+    """QtWebKit implementations related to searching on the page."""
+
+
+
+    def __init__(self, tab, parent=None):
+
+        super().__init__(tab, parent)
+
+        self._flags = QWebPage.FindFlags(0)
+
+
+
+    def _call_cb(self, callback, found, text, flags, caller):
+
+        """Call the given callback if it's non-None.
+
+
+
+        Delays the call via a QTimer so the website is re-rendered in between.
+
+
+
+        Args:
+
+            callback: What to call
+
+            found: If the text was found
+
+            text: The text searched for
+
+            flags: The flags searched with
+
+            caller: Name of the caller.
+
+        """
+
+        found_text = 'found' if found else "didn't find"
+
+        # Removing FindWrapsAroundDocument to get the same logging as with
+
+        # QtWebEngine
+
+        debug_flags = debug.qflags_key(
+
+            QWebPage, flags & ~QWebPage.FindWrapsAroundDocument,
+
+            klass=QWebPage.FindFlag)
+
+        if debug_flags != '0x0000':
+
+            flag_text = 'with flags {}'.format(debug_flags)
+
+        else:
+
+            flag_text = ''
+
+        log.webview.debug(' '.join([caller, found_text, text, flag_text])
+
+                          .strip())
+
+        if callback is not None:
+
+            QTimer.singleShot(0, functools.partial(callback, found))
+
+
+
+        self.finished.emit(found)
+
+
+
+    def clear(self):
+
+        if self.search_displayed:
+
+            self.cleared.emit()
+
+        self.search_displayed = False
+
+        # We first clear the marked text, then the highlights
+
+        self._widget.findText('')
+
+        self._widget.findText('', QWebPage.HighlightAllOccurrences)
+
+
+
+    def search(self, text, *, ignore_case=usertypes.IgnoreCase.never,
+
+               reverse=False, result_cb=None):
+
+        # Don't go to next entry on duplicate search
+
+        if self.text == text and self.search_displayed:
+
+            log.webview.debug("Ignoring duplicate search request"
+
+                              " for {}".format(text))
+
+            return
+
+
+
+        # Clear old search results, this is done automatically on QtWebEngine.
+
+        self.clear()
+
+
+
+        self.text = text
+
+        self.search_displayed = True
+
+        self._flags = QWebPage.FindWrapsAroundDocument
+
+        if self._is_case_sensitive(ignore_case):
+
+            self._flags |= QWebPage.FindCaseSensitively
+
+        if reverse:
+
+            self._flags |= QWebPage.FindBackward
+
+        # We actually search *twice* - once to highlight everything, then again
+
+        # to get a mark so we can navigate.
+
+        found = self._widget.findText(text, self._flags)
+
+        self._widget.findText(text,
+
+                              self._flags | QWebPage.HighlightAllOccurrences)
+
+        self._call_cb(result_cb, found, text, self._flags, 'search')
+
+
+
+    def next_result(self, *, result_cb=None):
+
+        self.search_displayed = True
+
+        found = self._widget.findText(self.text, self._flags)
+
+        self._call_cb(result_cb, found, self.text, self._flags, 'next_result')
+
+
+
+    def prev_result(self, *, result_cb=None):
+
+        self.search_displayed = True
+
+        # The int() here makes sure we get a copy of the flags.
+
+        flags = QWebPage.FindFlags(int(self._flags))
+
+        if flags & QWebPage.FindBackward:
+
+            flags &= ~QWebPage.FindBackward
+
+        else:
+
+            flags |= QWebPage.FindBackward
+
+        found = self._widget.findText(self.text, flags)
+
+        self._call_cb(result_cb, found, self.text, flags, 'prev_result')
+
+
+
+
+
+class WebKitCaret(browsertab.AbstractCaret):
+
+
+
+    """QtWebKit implementations related to moving the cursor/selection."""
+
+
+
+    @pyqtSlot(usertypes.KeyMode)
+
+    def _on_mode_entered(self, mode):
+
+        if mode != usertypes.KeyMode.caret:
+
+            return
+
+
+
+        self.selection_enabled = self._widget.hasSelection()
+
+        self.selection_toggled.emit(self.selection_enabled)
+
+        settings = self._widget.settings()
+
+        settings.setAttribute(QWebSettings.CaretBrowsingEnabled, True)
+
+
+
+        if self._widget.isVisible():
+
+            # Sometimes the caret isn't immediately visible, but unfocusing
+
+            # and refocusing it fixes that.
+
+            self._widget.clearFocus()
+
+            self._widget.setFocus(Qt.OtherFocusReason)
+
+
+
+            # Move the caret to the first element in the viewport if there
+
+            # isn't any text which is already selected.
+
+            #
+
+            # Note: We can't use hasSelection() here, as that's always
+
+            # true in caret mode.
+
+            if not self.selection_enabled:
+
+                self._widget.page().currentFrame().evaluateJavaScript(
+
+                    utils.read_file('javascript/position_caret.js'))
+
+
+
+    @pyqtSlot(usertypes.KeyMode)
+
+    def _on_mode_left(self, _mode):
+
+        settings = self._widget.settings()
+
+        if settings.testAttribute(QWebSettings.CaretBrowsingEnabled):
+
+            if self.selection_enabled and self._widget.hasSelection():
+
+                # Remove selection if it exists
+
+                self._widget.triggerPageAction(QWebPage.MoveToNextChar)
+
+            settings.setAttribute(QWebSettings.CaretBrowsingEnabled, False)
+
+            self.selection_enabled = False
+
+
+
+    def move_to_next_line(self, count=1):
+
+        if not self.selection_enabled:
+
+            act = QWebPage.MoveToNextLine
+
+        else:
+
+            act = QWebPage.SelectNextLine
+
+        for _ in range(count):
+
+            self._widget.triggerPageAction(act)
+
+
+
+    def move_to_prev_line(self, count=1):
+
+        if not self.selection_enabled:
+
+            act = QWebPage.MoveToPreviousLine
+
+        else:
+
+            act = QWebPage.SelectPreviousLine
+
+        for _ in range(count):
+
+            self._widget.triggerPageAction(act)
+
+
+
+    def move_to_next_char(self, count=1):
+
+        if not self.selection_enabled:
+
+            act = QWebPage.MoveToNextChar
+
+        else:
+
+            act = QWebPage.SelectNextChar
+
+        for _ in range(count):
+
+            self._widget.triggerPageAction(act)
+
+
+
+    def move_to_prev_char(self, count=1):
+
+        if not self.selection_enabled:
+
+            act = QWebPage.MoveToPreviousChar
+
+        else:
+
+            act = QWebPage.SelectPreviousChar
+
+        for _ in range(count):
+
+            self._widget.triggerPageAction(act)
+
+
+
+    def move_to_end_of_word(self, count=1):
+
+        if not self.selection_enabled:
+
+            act = [QWebPage.MoveToNextWord]
+
+            if utils.is_windows:  # pragma: no cover
+
+                act.append(QWebPage.MoveToPreviousChar)
+
+        else:
+
+            act = [QWebPage.SelectNextWord]
+
+            if utils.is_windows:  # pragma: no cover
+
+                act.append(QWebPage.SelectPreviousChar)
+
+        for _ in range(count):
+
+            for a in act:
+
+                self._widget.triggerPageAction(a)
+
+
+
+    def move_to_next_word(self, count=1):
+
+        if not self.selection_enabled:
+
+            act = [QWebPage.MoveToNextWord]
+
+            if not utils.is_windows:  # pragma: no branch
+
+                act.append(QWebPage.MoveToNextChar)
+
+        else:
+
+            act = [QWebPage.SelectNextWord]
+
+            if not utils.is_windows:  # pragma: no branch
+
+                act.append(QWebPage.SelectNextChar)
+
+        for _ in range(count):
+
+            for a in act:
+
+                self._widget.triggerPageAction(a)
+
+
+
+    def move_to_prev_word(self, count=1):
+
+        if not self.selection_enabled:
+
+            act = QWebPage.MoveToPreviousWord
+
+        else:
+
+            act = QWebPage.SelectPreviousWord
+
+        for _ in range(count):
+
+            self._widget.triggerPageAction(act)
+
+
+
+    def move_to_start_of_line(self):
+
+        if not self.selection_enabled:
+
+            act = QWebPage.MoveToStartOfLine
+
+        else:
+
+            act = QWebPage.SelectStartOfLine
+
+        self._widget.triggerPageAction(act)
+
+
+
+    def move_to_end_of_line(self):
+
+        if not self.selection_enabled:
+
+            act = QWebPage.MoveToEndOfLine
+
+        else:
+
+            act = QWebPage.SelectEndOfLine
+
+        self._widget.triggerPageAction(act)
+
+
+
+    def move_to_start_of_next_block(self, count=1):
+
+        if not self.selection_enabled:
+
+            act = [QWebPage.MoveToNextLine,
+
+                   QWebPage.MoveToStartOfBlock]
+
+        else:
+
+            act = [QWebPage.SelectNextLine,
+
+                   QWebPage.SelectStartOfBlock]
+
+        for _ in range(count):
+
+            for a in act:
+
+                self._widget.triggerPageAction(a)
+
+
+
+    def move_to_start_of_prev_block(self, count=1):
+
+        if not self.selection_enabled:
+
+            act = [QWebPage.MoveToPreviousLine,
+
+                   QWebPage.MoveToStartOfBlock]
+
+        else:
+
+            act = [QWebPage.SelectPreviousLine,
+
+                   QWebPage.SelectStartOfBlock]
+
+        for _ in range(count):
+
+            for a in act:
+
+                self._widget.triggerPageAction(a)
+
+
+
+    def move_to_end_of_next_block(self, count=1):
+
+        if not self.selection_enabled:
+
+            act = [QWebPage.MoveToNextLine,
+
+                   QWebPage.MoveToEndOfBlock]
+
+        else:
+
+            act = [QWebPage.SelectNextLine,
+
+                   QWebPage.SelectEndOfBlock]
+
+        for _ in range(count):
+
+            for a in act:
+
+                self._widget.triggerPageAction(a)
+
+
+
+    def move_to_end_of_prev_block(self, count=1):
+
+        if not self.selection_enabled:
+
+            act = [QWebPage.MoveToPreviousLine, QWebPage.MoveToEndOfBlock]
+
+        else:
+
+            act = [QWebPage.SelectPreviousLine, QWebPage.SelectEndOfBlock]
+
+        for _ in range(count):
+
+            for a in act:
+
+                self._widget.triggerPageAction(a)
+
+
+
+    def move_to_start_of_document(self):
+
+        if not self.selection_enabled:
+
+            act = QWebPage.MoveToStartOfDocument
+
+        else:
+
+            act = QWebPage.SelectStartOfDocument
+
+        self._widget.triggerPageAction(act)
+
+
+
+    def move_to_end_of_document(self):
+
+        if not self.selection_enabled:
+
+            act = QWebPage.MoveToEndOfDocument
+
+        else:
+
+            act = QWebPage.SelectEndOfDocument
+
+        self._widget.triggerPageAction(act)
+
+
+
+    def toggle_selection(self):
+
+        self.selection_enabled = not self.selection_enabled
+
+        self.selection_toggled.emit(self.selection_enabled)
+
+
+
+    def drop_selection(self):
+
+        self._widget.triggerPageAction(QWebPage.MoveToNextChar)
+
+
+
+    def selection(self, callback):
+
+        callback(self._widget.selectedText())
+
+
+
+    def reverse_selection(self):
+
+        self._tab.run_js_async("""{
+
+            const sel = window.getSelection();
+
+            sel.setBaseAndExtent(
+
+                sel.extentNode, sel.extentOffset, sel.baseNode,
+
+                sel.baseOffset
+
+            );
+
+        }""")
+
+
+
+    def _follow_selected(self, *, tab=False):
+
+        if QWebSettings.globalSettings().testAttribute(
+
+                QWebSettings.JavascriptEnabled):
+
+            if tab:
+
+                self._tab.data.override_target = usertypes.ClickTarget.tab
+
+            self._tab.run_js_async("""
+
+                const aElm = document.activeElement;
+
+                if (window.getSelection().anchorNode) {
+
+                    window.getSelection().anchorNode.parentNode.click();
+
+                } else if (aElm && aElm !== document.body) {
+
+                    aElm.click();
+
+                }
+
+            """)
+
+        else:
+
+            selection = self._widget.selectedHtml()
+
+            if not selection:
+
+                # Getting here may mean we crashed, but we can't do anything
+
+                # about that until this commit is released:
+
+                # https://github.com/annulen/webkit/commit/0e75f3272d149bc64899c161f150eb341a2417af
+
+                # TODO find a way to check if something is focused
+
+                self._follow_enter(tab)
+
+                return
+
+            try:
+
+                selected_element = xml.etree.ElementTree.fromstring(
+
+                    '<html>{}</html>'.format(selection)).find('a')
+
+            except xml.etree.ElementTree.ParseError:
+
+                raise browsertab.WebTabError('Could not parse selected '
+
+                                             'element!')
+
+
+
+            if selected_element is not None:
+
+                try:
+
+                    url = selected_element.attrib['href']
+
+                except KeyError:
+
+                    raise browsertab.WebTabError('Anchor element without '
+
+                                                 'href!')
+
+                url = self._tab.url().resolved(QUrl(url))
+
+                if tab:
+
+                    self._tab.new_tab_requested.emit(url)
+
+                else:
+
+                    self._tab.load_url(url)
+
+
+
+    def follow_selected(self, *, tab=False):
+
+        try:
+
+            self._follow_selected(tab=tab)
+
+        finally:
+
+            self.follow_selected_done.emit()
+
+
+
+
+
+class WebKitZoom(browsertab.AbstractZoom):
+
+
+
+    """QtWebKit implementations related to zooming."""
+
+
+
+    def _set_factor_internal(self, factor):
+
+        self._widget.setZoomFactor(factor)
+
+
+
+
+
+class WebKitScroller(browsertab.AbstractScroller):
+
+
+
+    """QtWebKit implementations related to scrolling."""
+
+
+
+    # FIXME:qtwebengine When to use the main frame, when the current one?
+
+
+
+    def pos_px(self):
+
+        return self._widget.page().mainFrame().scrollPosition()
+
+
+
+    def pos_perc(self):
+
+        return self._widget.scroll_pos
+
+
+
+    def to_point(self, point):
+
+        self._widget.page().mainFrame().setScrollPosition(point)
+
+
+
+    def to_anchor(self, name):
+
+        self._widget.page().mainFrame().scrollToAnchor(name)
+
+
+
+    def delta(self, x=0, y=0):
+
+        qtutils.check_overflow(x, 'int')
+
+        qtutils.check_overflow(y, 'int')
+
+        self._widget.page().mainFrame().scroll(x, y)
+
+
+
+    def delta_page(self, x=0.0, y=0.0):
+
+        if y.is_integer():
+
+            y = int(y)
+
+            if y == 0:
+
+                pass
+
+            elif y < 0:
+
+                self.page_up(count=-y)
+
+            elif y > 0:
+
+                self.page_down(count=y)
+
+            y = 0
+
+        if x == 0 and y == 0:
+
+            return
+
+        size = self._widget.page().mainFrame().geometry()
+
+        self.delta(x * size.width(), y * size.height())
+
+
+
+    def to_perc(self, x=None, y=None):
+
+        if x is None and y == 0:
+
+            self.top()
+
+        elif x is None and y == 100:
+
+            self.bottom()
+
+        else:
+
+            for val, orientation in [(x, Qt.Horizontal), (y, Qt.Vertical)]:
+
+                if val is not None:
+
+                    frame = self._widget.page().mainFrame()
+
+                    maximum = frame.scrollBarMaximum(orientation)
+
+                    if maximum == 0:
+
+                        continue
+
+                    pos = int(maximum * val / 100)
+
+                    pos = qtutils.check_overflow(pos, 'int', fatal=False)
+
+                    frame.setScrollBarValue(orientation, pos)
+
+
+
+    def _key_press(self, key, count=1, getter_name=None, direction=None):
+
+        frame = self._widget.page().mainFrame()
+
+        getter = None if getter_name is None else getattr(frame, getter_name)
+
+
+
+        # FIXME:qtwebengine needed?
+
+        # self._widget.setFocus()
+
+
+
+        for _ in range(min(count, 5000)):
+
+            # Abort scrolling if the minimum/maximum was reached.
+
+            if (getter is not None and
+
+                    frame.scrollBarValue(direction) == getter(direction)):
+
+                return
+
+            self._tab.fake_key_press(key)
+
+
+
+    def up(self, count=1):
+
+        self._key_press(Qt.Key_Up, count, 'scrollBarMinimum', Qt.Vertical)
+
+
+
+    def down(self, count=1):
+
+        self._key_press(Qt.Key_Down, count, 'scrollBarMaximum', Qt.Vertical)
+
+
+
+    def left(self, count=1):
+
+        self._key_press(Qt.Key_Left, count, 'scrollBarMinimum', Qt.Horizontal)
+
+
+
+    def right(self, count=1):
+
+        self._key_press(Qt.Key_Right, count, 'scrollBarMaximum', Qt.Horizontal)
+
+
+
+    def top(self):
+
+        self._key_press(Qt.Key_Home)
+
+
+
+    def bottom(self):
+
+        self._key_press(Qt.Key_End)
+
+
+
+    def page_up(self, count=1):
+
+        self._key_press(Qt.Key_PageUp, count, 'scrollBarMinimum', Qt.Vertical)
+
+
+
+    def page_down(self, count=1):
+
+        self._key_press(Qt.Key_PageDown, count, 'scrollBarMaximum',
+
+                        Qt.Vertical)
+
+
+
+    def at_top(self):
+
+        return self.pos_px().y() == 0
+
+
+
+    def at_bottom(self):
+
+        frame = self._widget.page().currentFrame()
+
+        return self.pos_px().y() >= frame.scrollBarMaximum(Qt.Vertical)
+
+
+
+
+
+class WebKitHistoryPrivate(browsertab.AbstractHistoryPrivate):
+
+
+
+    """History-related methods which are not part of the extension API."""
+
+
+
+    def serialize(self):
+
+        return qtutils.serialize(self._history)
+
+
+
+    def deserialize(self, data):
+
+        qtutils.deserialize(data, self._history)
+
+
+
+    def load_items(self, items):
+
+        if items:
+
+            self._tab.before_load_started.emit(items[-1].url)
+
+
+
+        stream, _data, user_data = tabhistory.serialize(items)
+
+        qtutils.deserialize_stream(stream, self._history)
+
+        for i, data in enumerate(user_data):
+
+            self._history.itemAt(i).setUserData(data)
+
+        cur_data = self._history.currentItem().userData()
+
+        if cur_data is not None:
+
+            if 'zoom' in cur_data:
+
+                self._tab.zoom.set_factor(cur_data['zoom'])
+
+            if ('scroll-pos' in cur_data and
+
+                    self._tab.scroller.pos_px() == QPoint(0, 0)):
+
+                QTimer.singleShot(0, functools.partial(
+
+                    self._tab.scroller.to_point, cur_data['scroll-pos']))
+
+
+
+
+
+class WebKitHistory(browsertab.AbstractHistory):
+
+
+
+    """QtWebKit implementations related to page history."""
+
+
+
+    def __init__(self, tab):
+
+        super().__init__(tab)
+
+        self.private_api = WebKitHistoryPrivate(tab)
+
+
+
+    def __len__(self):
+
+        return len(self._history)
+
+
+
+    def __iter__(self):
+
+        return iter(self._history.items())
+
+
+
+    def current_idx(self):
+
+        return self._history.currentItemIndex()
+
+
+
+    def can_go_back(self):
+
+        return self._history.canGoBack()
+
+
+
+    def can_go_forward(self):
+
+        return self._history.canGoForward()
+
+
+
+    def _item_at(self, i):
+
+        return self._history.itemAt(i)
+
+
+
+    def _go_to_item(self, item):
+
+        self._tab.before_load_started.emit(item.url())
+
+        self._history.goToItem(item)
+
+
+
+
+
+class WebKitElements(browsertab.AbstractElements):
+
+
+
+    """QtWebKit implemementations related to elements on the page."""
+
+
+
+    def find_css(self, selector, callback, error_cb, *, only_visible=False):
+
+        utils.unused(error_cb)
+
+        mainframe = self._widget.page().mainFrame()
+
+        if mainframe is None:
+
+            raise browsertab.WebTabError("No frame focused!")
+
+
+
+        elems = []
+
+        frames = webkitelem.get_child_frames(mainframe)
+
+        for f in frames:
+
+            for elem in f.findAllElements(selector):
+
+                elems.append(webkitelem.WebKitElement(elem, tab=self._tab))
+
+
+
+        if only_visible:
+
+            # pylint: disable=protected-access
+
+            elems = [e for e in elems if e._is_visible(mainframe)]
+
+            # pylint: enable=protected-access
+
+
+
+        callback(elems)
+
+
+
+    def find_id(self, elem_id, callback):
+
+        def find_id_cb(elems):
+
+            """Call the real callback with the found elements."""
+
+            if not elems:
+
+                callback(None)
+
+            else:
+
+                callback(elems[0])
+
+
+
+        # Escape non-alphanumeric characters in the selector
+
+        # https://www.w3.org/TR/CSS2/syndata.html#value-def-identifier
+
+        elem_id = re.sub(r'[^a-zA-Z0-9_-]', r'\\\g<0>', elem_id)
+
+        self.find_css('#' + elem_id, find_id_cb, error_cb=lambda exc: None)
+
+
+
+    def find_focused(self, callback):
+
+        frame = self._widget.page().currentFrame()
+
+        if frame is None:
+
+            callback(None)
+
+            return
+
+
+
+        elem = frame.findFirstElement('*:focus')
+
+        if elem.isNull():
+
+            callback(None)
+
+        else:
+
+            callback(webkitelem.WebKitElement(elem, tab=self._tab))
+
+
+
+    def find_at_pos(self, pos, callback):
+
+        assert pos.x() >= 0
+
+        assert pos.y() >= 0
+
+        frame = self._widget.page().frameAt(pos)
+
+        if frame is None:
+
+            # This happens when we click inside the webview, but not actually
+
+            # on the QWebPage - for example when clicking the scrollbar
+
+            # sometimes.
+
+            log.webview.debug("Hit test at {} but frame is None!".format(pos))
+
+            callback(None)
+
+            return
+
+
+
+        # You'd think we have to subtract frame.geometry().topLeft() from the
+
+        # position, but it seems QWebFrame::hitTestContent wants a position
+
+        # relative to the QWebView, not to the frame. This makes no sense to
+
+        # me, but it works this way.
+
+        hitresult = frame.hitTestContent(pos)
+
+        if hitresult.isNull():
+
+            # For some reason, the whole hit result can be null sometimes (e.g.
+
+            # on doodle menu links).
+
+            log.webview.debug("Hit test result is null!")
+
+            callback(None)
+
+            return
 
 
 
         try:
 
-            self.assertEqual(im._compression, "group4")
+            elem = webkitelem.WebKitElement(hitresult.element(), tab=self._tab)
 
-        except AttributeError:
+        except webkitelem.IsNullError:
 
-            print("No _compression")
+            # For some reason, the hit result element can be a null element
 
-            print(dir(im))
+            # sometimes (e.g. when clicking the timetable fields on
 
+            # http://www.sbb.ch/ ).
 
+            log.webview.debug("Hit test result element is null!")
 
-        # can we write it back out, in a different form.
+            callback(None)
 
-        out = self.tempfile("temp.png")
+            return
 
-        im.save(out)
 
 
+        callback(elem)
 
-        out_bytes = io.BytesIO()
 
-        im.save(out_bytes, format="tiff", compression="group4")
 
 
 
+class WebKitAudio(browsertab.AbstractAudio):
 
 
-class TestFileLibTiff(LibTiffTestCase):
 
-    def test_g4_tiff(self):
+    """Dummy handling of audio status for QtWebKit."""
 
-        """Test the ordinary file path load path"""
 
 
+    def set_muted(self, muted: bool, override: bool = False) -> None:
 
-        test_file = "Tests/images/hopper_g4_500.tif"
+        raise browsertab.WebTabError('Muting is not supported on QtWebKit!')
 
-        im = Image.open(test_file)
 
 
+    def is_muted(self):
 
-        self.assertEqual(im.size, (500, 500))
+        return False
 
-        self._assert_noerr(im)
 
 
+    def is_recently_audible(self):
 
-    def test_g4_large(self):
+        return False
 
-        test_file = "Tests/images/pport_g4.tif"
 
-        im = Image.open(test_file)
 
-        self._assert_noerr(im)
 
 
+class WebKitTabPrivate(browsertab.AbstractTabPrivate):
 
-    def test_g4_tiff_file(self):
 
-        """Testing the string load path"""
 
+    """QtWebKit-related methods which aren't part of the public API."""
 
 
-        test_file = "Tests/images/hopper_g4_500.tif"
 
-        with open(test_file, "rb") as f:
+    def networkaccessmanager(self):
 
-            im = Image.open(f)
+        return self._widget.page().networkAccessManager()
 
 
 
-            self.assertEqual(im.size, (500, 500))
+    def user_agent(self):
 
-            self._assert_noerr(im)
+        page = self._widget.page()
 
+        return page.userAgentForUrl(self._tab.url())
 
 
-    def test_g4_tiff_bytesio(self):
 
-        """Testing the stringio loading code path"""
+    def clear_ssl_errors(self):
 
-        test_file = "Tests/images/hopper_g4_500.tif"
+        self.networkaccessmanager().clear_all_ssl_errors()
 
-        s = io.BytesIO()
 
-        with open(test_file, "rb") as f:
 
-            s.write(f.read())
+    def event_target(self):
 
-            s.seek(0)
+        return self._widget
 
-        im = Image.open(s)
 
 
+    def shutdown(self):
 
-        self.assertEqual(im.size, (500, 500))
+        self._widget.shutdown()
 
-        self._assert_noerr(im)
 
 
 
-    def test_g4_non_disk_file_object(self):
 
-        """Testing loading from non-disk non-BytesIO file object"""
+class WebKitTab(browsertab.AbstractTab):
 
-        test_file = "Tests/images/hopper_g4_500.tif"
 
-        s = io.BytesIO()
 
-        with open(test_file, "rb") as f:
+    """A QtWebKit tab in the browser."""
 
-            s.write(f.read())
 
-            s.seek(0)
 
-        r = io.BufferedReader(s)
+    def __init__(self, *, win_id, mode_manager, private, parent=None):
 
-        im = Image.open(r)
+        super().__init__(win_id=win_id, private=private, parent=parent)
 
+        widget = webview.WebView(win_id=win_id, tab_id=self.tab_id,
 
+                                 private=private, tab=self)
 
-        self.assertEqual(im.size, (500, 500))
+        if private:
 
-        self._assert_noerr(im)
+            self._make_private(widget)
 
+        self.history = WebKitHistory(tab=self)
 
+        self.scroller = WebKitScroller(tab=self, parent=self)
 
-    def test_g4_eq_png(self):
+        self.caret = WebKitCaret(mode_manager=mode_manager,
 
-        """ Checking that we're actually getting the data that we expect"""
+                                 tab=self, parent=self)
 
-        png = Image.open("Tests/images/hopper_bw_500.png")
+        self.zoom = WebKitZoom(tab=self, parent=self)
 
-        g4 = Image.open("Tests/images/hopper_g4_500.tif")
+        self.search = WebKitSearch(tab=self, parent=self)
 
+        self.printing = WebKitPrinting(tab=self)
 
+        self.elements = WebKitElements(tab=self)
 
-        self.assert_image_equal(g4, png)
+        self.action = WebKitAction(tab=self)
 
+        self.audio = WebKitAudio(tab=self, parent=self)
 
+        self.private_api = WebKitTabPrivate(mode_manager=mode_manager,
 
-    # see https://github.com/python-pillow/Pillow/issues/279
+                                            tab=self)
 
-    def test_g4_fillorder_eq_png(self):
+        # We're assigning settings in _set_widget
 
-        """ Checking that we're actually getting the data that we expect"""
+        self.settings = webkitsettings.WebKitSettings(settings=None)
 
-        png = Image.open("Tests/images/g4-fillorder-test.png")
+        self._set_widget(widget)
 
-        g4 = Image.open("Tests/images/g4-fillorder-test.tif")
+        self._connect_signals()
 
+        self.backend = usertypes.Backend.QtWebKit
 
 
-        self.assert_image_equal(g4, png)
 
+    def _install_event_filter(self):
 
+        self._widget.installEventFilter(self._tab_event_filter)
 
-    def test_g4_write(self):
 
-        """Checking to see that the saved image is the same as what we wrote"""
 
-        test_file = "Tests/images/hopper_g4_500.tif"
+    def _make_private(self, widget):
 
-        orig = Image.open(test_file)
+        settings = widget.settings()
 
+        settings.setAttribute(QWebSettings.PrivateBrowsingEnabled, True)
 
 
-        out = self.tempfile("temp.tif")
 
-        rot = orig.transpose(Image.ROTATE_90)
+    def load_url(self, url, *, emit_before_load_started=True):
 
-        self.assertEqual(rot.size, (500, 500))
+        self._load_url_prepare(
 
-        rot.save(out)
+            url, emit_before_load_started=emit_before_load_started)
 
+        self._widget.load(url)
 
 
-        reread = Image.open(out)
 
-        self.assertEqual(reread.size, (500, 500))
+    def url(self, *, requested=False):
 
-        self._assert_noerr(reread)
+        frame = self._widget.page().mainFrame()
 
-        self.assert_image_equal(reread, rot)
+        if requested:
 
-        self.assertEqual(reread.info["compression"], "group4")
-
-
-
-        self.assertEqual(reread.info["compression"], orig.info["compression"])
-
-
-
-        self.assertNotEqual(orig.tobytes(), reread.tobytes())
-
-
-
-    def test_adobe_deflate_tiff(self):
-
-        test_file = "Tests/images/tiff_adobe_deflate.tif"
-
-        im = Image.open(test_file)
-
-
-
-        self.assertEqual(im.mode, "RGB")
-
-        self.assertEqual(im.size, (278, 374))
-
-        self.assertEqual(im.tile[0][:3], ("libtiff", (0, 0, 278, 374), 0))
-
-        im.load()
-
-
-
-        self.assert_image_equal_tofile(im, "Tests/images/tiff_adobe_deflate.png")
-
-
-
-    def test_write_metadata(self):
-
-        """ Test metadata writing through libtiff """
-
-        for legacy_api in [False, True]:
-
-            img = Image.open("Tests/images/hopper_g4.tif")
-
-            f = self.tempfile("temp.tiff")
-
-
-
-            img.save(f, tiffinfo=img.tag)
-
-
-
-            if legacy_api:
-
-                original = img.tag.named()
-
-            else:
-
-                original = img.tag_v2.named()
-
-
-
-            # PhotometricInterpretation is set from SAVE_INFO,
-
-            # not the original image.
-
-            ignored = [
-
-                "StripByteCounts",
-
-                "RowsPerStrip",
-
-                "PageNumber",
-
-                "PhotometricInterpretation",
-
-            ]
-
-
-
-            loaded = Image.open(f)
-
-            if legacy_api:
-
-                reloaded = loaded.tag.named()
-
-            else:
-
-                reloaded = loaded.tag_v2.named()
-
-
-
-            for tag, value in itertools.chain(reloaded.items(), original.items()):
-
-                if tag not in ignored:
-
-                    val = original[tag]
-
-                    if tag.endswith("Resolution"):
-
-                        if legacy_api:
-
-                            self.assertEqual(
-
-                                c_float(val[0][0] / val[0][1]).value,
-
-                                c_float(value[0][0] / value[0][1]).value,
-
-                                msg="%s didn't roundtrip" % tag,
-
-                            )
-
-                        else:
-
-                            self.assertEqual(
-
-                                c_float(val).value,
-
-                                c_float(value).value,
-
-                                msg="%s didn't roundtrip" % tag,
-
-                            )
-
-                    else:
-
-                        self.assertEqual(val, value, msg="%s didn't roundtrip" % tag)
-
-
-
-            # https://github.com/python-pillow/Pillow/issues/1561
-
-            requested_fields = ["StripByteCounts", "RowsPerStrip", "StripOffsets"]
-
-            for field in requested_fields:
-
-                self.assertIn(field, reloaded, "%s not in metadata" % field)
-
-
-
-    def test_additional_metadata(self):
-
-        # these should not crash. Seriously dummy data, most of it doesn't make
-
-        # any sense, so we're running up against limits where we're asking
-
-        # libtiff to do stupid things.
-
-
-
-        # Get the list of the ones that we should be able to write
-
-
-
-        core_items = {
-
-            tag: info
-
-            for tag, info in ((s, TiffTags.lookup(s)) for s in TiffTags.LIBTIFF_CORE)
-
-            if info.type is not None
-
-        }
-
-
-
-        # Exclude ones that have special meaning
-
-        # that we're already testing them
-
-        im = Image.open("Tests/images/hopper_g4.tif")
-
-        for tag in im.tag_v2:
-
-            try:
-
-                del core_items[tag]
-
-            except KeyError:
-
-                pass
-
-
-
-        # Type codes:
-
-        #     2: "ascii",
-
-        #     3: "short",
-
-        #     4: "long",
-
-        #     5: "rational",
-
-        #     12: "double",
-
-        # Type: dummy value
-
-        values = {
-
-            2: "test",
-
-            3: 1,
-
-            4: 2 ** 20,
-
-            5: TiffImagePlugin.IFDRational(100, 1),
-
-            12: 1.05,
-
-        }
-
-
-
-        new_ifd = TiffImagePlugin.ImageFileDirectory_v2()
-
-        for tag, info in core_items.items():
-
-            if info.length == 1:
-
-                new_ifd[tag] = values[info.type]
-
-            if info.length == 0:
-
-                new_ifd[tag] = tuple(values[info.type] for _ in range(3))
-
-            else:
-
-                new_ifd[tag] = tuple(values[info.type] for _ in range(info.length))
-
-
-
-        # Extra samples really doesn't make sense in this application.
-
-        del new_ifd[338]
-
-
-
-        out = self.tempfile("temp.tif")
-
-        TiffImagePlugin.WRITE_LIBTIFF = True
-
-
-
-        im.save(out, tiffinfo=new_ifd)
-
-
-
-        TiffImagePlugin.WRITE_LIBTIFF = False
-
-
-
-    def test_custom_metadata(self):
-
-        tc = namedtuple("test_case", "value,type,supported_by_default")
-
-        custom = {
-
-            37000 + k: v
-
-            for k, v in enumerate(
-
-                [
-
-                    tc(4, TiffTags.SHORT, True),
-
-                    tc(123456789, TiffTags.LONG, True),
-
-                    tc(-4, TiffTags.SIGNED_BYTE, False),
-
-                    tc(-4, TiffTags.SIGNED_SHORT, False),
-
-                    tc(-123456789, TiffTags.SIGNED_LONG, False),
-
-                    tc(TiffImagePlugin.IFDRational(4, 7), TiffTags.RATIONAL, True),
-
-                    tc(4.25, TiffTags.FLOAT, True),
-
-                    tc(4.25, TiffTags.DOUBLE, True),
-
-                    tc("custom tag value", TiffTags.ASCII, True),
-
-                    tc(u"custom tag value", TiffTags.ASCII, True),
-
-                    tc(b"custom tag value", TiffTags.BYTE, True),
-
-                    tc((4, 5, 6), TiffTags.SHORT, True),
-
-                    tc((123456789, 9, 34, 234, 219387, 92432323), TiffTags.LONG, True),
-
-                    tc((-4, 9, 10), TiffTags.SIGNED_BYTE, False),
-
-                    tc((-4, 5, 6), TiffTags.SIGNED_SHORT, False),
-
-                    tc(
-
-                        (-123456789, 9, 34, 234, 219387, -92432323),
-
-                        TiffTags.SIGNED_LONG,
-
-                        False,
-
-                    ),
-
-                    tc((4.25, 5.25), TiffTags.FLOAT, True),
-
-                    tc((4.25, 5.25), TiffTags.DOUBLE, True),
-
-                    # array of TIFF_BYTE requires bytes instead of tuple for backwards
-
-                    # compatibility
-
-                    tc(bytes([4]), TiffTags.BYTE, True),
-
-                    tc(bytes((4, 9, 10)), TiffTags.BYTE, True),
-
-                ]
-
-            )
-
-        }
-
-
-
-        libtiff_version = TiffImagePlugin._libtiff_version()
-
-
-
-        libtiffs = [False]
-
-        if distutils.version.StrictVersion(
-
-            libtiff_version
-
-        ) >= distutils.version.StrictVersion("4.0"):
-
-            libtiffs.append(True)
-
-
-
-        for libtiff in libtiffs:
-
-            TiffImagePlugin.WRITE_LIBTIFF = libtiff
-
-
-
-            def check_tags(tiffinfo):
-
-                im = hopper()
-
-
-
-                out = self.tempfile("temp.tif")
-
-                im.save(out, tiffinfo=tiffinfo)
-
-
-
-                reloaded = Image.open(out)
-
-                for tag, value in tiffinfo.items():
-
-                    reloaded_value = reloaded.tag_v2[tag]
-
-                    if (
-
-                        isinstance(reloaded_value, TiffImagePlugin.IFDRational)
-
-                        and libtiff
-
-                    ):
-
-                        # libtiff does not support real RATIONALS
-
-                        self.assertAlmostEqual(float(reloaded_value), float(value))
-
-                        continue
-
-
-
-                    if libtiff and isinstance(value, bytes):
-
-                        value = value.decode()
-
-
-
-                    self.assertEqual(reloaded_value, value)
-
-
-
-            # Test with types
-
-            ifd = TiffImagePlugin.ImageFileDirectory_v2()
-
-            for tag, tagdata in custom.items():
-
-                ifd[tag] = tagdata.value
-
-                ifd.tagtype[tag] = tagdata.type
-
-            check_tags(ifd)
-
-
-
-            # Test without types. This only works for some types, int for example are
-
-            # always encoded as LONG and not SIGNED_LONG.
-
-            check_tags(
-
-                {
-
-                    tag: tagdata.value
-
-                    for tag, tagdata in custom.items()
-
-                    if tagdata.supported_by_default
-
-                }
-
-            )
-
-        TiffImagePlugin.WRITE_LIBTIFF = False
-
-
-
-    def test_int_dpi(self):
-
-        # issue #1765
-
-        im = hopper("RGB")
-
-        out = self.tempfile("temp.tif")
-
-        TiffImagePlugin.WRITE_LIBTIFF = True
-
-        im.save(out, dpi=(72, 72))
-
-        TiffImagePlugin.WRITE_LIBTIFF = False
-
-        reloaded = Image.open(out)
-
-        self.assertEqual(reloaded.info["dpi"], (72.0, 72.0))
-
-
-
-    def test_g3_compression(self):
-
-        i = Image.open("Tests/images/hopper_g4_500.tif")
-
-        out = self.tempfile("temp.tif")
-
-        i.save(out, compression="group3")
-
-
-
-        reread = Image.open(out)
-
-        self.assertEqual(reread.info["compression"], "group3")
-
-        self.assert_image_equal(reread, i)
-
-
-
-    def test_little_endian(self):
-
-        im = Image.open("Tests/images/16bit.deflate.tif")
-
-        self.assertEqual(im.getpixel((0, 0)), 480)
-
-        self.assertEqual(im.mode, "I;16")
-
-
-
-        b = im.tobytes()
-
-        # Bytes are in image native order (little endian)
-
-        if py3:
-
-            self.assertEqual(b[0], ord(b"\xe0"))
-
-            self.assertEqual(b[1], ord(b"\x01"))
+            return frame.requestedUrl()
 
         else:
 
-            self.assertEqual(b[0], b"\xe0")
-
-            self.assertEqual(b[1], b"\x01")
+            return frame.url()
 
 
 
-        out = self.tempfile("temp.tif")
+    def dump_async(self, callback, *, plain=False):
 
-        # out = "temp.le.tif"
+        frame = self._widget.page().mainFrame()
 
-        im.save(out)
+        if plain:
 
-        reread = Image.open(out)
-
-
-
-        self.assertEqual(reread.info["compression"], im.info["compression"])
-
-        self.assertEqual(reread.getpixel((0, 0)), 480)
-
-        # UNDONE - libtiff defaults to writing in native endian, so
-
-        # on big endian, we'll get back mode = 'I;16B' here.
-
-
-
-    def test_big_endian(self):
-
-        im = Image.open("Tests/images/16bit.MM.deflate.tif")
-
-
-
-        self.assertEqual(im.getpixel((0, 0)), 480)
-
-        self.assertEqual(im.mode, "I;16B")
-
-
-
-        b = im.tobytes()
-
-
-
-        # Bytes are in image native order (big endian)
-
-        if py3:
-
-            self.assertEqual(b[0], ord(b"\x01"))
-
-            self.assertEqual(b[1], ord(b"\xe0"))
+            callback(frame.toPlainText())
 
         else:
 
-            self.assertEqual(b[0], b"\x01")
+            callback(frame.toHtml())
 
-            self.assertEqual(b[1], b"\xe0")
 
 
+    def run_js_async(self, code, callback=None, *, world=None):
 
-        out = self.tempfile("temp.tif")
+        if world is not None and world != usertypes.JsWorld.jseval:
 
-        im.save(out)
+            log.webview.warning("Ignoring world ID {}".format(world))
 
-        reread = Image.open(out)
+        document_element = self._widget.page().mainFrame().documentElement()
 
+        result = document_element.evaluateJavaScript(code)
 
+        if callback is not None:
 
-        self.assertEqual(reread.info["compression"], im.info["compression"])
+            callback(result)
 
-        self.assertEqual(reread.getpixel((0, 0)), 480)
 
 
+    def icon(self):
 
-    def test_g4_string_info(self):
+        return self._widget.icon()
 
-        """Tests String data in info directory"""
 
-        test_file = "Tests/images/hopper_g4_500.tif"
 
-        orig = Image.open(test_file)
+    def reload(self, *, force=False):
 
+        if force:
 
+            action = QWebPage.ReloadAndBypassCache
 
-        out = self.tempfile("temp.tif")
+        else:
 
+            action = QWebPage.Reload
 
+        self._widget.triggerPageAction(action)
 
-        orig.tag[269] = "temp.tif"
 
-        orig.save(out)
 
+    def stop(self):
 
+        self._widget.stop()
 
-        reread = Image.open(out)
 
-        self.assertEqual("temp.tif", reread.tag_v2[269])
 
-        self.assertEqual("temp.tif", reread.tag[269][0])
+    def title(self):
 
+        return self._widget.title()
 
 
-    def test_12bit_rawmode(self):
 
-        """ Are we generating the same interpretation
+    @pyqtSlot()
 
-        of the image as Imagemagick is? """
+    def _on_history_trigger(self):
 
-        TiffImagePlugin.READ_LIBTIFF = True
+        url = self.url()
 
-        im = Image.open("Tests/images/12bit.cropped.tif")
+        requested_url = self.url(requested=True)
 
-        im.load()
+        self.history_item_triggered.emit(url, requested_url, self.title())
 
-        TiffImagePlugin.READ_LIBTIFF = False
 
-        # to make the target --
 
-        # convert 12bit.cropped.tif -depth 16 tmp.tif
+    def set_html(self, html, base_url=QUrl()):
 
-        # convert tmp.tif -evaluate RightShift 4 12in16bit2.tif
+        self._widget.setHtml(html, base_url)
 
-        # imagemagick will auto scale so that a 12bit FFF is 16bit FFF0,
 
-        # so we need to unshift so that the integer values are the same.
 
+    @pyqtSlot()
 
+    def _on_load_started(self):
 
-        self.assert_image_equal_tofile(im, "Tests/images/12in16bit.tif")
+        super()._on_load_started()
 
+        nam = self._widget.page().networkAccessManager()
 
+        nam.netrc_used = False
 
-    def test_blur(self):
+        # Make sure the icon is cleared when navigating to a page without one.
 
-        # test case from irc, how to do blur on b/w image
+        self.icon_changed.emit(QIcon())
 
-        # and save to compressed tif.
 
-        from PIL import ImageFilter
 
+    @pyqtSlot(bool)
 
+    def _on_load_finished(self, ok: bool) -> None:
 
-        out = self.tempfile("temp.tif")
+        super()._on_load_finished(ok)
 
-        im = Image.open("Tests/images/pport_g4.tif")
+        self._update_load_status(ok)
 
-        im = im.convert("L")
 
 
+    @pyqtSlot()
 
-        im = im.filter(ImageFilter.GaussianBlur(4))
+    def _on_frame_load_finished(self):
 
-        im.save(out, compression="tiff_adobe_deflate")
+        """Make sure we emit an appropriate status when loading finished.
 
 
 
-        im2 = Image.open(out)
+        While Qt has a bool "ok" attribute for loadFinished, it always is True
 
-        im2.load()
+        when using error pages... See
 
+        https://github.com/qutebrowser/qutebrowser/issues/84
 
+        """
 
-        self.assert_image_equal(im, im2)
+        self._on_load_finished(not self._widget.page().error_occurred)
 
 
 
-    def test_compressions(self):
+    @pyqtSlot()
 
-        # Test various tiff compressions and assert similar image content but reduced
+    def _on_webkit_icon_changed(self):
 
-        # file sizes.
+        """Emit iconChanged with a QIcon like QWebEngineView does."""
 
-        im = hopper("RGB")
+        if sip.isdeleted(self._widget):
 
-        out = self.tempfile("temp.tif")
+            log.webview.debug("Got _on_webkit_icon_changed for deleted view!")
 
-        im.save(out)
+            return
 
-        size_raw = os.path.getsize(out)
+        self.icon_changed.emit(self._widget.icon())
 
 
 
-        for compression in ("packbits", "tiff_lzw"):
+    @pyqtSlot(QWebFrame)
 
-            im.save(out, compression=compression)
+    def _on_frame_created(self, frame):
 
-            size_compressed = os.path.getsize(out)
+        """Connect the contentsSizeChanged signal of each frame."""
 
-            im2 = Image.open(out)
+        # FIXME:qtwebengine those could theoretically regress:
 
-            self.assert_image_equal(im, im2)
+        # https://github.com/qutebrowser/qutebrowser/issues/152
 
+        # https://github.com/qutebrowser/qutebrowser/issues/263
 
+        frame.contentsSizeChanged.connect(self._on_contents_size_changed)
 
-        im.save(out, compression="jpeg")
 
-        size_jpeg = os.path.getsize(out)
 
-        im2 = Image.open(out)
+    @pyqtSlot(QSize)
 
-        self.assert_image_similar(im, im2, 30)
+    def _on_contents_size_changed(self, size):
 
+        self.contents_size_changed.emit(QSizeF(size))
 
 
-        im.save(out, compression="jpeg", quality=30)
 
-        size_jpeg_30 = os.path.getsize(out)
+    @pyqtSlot(usertypes.NavigationRequest)
 
-        im3 = Image.open(out)
+    def _on_navigation_request(self, navigation):
 
-        self.assert_image_similar(im2, im3, 30)
+        super()._on_navigation_request(navigation)
 
+        if not navigation.accepted:
 
+            return
 
-        self.assertGreater(size_raw, size_compressed)
 
-        self.assertGreater(size_compressed, size_jpeg)
 
-        self.assertGreater(size_jpeg, size_jpeg_30)
+        log.webview.debug("target {} override {}".format(
 
+            self.data.open_target, self.data.override_target))
 
 
-    def test_quality(self):
 
-        im = hopper("RGB")
+        if self.data.override_target is not None:
 
-        out = self.tempfile("temp.tif")
+            target = self.data.override_target
 
+            self.data.override_target = None
 
+        else:
 
-        self.assertRaises(ValueError, im.save, out, compression="tiff_lzw", quality=50)
+            target = self.data.open_target
 
-        self.assertRaises(ValueError, im.save, out, compression="jpeg", quality=-1)
 
-        self.assertRaises(ValueError, im.save, out, compression="jpeg", quality=101)
 
-        self.assertRaises(ValueError, im.save, out, compression="jpeg", quality="good")
+        if (navigation.navigation_type == navigation.Type.link_clicked and
 
-        im.save(out, compression="jpeg", quality=0)
+                target != usertypes.ClickTarget.normal):
 
-        im.save(out, compression="jpeg", quality=100)
+            tab = shared.get_tab(self.win_id, target)
 
+            tab.load_url(navigation.url)
 
+            self.data.open_target = usertypes.ClickTarget.normal
 
-    def test_cmyk_save(self):
+            navigation.accepted = False
 
-        im = hopper("CMYK")
 
-        out = self.tempfile("temp.tif")
 
+        if navigation.is_main_frame:
 
+            self.settings.update_for_url(navigation.url)
 
-        im.save(out, compression="tiff_adobe_deflate")
 
-        im2 = Image.open(out)
 
-        self.assert_image_equal(im, im2)
+    @pyqtSlot()
 
+    def _on_ssl_errors(self):
 
+        self._has_ssl_errors = True
 
-    def xtest_bw_compression_w_rgb(self):
 
-        """ This test passes, but when running all tests causes a failure due
 
-            to output on stderr from the error thrown by libtiff. We need to
+    def _connect_signals(self):
 
-            capture that but not now"""
+        view = self._widget
 
+        page = view.page()
 
+        frame = page.mainFrame()
 
-        im = hopper("RGB")
+        page.windowCloseRequested.connect(self.window_close_requested)
 
-        out = self.tempfile("temp.tif")
+        page.linkHovered.connect(self.link_hovered)
 
+        page.loadProgress.connect(self._on_load_progress)
 
+        frame.loadStarted.connect(self._on_load_started)
 
-        self.assertRaises(IOError, im.save, out, compression="tiff_ccitt")
+        view.scroll_pos_changed.connect(self.scroller.perc_changed)
 
-        self.assertRaises(IOError, im.save, out, compression="group3")
+        view.titleChanged.connect(self.title_changed)
 
-        self.assertRaises(IOError, im.save, out, compression="group4")
+        view.urlChanged.connect(self._on_url_changed)
 
+        view.shutting_down.connect(self.shutting_down)
 
+        page.networkAccessManager().sslErrors.connect(self._on_ssl_errors)
 
-    def test_fp_leak(self):
+        frame.loadFinished.connect(self._on_frame_load_finished)
 
-        im = Image.open("Tests/images/hopper_g4_500.tif")
+        view.iconChanged.connect(self._on_webkit_icon_changed)
 
-        fn = im.fp.fileno()
+        page.frameCreated.connect(self._on_frame_created)
 
+        frame.contentsSizeChanged.connect(self._on_contents_size_changed)
 
+        frame.initialLayoutCompleted.connect(self._on_history_trigger)
 
-        os.fstat(fn)
-
-        im.load()  # this should close it.
-
-        self.assertRaises(OSError, os.fstat, fn)
-
-        im = None  # this should force even more closed.
-
-        self.assertRaises(OSError, os.fstat, fn)
-
-        self.assertRaises(OSError, os.close, fn)
-
-
-
-    def test_multipage(self):
-
-        # issue #862
-
-        TiffImagePlugin.READ_LIBTIFF = True
-
-        im = Image.open("Tests/images/multipage.tiff")
-
-        # file is a multipage tiff,  10x10 green, 10x10 red, 20x20 blue
-
-
-
-        im.seek(0)
-
-        self.assertEqual(im.size, (10, 10))
-
-        self.assertEqual(im.convert("RGB").getpixel((0, 0)), (0, 128, 0))
-
-        self.assertTrue(im.tag.next)
-
-
-
-        im.seek(1)
-
-        self.assertEqual(im.size, (10, 10))
-
-        self.assertEqual(im.convert("RGB").getpixel((0, 0)), (255, 0, 0))
-
-        self.assertTrue(im.tag.next)
-
-
-
-        im.seek(2)
-
-        self.assertFalse(im.tag.next)
-
-        self.assertEqual(im.size, (20, 20))
-
-        self.assertEqual(im.convert("RGB").getpixel((0, 0)), (0, 0, 255))
-
-
-
-        TiffImagePlugin.READ_LIBTIFF = False
-
-
-
-    def test_multipage_nframes(self):
-
-        # issue #862
-
-        TiffImagePlugin.READ_LIBTIFF = True
-
-        im = Image.open("Tests/images/multipage.tiff")
-
-        frames = im.n_frames
-
-        self.assertEqual(frames, 3)
-
-        for _ in range(frames):
-
-            im.seek(0)
-
-            # Should not raise ValueError: I/O operation on closed file
-
-            im.load()
-
-
-
-        TiffImagePlugin.READ_LIBTIFF = False
-
-
-
-    def test__next(self):
-
-        TiffImagePlugin.READ_LIBTIFF = True
-
-        im = Image.open("Tests/images/hopper.tif")
-
-        self.assertFalse(im.tag.next)
-
-        im.load()
-
-        self.assertFalse(im.tag.next)
-
-
-
-    def test_4bit(self):
-
-        # Arrange
-
-        test_file = "Tests/images/hopper_gray_4bpp.tif"
-
-        original = hopper("L")
-
-
-
-        # Act
-
-        TiffImagePlugin.READ_LIBTIFF = True
-
-        im = Image.open(test_file)
-
-        TiffImagePlugin.READ_LIBTIFF = False
-
-
-
-        # Assert
-
-        self.assertEqual(im.size, (128, 128))
-
-        self.assertEqual(im.mode, "L")
-
-        self.assert_image_similar(im, original, 7.3)
-
-
-
-    def test_gray_semibyte_per_pixel(self):
-
-        test_files = (
-
-            (
-
-                24.8,  # epsilon
-
-                (  # group
-
-                    "Tests/images/tiff_gray_2_4_bpp/hopper2.tif",
-
-                    "Tests/images/tiff_gray_2_4_bpp/hopper2I.tif",
-
-                    "Tests/images/tiff_gray_2_4_bpp/hopper2R.tif",
-
-                    "Tests/images/tiff_gray_2_4_bpp/hopper2IR.tif",
-
-                ),
-
-            ),
-
-            (
-
-                7.3,  # epsilon
-
-                (  # group
-
-                    "Tests/images/tiff_gray_2_4_bpp/hopper4.tif",
-
-                    "Tests/images/tiff_gray_2_4_bpp/hopper4I.tif",
-
-                    "Tests/images/tiff_gray_2_4_bpp/hopper4R.tif",
-
-                    "Tests/images/tiff_gray_2_4_bpp/hopper4IR.tif",
-
-                ),
-
-            ),
-
-        )
-
-        original = hopper("L")
-
-        for epsilon, group in test_files:
-
-            im = Image.open(group[0])
-
-            self.assertEqual(im.size, (128, 128))
-
-            self.assertEqual(im.mode, "L")
-
-            self.assert_image_similar(im, original, epsilon)
-
-            for file in group[1:]:
-
-                im2 = Image.open(file)
-
-                self.assertEqual(im2.size, (128, 128))
-
-                self.assertEqual(im2.mode, "L")
-
-                self.assert_image_equal(im, im2)
-
-
-
-    def test_save_bytesio(self):
-
-        # PR 1011
-
-        # Test TIFF saving to io.BytesIO() object.
-
-
-
-        TiffImagePlugin.WRITE_LIBTIFF = True
-
-        TiffImagePlugin.READ_LIBTIFF = True
-
-
-
-        # Generate test image
-
-        pilim = hopper()
-
-
-
-        def save_bytesio(compression=None):
-
-
-
-            buffer_io = io.BytesIO()
-
-            pilim.save(buffer_io, format="tiff", compression=compression)
-
-            buffer_io.seek(0)
-
-
-
-            pilim_load = Image.open(buffer_io)
-
-            self.assert_image_similar(pilim, pilim_load, 0)
-
-
-
-        save_bytesio()
-
-        save_bytesio("raw")
-
-        save_bytesio("packbits")
-
-        save_bytesio("tiff_lzw")
-
-
-
-        TiffImagePlugin.WRITE_LIBTIFF = False
-
-        TiffImagePlugin.READ_LIBTIFF = False
-
-
-
-    def test_crashing_metadata(self):
-
-        # issue 1597
-
-        im = Image.open("Tests/images/rdf.tif")
-
-        out = self.tempfile("temp.tif")
-
-
-
-        TiffImagePlugin.WRITE_LIBTIFF = True
-
-        # this shouldn't crash
-
-        im.save(out, format="TIFF")
-
-        TiffImagePlugin.WRITE_LIBTIFF = False
-
-
-
-    def test_page_number_x_0(self):
-
-        # Issue 973
-
-        # Test TIFF with tag 297 (Page Number) having value of 0 0.
-
-        # The first number is the current page number.
-
-        # The second is the total number of pages, zero means not available.
-
-        outfile = self.tempfile("temp.tif")
-
-        # Created by printing a page in Chrome to PDF, then:
-
-        # /usr/bin/gs -q -sDEVICE=tiffg3 -sOutputFile=total-pages-zero.tif
-
-        # -dNOPAUSE /tmp/test.pdf -c quit
-
-        infile = "Tests/images/total-pages-zero.tif"
-
-        im = Image.open(infile)
-
-        # Should not divide by zero
-
-        im.save(outfile)
-
-
-
-    def test_fd_duplication(self):
-
-        # https://github.com/python-pillow/Pillow/issues/1651
-
-
-
-        tmpfile = self.tempfile("temp.tif")
-
-        with open(tmpfile, "wb") as f:
-
-            with open("Tests/images/g4-multi.tiff", "rb") as src:
-
-                f.write(src.read())
-
-
-
-        im = Image.open(tmpfile)
-
-        im.n_frames
-
-        im.close()
-
-        # Should not raise PermissionError.
-
-        os.remove(tmpfile)
-
-
-
-    def test_read_icc(self):
-
-        with Image.open("Tests/images/hopper.iccprofile.tif") as img:
-
-            icc = img.info.get("icc_profile")
-
-            self.assertIsNotNone(icc)
-
-        TiffImagePlugin.READ_LIBTIFF = True
-
-        with Image.open("Tests/images/hopper.iccprofile.tif") as img:
-
-            icc_libtiff = img.info.get("icc_profile")
-
-            self.assertIsNotNone(icc_libtiff)
-
-        TiffImagePlugin.READ_LIBTIFF = False
-
-        self.assertEqual(icc, icc_libtiff)
-
-
-
-    def test_multipage_compression(self):
-
-        im = Image.open("Tests/images/compression.tif")
-
-
-
-        im.seek(0)
-
-        self.assertEqual(im._compression, "tiff_ccitt")
-
-        self.assertEqual(im.size, (10, 10))
-
-
-
-        im.seek(1)
-
-        self.assertEqual(im._compression, "packbits")
-
-        self.assertEqual(im.size, (10, 10))
-
-        im.load()
-
-
-
-        im.seek(0)
-
-        self.assertEqual(im._compression, "tiff_ccitt")
-
-        self.assertEqual(im.size, (10, 10))
-
-        im.load()
-
-
-
-    def test_save_tiff_with_jpegtables(self):
-
-        # Arrange
-
-        outfile = self.tempfile("temp.tif")
-
-
-
-        # Created with ImageMagick: convert hopper.jpg hopper_jpg.tif
-
-        # Contains JPEGTables (347) tag
-
-        infile = "Tests/images/hopper_jpg.tif"
-
-        im = Image.open(infile)
-
-
-
-        # Act / Assert
-
-        # Should not raise UnicodeDecodeError or anything else
-
-        im.save(outfile)
-
-
-
-    def test_16bit_RGB_tiff(self):
-
-        im = Image.open("Tests/images/tiff_16bit_RGB.tiff")
-
-
-
-        self.assertEqual(im.mode, "RGB")
-
-        self.assertEqual(im.size, (100, 40))
-
-        self.assertEqual(
-
-            im.tile,
-
-            [
-
-                (
-
-                    "libtiff",
-
-                    (0, 0, 100, 40),
-
-                    0,
-
-                    ("RGB;16N", "tiff_adobe_deflate", False, 8),
-
-                )
-
-            ],
-
-        )
-
-        im.load()
-
-
-
-        self.assert_image_equal_tofile(im, "Tests/images/tiff_16bit_RGB_target.png")
-
-
-
-    def test_16bit_RGBa_tiff(self):
-
-        im = Image.open("Tests/images/tiff_16bit_RGBa.tiff")
-
-
-
-        self.assertEqual(im.mode, "RGBA")
-
-        self.assertEqual(im.size, (100, 40))
-
-        self.assertEqual(
-
-            im.tile,
-
-            [("libtiff", (0, 0, 100, 40), 0, ("RGBa;16N", "tiff_lzw", False, 38236))],
-
-        )
-
-        im.load()
-
-
-
-        self.assert_image_equal_tofile(im, "Tests/images/tiff_16bit_RGBa_target.png")
-
-
-
-    def test_gimp_tiff(self):
-
-        # Read TIFF JPEG images from GIMP [@PIL168]
-
-
-
-        codecs = dir(Image.core)
-
-        if "jpeg_decoder" not in codecs:
-
-            self.skipTest("jpeg support not available")
-
-
-
-        filename = "Tests/images/pil168.tif"
-
-        im = Image.open(filename)
-
-
-
-        self.assertEqual(im.mode, "RGB")
-
-        self.assertEqual(im.size, (256, 256))
-
-        self.assertEqual(
-
-            im.tile, [("libtiff", (0, 0, 256, 256), 0, ("RGB", "jpeg", False, 5122))]
-
-        )
-
-        im.load()
-
-
-
-        self.assert_image_equal_tofile(im, "Tests/images/pil168.png")
-
-
-
-    def test_sampleformat(self):
-
-        # https://github.com/python-pillow/Pillow/issues/1466
-
-        im = Image.open("Tests/images/copyleft.tiff")
-
-        self.assertEqual(im.mode, "RGB")
-
-
-
-        self.assert_image_equal_tofile(im, "Tests/images/copyleft.png", mode="RGB")
-
-
-
-    def test_lzw(self):
-
-        im = Image.open("Tests/images/hopper_lzw.tif")
-
-
-
-        self.assertEqual(im.mode, "RGB")
-
-        self.assertEqual(im.size, (128, 128))
-
-        self.assertEqual(im.format, "TIFF")
-
-        im2 = hopper()
-
-        self.assert_image_similar(im, im2, 5)
-
-
-
-    def test_strip_cmyk_jpeg(self):
-
-        infile = "Tests/images/tiff_strip_cmyk_jpeg.tif"
-
-        im = Image.open(infile)
-
-
-
-        self.assert_image_similar_tofile(im, "Tests/images/pil_sample_cmyk.jpg", 0.5)
-
-
-
-    def test_strip_cmyk_16l_jpeg(self):
-
-        infile = "Tests/images/tiff_strip_cmyk_16l_jpeg.tif"
-
-        im = Image.open(infile)
-
-
-
-        self.assert_image_similar_tofile(im, "Tests/images/pil_sample_cmyk.jpg", 0.5)
-
-
-
-    def test_strip_ycbcr_jpeg_2x2_sampling(self):
-
-        infile = "Tests/images/tiff_strip_ycbcr_jpeg_2x2_sampling.tif"
-
-        im = Image.open(infile)
-
-
-
-        self.assert_image_similar_tofile(im, "Tests/images/flower.jpg", 0.5)
-
-
-
-    def test_strip_ycbcr_jpeg_1x1_sampling(self):
-
-        infile = "Tests/images/tiff_strip_ycbcr_jpeg_1x1_sampling.tif"
-
-        im = Image.open(infile)
-
-
-
-        self.assert_image_equal_tofile(im, "Tests/images/flower2.jpg")
-
-
-
-    def test_tiled_cmyk_jpeg(self):
-
-        infile = "Tests/images/tiff_tiled_cmyk_jpeg.tif"
-
-        im = Image.open(infile)
-
-
-
-        self.assert_image_similar_tofile(im, "Tests/images/pil_sample_cmyk.jpg", 0.5)
-
-
-
-    def test_tiled_ycbcr_jpeg_1x1_sampling(self):
-
-        infile = "Tests/images/tiff_tiled_ycbcr_jpeg_1x1_sampling.tif"
-
-        im = Image.open(infile)
-
-
-
-        self.assert_image_equal_tofile(im, "Tests/images/flower2.jpg")
-
-
-
-    def test_tiled_ycbcr_jpeg_2x2_sampling(self):
-
-        infile = "Tests/images/tiff_tiled_ycbcr_jpeg_2x2_sampling.tif"
-
-        im = Image.open(infile)
-
-
-
-        self.assert_image_similar_tofile(im, "Tests/images/flower.jpg", 0.5)
-
-
-
-    def test_old_style_jpeg(self):
-
-        infile = "Tests/images/old-style-jpeg-compression.tif"
-
-        im = Image.open(infile)
-
-
-
-        self.assert_image_equal_tofile(
-
-            im, "Tests/images/old-style-jpeg-compression.png"
-
-        )
-
-
-
-    def test_no_rows_per_strip(self):
-
-        # This image does not have a RowsPerStrip TIFF tag
-
-        infile = "Tests/images/no_rows_per_strip.tif"
-
-        im = Image.open(infile)
-
-        im.load()
-
-        self.assertEqual(im.size, (950, 975))
-
-
-
-    def test_orientation(self):
-
-        base_im = Image.open("Tests/images/g4_orientation_1.tif")
-
-
-
-        for i in range(2, 9):
-
-            im = Image.open("Tests/images/g4_orientation_" + str(i) + ".tif")
-
-            im.load()
-
-
-
-            self.assert_image_similar(base_im, im, 0.7)
-
-
-
-    def test_sampleformat_not_corrupted(self):
-
-        # Assert that a TIFF image with SampleFormat=UINT tag is not corrupted
-
-        # when saving to a new file.
-
-        # Pillow 6.0 fails with "OSError: cannot identify image file".
-
-        import base64
-
-
-
-        tiff = io.BytesIO(
-
-            base64.b64decode(
-
-                b"SUkqAAgAAAAPAP4ABAABAAAAAAAAAAABBAABAAAAAQAAAAEBBAABAAAAAQAA"
-
-                b"AAIBAwADAAAAwgAAAAMBAwABAAAACAAAAAYBAwABAAAAAgAAABEBBAABAAAA"
-
-                b"4AAAABUBAwABAAAAAwAAABYBBAABAAAAAQAAABcBBAABAAAACwAAABoBBQAB"
-
-                b"AAAAyAAAABsBBQABAAAA0AAAABwBAwABAAAAAQAAACgBAwABAAAAAQAAAFMB"
-
-                b"AwADAAAA2AAAAAAAAAAIAAgACAABAAAAAQAAAAEAAAABAAAAAQABAAEAAAB4"
-
-                b"nGNgYAAAAAMAAQ=="
-
-            )
-
-        )
-
-        out = io.BytesIO()
-
-        with Image.open(tiff) as im:
-
-            im.save(out, format="tiff")
-
-        out.seek(0)
-
-        with Image.open(out) as im:
-
-            im.load()
+        page.navigation_request.connect(self._on_navigation_request)

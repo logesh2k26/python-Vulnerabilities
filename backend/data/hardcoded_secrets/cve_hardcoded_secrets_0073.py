@@ -2,1372 +2,762 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
+# -*- coding: utf-8 -*-
 
+from __future__ import unicode_literals
 
 
-# Copyright 2012 OpenStack LLC
 
-#
+from unittest import skipUnless
 
-# Licensed under the Apache License, Version 2.0 (the "License"); you may
 
-# not use this file except in compliance with the License. You may obtain
 
-# a copy of the License at
+from django.conf.global_settings import PASSWORD_HASHERS
 
-#
+from django.contrib.auth.hashers import (
 
-#      http://www.apache.org/licenses/LICENSE-2.0
+    UNUSABLE_PASSWORD_PREFIX, UNUSABLE_PASSWORD_SUFFIX_LENGTH,
 
-#
+    BasePasswordHasher, PBKDF2PasswordHasher, PBKDF2SHA1PasswordHasher,
 
-# Unless required by applicable law or agreed to in writing, software
+    check_password, get_hasher, identify_hasher, is_password_usable,
 
-# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+    make_password,
 
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+)
 
-# License for the specific language governing permissions and limitations
+from django.test import SimpleTestCase
 
-# under the License.
+from django.test.utils import override_settings
 
+from django.utils import six
 
 
-"""Main entry point into the Identity service."""
 
+try:
 
+    import crypt
 
-import urllib
+except ImportError:
 
-import urlparse
+    crypt = None
 
-import uuid
 
 
+try:
 
-from keystone.common import logging
+    import bcrypt
 
-from keystone.common import manager
+except ImportError:
 
-from keystone.common import wsgi
+    bcrypt = None
 
-from keystone import config
 
-from keystone import exception
 
-from keystone import policy
 
-from keystone import token
 
+class PBKDF2SingleIterationHasher(PBKDF2PasswordHasher):
 
+    iterations = 1
 
 
 
-CONF = config.CONF
 
 
+@override_settings(PASSWORD_HASHERS=PASSWORD_HASHERS)
 
-LOG = logging.getLogger(__name__)
+class TestUtilsHashPass(SimpleTestCase):
 
 
 
+    def test_simple(self):
 
+        encoded = make_password('lètmein')
 
-class Manager(manager.Manager):
+        self.assertTrue(encoded.startswith('pbkdf2_sha256$'))
 
-    """Default pivot point for the Identity backend.
+        self.assertTrue(is_password_usable(encoded))
 
+        self.assertTrue(check_password('lètmein', encoded))
 
+        self.assertFalse(check_password('lètmeinz', encoded))
 
-    See :mod:`keystone.common.manager.Manager` for more details on how this
+        # Blank passwords
 
-    dynamically calls the backend.
+        blank_encoded = make_password('')
 
+        self.assertTrue(blank_encoded.startswith('pbkdf2_sha256$'))
 
+        self.assertTrue(is_password_usable(blank_encoded))
 
-    """
+        self.assertTrue(check_password('', blank_encoded))
 
+        self.assertFalse(check_password(' ', blank_encoded))
 
 
-    def __init__(self):
 
-        super(Manager, self).__init__(CONF.identity.driver)
+    def test_pbkdf2(self):
 
+        encoded = make_password('lètmein', 'seasalt', 'pbkdf2_sha256')
 
+        self.assertEqual(encoded,
 
+            'pbkdf2_sha256$30000$seasalt$VrX+V8drCGo68wlvy6rfu8i1d1pfkdeXA4LJkRGJodY=')
 
+        self.assertTrue(is_password_usable(encoded))
 
-class Driver(object):
+        self.assertTrue(check_password('lètmein', encoded))
 
-    """Interface description for an Identity driver."""
+        self.assertFalse(check_password('lètmeinz', encoded))
 
+        self.assertEqual(identify_hasher(encoded).algorithm, "pbkdf2_sha256")
 
+        # Blank passwords
 
-    def authenticate(self, user_id=None, tenant_id=None, password=None):
+        blank_encoded = make_password('', 'seasalt', 'pbkdf2_sha256')
 
-        """Authenticate a given user, tenant and password.
+        self.assertTrue(blank_encoded.startswith('pbkdf2_sha256$'))
 
+        self.assertTrue(is_password_usable(blank_encoded))
 
+        self.assertTrue(check_password('', blank_encoded))
 
-        :returns: (user_ref, tenant_ref, metadata_ref)
+        self.assertFalse(check_password(' ', blank_encoded))
 
-        :raises: AssertionError
 
 
+    @override_settings(PASSWORD_HASHERS=['django.contrib.auth.hashers.SHA1PasswordHasher'])
 
-        """
+    def test_sha1(self):
 
-        raise exception.NotImplemented()
+        encoded = make_password('lètmein', 'seasalt', 'sha1')
 
+        self.assertEqual(encoded,
 
+            'sha1$seasalt$cff36ea83f5706ce9aa7454e63e431fc726b2dc8')
 
-    def get_tenant(self, tenant_id):
+        self.assertTrue(is_password_usable(encoded))
 
-        """Get a tenant by id.
+        self.assertTrue(check_password('lètmein', encoded))
 
+        self.assertFalse(check_password('lètmeinz', encoded))
 
+        self.assertEqual(identify_hasher(encoded).algorithm, "sha1")
 
-        :returns: tenant_ref
+        # Blank passwords
 
-        :raises: keystone.exception.TenantNotFound
+        blank_encoded = make_password('', 'seasalt', 'sha1')
 
+        self.assertTrue(blank_encoded.startswith('sha1$'))
 
+        self.assertTrue(is_password_usable(blank_encoded))
 
-        """
+        self.assertTrue(check_password('', blank_encoded))
 
-        raise exception.NotImplemented()
+        self.assertFalse(check_password(' ', blank_encoded))
 
 
 
-    def get_tenant_by_name(self, tenant_name):
+    @override_settings(PASSWORD_HASHERS=['django.contrib.auth.hashers.MD5PasswordHasher'])
 
-        """Get a tenant by name.
+    def test_md5(self):
 
+        encoded = make_password('lètmein', 'seasalt', 'md5')
 
+        self.assertEqual(encoded,
 
-        :returns: tenant_ref
+                         'md5$seasalt$3f86d0d3d465b7b458c231bf3555c0e3')
 
-        :raises: keystone.exception.TenantNotFound
+        self.assertTrue(is_password_usable(encoded))
 
+        self.assertTrue(check_password('lètmein', encoded))
 
+        self.assertFalse(check_password('lètmeinz', encoded))
 
-        """
+        self.assertEqual(identify_hasher(encoded).algorithm, "md5")
 
-        raise exception.NotImplemented()
+        # Blank passwords
 
+        blank_encoded = make_password('', 'seasalt', 'md5')
 
+        self.assertTrue(blank_encoded.startswith('md5$'))
 
-    def get_user(self, user_id):
+        self.assertTrue(is_password_usable(blank_encoded))
 
-        """Get a user by id.
+        self.assertTrue(check_password('', blank_encoded))
 
+        self.assertFalse(check_password(' ', blank_encoded))
 
 
-        :returns: user_ref
 
-        :raises: keystone.exception.UserNotFound
+    @override_settings(PASSWORD_HASHERS=['django.contrib.auth.hashers.UnsaltedMD5PasswordHasher'])
 
+    def test_unsalted_md5(self):
 
+        encoded = make_password('lètmein', '', 'unsalted_md5')
 
-        """
+        self.assertEqual(encoded, '88a434c88cca4e900f7874cd98123f43')
 
-        raise exception.NotImplemented()
+        self.assertTrue(is_password_usable(encoded))
 
+        self.assertTrue(check_password('lètmein', encoded))
 
+        self.assertFalse(check_password('lètmeinz', encoded))
 
-    def get_user_by_name(self, user_name):
+        self.assertEqual(identify_hasher(encoded).algorithm, "unsalted_md5")
 
-        """Get a user by name.
+        # Alternate unsalted syntax
 
+        alt_encoded = "md5$$%s" % encoded
 
+        self.assertTrue(is_password_usable(alt_encoded))
 
-        :returns: user_ref
+        self.assertTrue(check_password('lètmein', alt_encoded))
 
-        :raises: keystone.exception.UserNotFound
+        self.assertFalse(check_password('lètmeinz', alt_encoded))
 
+        # Blank passwords
 
+        blank_encoded = make_password('', '', 'unsalted_md5')
 
-        """
+        self.assertTrue(is_password_usable(blank_encoded))
 
-        raise exception.NotImplemented()
+        self.assertTrue(check_password('', blank_encoded))
 
+        self.assertFalse(check_password(' ', blank_encoded))
 
 
-    def get_role(self, role_id):
 
-        """Get a role by id.
+    @override_settings(PASSWORD_HASHERS=['django.contrib.auth.hashers.UnsaltedSHA1PasswordHasher'])
 
+    def test_unsalted_sha1(self):
 
+        encoded = make_password('lètmein', '', 'unsalted_sha1')
 
-        :returns: role_ref
+        self.assertEqual(encoded, 'sha1$$6d138ca3ae545631b3abd71a4f076ce759c5700b')
 
-        :raises: keystone.exception.RoleNotFound
+        self.assertTrue(is_password_usable(encoded))
 
+        self.assertTrue(check_password('lètmein', encoded))
 
+        self.assertFalse(check_password('lètmeinz', encoded))
 
-        """
+        self.assertEqual(identify_hasher(encoded).algorithm, "unsalted_sha1")
 
-        raise exception.NotImplemented()
+        # Raw SHA1 isn't acceptable
 
+        alt_encoded = encoded[6:]
 
+        self.assertFalse(check_password('lètmein', alt_encoded))
 
-    def list_users(self):
+        # Blank passwords
 
-        """List all users in the system.
+        blank_encoded = make_password('', '', 'unsalted_sha1')
 
+        self.assertTrue(blank_encoded.startswith('sha1$'))
 
+        self.assertTrue(is_password_usable(blank_encoded))
 
-        NOTE(termie): I'd prefer if this listed only the users for a given
+        self.assertTrue(check_password('', blank_encoded))
 
-                      tenant.
+        self.assertFalse(check_password(' ', blank_encoded))
 
 
 
-        :returns: a list of user_refs or an empty list
+    @skipUnless(crypt, "no crypt module to generate password.")
 
+    @override_settings(PASSWORD_HASHERS=['django.contrib.auth.hashers.CryptPasswordHasher'])
 
+    def test_crypt(self):
 
-        """
+        encoded = make_password('lètmei', 'ab', 'crypt')
 
-        raise exception.NotImplemented()
+        self.assertEqual(encoded, 'crypt$$ab1Hv2Lg7ltQo')
 
+        self.assertTrue(is_password_usable(encoded))
 
+        self.assertTrue(check_password('lètmei', encoded))
 
-    def list_roles(self):
+        self.assertFalse(check_password('lètmeiz', encoded))
 
-        """List all roles in the system.
+        self.assertEqual(identify_hasher(encoded).algorithm, "crypt")
 
+        # Blank passwords
 
+        blank_encoded = make_password('', 'ab', 'crypt')
 
-        :returns: a list of role_refs or an empty list.
+        self.assertTrue(blank_encoded.startswith('crypt$'))
 
+        self.assertTrue(is_password_usable(blank_encoded))
 
+        self.assertTrue(check_password('', blank_encoded))
 
-        """
+        self.assertFalse(check_password(' ', blank_encoded))
 
-        raise exception.NotImplemented()
 
 
+    @skipUnless(bcrypt, "bcrypt not installed")
 
-    # NOTE(termie): seven calls below should probably be exposed by the api
+    def test_bcrypt_sha256(self):
 
-    #               more clearly when the api redesign happens
+        encoded = make_password('lètmein', hasher='bcrypt_sha256')
 
-    def add_user_to_tenant(self, tenant_id, user_id):
+        self.assertTrue(is_password_usable(encoded))
 
-        """Add user to a tenant without an explicit role relationship.
+        self.assertTrue(encoded.startswith('bcrypt_sha256$'))
 
+        self.assertTrue(check_password('lètmein', encoded))
 
+        self.assertFalse(check_password('lètmeinz', encoded))
 
-        :raises: keystone.exception.TenantNotFound,
+        self.assertEqual(identify_hasher(encoded).algorithm, "bcrypt_sha256")
 
-                 keystone.exception.UserNotFound
 
 
+        # Verify that password truncation no longer works
 
-        """
+        password = ('VSK0UYV6FFQVZ0KG88DYN9WADAADZO1CTSIVDJUNZSUML6IBX7LN7ZS3R5'
 
-        raise exception.NotImplemented()
+                    'JGB3RGZ7VI7G7DJQ9NI8BQFSRPTG6UWTTVESA5ZPUN')
 
+        encoded = make_password(password, hasher='bcrypt_sha256')
 
+        self.assertTrue(check_password(password, encoded))
 
-    def remove_user_from_tenant(self, tenant_id, user_id):
+        self.assertFalse(check_password(password[:72], encoded))
 
-        """Remove user from a tenant without an explicit role relationship.
+        # Blank passwords
 
+        blank_encoded = make_password('', hasher='bcrypt_sha256')
 
+        self.assertTrue(blank_encoded.startswith('bcrypt_sha256$'))
 
-        :raises: keystone.exception.TenantNotFound,
+        self.assertTrue(is_password_usable(blank_encoded))
 
-                 keystone.exception.UserNotFound
+        self.assertTrue(check_password('', blank_encoded))
 
+        self.assertFalse(check_password(' ', blank_encoded))
 
 
-        """
 
-        raise exception.NotImplemented()
+    @skipUnless(bcrypt, "bcrypt not installed")
 
+    def test_bcrypt(self):
 
+        encoded = make_password('lètmein', hasher='bcrypt')
 
-    def get_all_tenants(self):
+        self.assertTrue(is_password_usable(encoded))
 
-        """FIXME(dolph): Lists all tenants in the system? I'm not sure how this
+        self.assertTrue(encoded.startswith('bcrypt$'))
 
-                         is different from get_tenants, why get_tenants isn't
+        self.assertTrue(check_password('lètmein', encoded))
 
-                         documented as part of the driver, or why it's called
+        self.assertFalse(check_password('lètmeinz', encoded))
 
-                         get_tenants instead of list_tenants (i.e. list_roles
+        self.assertEqual(identify_hasher(encoded).algorithm, "bcrypt")
 
-                         and list_users)...
+        # Blank passwords
 
+        blank_encoded = make_password('', hasher='bcrypt')
 
+        self.assertTrue(blank_encoded.startswith('bcrypt$'))
 
-        :returns: a list of ... FIXME(dolph): tenant_refs or tenant_id's?
+        self.assertTrue(is_password_usable(blank_encoded))
 
+        self.assertTrue(check_password('', blank_encoded))
 
+        self.assertFalse(check_password(' ', blank_encoded))
 
-        """
 
-        raise exception.NotImplemented()
 
+    @skipUnless(bcrypt, "bcrypt not installed")
 
+    def test_bcrypt_upgrade(self):
 
-    def get_tenant_users(self, tenant_id):
+        hasher = get_hasher('bcrypt')
 
-        """FIXME(dolph): Lists all users with a relationship to the specified
+        self.assertEqual('bcrypt', hasher.algorithm)
 
-                         tenant?
+        self.assertNotEqual(hasher.rounds, 4)
 
 
 
-        :returns: a list of ... FIXME(dolph): user_refs or user_id's?
-
-        :raises: keystone.exception.UserNotFound
-
-
-
-        """
-
-        raise exception.NotImplemented()
-
-
-
-    def get_tenants_for_user(self, user_id):
-
-        """Get the tenants associated with a given user.
-
-
-
-        :returns: a list of tenant_id's.
-
-        :raises: keystone.exception.UserNotFound
-
-
-
-        """
-
-        raise exception.NotImplemented()
-
-
-
-    def get_roles_for_user_and_tenant(self, user_id, tenant_id):
-
-        """Get the roles associated with a user within given tenant.
-
-
-
-        :returns: a list of role ids.
-
-        :raises: keystone.exception.UserNotFound,
-
-                 keystone.exception.TenantNotFound
-
-
-
-        """
-
-        raise exception.NotImplemented()
-
-
-
-    def add_role_to_user_and_tenant(self, user_id, tenant_id, role_id):
-
-        """Add a role to a user within given tenant.
-
-
-
-        :raises: keystone.exception.UserNotFound,
-
-                 keystone.exception.TenantNotFound,
-
-                 keystone.exception.RoleNotFound
-
-        """
-
-        raise exception.NotImplemented()
-
-
-
-    def remove_role_from_user_and_tenant(self, user_id, tenant_id, role_id):
-
-        """Remove a role from a user within given tenant.
-
-
-
-        :raises: keystone.exception.UserNotFound,
-
-                 keystone.exception.TenantNotFound,
-
-                 keystone.exception.RoleNotFound
-
-
-
-        """
-
-        raise exception.NotImplemented()
-
-
-
-    # user crud
-
-    def create_user(self, user_id, user):
-
-        """Creates a new user.
-
-
-
-        :raises: keystone.exception.Conflict
-
-
-
-        """
-
-        raise exception.NotImplemented()
-
-
-
-    def update_user(self, user_id, user):
-
-        """Updates an existing user.
-
-
-
-        :raises: keystone.exception.UserNotFound, keystone.exception.Conflict
-
-
-
-        """
-
-        raise exception.NotImplemented()
-
-
-
-    def delete_user(self, user_id):
-
-        """Deletes an existing user.
-
-
-
-        :raises: keystone.exception.UserNotFound
-
-
-
-        """
-
-        raise exception.NotImplemented()
-
-
-
-    # tenant crud
-
-    def create_tenant(self, tenant_id, tenant):
-
-        """Creates a new tenant.
-
-
-
-        :raises: keystone.exception.Conflict
-
-
-
-        """
-
-        raise exception.NotImplemented()
-
-
-
-    def update_tenant(self, tenant_id, tenant):
-
-        """Updates an existing tenant.
-
-
-
-        :raises: keystone.exception.TenantNotFound, keystone.exception.Conflict
-
-
-
-        """
-
-        raise exception.NotImplemented()
-
-
-
-    def delete_tenant(self, tenant_id):
-
-        """Deletes an existing tenant.
-
-
-
-        :raises: keystone.exception.TenantNotFound
-
-
-
-        """
-
-        raise exception.NotImplemented()
-
-
-
-    # metadata crud
-
-    def get_metadata(self, user_id, tenant_id):
-
-        raise exception.NotImplemented()
-
-
-
-    def create_metadata(self, user_id, tenant_id, metadata):
-
-        raise exception.NotImplemented()
-
-
-
-    def update_metadata(self, user_id, tenant_id, metadata):
-
-        raise exception.NotImplemented()
-
-
-
-    def delete_metadata(self, user_id, tenant_id):
-
-        raise exception.NotImplemented()
-
-
-
-    # role crud
-
-    def create_role(self, role_id, role):
-
-        """Creates a new role.
-
-
-
-        :raises: keystone.exception.Conflict
-
-
-
-        """
-
-        raise exception.NotImplemented()
-
-
-
-    def update_role(self, role_id, role):
-
-        """Updates an existing role.
-
-
-
-        :raises: keystone.exception.RoleNotFound, keystone.exception.Conflict
-
-
-
-        """
-
-        raise exception.NotImplemented()
-
-
-
-    def delete_role(self, role_id):
-
-        """Deletes an existing role.
-
-
-
-        :raises: keystone.exception.RoleNotFound
-
-
-
-        """
-
-        raise exception.NotImplemented()
-
-
-
-
-
-class PublicRouter(wsgi.ComposableRouter):
-
-    def add_routes(self, mapper):
-
-        tenant_controller = TenantController()
-
-        mapper.connect('/tenants',
-
-                       controller=tenant_controller,
-
-                       action='get_tenants_for_token',
-
-                       conditions=dict(method=['GET']))
-
-
-
-
-
-class AdminRouter(wsgi.ComposableRouter):
-
-    def add_routes(self, mapper):
-
-        # Tenant Operations
-
-        tenant_controller = TenantController()
-
-        mapper.connect('/tenants',
-
-                       controller=tenant_controller,
-
-                       action='get_all_tenants',
-
-                       conditions=dict(method=['GET']))
-
-        mapper.connect('/tenants/{tenant_id}',
-
-                       controller=tenant_controller,
-
-                       action='get_tenant',
-
-                       conditions=dict(method=['GET']))
-
-
-
-        # User Operations
-
-        user_controller = UserController()
-
-        mapper.connect('/users/{user_id}',
-
-                       controller=user_controller,
-
-                       action='get_user',
-
-                       conditions=dict(method=['GET']))
-
-
-
-        # Role Operations
-
-        roles_controller = RoleController()
-
-        mapper.connect('/tenants/{tenant_id}/users/{user_id}/roles',
-
-                       controller=roles_controller,
-
-                       action='get_user_roles',
-
-                       conditions=dict(method=['GET']))
-
-        mapper.connect('/users/{user_id}/roles',
-
-                       controller=roles_controller,
-
-                       action='get_user_roles',
-
-                       conditions=dict(method=['GET']))
-
-
-
-
-
-class TenantController(wsgi.Application):
-
-    def __init__(self):
-
-        self.identity_api = Manager()
-
-        self.policy_api = policy.Manager()
-
-        self.token_api = token.Manager()
-
-        super(TenantController, self).__init__()
-
-
-
-    def get_all_tenants(self, context, **kw):
-
-        """Gets a list of all tenants for an admin user."""
-
-        self.assert_admin(context)
-
-        tenant_refs = self.identity_api.get_tenants(context)
-
-        params = {
-
-            'limit': context['query_string'].get('limit'),
-
-            'marker': context['query_string'].get('marker'),
-
-        }
-
-        return self._format_tenant_list(tenant_refs, **params)
-
-
-
-    def get_tenants_for_token(self, context, **kw):
-
-        """Get valid tenants for token based on token used to authenticate.
-
-
-
-        Pulls the token from the context, validates it and gets the valid
-
-        tenants for the user in the token.
-
-
-
-        Doesn't care about token scopedness.
-
-
-
-        """
+        old_rounds = hasher.rounds
 
         try:
 
-            token_ref = self.token_api.get_token(context=context,
+            # Generate a password with 4 rounds.
 
-                                                 token_id=context['token_id'])
+            hasher.rounds = 4
 
-        except exception.NotFound:
+            encoded = make_password('letmein', hasher='bcrypt')
 
-            raise exception.Unauthorized()
+            rounds = hasher.safe_summary(encoded)['work factor']
 
+            self.assertEqual(rounds, '04')
 
 
-        user_ref = token_ref['user']
 
-        tenant_ids = self.identity_api.get_tenants_for_user(
+            state = {'upgraded': False}
 
-            context, user_ref['id'])
 
-        tenant_refs = []
 
-        for tenant_id in tenant_ids:
+            def setter(password):
 
-            tenant_refs.append(self.identity_api.get_tenant(
+                state['upgraded'] = True
 
-                context=context,
 
-                tenant_id=tenant_id))
 
-        params = {
+            # Check that no upgrade is triggered.
 
-            'limit': context['query_string'].get('limit'),
+            self.assertTrue(check_password('letmein', encoded, setter, 'bcrypt'))
 
-            'marker': context['query_string'].get('marker'),
+            self.assertFalse(state['upgraded'])
 
-        }
 
-        return self._format_tenant_list(tenant_refs, **params)
 
+            # Revert to the old rounds count and ...
 
+            hasher.rounds = old_rounds
 
-    def get_tenant(self, context, tenant_id):
 
-        # TODO(termie): this stuff should probably be moved to middleware
 
-        self.assert_admin(context)
+            # ... check if the password would get updated to the new count.
 
-        return {'tenant': self.identity_api.get_tenant(context, tenant_id)}
+            self.assertTrue(check_password('letmein', encoded, setter, 'bcrypt'))
 
+            self.assertTrue(state['upgraded'])
 
+        finally:
 
-    # CRUD Extension
+            hasher.rounds = old_rounds
 
-    def create_tenant(self, context, tenant):
 
-        tenant_ref = self._normalize_dict(tenant)
 
+    def test_unusable(self):
 
+        encoded = make_password(None)
 
-        if not 'name' in tenant_ref or not tenant_ref['name']:
+        self.assertEqual(len(encoded), len(UNUSABLE_PASSWORD_PREFIX) + UNUSABLE_PASSWORD_SUFFIX_LENGTH)
 
-            msg = 'Name field is required and cannot be empty'
+        self.assertFalse(is_password_usable(encoded))
 
-            raise exception.ValidationError(message=msg)
+        self.assertFalse(check_password(None, encoded))
 
+        self.assertFalse(check_password(encoded, encoded))
 
+        self.assertFalse(check_password(UNUSABLE_PASSWORD_PREFIX, encoded))
 
-        self.assert_admin(context)
+        self.assertFalse(check_password('', encoded))
 
-        tenant_ref['id'] = tenant_ref.get('id', uuid.uuid4().hex)
+        self.assertFalse(check_password('lètmein', encoded))
 
-        tenant = self.identity_api.create_tenant(
+        self.assertFalse(check_password('lètmeinz', encoded))
 
-            context, tenant_ref['id'], tenant_ref)
+        with self.assertRaises(ValueError):
 
-        return {'tenant': tenant}
+            identify_hasher(encoded)
 
+        # Assert that the unusable passwords actually contain a random part.
 
+        # This might fail one day due to a hash collision.
 
-    def update_tenant(self, context, tenant_id, tenant):
+        self.assertNotEqual(encoded, make_password(None), "Random password collision?")
 
-        self.assert_admin(context)
 
-        tenant_ref = self.identity_api.update_tenant(
 
-            context, tenant_id, tenant)
-
-        return {'tenant': tenant_ref}
-
-
-
-    def delete_tenant(self, context, tenant_id):
-
-        self.assert_admin(context)
-
-        self.identity_api.delete_tenant(context, tenant_id)
-
-
-
-    def get_tenant_users(self, context, tenant_id, **kw):
-
-        self.assert_admin(context)
-
-        user_refs = self.identity_api.get_tenant_users(context, tenant_id)
-
-        return {'users': user_refs}
-
-
-
-    def _format_tenant_list(self, tenant_refs, **kwargs):
-
-        marker = kwargs.get('marker')
-
-        first_index = 0
-
-        if marker is not None:
-
-            for (marker_index, tenant) in enumerate(tenant_refs):
-
-                if tenant['id'] == marker:
-
-                    # we start pagination after the marker
-
-                    first_index = marker_index + 1
-
-                    break
-
-            else:
-
-                msg = 'Marker could not be found'
-
-                raise exception.ValidationError(message=msg)
-
-
-
-        limit = kwargs.get('limit')
-
-        last_index = None
-
-        if limit is not None:
-
-            try:
-
-                limit = int(limit)
-
-                if limit < 0:
-
-                    raise AssertionError()
-
-            except (ValueError, AssertionError):
-
-                msg = 'Invalid limit value'
-
-                raise exception.ValidationError(message=msg)
-
-            last_index = first_index + limit
-
-
-
-        tenant_refs = tenant_refs[first_index:last_index]
-
-
-
-        for x in tenant_refs:
-
-            if 'enabled' not in x:
-
-                x['enabled'] = True
-
-        o = {'tenants': tenant_refs,
-
-             'tenants_links': []}
-
-        return o
-
-
-
-
-
-class UserController(wsgi.Application):
-
-    def __init__(self):
-
-        self.identity_api = Manager()
-
-        self.policy_api = policy.Manager()
-
-        self.token_api = token.Manager()
-
-        super(UserController, self).__init__()
-
-
-
-    def get_user(self, context, user_id):
-
-        self.assert_admin(context)
-
-        return {'user': self.identity_api.get_user(context, user_id)}
-
-
-
-    def get_users(self, context):
-
-        # NOTE(termie): i can't imagine that this really wants all the data
-
-        #               about every single user in the system...
-
-        self.assert_admin(context)
-
-        return {'users': self.identity_api.list_users(context)}
-
-
-
-    # CRUD extension
-
-    def create_user(self, context, user):
-
-        user = self._normalize_dict(user)
-
-        self.assert_admin(context)
-
-
-
-        if not 'name' in user or not user['name']:
-
-            msg = 'Name field is required and cannot be empty'
-
-            raise exception.ValidationError(message=msg)
-
-
-
-        tenant_id = user.get('tenantId', None)
-
-        if (tenant_id is not None
-
-                and self.identity_api.get_tenant(context, tenant_id) is None):
-
-            raise exception.TenantNotFound(tenant_id=tenant_id)
-
-        user_id = uuid.uuid4().hex
-
-        user_ref = user.copy()
-
-        user_ref['id'] = user_id
-
-        new_user_ref = self.identity_api.create_user(
-
-            context, user_id, user_ref)
-
-        if tenant_id:
-
-            self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
-
-        return {'user': new_user_ref}
-
-
-
-    def update_user(self, context, user_id, user):
-
-        # NOTE(termie): this is really more of a patch than a put
-
-        self.assert_admin(context)
-
-        user_ref = self.identity_api.update_user(context, user_id, user)
-
-
-
-        # If the password was changed or the user was disabled we clear tokens
-
-        if user.get('password') or not user.get('enabled', True):
-
-            try:
-
-                for token_id in self.token_api.list_tokens(context, user_id):
-
-                    self.token_api.delete_token(context, token_id)
-
-            except exception.NotImplemented:
-
-                # The users status has been changed but tokens remain valid for
-
-                # backends that can't list tokens for users
-
-                LOG.warning('User %s status has changed, but existing tokens '
-
-                            'remain valid' % user_id)
-
-        return {'user': user_ref}
-
-
-
-    def delete_user(self, context, user_id):
-
-        self.assert_admin(context)
-
-        self.identity_api.delete_user(context, user_id)
-
-
-
-    def set_user_enabled(self, context, user_id, user):
-
-        return self.update_user(context, user_id, user)
-
-
-
-    def set_user_password(self, context, user_id, user):
-
-        return self.update_user(context, user_id, user)
-
-
-
-    def update_user_tenant(self, context, user_id, user):
-
-        """Update the default tenant."""
-
-        # ensure that we're a member of that tenant
-
-        tenant_id = user.get('tenantId')
-
-        self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
-
-        return self.update_user(context, user_id, user)
-
-
-
-
-
-class RoleController(wsgi.Application):
-
-    def __init__(self):
-
-        self.identity_api = Manager()
-
-        self.token_api = token.Manager()
-
-        self.policy_api = policy.Manager()
-
-        super(RoleController, self).__init__()
-
-
-
-    # COMPAT(essex-3)
-
-    def get_user_roles(self, context, user_id, tenant_id=None):
-
-        """Get the roles for a user and tenant pair.
-
-
-
-        Since we're trying to ignore the idea of user-only roles we're
-
-        not implementing them in hopes that the idea will die off.
-
-
+    def test_unspecified_password(self):
 
         """
 
-        self.assert_admin(context)
+        Makes sure specifying no plain password with a valid encoded password
 
-        if tenant_id is None:
-
-            raise exception.NotImplemented(message='User roles not supported: '
-
-                                                   'tenant ID required')
-
-
-
-        roles = self.identity_api.get_roles_for_user_and_tenant(
-
-            context, user_id, tenant_id)
-
-        return {'roles': [self.identity_api.get_role(context, x)
-
-                          for x in roles]}
-
-
-
-    # CRUD extension
-
-    def get_role(self, context, role_id):
-
-        self.assert_admin(context)
-
-        return {'role': self.identity_api.get_role(context, role_id)}
-
-
-
-    def create_role(self, context, role):
-
-        role = self._normalize_dict(role)
-
-        self.assert_admin(context)
-
-
-
-        if not 'name' in role or not role['name']:
-
-            msg = 'Name field is required and cannot be empty'
-
-            raise exception.ValidationError(message=msg)
-
-
-
-        role_id = uuid.uuid4().hex
-
-        role['id'] = role_id
-
-        role_ref = self.identity_api.create_role(context, role_id, role)
-
-        return {'role': role_ref}
-
-
-
-    def delete_role(self, context, role_id):
-
-        self.assert_admin(context)
-
-        self.identity_api.delete_role(context, role_id)
-
-
-
-    def get_roles(self, context):
-
-        self.assert_admin(context)
-
-        return {'roles': self.identity_api.list_roles(context)}
-
-
-
-    def add_role_to_user(self, context, user_id, role_id, tenant_id=None):
-
-        """Add a role to a user and tenant pair.
-
-
-
-        Since we're trying to ignore the idea of user-only roles we're
-
-        not implementing them in hopes that the idea will die off.
-
-
+        returns `False`.
 
         """
 
-        self.assert_admin(context)
+        self.assertFalse(check_password(None, make_password('lètmein')))
 
-        if tenant_id is None:
 
-            raise exception.NotImplemented(message='User roles not supported: '
 
-                                                   'tenant_id required')
+    def test_bad_algorithm(self):
 
+        with self.assertRaises(ValueError):
 
+            make_password('lètmein', hasher='lolcat')
 
-        # This still has the weird legacy semantics that adding a role to
+        with self.assertRaises(ValueError):
 
-        # a user also adds them to a tenant
+            identify_hasher('lolcat$salt$hash')
 
-        self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
 
-        self.identity_api.add_role_to_user_and_tenant(
 
-            context, user_id, tenant_id, role_id)
+    def test_bad_encoded(self):
 
-        role_ref = self.identity_api.get_role(context, role_id)
+        self.assertFalse(is_password_usable('lètmein_badencoded'))
 
-        return {'role': role_ref}
+        self.assertFalse(is_password_usable(''))
 
 
 
-    def remove_role_from_user(self, context, user_id, role_id, tenant_id=None):
+    def test_low_level_pbkdf2(self):
 
-        """Remove a role from a user and tenant pair.
+        hasher = PBKDF2PasswordHasher()
 
+        encoded = hasher.encode('lètmein', 'seasalt2')
 
+        self.assertEqual(encoded,
 
-        Since we're trying to ignore the idea of user-only roles we're
+            'pbkdf2_sha256$30000$seasalt2$a75qzbogeVhNFeMqhdgyyoqGKpIzYUo651sq57RERew=')
 
-        not implementing them in hopes that the idea will die off.
+        self.assertTrue(hasher.verify('lètmein', encoded))
 
 
 
-        """
+    def test_low_level_pbkdf2_sha1(self):
 
-        self.assert_admin(context)
+        hasher = PBKDF2SHA1PasswordHasher()
 
-        if tenant_id is None:
+        encoded = hasher.encode('lètmein', 'seasalt2')
 
-            raise exception.NotImplemented(message='User roles not supported: '
+        self.assertEqual(encoded,
 
-                                                   'tenant_id required')
+            'pbkdf2_sha1$30000$seasalt2$pMzU1zNPcydf6wjnJFbiVKwgULc=')
 
+        self.assertTrue(hasher.verify('lètmein', encoded))
 
 
-        # This still has the weird legacy semantics that adding a role to
 
-        # a user also adds them to a tenant, so we must follow up on that
+    @override_settings(
 
-        self.identity_api.remove_role_from_user_and_tenant(
+        PASSWORD_HASHERS=[
 
-            context, user_id, tenant_id, role_id)
+            'django.contrib.auth.hashers.PBKDF2PasswordHasher',
 
-        roles = self.identity_api.get_roles_for_user_and_tenant(
+            'django.contrib.auth.hashers.SHA1PasswordHasher',
 
-            context, user_id, tenant_id)
+            'django.contrib.auth.hashers.MD5PasswordHasher',
 
-        if not roles:
+        ],
 
-            self.identity_api.remove_user_from_tenant(
+    )
 
-                context, tenant_id, user_id)
+    def test_upgrade(self):
 
-        return
+        self.assertEqual('pbkdf2_sha256', get_hasher('default').algorithm)
 
+        for algo in ('sha1', 'md5'):
 
+            encoded = make_password('lètmein', hasher=algo)
 
-    # COMPAT(diablo): CRUD extension
+            state = {'upgraded': False}
 
-    def get_role_refs(self, context, user_id):
 
-        """Ultimate hack to get around having to make role_refs first-class.
 
+            def setter(password):
 
+                state['upgraded'] = True
 
-        This will basically iterate over the various roles the user has in
+            self.assertTrue(check_password('lètmein', encoded, setter))
 
-        all tenants the user is a member of and create fake role_refs where
+            self.assertTrue(state['upgraded'])
 
-        the id encodes the user-tenant-role information so we can look
 
-        up the appropriate data when we need to delete them.
 
+    def test_no_upgrade(self):
 
+        encoded = make_password('lètmein')
 
-        """
+        state = {'upgraded': False}
 
-        self.assert_admin(context)
 
-        # Ensure user exists by getting it first.
 
-        self.identity_api.get_user(context, user_id)
+        def setter():
 
-        tenant_ids = self.identity_api.get_tenants_for_user(context, user_id)
+            state['upgraded'] = True
 
-        o = []
+        self.assertFalse(check_password('WRONG', encoded, setter))
 
-        for tenant_id in tenant_ids:
+        self.assertFalse(state['upgraded'])
 
-            role_ids = self.identity_api.get_roles_for_user_and_tenant(
 
-                context, user_id, tenant_id)
 
-            for role_id in role_ids:
+    @override_settings(
 
-                ref = {'roleId': role_id,
+        PASSWORD_HASHERS=[
 
-                       'tenantId': tenant_id,
+            'django.contrib.auth.hashers.PBKDF2PasswordHasher',
 
-                       'userId': user_id}
+            'django.contrib.auth.hashers.SHA1PasswordHasher',
 
-                ref['id'] = urllib.urlencode(ref)
+            'django.contrib.auth.hashers.MD5PasswordHasher',
 
-                o.append(ref)
+        ],
 
-        return {'roles': o}
+    )
 
+    def test_no_upgrade_on_incorrect_pass(self):
 
+        self.assertEqual('pbkdf2_sha256', get_hasher('default').algorithm)
 
-    # COMPAT(diablo): CRUD extension
+        for algo in ('sha1', 'md5'):
 
-    def create_role_ref(self, context, user_id, role):
+            encoded = make_password('lètmein', hasher=algo)
 
-        """This is actually used for adding a user to a tenant.
+            state = {'upgraded': False}
 
 
 
-        In the legacy data model adding a user to a tenant required setting
+            def setter():
 
-        a role.
+                state['upgraded'] = True
 
+            self.assertFalse(check_password('WRONG', encoded, setter))
 
+            self.assertFalse(state['upgraded'])
 
-        """
 
-        self.assert_admin(context)
 
-        # TODO(termie): for now we're ignoring the actual role
+    def test_pbkdf2_upgrade(self):
 
-        tenant_id = role.get('tenantId')
+        hasher = get_hasher('default')
 
-        role_id = role.get('roleId')
+        self.assertEqual('pbkdf2_sha256', hasher.algorithm)
 
-        self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
+        self.assertNotEqual(hasher.iterations, 1)
 
-        self.identity_api.add_role_to_user_and_tenant(
 
-            context, user_id, tenant_id, role_id)
 
-        role_ref = self.identity_api.get_role(context, role_id)
+        old_iterations = hasher.iterations
 
-        return {'role': role_ref}
+        try:
 
+            # Generate a password with 1 iteration.
 
+            hasher.iterations = 1
 
-    # COMPAT(diablo): CRUD extension
+            encoded = make_password('letmein')
 
-    def delete_role_ref(self, context, user_id, role_ref_id):
+            algo, iterations, salt, hash = encoded.split('$', 3)
 
-        """This is actually used for deleting a user from a tenant.
+            self.assertEqual(iterations, '1')
 
 
 
-        In the legacy data model removing a user from a tenant required
+            state = {'upgraded': False}
 
-        deleting a role.
 
 
+            def setter(password):
 
-        To emulate this, we encode the tenant and role in the role_ref_id,
+                state['upgraded'] = True
 
-        and if this happens to be the last role for the user-tenant pair,
 
-        we remove the user from the tenant.
 
+            # Check that no upgrade is triggered
 
+            self.assertTrue(check_password('letmein', encoded, setter))
 
-        """
+            self.assertFalse(state['upgraded'])
 
-        self.assert_admin(context)
 
-        # TODO(termie): for now we're ignoring the actual role
 
-        role_ref_ref = urlparse.parse_qs(role_ref_id)
+            # Revert to the old iteration count and ...
 
-        tenant_id = role_ref_ref.get('tenantId')[0]
+            hasher.iterations = old_iterations
 
-        role_id = role_ref_ref.get('roleId')[0]
 
-        self.identity_api.remove_role_from_user_and_tenant(
 
-            context, user_id, tenant_id, role_id)
+            # ... check if the password would get updated to the new iteration count.
 
-        roles = self.identity_api.get_roles_for_user_and_tenant(
+            self.assertTrue(check_password('letmein', encoded, setter))
 
-            context, user_id, tenant_id)
+            self.assertTrue(state['upgraded'])
 
-        if not roles:
+        finally:
 
-            self.identity_api.remove_user_from_tenant(
+            hasher.iterations = old_iterations
 
-                context, tenant_id, user_id)
+
+
+    def test_pbkdf2_upgrade_new_hasher(self):
+
+        hasher = get_hasher('default')
+
+        self.assertEqual('pbkdf2_sha256', hasher.algorithm)
+
+        self.assertNotEqual(hasher.iterations, 1)
+
+
+
+        state = {'upgraded': False}
+
+
+
+        def setter(password):
+
+            state['upgraded'] = True
+
+
+
+        with self.settings(PASSWORD_HASHERS=[
+
+                'auth_tests.test_hashers.PBKDF2SingleIterationHasher']):
+
+            encoded = make_password('letmein')
+
+            algo, iterations, salt, hash = encoded.split('$', 3)
+
+            self.assertEqual(iterations, '1')
+
+
+
+            # Check that no upgrade is triggered
+
+            self.assertTrue(check_password('letmein', encoded, setter))
+
+            self.assertFalse(state['upgraded'])
+
+
+
+        # Revert to the old iteration count and check if the password would get
+
+        # updated to the new iteration count.
+
+        with self.settings(PASSWORD_HASHERS=[
+
+                'django.contrib.auth.hashers.PBKDF2PasswordHasher',
+
+                'auth_tests.test_hashers.PBKDF2SingleIterationHasher']):
+
+            self.assertTrue(check_password('letmein', encoded, setter))
+
+            self.assertTrue(state['upgraded'])
+
+
+
+    def test_load_library_no_algorithm(self):
+
+        with self.assertRaises(ValueError) as e:
+
+            BasePasswordHasher()._load_library()
+
+        self.assertEqual("Hasher 'BasePasswordHasher' doesn't specify a "
+
+                         "library attribute", str(e.exception))
+
+
+
+    def test_load_library_importerror(self):
+
+        PlainHasher = type(str('PlainHasher'), (BasePasswordHasher,),
+
+                           {'algorithm': 'plain', 'library': 'plain'})
+
+        # Python 3 adds quotes around module name
+
+        with six.assertRaisesRegex(self, ValueError,
+
+                "Couldn't load 'PlainHasher' algorithm library: No module named '?plain'?"):
+
+            PlainHasher()._load_library()

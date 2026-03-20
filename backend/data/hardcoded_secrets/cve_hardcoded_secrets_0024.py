@@ -2,436 +2,830 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# This file is dual licensed under the terms of the Apache License, Version
+from __future__ import absolute_import
 
-# 2.0, and the BSD License. See the LICENSE file in the root of this repository
+import datetime
 
-# for complete details.
+import logging
 
+import os
 
+import socket
 
-from __future__ import absolute_import, division, print_function
+from socket import error as SocketError, timeout as SocketTimeout
 
+import warnings
 
+from .packages import six
 
-from cryptography import utils
+from .packages.six.moves.http_client import HTTPConnection as _HTTPConnection
 
-from cryptography.exceptions import InvalidTag, UnsupportedAlgorithm, _Reasons
-
-from cryptography.hazmat.primitives import ciphers
-
-from cryptography.hazmat.primitives.ciphers import modes
-
-
+from .packages.six.moves.http_client import HTTPException  # noqa: F401
 
 
 
-@utils.register_interface(ciphers.CipherContext)
+try:  # Compiled with SSL?
 
-@utils.register_interface(ciphers.AEADCipherContext)
-
-@utils.register_interface(ciphers.AEADEncryptionContext)
-
-@utils.register_interface(ciphers.AEADDecryptionContext)
-
-class _CipherContext(object):
-
-    _ENCRYPT = 1
-
-    _DECRYPT = 0
+    import ssl
 
 
 
-    def __init__(self, backend, cipher, mode, operation):
+    BaseSSLError = ssl.SSLError
 
-        self._backend = backend
+except (ImportError, AttributeError):  # Platform-specific: No SSL.
 
-        self._cipher = cipher
-
-        self._mode = mode
-
-        self._operation = operation
-
-        self._tag = None
+    ssl = None
 
 
 
-        if isinstance(self._cipher, ciphers.BlockCipherAlgorithm):
+    class BaseSSLError(BaseException):
 
-            self._block_size_bytes = self._cipher.block_size // 8
-
-        else:
-
-            self._block_size_bytes = 1
+        pass
 
 
 
-        ctx = self._backend._lib.EVP_CIPHER_CTX_new()
-
-        ctx = self._backend._ffi.gc(
-
-            ctx, self._backend._lib.EVP_CIPHER_CTX_free
-
-        )
 
 
+try:
 
-        registry = self._backend._cipher_registry
+    # Python 3: not a no-op, we're adding this to the namespace so it can be imported.
+
+    ConnectionError = ConnectionError
+
+except NameError:
+
+    # Python 2
+
+    class ConnectionError(Exception):
+
+        pass
+
+
+
+
+
+from .exceptions import (
+
+    NewConnectionError,
+
+    ConnectTimeoutError,
+
+    SubjectAltNameWarning,
+
+    SystemTimeWarning,
+
+)
+
+from .packages.ssl_match_hostname import match_hostname, CertificateError
+
+
+
+from .util.ssl_ import (
+
+    resolve_cert_reqs,
+
+    resolve_ssl_version,
+
+    assert_fingerprint,
+
+    create_urllib3_context,
+
+    ssl_wrap_socket,
+
+)
+
+
+
+
+
+from .util import connection
+
+
+
+from ._collections import HTTPHeaderDict
+
+
+
+log = logging.getLogger(__name__)
+
+
+
+port_by_scheme = {"http": 80, "https": 443}
+
+
+
+# When it comes time to update this value as a part of regular maintenance
+
+# (ie test_recent_date is failing) update it to ~6 months before the current date.
+
+RECENT_DATE = datetime.date(2019, 1, 1)
+
+
+
+
+
+class DummyConnection(object):
+
+    """Used to detect a failed ConnectionCls import."""
+
+
+
+    pass
+
+
+
+
+
+class HTTPConnection(_HTTPConnection, object):
+
+    """
+
+    Based on httplib.HTTPConnection but provides an extra constructor
+
+    backwards-compatibility layer between older and newer Pythons.
+
+
+
+    Additional keyword parameters are used to configure attributes of the connection.
+
+    Accepted parameters include:
+
+
+
+      - ``strict``: See the documentation on :class:`urllib3.connectionpool.HTTPConnectionPool`
+
+      - ``source_address``: Set the source address for the current connection.
+
+      - ``socket_options``: Set specific options on the underlying socket. If not specified, then
+
+        defaults are loaded from ``HTTPConnection.default_socket_options`` which includes disabling
+
+        Nagle's algorithm (sets TCP_NODELAY to 1) unless the connection is behind a proxy.
+
+
+
+        For example, if you wish to enable TCP Keep Alive in addition to the defaults,
+
+        you might pass::
+
+
+
+            HTTPConnection.default_socket_options + [
+
+                (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+
+            ]
+
+
+
+        Or you may want to disable the defaults by passing an empty list (e.g., ``[]``).
+
+    """
+
+
+
+    default_port = port_by_scheme["http"]
+
+
+
+    #: Disable Nagle's algorithm by default.
+
+    #: ``[(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)]``
+
+    default_socket_options = [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)]
+
+
+
+    #: Whether this connection verifies the host's certificate.
+
+    is_verified = False
+
+
+
+    def __init__(self, *args, **kw):
+
+        if not six.PY2:
+
+            kw.pop("strict", None)
+
+
+
+        # Pre-set source_address.
+
+        self.source_address = kw.get("source_address")
+
+
+
+        #: The socket options provided by the user. If no options are
+
+        #: provided, we use the default options.
+
+        self.socket_options = kw.pop("socket_options", self.default_socket_options)
+
+
+
+        _HTTPConnection.__init__(self, *args, **kw)
+
+
+
+    @property
+
+    def host(self):
+
+        """
+
+        Getter method to remove any trailing dots that indicate the hostname is an FQDN.
+
+
+
+        In general, SSL certificates don't include the trailing dot indicating a
+
+        fully-qualified domain name, and thus, they don't validate properly when
+
+        checked against a domain name that includes the dot. In addition, some
+
+        servers may not expect to receive the trailing dot when provided.
+
+
+
+        However, the hostname with trailing dot is critical to DNS resolution; doing a
+
+        lookup with the trailing dot will properly only resolve the appropriate FQDN,
+
+        whereas a lookup without a trailing dot will search the system's search domain
+
+        list. Thus, it's important to keep the original host around for use only in
+
+        those cases where it's appropriate (i.e., when doing DNS lookup to establish the
+
+        actual TCP connection across which we're going to send HTTP requests).
+
+        """
+
+        return self._dns_host.rstrip(".")
+
+
+
+    @host.setter
+
+    def host(self, value):
+
+        """
+
+        Setter for the `host` property.
+
+
+
+        We assume that only urllib3 uses the _dns_host attribute; httplib itself
+
+        only uses `host`, and it seems reasonable that other libraries follow suit.
+
+        """
+
+        self._dns_host = value
+
+
+
+    def _new_conn(self):
+
+        """ Establish a socket connection and set nodelay settings on it.
+
+
+
+        :return: New socket connection.
+
+        """
+
+        extra_kw = {}
+
+        if self.source_address:
+
+            extra_kw["source_address"] = self.source_address
+
+
+
+        if self.socket_options:
+
+            extra_kw["socket_options"] = self.socket_options
+
+
 
         try:
 
-            adapter = registry[type(cipher), type(mode)]
+            conn = connection.create_connection(
 
-        except KeyError:
-
-            raise UnsupportedAlgorithm(
-
-                "cipher {0} in {1} mode is not supported "
-
-                "by this backend.".format(
-
-                    cipher.name, mode.name if mode else mode),
-
-                _Reasons.UNSUPPORTED_CIPHER
+                (self._dns_host, self.port), self.timeout, **extra_kw
 
             )
 
 
 
-        evp_cipher = adapter(self._backend, cipher, mode)
+        except SocketTimeout:
 
-        if evp_cipher == self._backend._ffi.NULL:
+            raise ConnectTimeoutError(
 
-            raise UnsupportedAlgorithm(
+                self,
 
-                "cipher {0} in {1} mode is not supported "
+                "Connection to %s timed out. (connect timeout=%s)"
 
-                "by this backend.".format(
-
-                    cipher.name, mode.name if mode else mode),
-
-                _Reasons.UNSUPPORTED_CIPHER
+                % (self.host, self.timeout),
 
             )
 
 
 
-        if isinstance(mode, modes.ModeWithInitializationVector):
+        except SocketError as e:
 
-            iv_nonce = mode.initialization_vector
+            raise NewConnectionError(
 
-        elif isinstance(mode, modes.ModeWithTweak):
+                self, "Failed to establish a new connection: %s" % e
 
-            iv_nonce = mode.tweak
+            )
 
-        elif isinstance(mode, modes.ModeWithNonce):
 
-            iv_nonce = mode.nonce
 
-        elif isinstance(cipher, modes.ModeWithNonce):
+        return conn
 
-            iv_nonce = cipher.nonce
 
-        else:
 
-            iv_nonce = self._backend._ffi.NULL
+    def _prepare_conn(self, conn):
 
-        # begin init with cipher and operation type
+        self.sock = conn
 
-        res = self._backend._lib.EVP_CipherInit_ex(ctx, evp_cipher,
+        # Google App Engine's httplib does not define _tunnel_host
 
-                                                   self._backend._ffi.NULL,
+        if getattr(self, "_tunnel_host", None):
 
-                                                   self._backend._ffi.NULL,
+            # TODO: Fix tunnel so it doesn't depend on self.sock state.
 
-                                                   self._backend._ffi.NULL,
+            self._tunnel()
 
-                                                   operation)
+            # Mark this connection as not reusable
 
-        self._backend.openssl_assert(res != 0)
+            self.auto_open = 0
 
-        # set the key length to handle variable key ciphers
 
-        res = self._backend._lib.EVP_CIPHER_CTX_set_key_length(
 
-            ctx, len(cipher.key)
+    def connect(self):
+
+        conn = self._new_conn()
+
+        self._prepare_conn(conn)
+
+
+
+    def request_chunked(self, method, url, body=None, headers=None):
+
+        """
+
+        Alternative to the common request method, which sends the
+
+        body with chunked encoding and not as one block
+
+        """
+
+        headers = HTTPHeaderDict(headers if headers is not None else {})
+
+        skip_accept_encoding = "accept-encoding" in headers
+
+        skip_host = "host" in headers
+
+        self.putrequest(
+
+            method, url, skip_accept_encoding=skip_accept_encoding, skip_host=skip_host
 
         )
 
-        self._backend.openssl_assert(res != 0)
+        for header, value in headers.items():
 
-        if isinstance(mode, modes.GCM):
+            self.putheader(header, value)
 
-            res = self._backend._lib.EVP_CIPHER_CTX_ctrl(
+        if "transfer-encoding" not in headers:
 
-                ctx, self._backend._lib.EVP_CTRL_AEAD_SET_IVLEN,
+            self.putheader("Transfer-Encoding", "chunked")
 
-                len(iv_nonce), self._backend._ffi.NULL
+        self.endheaders()
+
+
+
+        if body is not None:
+
+            stringish_types = six.string_types + (bytes,)
+
+            if isinstance(body, stringish_types):
+
+                body = (body,)
+
+            for chunk in body:
+
+                if not chunk:
+
+                    continue
+
+                if not isinstance(chunk, bytes):
+
+                    chunk = chunk.encode("utf8")
+
+                len_str = hex(len(chunk))[2:]
+
+                self.send(len_str.encode("utf-8"))
+
+                self.send(b"\r\n")
+
+                self.send(chunk)
+
+                self.send(b"\r\n")
+
+
+
+        # After the if clause, to always have a closed body
+
+        self.send(b"0\r\n\r\n")
+
+
+
+
+
+class HTTPSConnection(HTTPConnection):
+
+    default_port = port_by_scheme["https"]
+
+
+
+    ssl_version = None
+
+
+
+    def __init__(
+
+        self,
+
+        host,
+
+        port=None,
+
+        key_file=None,
+
+        cert_file=None,
+
+        key_password=None,
+
+        strict=None,
+
+        timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
+
+        ssl_context=None,
+
+        server_hostname=None,
+
+        **kw
+
+    ):
+
+
+
+        HTTPConnection.__init__(self, host, port, strict=strict, timeout=timeout, **kw)
+
+
+
+        self.key_file = key_file
+
+        self.cert_file = cert_file
+
+        self.key_password = key_password
+
+        self.ssl_context = ssl_context
+
+        self.server_hostname = server_hostname
+
+
+
+        # Required property for Google AppEngine 1.9.0 which otherwise causes
+
+        # HTTPS requests to go out as HTTP. (See Issue #356)
+
+        self._protocol = "https"
+
+
+
+
+
+class VerifiedHTTPSConnection(HTTPSConnection):
+
+    """
+
+    Based on httplib.HTTPSConnection but wraps the socket with
+
+    SSL certification.
+
+    """
+
+
+
+    cert_reqs = None
+
+    ca_certs = None
+
+    ca_cert_dir = None
+
+    ssl_version = None
+
+    assert_fingerprint = None
+
+
+
+    def set_cert(
+
+        self,
+
+        key_file=None,
+
+        cert_file=None,
+
+        cert_reqs=None,
+
+        key_password=None,
+
+        ca_certs=None,
+
+        assert_hostname=None,
+
+        assert_fingerprint=None,
+
+        ca_cert_dir=None,
+
+    ):
+
+        """
+
+        This method should only be called once, before the connection is used.
+
+        """
+
+        # If cert_reqs is not provided we'll assume CERT_REQUIRED unless we also
+
+        # have an SSLContext object in which case we'll use its verify_mode.
+
+        if cert_reqs is None:
+
+            if self.ssl_context is not None:
+
+                cert_reqs = self.ssl_context.verify_mode
+
+            else:
+
+                cert_reqs = resolve_cert_reqs(None)
+
+
+
+        self.key_file = key_file
+
+        self.cert_file = cert_file
+
+        self.cert_reqs = cert_reqs
+
+        self.key_password = key_password
+
+        self.assert_hostname = assert_hostname
+
+        self.assert_fingerprint = assert_fingerprint
+
+        self.ca_certs = ca_certs and os.path.expanduser(ca_certs)
+
+        self.ca_cert_dir = ca_cert_dir and os.path.expanduser(ca_cert_dir)
+
+
+
+    def connect(self):
+
+        # Add certificate verification
+
+        conn = self._new_conn()
+
+        hostname = self.host
+
+
+
+        # Google App Engine's httplib does not define _tunnel_host
+
+        if getattr(self, "_tunnel_host", None):
+
+            self.sock = conn
+
+            # Calls self._set_hostport(), so self.host is
+
+            # self._tunnel_host below.
+
+            self._tunnel()
+
+            # Mark this connection as not reusable
+
+            self.auto_open = 0
+
+
+
+            # Override the host with the one we're requesting data from.
+
+            hostname = self._tunnel_host
+
+
+
+        server_hostname = hostname
+
+        if self.server_hostname is not None:
+
+            server_hostname = self.server_hostname
+
+
+
+        is_time_off = datetime.date.today() < RECENT_DATE
+
+        if is_time_off:
+
+            warnings.warn(
+
+                (
+
+                    "System time is way off (before {0}). This will probably "
+
+                    "lead to SSL verification errors"
+
+                ).format(RECENT_DATE),
+
+                SystemTimeWarning,
 
             )
 
-            self._backend.openssl_assert(res != 0)
-
-            if mode.tag is not None:
-
-                res = self._backend._lib.EVP_CIPHER_CTX_ctrl(
-
-                    ctx, self._backend._lib.EVP_CTRL_AEAD_SET_TAG,
-
-                    len(mode.tag), mode.tag
-
-                )
-
-                self._backend.openssl_assert(res != 0)
-
-                self._tag = mode.tag
-
-            elif (
-
-                self._operation == self._DECRYPT and
-
-                self._backend._lib.CRYPTOGRAPHY_OPENSSL_LESS_THAN_102 and
-
-                not self._backend._lib.CRYPTOGRAPHY_IS_LIBRESSL
-
-            ):
-
-                raise NotImplementedError(
-
-                    "delayed passing of GCM tag requires OpenSSL >= 1.0.2."
-
-                    " To use this feature please update OpenSSL"
-
-                )
 
 
+        # Wrap socket using verification with the root certs in
 
-        # pass key/iv
+        # trusted_root_certs
 
-        res = self._backend._lib.EVP_CipherInit_ex(
+        default_ssl_context = False
 
-            ctx,
+        if self.ssl_context is None:
 
-            self._backend._ffi.NULL,
+            default_ssl_context = True
 
-            self._backend._ffi.NULL,
+            self.ssl_context = create_urllib3_context(
 
-            cipher.key,
+                ssl_version=resolve_ssl_version(self.ssl_version),
 
-            iv_nonce,
-
-            operation
-
-        )
-
-        self._backend.openssl_assert(res != 0)
-
-        # We purposely disable padding here as it's handled higher up in the
-
-        # API.
-
-        self._backend._lib.EVP_CIPHER_CTX_set_padding(ctx, 0)
-
-        self._ctx = ctx
-
-
-
-    def update(self, data):
-
-        buf = bytearray(len(data) + self._block_size_bytes - 1)
-
-        n = self.update_into(data, buf)
-
-        return bytes(buf[:n])
-
-
-
-    def update_into(self, data, buf):
-
-        if len(buf) < (len(data) + self._block_size_bytes - 1):
-
-            raise ValueError(
-
-                "buffer must be at least {0} bytes for this "
-
-                "payload".format(len(data) + self._block_size_bytes - 1)
+                cert_reqs=resolve_cert_reqs(self.cert_reqs),
 
             )
 
 
 
-        buf = self._backend._ffi.cast(
+        context = self.ssl_context
 
-            "unsigned char *", self._backend._ffi.from_buffer(buf)
-
-        )
-
-        outlen = self._backend._ffi.new("int *")
-
-        res = self._backend._lib.EVP_CipherUpdate(self._ctx, buf, outlen,
-
-                                                  data, len(data))
-
-        self._backend.openssl_assert(res != 0)
-
-        return outlen[0]
+        context.verify_mode = resolve_cert_reqs(self.cert_reqs)
 
 
 
-    def finalize(self):
+        # Try to load OS default certs if none are given.
 
-        # OpenSSL 1.0.1 on Ubuntu 12.04 (and possibly other distributions)
-
-        # appears to have a bug where you must make at least one call to update
-
-        # even if you are only using authenticate_additional_data or the
-
-        # GCM tag will be wrong. An (empty) call to update resolves this
-
-        # and is harmless for all other versions of OpenSSL.
-
-        if isinstance(self._mode, modes.GCM):
-
-            self.update(b"")
-
-
+        # Works well on Windows (requires Python3.4+)
 
         if (
 
-            self._operation == self._DECRYPT and
+            not self.ca_certs
 
-            isinstance(self._mode, modes.ModeWithAuthenticationTag) and
+            and not self.ca_cert_dir
 
-            self.tag is None
+            and default_ssl_context
+
+            and hasattr(context, "load_default_certs")
 
         ):
 
-            raise ValueError(
+            context.load_default_certs()
 
-                "Authentication tag must be provided when decrypting."
+
+
+        self.sock = ssl_wrap_socket(
+
+            sock=conn,
+
+            keyfile=self.key_file,
+
+            certfile=self.cert_file,
+
+            key_password=self.key_password,
+
+            ca_certs=self.ca_certs,
+
+            ca_cert_dir=self.ca_cert_dir,
+
+            server_hostname=server_hostname,
+
+            ssl_context=context,
+
+        )
+
+
+
+        if self.assert_fingerprint:
+
+            assert_fingerprint(
+
+                self.sock.getpeercert(binary_form=True), self.assert_fingerprint
 
             )
 
+        elif (
 
+            context.verify_mode != ssl.CERT_NONE
 
-        buf = self._backend._ffi.new("unsigned char[]", self._block_size_bytes)
+            and not getattr(context, "check_hostname", False)
 
-        outlen = self._backend._ffi.new("int *")
+            and self.assert_hostname is not False
 
-        res = self._backend._lib.EVP_CipherFinal_ex(self._ctx, buf, outlen)
+        ):
 
-        if res == 0:
+            # While urllib3 attempts to always turn off hostname matching from
 
-            errors = self._backend._consume_errors()
+            # the TLS library, this cannot always be done. So we check whether
 
+            # the TLS Library still thinks it's matching hostnames.
 
+            cert = self.sock.getpeercert()
 
-            if not errors and isinstance(self._mode, modes.GCM):
+            if not cert.get("subjectAltName", ()):
 
-                raise InvalidTag
+                warnings.warn(
 
+                    (
 
+                        "Certificate for {0} has no `subjectAltName`, falling back to check for a "
 
-            self._backend.openssl_assert(
+                        "`commonName` for now. This feature is being removed by major browsers and "
 
-                errors[0]._lib_reason_match(
+                        "deprecated by RFC 2818. (See https://github.com/urllib3/urllib3/issues/497 "
 
-                    self._backend._lib.ERR_LIB_EVP,
+                        "for details.)".format(hostname)
 
-                    self._backend._lib.EVP_R_DATA_NOT_MULTIPLE_OF_BLOCK_LENGTH
+                    ),
+
+                    SubjectAltNameWarning,
 
                 )
 
-            )
-
-            raise ValueError(
-
-                "The length of the provided data is not a multiple of "
-
-                "the block length."
-
-            )
+            _match_hostname(cert, self.assert_hostname or server_hostname)
 
 
 
-        if (isinstance(self._mode, modes.GCM) and
+        self.is_verified = (
 
-           self._operation == self._ENCRYPT):
+            context.verify_mode == ssl.CERT_REQUIRED
 
-            tag_buf = self._backend._ffi.new(
-
-                "unsigned char[]", self._block_size_bytes
-
-            )
-
-            res = self._backend._lib.EVP_CIPHER_CTX_ctrl(
-
-                self._ctx, self._backend._lib.EVP_CTRL_AEAD_GET_TAG,
-
-                self._block_size_bytes, tag_buf
-
-            )
-
-            self._backend.openssl_assert(res != 0)
-
-            self._tag = self._backend._ffi.buffer(tag_buf)[:]
-
-
-
-        res = self._backend._lib.EVP_CIPHER_CTX_cleanup(self._ctx)
-
-        self._backend.openssl_assert(res == 1)
-
-        return self._backend._ffi.buffer(buf)[:outlen[0]]
-
-
-
-    def finalize_with_tag(self, tag):
-
-        if (
-
-            self._backend._lib.CRYPTOGRAPHY_OPENSSL_LESS_THAN_102 and
-
-            not self._backend._lib.CRYPTOGRAPHY_IS_LIBRESSL
-
-        ):
-
-            raise NotImplementedError(
-
-                "finalize_with_tag requires OpenSSL >= 1.0.2. To use this "
-
-                "method please update OpenSSL"
-
-            )
-
-        res = self._backend._lib.EVP_CIPHER_CTX_ctrl(
-
-            self._ctx, self._backend._lib.EVP_CTRL_AEAD_SET_TAG,
-
-            len(tag), tag
+            or self.assert_fingerprint is not None
 
         )
 
-        self._backend.openssl_assert(res != 0)
-
-        self._tag = tag
-
-        return self.finalize()
 
 
 
-    def authenticate_additional_data(self, data):
 
-        outlen = self._backend._ffi.new("int *")
+def _match_hostname(cert, asserted_hostname):
 
-        res = self._backend._lib.EVP_CipherUpdate(
+    try:
 
-            self._ctx, self._backend._ffi.NULL, outlen, data, len(data)
+        match_hostname(cert, asserted_hostname)
+
+    except CertificateError as e:
+
+        log.warning(
+
+            "Certificate did not match expected hostname: %s. Certificate: %s",
+
+            asserted_hostname,
+
+            cert,
 
         )
 
-        self._backend.openssl_assert(res != 0)
+        # Add cert to exception and reraise so client code can inspect
+
+        # the cert when catching the exception, if they want to
+
+        e._peer_cert = cert
+
+        raise
 
 
 
-    tag = utils.read_only_property("_tag")
+
+
+if ssl:
+
+    # Make a copy for testing.
+
+    UnverifiedHTTPSConnection = HTTPSConnection
+
+    HTTPSConnection = VerifiedHTTPSConnection
+
+else:
+
+    HTTPSConnection = DummyConnection

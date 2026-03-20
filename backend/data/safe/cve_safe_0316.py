@@ -2,544 +2,646 @@
 # Safety: safe
 # Category: safe
 
-import json
+#!/usr/bin/python
 
-from datetime import datetime
+# -*- coding: utf-8 -*-
 
-from six.moves.urllib.parse import urljoin
 
 
+# Copyright: (c) 2019, Patrick Pichler <ppichler+ansible@mgit.at>
 
-import hashlib
+# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 
-import hmac
 
-from base64 import b64encode
 
-from django.core.exceptions import ImproperlyConfigured
+from __future__ import absolute_import, division, print_function
 
-from django.test import override_settings
+__metaclass__ = type
 
-from django.utils.timezone import utc
 
-from mock import ANY
 
 
 
-from anymail.signals import AnymailTrackingEvent
+DOCUMENTATION = r'''
 
-from anymail.webhooks.mandrill import MandrillCombinedWebhookView, MandrillTrackingWebhookView
+---
 
+module: openssl_signature
 
+version_added: 1.1.0
 
-from .webhook_cases import WebhookTestCase, WebhookBasicAuthTestsMixin
+short_description: Sign data with openssl
 
+description:
 
+    - This module allows one to sign data using a private key.
 
-TEST_WEBHOOK_KEY = 'TEST_WEBHOOK_KEY'
+    - The module can use the cryptography Python library, or the pyOpenSSL Python
 
+      library. By default, it tries to detect which one is available. This can be
 
+      overridden with the I(select_crypto_backend) option. Please note that the PyOpenSSL backend
 
+      was deprecated in Ansible 2.9 and will be removed in community.crypto 2.0.0.
 
+requirements:
 
-def mandrill_args(events=None,
+    - Either cryptography >= 1.4 (some key types require newer versions)
 
-                  host="http://testserver/",  # Django test-client default
+    - Or pyOpenSSL >= 0.11 (Ed25519 and Ed448 keys are not supported with this backend)
 
-                  path='/anymail/mandrill/',  # Anymail urlconf default
+author:
 
-                  auth="username:password",  # WebhookTestCase default
+    - Patrick Pichler (@aveexy)
 
-                  key=TEST_WEBHOOK_KEY):
+    - Markus Teufelberger (@MarkusTeufelberger)
 
-    """Returns TestClient.post kwargs for Mandrill webhook call with events
+options:
 
+    privatekey_path:
 
+        description:
 
-    Computes correct signature.
+            - The path to the private key to use when signing.
 
-    """
+            - Either I(privatekey_path) or I(privatekey_content) must be specified, but not both.
 
-    if events is None:
+        type: path
 
-        events = []
+    privatekey_content:
 
-    test_client_path = urljoin(host, path)  # https://testserver/anymail/mandrill/
+        description:
 
-    if auth:
+            - The content of the private key to use when signing the certificate signing request.
 
-        # we can get away with this simplification in these controlled tests,
+            - Either I(privatekey_path) or I(privatekey_content) must be specified, but not both.
 
-        # but don't ever construct urls like this in production code -- it's not safe!
+        type: str
 
-        full_url = test_client_path.replace("://", "://" + auth + "@")
+    privatekey_passphrase:
 
-    else:
+        description:
 
-        full_url = test_client_path
+            - The passphrase for the private key.
 
-    mandrill_events = json.dumps(events)
+            - This is required if the private key is password protected.
 
-    signed_data = full_url + 'mandrill_events' + mandrill_events
+        type: str
 
-    signature = b64encode(hmac.new(key=key.encode('ascii'),
+    path:
 
-                                   msg=signed_data.encode('utf-8'),
+        description:
 
-                                   digestmod=hashlib.sha1).digest())
+            - The file to sign.
 
-    return {
+            - This file will only be read and not modified.
 
-        'path': test_client_path,
+        type: path
 
-        'data': {'mandrill_events': mandrill_events},
+        required: true
 
-        'HTTP_X_MANDRILL_SIGNATURE': signature,
+    select_crypto_backend:
 
-    }
+        description:
 
+            - Determines which crypto backend to use.
 
+            - The default choice is C(auto), which tries to use C(cryptography) if available, and falls back to C(pyopenssl).
 
+            - If set to C(pyopenssl), will try to use the L(pyOpenSSL,https://pypi.org/project/pyOpenSSL/) library.
 
+            - If set to C(cryptography), will try to use the L(cryptography,https://cryptography.io/) library.
 
-class MandrillWebhookSettingsTestCase(WebhookTestCase):
+        type: str
 
-    def test_requires_webhook_key(self):
+        default: auto
 
-        with self.assertRaisesRegex(ImproperlyConfigured, r'MANDRILL_WEBHOOK_KEY'):
+        choices: [ auto, cryptography, pyopenssl ]
 
-            self.client.post('/anymail/mandrill/',
+notes:
 
-                             data={'mandrill_events': '[]'})
+    - |
 
+      When using the C(cryptography) backend, the following key types require at least the following C(cryptography) version:
 
+      RSA keys: C(cryptography) >= 1.4
 
-    def test_head_does_not_require_webhook_key(self):
+      DSA and ECDSA keys: C(cryptography) >= 1.5
 
-        # Mandrill issues an unsigned HEAD request to verify the wehbook url.
+      ed448 and ed25519 keys: C(cryptography) >= 2.6
 
-        # Only *after* that succeeds will Mandrill will tell you the webhook key.
+seealso:
 
-        # So make sure that HEAD request will go through without any key set:
+    - module: community.crypto.openssl_signature_info
 
-        response = self.client.head('/anymail/mandrill/')
+    - module: community.crypto.openssl_privatekey
 
-        self.assertEqual(response.status_code, 200)
+'''
 
 
 
+EXAMPLES = r'''
 
+- name: Sign example file
 
-@override_settings(ANYMAIL_MANDRILL_WEBHOOK_KEY=TEST_WEBHOOK_KEY)
+  community.crypto.openssl_signature:
 
-class MandrillWebhookSecurityTestCase(WebhookTestCase, WebhookBasicAuthTestsMixin):
+    privatekey_path: private.key
 
-    should_warn_if_no_auth = False  # because we check webhook signature
+    path: /tmp/example_file
 
+  register: sig
 
 
-    def call_webhook(self):
 
-        kwargs = mandrill_args([{'event': 'send'}])
+- name: Verify signature of example file
 
-        return self.client.post(**kwargs)
+  community.crypto.openssl_signature_info:
 
+    certificate_path: cert.pem
 
+    path: /tmp/example_file
 
-    # Additional tests are in WebhookBasicAuthTestsMixin
+    signature: "{{ sig.signature }}"
 
+  register: verify
 
 
-    def test_verifies_correct_signature(self):
 
-        kwargs = mandrill_args([{'event': 'send'}])
+- name: Make sure the signature is valid
 
-        response = self.client.post(**kwargs)
+  assert:
 
-        self.assertEqual(response.status_code, 200)
+    that:
 
+      - verify.valid
 
+'''
 
-    def test_verifies_missing_signature(self):
 
-        response = self.client.post('/anymail/mandrill/',
 
-                                    data={'mandrill_events': '[{"event":"send"}]'})
+RETURN = r'''
 
-        self.assertEqual(response.status_code, 400)
+signature:
 
+    description: Base64 encoded signature.
 
+    returned: success
 
-    def test_verifies_bad_signature(self):
+    type: str
 
-        kwargs = mandrill_args([{'event': 'send'}], key="wrong API key")
+'''
 
-        response = self.client.post(**kwargs)
 
-        self.assertEqual(response.status_code, 400)
 
+import os
 
+import traceback
 
-    @override_settings(ANYMAIL={})  # clear WEBHOOK_SECRET from WebhookTestCase
+from distutils.version import LooseVersion
 
-    def test_no_basic_auth(self):
+import base64
 
-        # Signature validation should work properly if you're not using basic auth
 
-        self.clear_basic_auth()
 
-        kwargs = mandrill_args([{'event': 'send'}], auth="")
+MINIMAL_PYOPENSSL_VERSION = '0.11'
 
-        response = self.client.post(**kwargs)
+MINIMAL_CRYPTOGRAPHY_VERSION = '1.4'
 
-        self.assertEqual(response.status_code, 200)
 
 
+PYOPENSSL_IMP_ERR = None
 
-    @override_settings(
+try:
 
-        ALLOWED_HOSTS=['127.0.0.1', '.example.com'],
+    import OpenSSL
 
-        ANYMAIL={
+    from OpenSSL import crypto
 
-            "MANDRILL_WEBHOOK_URL": "https://abcde:12345@example.com/anymail/mandrill/",
+    PYOPENSSL_VERSION = LooseVersion(OpenSSL.__version__)
 
-            "WEBHOOK_SECRET": "abcde:12345",
+except ImportError:
 
-        })
+    PYOPENSSL_IMP_ERR = traceback.format_exc()
 
-    def test_webhook_url_setting(self):
+    PYOPENSSL_FOUND = False
 
-        # If Django can't build_absolute_uri correctly (e.g., because your proxy
+else:
 
-        # frontend isn't setting the proxy headers correctly), you must set
+    PYOPENSSL_FOUND = True
 
-        # MANDRILL_WEBHOOK_URL to the actual public url where Mandrill calls the webhook.
 
-        self.set_basic_auth("abcde", "12345")
 
-        kwargs = mandrill_args([{'event': 'send'}], host="https://example.com/", auth="abcde:12345")
+CRYPTOGRAPHY_IMP_ERR = None
 
-        response = self.client.post(SERVER_NAME="127.0.0.1", **kwargs)
+try:
 
-        self.assertEqual(response.status_code, 200)
+    import cryptography
 
+    import cryptography.hazmat.primitives.asymmetric.padding
 
+    import cryptography.hazmat.primitives.hashes
 
-    # override WebhookBasicAuthTestsMixin version of this test
+    CRYPTOGRAPHY_VERSION = LooseVersion(cryptography.__version__)
 
-    @override_settings(ANYMAIL={'WEBHOOK_SECRET': ['cred1:pass1', 'cred2:pass2']})
+except ImportError:
 
-    def test_supports_credential_rotation(self):
+    CRYPTOGRAPHY_IMP_ERR = traceback.format_exc()
 
-        """You can supply a list of basic auth credentials, and any is allowed"""
+    CRYPTOGRAPHY_FOUND = False
 
-        self.set_basic_auth('cred1', 'pass1')
+else:
 
-        response = self.client.post(**mandrill_args(auth="cred1:pass1"))
+    CRYPTOGRAPHY_FOUND = True
 
-        self.assertEqual(response.status_code, 200)
 
 
+from ansible_collections.community.crypto.plugins.module_utils.crypto.basic import (
 
-        self.set_basic_auth('cred2', 'pass2')
+    CRYPTOGRAPHY_HAS_DSA_SIGN,
 
-        response = self.client.post(**mandrill_args(auth="cred2:pass2"))
+    CRYPTOGRAPHY_HAS_EC_SIGN,
 
-        self.assertEqual(response.status_code, 200)
+    CRYPTOGRAPHY_HAS_ED25519_SIGN,
 
+    CRYPTOGRAPHY_HAS_ED448_SIGN,
 
+    CRYPTOGRAPHY_HAS_RSA_SIGN,
 
-        self.set_basic_auth('baduser', 'wrongpassword')
+    OpenSSLObjectError,
 
-        response = self.client.post(**mandrill_args(auth="baduser:wrongpassword"))
+)
 
-        self.assertEqual(response.status_code, 400)
 
 
+from ansible_collections.community.crypto.plugins.module_utils.crypto.support import (
 
+    OpenSSLObject,
 
+    load_privatekey,
 
-@override_settings(ANYMAIL_MANDRILL_WEBHOOK_KEY=TEST_WEBHOOK_KEY)
+)
 
-class MandrillTrackingTestCase(WebhookTestCase):
 
 
+from ansible.module_utils._text import to_native, to_bytes
 
-    def test_head_request(self):
+from ansible.module_utils.basic import AnsibleModule, missing_required_lib
 
-        # Mandrill verifies webhooks at config time with a HEAD request
 
-        # (See MandrillWebhookSettingsTestCase above for equivalent without the key yet set)
 
-        response = self.client.head('/anymail/mandrill/tracking/')
 
-        self.assertEqual(response.status_code, 200)
 
+class SignatureBase(OpenSSLObject):
 
 
-    def test_post_request_invalid_json(self):
 
-        kwargs = mandrill_args()
+    def __init__(self, module, backend):
 
-        kwargs['data'] = {'mandrill_events': "GARBAGE DATA"}
+        super(SignatureBase, self).__init__(
 
-        response = self.client.post(**kwargs)
+            path=module.params['path'],
 
-        self.assertEqual(response.status_code, 400)
+            state='present',
 
+            force=False,
 
+            check_mode=module.check_mode
 
-    def test_send_event(self):
+        )
 
-        raw_events = [{
 
-            "event": "send",
 
-            "msg": {
+        self.backend = backend
 
-                "ts": 1461095211,  # time send called
 
-                "subject": "Webhook Test",
 
-                "email": "recipient@example.com",
+        self.privatekey_path = module.params['privatekey_path']
 
-                "sender": "sender@example.com",
+        self.privatekey_content = module.params['privatekey_content']
 
-                "tags": ["tag1", "tag2"],
+        if self.privatekey_content is not None:
 
-                "metadata": {"custom1": "value1", "custom2": "value2"},
+            self.privatekey_content = self.privatekey_content.encode('utf-8')
 
-                "_id": "abcdef012345789abcdef012345789"
+        self.privatekey_passphrase = module.params['privatekey_passphrase']
 
-            },
 
-            "_id": "abcdef012345789abcdef012345789",
 
-            "ts": 1461095246  # time of event
+    def generate(self):
 
-        }]
+        # Empty method because OpenSSLObject wants this
 
-        response = self.client.post(**mandrill_args(events=raw_events))
+        pass
 
-        self.assertEqual(response.status_code, 200)
 
-        kwargs = self.assert_handler_called_once_with(self.tracking_handler, sender=MandrillCombinedWebhookView,
 
-                                                      event=ANY, esp_name='Mandrill')
+    def dump(self):
 
-        event = kwargs['event']
+        # Empty method because OpenSSLObject wants this
 
-        self.assertIsInstance(event, AnymailTrackingEvent)
+        pass
 
-        self.assertEqual(event.event_type, "sent")
 
-        self.assertEqual(event.timestamp, datetime(2016, 4, 19, 19, 47, 26, tzinfo=utc))
 
-        self.assertEqual(event.esp_event, raw_events[0])
 
-        self.assertEqual(event.message_id, "abcdef012345789abcdef012345789")
 
-        self.assertEqual(event.recipient, "recipient@example.com")
+# Implementation with using pyOpenSSL
 
-        self.assertEqual(event.tags, ["tag1", "tag2"])
+class SignaturePyOpenSSL(SignatureBase):
 
-        self.assertEqual(event.metadata, {"custom1": "value1", "custom2": "value2"})
 
 
+    def __init__(self, module, backend):
 
-    def test_hard_bounce_event(self):
+        super(SignaturePyOpenSSL, self).__init__(module, backend)
 
-        raw_events = [{
 
-            "event": "hard_bounce",
 
-            "msg": {
+    def run(self):
 
-                "ts": 1461095211,  # time send called
 
-                "subject": "Webhook Test",
 
-                "email": "bounce@example.com",
+        result = dict()
 
-                "sender": "sender@example.com",
 
-                "bounce_description": "bad_mailbox",
 
-                "bgtools_code": 10,
+        try:
 
-                "diag": "smtp;550 5.1.1 The email account that you tried to reach does not exist.",
+            with open(self.path, "rb") as f:
 
-                "_id": "abcdef012345789abcdef012345789"
+                _in = f.read()
 
-            },
 
-            "_id": "abcdef012345789abcdef012345789",
 
-            "ts": 1461095246  # time of event
+            private_key = load_privatekey(
 
-        }]
+                path=self.privatekey_path,
 
-        response = self.client.post(**mandrill_args(events=raw_events))
+                content=self.privatekey_content,
 
-        self.assertEqual(response.status_code, 200)
+                passphrase=self.privatekey_passphrase,
 
-        kwargs = self.assert_handler_called_once_with(self.tracking_handler, sender=MandrillCombinedWebhookView,
+                backend=self.backend,
 
-                                                      event=ANY, esp_name='Mandrill')
+            )
 
-        event = kwargs['event']
 
-        self.assertIsInstance(event, AnymailTrackingEvent)
 
-        self.assertEqual(event.event_type, "bounced")
+            signature = OpenSSL.crypto.sign(private_key, _in, "sha256")
 
-        self.assertEqual(event.esp_event, raw_events[0])
+            result['signature'] = base64.b64encode(signature)
 
-        self.assertEqual(event.message_id, "abcdef012345789abcdef012345789")
+            return result
 
-        self.assertEqual(event.recipient, "bounce@example.com")
+        except Exception as e:
 
-        self.assertEqual(event.mta_response,
+            raise OpenSSLObjectError(e)
 
-                         "smtp;550 5.1.1 The email account that you tried to reach does not exist.")
 
 
 
-    def test_click_event(self):
 
-        raw_events = [{
+# Implementation with using cryptography
 
-            "event": "click",
+class SignatureCryptography(SignatureBase):
 
-            "msg": {
 
-                "ts": 1461095211,  # time send called
 
-                "subject": "Webhook Test",
+    def __init__(self, module, backend):
 
-                "email": "recipient@example.com",
+        super(SignatureCryptography, self).__init__(module, backend)
 
-                "sender": "sender@example.com",
 
-                "opens": [{"ts": 1461095242}],
 
-                "clicks": [{"ts": 1461095246, "url": "http://example.com"}],
+    def run(self):
 
-                "_id": "abcdef012345789abcdef012345789"
+        _padding = cryptography.hazmat.primitives.asymmetric.padding.PKCS1v15()
 
-            },
+        _hash = cryptography.hazmat.primitives.hashes.SHA256()
 
-            "user_agent": "Mozilla/5.0 (Windows NT 5.1; rv:11.0) Gecko Firefox/11.0",
 
-            "url": "http://example.com",
 
-            "_id": "abcdef012345789abcdef012345789",
+        result = dict()
 
-            "ts": 1461095246  # time of event
 
-        }]
 
-        response = self.client.post(**mandrill_args(events=raw_events))
+        try:
 
-        self.assertEqual(response.status_code, 200)
+            with open(self.path, "rb") as f:
 
-        kwargs = self.assert_handler_called_once_with(self.tracking_handler, sender=MandrillCombinedWebhookView,
+                _in = f.read()
 
-                                                      event=ANY, esp_name='Mandrill')
 
-        event = kwargs['event']
 
-        self.assertIsInstance(event, AnymailTrackingEvent)
+            private_key = load_privatekey(
 
-        self.assertEqual(event.event_type, "clicked")
+                path=self.privatekey_path,
 
-        self.assertEqual(event.esp_event, raw_events[0])
+                content=self.privatekey_content,
 
-        self.assertEqual(event.click_url, "http://example.com")
+                passphrase=self.privatekey_passphrase,
 
-        self.assertEqual(event.user_agent, "Mozilla/5.0 (Windows NT 5.1; rv:11.0) Gecko Firefox/11.0")
+                backend=self.backend,
 
+            )
 
 
-    def test_sync_event(self):
 
-        # Mandrill sync events use a different format from other events
+            signature = None
 
-        # https://mandrill.zendesk.com/hc/en-us/articles/205583297-Sync-Event-Webhook-format
 
-        raw_events = [{
 
-            "type": "blacklist",
+            if CRYPTOGRAPHY_HAS_DSA_SIGN:
 
-            "action": "add",
+                if isinstance(private_key, cryptography.hazmat.primitives.asymmetric.dsa.DSAPrivateKey):
 
-            "reject": {
+                    signature = private_key.sign(_in, _hash)
 
-                "email": "recipient@example.com",
 
-                "reason": "manual edit"
 
-            }
+            if CRYPTOGRAPHY_HAS_EC_SIGN:
 
-        }]
+                if isinstance(private_key, cryptography.hazmat.primitives.asymmetric.ec.EllipticCurvePrivateKey):
 
-        response = self.client.post(**mandrill_args(events=raw_events))
+                    signature = private_key.sign(_in, cryptography.hazmat.primitives.asymmetric.ec.ECDSA(_hash))
 
-        self.assertEqual(response.status_code, 200)
 
-        kwargs = self.assert_handler_called_once_with(self.tracking_handler, sender=MandrillCombinedWebhookView,
 
-                                                      event=ANY, esp_name='Mandrill')
+            if CRYPTOGRAPHY_HAS_ED25519_SIGN:
 
-        event = kwargs['event']
+                if isinstance(private_key, cryptography.hazmat.primitives.asymmetric.ed25519.Ed25519PrivateKey):
 
-        self.assertEqual(event.event_type, "unknown")
+                    signature = private_key.sign(_in)
 
-        self.assertEqual(event.recipient, "recipient@example.com")
 
-        self.assertEqual(event.description, "manual edit")
 
+            if CRYPTOGRAPHY_HAS_ED448_SIGN:
 
+                if isinstance(private_key, cryptography.hazmat.primitives.asymmetric.ed448.Ed448PrivateKey):
 
-    def test_old_tracking_url(self):
+                    signature = private_key.sign(_in)
 
-        # Earlier versions of Anymail used /mandrill/tracking/ (and didn't support inbound);
 
-        # make sure that URL continues to work.
 
-        raw_events = [{
+            if CRYPTOGRAPHY_HAS_RSA_SIGN:
 
-            "event": "send",
+                if isinstance(private_key, cryptography.hazmat.primitives.asymmetric.rsa.RSAPrivateKey):
 
-            "msg": {
+                    signature = private_key.sign(_in, _padding, _hash)
 
-                "ts": 1461095211,  # time send called
 
-                "subject": "Webhook Test",
 
-                "email": "recipient@example.com",
+            if signature is None:
 
-                "sender": "sender@example.com",
+                self.module.fail_json(
 
-                "tags": ["tag1", "tag2"],
+                    msg="Unsupported key type. Your cryptography version is {0}".format(CRYPTOGRAPHY_VERSION)
 
-                "metadata": {"custom1": "value1", "custom2": "value2"},
+                )
 
-                "_id": "abcdef012345789abcdef012345789"
 
-            },
 
-            "_id": "abcdef012345789abcdef012345789",
+            result['signature'] = base64.b64encode(signature)
 
-            "ts": 1461095246  # time of event
+            return result
 
-        }]
 
-        response = self.client.post(**mandrill_args(events=raw_events, path='/anymail/mandrill/tracking/'))
 
-        self.assertEqual(response.status_code, 200)
+        except Exception as e:
 
-        self.assert_handler_called_once_with(self.tracking_handler, sender=MandrillTrackingWebhookView,
+            raise OpenSSLObjectError(e)
 
-                                             event=ANY, esp_name='Mandrill')
+
+
+
+
+def main():
+
+    module = AnsibleModule(
+
+        argument_spec=dict(
+
+            privatekey_path=dict(type='path'),
+
+            privatekey_content=dict(type='str', no_log=True),
+
+            privatekey_passphrase=dict(type='str', no_log=True),
+
+            path=dict(type='path', required=True),
+
+            select_crypto_backend=dict(type='str', choices=['auto', 'pyopenssl', 'cryptography'], default='auto'),
+
+        ),
+
+        mutually_exclusive=(
+
+            ['privatekey_path', 'privatekey_content'],
+
+        ),
+
+        required_one_of=(
+
+            ['privatekey_path', 'privatekey_content'],
+
+        ),
+
+        supports_check_mode=True,
+
+    )
+
+
+
+    if not os.path.isfile(module.params['path']):
+
+        module.fail_json(
+
+            name=module.params['path'],
+
+            msg='The file {0} does not exist'.format(module.params['path'])
+
+        )
+
+
+
+    backend = module.params['select_crypto_backend']
+
+    if backend == 'auto':
+
+        # Detection what is possible
+
+        can_use_cryptography = CRYPTOGRAPHY_FOUND and CRYPTOGRAPHY_VERSION >= LooseVersion(MINIMAL_CRYPTOGRAPHY_VERSION)
+
+        can_use_pyopenssl = PYOPENSSL_FOUND and PYOPENSSL_VERSION >= LooseVersion(MINIMAL_PYOPENSSL_VERSION)
+
+
+
+        # Decision
+
+        if can_use_cryptography:
+
+            backend = 'cryptography'
+
+        elif can_use_pyopenssl:
+
+            backend = 'pyopenssl'
+
+
+
+        # Success?
+
+        if backend == 'auto':
+
+            module.fail_json(msg=("Can't detect any of the required Python libraries "
+
+                                  "cryptography (>= {0}) or PyOpenSSL (>= {1})").format(
+
+                MINIMAL_CRYPTOGRAPHY_VERSION,
+
+                MINIMAL_PYOPENSSL_VERSION))
+
+    try:
+
+        if backend == 'pyopenssl':
+
+            if not PYOPENSSL_FOUND:
+
+                module.fail_json(msg=missing_required_lib('pyOpenSSL >= {0}'.format(MINIMAL_PYOPENSSL_VERSION)),
+
+                                 exception=PYOPENSSL_IMP_ERR)
+
+            module.deprecate('The module is using the PyOpenSSL backend. This backend has been deprecated',
+
+                             version='2.0.0', collection_name='community.crypto')
+
+            _sign = SignaturePyOpenSSL(module, backend)
+
+        elif backend == 'cryptography':
+
+            if not CRYPTOGRAPHY_FOUND:
+
+                module.fail_json(msg=missing_required_lib('cryptography >= {0}'.format(MINIMAL_CRYPTOGRAPHY_VERSION)),
+
+                                 exception=CRYPTOGRAPHY_IMP_ERR)
+
+            _sign = SignatureCryptography(module, backend)
+
+
+
+        result = _sign.run()
+
+
+
+        module.exit_json(**result)
+
+    except OpenSSLObjectError as exc:
+
+        module.fail_json(msg=to_native(exc))
+
+
+
+
+
+if __name__ == '__main__':
+
+    main()

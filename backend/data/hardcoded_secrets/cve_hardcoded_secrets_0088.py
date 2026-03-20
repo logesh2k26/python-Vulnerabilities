@@ -2,196 +2,304 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-#
+from datetime import datetime
 
-# djblets_js.py -- JavaScript-related template tags
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-#
+from uuid import uuid4
 
-# Copyright (c) 2007-2009  Christian Hammond
 
-# Copyright (c) 2007-2009  David Trowbridge
 
-#
+from flask import g
 
-# Permission is hereby granted, free of charge, to any person obtaining
 
-# a copy of this software and associated documentation files (the
 
-# "Software"), to deal in the Software without restriction, including
+from alerta.app import db
 
-# without limitation the rights to use, copy, modify, merge, publish,
+from alerta.database.base import Query
 
-# distribute, sublicense, and/or sell copies of the Software, and to
+from alerta.models.enums import ChangeType, NoteType
 
-# permit persons to whom the Software is furnished to do so, subject to
+from alerta.models.history import History
 
-# the following conditions:
+from alerta.utils.format import DateTime
 
-#
+from alerta.utils.response import absolute_url
 
-# The above copyright notice and this permission notice shall be included
 
-# in all copies or substantial portions of the Software.
 
-#
+JSON = Dict[str, Any]
 
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
 
-# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
 
-# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
 
-# IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
 
-# CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+class Note:
 
-# TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 
-# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+    def __init__(self, text: str, user: str, note_type: str, **kwargs) -> None:
 
 
-from __future__ import unicode_literals
 
+        self.id = kwargs.get('id') or str(uuid4())
 
+        self.text = text
 
-import json
+        self.user = user
 
+        self.note_type = note_type
 
+        self.attributes = kwargs.get('attributes', None) or dict()
 
-from django import template
+        self.create_time = kwargs['create_time'] if 'create_time' in kwargs else datetime.utcnow()
 
-from django.core.serializers import serialize
+        self.update_time = kwargs.get('update_time')
 
-from django.db.models.query import QuerySet
+        self.alert = kwargs.get('alert')
 
-from django.utils import six
+        self.customer = kwargs.get('customer')
 
-from django.utils.safestring import mark_safe
 
 
+    @classmethod
 
-from djblets.util.serializers import DjbletsJSONEncoder
+    def parse(cls, json: JSON) -> 'Note':
 
+        return Note(
 
+            id=json.get('id', None),
 
+            text=json.get('status', None),
 
+            user=json.get('status', None),
 
-register = template.Library()
+            attributes=json.get('attributes', dict()),
 
+            note_type=json.get('type', None),
 
+            create_time=DateTime.parse(json['createTime']) if 'createTime' in json else None,
 
+            update_time=DateTime.parse(json['updateTime']) if 'updateTime' in json else None,
 
+            alert=json.get('related', {}).get('alert'),
 
-@register.simple_tag
+            customer=json.get('customer', None)
 
-def form_dialog_fields(form):
+        )
 
-    """
 
-    Translates a Django Form object into a JavaScript list of fields.
 
-    The resulting list of fields can be used to represent the form
+    @property
 
-    dynamically.
+    def serialize(self) -> Dict[str, Any]:
 
-    """
+        note = {
 
-    s = ''
+            'id': self.id,
 
+            'href': absolute_url('/note/' + self.id),
 
+            'text': self.text,
 
-    for field in form:
+            'user': self.user,
 
-        s += "{ name: '%s', " % field.name
+            'attributes': self.attributes,
 
+            'type': self.note_type,
 
+            'createTime': self.create_time,
 
-        if field.is_hidden:
+            'updateTime': self.update_time,
 
-            s += "hidden: true, "
+            '_links': dict(),
 
-        else:
+            'customer': self.customer
 
-            s += "label: '%s', " % field.label_tag(field.label + ":")
+        }
 
+        if self.alert:
 
+            note['_links'] = {
 
-            if field.field.required:
+                'alert': absolute_url('/alert/' + self.alert)
 
-                s += "required: true, "
+            }
 
+        return note
 
 
-            if field.field.help_text:
 
-                s += "help_text: '%s', " % field.field.help_text
+    def __repr__(self) -> str:
 
+        return 'Note(id={!r}, text={!r}, user={!r}, type={!r}, customer={!r})'.format(
 
+            self.id, self.text, self.user, self.note_type, self.customer
 
-        s += "widget: '%s' }," % six.text_type(field)
+        )
 
 
 
-    # Chop off the last ','
+    @classmethod
 
-    return "[ %s ]" % s[:-1]
+    def from_document(cls, doc: Dict[str, Any]) -> 'Note':
 
+        return Note(
 
+            id=doc.get('id', None) or doc.get('_id'),
 
+            text=doc.get('text', None),
 
+            user=doc.get('user', None),
 
-@register.filter
+            attributes=doc.get('attributes', dict()),
 
-def json_dumps(value, indent=None):
+            note_type=doc.get('type', None),
 
-    if isinstance(value, QuerySet):
+            create_time=doc.get('createTime'),
 
-        result = serialize('json', value, indent=indent)
+            update_time=doc.get('updateTime'),
 
-    else:
+            alert=doc.get('alert'),
 
-        result = json.dumps(value, indent=indent, cls=DjbletsJSONEncoder)
+            customer=doc.get('customer')
 
+        )
 
 
-    return mark_safe(result)
 
+    @classmethod
 
+    def from_record(cls, rec) -> 'Note':
 
+        return Note(
 
+            id=rec.id,
 
-@register.filter
+            text=rec.text,
 
-def json_dumps_items(d, append=''):
+            user=rec.user,
 
-    """Dumps a list of keys/values from a dictionary, without braces.
+            attributes=dict(rec.attributes),
 
+            note_type=rec.type,
 
+            create_time=rec.create_time,
 
-    This works very much like ``json_dumps``, but doesn't output the
+            update_time=rec.update_time,
 
-    surrounding braces. This allows it to be used within a JavaScript
+            alert=rec.alert,
 
-    object definition alongside other custom keys.
+            customer=rec.customer
 
+        )
 
 
-    If the dictionary is not empty, and ``append`` is passed, it will be
 
-    appended onto the results. This is most useful when you want to append
+    @classmethod
 
-    a comma after all the dictionary items, in order to provide further
+    def from_db(cls, r: Union[Dict, Tuple]) -> 'Note':
 
-    keys in the template.
+        if isinstance(r, dict):
 
-    """
+            return cls.from_document(r)
 
-    if not d:
+        elif isinstance(r, tuple):
 
-        return ''
+            return cls.from_record(r)
 
 
 
-    return mark_safe(json_dumps(d)[1:-1] + append)
+    def create(self) -> 'Note':
+
+        return Note.from_db(db.create_note(self))
+
+
+
+    @staticmethod
+
+    def from_alert(alert, text):
+
+        note = Note(
+
+            text=text,
+
+            user=g.login,
+
+            note_type=NoteType.alert,
+
+            attributes=dict(
+
+                resource=alert.resource,
+
+                event=alert.event,
+
+                environment=alert.environment,
+
+                severity=alert.severity,
+
+                status=alert.status
+
+            ),
+
+            alert=alert.id,
+
+            customer=alert.customer
+
+        )
+
+
+
+        history = History(
+
+            id=note.id,
+
+            event=alert.event,
+
+            severity=alert.severity,
+
+            status=alert.status,
+
+            value=alert.value,
+
+            text=text,
+
+            change_type=ChangeType.note,
+
+            update_time=datetime.utcnow(),
+
+            user=g.login
+
+        )
+
+        db.add_history(alert.id, history)
+
+        return note.create()
+
+
+
+    @staticmethod
+
+    def find_by_id(id: str) -> Optional['Note']:
+
+        return Note.from_db(db.get_note(id))
+
+
+
+    @staticmethod
+
+    def find_all(query: Query = None) -> List['Note']:
+
+        return [Note.from_db(note) for note in db.get_notes(query)]
+
+
+
+    def update(self, **kwargs) -> 'Note':
+
+        return Note.from_db(db.update_note(self.id, **kwargs))
+
+
+
+    def delete(self) -> bool:
+
+        return db.delete_note(self.id)

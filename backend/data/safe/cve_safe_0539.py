@@ -2,344 +2,268 @@
 # Safety: safe
 # Category: safe
 
-# -*- coding: utf-8 -*-
+# vim: ft=python fileencoding=utf-8 sts=4 sw=4 et:
 
-# Self-tests for the user-friendly Crypto.Random interface
 
-#
 
-# Written in 2013 by Dwayne C. Litzenberger <dlitz@dlitz.net>
+# Copyright 2014-2018 Florian Bruhin (The Compiler) <mail@qutebrowser.org>
 
-#
-
-# ===================================================================
-
-# The contents of this file are dedicated to the public domain.  To
-
-# the extent that dedication to the public domain is not available,
-
-# everyone is granted a worldwide, perpetual, royalty-free,
-
-# non-exclusive license to exercise all rights associated with the
-
-# contents of this file for any purpose whatsoever.
-
-# No rights are reserved.
+# Copyright 2015-2018 Antoni Boucher (antoyo) <bouanto@zoho.com>
 
 #
 
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# This file is part of qutebrowser.
 
-# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+#
 
-# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# qutebrowser is free software: you can redistribute it and/or modify
 
-# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+# it under the terms of the GNU General Public License as published by
 
-# BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+# the Free Software Foundation, either version 3 of the License, or
 
-# ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# (at your option) any later version.
 
-# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+#
 
-# SOFTWARE.
+# qutebrowser is distributed in the hope that it will be useful,
 
-# ===================================================================
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+
+# GNU General Public License for more details.
+
+#
+
+# You should have received a copy of the GNU General Public License
+
+# along with qutebrowser.  If not, see <http://www.gnu.org/licenses/>.
+
+#
+
+# pylint complains when using .render() on jinja templates, so we make it shut
+
+# up for this whole module.
 
 
 
-"""Self-test suite for generic Crypto.Random stuff """
+"""Handler functions for file:... pages."""
 
 
-
-from __future__ import nested_scopes
-
-
-
-__revision__ = "$Id$"
-
-
-
-import binascii
-
-import pprint
-
-import unittest
 
 import os
 
-import time
 
-import sys
 
-if sys.version_info[0] == 2 and sys.version_info[1] == 1:
+from qutebrowser.browser.webkit.network import networkreply
 
-    from Crypto.Util.py21compat import *
+from qutebrowser.utils import jinja
 
-from Crypto.Util.py3compat import *
 
 
 
-try:
 
-    import multiprocessing
+def get_file_list(basedir, all_files, filterfunc):
 
-except ImportError:
+    """Get a list of files filtered by a filter function and sorted by name.
 
-    multiprocessing = None
 
 
+    Args:
 
-import Crypto.Random._UserFriendlyRNG
+        basedir: The parent directory of all files.
 
-import Crypto.Random.random
+        all_files: The list of files to filter and sort.
 
+        filterfunc: The filter function.
 
 
-class RNGForkTest(unittest.TestCase):
 
+    Return:
 
+        A list of dicts. Each dict contains the name and absname keys.
 
-    def _get_reseed_count(self):
+    """
 
-        """
+    items = []
 
-        Get `FortunaAccumulator.reseed_count`, the global count of the
+    for filename in all_files:
 
-        number of times that the PRNG has been reseeded.
+        absname = os.path.join(basedir, filename)
 
-        """
+        if filterfunc(absname):
 
-        rng_singleton = Crypto.Random._UserFriendlyRNG._get_singleton()
+            items.append({'name': filename, 'absname': absname})
 
-        rng_singleton._lock.acquire()
+    return sorted(items, key=lambda v: v['name'].lower())
 
-        try:
 
-            return rng_singleton._fa.reseed_count
 
-        finally:
 
-            rng_singleton._lock.release()
 
+def is_root(directory):
 
+    """Check if the directory is the root directory.
 
-    def runTest(self):
 
-        # Regression test for CVE-2013-1445.  We had a bug where, under the
 
-        # right conditions, two processes might see the same random sequence.
+    Args:
 
+        directory: The directory to check.
 
 
-        if sys.platform.startswith('win'):  # windows can't fork
 
-            assert not hasattr(os, 'fork')    # ... right?
+    Return:
 
-            return
+        Whether the directory is a root directory or not.
 
+    """
 
+    # If you're curious as why this works:
 
-        # Wait 150 ms so that we don't trigger the rate-limit prematurely.
+    # dirname('/') = '/'
 
-        time.sleep(0.15)
+    # dirname('/home') = '/'
 
+    # dirname('/home/') = '/home'
 
+    # dirname('/home/foo') = '/home'
 
-        reseed_count_before = self._get_reseed_count()
+    # basically, for files (no trailing slash) it removes the file part, and
 
+    # for directories, it removes the trailing slash, so the only way for this
 
+    # to be equal is if the directory is the root directory.
 
-        # One or both of these calls together should trigger a reseed right here.
+    return os.path.dirname(directory) == directory
 
-        Crypto.Random._UserFriendlyRNG._get_singleton().reinit()
 
-        Crypto.Random.get_random_bytes(1)
 
 
 
-        reseed_count_after = self._get_reseed_count()
+def parent_dir(directory):
 
-        self.assertNotEqual(reseed_count_before, reseed_count_after)  # sanity check: test should reseed parent before forking
+    """Return the parent directory for the given directory.
 
 
 
-        rfiles = []
+    Args:
 
-        for i in range(10):
+        directory: The path to the directory.
 
-            rfd, wfd = os.pipe()
 
-            if os.fork() == 0:
 
-                # child
+    Return:
 
-                os.close(rfd)
+        The path to the parent directory.
 
-                f = os.fdopen(wfd, "wb")
+    """
 
+    return os.path.normpath(os.path.join(directory, os.pardir))
 
 
-                Crypto.Random.atfork()
 
 
 
-                data = Crypto.Random.get_random_bytes(16)
+def dirbrowser_html(path):
 
+    """Get the directory browser web page.
 
 
-                f.write(data)
 
-                f.close()
+    Args:
 
-                os._exit(0)
+        path: The directory path.
 
-            # parent
 
-            os.close(wfd)
 
-            rfiles.append(os.fdopen(rfd, "rb"))
+    Return:
 
+        The HTML of the web page.
 
+    """
 
-        results = []
+    title = "Browse directory: {}".format(path)
 
-        results_dict = {}
 
-        for f in rfiles:
 
-            data = binascii.hexlify(f.read())
+    if is_root(path):
 
-            results.append(data)
+        parent = None
 
-            results_dict[data] = 1
+    else:
 
-            f.close()
+        parent = parent_dir(path)
 
 
 
-        if len(results) != len(results_dict.keys()):
+    try:
 
-            raise AssertionError("RNG output duplicated across fork():\n%s" %
+        all_files = os.listdir(path)
 
-                                 (pprint.pformat(results)))
+    except OSError as e:
 
+        html = jinja.render('error.html',
 
+                            title="Error while reading directory",
 
+                            url='file:///{}'.format(path), error=str(e))
 
+        return html.encode('UTF-8', errors='xmlcharrefreplace')
 
-# For RNGMultiprocessingForkTest
 
-def _task_main(q):
 
-    a = Crypto.Random.get_random_bytes(16)
+    files = get_file_list(path, all_files, os.path.isfile)
 
-    time.sleep(0.1)     # wait 100 ms
+    directories = get_file_list(path, all_files, os.path.isdir)
 
-    b = Crypto.Random.get_random_bytes(16)
+    html = jinja.render('dirbrowser.html', title=title, url=path,
 
-    q.put(binascii.b2a_hex(a))
+                        parent=parent, files=files, directories=directories)
 
-    q.put(binascii.b2a_hex(b))
+    return html.encode('UTF-8', errors='xmlcharrefreplace')
 
-    q.put(None)      # Wait for acknowledgment
 
 
 
 
+def handler(request, _operation, _current_url):
 
-class RNGMultiprocessingForkTest(unittest.TestCase):
+    """Handler for a file:// URL.
 
 
 
-    def runTest(self):
+    Args:
 
-        # Another regression test for CVE-2013-1445.  This is basically the
+        request: QNetworkRequest to answer to.
 
-        # same as RNGForkTest, but less compatible with old versions of Python,
+        _operation: The HTTP operation being done.
 
-        # and a little easier to read.
+        _current_url: The page we're on currently.
 
 
 
-        n_procs = 5
+    Return:
 
-        manager = multiprocessing.Manager()
+        A QNetworkReply for directories, None for files.
 
-        queues = [manager.Queue(1) for i in range(n_procs)]
+    """
 
+    path = request.url().toLocalFile()
 
+    try:
 
-        # Reseed the pool
+        if os.path.isdir(path):
 
-        time.sleep(0.15)
+            data = dirbrowser_html(path)
 
-        Crypto.Random._UserFriendlyRNG._get_singleton().reinit()
+            return networkreply.FixedDataNetworkReply(
 
-        Crypto.Random.get_random_bytes(1)
+                request, data, 'text/html')
 
+        return None
 
+    except UnicodeEncodeError:
 
-        # Start the child processes
-
-        pool = multiprocessing.Pool(processes=n_procs, initializer=Crypto.Random.atfork)
-
-        map_result = pool.map_async(_task_main, queues)
-
-
-
-        # Get the results, ensuring that no pool processes are reused.
-
-        aa = [queues[i].get(30) for i in range(n_procs)]
-
-        bb = [queues[i].get(30) for i in range(n_procs)]
-
-        res = list(zip(aa, bb))
-
-
-
-        # Shut down the pool
-
-        map_result.get(30)
-
-        pool.close()
-
-        pool.join()
-
-
-
-        # Check that the results are unique
-
-        if len(set(aa)) != len(aa) or len(set(res)) != len(res):
-
-            raise AssertionError("RNG output duplicated across fork():\n%s" %
-
-                                 (pprint.pformat(res),))
-
-
-
-
-
-def get_tests(config={}):
-
-    tests = []
-
-    tests += [RNGForkTest()]
-
-    if multiprocessing is not None:
-
-        tests += [RNGMultiprocessingForkTest()]
-
-    return tests
-
-
-
-if __name__ == '__main__':
-
-    suite = lambda: unittest.TestSuite(get_tests())
-
-    unittest.main(defaultTest='suite')
-
-
-
-# vim:set ts=4 sw=4 sts=4 expandtab:
+        return None

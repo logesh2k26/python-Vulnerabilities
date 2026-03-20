@@ -2,590 +2,1086 @@
 # Safety: safe
 # Category: safe
 
-"""Executable Python script for a proxy service to dockerSkeleton.
+#!/usr/bin/python
 
+from k5test import *
 
+import time
 
-Provides a proxy service (using Flask, a Python web microframework)
+from itertools import imap
 
-that implements the required /init and /run routes to interact with
 
-the OpenWhisk invoker service.
 
+# Run kdbtest against the BDB module.
 
+realm = K5Realm(create_kdb=False)
 
-The implementation of these routes is encapsulated in a class named
+realm.run(['./kdbtest'])
 
-ActionRunner which provides a basic framework for receiving code
 
-from an invoker, preparing it for execution, and then running the
 
-code when required.
+# Set up an OpenLDAP test server if we can.
 
 
 
-/*
+if (not os.path.exists(os.path.join(plugins, 'kdb', 'kldap.so')) and
 
- * Licensed to the Apache Software Foundation (ASF) under one or more
+    not os.path.exists(os.path.join(buildtop, 'lib', 'libkdb_ldap.a'))):
 
- * contributor license agreements.  See the NOTICE file distributed with
+    skip_rest('LDAP KDB tests', 'LDAP KDB module not built')
 
- * this work for additional information regarding copyright ownership.
 
- * The ASF licenses this file to You under the Apache License, Version 2.0
 
- * (the "License"); you may not use this file except in compliance with
+if 'SLAPD' not in os.environ and not which('slapd'):
 
- * the License.  You may obtain a copy of the License at
+    skip_rest('LDAP KDB tests', 'slapd not found')
 
- *
 
- *     http://www.apache.org/licenses/LICENSE-2.0
 
- *
+slapadd = which('slapadd')
 
- * Unless required by applicable law or agreed to in writing, software
+if not slapadd:
 
- * distributed under the License is distributed on an "AS IS" BASIS,
+    skip_rest('LDAP KDB tests', 'slapadd not found')
 
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 
- * See the License for the specific language governing permissions and
 
- * limitations under the License.
+ldapdir = os.path.abspath('ldap')
 
- */
+dbdir = os.path.join(ldapdir, 'ldap')
 
-"""
+slapd_conf = os.path.join(ldapdir, 'slapd.d')
 
+slapd_out = os.path.join(ldapdir, 'slapd.out')
 
+slapd_pidfile = os.path.join(ldapdir, 'pid')
 
-import sys
+ldap_pwfile = os.path.join(ldapdir, 'pw')
 
-import os
+ldap_sock = os.path.join(ldapdir, 'sock')
 
-import json
+ldap_uri = 'ldapi://%s/' % ldap_sock.replace(os.path.sep, '%2F')
 
-import subprocess
+schema = os.path.join(srctop, 'plugins', 'kdb', 'ldap', 'libkdb_ldap',
 
-import codecs
+                      'kerberos.openldap.ldif')
 
-import flask
+top_dn = 'cn=krb5'
 
-from gevent.wsgi import WSGIServer
+admin_dn = 'cn=admin,cn=krb5'
 
-import zipfile
+admin_pw = 'admin'
 
-import io
 
-import base64
 
+shutil.rmtree(ldapdir, True)
 
+os.mkdir(ldapdir)
 
+os.mkdir(slapd_conf)
 
+os.mkdir(dbdir)
 
-class ActionRunner:
 
-    """ActionRunner."""
 
-    LOG_SENTINEL = 'XXX_THE_END_OF_A_WHISK_ACTIVATION_XXX'
+if 'SLAPD' in os.environ:
 
+    slapd = os.environ['SLAPD']
 
+else:
 
-    # initializes the runner
+    # Some Linux installations have AppArmor or similar restrictions
 
-    # @param source the path where the source code will be located (if any)
+    # on the slapd binary, which would prevent it from accessing the
 
-    # @param binary the path where the binary will be located (may be the
+    # build directory.  Try to defeat this by copying the binary.
 
-    # same as source code path)
+    system_slapd = which('slapd')
 
-    def __init__(self, source=None, binary=None, zipdest=None):
+    slapd = os.path.join(ldapdir, 'slapd')
 
-        defaultBinary = '/action/exec'
+    shutil.copy(system_slapd, slapd)
 
-        self.source = source if source else defaultBinary
 
-        self.binary = binary if binary else defaultBinary
 
-        self.zipdest = zipdest if zipdest else os.path.dirname(self.source)
+def slap_add(ldif):
 
+    proc = subprocess.Popen([slapadd, '-b', 'cn=config', '-F', slapd_conf],
 
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
 
-    def preinit(self):
+                            stderr=subprocess.STDOUT)
 
-        return
+    (out, dummy) = proc.communicate(ldif)
 
+    output(out)
 
+    return proc.wait()
 
-    # extracts from the JSON object message a 'code' property and
 
-    # writes it to the <source> path. The source code may have an
 
-    # an optional <epilogue>. The source code is subsequently built
 
-    # to produce the <binary> that is executed during <run>.
 
-    # @param message is a JSON object, should contain 'code'
+# Configure the pid file and some authorization rules we will need for
 
-    # @return True iff binary exists and is executable
+# SASL testing.
 
-    def init(self, message):
+if slap_add('dn: cn=config\n'
 
-        def prep():
+            'objectClass: olcGlobal\n'
 
-            self.preinit()
+            'olcPidFile: %s\n'
 
-            if 'code' in message and message['code'] is not None:
+            'olcAuthzRegexp: '
 
-                binary = message['binary'] if 'binary' in message else False
+            '".*uidNumber=%d,cn=peercred,cn=external,cn=auth" "%s"\n'
 
-                if not binary:
+            'olcAuthzRegexp: "uid=digestuser,cn=digest-md5,cn=auth" "%s"\n' %
 
-                    return self.initCodeFromString(message)
+            (slapd_pidfile, os.geteuid(), admin_dn, admin_dn)) != 0:
 
-                else:
+    skip_rest('LDAP KDB tests', 'slapd basic configuration failed')
 
-                    return self.initCodeFromZip(message)
 
-            else:
 
-                return False
+# Find a working writable database type, trying mdb (added in OpenLDAP
 
+# 2.4.27) and bdb (deprecated and sometimes not built due to licensing
 
+# incompatibilities).
 
-        if prep():
+for dbtype in ('mdb', 'bdb'):
 
-            try:
+    # Try to load the module.  This could fail if OpenLDAP is built
 
-                # write source epilogue if any
+    # without module support, so ignore errors.
 
-                # the message is passed along as it may contain other
+    slap_add('dn: cn=module,cn=config\n'
 
-                # fields relevant to a specific container.
+             'objectClass: olcModuleList\n'
 
-                if self.epilogue(message) is False:
+             'olcModuleLoad: back_%s\n' % dbtype)
 
-                    return False
 
-                # build the source
 
-                if self.build(message) is False:
+    dbclass = 'olc%sConfig' % dbtype.capitalize()
 
-                    return False
+    if slap_add('dn: olcDatabase=%s,cn=config\n'
 
-            except Exception:
+                'objectClass: olcDatabaseConfig\n'
 
-                return False
+                'objectClass: %s\n'
 
-        # verify the binary exists and is executable
+                'olcSuffix: %s\n'
 
-        return self.verify()
+                'olcRootDN: %s\n'
 
+                'olcRootPW: %s\n'
 
+                'olcDbDirectory: %s\n' %
 
-    # optionally appends source to the loaded code during <init>
+                (dbtype, dbclass, top_dn, admin_dn, admin_pw, dbdir)) == 0:
 
-    def epilogue(self, init_arguments):
+        break
 
-        return
+else:
 
+    skip_rest('LDAP KDB tests', 'could not find working slapd db type')
 
 
-    # optionally builds the source code loaded during <init> into an executable
 
-    def build(self, init_arguments):
+if slap_add('include: file://%s\n' % schema) != 0:
 
-        return
+    skip_rest('LDAP KDB tests', 'failed to load Kerberos schema')
 
 
 
-    # @return True iff binary exists and is executable, False otherwise
+# Load the core schema if we can.
 
-    def verify(self):
+ldap_homes = ['/etc/ldap', '/etc/openldap', '/usr/local/etc/openldap',
 
-        return (os.path.isfile(self.binary) and
+              '/usr/local/etc/ldap']
 
-                os.access(self.binary, os.X_OK))
+local_schema_path = '/schema/core.ldif'
 
+core_schema = next((i for i in imap(lambda x:x+local_schema_path, ldap_homes)
 
+                    if os.path.isfile(i)), None)
 
-    # constructs an environment for the action to run in
+if core_schema:
 
-    # @param message is a JSON object received from invoker (should
+    if slap_add('include: file://%s\n' % core_schema) != 0:
 
-    # contain 'value' and 'api_key' and other metadata)
+        core_schema = None
 
-    # @return an environment dictionary for the action process
 
-    def env(self, message):
 
-        # make sure to include all the env vars passed in by the invoker
+slapd_pid = -1
 
-        env = os.environ
+def kill_slapd():
 
-        for p in ['api_key', 'namespace', 'action_name', 'activation_id', 'deadline']:
+    global slapd_pid
 
-            if p in message:
+    if slapd_pid != -1:
 
-                env['__OW_%s' % p.upper()] = message[p]
+        os.kill(slapd_pid, signal.SIGTERM)
 
-        return env
+        slapd_pid = -1
 
+atexit.register(kill_slapd)
 
 
-    # runs the action, called iff self.verify() is True.
 
-    # @param args is a JSON object representing the input to the action
+out = open(slapd_out, 'w')
 
-    # @param env is the environment for the action to run in (defined edge
+subprocess.call([slapd, '-h', ldap_uri, '-F', slapd_conf], stdout=out,
 
-    # host, auth key)
+                stderr=out)
 
-    # return JSON object result of running the action or an error dictionary
+out.close()
 
-    # if action failed
+pidf = open(slapd_pidfile, 'r')
 
-    def run(self, args, env):
+slapd_pid = int(pidf.read())
 
-        def error(msg):
+pidf.close()
 
-            # fall through (exception and else case are handled the same way)
+output('*** Started slapd (pid %d, output in %s)\n' % (slapd_pid, slapd_out))
 
-            sys.stdout.write('%s\n' % msg)
 
-            return (502, {'error': 'The action did not return a dictionary.'})
 
+# slapd detaches before it finishes setting up its listener sockets
 
+# (they are bound but listen() has not been called).  Give it a second
 
-        try:
+# to finish.
 
-            input = json.dumps(args)
+time.sleep(1)
 
-            if len(input) > 131071:             # MAX_ARG_STRLEN (131071) linux/binfmts.h
 
-                # pass argument via stdin
 
-                p = subprocess.Popen(
+# Run kdbtest against the LDAP module.
 
-                    [self.binary],
+conf = {'realms': {'$realm': {'database_module': 'ldap'}},
 
-                    stdin=subprocess.PIPE,
+        'dbmodules': {'ldap': {'db_library': 'kldap',
 
-                    stdout=subprocess.PIPE,
+                               'ldap_kerberos_container_dn': top_dn,
 
-                    stderr=subprocess.PIPE,
+                               'ldap_kdc_dn': admin_dn,
 
-                    env=env)
+                               'ldap_kadmind_dn': admin_dn,
 
-            else:
+                               'ldap_service_password_file': ldap_pwfile,
 
-                # pass argument via stdin and command parameter
+                               'ldap_servers': ldap_uri}}}
 
-                p = subprocess.Popen(
+realm = K5Realm(create_kdb=False, kdc_conf=conf)
 
-                    [self.binary, input],
+input = admin_pw + '\n' + admin_pw + '\n'
 
-                    stdin=subprocess.PIPE,
+realm.run([kdb5_ldap_util, 'stashsrvpw', admin_dn], input=input)
 
-                    stdout=subprocess.PIPE,
+realm.run(['./kdbtest'])
 
-                    stderr=subprocess.PIPE,
 
-                    env=env)
 
-            # run the process and wait until it completes.
+# Run a kdb5_ldap_util command using the test server's admin DN and password.
 
-            # stdout/stderr will always be set because we passed PIPEs to Popen
+def kldaputil(args, **kw):
 
-            (o, e) = p.communicate(input=input.encode())
+    return realm.run([kdb5_ldap_util, '-D', admin_dn, '-w', admin_pw] + args,
 
+                     **kw)
 
 
-        except Exception as e:
 
-            return error(e)
+# kdbtest can't currently clean up after itself since the LDAP module
 
+# doesn't support krb5_db_destroy.  So clean up after it with
 
+# kdb5_ldap_util before proceeding.
 
-        # stdout/stderr may be either text or bytes, depending on Python
+kldaputil(['destroy', '-f'])
 
-        # version, so if bytes, decode to text. Note that in Python 2
 
-        # a string will match both types; so also skip decoding in that case
 
-        if isinstance(o, bytes) and not isinstance(o, str):
+ldapmodify = which('ldapmodify')
 
-            o = o.decode('utf-8')
+ldapsearch = which('ldapsearch')
 
-        if isinstance(e, bytes) and not isinstance(e, str):
+if not ldapmodify or not ldapsearch:
 
-            e = e.decode('utf-8')
+    skip_rest('some LDAP KDB tests', 'ldapmodify or ldapsearch not found')
 
 
 
-        # get the last line of stdout, even if empty
+def ldap_search(args):
 
-        lastNewLine = o.rfind('\n', 0, len(o)-1)
+    proc = subprocess.Popen([ldapsearch, '-H', ldap_uri, '-b', top_dn,
 
-        if lastNewLine != -1:
+                             '-D', admin_dn, '-w', admin_pw, args],
 
-            # this is the result string to JSON parse
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
 
-            lastLine = o[lastNewLine+1:].strip()
+                            stderr=subprocess.STDOUT)
 
-            # emit the rest as logs to stdout (including last new line)
+    (out, dummy) = proc.communicate()
 
-            sys.stdout.write(o[:lastNewLine+1])
+    return out
 
-        else:
 
-            # either o is empty or it is the result string
 
-            lastLine = o.strip()
+def ldap_modify(ldif, args=[]):
 
+    proc = subprocess.Popen([ldapmodify, '-H', ldap_uri, '-D', admin_dn,
 
+                             '-x', '-w', admin_pw] + args,
 
-        if e:
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
 
-            sys.stderr.write(e)
+                            stderr=subprocess.STDOUT)
 
+    (out, dummy) = proc.communicate(ldif)
 
+    output(out)
 
-        try:
 
-            json_output = json.loads(lastLine)
 
-            if isinstance(json_output, dict):
+def ldap_add(dn, objectclass, attrs=[]):
 
-                return (200, json_output)
+    in_data = 'dn: %s\nobjectclass: %s\n' % (dn, objectclass)
 
-            else:
+    in_data += '\n'.join(attrs) + '\n'
 
-                return error(lastLine)
+    ldap_modify(in_data, ['-a'])
 
-        except Exception:
 
-            return error(lastLine)
 
+# Create krbContainer objects for use as subtrees.
 
+ldap_add('cn=t1,cn=krb5', 'krbContainer')
 
-    # initialize code from inlined string
+ldap_add('cn=t2,cn=krb5', 'krbContainer')
 
-    def initCodeFromString(self, message):
+ldap_add('cn=x,cn=t1,cn=krb5', 'krbContainer')
 
-        with codecs.open(self.source, 'w', 'utf-8') as fp:
+ldap_add('cn=y,cn=t2,cn=krb5', 'krbContainer')
 
-            fp.write(message['code'])
 
-        return True
 
+# Create a realm, exercising all of the realm options.
 
+kldaputil(['create', '-s', '-P', 'master', '-subtrees', 'cn=t2,cn=krb5',
 
-    # initialize code from base64 encoded archive
+           '-containerref', 'cn=t2,cn=krb5', '-sscope', 'one',
 
-    def initCodeFromZip(self, message):
+           '-maxtktlife', '5min', '-maxrenewlife', '10min', '-allow_svr'])
 
-        try:
 
-            bytes = base64.b64decode(message['code'])
 
-            bytes = io.BytesIO(bytes)
+# Modify the realm, exercising overlapping subtree pruning.
 
-            archive = zipfile.ZipFile(bytes)
+kldaputil(['modify', '-subtrees',
 
-            archive.extractall(self.zipdest)
+           'cn=x,cn=t1,cn=krb5:cn=t1,cn=krb5:cn=t2,cn=krb5:cn=y,cn=t2,cn=krb5',
 
-            archive.close()
+           '-containerref', 'cn=t1,cn=krb5', '-sscope', 'sub',
 
-            return True
+           '-maxtktlife', '5hour', '-maxrenewlife', '10hour', '+allow_svr'])
 
-        except Exception as e:
 
-            print('err', str(e))
 
-            return False
+out = kldaputil(['list'])
 
+if out != 'KRBTEST.COM\n':
 
+    fail('Unexpected kdb5_ldap_util list output')
 
-proxy = flask.Flask(__name__)
 
-proxy.debug = False
 
-# disable re-initialization of the executable unless explicitly allowed via an environment
+# Create a principal at a specified DN.  This is a little dodgy
 
-# variable PROXY_ALLOW_REINIT == "1" (this is generally useful for local testing and development)
+# because we're sticking a krbPrincipalAux objectclass onto a subtree
 
-proxy.rejectReinit = 'PROXY_ALLOW_REINIT' not in os.environ or os.environ['PROXY_ALLOW_REINIT'] != "1"
+# krbContainer, but it works and it avoids having to load core.schema
 
-proxy.initialized = False
+# in the test LDAP server.
 
-runner = None
+realm.run([kadminl, 'ank', '-randkey', '-x', 'dn=cn=krb5', 'princ1'],
 
+          expected_code=1, expected_msg='DN is out of the realm subtree')
 
+# Check that the DN container check is a hierarchy test, not a simple
 
-def setRunner(r):
+# suffix match (CVE-2018-5730).  We expect this operation to fail
 
-    global runner
+# either way (because "xcn" isn't a valid DN tag) but the container
 
-    runner = r
+# check should happen before the DN is parsed.
 
+realm.run([kadminl, 'ank', '-randkey', '-x', 'dn=xcn=t1,cn=krb5', 'princ1'],
 
+          expected_code=1, expected_msg='DN is out of the realm subtree')
 
+realm.run([kadminl, 'ank', '-randkey', '-x', 'dn=cn=t2,cn=krb5', 'princ1'])
 
+realm.run([kadminl, 'getprinc', 'princ1'], expected_msg='Principal: princ1')
 
-@proxy.route('/init', methods=['POST'])
+realm.run([kadminl, 'ank', '-randkey', '-x', 'dn=cn=t2,cn=krb5', 'again'],
 
-def init():
+          expected_code=1, expected_msg='ldap object is already kerberized')
 
-    if proxy.rejectReinit is True and proxy.initialized is True:
+# Check that we can't set linkdn on a non-standalone object.
 
-        msg = 'Cannot initialize the action more than once.'
+realm.run([kadminl, 'modprinc', '-x', 'linkdn=cn=t1,cn=krb5', 'princ1'],
 
-        sys.stderr.write(msg + '\n')
+          expected_code=1, expected_msg='link information can not be set')
 
-        response = flask.jsonify({'error': msg})
 
-        response.status_code = 403
 
-        return complete(response)
+# Create a principal with a specified linkdn.
 
+realm.run([kadminl, 'ank', '-randkey', '-x', 'linkdn=cn=krb5', 'princ2'],
 
+          expected_code=1, expected_msg='DN is out of the realm subtree')
 
-    message = flask.request.get_json(force=True, silent=True)
+realm.run([kadminl, 'ank', '-randkey', '-x', 'linkdn=cn=t1,cn=krb5', 'princ2'])
 
-    if message and not isinstance(message, dict):
+# Check that we can't reset linkdn.
 
-        flask.abort(404)
+realm.run([kadminl, 'modprinc', '-x', 'linkdn=cn=t2,cn=krb5', 'princ2'],
 
-    else:
+          expected_code=1, expected_msg='kerberos principal is already linked')
 
-        value = message.get('value', {}) if message else {}
 
 
+# Create a principal with a specified containerdn.
 
-    if not isinstance(value, dict):
+realm.run([kadminl, 'ank', '-randkey', '-x', 'containerdn=cn=krb5', 'princ3'],
 
-        flask.abort(404)
+          expected_code=1, expected_msg='DN is out of the realm subtree')
 
+realm.run([kadminl, 'ank', '-randkey', '-x', 'containerdn=cn=t1,cn=krb5',
 
+           'princ3'])
 
-    try:
+realm.run([kadminl, 'modprinc', '-x', 'containerdn=cn=t2,cn=krb5', 'princ3'],
 
-        status = runner.init(value)
+          expected_code=1, expected_msg='containerdn option not supported')
 
-    except Exception as e:
+# Verify that containerdn is checked when linkdn is also supplied
 
-        status = False
+# (CVE-2018-5730).
 
+realm.run([kadminl, 'ank', '-randkey', '-x', 'containerdn=cn=krb5',
 
+           '-x', 'linkdn=cn=t2,cn=krb5', 'princ4'], expected_code=1,
 
-    if status is True:
+          expected_msg='DN is out of the realm subtree')
 
-        proxy.initialized = True
 
-        return ('OK', 200)
 
-    else:
+# Create and modify a ticket policy.
 
-        response = flask.jsonify({'error': 'The action failed to generate or locate a binary. See logs for details.'})
+kldaputil(['create_policy', '-maxtktlife', '3hour', '-maxrenewlife', '6hour',
 
-        response.status_code = 502
+           '-allow_forwardable', 'tktpol'])
 
-        return complete(response)
+kldaputil(['modify_policy', '-maxtktlife', '4hour', '-maxrenewlife', '8hour',
 
+           '+requires_preauth', 'tktpol'])
 
+out = kldaputil(['view_policy', 'tktpol'])
 
+if ('Ticket policy: tktpol\n' not in out or
 
+    'Maximum ticket life: 0 days 04:00:00\n' not in out or
 
-@proxy.route('/run', methods=['POST'])
+    'Maximum renewable life: 0 days 08:00:00\n' not in out or
 
-def run():
+    'Ticket flags: DISALLOW_FORWARDABLE REQUIRES_PRE_AUTH' not in out):
 
-    def error():
+    fail('Unexpected kdb5_ldap_util view_policy output')
 
-        response = flask.jsonify({'error': 'The action did not receive a dictionary as an argument.'})
 
-        response.status_code = 404
 
-        return complete(response)
+out = kldaputil(['list_policy'])
 
+if out != 'tktpol\n':
 
+    fail('Unexpected kdb5_ldap_util list_policy output')
 
-    message = flask.request.get_json(force=True, silent=True)
 
-    if message and not isinstance(message, dict):
 
-        return error()
+# Associate the ticket policy to a principal.
 
-    else:
+realm.run([kadminl, 'ank', '-randkey', '-x', 'tktpolicy=tktpol', 'princ4'])
 
-        args = message.get('value', {}) if message else {}
+out = realm.run([kadminl, 'getprinc', 'princ4'])
 
-        if not isinstance(args, dict):
+if ('Maximum ticket life: 0 days 04:00:00\n' not in out or
 
-            return error()
+    'Maximum renewable life: 0 days 08:00:00\n' not in out or
 
+    'Attributes: DISALLOW_FORWARDABLE REQUIRES_PRE_AUTH\n' not in out):
 
+    fail('Unexpected getprinc output with ticket policy')
 
-    if runner.verify():
 
-        try:
 
-            code, result = runner.run(args, runner.env(message or {}))
+# Destroying the policy should fail while a principal references it.
 
-            response = flask.jsonify(result)
+kldaputil(['destroy_policy', '-force', 'tktpol'], expected_code=1)
 
-            response.status_code = code
 
-        except Exception as e:
 
-            response = flask.jsonify({'error': 'Internal error. {}'.format(e)})
+# Dissociate the ticket policy from the principal.
 
-            response.status_code = 500
+realm.run([kadminl, 'modprinc', '-x', 'tktpolicy=', 'princ4'])
 
-    else:
+out = realm.run([kadminl, 'getprinc', 'princ4'])
 
-        response = flask.jsonify({'error': 'The action failed to locate a binary. See logs for details.'})
+if ('Maximum ticket life: 0 days 05:00:00\n' not in out or
 
-        response.status_code = 502
+    'Maximum renewable life: 0 days 10:00:00\n' not in out or
 
-    return complete(response)
+    'Attributes:\n' not in out):
 
+    fail('Unexpected getprinc output without ticket policy')
 
 
 
+# Destroy the ticket policy.
 
-def complete(response):
+kldaputil(['destroy_policy', '-force', 'tktpol'])
 
-    # Add sentinel to stdout/stderr
+kldaputil(['view_policy', 'tktpol'], expected_code=1)
 
-    sys.stdout.write('%s\n' % ActionRunner.LOG_SENTINEL)
+out = kldaputil(['list_policy'])
 
-    sys.stdout.flush()
+if out:
 
-    sys.stderr.write('%s\n' % ActionRunner.LOG_SENTINEL)
+    fail('Unexpected kdb5_ldap_util list_policy output after destroy')
 
-    sys.stderr.flush()
 
-    return response
 
+# Create another ticket policy to be destroyed with the realm.
 
+kldaputil(['create_policy', 'tktpol2'])
 
 
 
-def main():
+# Try to create a password policy conflicting with a ticket policy.
 
-    port = int(os.getenv('FLASK_PROXY_PORT', 8080))
+realm.run([kadminl, 'addpol', 'tktpol2'], expected_code=1,
 
-    server = WSGIServer(('0.0.0.0', port), proxy, log=None)
+          expected_msg='Already exists while creating policy "tktpol2"')
 
-    server.serve_forever()
 
 
+# Try to create a ticket policy conflicting with a password policy.
 
-if __name__ == '__main__':
+realm.run([kadminl, 'addpol', 'pwpol'])
 
-    setRunner(ActionRunner())
+out = kldaputil(['create_policy', 'pwpol'], expected_code=1)
 
-    main()
+if 'Already exists while creating policy object' not in out:
+
+    fail('Expected error not seen in kdb5_ldap_util output')
+
+
+
+# Try to use a password policy as a ticket policy.
+
+realm.run([kadminl, 'modprinc', '-x', 'tktpolicy=pwpol', 'princ4'],
+
+          expected_code=1, expected_msg='Object class violation')
+
+
+
+# Use a ticket policy as a password policy (CVE-2014-5353).  This
+
+# works with a warning; use kadmin.local -q so the warning is shown.
+
+realm.run([kadminl, '-q', 'modprinc -policy tktpol2 princ4'],
+
+          expected_msg='WARNING: policy "tktpol2" does not exist')
+
+
+
+# Do some basic tests with a KDC against the LDAP module, exercising the
+
+# db_args processing code.
+
+realm.start_kdc(['-x', 'nconns=3', '-x', 'host=' + ldap_uri,
+
+                 '-x', 'binddn=' + admin_dn, '-x', 'bindpwd=' + admin_pw])
+
+realm.addprinc(realm.user_princ, password('user'))
+
+realm.addprinc(realm.host_princ)
+
+realm.extract_keytab(realm.host_princ, realm.keytab)
+
+realm.kinit(realm.user_princ, password('user'))
+
+realm.run([kvno, realm.host_princ])
+
+realm.klist(realm.user_princ, realm.host_princ)
+
+
+
+# Test auth indicator support
+
+realm.addprinc('authind', password('authind'))
+
+realm.run([kadminl, 'setstr', 'authind', 'require_auth', 'otp radius'])
+
+
+
+out = ldap_search('(krbPrincipalName=authind*)')
+
+if 'krbPrincipalAuthInd: otp' not in out:
+
+    fail('Expected krbPrincipalAuthInd value not in output')
+
+if 'krbPrincipalAuthInd: radius' not in out:
+
+    fail('Expected krbPrincipalAuthInd value not in output')
+
+
+
+realm.run([kadminl, 'getstrs', 'authind'],
+
+          expected_msg='require_auth: otp radius')
+
+
+
+# Test service principal aliases.
+
+realm.addprinc('canon', password('canon'))
+
+ldap_modify('dn: krbPrincipalName=canon@KRBTEST.COM,cn=t1,cn=krb5\n'
+
+            'changetype: modify\n'
+
+            'add: krbPrincipalName\n'
+
+            'krbPrincipalName: alias@KRBTEST.COM\n'
+
+            '-\n'
+
+            'add: krbCanonicalName\n'
+
+            'krbCanonicalName: canon@KRBTEST.COM\n')
+
+realm.run([kadminl, 'getprinc', 'alias'],
+
+          expected_msg='Principal: canon@KRBTEST.COM\n')
+
+realm.run([kadminl, 'getprinc', 'canon'],
+
+          expected_msg='Principal: canon@KRBTEST.COM\n')
+
+realm.run([kvno, 'alias', 'canon'])
+
+out = realm.run([klist])
+
+if 'alias@KRBTEST.COM\n' not in out or 'canon@KRBTEST.COM' not in out:
+
+    fail('After fetching alias and canon, klist is missing one or both')
+
+realm.kinit(realm.user_princ, password('user'), ['-S', 'alias'])
+
+realm.klist(realm.user_princ, 'alias@KRBTEST.COM')
+
+
+
+# Make sure an alias to the local TGS is still treated like an alias.
+
+ldap_modify('dn: krbPrincipalName=krbtgt/KRBTEST.COM@KRBTEST.COM,'
+
+            'cn=KRBTEST.COM,cn=krb5\n'
+
+            'changetype: modify\n'
+
+            'add:krbPrincipalName\n'
+
+            'krbPrincipalName: tgtalias@KRBTEST.COM\n'
+
+            '-\n'
+
+            'add: krbCanonicalName\n'
+
+            'krbCanonicalName: krbtgt/KRBTEST.COM@KRBTEST.COM\n')
+
+realm.run([kadminl, 'getprinc', 'tgtalias'],
+
+          expected_msg='Principal: krbtgt/KRBTEST.COM@KRBTEST.COM')
+
+realm.kinit(realm.user_princ, password('user'))
+
+realm.run([kvno, 'tgtalias'])
+
+realm.klist(realm.user_princ, 'tgtalias@KRBTEST.COM')
+
+
+
+# Make sure aliases work in header tickets.
+
+realm.run([kadminl, 'modprinc', '-maxrenewlife', '3 hours', 'user'])
+
+realm.run([kadminl, 'modprinc', '-maxrenewlife', '3 hours',
+
+           'krbtgt/KRBTEST.COM'])
+
+realm.kinit(realm.user_princ, password('user'), ['-l', '1h', '-r', '2h'])
+
+realm.run([kvno, 'alias'])
+
+realm.kinit(realm.user_princ, flags=['-R', '-S', 'alias'])
+
+realm.klist(realm.user_princ, 'alias@KRBTEST.COM')
+
+
+
+# Test client principal aliases, with and without preauth.
+
+realm.kinit('canon', password('canon'))
+
+realm.kinit('alias', password('canon'), expected_code=1,
+
+            expected_msg='not found in Kerberos database')
+
+realm.kinit('alias', password('canon'), ['-C'])
+
+realm.run([kvno, 'alias'])
+
+realm.klist('canon@KRBTEST.COM', 'alias@KRBTEST.COM')
+
+realm.run([kadminl, 'modprinc', '+requires_preauth', 'canon'])
+
+realm.kinit('canon', password('canon'))
+
+realm.kinit('alias', password('canon'), ['-C'])
+
+
+
+# Test password history.
+
+def test_pwhist(nhist):
+
+    def cpw(n, **kwargs):
+
+        realm.run([kadminl, 'cpw', '-pw', str(n), princ], **kwargs)
+
+    def cpw_fail(n):
+
+        cpw(n, expected_code=1)
+
+    output('*** Testing password history of size %d\n' % nhist)
+
+    princ = 'pwhistprinc' + str(nhist)
+
+    pol = 'pwhistpol' + str(nhist)
+
+    realm.run([kadminl, 'addpol', '-history', str(nhist), pol])
+
+    realm.run([kadminl, 'addprinc', '-policy', pol, '-nokey', princ])
+
+    for i in range(nhist):
+
+        # Set a password, then check that all previous passwords fail.
+
+        cpw(i)
+
+        for j in range(i + 1):
+
+            cpw_fail(j)
+
+    # Set one more new password, and make sure the oldest key is
+
+    # rotated out.
+
+    cpw(nhist)
+
+    cpw_fail(1)
+
+    cpw(0)
+
+
+
+for n in (1, 2, 3, 4, 5):
+
+    test_pwhist(n)
+
+
+
+# Regression test for #8193: test password character class requirements.
+
+princ = 'charclassprinc'
+
+pol = 'charclasspol'
+
+realm.run([kadminl, 'addpol', '-minclasses', '3', pol])
+
+realm.run([kadminl, 'addprinc', '-policy', pol, '-nokey', princ])
+
+realm.run([kadminl, 'cpw', '-pw', 'abcdef', princ], expected_code=1)
+
+realm.run([kadminl, 'cpw', '-pw', 'Abcdef', princ], expected_code=1)
+
+realm.run([kadminl, 'cpw', '-pw', 'Abcdef1', princ])
+
+
+
+# Test principal renaming and make sure last modified is changed
+
+def get_princ(princ):
+
+    out = realm.run([kadminl, 'getprinc', princ])
+
+    return dict(map(str.strip, x.split(":", 1)) for x in out.splitlines())
+
+
+
+realm.addprinc("rename", password('rename'))
+
+renameprinc = get_princ("rename")
+
+realm.run([kadminl, '-p', 'fake@KRBTEST.COM', 'renprinc', 'rename', 'renamed'])
+
+renamedprinc = get_princ("renamed")
+
+if renameprinc['Last modified'] == renamedprinc['Last modified']:
+
+    fail('Last modified data not updated when principal was renamed')
+
+
+
+# Regression test for #7980 (fencepost when dividing keys up by kvno).
+
+realm.run([kadminl, 'addprinc', '-randkey', '-e', 'aes256-cts,aes128-cts',
+
+           'kvnoprinc'])
+
+realm.run([kadminl, 'cpw', '-randkey', '-keepold', '-e',
+
+           'aes256-cts,aes128-cts', 'kvnoprinc'])
+
+realm.run([kadminl, 'getprinc', 'kvnoprinc'], expected_msg='Number of keys: 4')
+
+realm.run([kadminl, 'cpw', '-randkey', '-keepold', '-e',
+
+           'aes256-cts,aes128-cts', 'kvnoprinc'])
+
+realm.run([kadminl, 'getprinc', 'kvnoprinc'], expected_msg='Number of keys: 6')
+
+
+
+# Regression test for #8041 (NULL dereference on keyless principals).
+
+realm.run([kadminl, 'addprinc', '-nokey', 'keylessprinc'])
+
+realm.run([kadminl, 'getprinc', 'keylessprinc'],
+
+          expected_msg='Number of keys: 0')
+
+realm.run([kadminl, 'cpw', '-randkey', '-e', 'aes256-cts,aes128-cts',
+
+           'keylessprinc'])
+
+realm.run([kadminl, 'cpw', '-randkey', '-keepold', '-e',
+
+           'aes256-cts,aes128-cts', 'keylessprinc'])
+
+realm.run([kadminl, 'getprinc', 'keylessprinc'],
+
+          expected_msg='Number of keys: 4')
+
+realm.run([kadminl, 'purgekeys', '-all', 'keylessprinc'])
+
+realm.run([kadminl, 'getprinc', 'keylessprinc'],
+
+          expected_msg='Number of keys: 0')
+
+
+
+# Test for 8354 (old password history entries when -keepold is used)
+
+realm.run([kadminl, 'addpol', '-history', '2', 'keepoldpasspol'])
+
+realm.run([kadminl, 'addprinc', '-policy', 'keepoldpasspol', '-pw', 'aaaa',
+
+           'keepoldpassprinc'])
+
+for p in ('bbbb', 'cccc', 'aaaa'):
+
+    realm.run([kadminl, 'cpw', '-keepold', '-pw', p, 'keepoldpassprinc'])
+
+
+
+if runenv.sizeof_time_t <= 4:
+
+    skipped('y2038 LDAP test', 'platform has 32-bit time_t')
+
+else:
+
+    # Test storage of timestamps after y2038.
+
+    realm.run([kadminl, 'modprinc', '-pwexpire', '2040-02-03', 'user'])
+
+    realm.run([kadminl, 'getprinc', 'user'], expected_msg=' 2040\n')
+
+
+
+realm.stop()
+
+
+
+# Briefly test dump and load.
+
+dumpfile = os.path.join(realm.testdir, 'dump')
+
+realm.run([kdb5_util, 'dump', dumpfile])
+
+realm.run([kdb5_util, 'load', dumpfile], expected_code=1,
+
+          expected_msg='KDB module requires -update argument')
+
+realm.run([kdb5_util, 'load', '-update', dumpfile])
+
+
+
+# Destroy the realm.
+
+kldaputil(['destroy', '-f'])
+
+out = kldaputil(['list'])
+
+if out:
+
+    fail('Unexpected kdb5_ldap_util list output after destroy')
+
+
+
+if not core_schema:
+
+    skip_rest('LDAP SASL tests', 'core schema not found')
+
+
+
+if runenv.have_sasl != 'yes':
+
+    skip_rest('LDAP SASL tests', 'SASL support not built')
+
+
+
+# Test SASL EXTERNAL auth.  Remove the DNs and service password file
+
+# from the DB module config.
+
+os.remove(ldap_pwfile)
+
+dbmod = conf['dbmodules']['ldap']
+
+dbmod['ldap_kdc_sasl_mech'] = dbmod['ldap_kadmind_sasl_mech'] = 'EXTERNAL'
+
+del dbmod['ldap_service_password_file']
+
+del dbmod['ldap_kdc_dn'], dbmod['ldap_kadmind_dn']
+
+realm = K5Realm(create_kdb=False, kdc_conf=conf)
+
+realm.run([kdb5_ldap_util, 'create', '-s', '-P', 'master'])
+
+realm.start_kdc()
+
+realm.addprinc(realm.user_princ, password('user'))
+
+realm.kinit(realm.user_princ, password('user'))
+
+realm.stop()
+
+realm.run([kdb5_ldap_util, 'destroy', '-f'])
+
+
+
+# Test SASL DIGEST-MD5 auth.  We need to set a clear-text password for
+
+# the admin DN, so create a person entry (requires the core schema).
+
+# Restore the service password file in the config and set authcids.
+
+ldap_add('cn=admin,cn=krb5', 'person',
+
+         ['sn: dummy', 'userPassword: admin'])
+
+dbmod['ldap_kdc_sasl_mech'] = dbmod['ldap_kadmind_sasl_mech'] = 'DIGEST-MD5'
+
+dbmod['ldap_kdc_sasl_authcid'] = 'digestuser'
+
+dbmod['ldap_kadmind_sasl_authcid'] = 'digestuser'
+
+dbmod['ldap_service_password_file'] = ldap_pwfile
+
+realm = K5Realm(create_kdb=False, kdc_conf=conf)
+
+input = admin_pw + '\n' + admin_pw + '\n'
+
+realm.run([kdb5_ldap_util, 'stashsrvpw', 'digestuser'], input=input)
+
+realm.run([kdb5_ldap_util, 'create', '-s', '-P', 'master'])
+
+realm.start_kdc()
+
+realm.addprinc(realm.user_princ, password('user'))
+
+realm.kinit(realm.user_princ, password('user'))
+
+realm.stop()
+
+# Exercise DB options, which should cause binding to fail.
+
+realm.run([kadminl, '-x', 'sasl_authcid=ab', 'getprinc', 'user'],
+
+          expected_code=1, expected_msg='Cannot bind to LDAP server')
+
+realm.run([kadminl, '-x', 'bindpwd=wrong', 'getprinc', 'user'],
+
+          expected_code=1, expected_msg='Cannot bind to LDAP server')
+
+realm.run([kdb5_ldap_util, 'destroy', '-f'])
+
+
+
+# We could still use tests to exercise:
+
+# * DB arg handling in krb5_ldap_create
+
+# * krbAllowedToDelegateTo attribute processing
+
+# * A load operation overwriting a standalone principal entry which
+
+#   already exists but doesn't have a krbPrincipalName attribute
+
+#   matching the principal name.
+
+# * A bunch of invalid-input error conditions
+
+#
+
+# There is no coverage for the following because it would be difficult:
+
+# * Out-of-memory error conditions
+
+# * Handling of failures from slapd (including krb5_retry_get_ldap_handle)
+
+# * Handling of servers which don't support mod-increment
+
+# * krb5_ldap_delete_krbcontainer (only happens if krb5_ldap_create fails)
+
+
+
+success('LDAP and DB2 KDB tests')

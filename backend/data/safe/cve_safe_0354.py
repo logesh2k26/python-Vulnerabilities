@@ -2,1766 +2,2302 @@
 # Safety: safe
 # Category: safe
 
-import unittest
+# coding: utf-8
+
+"""A tornado based Jupyter notebook server."""
+
+
+
+# Copyright (c) Jupyter Development Team.
+
+# Distributed under the terms of the Modified BSD License.
+
+
+
+from __future__ import absolute_import, print_function
+
+
+
+import base64
+
+import datetime
+
+import errno
+
+import importlib
 
 import io
 
+import json
 
+import logging
 
+import os
 
+import random
 
-class TestHTTPChannel(unittest.TestCase):
+import re
 
-    def _makeOne(self, sock, addr, adj, map=None):
+import select
 
-        from waitress.channel import HTTPChannel
+import signal
 
+import socket
 
+import ssl
 
-        server = DummyServer()
+import sys
 
-        return HTTPChannel(server, sock, addr, adj=adj, map=map)
+import threading
 
+import webbrowser
 
 
-    def _makeOneWithMap(self, adj=None):
 
-        if adj is None:
 
-            adj = DummyAdjustments()
 
-        sock = DummySock()
+from jinja2 import Environment, FileSystemLoader
 
-        map = {}
 
-        inst = self._makeOne(sock, "127.0.0.1", adj, map=map)
 
-        inst.outbuf_lock = DummyLock()
+# Install the pyzmq ioloop. This has to be done before anything else from
 
-        return inst, sock, map
+# tornado is imported.
 
+from zmq.eventloop import ioloop
 
+ioloop.install()
 
-    def test_ctor(self):
 
-        inst, _, map = self._makeOneWithMap()
 
-        self.assertEqual(inst.addr, "127.0.0.1")
+# check for tornado 3.1.0
 
-        self.assertEqual(inst.sendbuf_len, 2048)
+msg = "The Jupyter Notebook requires tornado >= 4.0"
 
-        self.assertEqual(map[100], inst)
+try:
 
+    import tornado
 
+except ImportError:
 
-    def test_total_outbufs_len_an_outbuf_size_gt_sys_maxint(self):
+    raise ImportError(msg)
 
-        from waitress.compat import MAXINT
+try:
 
+    version_info = tornado.version_info
 
+except AttributeError:
 
-        inst, _, map = self._makeOneWithMap()
+    raise ImportError(msg + ", but you have < 1.1.0")
 
+if version_info < (4,0):
 
+    raise ImportError(msg + ", but you have %s" % tornado.version)
 
-        class DummyBuffer(object):
 
-            chunks = []
 
+from tornado import httpserver
 
+from tornado import web
 
-            def append(self, data):
+from tornado.log import LogFormatter, app_log, access_log, gen_log
 
-                self.chunks.append(data)
 
 
+from notebook import (
 
-        class DummyData(object):
+    DEFAULT_STATIC_FILES_PATH,
 
-            def __len__(self):
+    DEFAULT_TEMPLATE_PATH_LIST,
 
-                return MAXINT
+    __version__,
 
+)
 
+from .base.handlers import Template404
 
-        inst.total_outbufs_len = 1
+from .log import log_request
 
-        inst.outbufs = [DummyBuffer()]
+from .services.kernels.kernelmanager import MappingKernelManager
 
-        inst.write_soon(DummyData())
+from .services.config import ConfigManager
 
-        # we are testing that this method does not raise an OverflowError
+from .services.contents.manager import ContentsManager
 
-        # (see https://github.com/Pylons/waitress/issues/47)
+from .services.contents.filemanager import FileContentsManager
 
-        self.assertEqual(inst.total_outbufs_len, MAXINT + 1)
+from .services.sessions.sessionmanager import SessionManager
 
 
 
-    def test_writable_something_in_outbuf(self):
+from .auth.login import LoginHandler
 
-        inst, sock, map = self._makeOneWithMap()
+from .auth.logout import LogoutHandler
 
-        inst.total_outbufs_len = 3
+from .base.handlers import FileFindHandler, IPythonHandler
 
-        self.assertTrue(inst.writable())
 
 
+from traitlets.config import Config
 
-    def test_writable_nothing_in_outbuf(self):
+from traitlets.config.application import catch_config_error, boolean_flag
 
-        inst, sock, map = self._makeOneWithMap()
+from jupyter_core.application import (
 
-        self.assertFalse(inst.writable())
+    JupyterApp, base_flags, base_aliases,
 
+)
 
+from jupyter_client import KernelManager
 
-    def test_writable_nothing_in_outbuf_will_close(self):
+from jupyter_client.kernelspec import KernelSpecManager, NoSuchKernel, NATIVE_KERNEL_NAME
 
-        inst, sock, map = self._makeOneWithMap()
+from jupyter_client.session import Session
 
-        inst.will_close = True
+from nbformat.sign import NotebookNotary
 
-        self.assertTrue(inst.writable())
+from traitlets import (
 
+    Dict, Unicode, Integer, List, Bool, Bytes, Instance,
 
+    TraitError, Type,
 
-    def test_handle_write_not_connected(self):
+)
 
-        inst, sock, map = self._makeOneWithMap()
+from ipython_genutils import py3compat
 
-        inst.connected = False
+from IPython.paths import get_ipython_dir
 
-        self.assertFalse(inst.handle_write())
+from jupyter_core.paths import jupyter_runtime_dir, jupyter_path
 
+from notebook._sysinfo import get_sys_info
 
 
-    def test_handle_write_with_requests(self):
 
-        inst, sock, map = self._makeOneWithMap()
+from .utils import url_path_join, check_pid
 
-        inst.requests = True
 
-        inst.last_activity = 0
 
-        result = inst.handle_write()
+#-----------------------------------------------------------------------------
 
-        self.assertEqual(result, None)
+# Module globals
 
-        self.assertEqual(inst.last_activity, 0)
+#-----------------------------------------------------------------------------
 
 
 
-    def test_handle_write_no_request_with_outbuf(self):
+_examples = """
 
-        inst, sock, map = self._makeOneWithMap()
+jupyter notebook                       # start the notebook
 
-        inst.requests = []
+jupyter notebook --certfile=mycert.pem # use SSL/TLS certificate
 
-        inst.outbufs = [DummyBuffer(b"abc")]
+"""
 
-        inst.total_outbufs_len = len(inst.outbufs[0])
 
-        inst.last_activity = 0
 
-        result = inst.handle_write()
+#-----------------------------------------------------------------------------
 
-        self.assertEqual(result, None)
+# Helper functions
 
-        self.assertNotEqual(inst.last_activity, 0)
+#-----------------------------------------------------------------------------
 
-        self.assertEqual(sock.sent, b"abc")
 
 
+def random_ports(port, n):
 
-    def test_handle_write_outbuf_raises_socketerror(self):
+    """Generate a list of n random ports near the given port.
 
-        import socket
 
 
+    The first 5 ports will be sequential, and the remaining n-5 will be
 
-        inst, sock, map = self._makeOneWithMap()
+    randomly selected in the range [port-2*n, port+2*n].
 
-        inst.requests = []
+    """
 
-        outbuf = DummyBuffer(b"abc", socket.error)
+    for i in range(min(5, n)):
 
-        inst.outbufs = [outbuf]
+        yield port + i
 
-        inst.total_outbufs_len = len(outbuf)
+    for i in range(n-5):
 
-        inst.last_activity = 0
+        yield max(1, port + random.randint(-2*n, 2*n))
 
-        inst.logger = DummyLogger()
 
-        result = inst.handle_write()
 
-        self.assertEqual(result, None)
+def load_handlers(name):
 
-        self.assertEqual(inst.last_activity, 0)
+    """Load the (URL pattern, handler) tuples for each component."""
 
-        self.assertEqual(sock.sent, b"")
+    name = 'notebook.' + name
 
-        self.assertEqual(len(inst.logger.exceptions), 1)
+    mod = __import__(name, fromlist=['default_handlers'])
 
-        self.assertTrue(outbuf.closed)
+    return mod.default_handlers
 
 
 
-    def test_handle_write_outbuf_raises_othererror(self):
 
-        inst, sock, map = self._makeOneWithMap()
 
-        inst.requests = []
+class DeprecationHandler(IPythonHandler):
 
-        outbuf = DummyBuffer(b"abc", IOError)
+    def get(self, url_path):
 
-        inst.outbufs = [outbuf]
+        self.set_header("Content-Type", 'text/javascript')
 
-        inst.total_outbufs_len = len(outbuf)
+        self.finish("""
 
-        inst.last_activity = 0
+            console.warn('`/static/widgets/js` is deprecated.  Use `/nbextensions/widgets/widgets/js` instead.');
 
-        inst.logger = DummyLogger()
+            define(['%s'], function(x) { return x; });
 
-        result = inst.handle_write()
+        """ % url_path_join('nbextensions', 'widgets', 'widgets', url_path.rstrip('.js')))
 
-        self.assertEqual(result, None)
+        self.log.warn('Deprecated widget Javascript path /static/widgets/js/*.js was used')
 
-        self.assertEqual(inst.last_activity, 0)
 
-        self.assertEqual(sock.sent, b"")
 
-        self.assertEqual(len(inst.logger.exceptions), 1)
+#-----------------------------------------------------------------------------
 
-        self.assertTrue(outbuf.closed)
+# The Tornado web application
 
+#-----------------------------------------------------------------------------
 
 
-    def test_handle_write_no_requests_no_outbuf_will_close(self):
 
-        inst, sock, map = self._makeOneWithMap()
+class NotebookWebApplication(web.Application):
 
-        inst.requests = []
 
-        outbuf = DummyBuffer(b"")
 
-        inst.outbufs = [outbuf]
+    def __init__(self, ipython_app, kernel_manager, contents_manager,
 
-        inst.will_close = True
+                 session_manager, kernel_spec_manager,
 
-        inst.last_activity = 0
+                 config_manager, log,
 
-        result = inst.handle_write()
+                 base_url, default_url, settings_overrides, jinja_env_options):
 
-        self.assertEqual(result, None)
 
-        self.assertEqual(inst.connected, False)
 
-        self.assertEqual(sock.closed, True)
+        settings = self.init_settings(
 
-        self.assertEqual(inst.last_activity, 0)
+            ipython_app, kernel_manager, contents_manager,
 
-        self.assertTrue(outbuf.closed)
+            session_manager, kernel_spec_manager, config_manager, log, base_url,
 
+            default_url, settings_overrides, jinja_env_options)
 
+        handlers = self.init_handlers(settings)
 
-    def test_handle_write_no_requests_outbuf_gt_send_bytes(self):
 
-        inst, sock, map = self._makeOneWithMap()
 
-        inst.requests = [True]
+        super(NotebookWebApplication, self).__init__(handlers, **settings)
 
-        inst.outbufs = [DummyBuffer(b"abc")]
 
-        inst.total_outbufs_len = len(inst.outbufs[0])
 
-        inst.adj.send_bytes = 2
+    def init_settings(self, ipython_app, kernel_manager, contents_manager,
 
-        inst.will_close = False
+                      session_manager, kernel_spec_manager,
 
-        inst.last_activity = 0
+                      config_manager,
 
-        result = inst.handle_write()
+                      log, base_url, default_url, settings_overrides,
 
-        self.assertEqual(result, None)
+                      jinja_env_options=None):
 
-        self.assertEqual(inst.will_close, False)
 
-        self.assertTrue(inst.outbuf_lock.acquired)
 
-        self.assertEqual(sock.sent, b"abc")
+        _template_path = settings_overrides.get(
 
+            "template_path",
 
+            ipython_app.template_file_path,
 
-    def test_handle_write_close_when_flushed(self):
+        )
 
-        inst, sock, map = self._makeOneWithMap()
+        if isinstance(_template_path, py3compat.string_types):
 
-        outbuf = DummyBuffer(b"abc")
+            _template_path = (_template_path,)
 
-        inst.outbufs = [outbuf]
+        template_path = [os.path.expanduser(path) for path in _template_path]
 
-        inst.total_outbufs_len = len(outbuf)
 
-        inst.will_close = False
 
-        inst.close_when_flushed = True
+        jenv_opt = {"autoescape": True}
 
-        inst.last_activity = 0
+        jenv_opt.update(jinja_env_options if jinja_env_options else {})
 
-        result = inst.handle_write()
 
-        self.assertEqual(result, None)
 
-        self.assertEqual(inst.will_close, True)
+        env = Environment(loader=FileSystemLoader(template_path), **jenv_opt)
 
-        self.assertEqual(inst.close_when_flushed, False)
+        
 
-        self.assertEqual(sock.sent, b"abc")
+        sys_info = get_sys_info()
 
-        self.assertTrue(outbuf.closed)
+        if sys_info['commit_source'] == 'repository':
 
+            # don't cache (rely on 304) when working from master
 
+            version_hash = ''
 
-    def test_readable_no_requests_not_will_close(self):
+        else:
 
-        inst, sock, map = self._makeOneWithMap()
+            # reset the cache on server restart
 
-        inst.requests = []
+            version_hash = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
 
-        inst.will_close = False
 
-        self.assertEqual(inst.readable(), True)
 
+        settings = dict(
 
+            # basics
 
-    def test_readable_no_requests_will_close(self):
+            log_function=log_request,
 
-        inst, sock, map = self._makeOneWithMap()
+            base_url=base_url,
 
-        inst.requests = []
+            default_url=default_url,
 
-        inst.will_close = True
+            template_path=template_path,
 
-        self.assertEqual(inst.readable(), False)
+            static_path=ipython_app.static_file_path,
 
+            static_custom_path=ipython_app.static_custom_path,
 
+            static_handler_class = FileFindHandler,
 
-    def test_readable_with_requests(self):
+            static_url_prefix = url_path_join(base_url,'/static/'),
 
-        inst, sock, map = self._makeOneWithMap()
+            static_handler_args = {
 
-        inst.requests = True
+                # don't cache custom.js
 
-        self.assertEqual(inst.readable(), False)
+                'no_cache_paths': [url_path_join(base_url, 'static', 'custom')],
 
+            },
 
+            version_hash=version_hash,
 
-    def test_handle_read_no_error(self):
+            ignore_minified_js=ipython_app.ignore_minified_js,
 
-        inst, sock, map = self._makeOneWithMap()
+            
 
-        inst.will_close = False
+            # authentication
 
-        inst.recv = lambda *arg: b"abc"
+            cookie_secret=ipython_app.cookie_secret,
 
-        inst.last_activity = 0
+            login_url=url_path_join(base_url,'/login'),
 
-        L = []
+            login_handler_class=ipython_app.login_handler_class,
 
-        inst.received = lambda x: L.append(x)
+            logout_handler_class=ipython_app.logout_handler_class,
 
-        result = inst.handle_read()
+            password=ipython_app.password,
 
-        self.assertEqual(result, None)
 
-        self.assertNotEqual(inst.last_activity, 0)
 
-        self.assertEqual(L, [b"abc"])
+            # managers
 
+            kernel_manager=kernel_manager,
 
+            contents_manager=contents_manager,
 
-    def test_handle_read_error(self):
+            session_manager=session_manager,
 
-        import socket
+            kernel_spec_manager=kernel_spec_manager,
 
+            config_manager=config_manager,
 
 
-        inst, sock, map = self._makeOneWithMap()
 
-        inst.will_close = False
+            # IPython stuff
 
+            jinja_template_vars=ipython_app.jinja_template_vars,
 
+            nbextensions_path=ipython_app.nbextensions_path,
 
-        def recv(b):
+            websocket_url=ipython_app.websocket_url,
 
-            raise socket.error
+            mathjax_url=ipython_app.mathjax_url,
 
+            config=ipython_app.config,
 
+            config_dir=ipython_app.config_dir,
 
-        inst.recv = recv
+            jinja2_env=env,
 
-        inst.last_activity = 0
+            terminals_available=False,  # Set later if terminals are available
 
-        inst.logger = DummyLogger()
+        )
 
-        result = inst.handle_read()
 
-        self.assertEqual(result, None)
 
-        self.assertEqual(inst.last_activity, 0)
+        # allow custom overrides for the tornado web app.
 
-        self.assertEqual(len(inst.logger.exceptions), 1)
+        settings.update(settings_overrides)
 
+        return settings
 
 
-    def test_write_soon_empty_byte(self):
 
-        inst, sock, map = self._makeOneWithMap()
+    def init_handlers(self, settings):
 
-        wrote = inst.write_soon(b"")
+        """Load the (URL pattern, handler) tuples for each component."""
 
-        self.assertEqual(wrote, 0)
+        
 
-        self.assertEqual(len(inst.outbufs[0]), 0)
+        # Order matters. The first handler to match the URL will handle the request.
 
+        handlers = []
 
+        handlers.append((r'/deprecatedwidgets/(.*)', DeprecationHandler))
 
-    def test_write_soon_nonempty_byte(self):
+        handlers.extend(load_handlers('tree.handlers'))
 
-        inst, sock, map = self._makeOneWithMap()
+        handlers.extend([(r"/login", settings['login_handler_class'])])
 
-        wrote = inst.write_soon(b"a")
+        handlers.extend([(r"/logout", settings['logout_handler_class'])])
 
-        self.assertEqual(wrote, 1)
+        handlers.extend(load_handlers('files.handlers'))
 
-        self.assertEqual(len(inst.outbufs[0]), 1)
+        handlers.extend(load_handlers('notebook.handlers'))
 
+        handlers.extend(load_handlers('nbconvert.handlers'))
 
+        handlers.extend(load_handlers('kernelspecs.handlers'))
 
-    def test_write_soon_filewrapper(self):
+        handlers.extend(load_handlers('edit.handlers'))
 
-        from waitress.buffers import ReadOnlyFileBasedBuffer
+        handlers.extend(load_handlers('services.api.handlers'))
 
+        handlers.extend(load_handlers('services.config.handlers'))
 
+        handlers.extend(load_handlers('services.kernels.handlers'))
 
-        f = io.BytesIO(b"abc")
+        handlers.extend(load_handlers('services.contents.handlers'))
 
-        wrapper = ReadOnlyFileBasedBuffer(f, 8192)
+        handlers.extend(load_handlers('services.sessions.handlers'))
 
-        wrapper.prepare()
+        handlers.extend(load_handlers('services.nbconvert.handlers'))
 
-        inst, sock, map = self._makeOneWithMap()
+        handlers.extend(load_handlers('services.kernelspecs.handlers'))
 
-        outbufs = inst.outbufs
+        handlers.extend(load_handlers('services.security.handlers'))
 
-        orig_outbuf = outbufs[0]
+        
 
-        wrote = inst.write_soon(wrapper)
+        # BEGIN HARDCODED WIDGETS HACK
 
-        self.assertEqual(wrote, 3)
+        try:
 
-        self.assertEqual(len(outbufs), 3)
+            import ipywidgets
 
-        self.assertEqual(outbufs[0], orig_outbuf)
+            handlers.append(
 
-        self.assertEqual(outbufs[1], wrapper)
+                (r"/nbextensions/widgets/(.*)", FileFindHandler, {
 
-        self.assertEqual(outbufs[2].__class__.__name__, "OverflowableBuffer")
+                    'path': ipywidgets.find_static_assets(),
 
+                    'no_cache_paths': ['/'], # don't cache anything in nbextensions
 
+                }),
 
-    def test_write_soon_disconnected(self):
+            )
 
-        from waitress.channel import ClientDisconnected
+        except:
 
+            app_log.warn('ipywidgets package not installed.  Widgets are unavailable.')
 
+        # END HARDCODED WIDGETS HACK
 
-        inst, sock, map = self._makeOneWithMap()
+        
 
-        inst.connected = False
+        handlers.append(
 
-        self.assertRaises(ClientDisconnected, lambda: inst.write_soon(b"stuff"))
+            (r"/nbextensions/(.*)", FileFindHandler, {
 
+                'path': settings['nbextensions_path'],
 
+                'no_cache_paths': ['/'], # don't cache anything in nbextensions
 
-    def test_write_soon_disconnected_while_over_watermark(self):
+            }),
 
-        from waitress.channel import ClientDisconnected
+        )
 
+        handlers.append(
 
+            (r"/custom/(.*)", FileFindHandler, {
 
-        inst, sock, map = self._makeOneWithMap()
+                'path': settings['static_custom_path'],
 
+                'no_cache_paths': ['/'], # don't cache anything in custom
 
+            })
 
-        def dummy_flush():
+        )
 
-            inst.connected = False
+        # register base handlers last
 
+        handlers.extend(load_handlers('base.handlers'))
 
+        # set the URL that will be redirected from `/`
 
-        inst._flush_outbufs_below_high_watermark = dummy_flush
+        handlers.append(
 
-        self.assertRaises(ClientDisconnected, lambda: inst.write_soon(b"stuff"))
+            (r'/?', web.RedirectHandler, {
 
+                'url' : settings['default_url'],
 
+                'permanent': False, # want 302, not 301
 
-    def test_write_soon_rotates_outbuf_on_overflow(self):
+            })
 
-        inst, sock, map = self._makeOneWithMap()
+        )
 
-        inst.adj.outbuf_high_watermark = 3
 
-        inst.current_outbuf_count = 4
 
-        wrote = inst.write_soon(b"xyz")
+        # prepend base_url onto the patterns that we match
 
-        self.assertEqual(wrote, 3)
+        new_handlers = []
 
-        self.assertEqual(len(inst.outbufs), 2)
+        for handler in handlers:
 
-        self.assertEqual(inst.outbufs[0].get(), b"")
+            pattern = url_path_join(settings['base_url'], handler[0])
 
-        self.assertEqual(inst.outbufs[1].get(), b"xyz")
+            new_handler = tuple([pattern] + list(handler[1:]))
 
+            new_handlers.append(new_handler)
 
+        # add 404 on the end, which will catch everything that falls through
 
-    def test_write_soon_waits_on_backpressure(self):
+        new_handlers.append((r'(.*)', Template404))
 
-        inst, sock, map = self._makeOneWithMap()
+        return new_handlers
 
-        inst.adj.outbuf_high_watermark = 3
 
-        inst.total_outbufs_len = 4
 
-        inst.current_outbuf_count = 4
 
 
+class NbserverListApp(JupyterApp):
 
-        class Lock(DummyLock):
+    version = __version__
 
-            def wait(self):
+    description="List currently running notebook servers in this profile."
 
-                inst.total_outbufs_len = 0
+    
 
-                super(Lock, self).wait()
+    flags = dict(
 
+        json=({'NbserverListApp': {'json': True}},
 
+              "Produce machine-readable JSON output."),
 
-        inst.outbuf_lock = Lock()
+    )
 
-        wrote = inst.write_soon(b"xyz")
+    
 
-        self.assertEqual(wrote, 3)
+    json = Bool(False, config=True,
 
-        self.assertEqual(len(inst.outbufs), 2)
+          help="If True, each line of output will be a JSON object with the "
 
-        self.assertEqual(inst.outbufs[0].get(), b"")
+                  "details from the server info file.")
 
-        self.assertEqual(inst.outbufs[1].get(), b"xyz")
 
-        self.assertTrue(inst.outbuf_lock.waited)
 
+    def start(self):
 
+        if not self.json:
 
-    def test_handle_write_notify_after_flush(self):
+            print("Currently running servers:")
 
-        inst, sock, map = self._makeOneWithMap()
+        for serverinfo in list_running_servers(self.runtime_dir):
 
-        inst.requests = [True]
+            if self.json:
 
-        inst.outbufs = [DummyBuffer(b"abc")]
+                print(json.dumps(serverinfo))
 
-        inst.total_outbufs_len = len(inst.outbufs[0])
+            else:
 
-        inst.adj.send_bytes = 1
+                print(serverinfo['url'], "::", serverinfo['notebook_dir'])
 
-        inst.adj.outbuf_high_watermark = 5
 
-        inst.will_close = False
 
-        inst.last_activity = 0
+#-----------------------------------------------------------------------------
 
-        result = inst.handle_write()
+# Aliases and Flags
 
-        self.assertEqual(result, None)
+#-----------------------------------------------------------------------------
 
-        self.assertEqual(inst.will_close, False)
 
-        self.assertTrue(inst.outbuf_lock.acquired)
 
-        self.assertTrue(inst.outbuf_lock.notified)
+flags = dict(base_flags)
 
-        self.assertEqual(sock.sent, b"abc")
+flags['no-browser']=(
 
+    {'NotebookApp' : {'open_browser' : False}},
 
+    "Don't open the notebook in a browser after startup."
 
-    def test_handle_write_no_notify_after_flush(self):
+)
 
-        inst, sock, map = self._makeOneWithMap()
+flags['pylab']=(
 
-        inst.requests = [True]
+    {'NotebookApp' : {'pylab' : 'warn'}},
 
-        inst.outbufs = [DummyBuffer(b"abc")]
+    "DISABLED: use %pylab or %matplotlib in the notebook to enable matplotlib."
 
-        inst.total_outbufs_len = len(inst.outbufs[0])
+)
 
-        inst.adj.send_bytes = 1
+flags['no-mathjax']=(
 
-        inst.adj.outbuf_high_watermark = 2
+    {'NotebookApp' : {'enable_mathjax' : False}},
 
-        sock.send = lambda x: False
+    """Disable MathJax
 
-        inst.will_close = False
+    
 
-        inst.last_activity = 0
+    MathJax is the javascript library Jupyter uses to render math/LaTeX. It is
 
-        result = inst.handle_write()
+    very large, so you may want to disable it if you have a slow internet
 
-        self.assertEqual(result, None)
+    connection, or for offline use of the notebook.
 
-        self.assertEqual(inst.will_close, False)
+    
 
-        self.assertTrue(inst.outbuf_lock.acquired)
+    When disabled, equations etc. will appear as their untransformed TeX source.
 
-        self.assertFalse(inst.outbuf_lock.notified)
+    """
 
-        self.assertEqual(sock.sent, b"")
+)
 
 
 
-    def test__flush_some_empty_outbuf(self):
+# Add notebook manager flags
 
-        inst, sock, map = self._makeOneWithMap()
+flags.update(boolean_flag('script', 'FileContentsManager.save_script',
 
-        result = inst._flush_some()
+               'DEPRECATED, IGNORED',
 
-        self.assertEqual(result, False)
+               'DEPRECATED, IGNORED'))
 
 
 
-    def test__flush_some_full_outbuf_socket_returns_nonzero(self):
+aliases = dict(base_aliases)
 
-        inst, sock, map = self._makeOneWithMap()
 
-        inst.outbufs[0].append(b"abc")
 
-        inst.total_outbufs_len = sum(len(x) for x in inst.outbufs)
+aliases.update({
 
-        result = inst._flush_some()
+    'ip': 'NotebookApp.ip',
 
-        self.assertEqual(result, True)
+    'port': 'NotebookApp.port',
 
+    'port-retries': 'NotebookApp.port_retries',
 
+    'transport': 'KernelManager.transport',
 
-    def test__flush_some_full_outbuf_socket_returns_zero(self):
+    'keyfile': 'NotebookApp.keyfile',
 
-        inst, sock, map = self._makeOneWithMap()
+    'certfile': 'NotebookApp.certfile',
 
-        sock.send = lambda x: False
+    'notebook-dir': 'NotebookApp.notebook_dir',
 
-        inst.outbufs[0].append(b"abc")
+    'browser': 'NotebookApp.browser',
 
-        inst.total_outbufs_len = sum(len(x) for x in inst.outbufs)
+    'pylab': 'NotebookApp.pylab',
 
-        result = inst._flush_some()
+})
 
-        self.assertEqual(result, False)
 
 
+#-----------------------------------------------------------------------------
 
-    def test_flush_some_multiple_buffers_first_empty(self):
+# NotebookApp
 
-        inst, sock, map = self._makeOneWithMap()
+#-----------------------------------------------------------------------------
 
-        sock.send = lambda x: len(x)
 
-        buffer = DummyBuffer(b"abc")
 
-        inst.outbufs.append(buffer)
+class NotebookApp(JupyterApp):
 
-        inst.total_outbufs_len = sum(len(x) for x in inst.outbufs)
 
-        result = inst._flush_some()
 
-        self.assertEqual(result, True)
+    name = 'jupyter-notebook'
 
-        self.assertEqual(buffer.skipped, 3)
+    version = __version__
 
-        self.assertEqual(inst.outbufs, [buffer])
+    description = """
 
+        The Jupyter HTML Notebook.
 
+        
 
-    def test_flush_some_multiple_buffers_close_raises(self):
+        This launches a Tornado based HTML Notebook Server that serves up an
 
-        inst, sock, map = self._makeOneWithMap()
+        HTML5/Javascript Notebook client.
 
-        sock.send = lambda x: len(x)
+    """
 
-        buffer = DummyBuffer(b"abc")
+    examples = _examples
 
-        inst.outbufs.append(buffer)
+    aliases = aliases
 
-        inst.total_outbufs_len = sum(len(x) for x in inst.outbufs)
+    flags = flags
 
-        inst.logger = DummyLogger()
+    
 
+    classes = [
 
+        KernelManager, Session, MappingKernelManager,
 
-        def doraise():
+        ContentsManager, FileContentsManager, NotebookNotary,
 
-            raise NotImplementedError
+        KernelSpecManager,
 
+    ]
 
+    flags = Dict(flags)
 
-        inst.outbufs[0].close = doraise
+    aliases = Dict(aliases)
 
-        result = inst._flush_some()
+    
 
-        self.assertEqual(result, True)
+    subcommands = dict(
 
-        self.assertEqual(buffer.skipped, 3)
+        list=(NbserverListApp, NbserverListApp.description.splitlines()[0]),
 
-        self.assertEqual(inst.outbufs, [buffer])
+    )
 
-        self.assertEqual(len(inst.logger.exceptions), 1)
 
 
+    _log_formatter_cls = LogFormatter
 
-    def test__flush_some_outbuf_len_gt_sys_maxint(self):
 
-        from waitress.compat import MAXINT
 
+    def _log_level_default(self):
 
+        return logging.INFO
 
-        inst, sock, map = self._makeOneWithMap()
 
 
+    def _log_datefmt_default(self):
 
-        class DummyHugeOutbuffer(object):
+        """Exclude date from default date format"""
 
-            def __init__(self):
+        return "%H:%M:%S"
 
-                self.length = MAXINT + 1
+    
 
+    def _log_format_default(self):
 
+        """override default log format to include time"""
 
-            def __len__(self):
+        return u"%(color)s[%(levelname)1.1s %(asctime)s.%(msecs).03d %(name)s]%(end_color)s %(message)s"
 
-                return self.length
 
 
+    # create requested profiles by default, if they don't exist:
 
-            def get(self, numbytes):
+    auto_create = Bool(True)
 
-                self.length = 0
 
-                return b"123"
 
+    ignore_minified_js = Bool(False,
 
+            config=True,
 
-        buf = DummyHugeOutbuffer()
+            help='Use minified JS file or not, mainly use during dev to avoid JS recompilation', 
 
-        inst.outbufs = [buf]
+            )
 
-        inst.send = lambda *arg: 0
 
-        result = inst._flush_some()
 
-        # we are testing that _flush_some doesn't raise an OverflowError
+    # file to be opened in the notebook server
 
-        # when one of its outbufs has a __len__ that returns gt sys.maxint
+    file_to_run = Unicode('', config=True)
 
-        self.assertEqual(result, False)
 
 
+    # Network related information
 
-    def test_handle_close(self):
+    
 
-        inst, sock, map = self._makeOneWithMap()
+    allow_origin = Unicode('', config=True,
 
-        inst.handle_close()
+        help="""Set the Access-Control-Allow-Origin header
 
-        self.assertEqual(inst.connected, False)
+        
 
-        self.assertEqual(sock.closed, True)
+        Use '*' to allow any origin to access your server.
 
+        
 
+        Takes precedence over allow_origin_pat.
 
-    def test_handle_close_outbuf_raises_on_close(self):
+        """
 
-        inst, sock, map = self._makeOneWithMap()
+    )
 
+    
 
+    allow_origin_pat = Unicode('', config=True,
 
-        def doraise():
+        help="""Use a regular expression for the Access-Control-Allow-Origin header
 
-            raise NotImplementedError
+        
 
+        Requests from an origin matching the expression will get replies with:
 
+        
 
-        inst.outbufs[0].close = doraise
+            Access-Control-Allow-Origin: origin
 
-        inst.logger = DummyLogger()
+        
 
-        inst.handle_close()
+        where `origin` is the origin of the request.
 
-        self.assertEqual(inst.connected, False)
+        
 
-        self.assertEqual(sock.closed, True)
+        Ignored if allow_origin is set.
 
-        self.assertEqual(len(inst.logger.exceptions), 1)
+        """
 
+    )
 
+    
 
-    def test_add_channel(self):
+    allow_credentials = Bool(False, config=True,
 
-        inst, sock, map = self._makeOneWithMap()
+        help="Set the Access-Control-Allow-Credentials: true header"
 
-        fileno = inst._fileno
+    )
 
-        inst.add_channel(map)
+    
 
-        self.assertEqual(map[fileno], inst)
+    default_url = Unicode('/tree', config=True,
 
-        self.assertEqual(inst.server.active_channels[fileno], inst)
+        help="The default URL to redirect to from `/`"
 
+    )
 
+    
 
-    def test_del_channel(self):
+    ip = Unicode('localhost', config=True,
 
-        inst, sock, map = self._makeOneWithMap()
+        help="The IP address the notebook server will listen on."
 
-        fileno = inst._fileno
+    )
 
-        inst.server.active_channels[fileno] = True
+    def _ip_default(self):
 
-        inst.del_channel(map)
+        """Return localhost if available, 127.0.0.1 otherwise.
 
-        self.assertEqual(map.get(fileno), None)
+        
 
-        self.assertEqual(inst.server.active_channels.get(fileno), None)
+        On some (horribly broken) systems, localhost cannot be bound.
 
+        """
 
+        s = socket.socket()
 
-    def test_received(self):
+        try:
 
-        inst, sock, map = self._makeOneWithMap()
+            s.bind(('localhost', 0))
 
-        inst.server = DummyServer()
+        except socket.error as e:
 
-        inst.received(b"GET / HTTP/1.1\r\n\r\n")
+            self.log.warn("Cannot bind to localhost, using 127.0.0.1 as default ip\n%s", e)
 
-        self.assertEqual(inst.server.tasks, [inst])
+            return '127.0.0.1'
 
-        self.assertTrue(inst.requests)
+        else:
 
+            s.close()
 
+            return 'localhost'
 
-    def test_received_no_chunk(self):
 
-        inst, sock, map = self._makeOneWithMap()
 
-        self.assertEqual(inst.received(b""), False)
+    def _ip_changed(self, name, old, new):
 
+        if new == u'*': self.ip = u''
 
 
-    def test_received_preq_not_completed(self):
 
-        inst, sock, map = self._makeOneWithMap()
+    port = Integer(8888, config=True,
 
-        inst.server = DummyServer()
+        help="The port the notebook server will listen on."
 
-        preq = DummyParser()
+    )
 
-        inst.request = preq
+    port_retries = Integer(50, config=True,
 
-        preq.completed = False
+        help="The number of additional ports to try if the specified port is not available."
 
-        preq.empty = True
+    )
 
-        inst.received(b"GET / HTTP/1.1\r\n\r\n")
 
-        self.assertEqual(inst.requests, ())
 
-        self.assertEqual(inst.server.tasks, [])
+    certfile = Unicode(u'', config=True, 
 
+        help="""The full path to an SSL/TLS certificate file."""
 
+    )
 
-    def test_received_preq_completed_empty(self):
+    
 
-        inst, sock, map = self._makeOneWithMap()
+    keyfile = Unicode(u'', config=True, 
 
-        inst.server = DummyServer()
+        help="""The full path to a private key file for usage with SSL/TLS."""
 
-        preq = DummyParser()
+    )
 
-        inst.request = preq
+    
 
-        preq.completed = True
+    cookie_secret_file = Unicode(config=True,
 
-        preq.empty = True
+        help="""The file where the cookie secret is stored."""
 
-        inst.received(b"GET / HTTP/1.1\r\n\r\n")
+    )
 
-        self.assertEqual(inst.request, None)
+    def _cookie_secret_file_default(self):
 
-        self.assertEqual(inst.server.tasks, [])
+        return os.path.join(self.runtime_dir, 'notebook_cookie_secret')
 
+    
 
+    cookie_secret = Bytes(b'', config=True,
 
-    def test_received_preq_error(self):
+        help="""The random bytes used to secure cookies.
 
-        inst, sock, map = self._makeOneWithMap()
+        By default this is a new random number every time you start the Notebook.
 
-        inst.server = DummyServer()
+        Set it to a value in a config file to enable logins to persist across server sessions.
 
-        preq = DummyParser()
+        
 
-        inst.request = preq
+        Note: Cookie secrets should be kept private, do not share config files with
 
-        preq.completed = True
+        cookie_secret stored in plaintext (you can read the value from a file).
 
-        preq.error = True
+        """
 
-        inst.received(b"GET / HTTP/1.1\r\n\r\n")
+    )
 
-        self.assertEqual(inst.request, None)
+    def _cookie_secret_default(self):
 
-        self.assertEqual(len(inst.server.tasks), 1)
+        if os.path.exists(self.cookie_secret_file):
 
-        self.assertTrue(inst.requests)
+            with io.open(self.cookie_secret_file, 'rb') as f:
 
+                return f.read()
 
+        else:
 
-    def test_received_preq_completed_connection_close(self):
+            secret = base64.encodestring(os.urandom(1024))
 
-        inst, sock, map = self._makeOneWithMap()
+            self._write_cookie_secret_file(secret)
 
-        inst.server = DummyServer()
+            return secret
 
-        preq = DummyParser()
+    
 
-        inst.request = preq
+    def _write_cookie_secret_file(self, secret):
 
-        preq.completed = True
+        """write my secret to my secret_file"""
 
-        preq.empty = True
+        self.log.info("Writing notebook server cookie secret to %s", self.cookie_secret_file)
 
-        preq.connection_close = True
+        with io.open(self.cookie_secret_file, 'wb') as f:
 
-        inst.received(b"GET / HTTP/1.1\r\n\r\n" + b"a" * 50000)
+            f.write(secret)
 
-        self.assertEqual(inst.request, None)
+        try:
 
-        self.assertEqual(inst.server.tasks, [])
+            os.chmod(self.cookie_secret_file, 0o600)
 
+        except OSError:
 
+            self.log.warn(
 
-    def test_received_headers_finished_expect_continue_false(self):
+                "Could not set permissions on %s",
 
-        inst, sock, map = self._makeOneWithMap()
+                self.cookie_secret_file
 
-        inst.server = DummyServer()
+            )
 
-        preq = DummyParser()
 
-        inst.request = preq
 
-        preq.expect_continue = False
+    password = Unicode(u'', config=True,
 
-        preq.headers_finished = True
+                      help="""Hashed password to use for web authentication.
 
-        preq.completed = False
 
-        preq.empty = False
 
-        preq.retval = 1
+                      To generate, type in a python/IPython shell:
 
-        inst.received(b"GET / HTTP/1.1\r\n\r\n")
 
-        self.assertEqual(inst.request, preq)
 
-        self.assertEqual(inst.server.tasks, [])
+                        from notebook.auth import passwd; passwd()
 
-        self.assertEqual(inst.outbufs[0].get(100), b"")
 
 
+                      The string should be of the form type:salt:hashed-password.
 
-    def test_received_headers_finished_expect_continue_true(self):
+                      """
 
-        inst, sock, map = self._makeOneWithMap()
+    )
 
-        inst.server = DummyServer()
 
-        preq = DummyParser()
 
-        inst.request = preq
+    open_browser = Bool(True, config=True,
 
-        preq.expect_continue = True
+                        help="""Whether to open in a browser after starting.
 
-        preq.headers_finished = True
+                        The specific browser used is platform dependent and
 
-        preq.completed = False
+                        determined by the python standard library `webbrowser`
 
-        preq.empty = False
+                        module, unless it is overridden using the --browser
 
-        inst.received(b"GET / HTTP/1.1\r\n\r\n")
+                        (NotebookApp.browser) configuration option.
 
-        self.assertEqual(inst.request, preq)
+                        """)
 
-        self.assertEqual(inst.server.tasks, [])
 
-        self.assertEqual(sock.sent, b"HTTP/1.1 100 Continue\r\n\r\n")
 
-        self.assertEqual(inst.sent_continue, True)
+    browser = Unicode(u'', config=True,
 
-        self.assertEqual(preq.completed, False)
+                      help="""Specify what command to use to invoke a web
 
+                      browser when opening the notebook. If not specified, the
 
+                      default browser will be determined by the `webbrowser`
 
-    def test_received_headers_finished_expect_continue_true_sent_true(self):
+                      standard library module, which allows setting of the
 
-        inst, sock, map = self._makeOneWithMap()
+                      BROWSER environment variable to override it.
 
-        inst.server = DummyServer()
+                      """)
 
-        preq = DummyParser()
+    
 
-        inst.request = preq
+    webapp_settings = Dict(config=True,
 
-        preq.expect_continue = True
+        help="DEPRECATED, use tornado_settings"
 
-        preq.headers_finished = True
+    )
 
-        preq.completed = False
+    def _webapp_settings_changed(self, name, old, new):
 
-        preq.empty = False
+        self.log.warn("\n    webapp_settings is deprecated, use tornado_settings.\n")
 
-        inst.sent_continue = True
+        self.tornado_settings = new
 
-        inst.received(b"GET / HTTP/1.1\r\n\r\n")
+    
 
-        self.assertEqual(inst.request, preq)
+    tornado_settings = Dict(config=True,
 
-        self.assertEqual(inst.server.tasks, [])
+            help="Supply overrides for the tornado.web.Application that the "
 
-        self.assertEqual(sock.sent, b"")
+                 "Jupyter notebook uses.")
 
-        self.assertEqual(inst.sent_continue, True)
+    
 
-        self.assertEqual(preq.completed, False)
+    ssl_options = Dict(config=True,
 
+            help="""Supply SSL options for the tornado HTTPServer.
 
+            See the tornado docs for details.""")
 
-    def test_service_no_requests(self):
+    
 
-        inst, sock, map = self._makeOneWithMap()
+    jinja_environment_options = Dict(config=True, 
 
-        inst.requests = []
+            help="Supply extra arguments that will be passed to Jinja environment.")
 
-        inst.service()
 
-        self.assertEqual(inst.requests, [])
 
-        self.assertTrue(inst.server.trigger_pulled)
+    jinja_template_vars = Dict(
 
-        self.assertTrue(inst.last_activity)
+        config=True,
 
+        help="Extra variables to supply to jinja templates when rendering.",
 
+    )
 
-    def test_service_with_one_request(self):
+    
 
-        inst, sock, map = self._makeOneWithMap()
+    enable_mathjax = Bool(True, config=True,
 
-        request = DummyRequest()
+        help="""Whether to enable MathJax for typesetting math/TeX
 
-        inst.task_class = DummyTaskClass()
 
-        inst.requests = [request]
 
-        inst.service()
+        MathJax is the javascript library Jupyter uses to render math/LaTeX. It is
 
-        self.assertEqual(inst.requests, [])
+        very large, so you may want to disable it if you have a slow internet
 
-        self.assertTrue(request.serviced)
+        connection, or for offline use of the notebook.
 
-        self.assertTrue(request.closed)
 
 
+        When disabled, equations etc. will appear as their untransformed TeX source.
 
-    def test_service_with_one_error_request(self):
+        """
 
-        inst, sock, map = self._makeOneWithMap()
+    )
 
-        request = DummyRequest()
+    def _enable_mathjax_changed(self, name, old, new):
 
-        request.error = DummyError()
+        """set mathjax url to empty if mathjax is disabled"""
 
-        inst.error_task_class = DummyTaskClass()
+        if not new:
 
-        inst.requests = [request]
+            self.mathjax_url = u''
 
-        inst.service()
 
-        self.assertEqual(inst.requests, [])
 
-        self.assertTrue(request.serviced)
+    base_url = Unicode('/', config=True,
 
-        self.assertTrue(request.closed)
+                               help='''The base URL for the notebook server.
 
 
 
-    def test_service_with_multiple_requests(self):
+                               Leading and trailing slashes can be omitted,
 
-        inst, sock, map = self._makeOneWithMap()
+                               and will automatically be added.
 
-        request1 = DummyRequest()
+                               ''')
 
-        request2 = DummyRequest()
+    def _base_url_changed(self, name, old, new):
 
-        inst.task_class = DummyTaskClass()
+        if not new.startswith('/'):
 
-        inst.requests = [request1, request2]
+            self.base_url = '/'+new
 
-        inst.service()
+        elif not new.endswith('/'):
 
-        self.assertEqual(inst.requests, [])
+            self.base_url = new+'/'
 
-        self.assertTrue(request1.serviced)
+    
 
-        self.assertTrue(request2.serviced)
+    base_project_url = Unicode('/', config=True, help="""DEPRECATED use base_url""")
 
-        self.assertTrue(request1.closed)
+    def _base_project_url_changed(self, name, old, new):
 
-        self.assertTrue(request2.closed)
+        self.log.warn("base_project_url is deprecated, use base_url")
 
+        self.base_url = new
 
 
-    def test_service_with_request_raises(self):
 
-        inst, sock, map = self._makeOneWithMap()
+    extra_static_paths = List(Unicode(), config=True,
 
-        inst.adj.expose_tracebacks = False
+        help="""Extra paths to search for serving static files.
 
-        inst.server = DummyServer()
+        
 
-        request = DummyRequest()
+        This allows adding javascript/css to be available from the notebook server machine,
 
-        inst.requests = [request]
+        or overriding individual files in the IPython"""
 
-        inst.task_class = DummyTaskClass(ValueError)
+    )
 
-        inst.task_class.wrote_header = False
+    
 
-        inst.error_task_class = DummyTaskClass()
+    @property
 
-        inst.logger = DummyLogger()
+    def static_file_path(self):
 
-        inst.service()
+        """return extra paths + the default location"""
 
-        self.assertTrue(request.serviced)
+        return self.extra_static_paths + [DEFAULT_STATIC_FILES_PATH]
 
-        self.assertEqual(inst.requests, [])
+    
 
-        self.assertEqual(len(inst.logger.exceptions), 1)
+    static_custom_path = List(Unicode(),
 
-        self.assertTrue(inst.server.trigger_pulled)
+        help="""Path to search for custom.js, css"""
 
-        self.assertTrue(inst.last_activity)
+    )
 
-        self.assertFalse(inst.will_close)
+    def _static_custom_path_default(self):
 
-        self.assertEqual(inst.error_task_class.serviced, True)
+        return [
 
-        self.assertTrue(request.closed)
+            os.path.join(d, 'custom') for d in (
 
+                self.config_dir,
 
+                # FIXME: serve IPython profile while we don't have `jupyter migrate`
 
-    def test_service_with_requests_raises_already_wrote_header(self):
+                os.path.join(get_ipython_dir(), 'profile_default', 'static'),
 
-        inst, sock, map = self._makeOneWithMap()
+                DEFAULT_STATIC_FILES_PATH)
 
-        inst.adj.expose_tracebacks = False
+        ]
 
-        inst.server = DummyServer()
 
-        request = DummyRequest()
 
-        inst.requests = [request]
+    extra_template_paths = List(Unicode(), config=True,
 
-        inst.task_class = DummyTaskClass(ValueError)
+        help="""Extra paths to search for serving jinja templates.
 
-        inst.error_task_class = DummyTaskClass()
 
-        inst.logger = DummyLogger()
 
-        inst.service()
+        Can be used to override templates from notebook.templates."""
 
-        self.assertTrue(request.serviced)
+    )
 
-        self.assertEqual(inst.requests, [])
 
-        self.assertEqual(len(inst.logger.exceptions), 1)
 
-        self.assertTrue(inst.server.trigger_pulled)
+    @property
 
-        self.assertTrue(inst.last_activity)
+    def template_file_path(self):
 
-        self.assertTrue(inst.close_when_flushed)
+        """return extra paths + the default locations"""
 
-        self.assertEqual(inst.error_task_class.serviced, False)
+        return self.extra_template_paths + DEFAULT_TEMPLATE_PATH_LIST
 
-        self.assertTrue(request.closed)
 
 
+    extra_nbextensions_path = List(Unicode(), config=True,
 
-    def test_service_with_requests_raises_didnt_write_header_expose_tbs(self):
+        help="""extra paths to look for Javascript notebook extensions"""
 
-        inst, sock, map = self._makeOneWithMap()
+    )
 
-        inst.adj.expose_tracebacks = True
+    
 
-        inst.server = DummyServer()
+    @property
 
-        request = DummyRequest()
+    def nbextensions_path(self):
 
-        inst.requests = [request]
+        """The path to look for Javascript notebook extensions"""
 
-        inst.task_class = DummyTaskClass(ValueError)
+        path = self.extra_nbextensions_path + jupyter_path('nbextensions')
 
-        inst.task_class.wrote_header = False
+        # FIXME: remove IPython nbextensions path once migration is setup
 
-        inst.error_task_class = DummyTaskClass()
+        path.append(os.path.join(get_ipython_dir(), 'nbextensions'))
 
-        inst.logger = DummyLogger()
+        return path
 
-        inst.service()
 
-        self.assertTrue(request.serviced)
 
-        self.assertFalse(inst.will_close)
+    websocket_url = Unicode("", config=True,
 
-        self.assertEqual(inst.requests, [])
+        help="""The base URL for websockets,
 
-        self.assertEqual(len(inst.logger.exceptions), 1)
+        if it differs from the HTTP server (hint: it almost certainly doesn't).
 
-        self.assertTrue(inst.server.trigger_pulled)
+        
 
-        self.assertTrue(inst.last_activity)
+        Should be in the form of an HTTP origin: ws[s]://hostname[:port]
 
-        self.assertEqual(inst.error_task_class.serviced, True)
+        """
 
-        self.assertTrue(request.closed)
+    )
 
+    mathjax_url = Unicode("", config=True,
 
+        help="""The url for MathJax.js."""
 
-    def test_service_with_requests_raises_didnt_write_header(self):
+    )
 
-        inst, sock, map = self._makeOneWithMap()
+    def _mathjax_url_default(self):
 
-        inst.adj.expose_tracebacks = False
+        if not self.enable_mathjax:
 
-        inst.server = DummyServer()
+            return u''
 
-        request = DummyRequest()
+        static_url_prefix = self.tornado_settings.get("static_url_prefix",
 
-        inst.requests = [request]
+                         url_path_join(self.base_url, "static")
 
-        inst.task_class = DummyTaskClass(ValueError)
+        )
 
-        inst.task_class.wrote_header = False
+        return url_path_join(static_url_prefix, 'components', 'MathJax', 'MathJax.js')
 
-        inst.logger = DummyLogger()
+    
 
-        inst.service()
+    def _mathjax_url_changed(self, name, old, new):
 
-        self.assertTrue(request.serviced)
+        if new and not self.enable_mathjax:
 
-        self.assertEqual(inst.requests, [])
+            # enable_mathjax=False overrides mathjax_url
 
-        self.assertEqual(len(inst.logger.exceptions), 1)
+            self.mathjax_url = u''
 
-        self.assertTrue(inst.server.trigger_pulled)
+        else:
 
-        self.assertTrue(inst.last_activity)
+            self.log.info("Using MathJax: %s", new)
 
-        self.assertTrue(inst.close_when_flushed)
 
-        self.assertTrue(request.closed)
 
+    contents_manager_class = Type(
 
+        default_value=FileContentsManager,
 
-    def test_service_with_request_raises_disconnect(self):
+        klass=ContentsManager,
 
-        from waitress.channel import ClientDisconnected
+        config=True,
 
+        help='The notebook manager class to use.'
 
+    )
 
-        inst, sock, map = self._makeOneWithMap()
+    kernel_manager_class = Type(
 
-        inst.adj.expose_tracebacks = False
+        default_value=MappingKernelManager,
 
-        inst.server = DummyServer()
+        config=True,
 
-        request = DummyRequest()
+        help='The kernel manager class to use.'
 
-        inst.requests = [request]
+    )
 
-        inst.task_class = DummyTaskClass(ClientDisconnected)
+    session_manager_class = Type(
 
-        inst.error_task_class = DummyTaskClass()
+        default_value=SessionManager,
 
-        inst.logger = DummyLogger()
+        config=True,
 
-        inst.service()
+        help='The session manager class to use.'
 
-        self.assertTrue(request.serviced)
+    )
 
-        self.assertEqual(inst.requests, [])
 
-        self.assertEqual(len(inst.logger.infos), 1)
 
-        self.assertTrue(inst.server.trigger_pulled)
+    config_manager_class = Type(
 
-        self.assertTrue(inst.last_activity)
+        default_value=ConfigManager,
 
-        self.assertFalse(inst.will_close)
+        config = True,
 
-        self.assertEqual(inst.error_task_class.serviced, False)
+        help='The config manager class to use'
 
-        self.assertTrue(request.closed)
+    )
 
 
 
-    def test_service_with_request_error_raises_disconnect(self):
+    kernel_spec_manager = Instance(KernelSpecManager, allow_none=True)
 
-        from waitress.channel import ClientDisconnected
 
 
+    kernel_spec_manager_class = Type(
 
-        inst, sock, map = self._makeOneWithMap()
+        default_value=KernelSpecManager,
 
-        inst.adj.expose_tracebacks = False
+        config=True,
 
-        inst.server = DummyServer()
+        help="""
 
-        request = DummyRequest()
+        The kernel spec manager class to use. Should be a subclass
 
-        err_request = DummyRequest()
+        of `jupyter_client.kernelspec.KernelSpecManager`.
 
-        inst.requests = [request]
 
-        inst.parser_class = lambda x: err_request
 
-        inst.task_class = DummyTaskClass(RuntimeError)
+        The Api of KernelSpecManager is provisional and might change
 
-        inst.task_class.wrote_header = False
+        without warning between this version of Jupyter and the next stable one.
 
-        inst.error_task_class = DummyTaskClass(ClientDisconnected)
+        """
 
-        inst.logger = DummyLogger()
+    )
 
-        inst.service()
 
-        self.assertTrue(request.serviced)
 
-        self.assertTrue(err_request.serviced)
+    login_handler_class = Type(
 
-        self.assertEqual(inst.requests, [])
+        default_value=LoginHandler,
 
-        self.assertEqual(len(inst.logger.exceptions), 1)
+        klass=web.RequestHandler,
 
-        self.assertEqual(len(inst.logger.infos), 0)
+        config=True,
 
-        self.assertTrue(inst.server.trigger_pulled)
+        help='The login handler class to use.',
 
-        self.assertTrue(inst.last_activity)
+    )
 
-        self.assertFalse(inst.will_close)
 
-        self.assertEqual(inst.task_class.serviced, True)
 
-        self.assertEqual(inst.error_task_class.serviced, True)
+    logout_handler_class = Type(
 
-        self.assertTrue(request.closed)
+        default_value=LogoutHandler,
 
+        klass=web.RequestHandler,
 
+        config=True,
 
-    def test_cancel_no_requests(self):
+        help='The logout handler class to use.',
 
-        inst, sock, map = self._makeOneWithMap()
+    )
 
-        inst.requests = ()
 
-        inst.cancel()
 
-        self.assertEqual(inst.requests, [])
+    trust_xheaders = Bool(False, config=True,
 
+        help=("Whether to trust or not X-Scheme/X-Forwarded-Proto and X-Real-Ip/X-Forwarded-For headers"
 
+              "sent by the upstream reverse proxy. Necessary if the proxy handles SSL")
 
-    def test_cancel_with_requests(self):
+    )
 
-        inst, sock, map = self._makeOneWithMap()
 
-        inst.requests = [None]
 
-        inst.cancel()
+    info_file = Unicode()
 
-        self.assertEqual(inst.requests, [])
 
 
+    def _info_file_default(self):
 
+        info_file = "nbserver-%s.json" % os.getpid()
 
+        return os.path.join(self.runtime_dir, info_file)
 
-class DummySock(object):
+    
 
-    blocking = False
+    pylab = Unicode('disabled', config=True,
 
-    closed = False
+        help="""
 
+        DISABLED: use %pylab or %matplotlib in the notebook to enable matplotlib.
 
+        """
 
-    def __init__(self):
+    )
 
-        self.sent = b""
+    def _pylab_changed(self, name, old, new):
 
+        """when --pylab is specified, display a warning and exit"""
 
+        if new != 'warn':
 
-    def setblocking(self, *arg):
+            backend = ' %s' % new
 
-        self.blocking = True
+        else:
 
+            backend = ''
 
+        self.log.error("Support for specifying --pylab on the command line has been removed.")
 
-    def fileno(self):
+        self.log.error(
 
-        return 100
+            "Please use `%pylab{0}` or `%matplotlib{0}` in the notebook itself.".format(backend)
 
+        )
 
+        self.exit(1)
 
-    def getpeername(self):
 
-        return "127.0.0.1"
 
+    notebook_dir = Unicode(config=True,
 
+        help="The directory to use for notebooks and kernels."
 
-    def getsockopt(self, level, option):
+    )
 
-        return 2048
 
 
+    def _notebook_dir_default(self):
 
-    def close(self):
+        if self.file_to_run:
 
-        self.closed = True
+            return os.path.dirname(os.path.abspath(self.file_to_run))
 
+        else:
 
+            return py3compat.getcwd()
 
-    def send(self, data):
 
-        self.sent += data
 
-        return len(data)
+    def _notebook_dir_changed(self, name, old, new):
 
+        """Do a bit of validation of the notebook dir."""
 
+        if not os.path.isabs(new):
 
+            # If we receive a non-absolute path, make it absolute.
 
+            self.notebook_dir = os.path.abspath(new)
 
-class DummyLock(object):
+            return
 
-    notified = False
+        if not os.path.isdir(new):
 
+            raise TraitError("No such notebook dir: %r" % new)
 
+        
 
-    def __init__(self, acquirable=True):
+        # setting App.notebook_dir implies setting notebook and kernel dirs as well
 
-        self.acquirable = acquirable
+        self.config.FileContentsManager.root_dir = new
 
+        self.config.MappingKernelManager.root_dir = new
 
 
-    def acquire(self, val):
 
-        self.val = val
+    server_extensions = List(Unicode(), config=True,
 
-        self.acquired = True
+        help=("Python modules to load as notebook server extensions. "
 
-        return self.acquirable
+              "This is an experimental API, and may change in future releases.")
 
+    )
 
 
-    def release(self):
 
-        self.released = True
+    reraise_server_extension_failures = Bool(
 
+        False,
 
+        config=True,
 
-    def notify(self):
+        help="Reraise exceptions encountered loading server extensions?",
 
-        self.notified = True
+    )
 
 
 
-    def wait(self):
+    def parse_command_line(self, argv=None):
 
-        self.waited = True
+        super(NotebookApp, self).parse_command_line(argv)
 
+        
 
+        if self.extra_args:
 
-    def __exit__(self, type, val, traceback):
+            arg0 = self.extra_args[0]
 
-        self.acquire(True)
+            f = os.path.abspath(arg0)
 
+            self.argv.remove(arg0)
 
+            if not os.path.exists(f):
 
-    def __enter__(self):
+                self.log.critical("No such file or directory: %s", f)
+
+                self.exit(1)
+
+            
+
+            # Use config here, to ensure that it takes higher priority than
+
+            # anything that comes from the profile.
+
+            c = Config()
+
+            if os.path.isdir(f):
+
+                c.NotebookApp.notebook_dir = f
+
+            elif os.path.isfile(f):
+
+                c.NotebookApp.file_to_run = f
+
+            self.update_config(c)
+
+
+
+    def init_configurables(self):
+
+        self.kernel_spec_manager = self.kernel_spec_manager_class(
+
+            parent=self,
+
+        )
+
+        self.kernel_manager = self.kernel_manager_class(
+
+            parent=self,
+
+            log=self.log,
+
+            connection_dir=self.runtime_dir,
+
+            kernel_spec_manager=self.kernel_spec_manager,
+
+        )
+
+        self.contents_manager = self.contents_manager_class(
+
+            parent=self,
+
+            log=self.log,
+
+        )
+
+        self.session_manager = self.session_manager_class(
+
+            parent=self,
+
+            log=self.log,
+
+            kernel_manager=self.kernel_manager,
+
+            contents_manager=self.contents_manager,
+
+        )
+
+        self.config_manager = self.config_manager_class(
+
+            parent=self,
+
+            log=self.log,
+
+            config_dir=os.path.join(self.config_dir, 'nbconfig'),
+
+        )
+
+
+
+    def init_logging(self):
+
+        # This prevents double log messages because tornado use a root logger that
+
+        # self.log is a child of. The logging module dipatches log messages to a log
+
+        # and all of its ancenstors until propagate is set to False.
+
+        self.log.propagate = False
+
+        
+
+        for log in app_log, access_log, gen_log:
+
+            # consistent log output name (NotebookApp instead of tornado.access, etc.)
+
+            log.name = self.log.name
+
+        # hook up tornado 3's loggers to our app handlers
+
+        logger = logging.getLogger('tornado')
+
+        logger.propagate = True
+
+        logger.parent = self.log
+
+        logger.setLevel(self.log.level)
+
+    
+
+    def init_webapp(self):
+
+        """initialize tornado webapp and httpserver"""
+
+        self.tornado_settings['allow_origin'] = self.allow_origin
+
+        if self.allow_origin_pat:
+
+            self.tornado_settings['allow_origin_pat'] = re.compile(self.allow_origin_pat)
+
+        self.tornado_settings['allow_credentials'] = self.allow_credentials
+
+        # ensure default_url starts with base_url
+
+        if not self.default_url.startswith(self.base_url):
+
+            self.default_url = url_path_join(self.base_url, self.default_url)
+
+        
+
+        self.web_app = NotebookWebApplication(
+
+            self, self.kernel_manager, self.contents_manager,
+
+            self.session_manager, self.kernel_spec_manager,
+
+            self.config_manager,
+
+            self.log, self.base_url, self.default_url, self.tornado_settings,
+
+            self.jinja_environment_options
+
+        )
+
+        ssl_options = self.ssl_options
+
+        if self.certfile:
+
+            ssl_options['certfile'] = self.certfile
+
+        if self.keyfile:
+
+            ssl_options['keyfile'] = self.keyfile
+
+        if not ssl_options:
+
+            # None indicates no SSL config
+
+            ssl_options = None
+
+        else:
+
+            # Disable SSLv3, since its use is discouraged.
+
+            ssl_options['ssl_version']=ssl.PROTOCOL_TLSv1
+
+        self.login_handler_class.validate_security(self, ssl_options=ssl_options)
+
+        self.http_server = httpserver.HTTPServer(self.web_app, ssl_options=ssl_options,
+
+                                                 xheaders=self.trust_xheaders)
+
+
+
+        success = None
+
+        for port in random_ports(self.port, self.port_retries+1):
+
+            try:
+
+                self.http_server.listen(port, self.ip)
+
+            except socket.error as e:
+
+                if e.errno == errno.EADDRINUSE:
+
+                    self.log.info('The port %i is already in use, trying another random port.' % port)
+
+                    continue
+
+                elif e.errno in (errno.EACCES, getattr(errno, 'WSAEACCES', errno.EACCES)):
+
+                    self.log.warn("Permission to listen on port %i denied" % port)
+
+                    continue
+
+                else:
+
+                    raise
+
+            else:
+
+                self.port = port
+
+                success = True
+
+                break
+
+        if not success:
+
+            self.log.critical('ERROR: the notebook server could not be started because '
+
+                              'no available port could be found.')
+
+            self.exit(1)
+
+    
+
+    @property
+
+    def display_url(self):
+
+        ip = self.ip if self.ip else '[all ip addresses on your system]'
+
+        return self._url(ip)
+
+
+
+    @property
+
+    def connection_url(self):
+
+        ip = self.ip if self.ip else 'localhost'
+
+        return self._url(ip)
+
+
+
+    def _url(self, ip):
+
+        proto = 'https' if self.certfile else 'http'
+
+        return "%s://%s:%i%s" % (proto, ip, self.port, self.base_url)
+
+
+
+    def init_terminals(self):
+
+        try:
+
+            from .terminal import initialize
+
+            initialize(self.web_app, self.notebook_dir, self.connection_url)
+
+            self.web_app.settings['terminals_available'] = True
+
+        except ImportError as e:
+
+            log = self.log.debug if sys.platform == 'win32' else self.log.warn
+
+            log("Terminals not available (error was %s)", e)
+
+
+
+    def init_signal(self):
+
+        if not sys.platform.startswith('win') and sys.stdin.isatty():
+
+            signal.signal(signal.SIGINT, self._handle_sigint)
+
+        signal.signal(signal.SIGTERM, self._signal_stop)
+
+        if hasattr(signal, 'SIGUSR1'):
+
+            # Windows doesn't support SIGUSR1
+
+            signal.signal(signal.SIGUSR1, self._signal_info)
+
+        if hasattr(signal, 'SIGINFO'):
+
+            # only on BSD-based systems
+
+            signal.signal(signal.SIGINFO, self._signal_info)
+
+    
+
+    def _handle_sigint(self, sig, frame):
+
+        """SIGINT handler spawns confirmation dialog"""
+
+        # register more forceful signal handler for ^C^C case
+
+        signal.signal(signal.SIGINT, self._signal_stop)
+
+        # request confirmation dialog in bg thread, to avoid
+
+        # blocking the App
+
+        thread = threading.Thread(target=self._confirm_exit)
+
+        thread.daemon = True
+
+        thread.start()
+
+    
+
+    def _restore_sigint_handler(self):
+
+        """callback for restoring original SIGINT handler"""
+
+        signal.signal(signal.SIGINT, self._handle_sigint)
+
+    
+
+    def _confirm_exit(self):
+
+        """confirm shutdown on ^C
+
+        
+
+        A second ^C, or answering 'y' within 5s will cause shutdown,
+
+        otherwise original SIGINT handler will be restored.
+
+        
+
+        This doesn't work on Windows.
+
+        """
+
+        info = self.log.info
+
+        info('interrupted')
+
+        print(self.notebook_info())
+
+        sys.stdout.write("Shutdown this notebook server (y/[n])? ")
+
+        sys.stdout.flush()
+
+        r,w,x = select.select([sys.stdin], [], [], 5)
+
+        if r:
+
+            line = sys.stdin.readline()
+
+            if line.lower().startswith('y') and 'n' not in line.lower():
+
+                self.log.critical("Shutdown confirmed")
+
+                ioloop.IOLoop.current().stop()
+
+                return
+
+        else:
+
+            print("No answer for 5s:", end=' ')
+
+        print("resuming operation...")
+
+        # no answer, or answer is no:
+
+        # set it back to original SIGINT handler
+
+        # use IOLoop.add_callback because signal.signal must be called
+
+        # from main thread
+
+        ioloop.IOLoop.current().add_callback(self._restore_sigint_handler)
+
+    
+
+    def _signal_stop(self, sig, frame):
+
+        self.log.critical("received signal %s, stopping", sig)
+
+        ioloop.IOLoop.current().stop()
+
+
+
+    def _signal_info(self, sig, frame):
+
+        print(self.notebook_info())
+
+    
+
+    def init_components(self):
+
+        """Check the components submodule, and warn if it's unclean"""
+
+        # TODO: this should still check, but now we use bower, not git submodule
 
         pass
 
 
 
+    def init_server_extensions(self):
 
+        """Load any extensions specified by config.
 
-class DummyBuffer(object):
 
-    closed = False
 
+        Import the module, then call the load_jupyter_server_extension function,
 
+        if one exists.
 
-    def __init__(self, data, toraise=None):
+        
 
-        self.data = data
+        The extension API is experimental, and may change in future releases.
 
-        self.toraise = toraise
+        """
 
+        for modulename in self.server_extensions:
 
+            try:
 
-    def get(self, *arg):
+                mod = importlib.import_module(modulename)
 
-        if self.toraise:
+                func = getattr(mod, 'load_jupyter_server_extension', None)
 
-            raise self.toraise
+                if func is not None:
 
-        data = self.data
+                    func(self)
 
-        self.data = b""
+            except Exception:
 
-        return data
+                if self.reraise_server_extension_failures:
 
+                    raise
 
+                self.log.warn("Error loading server extension %s", modulename,
 
-    def skip(self, num, x):
+                              exc_info=True)
 
-        self.skipped = num
+    
 
+    @catch_config_error
 
+    def initialize(self, argv=None):
 
-    def __len__(self):
+        super(NotebookApp, self).initialize(argv)
 
-        return len(self.data)
+        self.init_logging()
 
+        if self._dispatching:
 
+            return
 
-    def close(self):
+        self.init_configurables()
 
-        self.closed = True
+        self.init_components()
 
+        self.init_webapp()
 
+        self.init_terminals()
 
+        self.init_signal()
 
+        self.init_server_extensions()
 
-class DummyAdjustments(object):
 
-    outbuf_overflow = 1048576
 
-    outbuf_high_watermark = 1048576
+    def cleanup_kernels(self):
 
-    inbuf_overflow = 512000
+        """Shutdown all kernels.
 
-    cleanup_interval = 900
+        
 
-    url_scheme = "http"
+        The kernels will shutdown themselves when this process no longer exists,
 
-    channel_timeout = 300
+        but explicit shutdown allows the KernelManagers to cleanup the connection files.
 
-    log_socket_errors = True
+        """
 
-    recv_bytes = 8192
+        self.log.info('Shutting down kernels')
 
-    send_bytes = 1
+        self.kernel_manager.shutdown_all()
 
-    expose_tracebacks = True
 
-    ident = "waitress"
 
-    max_request_header_size = 10000
+    def notebook_info(self):
 
+        "Return the current working directory and the server url information"
 
+        info = self.contents_manager.info_string() + "\n"
 
+        info += "%d active kernels \n" % len(self.kernel_manager._kernels)
 
+        return info + "The Jupyter Notebook is running at: %s" % self.display_url
 
-class DummyServer(object):
 
-    trigger_pulled = False
 
-    adj = DummyAdjustments()
+    def server_info(self):
 
+        """Return a JSONable dict of information about this server."""
 
+        return {'url': self.connection_url,
 
-    def __init__(self):
+                'hostname': self.ip if self.ip else 'localhost',
 
-        self.tasks = []
+                'port': self.port,
 
-        self.active_channels = {}
+                'secure': bool(self.certfile),
 
+                'base_url': self.base_url,
 
+                'notebook_dir': os.path.abspath(self.notebook_dir),
 
-    def add_task(self, task):
+                'pid': os.getpid()
 
-        self.tasks.append(task)
+               }
 
 
 
-    def pull_trigger(self):
+    def write_server_info_file(self):
 
-        self.trigger_pulled = True
+        """Write the result of server_info() to the JSON file info_file."""
 
+        with open(self.info_file, 'w') as f:
 
+            json.dump(self.server_info(), f, indent=2)
 
 
 
-class DummyParser(object):
+    def remove_server_info_file(self):
 
-    version = 1
+        """Remove the nbserver-<pid>.json file created for this server.
 
-    data = None
+        
 
-    completed = True
+        Ignores the error raised when the file has already been removed.
 
-    empty = False
+        """
 
-    headers_finished = False
+        try:
 
-    expect_continue = False
+            os.unlink(self.info_file)
 
-    retval = None
+        except OSError as e:
 
-    error = None
+            if e.errno != errno.ENOENT:
 
-    connection_close = False
+                raise
 
 
 
-    def received(self, data):
+    def start(self):
 
-        self.data = data
+        """ Start the Notebook server app, after initialization
 
-        if self.retval is not None:
+        
 
-            return self.retval
+        This method takes no arguments so all configuration and initialization
 
-        return len(data)
+        must be done prior to calling this method."""
 
+        super(NotebookApp, self).start()
 
 
 
+        info = self.log.info
 
-class DummyRequest(object):
+        for line in self.notebook_info().split("\n"):
 
-    error = None
+            info(line)
 
-    path = "/"
+        info("Use Control-C to stop this server and shut down all kernels (twice to skip confirmation).")
 
-    version = "1.0"
 
-    closed = False
 
+        self.write_server_info_file()
 
 
-    def __init__(self):
 
-        self.headers = {}
+        if self.open_browser or self.file_to_run:
 
+            try:
 
+                browser = webbrowser.get(self.browser or None)
 
-    def close(self):
+            except webbrowser.Error as e:
 
-        self.closed = True
+                self.log.warn('No web browser found: %s.' % e)
 
+                browser = None
 
+            
 
+            if self.file_to_run:
 
+                if not os.path.exists(self.file_to_run):
 
-class DummyLogger(object):
+                    self.log.critical("%s does not exist" % self.file_to_run)
 
-    def __init__(self):
+                    self.exit(1)
 
-        self.exceptions = []
 
-        self.infos = []
 
-        self.warnings = []
+                relpath = os.path.relpath(self.file_to_run, self.notebook_dir)
 
+                uri = url_path_join('notebooks', *relpath.split(os.sep))
 
+            else:
 
-    def info(self, msg):
+                uri = 'tree'
 
-        self.infos.append(msg)
+            if browser:
 
+                b = lambda : browser.open(url_path_join(self.connection_url, uri),
 
+                                          new=2)
 
-    def exception(self, msg):
+                threading.Thread(target=b).start()
 
-        self.exceptions.append(msg)
+        
 
+        self.io_loop = ioloop.IOLoop.current()
 
+        if sys.platform.startswith('win'):
 
+            # add no-op to wake every 5s
 
+            # to handle signals that may be ignored by the inner loop
 
-class DummyError(object):
+            pc = ioloop.PeriodicCallback(lambda : None, 5000)
 
-    code = "431"
+            pc.start()
 
-    reason = "Bleh"
+        try:
 
-    body = "My body"
+            self.io_loop.start()
 
+        except KeyboardInterrupt:
 
+            info("Interrupted...")
 
+        finally:
 
+            self.cleanup_kernels()
 
-class DummyTaskClass(object):
+            self.remove_server_info_file()
 
-    wrote_header = True
+    
 
-    close_on_finish = False
+    def stop(self):
 
-    serviced = False
+        def _stop():
 
+            self.http_server.stop()
 
+            self.io_loop.stop()
 
-    def __init__(self, toraise=None):
+        self.io_loop.add_callback(_stop)
 
-        self.toraise = toraise
 
 
 
-    def __call__(self, channel, request):
 
-        self.request = request
+def list_running_servers(runtime_dir=None):
 
-        return self
+    """Iterate over the server info files of running notebook servers.
 
+    
 
+    Given a profile name, find nbserver-* files in the security directory of
 
-    def service(self):
+    that profile, and yield dicts of their information, each one pertaining to
 
-        self.serviced = True
+    a currently running notebook server instance.
 
-        self.request.serviced = True
+    """
 
-        if self.toraise:
+    if runtime_dir is None:
 
-            raise self.toraise
+        runtime_dir = jupyter_runtime_dir()
+
+
+
+    # The runtime dir might not exist
+
+    if not os.path.isdir(runtime_dir):
+
+        return
+
+
+
+    for file in os.listdir(runtime_dir):
+
+        if file.startswith('nbserver-'):
+
+            with io.open(os.path.join(runtime_dir, file), encoding='utf-8') as f:
+
+                info = json.load(f)
+
+
+
+            # Simple check whether that process is really still running
+
+            # Also remove leftover files from IPython 2.x without a pid field
+
+            if ('pid' in info) and check_pid(info['pid']):
+
+                yield info
+
+            else:
+
+                # If the process has died, try to delete its info file
+
+                try:
+
+                    os.unlink(file)
+
+                except OSError:
+
+                    pass  # TODO: This should warn or log or something
+
+#-----------------------------------------------------------------------------
+
+# Main entry point
+
+#-----------------------------------------------------------------------------
+
+
+
+main = launch_new_instance = NotebookApp.launch_instance

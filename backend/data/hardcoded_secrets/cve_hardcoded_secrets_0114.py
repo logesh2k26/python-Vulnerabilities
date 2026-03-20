@@ -2,756 +2,662 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
+# tests.paths_tests
+
+# Testing the paths descriptor
+
+#
+
+# Author:   Benjamin Bengfort <benjamin@bengfort.com>
+
+# Created:  Thu Jun 11 08:09:40 2015 -0400
+
+#
+
+# Copyright (C) 2014 Bengfort.com
+
+# For license information, see LICENSE.txt
+
+#
+
+# ID: paths_tests.py [] benjamin@bengfort.com $
+
+
+
 """
 
-.. module: security_monkey.sso.views
-
-    :platform: Unix
-
-    :copyright: (c) 2015 by Netflix Inc., see AUTHORS for more
-
-    :license: Apache, see LICENSE for more details.
-
-.. moduleauthor:: Patrick Kelley <patrick@netflix.com>
+Testing the paths descriptor
 
 """
 
-import jwt
-
-import base64
-
-import requests
 
 
+##########################################################################
 
-from flask import Blueprint, current_app, redirect, request
+## Imports
+
+##########################################################################
 
 
 
-from flask.ext.restful import reqparse, Resource, Api
+import os
 
-from flask.ext.principal import Identity, identity_changed
+import pytest
 
-from flask_login import login_user
+import shutil
 
-
-
-try:
-
-    from onelogin.saml2.auth import OneLogin_Saml2_Auth
-
-    from onelogin.saml2.utils import OneLogin_Saml2_Utils
-
-    onelogin_import_success = True
-
-except ImportError:
-
-    onelogin_import_success = False
+import tempfile
 
 
 
-from .service import fetch_token_header_payload, get_rsa_public_key
+from confire.paths import Path
+
+from confire import path_setting
+
+from six import with_metaclass, string_types
+
+from confire.descriptors import SettingsMeta
+
+from confire.exceptions import ImproperlyConfigured, PathNotFound
 
 
 
-from security_monkey.datastore import User
+##########################################################################
 
-from security_monkey import db, rbac
+## Temporary Paths
 
-
-
-from urlparse import urlparse
+##########################################################################
 
 
 
-mod = Blueprint('sso', __name__)
+TEMPDIR  = tempfile.mkdtemp('_paths', 'confire_')    # The base temporary directory
 
-api = Api(mod)
+MDROOT   = os.path.join(TEMPDIR, "missing")          # The root of the missing directory, for unlinking
+
+MISSDIR  = os.path.join(MDROOT, "path", "to", "dir") # A temporary directory that does not exist
+
+VARSDIR  = tempfile.mkdtemp("subdir", dir=TEMPDIR)   # A temporary directory referenced by environment
+
+TESTDIR  = tempfile.mkdtemp("testdir", dir=TEMPDIR)  # Another temporary directory for testing
+
+_, TESTFILE = tempfile.mkstemp("test.txt", dir=TEMPDIR) # A temporary file for testing
+
+
+
+ENVVAR  = "VARDIR"  # environment variable to test expansion
+
+
+
+##########################################################################
+
+## Setup and tear down module
+
+##########################################################################
+
+
+
+@pytest.fixture(scope='module', autouse=True)
+
+def environ():
+
+    os.environ[ENVVAR] = VARSDIR
+
+    yield
+
+    os.environ.pop(ENVVAR)
 
 
 
 
 
-from flask_security.utils import validate_redirect_url
+@pytest.fixture(scope='module', autouse=True)
+
+def paths():
+
+    for path in (TEMPDIR, VARSDIR):
+
+        assert os.path.exists(path)
+
+    yield
+
+    shutil.rmtree(TEMPDIR)
+
+    for path in (TEMPDIR, MISSDIR, VARSDIR, TESTDIR, TESTFILE):
+
+        assert not os.path.exists(path)
 
 
 
 
 
-class Ping(Resource):
+@pytest.fixture(scope='function', autouse=True)
+
+def destroy_paths():
+
+    yield
+
+    if os.path.exists(MDROOT):
+
+        shutil.rmtree(MDROOT)
+
+
+
+    # Delete contents of the test file
+
+    with open(TESTFILE, 'w') as f:
+
+        f.write("")
+
+
+
+
+
+@pytest.fixture(scope='function')
+
+def mockobj():
+
+    obj = MockObject()
+
+    path_attrs = (
+
+        'standard_path',
+
+        'default_path',
+
+        'not_required_path',
+
+        'mkdirs_path',
+
+        'mk_no_raise_path',
+
+        'dont_raise_path',
+
+        'not_absolute',
+
+        'silent_path',
+
+    )
+
+    return obj, path_attrs
+
+
+
+
+
+##########################################################################
+
+## Mock configuration object
+
+##########################################################################
+
+
+
+class MockObject(with_metaclass(SettingsMeta, object)):
 
     """
 
-    This class serves as an example of how one might implement an SSO provider for use with Security Monkey. In
-
-    this example we use a OpenIDConnect authentication flow, that is essentially OAuth2 underneath.
+    Tests an object that has Path descriptors set on the class.
 
     """
 
-    decorators = [rbac.allow(["anonymous"], ["GET", "POST"])]
 
-    def __init__(self):
 
-        self.reqparse = reqparse.RequestParser()
+    __metaclass__ = SettingsMeta
 
-        super(Ping, self).__init__()
 
 
+    standard_path     = path_setting()
 
-    def get(self):
+    default_path      = path_setting(default=TESTDIR)
 
-        return self.post()
+    not_required_path = path_setting(required=False)
 
+    mkdirs_path       = path_setting(mkdirs=True)
 
+    mk_no_raise_path  = path_setting(mkdirs=True, raises=False)
 
-    def post(self):
+    dont_raise_path   = path_setting(raises=False)
 
-        if "ping" not in current_app.config.get("ACTIVE_PROVIDERS"):
+    not_absolute      = path_setting(absolute=False, raises=False)
 
-            return "Ping is not enabled in the config.  See the ACTIVE_PROVIDERS section.", 404
+    silent_path       = path_setting(raises=False, required=False)
 
 
 
-        default_state = 'clientId,{client_id},redirectUri,{redirectUri},return_to,{return_to}'.format(
 
-            client_id=current_app.config.get('PING_CLIENT_ID'),
 
-            redirectUri=current_app.config.get('PING_REDIRECT_URI'),
+##########################################################################
 
-            return_to=current_app.config.get('WEB_PATH')
+## Test case
 
-        )
+##########################################################################
 
-        self.reqparse.add_argument('code', type=str, required=True)
 
-        self.reqparse.add_argument('state', type=str, required=False, default=default_state)
 
+class TestPaths():
 
 
-        args = self.reqparse.parse_args()
 
-        client_id = args['state'].split(',')[1]
+    def test_label(self, mockobj):
 
-        redirect_uri = args['state'].split(',')[3]
+        """
 
-        return_to = args['state'].split(',')[5]
+        Check that path settings get labeled
 
+        """
 
+        _, path_attrs = mockobj
 
-        if not validate_redirect_url(return_to):
+        for name in path_attrs:
 
-            return_to = current_app.config.get('WEB_PATH')
+            setting = getattr(MockObject, name)
 
+            assert setting.label == name
 
 
-        # take the information we have received from the provider to create a new request
 
-        params = {
+    def test_get_path_descriptor(self, mockobj):
 
-            'client_id': client_id,
+        """
 
-            'grant_type': 'authorization_code',
+        Check that the path descriptor can be fetched from the class
 
-            'scope': 'openid email profile address',
+        """
 
-            'redirect_uri': redirect_uri,
+        obj,_ = mockobj
 
-            'code': args['code']
+        assert isinstance(MockObject.default_path, Path)
 
-        }
+        assert isinstance(obj.default_path, string_types)
 
 
 
-        # you can either discover these dynamically or simply configure them
+    def test_set_and_get_paths(self, mockobj):
 
-        access_token_url = current_app.config.get('PING_ACCESS_TOKEN_URL')
+        """
 
-        user_api_url = current_app.config.get('PING_USER_API_URL')
+        Assert that paths can be set and fetched
 
+        """
 
+        obj, path_attrs = mockobj
 
-        # the secret and cliendId will be given to you when you signup for the provider
+        for name in path_attrs:
 
-        basic = base64.b64encode(bytes('{0}:{1}'.format(client_id, current_app.config.get("PING_SECRET"))))
+            setattr(obj, name, TESTDIR)
 
-        headers = {'Authorization': 'Basic {0}'.format(basic.decode('utf-8'))}
+            attr = getattr(obj, name)
 
 
 
-        # exchange authorization code for access token.
+            assert attr == TESTDIR
 
-        r = requests.post(access_token_url, headers=headers, params=params)
 
-        id_token = r.json()['id_token']
 
-        access_token = r.json()['access_token']
+    def test_delete_not_required_path(self, mockobj):
 
+        """
 
+        Assert that paths can be deleted
 
-        # fetch token public key
+        """
 
-        header_data = fetch_token_header_payload(id_token)[0]
+        obj, _ = mockobj
 
-        jwks_url = current_app.config.get('PING_JWKS_URL')
 
 
+        # Must use the not required path, otherwise exceptions!
 
-        # retrieve the key material as specified by the token header
+        obj.not_required_path = TESTDIR
 
-        r = requests.get(jwks_url)
+        assert obj.not_required_path == TESTDIR
 
-        for key in r.json()['keys']:
 
-            if key['kid'] == header_data['kid']:
 
-                secret = get_rsa_public_key(key['n'], key['e'])
+        del obj.not_required_path
 
-                algo = header_data['alg']
+        assert obj.not_required_path is None
 
-                break
 
-        else:
 
-            return dict(message='Key not found'), 403
+    def test_delete_required_path(self, mockobj):
 
+        """
 
+        Test that required paths on delete raise error
 
-        # validate your token based on the key it was signed with
+        """
+
+        obj, _ = mockobj
+
+
+
+        with pytest.raises(ImproperlyConfigured):
+
+            # Path is required on access
+
+            path = obj.standard_path
+
+
+
+        # Set to a file, and we're good to go
+
+        obj.standard_path = TESTFILE
+
+        path = obj.standard_path
+
+        assert path == TESTFILE
+
+
+
+        # Now try to delete it
+
+        del obj.standard_path
+
+        with pytest.raises(ImproperlyConfigured):
+
+            path = obj.standard_path
+
+
+
+    def test_default_path(self, mockobj):
+
+        """
+
+        Check that a default path is returned when not set
+
+        """
+
+        obj, _ = mockobj
+
+
+
+        # Make sure the default is available
+
+        assert obj.default_path is not None
+
+        assert obj.default_path == TESTDIR
+
+
+
+        # Change the default to the test file
+
+        obj.default_path = TESTFILE
+
+        assert obj.default_path == TESTFILE
+
+
+
+        # Now delete the test file and check default again
+
+        del obj.default_path
+
+        assert obj.default_path is not None
+
+        assert obj.default_path == TESTDIR
+
+
+
+    def test_required_path(self, mockobj):
+
+        """
+
+        Assert that paths are required
+
+        """
+
+        obj, _ = mockobj
+
+        with pytest.raises(ImproperlyConfigured):
+
+            obj.standard_path
+
+
+
+    def test_not_required_path(self, mockobj):
+
+        """
+
+        Assert not required paths don't raise an error
+
+        """
+
+        obj, _ = mockobj
+
+
 
         try:
 
-            current_app.logger.debug(id_token)
+            path = obj.not_required_path
 
-            current_app.logger.debug(secret)
+            assert path is None
 
-            current_app.logger.debug(algo)
+        except ImproperlyConfigured:
 
-            jwt.decode(id_token, secret.decode('utf-8'), algorithms=[algo], audience=client_id)
+            pytest.fail("a non-required path raised a configuration error")
 
-        except jwt.DecodeError:
 
-            return dict(message='Token is invalid'), 403
 
-        except jwt.ExpiredSignatureError:
+    def test_path_not_found_warning(self, mockobj):
 
-            return dict(message='Token has expired'), 403
+        """
 
-        except jwt.InvalidTokenError:
+        Test that PathNotFound is warned on not raises
 
-            return dict(message='Token is invalid'), 403
+        """
 
+        obj, _ = mockobj
 
 
-        user_params = dict(access_token=access_token, schema='profile')
 
+        with pytest.warns(PathNotFound):
 
+            assert not MockObject.dont_raise_path.mkdirs
 
-        # retrieve information about the current user.
+            assert not os.path.exists(MISSDIR)
 
-        r = requests.get(user_api_url, params=user_params)
 
-        profile = r.json()
 
+            # Trigger a warning.
 
+            obj.dont_raise_path = MISSDIR
 
-        user = User.query.filter(User.email==profile['email']).first()
 
 
+    @pytest.mark.filterwarnings("ignore")
 
-        # if we get an sso user create them an account
+    def test_user_expansion(self, mockobj):
 
-        if not user:
+        """
 
-            user = User(
+        Test that on set, user is expanded.
 
-                email=profile['email'],
+        """
 
-                active=True,
+        obj, _ = mockobj
 
-                role='View'
 
-                # profile_picture=profile.get('thumbnailPhotoUrl')
 
-            )
+        testpath = "~/path/to/test"
 
-            db.session.add(user)
+        obj.dont_raise_path = "~/path/to/test"
 
-            db.session.commit()
+        assert obj.dont_raise_path == os.path.expanduser(testpath)
 
-            db.session.refresh(user)
 
 
+    @pytest.mark.filterwarnings("ignore")
 
-        # Tell Flask-Principal the identity changed
+    def test_vars_expansion(self, mockobj):
 
-        identity_changed.send(current_app._get_current_object(), identity=Identity(user.id))
+        """
 
-        login_user(user)
+        Test that on set, vars are expanded.
 
+        """
 
+        obj, _ = mockobj
 
-        return redirect(return_to, code=302)
+        obj.standard_path = "${}".format(ENVVAR)
 
+        assert obj.standard_path == VARSDIR
 
 
 
+    @pytest.mark.filterwarnings("ignore")
 
-class Google(Resource):
+    def test_normpath_path(self, mockobj):
 
-    decorators = [rbac.allow(["anonymous"], ["GET", "POST"])]
+        """
 
-    def __init__(self):
+        Test that on set the path is normed
 
-        self.reqparse = reqparse.RequestParser()
+        """
 
-        super(Google, self).__init__()
+        obj, _ = mockobj
 
 
 
-    def get(self):
+        # Use the not raises so that we don't have to create the user path
 
-        return self.post()
+        path = os.path.join(VARSDIR, "..")
 
+        obj.standard_path = path
 
+        assert obj.standard_path == TEMPDIR
 
-    def post(self):
 
-        if "google" not in current_app.config.get("ACTIVE_PROVIDERS"):
 
-            return "Google is not enabled in the config.  See the ACTIVE_PROVIDERS section.", 404
+    @pytest.mark.filterwarnings("ignore")
 
+    def test_absolute_path(self, mockobj):
 
+        """
 
-        default_state = 'clientId,{client_id},redirectUri,{redirectUri},return_to,{return_to}'.format(
+        Test that the path is transformed into an absolute path
 
-            client_id=current_app.config.get("GOOGLE_CLIENT_ID"),
+        """
 
-            redirectUri=api.url_for(Google),
+        obj, _ = mockobj
 
-            return_to=current_app.config.get('WEB_PATH')
 
-        )
 
-        self.reqparse.add_argument('code', type=str, required=True)
+        # Use the not raises so that we don't have to create the user path
 
-        self.reqparse.add_argument('state', type=str, required=False, default=default_state)
+        relative_path = "path/to/test.txt"
 
+        obj.dont_raise_path = relative_path
 
+        assert obj.dont_raise_path == os.path.abspath(relative_path)
 
-        args = self.reqparse.parse_args()
 
-        client_id = args['state'].split(',')[1]
 
-        redirect_uri = args['state'].split(',')[3]
+    @pytest.mark.filterwarnings("ignore")
 
-        return_to = args['state'].split(',')[5]
+    def test_not_absolute_path(self, mockobj):
 
+        """
 
+        Test that the path is not transformed into an absolute path
 
-        if not validate_redirect_url(return_to):
+        """
 
-            return_to = current_app.config.get('WEB_PATH')
+        obj, _ = mockobj
 
+        # Use the not raises so that we don't have to create the user path
 
+        relative_path = "path/to/test.txt"
 
-        access_token_url = 'https://accounts.google.com/o/oauth2/token'
+        obj.not_absolute = relative_path
 
-        people_api_url = 'https://www.googleapis.com/plus/v1/people/me/openIdConnect'
+        assert obj.not_absolute == relative_path
 
 
 
-        args = self.reqparse.parse_args()
+    def test_mkdirs_path(self, mockobj):
 
+        """
 
+        Test that a directory is created on mkdirs = True
 
-        # Step 1. Exchange authorization code for access token
+        """
 
-        payload = {
+        obj, _ = mockobj
 
-            'client_id': client_id,
+        assert not os.path.exists(MISSDIR)
 
-            'grant_type': 'authorization_code',
+        obj.mkdirs_path = MISSDIR
 
-            'redirect_uri': redirect_uri,
+        assert os.path.exists(MISSDIR)
 
-            'code': args['code'],
 
-            'client_secret': current_app.config.get('GOOGLE_SECRET')
 
-        }
+    @pytest.mark.filterwarnings("ignore")
 
+    def test_no_mkdirs_path(self, mockobj):
 
+        """
 
-        r = requests.post(access_token_url, data=payload)
+        Test that no directory is created by default
 
-        token = r.json()
+        """
 
+        obj, _ = mockobj
 
 
-        # Step 1bis. Validate (some information of) the id token (if necessary)
 
-        google_hosted_domain = current_app.config.get("GOOGLE_HOSTED_DOMAIN")
+        assert not os.path.exists(MISSDIR)
 
-        if google_hosted_domain is not None:
+        obj.silent_path = MISSDIR
 
-            current_app.logger.debug('We need to verify that the token was issued for this hosted domain: %s ' % (google_hosted_domain))
+        assert not os.path.exists(MISSDIR)
 
 
 
-	    # Get the JSON Web Token
+    def test_raises_path(self, mockobj):
 
-            id_token = r.json()['id_token']
+        """
 
-            current_app.logger.debug('The id_token is: %s' % (id_token))
+        Test that if raises is True, an exception happens
 
+        """
 
+        obj, _ = mockobj
 
-            # Extract the payload
+        for path in ('standard_path', 'default_path', 'not_required_path'):
 
-            (header_data, payload_data) = fetch_token_header_payload(id_token)
+            with pytest.raises(ImproperlyConfigured):
 
-            current_app.logger.debug('id_token.header_data: %s' % (header_data))
+                assert not os.path.exists(MISSDIR)
 
-            current_app.logger.debug('id_token.payload_data: %s' % (payload_data))
+                setattr(obj, path, MISSDIR)
 
 
 
-            token_hd = payload_data.get('hd')
+    @pytest.mark.filterwarnings("ignore")
 
-            if token_hd != google_hosted_domain:
+    def test_not_raises_path(self, mockobj):
 
-                current_app.logger.debug('Verification failed: %s != %s' % (token_hd, google_hosted_domain))
+        """
 
-                return dict(message='Token is invalid %s' % token), 403
+        Assert other paths don't raise an exception
 
-            current_app.logger.debug('Verification passed')
+        """
 
+        obj, _ = mockobj
 
+        for path in ('mk_no_raise_path', 'dont_raise_path', 'not_absolute', 'silent_path'):
 
-        # Step 2. Retrieve information about the current user
+            try:
 
-        headers = {'Authorization': 'Bearer {0}'.format(token['access_token'])}
+                if os.path.exists(MISSDIR):
 
+                    shutil.rmtree(MISSDIR)
 
 
-        r = requests.get(people_api_url, headers=headers)
 
-        profile = r.json()
+                setattr(obj, path, MISSDIR)
 
+            except ImproperlyConfigured:
 
-
-        user = User.query.filter(User.email == profile['email']).first()
-
-
-
-        # if we get an sso user create them an account
-
-        if not user:
-
-            user = User(
-
-                email=profile['email'],
-
-                active=True,
-
-                role='View'
-
-                # profile_picture=profile.get('thumbnailPhotoUrl')
-
-            )
-
-            db.session.add(user)
-
-            db.session.commit()
-
-            db.session.refresh(user)
-
-
-
-        # Tell Flask-Principal the identity changed
-
-        identity_changed.send(current_app._get_current_object(), identity=Identity(user.id))
-
-        login_user(user)
-
-
-
-        return redirect(return_to, code=302)
-
-
-
-
-
-class OneLogin(Resource):
-
-    decorators = [rbac.allow(["anonymous"], ["GET", "POST"])]
-
-    def __init__(self):
-
-        self.reqparse = reqparse.RequestParser()
-
-        self.req = OneLogin.prepare_from_flask_request(request)
-
-        super(OneLogin, self).__init__()
-
-
-
-    @staticmethod
-
-    def prepare_from_flask_request(req):
-
-        url_data = urlparse(req.url)
-
-        return {
-
-            'http_host': req.host,
-
-            'server_port': url_data.port,
-
-            'script_name': req.path,
-
-            'get_data': req.args.copy(),
-
-            'post_data': req.form.copy(),
-
-            'https': ("on" if current_app.config.get("ONELOGIN_HTTPS") else "off")
-
-    }
-
-
-
-    def get(self):
-
-        return self.post()
-
-
-
-    def _consumer(self, auth):
-
-        auth.process_response()
-
-        errors = auth.get_errors()
-
-        if not errors:
-
-            if auth.is_authenticated():
-
-                return True
-
-            else:
-
-                return False
-
-        else:
-
-            current_app.logger.error('Error processing %s' % (', '.join(errors)))
-
-            return False
-
-
-
-    def post(self):
-
-        if "onelogin" not in current_app.config.get("ACTIVE_PROVIDERS"):
-
-            return "Onelogin is not enabled in the config.  See the ACTIVE_PROVIDERS section.", 404
-
-        auth = OneLogin_Saml2_Auth(self.req, current_app.config.get("ONELOGIN_SETTINGS"))
-
-
-
-        self.reqparse.add_argument('return_to', required=False, default=current_app.config.get('WEB_PATH'))
-
-        self.reqparse.add_argument('acs', required=False)
-
-        self.reqparse.add_argument('sls', required=False)
-
-
-
-        args = self.reqparse.parse_args()
-
-
-
-        return_to = args['return_to']
-
-
-
-        if args['acs'] != None:
-
-            # valids the SAML response and checks if successfully authenticated
-
-            if self._consumer(auth):
-
-                email = auth.get_attribute(current_app.config.get("ONELOGIN_EMAIL_FIELD"))[0]
-
-                user = User.query.filter(User.email == email).first()
-
-
-
-                # if we get an sso user create them an account
-
-                if not user:
-
-                    user = User(
-
-                        email=email,
-
-                        active=True,
-
-                        role=current_app.config.get('ONELOGIN_DEFAULT_ROLE')
-
-                        # profile_picture=profile.get('thumbnailPhotoUrl')
-
-                    )
-
-                    db.session.add(user)
-
-                    db.session.commit()
-
-                    db.session.refresh(user)
-
-
-
-                # Tell Flask-Principal the identity changed
-
-                identity_changed.send(current_app._get_current_object(), identity=Identity(user.id))
-
-                login_user(user)
-
-
-
-                self_url = OneLogin_Saml2_Utils.get_self_url(self.req)
-
-                if 'RelayState' in request.form and self_url != request.form['RelayState']:
-
-                    return redirect(auth.redirect_to(request.form['RelayState']), code=302)
-
-                else:  
-
-                    return redirect(current_app.config.get('BASE_URL'), code=302)
-
-            else:
-
-                return dict(message='OneLogin authentication failed.'), 403
-
-        elif args['sls'] != None:
-
-            return dict(message='OneLogin SLS not implemented yet.'), 405
-
-        else:
-
-            return redirect(auth.login(return_to=return_to))
-
-
-
-
-
-class Providers(Resource):
-
-    decorators = [rbac.allow(["anonymous"], ["GET"])]
-
-    def __init__(self):
-
-        super(Providers, self).__init__()
-
-
-
-    def get(self):
-
-        active_providers = []
-
-
-
-        for provider in current_app.config.get("ACTIVE_PROVIDERS"):
-
-            provider = provider.lower()
-
-
-
-            if provider == "ping":
-
-                active_providers.append({
-
-                    'name': current_app.config.get("PING_NAME"),
-
-                    'url': current_app.config.get('PING_REDIRECT_URI'),
-
-                    'redirectUri': current_app.config.get("PING_REDIRECT_URI"),
-
-                    'clientId': current_app.config.get("PING_CLIENT_ID"),
-
-                    'responseType': 'code',
-
-                    'scope': ['openid', 'profile', 'email'],
-
-                    'scopeDelimiter': ' ',
-
-                    'authorizationEndpoint': current_app.config.get("PING_AUTH_ENDPOINT"),
-
-                    'requiredUrlParams': ['scope'],
-
-                    'type': '2.0'
-
-                })
-
-            elif provider == "google":
-
-                google_provider = {
-
-                    'name': 'google',
-
-                    'clientId': current_app.config.get("GOOGLE_CLIENT_ID"),
-
-                    'url': api.url_for(Google, _external=True, _scheme='https'),
-
-                    'redirectUri': api.url_for(Google, _external=True, _scheme='https'),
-
-                    'authorizationEndpoint': current_app.config.get("GOOGLE_AUTH_ENDPOINT"),
-
-                    'scope': ['openid email'],
-
-                    'responseType': 'code'
-
-                }
-
-                google_hosted_domain = current_app.config.get("GOOGLE_HOSTED_DOMAIN")
-
-                if google_hosted_domain is not None:
-
-                    google_provider['hd'] = google_hosted_domain
-
-                active_providers.append(google_provider)
-
-            elif provider == "onelogin":
-
-                active_providers.append({
-
-                    'name': 'OneLogin',
-
-                    'authorizationEndpoint': api.url_for(OneLogin)
-
-                })
-
-            else:
-
-                raise Exception("Unknown authentication provider: {0}".format(provider))
-
-
-
-        return active_providers
-
-
-
-
-
-api.add_resource(Ping, '/auth/ping', endpoint='ping')
-
-api.add_resource(Google, '/auth/google', endpoint='google')
-
-api.add_resource(Providers, '/auth/providers', endpoint='providers')
-
-
-
-if onelogin_import_success:
-
-    api.add_resource(OneLogin, '/auth/onelogin', endpoint='onelogin')
+                self.fail("Improperly configured raised on %s" % path)

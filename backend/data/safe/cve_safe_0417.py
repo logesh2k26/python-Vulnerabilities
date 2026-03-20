@@ -2,434 +2,172 @@
 # Safety: safe
 # Category: safe
 
-# Copyright (c) 2015, Hubert Kario
+#
+
+# gravatars.py -- Decorational template tags
 
 #
 
-# See the LICENSE file for legal information regarding use of this file.
+# Copyright (c) 2008-2009  Christian Hammond
 
-"""Various constant time functions for processing sensitive data"""
+#
 
+# Permission is hereby granted, free of charge, to any person obtaining
 
+# a copy of this software and associated documentation files (the
 
-from __future__ import division
+# "Software"), to deal in the Software without restriction, including
 
+# without limitation the rights to use, copy, modify, merge, publish,
 
+# distribute, sublicense, and/or sell copies of the Software, and to
 
-from .compat import compatHMAC
+# permit persons to whom the Software is furnished to do so, subject to
 
-import hmac
+# the following conditions:
 
+#
 
+# The above copyright notice and this permission notice shall be included
 
-def ct_lt_u32(val_a, val_b):
+# in all copies or substantial portions of the Software.
 
-    """
+#
 
-    Returns 1 if val_a < val_b, 0 otherwise. Constant time.
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
 
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
 
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
 
-    :type val_a: int
+# IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
 
-    :type val_b: int
+# CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
 
-    :param val_a: an unsigned integer representable as a 32 bit value
+# TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 
-    :param val_b: an unsigned integer representable as a 32 bit value
-
-    :rtype: int
-
-    """
-
-    val_a &= 0xffffffff
-
-    val_b &= 0xffffffff
-
-
-
-    return (val_a^((val_a^val_b)|(((val_a-val_b)&0xffffffff)^val_b)))>>31
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 
 
-
-
-def ct_gt_u32(val_a, val_b):
-
-    """
-
-    Return 1 if val_a > val_b, 0 otherwise. Constant time.
+from __future__ import unicode_literals
 
 
 
-    :type val_a: int
+from django import template
 
-    :type val_b: int
+from django.utils.html import format_html
 
-    :param val_a: an unsigned integer representable as a 32 bit value
 
-    :param val_b: an unsigned integer representable as a 32 bit value
 
-    :rtype: int
+from djblets.gravatars import (get_gravatar_url,
 
-    """
+                               get_gravatar_url_for_email)
 
-    return ct_lt_u32(val_b, val_a)
+from djblets.util.decorators import basictag
 
 
 
 
 
-def ct_le_u32(val_a, val_b):
+register = template.Library()
+
+
+
+
+
+@register.tag
+
+@basictag(takes_context=True)
+
+def gravatar(context, user, size=None):
 
     """
 
-    Return 1 if val_a <= val_b, 0 otherwise. Constant time.
+    Outputs the HTML for displaying a user's gravatar.
 
 
 
-    :type val_a: int
+    This can take an optional size of the image (defaults to 80 if not
 
-    :type val_b: int
-
-    :param val_a: an unsigned integer representable as a 32 bit value
-
-    :param val_b: an unsigned integer representable as a 32 bit value
-
-    :rtype: int
-
-    """
-
-    return 1 ^ ct_gt_u32(val_a, val_b)
+    specified).
 
 
 
-
-
-def ct_lsb_prop_u8(val):
-
-    """Propagate LSB to all 8 bits of the returned int. Constant time."""
-
-    val &= 0x01
-
-    val |= val << 1
-
-    val |= val << 2
-
-    val |= val << 4
-
-    return val
+    This is also influenced by the following settings:
 
 
 
+        GRAVATAR_SIZE    - Default size for gravatars
 
+        GRAVATAR_RATING  - Maximum allowed rating (g, pg, r, x)
 
-def ct_lsb_prop_u16(val):
+        GRAVATAR_DEFAULT - Default image set to show if the user hasn't
 
-    """Propagate LSB to all 16 bits of the returned int. Constant time."""
-
-    val &= 0x01
-
-    val |= val << 1
-
-    val |= val << 2
-
-    val |= val << 4
-
-    val |= val << 8
-
-    return val
+                           specified a gravatar (identicon, monsterid, wavatar)
 
 
 
-
-
-def ct_isnonzero_u32(val):
+    See http://www.gravatar.com/ for more information.
 
     """
 
-    Returns 1 if val is != 0, 0 otherwise. Constant time.
+    url = get_gravatar_url(context['request'], user, size)
 
 
 
-    :type val: int
+    if url:
 
-    :param val: an unsigned integer representable as a 32 bit value
+        return format_html(
 
-    :rtype: int
+            '<img src="{0}" width="{1}" height="{1}" alt="{2}" '
 
-    """
+            'class="gravatar"/>',
 
-    val &= 0xffffffff
-
-    return (val|(-val&0xffffffff)) >> 31
-
-
-
-
-
-def ct_neq_u32(val_a, val_b):
-
-    """
-
-    Return 1 if val_a != val_b, 0 otherwise. Constant time.
-
-
-
-    :type val_a: int
-
-    :type val_b: int
-
-    :param val_a: an unsigned integer representable as a 32 bit value
-
-    :param val_b: an unsigned integer representable as a 32 bit value
-
-    :rtype: int
-
-    """
-
-    val_a &= 0xffffffff
-
-    val_b &= 0xffffffff
-
-
-
-    return (((val_a-val_b)&0xffffffff) | ((val_b-val_a)&0xffffffff)) >> 31
-
-
-
-def ct_eq_u32(val_a, val_b):
-
-    """
-
-    Return 1 if val_a == val_b, 0 otherwise. Constant time.
-
-
-
-    :type val_a: int
-
-    :type val_b: int
-
-    :param val_a: an unsigned integer representable as a 32 bit value
-
-    :param val_b: an unsigned integer representable as a 32 bit value
-
-    :rtype: int
-
-    """
-
-    return 1 ^ ct_neq_u32(val_a, val_b)
-
-
-
-def ct_check_cbc_mac_and_pad(data, mac, seqnumBytes, contentType, version):
-
-    """
-
-    Check CBC cipher HMAC and padding. Close to constant time.
-
-
-
-    :type data: bytearray
-
-    :param data: data with HMAC value to test and padding
-
-
-
-    :type mac: hashlib mac
-
-    :param mac: empty HMAC, initialised with a key
-
-
-
-    :type seqnumBytes: bytearray
-
-    :param seqnumBytes: TLS sequence number, used as input to HMAC
-
-
-
-    :type contentType: int
-
-    :param contentType: a single byte, used as input to HMAC
-
-
-
-    :type version: tuple of int
-
-    :param version: a tuple of two ints, used as input to HMAC and to guide
-
-        checking of padding
-
-
-
-    :rtype: boolean
-
-    :returns: True if MAC and pad is ok, False otherwise
-
-    """
-
-    assert version in ((3, 0), (3, 1), (3, 2), (3, 3))
-
-
-
-    data_len = len(data)
-
-    if mac.digest_size + 1 > data_len: # data_len is public
-
-        return False
-
-
-
-    # 0 - OK
-
-    result = 0x00
-
-
-
-    #
-
-    # check padding
-
-    #
-
-    pad_length = data[data_len-1]
-
-    pad_start = data_len - pad_length - 1
-
-    pad_start = max(0, pad_start)
-
-
-
-    if version == (3, 0): # version is public
-
-        # in SSLv3 we can only check if pad is not longer than overall length
-
-
-
-        # subtract 1 for the pad length byte
-
-        mask = ct_lsb_prop_u8(ct_lt_u32(data_len-1, pad_length))
-
-        result |= mask
+            url, size, user.get_full_name() or user.username)
 
     else:
 
-        start_pos = max(0, data_len - 256)
+        return ''
 
-        for i in range(start_pos, data_len):
 
-            # if pad_start < i: mask = 0xff; else: mask = 0x00
 
-            mask = ct_lsb_prop_u8(ct_le_u32(pad_start, i))
 
-            # if data[i] != pad_length and "inside_pad": result = False
 
-            result |= (data[i] ^ pad_length) & mask
+@register.tag
 
+@basictag(takes_context=True)
 
+def gravatar_url(context, email, size=None):
 
-    #
+    """
 
-    # check MAC
+    Outputs the URL for a gravatar for the given email address.
 
-    #
 
 
+    This can take an optional size of the image (defaults to 80 if not
 
-    # real place where mac starts and data ends
+    specified).
 
-    mac_start = pad_start - mac.digest_size
 
-    mac_start = max(0, mac_start)
 
+    This is also influenced by the following settings:
 
 
-    # place to start processing
 
-    start_pos = max(0, data_len - (256 + mac.digest_size)) // mac.block_size
+        GRAVATAR_SIZE    - Default size for gravatars
 
-    start_pos *= mac.block_size
+        GRAVATAR_RATING  - Maximum allowed rating (g, pg, r, x)
 
+        GRAVATAR_DEFAULT - Default image set to show if the user hasn't
 
+                           specified a gravatar (identicon, monsterid, wavatar)
 
-    # add start data
 
-    data_mac = mac.copy()
 
-    data_mac.update(compatHMAC(seqnumBytes))
+    See http://www.gravatar.com/ for more information.
 
-    data_mac.update(compatHMAC(bytearray([contentType])))
+    """
 
-    if version != (3, 0): # version is public
-
-        data_mac.update(compatHMAC(bytearray([version[0]])))
-
-        data_mac.update(compatHMAC(bytearray([version[1]])))
-
-    data_mac.update(compatHMAC(bytearray([mac_start >> 8])))
-
-    data_mac.update(compatHMAC(bytearray([mac_start & 0xff])))
-
-    data_mac.update(compatHMAC(data[:start_pos]))
-
-
-
-    # don't check past the array end (already checked to be >= zero)
-
-    end_pos = data_len - mac.digest_size
-
-
-
-    # calculate all possible
-
-    for i in range(start_pos, end_pos): # constant for given overall length
-
-        cur_mac = data_mac.copy()
-
-        cur_mac.update(compatHMAC(data[start_pos:i]))
-
-        mac_compare = bytearray(cur_mac.digest())
-
-        # compare the hash for real only if it's the place where mac is
-
-        # supposed to be
-
-        mask = ct_lsb_prop_u8(ct_eq_u32(i, mac_start))
-
-        for j in range(0, mac.digest_size): # digest_size is public
-
-            result |= (data[i+j] ^ mac_compare[j]) & mask
-
-
-
-    # return python boolean
-
-    return result == 0
-
-
-
-if hasattr(hmac, 'compare_digest'):
-
-    ct_compare_digest = hmac.compare_digest
-
-else:
-
-    def ct_compare_digest(val_a, val_b):
-
-        """Compares if string like objects are equal. Constant time."""
-
-        if len(val_a) != len(val_b):
-
-            return False
-
-
-
-        result = 0
-
-        for x, y in zip(val_a, val_b):
-
-            result |= x ^ y
-
-
-
-        return result == 0
+    return get_gravatar_url_for_email(context['request'], email, size)

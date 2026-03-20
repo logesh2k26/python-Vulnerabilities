@@ -2,1504 +2,686 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# encoding: utf-8
-
-from __future__ import absolute_import, unicode_literals
+"""Tornado handlers for the contents web service."""
 
 
 
-from datetime import datetime
+# Copyright (c) IPython Development Team.
+
+# Distributed under the terms of the Modified BSD License.
 
 
 
-from django import forms
-
-from django.conf import settings
-
-from django.contrib import admin
-
-from django.contrib.admin import widgets
-
-from django.contrib.admin.tests import AdminSeleniumWebDriverTestCase
-
-from django.core.files.storage import default_storage
-
-from django.core.files.uploadedfile import SimpleUploadedFile
-
-from django.db.models import CharField, DateField
-
-from django.test import TestCase as DjangoTestCase
-
-from django.test.utils import override_settings
-
-from django.utils import translation
-
-from django.utils.html import conditional_escape
-
-from django.utils.unittest import TestCase
+import json
 
 
 
-from . import models
+from tornado import gen, web
 
-from .widgetadmin import site as widget_admin_site
+
+
+from IPython.html.utils import url_path_join, url_escape
+
+from IPython.utils.jsonutil import date_default
+
+
+
+from IPython.html.base.handlers import (
+
+    IPythonHandler, json_errors, path_regex,
+
+)
 
 
 
 
 
-admin_static_prefix = lambda: {
+def sort_key(model):
 
-    'ADMIN_STATIC_PREFIX': "%sadmin/" % settings.STATIC_URL,
+    """key function for case-insensitive sort by name and type"""
 
-}
+    iname = model['name'].lower()
+
+    type_key = {
+
+        'directory' : '0',
+
+        'notebook'  : '1',
+
+        'file'      : '2',
+
+    }.get(model['type'], '9')
+
+    return u'%s%s' % (type_key, iname)
 
 
 
-class AdminFormfieldForDBFieldTests(TestCase):
 
-    """
 
-    Tests for correct behavior of ModelAdmin.formfield_for_dbfield
+def validate_model(model, expect_content):
 
     """
 
-
-
-    def assertFormfield(self, model, fieldname, widgetclass, **admin_overrides):
-
-        """
-
-        Helper to call formfield_for_dbfield for a given model and field name
-
-        and verify that the returned formfield is appropriate.
-
-        """
-
-        # Override any settings on the model admin
-
-        class MyModelAdmin(admin.ModelAdmin):
-
-            pass
-
-        for k in admin_overrides:
-
-            setattr(MyModelAdmin, k, admin_overrides[k])
+    Validate a model returned by a ContentsManager method.
 
 
 
-        # Construct the admin, and ask it for a formfield
+    If expect_content is True, then we expect non-null entries for 'content'
 
-        ma = MyModelAdmin(model, admin.site)
+    and 'format'.
 
-        ff = ma.formfield_for_dbfield(model._meta.get_field(fieldname), request=None)
+    """
 
+    required_keys = {
 
+        "name",
 
-        # "unwrap" the widget wrapper, if needed
+        "path",
 
-        if isinstance(ff.widget, widgets.RelatedFieldWidgetWrapper):
+        "type",
 
-            widget = ff.widget.widget
+        "writable",
 
-        else:
+        "created",
 
-            widget = ff.widget
+        "last_modified",
 
+        "mimetype",
 
+        "content",
 
-        # Check that we got a field of the right type
+        "format",
 
-        self.assertTrue(
+    }
 
-            isinstance(widget, widgetclass),
+    missing = required_keys - set(model.keys())
 
-            "Wrong widget for %s.%s: expected %s, got %s" % \
+    if missing:
 
-                (model.__class__.__name__, fieldname, widgetclass, type(widget))
+        raise web.HTTPError(
+
+            500,
+
+            u"Missing Model Keys: {missing}".format(missing=missing),
 
         )
 
 
 
-        # Return the formfield so that other tests can continue
+    maybe_none_keys = ['content', 'format']
 
-        return ff
+    if model['type'] == 'file':
 
+        # mimetype should be populated only for file models
 
+        maybe_none_keys.append('mimetype')
 
-    def testDateField(self):
+    if expect_content:
 
-        self.assertFormfield(models.Event, 'start_date', widgets.AdminDateWidget)
+        errors = [key for key in maybe_none_keys if model[key] is None]
 
+        if errors:
 
+            raise web.HTTPError(
 
-    def testDateTimeField(self):
+                500,
 
-        self.assertFormfield(models.Member, 'birthdate', widgets.AdminSplitDateTime)
+                u"Keys unexpectedly None: {keys}".format(keys=errors),
 
+            )
 
+    else:
 
-    def testTimeField(self):
+        errors = {
 
-        self.assertFormfield(models.Event, 'start_time', widgets.AdminTimeWidget)
+            key: model[key]
 
+            for key in maybe_none_keys
 
-
-    def testTextField(self):
-
-        self.assertFormfield(models.Event, 'description', widgets.AdminTextareaWidget)
-
-
-
-    def testURLField(self):
-
-        self.assertFormfield(models.Event, 'link', widgets.AdminURLFieldWidget)
-
-
-
-    def testIntegerField(self):
-
-        self.assertFormfield(models.Event, 'min_age', widgets.AdminIntegerFieldWidget)
-
-
-
-    def testCharField(self):
-
-        self.assertFormfield(models.Member, 'name', widgets.AdminTextInputWidget)
-
-
-
-    def testFileField(self):
-
-        self.assertFormfield(models.Album, 'cover_art', widgets.AdminFileWidget)
-
-
-
-    def testForeignKey(self):
-
-        self.assertFormfield(models.Event, 'band', forms.Select)
-
-
-
-    def testRawIDForeignKey(self):
-
-        self.assertFormfield(models.Event, 'band', widgets.ForeignKeyRawIdWidget,
-
-                             raw_id_fields=['band'])
-
-
-
-    def testRadioFieldsForeignKey(self):
-
-        ff = self.assertFormfield(models.Event, 'band', widgets.AdminRadioSelect,
-
-                                  radio_fields={'band':admin.VERTICAL})
-
-        self.assertEqual(ff.empty_label, None)
-
-
-
-    def testManyToMany(self):
-
-        self.assertFormfield(models.Band, 'members', forms.SelectMultiple)
-
-
-
-    def testRawIDManyTOMany(self):
-
-        self.assertFormfield(models.Band, 'members', widgets.ManyToManyRawIdWidget,
-
-                             raw_id_fields=['members'])
-
-
-
-    def testFilteredManyToMany(self):
-
-        self.assertFormfield(models.Band, 'members', widgets.FilteredSelectMultiple,
-
-                             filter_vertical=['members'])
-
-
-
-    def testFormfieldOverrides(self):
-
-        self.assertFormfield(models.Event, 'start_date', forms.TextInput,
-
-                             formfield_overrides={DateField: {'widget': forms.TextInput}})
-
-
-
-    def testFormfieldOverridesWidgetInstances(self):
-
-        """
-
-        Test that widget instances in formfield_overrides are not shared between
-
-        different fields. (#19423)
-
-        """
-
-        class BandAdmin(admin.ModelAdmin):
-
-            formfield_overrides = {
-
-                CharField: {'widget': forms.TextInput(attrs={'size':'10'})}
-
-            }
-
-        ma = BandAdmin(models.Band, admin.site)
-
-        f1 = ma.formfield_for_dbfield(models.Band._meta.get_field('name'), request=None)
-
-        f2 = ma.formfield_for_dbfield(models.Band._meta.get_field('style'), request=None)
-
-        self.assertNotEqual(f1.widget, f2.widget)
-
-        self.assertEqual(f1.widget.attrs['maxlength'], '100')
-
-        self.assertEqual(f2.widget.attrs['maxlength'], '20')
-
-        self.assertEqual(f2.widget.attrs['size'], '10')
-
-
-
-    def testFieldWithChoices(self):
-
-        self.assertFormfield(models.Member, 'gender', forms.Select)
-
-
-
-    def testChoicesWithRadioFields(self):
-
-        self.assertFormfield(models.Member, 'gender', widgets.AdminRadioSelect,
-
-                             radio_fields={'gender':admin.VERTICAL})
-
-
-
-    def testInheritance(self):
-
-        self.assertFormfield(models.Album, 'backside_art', widgets.AdminFileWidget)
-
-
-
-
-
-@override_settings(PASSWORD_HASHERS=('django.contrib.auth.hashers.SHA1PasswordHasher',))
-
-class AdminFormfieldForDBFieldWithRequestTests(DjangoTestCase):
-
-    fixtures = ["admin-widgets-users.xml"]
-
-
-
-    def testFilterChoicesByRequestUser(self):
-
-        """
-
-        Ensure the user can only see their own cars in the foreign key dropdown.
-
-        """
-
-        self.client.login(username="super", password="secret")
-
-        response = self.client.get("/widget_admin/admin_widgets/cartire/add/")
-
-        self.assertNotContains(response, "BMW M3")
-
-        self.assertContains(response, "Volkswagon Passat")
-
-
-
-
-
-@override_settings(PASSWORD_HASHERS=('django.contrib.auth.hashers.SHA1PasswordHasher',))
-
-class AdminForeignKeyWidgetChangeList(DjangoTestCase):
-
-    fixtures = ["admin-widgets-users.xml"]
-
-    admin_root = '/widget_admin'
-
-
-
-    def setUp(self):
-
-        self.client.login(username="super", password="secret")
-
-
-
-    def tearDown(self):
-
-        self.client.logout()
-
-
-
-    def test_changelist_foreignkey(self):
-
-        response = self.client.get('%s/admin_widgets/car/' % self.admin_root)
-
-        self.assertContains(response, '%s/auth/user/add/' % self.admin_root)
-
-
-
-
-
-@override_settings(PASSWORD_HASHERS=('django.contrib.auth.hashers.SHA1PasswordHasher',))
-
-class AdminForeignKeyRawIdWidget(DjangoTestCase):
-
-    fixtures = ["admin-widgets-users.xml"]
-
-    admin_root = '/widget_admin'
-
-
-
-    def setUp(self):
-
-        self.client.login(username="super", password="secret")
-
-
-
-    def tearDown(self):
-
-        self.client.logout()
-
-
-
-    def test_nonexistent_target_id(self):
-
-        band = models.Band.objects.create(name='Bogey Blues')
-
-        pk = band.pk
-
-        band.delete()
-
-        post_data = {
-
-            "band": '%s' % pk,
+            if model[key] is not None
 
         }
 
-        # Try posting with a non-existent pk in a raw id field: this
+        if errors:
 
-        # should result in an error message, not a server exception.
+            raise web.HTTPError(
 
-        response = self.client.post('%s/admin_widgets/event/add/' % self.admin_root,
+                500,
 
-            post_data)
+                u"Keys unexpectedly not None: {keys}".format(keys=errors),
 
-        self.assertContains(response,
-
-            'Select a valid choice. That choice is not one of the available choices.')
-
-
-
-    def test_invalid_target_id(self):
-
-
-
-        for test_str in ('Iñtërnâtiônàlizætiøn', "1234'", -1234):
-
-            # This should result in an error message, not a server exception.
-
-            response = self.client.post('%s/admin_widgets/event/add/' % self.admin_root,
-
-                {"band": test_str})
-
-
-
-            self.assertContains(response,
-
-                'Select a valid choice. That choice is not one of the available choices.')
-
-
-
-    def test_url_params_from_lookup_dict_any_iterable(self):
-
-        lookup1 = widgets.url_params_from_lookup_dict({'color__in': ('red', 'blue')})
-
-        lookup2 = widgets.url_params_from_lookup_dict({'color__in': ['red', 'blue']})
-
-        self.assertEqual(lookup1, {'color__in': 'red,blue'})
-
-        self.assertEqual(lookup1, lookup2)
+            )
 
 
 
 
 
-class FilteredSelectMultipleWidgetTest(DjangoTestCase):
-
-    def test_render(self):
-
-        w = widgets.FilteredSelectMultiple('test', False)
-
-        self.assertHTMLEqual(
-
-            conditional_escape(w.render('test', 'test')),
-
-            '<select multiple="multiple" name="test" class="selectfilter">\n</select><script type="text/javascript">addEvent(window, "load", function(e) {SelectFilter.init("id_test", "test", 0, "%(ADMIN_STATIC_PREFIX)s"); });</script>\n' % admin_static_prefix()
-
-        )
+class ContentsHandler(IPythonHandler):
 
 
 
-    def test_stacked_render(self):
-
-        w = widgets.FilteredSelectMultiple('test', True)
-
-        self.assertHTMLEqual(
-
-            conditional_escape(w.render('test', 'test')),
-
-            '<select multiple="multiple" name="test" class="selectfilterstacked">\n</select><script type="text/javascript">addEvent(window, "load", function(e) {SelectFilter.init("id_test", "test", 1, "%(ADMIN_STATIC_PREFIX)s"); });</script>\n' % admin_static_prefix()
-
-        )
+    SUPPORTED_METHODS = (u'GET', u'PUT', u'PATCH', u'POST', u'DELETE')
 
 
 
-class AdminDateWidgetTest(DjangoTestCase):
+    def location_url(self, path):
 
-    def test_attrs(self):
+        """Return the full URL location of a file.
+
+
+
+        Parameters
+
+        ----------
+
+        path : unicode
+
+            The API path of the file, such as "foo/bar.txt".
 
         """
 
-        Ensure that user-supplied attrs are used.
+        return url_escape(url_path_join(
 
-        Refs #12073.
+            self.base_url, 'api', 'contents', path
+
+        ))
+
+
+
+    def _finish_model(self, model, location=True):
+
+        """Finish a JSON request with a model, setting relevant headers, etc."""
+
+        if location:
+
+            location = self.location_url(model['path'])
+
+            self.set_header('Location', location)
+
+        self.set_header('Last-Modified', model['last_modified'])
+
+        self.set_header('Content-Type', 'application/json')
+
+        self.finish(json.dumps(model, default=date_default))
+
+
+
+    @web.authenticated
+
+    @json_errors
+
+    @gen.coroutine
+
+    def get(self, path=''):
+
+        """Return a model for a file or directory.
+
+
+
+        A directory model contains a list of models (without content)
+
+        of the files and directories it contains.
 
         """
 
-        w = widgets.AdminDateWidget()
+        path = path or ''
 
-        self.assertHTMLEqual(
+        type = self.get_query_argument('type', default=None)
 
-            conditional_escape(w.render('test', datetime(2007, 12, 1, 9, 30))),
+        if type not in {None, 'directory', 'file', 'notebook'}:
 
-            '<input value="2007-12-01" type="text" class="vDateField" name="test" size="10" />',
-
-        )
-
-        # pass attrs to widget
-
-        w = widgets.AdminDateWidget(attrs={'size': 20, 'class': 'myDateField'})
-
-        self.assertHTMLEqual(
-
-            conditional_escape(w.render('test', datetime(2007, 12, 1, 9, 30))),
-
-            '<input value="2007-12-01" type="text" class="myDateField" name="test" size="20" />',
-
-        )
+            raise web.HTTPError(400, u'Type %r is invalid' % type)
 
 
 
-class AdminTimeWidgetTest(DjangoTestCase):
+        format = self.get_query_argument('format', default=None)
 
-    def test_attrs(self):
+        if format not in {None, 'text', 'base64'}:
+
+            raise web.HTTPError(400, u'Format %r is invalid' % format)
+
+        content = self.get_query_argument('content', default='1')
+
+        if content not in {'0', '1'}:
+
+            raise web.HTTPError(400, u'Content %r is invalid' % content)
+
+        content = int(content)
+
+        
+
+        model = yield gen.maybe_future(self.contents_manager.get(
+
+            path=path, type=type, format=format, content=content,
+
+        ))
+
+        if model['type'] == 'directory' and content:
+
+            # group listing by type, then by name (case-insensitive)
+
+            # FIXME: sorting should be done in the frontends
+
+            model['content'].sort(key=sort_key)
+
+        validate_model(model, expect_content=content)
+
+        self._finish_model(model, location=False)
+
+
+
+    @web.authenticated
+
+    @json_errors
+
+    @gen.coroutine
+
+    def patch(self, path=''):
+
+        """PATCH renames a file or directory without re-uploading content."""
+
+        cm = self.contents_manager
+
+        model = self.get_json_body()
+
+        if model is None:
+
+            raise web.HTTPError(400, u'JSON body missing')
+
+        model = yield gen.maybe_future(cm.update(model, path))
+
+        validate_model(model, expect_content=False)
+
+        self._finish_model(model)
+
+    
+
+    @gen.coroutine
+
+    def _copy(self, copy_from, copy_to=None):
+
+        """Copy a file, optionally specifying a target directory."""
+
+        self.log.info(u"Copying {copy_from} to {copy_to}".format(
+
+            copy_from=copy_from,
+
+            copy_to=copy_to or '',
+
+        ))
+
+        model = yield gen.maybe_future(self.contents_manager.copy(copy_from, copy_to))
+
+        self.set_status(201)
+
+        validate_model(model, expect_content=False)
+
+        self._finish_model(model)
+
+
+
+    @gen.coroutine
+
+    def _upload(self, model, path):
+
+        """Handle upload of a new file to path"""
+
+        self.log.info(u"Uploading file to %s", path)
+
+        model = yield gen.maybe_future(self.contents_manager.new(model, path))
+
+        self.set_status(201)
+
+        validate_model(model, expect_content=False)
+
+        self._finish_model(model)
+
+    
+
+    @gen.coroutine
+
+    def _new_untitled(self, path, type='', ext=''):
+
+        """Create a new, empty untitled entity"""
+
+        self.log.info(u"Creating new %s in %s", type or 'file', path)
+
+        model = yield gen.maybe_future(self.contents_manager.new_untitled(path=path, type=type, ext=ext))
+
+        self.set_status(201)
+
+        validate_model(model, expect_content=False)
+
+        self._finish_model(model)
+
+    
+
+    @gen.coroutine
+
+    def _save(self, model, path):
+
+        """Save an existing file."""
+
+        self.log.info(u"Saving file at %s", path)
+
+        model = yield gen.maybe_future(self.contents_manager.save(model, path))
+
+        validate_model(model, expect_content=False)
+
+        self._finish_model(model)
+
+
+
+    @web.authenticated
+
+    @json_errors
+
+    @gen.coroutine
+
+    def post(self, path=''):
+
+        """Create a new file in the specified path.
+
+
+
+        POST creates new files. The server always decides on the name.
+
+
+
+        POST /api/contents/path
+
+          New untitled, empty file or directory.
+
+        POST /api/contents/path
+
+          with body {"copy_from" : "/path/to/OtherNotebook.ipynb"}
+
+          New copy of OtherNotebook in path
 
         """
 
-        Ensure that user-supplied attrs are used.
 
-        Refs #12073.
+
+        cm = self.contents_manager
+
+
+
+        if cm.file_exists(path):
+
+            raise web.HTTPError(400, "Cannot POST to files, use PUT instead.")
+
+
+
+        if not cm.dir_exists(path):
+
+            raise web.HTTPError(404, "No such directory: %s" % path)
+
+
+
+        model = self.get_json_body()
+
+
+
+        if model is not None:
+
+            copy_from = model.get('copy_from')
+
+            ext = model.get('ext', '')
+
+            type = model.get('type', '')
+
+            if copy_from:
+
+                yield self._copy(copy_from, path)
+
+            else:
+
+                yield self._new_untitled(path, type=type, ext=ext)
+
+        else:
+
+            yield self._new_untitled(path)
+
+
+
+    @web.authenticated
+
+    @json_errors
+
+    @gen.coroutine
+
+    def put(self, path=''):
+
+        """Saves the file in the location specified by name and path.
+
+
+
+        PUT is very similar to POST, but the requester specifies the name,
+
+        whereas with POST, the server picks the name.
+
+
+
+        PUT /api/contents/path/Name.ipynb
+
+          Save notebook at ``path/Name.ipynb``. Notebook structure is specified
+
+          in `content` key of JSON request body. If content is not specified,
+
+          create a new empty notebook.
 
         """
 
-        w = widgets.AdminTimeWidget()
+        model = self.get_json_body()
 
-        self.assertHTMLEqual(
+        if model:
 
-            conditional_escape(w.render('test', datetime(2007, 12, 1, 9, 30))),
+            if model.get('copy_from'):
 
-            '<input value="09:30:00" type="text" class="vTimeField" name="test" size="8" />',
+                raise web.HTTPError(400, "Cannot copy with PUT, only POST")
 
-        )
+            exists = yield gen.maybe_future(self.contents_manager.file_exists(path))
 
-        # pass attrs to widget
+            if exists:
 
-        w = widgets.AdminTimeWidget(attrs={'size': 20, 'class': 'myTimeField'})
+                yield gen.maybe_future(self._save(model, path))
 
-        self.assertHTMLEqual(
+            else:
 
-            conditional_escape(w.render('test', datetime(2007, 12, 1, 9, 30))),
+                yield gen.maybe_future(self._upload(model, path))
 
-            '<input value="09:30:00" type="text" class="myTimeField" name="test" size="20" />',
+        else:
 
-        )
+            yield gen.maybe_future(self._new_untitled(path))
 
 
 
-class AdminSplitDateTimeWidgetTest(DjangoTestCase):
+    @web.authenticated
 
-    def test_render(self):
+    @json_errors
 
-        w = widgets.AdminSplitDateTime()
+    @gen.coroutine
 
-        self.assertHTMLEqual(
+    def delete(self, path=''):
 
-            conditional_escape(w.render('test', datetime(2007, 12, 1, 9, 30))),
+        """delete a file in the given path"""
 
-            '<p class="datetime">Date: <input value="2007-12-01" type="text" class="vDateField" name="test_0" size="10" /><br />Time: <input value="09:30:00" type="text" class="vTimeField" name="test_1" size="8" /></p>',
+        cm = self.contents_manager
 
-        )
+        self.log.warn('delete %s', path)
 
+        yield gen.maybe_future(cm.delete(path))
 
+        self.set_status(204)
 
-    def test_localization(self):
+        self.finish()
 
-        w = widgets.AdminSplitDateTime()
 
 
 
-        with self.settings(USE_L10N=True):
 
-            with translation.override('de-at'):
+class CheckpointsHandler(IPythonHandler):
 
-                w.is_localized = True
 
-                self.assertHTMLEqual(
 
-                    conditional_escape(w.render('test', datetime(2007, 12, 1, 9, 30))),
+    SUPPORTED_METHODS = ('GET', 'POST')
 
-                    '<p class="datetime">Datum: <input value="01.12.2007" type="text" class="vDateField" name="test_0" size="10" /><br />Zeit: <input value="09:30:00" type="text" class="vTimeField" name="test_1" size="8" /></p>',
 
-                )
 
+    @web.authenticated
 
+    @json_errors
 
+    @gen.coroutine
 
+    def get(self, path=''):
 
-class AdminURLWidgetTest(DjangoTestCase):
+        """get lists checkpoints for a file"""
 
-    def test_render(self):
+        cm = self.contents_manager
 
-        w = widgets.AdminURLFieldWidget()
+        checkpoints = yield gen.maybe_future(cm.list_checkpoints(path))
 
-        self.assertHTMLEqual(
+        data = json.dumps(checkpoints, default=date_default)
 
-            conditional_escape(w.render('test', '')),
+        self.finish(data)
 
-            '<input class="vURLField" name="test" type="text" />'
 
-        )
 
-        self.assertHTMLEqual(
+    @web.authenticated
 
-            conditional_escape(w.render('test', 'http://example.com')),
+    @json_errors
 
-            '<p class="url">Currently:<a href="http://example.com">http://example.com</a><br />Change:<input class="vURLField" name="test" type="text" value="http://example.com" /></p>'
+    @gen.coroutine
 
-        )
+    def post(self, path=''):
 
+        """post creates a new checkpoint"""
 
+        cm = self.contents_manager
 
-    def test_render_idn(self):
+        checkpoint = yield gen.maybe_future(cm.create_checkpoint(path))
 
-        w = widgets.AdminURLFieldWidget()
+        data = json.dumps(checkpoint, default=date_default)
 
-        self.assertHTMLEqual(
+        location = url_path_join(self.base_url, 'api/contents',
 
-            conditional_escape(w.render('test', 'http://example-äüö.com')),
+            path, 'checkpoints', checkpoint['id'])
 
-            '<p class="url">Currently:<a href="http://xn--example--7za4pnc.com">http://example-äüö.com</a><br />Change:<input class="vURLField" name="test" type="text" value="http://example-äüö.com" /></p>'
+        self.set_header('Location', url_escape(location))
 
-        )
+        self.set_status(201)
 
+        self.finish(data)
 
 
-    def test_render_quoting(self):
 
-        w = widgets.AdminURLFieldWidget()
 
-        self.assertHTMLEqual(
 
-            conditional_escape(w.render('test', 'http://example.com/<sometag>some text</sometag>')),
+class ModifyCheckpointsHandler(IPythonHandler):
 
-            '<p class="url">Currently:<a href="http://example.com/%3Csometag%3Esome%20text%3C/sometag%3E">http://example.com/&lt;sometag&gt;some text&lt;/sometag&gt;</a><br />Change:<input class="vURLField" name="test" type="text" value="http://example.com/<sometag>some text</sometag>" /></p>'
 
-        )
 
-        self.assertHTMLEqual(
+    SUPPORTED_METHODS = ('POST', 'DELETE')
 
-            conditional_escape(w.render('test', 'http://example-äüö.com/<sometag>some text</sometag>')),
 
-            '<p class="url">Currently:<a href="http://xn--example--7za4pnc.com/%3Csometag%3Esome%20text%3C/sometag%3E">http://example-äüö.com/&lt;sometag&gt;some text&lt;/sometag&gt;</a><br />Change:<input class="vURLField" name="test" type="text" value="http://example-äüö.com/<sometag>some text</sometag>" /></p>'
 
-        )
+    @web.authenticated
 
+    @json_errors
 
+    @gen.coroutine
 
+    def post(self, path, checkpoint_id):
 
+        """post restores a file from a checkpoint"""
 
-class AdminFileWidgetTest(DjangoTestCase):
+        cm = self.contents_manager
 
-    def test_render(self):
+        yield gen.maybe_future(cm.restore_checkpoint(checkpoint_id, path))
 
-        band = models.Band.objects.create(name='Linkin Park')
+        self.set_status(204)
 
-        album = band.album_set.create(
+        self.finish()
 
-            name='Hybrid Theory', cover_art=r'albums\hybrid_theory.jpg'
 
-        )
 
+    @web.authenticated
 
+    @json_errors
 
-        w = widgets.AdminFileWidget()
+    @gen.coroutine
 
-        self.assertHTMLEqual(
+    def delete(self, path, checkpoint_id):
 
-            conditional_escape(w.render('test', album.cover_art)),
+        """delete clears a checkpoint for a given file"""
 
-            '<p class="file-upload">Currently: <a href="%(STORAGE_URL)salbums/hybrid_theory.jpg">albums\hybrid_theory.jpg</a> <span class="clearable-file-input"><input type="checkbox" name="test-clear" id="test-clear_id" /> <label for="test-clear_id">Clear</label></span><br />Change: <input type="file" name="test" /></p>' % { 'STORAGE_URL': default_storage.url('') },
+        cm = self.contents_manager
 
-        )
+        yield gen.maybe_future(cm.delete_checkpoint(checkpoint_id, path))
 
+        self.set_status(204)
 
+        self.finish()
 
-        self.assertHTMLEqual(
 
-            conditional_escape(w.render('test', SimpleUploadedFile('test', b'content'))),
 
-            '<input type="file" name="test" />',
 
-        )
 
+class NotebooksRedirectHandler(IPythonHandler):
 
+    """Redirect /api/notebooks to /api/contents"""
 
+    SUPPORTED_METHODS = ('GET', 'PUT', 'PATCH', 'POST', 'DELETE')
 
 
-class ForeignKeyRawIdWidgetTest(DjangoTestCase):
 
-    def test_render(self):
+    def get(self, path):
 
-        band = models.Band.objects.create(name='Linkin Park')
+        self.log.warn("/api/notebooks is deprecated, use /api/contents")
 
-        band.album_set.create(
+        self.redirect(url_path_join(
 
-            name='Hybrid Theory', cover_art=r'albums\hybrid_theory.jpg'
+            self.base_url,
 
-        )
+            'api/contents',
 
-        rel = models.Album._meta.get_field('band').rel
+            path
 
+        ))
 
 
-        w = widgets.ForeignKeyRawIdWidget(rel, widget_admin_site)
 
-        self.assertHTMLEqual(
+    put = patch = post = delete = get
 
-            conditional_escape(w.render('test', band.pk, attrs={})),
 
-            '<input type="text" name="test" value="%(bandpk)s" class="vForeignKeyRawIdAdminField" /><a href="/widget_admin/admin_widgets/band/?t=id" class="related-lookup" id="lookup_id_test" onclick="return showRelatedObjectLookupPopup(this);"> <img src="%(ADMIN_STATIC_PREFIX)simg/selector-search.gif" width="16" height="16" alt="Lookup" /></a>&nbsp;<strong>Linkin Park</strong>' % dict(admin_static_prefix(), bandpk=band.pk)
 
-        )
 
 
+#-----------------------------------------------------------------------------
 
-    def test_relations_to_non_primary_key(self):
+# URL to handler mappings
 
-        # Check that ForeignKeyRawIdWidget works with fields which aren't
+#-----------------------------------------------------------------------------
 
-        # related to the model's primary key.
 
-        apple = models.Inventory.objects.create(barcode=86, name='Apple')
 
-        models.Inventory.objects.create(barcode=22, name='Pear')
 
-        core = models.Inventory.objects.create(
 
-            barcode=87, name='Core', parent=apple
+_checkpoint_id_regex = r"(?P<checkpoint_id>[\w-]+)"
 
-        )
 
-        rel = models.Inventory._meta.get_field('parent').rel
 
-        w = widgets.ForeignKeyRawIdWidget(rel, widget_admin_site)
+default_handlers = [
 
-        self.assertHTMLEqual(
+    (r"/api/contents%s/checkpoints" % path_regex, CheckpointsHandler),
 
-            w.render('test', core.parent_id, attrs={}),
+    (r"/api/contents%s/checkpoints/%s" % (path_regex, _checkpoint_id_regex),
 
-            '<input type="text" name="test" value="86" class="vForeignKeyRawIdAdminField" /><a href="/widget_admin/admin_widgets/inventory/?t=barcode" class="related-lookup" id="lookup_id_test" onclick="return showRelatedObjectLookupPopup(this);"> <img src="%(ADMIN_STATIC_PREFIX)simg/selector-search.gif" width="16" height="16" alt="Lookup" /></a>&nbsp;<strong>Apple</strong>' % admin_static_prefix()
+        ModifyCheckpointsHandler),
 
-        )
+    (r"/api/contents%s" % path_regex, ContentsHandler),
 
+    (r"/api/notebooks/?(.*)", NotebooksRedirectHandler),
 
-
-    def test_fk_related_model_not_in_admin(self):
-
-        # FK to a model not registered with admin site. Raw ID widget should
-
-        # have no magnifying glass link. See #16542
-
-        big_honeycomb = models.Honeycomb.objects.create(location='Old tree')
-
-        big_honeycomb.bee_set.create()
-
-        rel = models.Bee._meta.get_field('honeycomb').rel
-
-
-
-        w = widgets.ForeignKeyRawIdWidget(rel, widget_admin_site)
-
-        self.assertHTMLEqual(
-
-            conditional_escape(w.render('honeycomb_widget', big_honeycomb.pk, attrs={})),
-
-            '<input type="text" name="honeycomb_widget" value="%(hcombpk)s" />&nbsp;<strong>Honeycomb object</strong>' % {'hcombpk': big_honeycomb.pk}
-
-        )
-
-
-
-    def test_fk_to_self_model_not_in_admin(self):
-
-        # FK to self, not registered with admin site. Raw ID widget should have
-
-        # no magnifying glass link. See #16542
-
-        subject1 = models.Individual.objects.create(name='Subject #1')
-
-        models.Individual.objects.create(name='Child', parent=subject1)
-
-        rel = models.Individual._meta.get_field('parent').rel
-
-
-
-        w = widgets.ForeignKeyRawIdWidget(rel, widget_admin_site)
-
-        self.assertHTMLEqual(
-
-            conditional_escape(w.render('individual_widget', subject1.pk, attrs={})),
-
-            '<input type="text" name="individual_widget" value="%(subj1pk)s" />&nbsp;<strong>Individual object</strong>' % {'subj1pk': subject1.pk}
-
-        )
-
-
-
-    def test_proper_manager_for_label_lookup(self):
-
-        # see #9258
-
-        rel = models.Inventory._meta.get_field('parent').rel
-
-        w = widgets.ForeignKeyRawIdWidget(rel, widget_admin_site)
-
-
-
-        hidden = models.Inventory.objects.create(
-
-            barcode=93, name='Hidden', hidden=True
-
-        )
-
-        child_of_hidden = models.Inventory.objects.create(
-
-            barcode=94, name='Child of hidden', parent=hidden
-
-        )
-
-        self.assertHTMLEqual(
-
-            w.render('test', child_of_hidden.parent_id, attrs={}),
-
-            '<input type="text" name="test" value="93" class="vForeignKeyRawIdAdminField" /><a href="/widget_admin/admin_widgets/inventory/?t=barcode" class="related-lookup" id="lookup_id_test" onclick="return showRelatedObjectLookupPopup(this);"> <img src="%(ADMIN_STATIC_PREFIX)simg/selector-search.gif" width="16" height="16" alt="Lookup" /></a>&nbsp;<strong>Hidden</strong>' % admin_static_prefix()
-
-        )
-
-
-
-
-
-class ManyToManyRawIdWidgetTest(DjangoTestCase):
-
-    def test_render(self):
-
-        band = models.Band.objects.create(name='Linkin Park')
-
-
-
-        m1 = models.Member.objects.create(name='Chester')
-
-        m2 = models.Member.objects.create(name='Mike')
-
-        band.members.add(m1, m2)
-
-        rel = models.Band._meta.get_field('members').rel
-
-
-
-        w = widgets.ManyToManyRawIdWidget(rel, widget_admin_site)
-
-        self.assertHTMLEqual(
-
-            conditional_escape(w.render('test', [m1.pk, m2.pk], attrs={})),
-
-            '<input type="text" name="test" value="%(m1pk)s,%(m2pk)s" class="vManyToManyRawIdAdminField" /><a href="/widget_admin/admin_widgets/member/" class="related-lookup" id="lookup_id_test" onclick="return showRelatedObjectLookupPopup(this);"> <img src="/static/admin/img/selector-search.gif" width="16" height="16" alt="Lookup" /></a>' % dict(admin_static_prefix(), m1pk=m1.pk, m2pk=m2.pk)
-
-        )
-
-
-
-        self.assertHTMLEqual(
-
-            conditional_escape(w.render('test', [m1.pk])),
-
-            '<input type="text" name="test" value="%(m1pk)s" class="vManyToManyRawIdAdminField" /><a href="/widget_admin/admin_widgets/member/" class="related-lookup" id="lookup_id_test" onclick="return showRelatedObjectLookupPopup(this);"> <img src="%(ADMIN_STATIC_PREFIX)simg/selector-search.gif" width="16" height="16" alt="Lookup" /></a>' % dict(admin_static_prefix(), m1pk=m1.pk)
-
-        )
-
-
-
-        self.assertEqual(w._has_changed(None, None), False)
-
-        self.assertEqual(w._has_changed([], None), False)
-
-        self.assertEqual(w._has_changed(None, ['1']), True)
-
-        self.assertEqual(w._has_changed([1, 2], ['1', '2']), False)
-
-        self.assertEqual(w._has_changed([1, 2], ['1']), True)
-
-        self.assertEqual(w._has_changed([1, 2], ['1', '3']), True)
-
-
-
-    def test_m2m_related_model_not_in_admin(self):
-
-        # M2M relationship with model not registered with admin site. Raw ID
-
-        # widget should have no magnifying glass link. See #16542
-
-        consultor1 = models.Advisor.objects.create(name='Rockstar Techie')
-
-
-
-        c1 = models.Company.objects.create(name='Doodle')
-
-        c2 = models.Company.objects.create(name='Pear')
-
-        consultor1.companies.add(c1, c2)
-
-        rel = models.Advisor._meta.get_field('companies').rel
-
-
-
-        w = widgets.ManyToManyRawIdWidget(rel, widget_admin_site)
-
-        self.assertHTMLEqual(
-
-            conditional_escape(w.render('company_widget1', [c1.pk, c2.pk], attrs={})),
-
-            '<input type="text" name="company_widget1" value="%(c1pk)s,%(c2pk)s" />' % {'c1pk': c1.pk, 'c2pk': c2.pk}
-
-        )
-
-
-
-        self.assertHTMLEqual(
-
-            conditional_escape(w.render('company_widget2', [c1.pk])),
-
-            '<input type="text" name="company_widget2" value="%(c1pk)s" />' % {'c1pk': c1.pk}
-
-        )
-
-
-
-class RelatedFieldWidgetWrapperTests(DjangoTestCase):
-
-    def test_no_can_add_related(self):
-
-        rel = models.Individual._meta.get_field('parent').rel
-
-        w = widgets.AdminRadioSelect()
-
-        # Used to fail with a name error.
-
-        w = widgets.RelatedFieldWidgetWrapper(w, rel, widget_admin_site)
-
-        self.assertFalse(w.can_add_related)
-
-
-
-
-
-
-
-@override_settings(PASSWORD_HASHERS=('django.contrib.auth.hashers.SHA1PasswordHasher',))
-
-class DateTimePickerSeleniumFirefoxTests(AdminSeleniumWebDriverTestCase):
-
-    webdriver_class = 'selenium.webdriver.firefox.webdriver.WebDriver'
-
-    fixtures = ['admin-widgets-users.xml']
-
-    urls = "regressiontests.admin_widgets.urls"
-
-
-
-    def test_show_hide_date_time_picker_widgets(self):
-
-        """
-
-        Ensure that pressing the ESC key closes the date and time picker
-
-        widgets.
-
-        Refs #17064.
-
-        """
-
-        from selenium.webdriver.common.keys import Keys
-
-
-
-        self.admin_login(username='super', password='secret', login_url='/')
-
-        # Open a page that has a date and time picker widgets
-
-        self.selenium.get('%s%s' % (self.live_server_url,
-
-            '/admin_widgets/member/add/'))
-
-
-
-        # First, with the date picker widget ---------------------------------
-
-        # Check that the date picker is hidden
-
-        self.assertEqual(
-
-            self.get_css_value('#calendarbox0', 'display'), 'none')
-
-        # Click the calendar icon
-
-        self.selenium.find_element_by_id('calendarlink0').click()
-
-        # Check that the date picker is visible
-
-        self.assertEqual(
-
-            self.get_css_value('#calendarbox0', 'display'), 'block')
-
-        # Press the ESC key
-
-        self.selenium.find_element_by_tag_name('body').send_keys([Keys.ESCAPE])
-
-        # Check that the date picker is hidden again
-
-        self.assertEqual(
-
-            self.get_css_value('#calendarbox0', 'display'), 'none')
-
-
-
-        # Then, with the time picker widget ----------------------------------
-
-        # Check that the time picker is hidden
-
-        self.assertEqual(
-
-            self.get_css_value('#clockbox0', 'display'), 'none')
-
-        # Click the time icon
-
-        self.selenium.find_element_by_id('clocklink0').click()
-
-        # Check that the time picker is visible
-
-        self.assertEqual(
-
-            self.get_css_value('#clockbox0', 'display'), 'block')
-
-        # Press the ESC key
-
-        self.selenium.find_element_by_tag_name('body').send_keys([Keys.ESCAPE])
-
-        # Check that the time picker is hidden again
-
-        self.assertEqual(
-
-            self.get_css_value('#clockbox0', 'display'), 'none')
-
-
-
-class DateTimePickerSeleniumChromeTests(DateTimePickerSeleniumFirefoxTests):
-
-    webdriver_class = 'selenium.webdriver.chrome.webdriver.WebDriver'
-
-
-
-class DateTimePickerSeleniumIETests(DateTimePickerSeleniumFirefoxTests):
-
-    webdriver_class = 'selenium.webdriver.ie.webdriver.WebDriver'
-
-
-
-
-
-@override_settings(PASSWORD_HASHERS=('django.contrib.auth.hashers.SHA1PasswordHasher',))
-
-class HorizontalVerticalFilterSeleniumFirefoxTests(AdminSeleniumWebDriverTestCase):
-
-    webdriver_class = 'selenium.webdriver.firefox.webdriver.WebDriver'
-
-    fixtures = ['admin-widgets-users.xml']
-
-    urls = "regressiontests.admin_widgets.urls"
-
-
-
-    def setUp(self):
-
-        self.lisa = models.Student.objects.create(name='Lisa')
-
-        self.john = models.Student.objects.create(name='John')
-
-        self.bob = models.Student.objects.create(name='Bob')
-
-        self.peter = models.Student.objects.create(name='Peter')
-
-        self.jenny = models.Student.objects.create(name='Jenny')
-
-        self.jason = models.Student.objects.create(name='Jason')
-
-        self.cliff = models.Student.objects.create(name='Cliff')
-
-        self.arthur = models.Student.objects.create(name='Arthur')
-
-        self.school = models.School.objects.create(name='School of Awesome')
-
-        super(HorizontalVerticalFilterSeleniumFirefoxTests, self).setUp()
-
-
-
-    def assertActiveButtons(self, mode, field_name, choose, remove,
-
-                             choose_all=None, remove_all=None):
-
-        choose_link = '#id_%s_add_link' % field_name
-
-        choose_all_link = '#id_%s_add_all_link' % field_name
-
-        remove_link = '#id_%s_remove_link' % field_name
-
-        remove_all_link = '#id_%s_remove_all_link' % field_name
-
-        self.assertEqual(self.has_css_class(choose_link, 'active'), choose)
-
-        self.assertEqual(self.has_css_class(remove_link, 'active'), remove)
-
-        if mode == 'horizontal':
-
-            self.assertEqual(self.has_css_class(choose_all_link, 'active'), choose_all)
-
-            self.assertEqual(self.has_css_class(remove_all_link, 'active'), remove_all)
-
-
-
-    def execute_basic_operations(self, mode, field_name):
-
-        from_box = '#id_%s_from' % field_name
-
-        to_box = '#id_%s_to' % field_name
-
-        choose_link = 'id_%s_add_link' % field_name
-
-        choose_all_link = 'id_%s_add_all_link' % field_name
-
-        remove_link = 'id_%s_remove_link' % field_name
-
-        remove_all_link = 'id_%s_remove_all_link' % field_name
-
-
-
-        # Initial positions ---------------------------------------------------
-
-        self.assertSelectOptions(from_box,
-
-                        [str(self.arthur.id), str(self.bob.id),
-
-                         str(self.cliff.id), str(self.jason.id),
-
-                         str(self.jenny.id), str(self.john.id)])
-
-        self.assertSelectOptions(to_box,
-
-                        [str(self.lisa.id), str(self.peter.id)])
-
-        self.assertActiveButtons(mode, field_name, False, False, True, True)
-
-
-
-        # Click 'Choose all' --------------------------------------------------
-
-        if mode == 'horizontal':
-
-            self.selenium.find_element_by_id(choose_all_link).click()
-
-        elif mode == 'vertical':
-
-            # There 's no 'Choose all' button in vertical mode, so individually
-
-            # select all options and click 'Choose'.
-
-            for option in self.selenium.find_elements_by_css_selector(from_box + ' > option'):
-
-                option.click()
-
-            self.selenium.find_element_by_id(choose_link).click()
-
-        self.assertSelectOptions(from_box, [])
-
-        self.assertSelectOptions(to_box,
-
-                        [str(self.lisa.id), str(self.peter.id),
-
-                         str(self.arthur.id), str(self.bob.id),
-
-                         str(self.cliff.id), str(self.jason.id),
-
-                         str(self.jenny.id), str(self.john.id)])
-
-        self.assertActiveButtons(mode, field_name, False, False, False, True)
-
-
-
-        # Click 'Remove all' --------------------------------------------------
-
-        if mode == 'horizontal':
-
-            self.selenium.find_element_by_id(remove_all_link).click()
-
-        elif mode == 'vertical':
-
-            # There 's no 'Remove all' button in vertical mode, so individually
-
-            # select all options and click 'Remove'.
-
-            for option in self.selenium.find_elements_by_css_selector(to_box + ' > option'):
-
-                option.click()
-
-            self.selenium.find_element_by_id(remove_link).click()
-
-        self.assertSelectOptions(from_box,
-
-                        [str(self.lisa.id), str(self.peter.id),
-
-                         str(self.arthur.id), str(self.bob.id),
-
-                         str(self.cliff.id), str(self.jason.id),
-
-                         str(self.jenny.id), str(self.john.id)])
-
-        self.assertSelectOptions(to_box, [])
-
-        self.assertActiveButtons(mode, field_name, False, False, True, False)
-
-
-
-        # Choose some options ------------------------------------------------
-
-        self.get_select_option(from_box, str(self.lisa.id)).click()
-
-        self.get_select_option(from_box, str(self.jason.id)).click()
-
-        self.get_select_option(from_box, str(self.bob.id)).click()
-
-        self.get_select_option(from_box, str(self.john.id)).click()
-
-        self.assertActiveButtons(mode, field_name, True, False, True, False)
-
-        self.selenium.find_element_by_id(choose_link).click()
-
-        self.assertActiveButtons(mode, field_name, False, False, True, True)
-
-
-
-        self.assertSelectOptions(from_box,
-
-                        [str(self.peter.id), str(self.arthur.id),
-
-                         str(self.cliff.id), str(self.jenny.id)])
-
-        self.assertSelectOptions(to_box,
-
-                        [str(self.lisa.id), str(self.bob.id),
-
-                         str(self.jason.id), str(self.john.id)])
-
-
-
-        # Remove some options -------------------------------------------------
-
-        self.get_select_option(to_box, str(self.lisa.id)).click()
-
-        self.get_select_option(to_box, str(self.bob.id)).click()
-
-        self.assertActiveButtons(mode, field_name, False, True, True, True)
-
-        self.selenium.find_element_by_id(remove_link).click()
-
-        self.assertActiveButtons(mode, field_name, False, False, True, True)
-
-
-
-        self.assertSelectOptions(from_box,
-
-                        [str(self.peter.id), str(self.arthur.id),
-
-                         str(self.cliff.id), str(self.jenny.id),
-
-                         str(self.lisa.id), str(self.bob.id)])
-
-        self.assertSelectOptions(to_box,
-
-                        [str(self.jason.id), str(self.john.id)])
-
-
-
-        # Choose some more options --------------------------------------------
-
-        self.get_select_option(from_box, str(self.arthur.id)).click()
-
-        self.get_select_option(from_box, str(self.cliff.id)).click()
-
-        self.selenium.find_element_by_id(choose_link).click()
-
-
-
-        self.assertSelectOptions(from_box,
-
-                        [str(self.peter.id), str(self.jenny.id),
-
-                         str(self.lisa.id), str(self.bob.id)])
-
-        self.assertSelectOptions(to_box,
-
-                        [str(self.jason.id), str(self.john.id),
-
-                         str(self.arthur.id), str(self.cliff.id)])
-
-
-
-    def test_basic(self):
-
-        self.school.students = [self.lisa, self.peter]
-
-        self.school.alumni = [self.lisa, self.peter]
-
-        self.school.save()
-
-
-
-        self.admin_login(username='super', password='secret', login_url='/')
-
-        self.selenium.get(
-
-            '%s%s' % (self.live_server_url, '/admin_widgets/school/%s/' % self.school.id))
-
-
-
-        self.wait_page_loaded()
-
-        self.execute_basic_operations('vertical', 'students')
-
-        self.execute_basic_operations('horizontal', 'alumni')
-
-
-
-        # Save and check that everything is properly stored in the database ---
-
-        self.selenium.find_element_by_xpath('//input[@value="Save"]').click()
-
-        self.wait_page_loaded()
-
-        self.school = models.School.objects.get(id=self.school.id)  # Reload from database
-
-        self.assertEqual(list(self.school.students.all()),
-
-                         [self.arthur, self.cliff, self.jason, self.john])
-
-        self.assertEqual(list(self.school.alumni.all()),
-
-                         [self.arthur, self.cliff, self.jason, self.john])
-
-
-
-    def test_filter(self):
-
-        """
-
-        Ensure that typing in the search box filters out options displayed in
-
-        the 'from' box.
-
-        """
-
-        from selenium.webdriver.common.keys import Keys
-
-
-
-        self.school.students = [self.lisa, self.peter]
-
-        self.school.alumni = [self.lisa, self.peter]
-
-        self.school.save()
-
-
-
-        self.admin_login(username='super', password='secret', login_url='/')
-
-        self.selenium.get(
-
-            '%s%s' % (self.live_server_url, '/admin_widgets/school/%s/' % self.school.id))
-
-
-
-
-
-        for field_name in ['students', 'alumni']:
-
-            from_box = '#id_%s_from' % field_name
-
-            to_box = '#id_%s_to' % field_name
-
-            choose_link = '#id_%s_add_link' % field_name
-
-            remove_link = '#id_%s_remove_link' % field_name
-
-            input = self.selenium.find_element_by_css_selector('#id_%s_input' % field_name)
-
-
-
-            # Initial values
-
-            self.assertSelectOptions(from_box,
-
-                        [str(self.arthur.id), str(self.bob.id),
-
-                         str(self.cliff.id), str(self.jason.id),
-
-                         str(self.jenny.id), str(self.john.id)])
-
-
-
-            # Typing in some characters filters out non-matching options
-
-            input.send_keys('a')
-
-            self.assertSelectOptions(from_box, [str(self.arthur.id), str(self.jason.id)])
-
-            input.send_keys('R')
-
-            self.assertSelectOptions(from_box, [str(self.arthur.id)])
-
-
-
-            # Clearing the text box makes the other options reappear
-
-            input.send_keys([Keys.BACK_SPACE])
-
-            self.assertSelectOptions(from_box, [str(self.arthur.id), str(self.jason.id)])
-
-            input.send_keys([Keys.BACK_SPACE])
-
-            self.assertSelectOptions(from_box,
-
-                        [str(self.arthur.id), str(self.bob.id),
-
-                         str(self.cliff.id), str(self.jason.id),
-
-                         str(self.jenny.id), str(self.john.id)])
-
-
-
-            # -----------------------------------------------------------------
-
-            # Check that chosing a filtered option sends it properly to the
-
-            # 'to' box.
-
-            input.send_keys('a')
-
-            self.assertSelectOptions(from_box, [str(self.arthur.id), str(self.jason.id)])
-
-            self.get_select_option(from_box, str(self.jason.id)).click()
-
-            self.selenium.find_element_by_css_selector(choose_link).click()
-
-            self.assertSelectOptions(from_box, [str(self.arthur.id)])
-
-            self.assertSelectOptions(to_box,
-
-                        [str(self.lisa.id), str(self.peter.id),
-
-                         str(self.jason.id)])
-
-
-
-            self.get_select_option(to_box, str(self.lisa.id)).click()
-
-            self.selenium.find_element_by_css_selector(remove_link).click()
-
-            self.assertSelectOptions(from_box,
-
-                        [str(self.arthur.id), str(self.lisa.id)])
-
-            self.assertSelectOptions(to_box,
-
-                        [str(self.peter.id), str(self.jason.id)])
-
-
-
-            input.send_keys([Keys.BACK_SPACE]) # Clear text box
-
-            self.assertSelectOptions(from_box,
-
-                        [str(self.arthur.id), str(self.bob.id),
-
-                         str(self.cliff.id), str(self.jenny.id),
-
-                         str(self.john.id), str(self.lisa.id)])
-
-            self.assertSelectOptions(to_box,
-
-                        [str(self.peter.id), str(self.jason.id)])
-
-
-
-        # Save and check that everything is properly stored in the database ---
-
-        self.selenium.find_element_by_xpath('//input[@value="Save"]').click()
-
-        self.wait_page_loaded()
-
-        self.school = models.School.objects.get(id=self.school.id) # Reload from database
-
-        self.assertEqual(list(self.school.students.all()),
-
-                         [self.jason, self.peter])
-
-        self.assertEqual(list(self.school.alumni.all()),
-
-                         [self.jason, self.peter])
-
-
-
-class HorizontalVerticalFilterSeleniumChromeTests(HorizontalVerticalFilterSeleniumFirefoxTests):
-
-    webdriver_class = 'selenium.webdriver.chrome.webdriver.WebDriver'
-
-
-
-class HorizontalVerticalFilterSeleniumIETests(HorizontalVerticalFilterSeleniumFirefoxTests):
-
-    webdriver_class = 'selenium.webdriver.ie.webdriver.WebDriver'
+]

@@ -1,375 +1,281 @@
 # Source: CVEFixes dataset
-# Safety: vulnerable
+# Safety: safe
 # Category: safe
 
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
+"""
 
+Custom Authenticator to use Bitbucket OAuth with JupyterHub
 
+"""
 
-# Copyright 2012 OpenStack LLC
 
-#
 
-# Licensed under the Apache License, Version 2.0 (the "License"); you may
+import json
 
-# not use this file except in compliance with the License. You may obtain
+import urllib
 
-# a copy of the License at
 
-#
 
-#      http://www.apache.org/licenses/LICENSE-2.0
+from tornado.auth import OAuth2Mixin
 
-#
+from tornado import web
 
-# Unless required by applicable law or agreed to in writing, software
 
-# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+from tornado.httputil import url_concat
 
-# License for the specific language governing permissions and limitations
+from tornado.httpclient import HTTPRequest, AsyncHTTPClient
 
-# under the License.
 
 
+from jupyterhub.auth import LocalAuthenticator
 
-import gettext
 
-import os
 
-import sys
+from traitlets import Set, default, observe
 
 
 
-from keystone.common import logging
+from .oauth2 import OAuthLoginHandler, OAuthenticator
 
-from keystone.openstack.common import cfg
 
 
 
 
+def _api_headers(access_token):
 
-gettext.install('keystone', unicode=1)
+    return {
 
+        "Accept": "application/json",
 
+        "User-Agent": "JupyterHub",
 
+        "Authorization": "Bearer {}".format(access_token),
 
+    }
 
-CONF = cfg.CONF
 
 
 
 
+class BitbucketOAuthenticator(OAuthenticator):
 
-def setup_logging(conf):
 
-    """
 
-    Sets up the logging options for a log with supplied name
+    _deprecated_oauth_aliases = {
 
+        "team_whitelist": ("allowed_teams", "0.12.0"),
 
+        **OAuthenticator._deprecated_oauth_aliases,
 
-    :param conf: a cfg.ConfOpts object
+    }
 
-    """
 
 
+    login_service = "Bitbucket"
 
-    if conf.log_config:
+    client_id_env = 'BITBUCKET_CLIENT_ID'
 
-        # Use a logging configuration file for all settings...
+    client_secret_env = 'BITBUCKET_CLIENT_SECRET'
 
-        if os.path.exists(conf.log_config):
 
-            logging.config.fileConfig(conf.log_config)
 
-            return
+    @default("authorize_url")
 
-        else:
+    def _authorize_url_default(self):
 
-            raise RuntimeError('Unable to locate specified logging '
+        return "https://bitbucket.org/site/oauth2/authorize"
 
-                               'config file: %s' % conf.log_config)
 
 
+    @default("token_url")
 
-    root_logger = logging.root
+    def _token_url_default(self):
 
-    if conf.debug:
+        return "https://bitbucket.org/site/oauth2/access_token"
 
-        root_logger.setLevel(logging.DEBUG)
 
-    elif conf.verbose:
 
-        root_logger.setLevel(logging.INFO)
+    team_whitelist = Set(help="Deprecated, use `BitbucketOAuthenticator.allowed_teams`", config=True,)
 
-    else:
 
-        root_logger.setLevel(logging.WARNING)
 
+    allowed_teams = Set(
 
+        config=True, help="Automatically allow members of selected teams"
 
-    formatter = logging.Formatter(conf.log_format, conf.log_date_format)
+    )
 
 
 
-    if conf.use_syslog:
 
-        try:
 
-            facility = getattr(logging.SysLogHandler,
+    headers = {
 
-                               conf.syslog_log_facility)
+        "Accept": "application/json",
 
-        except AttributeError:
+        "User-Agent": "JupyterHub",
 
-            raise ValueError(_('Invalid syslog facility'))
+        "Authorization": "Bearer {}",
 
+    }
 
 
-        handler = logging.SysLogHandler(address='/dev/log',
 
-                                        facility=facility)
+    async def authenticate(self, handler, data=None):
 
-    elif conf.log_file:
+        code = handler.get_argument("code")
 
-        logfile = conf.log_file
+        # TODO: Configure the curl_httpclient for tornado
 
-        if conf.log_dir:
+        http_client = AsyncHTTPClient()
 
-            logfile = os.path.join(conf.log_dir, logfile)
 
-        handler = logging.WatchedFileHandler(logfile)
 
-    else:
+        params = dict(
 
-        handler = logging.StreamHandler(sys.stdout)
+            client_id=self.client_id,
 
+            client_secret=self.client_secret,
 
+            grant_type="authorization_code",
 
-    handler.setFormatter(formatter)
+            code=code,
 
-    root_logger.addHandler(handler)
+            redirect_uri=self.get_callback_url(handler),
 
+        )
 
 
 
+        url = url_concat("https://bitbucket.org/site/oauth2/access_token", params)
 
-def register_str(*args, **kw):
 
-    conf = kw.pop('conf', CONF)
 
-    group = kw.pop('group', None)
+        bb_header = {"Content-Type": "application/x-www-form-urlencoded;charset=utf-8"}
 
-    return conf.register_opt(cfg.StrOpt(*args, **kw), group=group)
+        req = HTTPRequest(
 
+            url,
 
+            method="POST",
 
+            auth_username=self.client_id,
 
+            auth_password=self.client_secret,
 
-def register_cli_str(*args, **kw):
+            body=urllib.parse.urlencode(params).encode('utf-8'),
 
-    conf = kw.pop('conf', CONF)
+            headers=bb_header,
 
-    group = kw.pop('group', None)
+        )
 
-    return conf.register_cli_opt(cfg.StrOpt(*args, **kw), group=group)
 
 
+        resp = await http_client.fetch(req)
 
+        resp_json = json.loads(resp.body.decode('utf8', 'replace'))
 
 
-def register_bool(*args, **kw):
 
-    conf = kw.pop('conf', CONF)
+        access_token = resp_json['access_token']
 
-    group = kw.pop('group', None)
 
-    return conf.register_opt(cfg.BoolOpt(*args, **kw), group=group)
 
+        # Determine who the logged in user is
 
+        req = HTTPRequest(
 
+            "https://api.bitbucket.org/2.0/user",
 
+            method="GET",
 
-def register_cli_bool(*args, **kw):
+            headers=_api_headers(access_token),
 
-    conf = kw.pop('conf', CONF)
+        )
 
-    group = kw.pop('group', None)
+        resp = await http_client.fetch(req)
 
-    return conf.register_cli_opt(cfg.BoolOpt(*args, **kw), group=group)
+        resp_json = json.loads(resp.body.decode('utf8', 'replace'))
 
 
 
+        username = resp_json["username"]
 
 
-def register_int(*args, **kw):
 
-    conf = kw.pop('conf', CONF)
+        # Check if user is a member of any allowed teams.
 
-    group = kw.pop('group', None)
+        # This check is performed here, as the check requires `access_token`.
 
-    return conf.register_opt(cfg.IntOpt(*args, **kw), group=group)
+        if self.allowed_teams:
 
+            user_in_team = await self._check_membership_allowed_teams(username, access_token)
 
+            if not user_in_team:
 
+                self.log.warning("%s not in team allowed list of users", username)
 
+                return None
 
-def register_cli_int(*args, **kw):
 
-    conf = kw.pop('conf', CONF)
 
-    group = kw.pop('group', None)
+        return {
 
-    return conf.register_cli_opt(cfg.IntOpt(*args, **kw), group=group)
+            'name': username,
 
+            'auth_state': {'access_token': access_token, 'bitbucket_user': resp_json},
 
+        }
 
-register_str('admin_token', default='ADMIN')
 
-register_str('bind_host', default='0.0.0.0')
 
-register_str('compute_port', default=8774)
+    async def _check_membership_allowed_teams(self, username, access_token):
 
-register_str('admin_port', default=35357)
+        http_client = AsyncHTTPClient()
 
-register_str('public_port', default=5000)
 
-register_str('onready')
 
-register_str('auth_admin_prefix', default='')
+        headers = _api_headers(access_token)
 
+        # We verify the team membership by calling teams endpoint.
 
+        next_page = url_concat(
 
-#ssl options
+            "https://api.bitbucket.org/2.0/teams", {'role': 'member'}
 
-register_bool('enable', group='ssl', default=False)
+        )
 
-register_str('certfile', group='ssl', default=None)
+        while next_page:
 
-register_str('keyfile', group='ssl', default=None)
+            req = HTTPRequest(next_page, method="GET", headers=headers)
 
-register_str('ca_certs', group='ssl', default=None)
+            resp = await http_client.fetch(req)
 
-register_bool('cert_required', group='ssl', default=False)
+            resp_json = json.loads(resp.body.decode('utf8', 'replace'))
 
-#signing options
+            next_page = resp_json.get('next', None)
 
-register_str('token_format', group='signing',
 
-             default="UUID")
 
-register_str('certfile', group='signing',
+            user_teams = set([entry["username"] for entry in resp_json["values"]])
 
-             default="/etc/keystone/ssl/certs/signing_cert.pem")
+            # check if any of the organizations seen thus far are in the allowed list
 
-register_str('keyfile', group='signing',
+            if len(self.allowed_teams & user_teams) > 0:
 
-             default="/etc/keystone/ssl/private/signing_key.pem")
+                return True
 
-register_str('ca_certs', group='signing',
+        return False
 
-             default="/etc/keystone/ssl/certs/ca.pem")
 
-register_int('key_size', group='signing', default=1024)
 
-register_int('valid_days', group='signing', default=3650)
 
-register_str('ca_password', group='signing', default=None)
 
+class LocalBitbucketOAuthenticator(LocalAuthenticator, BitbucketOAuthenticator):
 
+    """A version that mixes in local system user creation"""
 
 
 
-# sql options
-
-register_str('connection', group='sql', default='sqlite:///keystone.db')
-
-register_int('idle_timeout', group='sql', default=200)
-
-
-
-
-
-register_str('driver', group='catalog',
-
-             default='keystone.catalog.backends.sql.Catalog')
-
-register_str('driver', group='identity',
-
-             default='keystone.identity.backends.sql.Identity')
-
-register_str('driver', group='policy',
-
-             default='keystone.policy.backends.rules.Policy')
-
-register_str('driver', group='token',
-
-             default='keystone.token.backends.kvs.Token')
-
-register_str('driver', group='ec2',
-
-             default='keystone.contrib.ec2.backends.kvs.Ec2')
-
-register_str('driver', group='stats',
-
-             default='keystone.contrib.stats.backends.kvs.Stats')
-
-
-
-#ldap
-
-register_str('url', group='ldap', default='ldap://localhost')
-
-register_str('user', group='ldap', default='dc=Manager,dc=example,dc=com')
-
-register_str('password', group='ldap', default='freeipa4all')
-
-register_str('suffix', group='ldap', default='cn=example,cn=com')
-
-register_bool('use_dumb_member', group='ldap', default=False)
-
-register_str('user_name_attribute', group='ldap', default='sn')
-
-
-
-
-
-register_str('user_tree_dn', group='ldap', default=None)
-
-register_str('user_objectclass', group='ldap', default='inetOrgPerson')
-
-register_str('user_id_attribute', group='ldap', default='cn')
-
-
-
-register_str('tenant_tree_dn', group='ldap', default=None)
-
-register_str('tenant_objectclass', group='ldap', default='groupOfNames')
-
-register_str('tenant_id_attribute', group='ldap', default='cn')
-
-register_str('tenant_member_attribute', group='ldap', default='member')
-
-register_str('tenant_name_attribute', group='ldap', default='ou')
-
-
-
-register_str('role_tree_dn', group='ldap', default=None)
-
-register_str('role_objectclass', group='ldap', default='organizationalRole')
-
-register_str('role_id_attribute', group='ldap', default='cn')
-
-register_str('role_member_attribute', group='ldap', default='roleOccupant')
-
-
-
-#pam
-
-register_str('url', group='pam', default=None)
-
-register_str('userid', group='pam', default=None)
-
-register_str('password', group='pam', default=None)
+    pass

@@ -2,306 +2,162 @@
 # Safety: safe
 # Category: safe
 
-#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
+# See https://zulip.readthedocs.io/en/latest/subsystems/thumbnailing.html
 
-
-"""
-
-This is the main CLI for lookatme
-
-"""
-
-
-
-
-
-import click
-
-import logging
-
-import io
+import base64
 
 import os
 
-import pygments.styles
-
 import sys
 
-import tempfile
+import urllib
+
+from urllib.parse import urljoin, urlsplit, urlunsplit
+
+from django.conf import settings
+
+from libthumbor import CryptoURL
 
 
 
+ZULIP_PATH = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath('__file__'))))
 
-
-import lookatme.tui
-
-import lookatme.log
-
-import lookatme.config
-
-from lookatme.pres import Presentation
-
-from lookatme.schemas import StyleSchema
+sys.path.append(ZULIP_PATH)
 
 
 
+from zthumbor.loaders.helpers import (
 
-
-@click.command("lookatme")
-
-@click.option("--debug", "debug", is_flag="True", default=False)
-
-@click.option(
-
-    "-l",
-
-    "--log",
-
-    "log_path",
-
-    type=click.Path(writable=True),
-
-    default=os.path.join(tempfile.gettempdir(), "lookatme.log"),
+    THUMBOR_S3_TYPE, THUMBOR_LOCAL_FILE_TYPE, THUMBOR_EXTERNAL_TYPE
 
 )
 
-@click.option(
+from zerver.lib.camo import get_camo_url
 
-    "-t",
 
-    "--theme",
 
-    "theme",
+def is_thumbor_enabled() -> bool:
 
-    type=click.Choice(["dark", "light"]),
+    return settings.THUMBOR_URL != ''
 
-    default="dark",
 
-)
 
-@click.option(
+def user_uploads_or_external(url: str) -> bool:
 
-    "-s",
+    u = urlsplit(url)
 
-    "--style",
+    return u.scheme != "" or u.netloc != "" or u.path.startswith("/user_uploads/")
 
-    "code_style",
 
-    default=None,
 
-    type=click.Choice(list(pygments.styles.get_all_styles())),
+def get_source_type(url: str) -> str:
 
-)
+    if not url.startswith('/user_uploads/'):
 
-@click.option(
+        return THUMBOR_EXTERNAL_TYPE
 
-    "--dump-styles",
 
-    help="Dump the resolved styles that will be used with the presentation to stdout",
 
-    is_flag=True,
+    local_uploads_dir = settings.LOCAL_UPLOADS_DIR
 
-    default=False,
+    if local_uploads_dir:
 
-)
+        return THUMBOR_LOCAL_FILE_TYPE
 
-@click.option(
+    return THUMBOR_S3_TYPE
 
-    "--live",
 
-    "--live-reload",
 
-    "live_reload",
+def generate_thumbnail_url(path: str,
 
-    help="Watch the input filename for modifications and automatically reload",
+                           size: str='0x0',
 
-    is_flag=True,
+                           is_camo_url: bool=False) -> str:
 
-    default=False,
+    path = urljoin("/", path)
 
-)
+    u = urlsplit(path)
 
-@click.option(
 
-    "-s",
 
-    "--safe",
+    if not is_thumbor_enabled():
 
-    help="Do not load any new extensions specified in the source markdown. "
+        if u.scheme == "" and u.netloc == "":
 
-         "Extensions specified via env var or -e are still loaded",
+            return urlunsplit(u)
 
-    is_flag=True,
+        return get_camo_url(path)
 
-    default=False,
 
-)
 
-@click.option(
+    if u.scheme == "" and u.netloc == "" and not u.path.startswith("/user_uploads/"):
 
-    "--no-ext-warn",
+        return urlunsplit(u)
 
-    help="Load new extensions specified in the source markdown without warning",
 
-    is_flag=True,
 
-    default=False,
+    source_type = get_source_type(path)
 
-)
+    safe_url = base64.urlsafe_b64encode(path.encode()).decode('utf-8')
 
-@click.option(
+    image_url = '%s/source_type/%s' % (safe_url, source_type)
 
-    "-i",
+    width, height = map(int, size.split('x'))
 
-    "--ignore-ext-failure",
+    crypto = CryptoURL(key=settings.THUMBOR_KEY)
 
-    help="Ignore load failures of extensions",
 
-    is_flag=True,
 
-    default=False,
+    smart_crop_enabled = True
 
-)
+    apply_filters = ['no_upscale()']
 
-@click.option(
+    if is_camo_url:
 
-    "-e",
+        smart_crop_enabled = False
 
-    "--exts",
+        apply_filters.append('quality(100)')
 
-    "extensions",
+    if size != '0x0':
 
-    help="A comma-separated list of extension names to automatically load"
+        apply_filters.append('sharpen(0.5,0.2,true)')
 
-         " (LOOKATME_EXTS)",
 
-    envvar="LOOKATME_EXTS",
 
-    default="",
+    encrypted_url = crypto.generate(
 
-)
+        width=width,
 
-@click.option(
+        height=height,
 
-    "--single",
+        smart=smart_crop_enabled,
 
-    "--one",
+        filters=apply_filters,
 
-    "single_slide",
-
-    help="Render the source as a single slide",
-
-    is_flag=True,
-
-    default=False
-
-)
-
-@click.version_option(lookatme.__version__)
-
-@click.argument(
-
-    "input_files",
-
-    type=click.File("r"),
-
-    nargs=-1,
-
-)
-
-def main(debug, log_path, theme, code_style, dump_styles,
-
-         input_files, live_reload, extensions, single_slide, safe, no_ext_warn,
-
-         ignore_ext_failure):
-
-    """lookatme - An interactive, terminal-based markdown presentation tool.
-
-    
-
-    See https://lookatme.readthedocs.io/en/v{{VERSION}} for documentation
-
-    """
-
-    if debug:
-
-        lookatme.config.LOG = lookatme.log.create_log(log_path)
-
-    else:
-
-        lookatme.config.LOG = lookatme.log.create_null_log()
-
-
-
-    if len(input_files) == 0:
-
-        input_files = [io.StringIO("")]
-
-
-
-    preload_exts = [x.strip() for x in extensions.split(',')]
-
-    preload_exts = list(filter(lambda x: x != '', preload_exts))
-
-    pres = Presentation(
-
-        input_files[0],
-
-        theme,
-
-        code_style,
-
-        live_reload=live_reload,
-
-        single_slide=single_slide,
-
-        preload_extensions=preload_exts,
-
-        safe=safe,
-
-        no_ext_warn=no_ext_warn,
-
-        ignore_ext_failure=ignore_ext_failure,
+        image_url=image_url
 
     )
 
 
 
-    if dump_styles:
+    if settings.THUMBOR_URL == 'http://127.0.0.1:9995':
 
-        print(StyleSchema().dumps(pres.styles))
+        # If THUMBOR_URL is the default then thumbor is hosted on same machine
 
-        return 0
+        # as the Zulip server and we should serve a relative URL.
 
+        # We add a /thumbor in front of the relative url because we make
 
+        # use of a proxy pass to redirect request internally in Nginx to 9995
 
-    try:
+        # port where thumbor is running.
 
-        pres.run()
+        thumbnail_url = '/thumbor' + encrypted_url
 
-    except Exception as e:
+    else:
 
-        number = pres.tui.curr_slide.number + 1
+        thumbnail_url = urllib.parse.urljoin(settings.THUMBOR_URL, encrypted_url)
 
-        click.echo(f"Error rendering slide {number}: {e}")
-
-        if not debug:
-
-            click.echo("Rerun with --debug to view the full traceback in logs")
-
-        else:
-
-            lookatme.config.LOG.exception(f"Error rendering slide {number}: {e}")
-
-            click.echo(f"See {log_path} for traceback")
-
-        raise click.Abort()
-
-
-
-
-
-if __name__ == "__main__":
-
-    main()
+    return thumbnail_url

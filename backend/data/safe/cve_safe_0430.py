@@ -1,163 +1,185 @@
 # Source: CVEFixes dataset
-# Safety: safe
+# Safety: vulnerable
 # Category: safe
 
-# -*- coding: utf-8 -*-
+from functools import partial
 
-# See https://zulip.readthedocs.io/en/latest/subsystems/thumbnailing.html
 
-import base64
 
-import os
-
-import sys
-
-import urllib
-
-from urllib.parse import urljoin, urlsplit, urlunsplit
+import django_otp
 
 from django.conf import settings
 
-from libthumbor import CryptoURL
+from django.contrib.auth.views import redirect_to_login
 
+from django.urls import NoReverseMatch, reverse
 
+from django.utils.functional import SimpleLazyObject
 
-ZULIP_PATH = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath('__file__'))))
+from django_otp.middleware import OTPMiddleware as _OTPMiddleware
 
-sys.path.append(ZULIP_PATH)
 
 
 
-from zthumbor.loaders.helpers import (
 
-    THUMBOR_S3_TYPE, THUMBOR_LOCAL_FILE_TYPE, THUMBOR_EXTERNAL_TYPE
+class VerifyUserMiddleware(_OTPMiddleware):
 
-)
+    _allowed_url_names = [
 
-from zerver.lib.camo import get_camo_url
+        "wagtail_2fa_auth",
 
+        "wagtail_2fa_device_list",
 
+        "wagtail_2fa_device_new",
 
-def is_thumbor_enabled() -> bool:
+        "wagtail_2fa_device_qrcode",
 
-    return settings.THUMBOR_URL != ''
+        "wagtailadmin_login",
 
+        "wagtailadmin_logout",
 
+    ]
 
-def user_uploads_or_external(url: str) -> bool:
 
-    u = urlsplit(url)
 
-    return u.scheme != "" or u.netloc != "" or u.path.startswith("/user_uploads/")
+    def __call__(self, request):
 
+        if hasattr(self, 'process_request'):
 
+            response = self.process_request(request)
 
-def get_source_type(url: str) -> str:
+        if not response:
 
-    if not url.startswith('/user_uploads/'):
+            response = self.get_response(request)
 
-        return THUMBOR_EXTERNAL_TYPE
+        if hasattr(self, 'process_response'):
 
+            response = self.process_response(request, response)
 
+        return response
 
-    local_uploads_dir = settings.LOCAL_UPLOADS_DIR
 
-    if local_uploads_dir:
 
-        return THUMBOR_LOCAL_FILE_TYPE
+    def process_request(self, request):
 
-    return THUMBOR_S3_TYPE
+        if request.user:
 
+            request.user = SimpleLazyObject(partial(self._verify_user, request, request.user))
 
+        user = request.user
 
-def generate_thumbnail_url(path: str,
+        if self._require_verified_user(request):
 
-                           size: str='0x0',
+            user_has_device = django_otp.user_has_device(user, confirmed=True)
 
-                           is_camo_url: bool=False) -> str:
 
-    path = urljoin("/", path)
 
-    u = urlsplit(path)
+            if user_has_device and not user.is_verified():
 
+                return redirect_to_login(
 
+                    request.get_full_path(), login_url=reverse("wagtail_2fa_auth")
 
-    if not is_thumbor_enabled():
+                )
 
-        if u.scheme == "" and u.netloc == "":
 
-            return urlunsplit(u)
 
-        return get_camo_url(path)
+            elif not user_has_device and settings.WAGTAIL_2FA_REQUIRED:
 
+                # only allow the user to visit the admin index page and the
 
+                # admin setup page
 
-    if u.scheme == "" and u.netloc == "" and not u.path.startswith("/user_uploads/"):
+                return redirect_to_login(
 
-        return urlunsplit(u)
+                    request.get_full_path(), login_url=reverse("wagtail_2fa_device_new")
 
+                )
 
 
-    source_type = get_source_type(path)
 
-    safe_url = base64.urlsafe_b64encode(path.encode()).decode('utf-8')
+    def _require_verified_user(self, request):
 
-    image_url = '%s/source_type/%s' % (safe_url, source_type)
+        user = request.user
 
-    width, height = map(int, size.split('x'))
 
-    crypto = CryptoURL(key=settings.THUMBOR_KEY)
 
+        if not settings.WAGTAIL_2FA_REQUIRED:
 
+            # If two factor authentication is disabled in the settings
 
-    smart_crop_enabled = True
+            return False
 
-    apply_filters = ['no_upscale()']
 
-    if is_camo_url:
 
-        smart_crop_enabled = False
+        if not user.is_authenticated:
 
-        apply_filters.append('quality(100)')
+            return False
 
-    if size != '0x0':
 
-        apply_filters.append('sharpen(0.5,0.2,true)')
 
+        # If the user has no access to the admin anyway then don't require a
 
+        # verified user here
 
-    encrypted_url = crypto.generate(
+        if not (
 
-        width=width,
+            user.is_staff
 
-        height=height,
+            or user.is_superuser
 
-        smart=smart_crop_enabled,
+            or user.has_perms(["wagtailadmin.access_admin"])
 
-        filters=apply_filters,
+        ):
 
-        image_url=image_url
+            return False
 
-    )
 
 
+        # Allow the user to a fixed number of paths when not verified
 
-    if settings.THUMBOR_URL == 'http://127.0.0.1:9995':
+        if request.path in self._allowed_paths:
 
-        # If THUMBOR_URL is the default then thumbor is hosted on same machine
+            return False
 
-        # as the Zulip server and we should serve a relative URL.
 
-        # We add a /thumbor in front of the relative url because we make
 
-        # use of a proxy pass to redirect request internally in Nginx to 9995
+        # For all other cases require that the user is verfied via otp
 
-        # port where thumbor is running.
+        return True
 
-        thumbnail_url = '/thumbor' + encrypted_url
 
-    else:
 
-        thumbnail_url = urllib.parse.urljoin(settings.THUMBOR_URL, encrypted_url)
+    @property
 
-    return thumbnail_url
+    def _allowed_paths(self):
+
+        """Return the paths the user may visit when not verified via otp
+
+
+
+        This result cannot be cached since we want to be compatible with the
+
+        django-hosts package. Django-hosts alters the urlconf based on the
+
+        hostname in the request, so the urls might exist for admin.<domain> but
+
+        not for www.<domain>.
+
+
+
+        """
+
+        results = []
+
+        for route_name in self._allowed_url_names:
+
+            try:
+
+                results.append(settings.WAGTAIL_MOUNT_PATH + reverse(route_name))
+
+            except NoReverseMatch:
+
+                pass
+
+        return results

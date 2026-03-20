@@ -2,564 +2,130 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-try:
+# Copyright 2019 The TensorFlow Authors. All Rights Reserved.
 
-    from urllib.parse import urlparse, urlunparse
+#
 
-except ImportError:     # Python 2
+# Licensed under the Apache License, Version 2.0 (the "License");
 
-    from urlparse import urlparse, urlunparse
+# you may not use this file except in compliance with the License.
 
+# You may obtain a copy of the License at
 
+#
 
-from django.conf import settings
+#     http://www.apache.org/licenses/LICENSE-2.0
 
-from django.core.urlresolvers import reverse
+#
 
-from django.http import HttpResponseRedirect, QueryDict
+# Unless required by applicable law or agreed to in writing, software
 
-from django.template.response import TemplateResponse
+# distributed under the License is distributed on an "AS IS" BASIS,
 
-from django.utils.http import base36_to_int
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 
-from django.utils.translation import ugettext as _
+# See the License for the specific language governing permissions and
 
-from django.shortcuts import resolve_url
+# limitations under the License.
 
-from django.views.decorators.debug import sensitive_post_parameters
+# ==============================================================================
 
-from django.views.decorators.cache import never_cache
+"""Raw ops tests."""
 
-from django.views.decorators.csrf import csrf_protect
 
 
+from __future__ import absolute_import
 
-# Avoid shadowing the login() and logout() views below.
+from __future__ import division
 
-from django.contrib.auth import REDIRECT_FIELD_NAME, login as auth_login, logout as auth_logout, get_user_model
+from __future__ import print_function
 
-from django.contrib.auth.decorators import login_required
 
-from django.contrib.auth.forms import AuthenticationForm, PasswordResetForm, SetPasswordForm, PasswordChangeForm
 
-from django.contrib.auth.tokens import default_token_generator
+from tensorflow.python.eager import context
 
-from django.contrib.sites.models import get_current_site
+from tensorflow.python.framework import constant_op
 
+from tensorflow.python.framework import ops
 
+from tensorflow.python.framework import test_util
 
+from tensorflow.python.ops import gen_math_ops
 
+from tensorflow.python.platform import test
 
-@sensitive_post_parameters()
 
-@csrf_protect
 
-@never_cache
 
-def login(request, template_name='registration/login.html',
 
-          redirect_field_name=REDIRECT_FIELD_NAME,
+@test_util.run_all_in_graph_and_eager_modes
 
-          authentication_form=AuthenticationForm,
+class RawOpsTest(test.TestCase):
 
-          current_app=None, extra_context=None):
 
-    """
 
-    Displays the login form and handles the login action.
+  def testSimple(self):
 
-    """
+    x = constant_op.constant(1)
 
-    redirect_to = request.REQUEST.get(redirect_field_name, '')
+    self.assertEqual([2], self.evaluate(gen_math_ops.Add(x=x, y=x)))
 
 
 
-    if request.method == "POST":
+  def testRequiresKwargs(self):
 
-        form = authentication_form(data=request.POST)
+    with self.assertRaisesRegex(TypeError, "only takes keyword args"):
 
-        if form.is_valid():
+      gen_math_ops.Add(1., 1.)
 
-            # Use default setting if redirect_to is empty
 
-            if not redirect_to:
 
-                redirect_to = settings.LOGIN_REDIRECT_URL
+  def testRequiresKwargs_providesSuggestion(self):
 
-            redirect_to = resolve_url(redirect_to)
+    msg = "possible keys: \\['x', 'y', 'name'\\]"
 
+    with self.assertRaisesRegex(TypeError, msg):
 
+      gen_math_ops.Add(1., y=2.)
 
-            netloc = urlparse(redirect_to)[1]
 
-            # Heavier security check -- don't allow redirection to a different
 
-            # host.
+  def testName(self):
 
-            if netloc and netloc != request.get_host():
+    x = constant_op.constant(1)
 
-                redirect_to = resolve_url(settings.LOGIN_REDIRECT_URL)
+    op = gen_math_ops.Add(x=x, y=x, name="double")
 
+    if not context.executing_eagerly():
 
+      # `Tensor.name` is not available in eager.
 
-            # Okay, security checks complete. Log the user in.
+      self.assertEqual(op.name, "double:0")
 
-            auth_login(request, form.get_user())
 
 
+  def testDoc(self):
 
-            if request.session.test_cookie_worked():
+    self.assertEqual(gen_math_ops.add.__doc__, gen_math_ops.Add.__doc__)
 
-                request.session.delete_test_cookie()
 
 
+  def testDefaults(self):
 
-            return HttpResponseRedirect(redirect_to)
+    x = constant_op.constant([[True]])
 
-    else:
+    self.assertAllClose(
 
-        form = authentication_form(request)
+        gen_math_ops.Any(input=x, axis=0),
 
+        gen_math_ops.Any(input=x, axis=0, keep_dims=False))
 
 
-    request.session.set_test_cookie()
 
 
 
-    current_site = get_current_site(request)
+if __name__ == "__main__":
 
+  ops.enable_eager_execution()
 
-
-    context = {
-
-        'form': form,
-
-        redirect_field_name: redirect_to,
-
-        'site': current_site,
-
-        'site_name': current_site.name,
-
-    }
-
-    if extra_context is not None:
-
-        context.update(extra_context)
-
-    return TemplateResponse(request, template_name, context,
-
-                            current_app=current_app)
-
-
-
-
-
-def logout(request, next_page=None,
-
-           template_name='registration/logged_out.html',
-
-           redirect_field_name=REDIRECT_FIELD_NAME,
-
-           current_app=None, extra_context=None):
-
-    """
-
-    Logs out the user and displays 'You are logged out' message.
-
-    """
-
-    auth_logout(request)
-
-    redirect_to = request.REQUEST.get(redirect_field_name, '')
-
-    if redirect_to:
-
-        netloc = urlparse(redirect_to)[1]
-
-        # Security check -- don't allow redirection to a different host.
-
-        if not (netloc and netloc != request.get_host()):
-
-            return HttpResponseRedirect(redirect_to)
-
-
-
-    if next_page is None:
-
-        current_site = get_current_site(request)
-
-        context = {
-
-            'site': current_site,
-
-            'site_name': current_site.name,
-
-            'title': _('Logged out')
-
-        }
-
-        if extra_context is not None:
-
-            context.update(extra_context)
-
-        return TemplateResponse(request, template_name, context,
-
-                                current_app=current_app)
-
-    else:
-
-        # Redirect to this page until the session has been cleared.
-
-        return HttpResponseRedirect(next_page or request.path)
-
-
-
-
-
-def logout_then_login(request, login_url=None, current_app=None, extra_context=None):
-
-    """
-
-    Logs out the user if he is logged in. Then redirects to the log-in page.
-
-    """
-
-    if not login_url:
-
-        login_url = settings.LOGIN_URL
-
-    login_url = resolve_url(login_url)
-
-    return logout(request, login_url, current_app=current_app, extra_context=extra_context)
-
-
-
-
-
-def redirect_to_login(next, login_url=None,
-
-                      redirect_field_name=REDIRECT_FIELD_NAME):
-
-    """
-
-    Redirects the user to the login page, passing the given 'next' page
-
-    """
-
-    resolved_url = resolve_url(login_url or settings.LOGIN_URL)
-
-
-
-    login_url_parts = list(urlparse(resolved_url))
-
-    if redirect_field_name:
-
-        querystring = QueryDict(login_url_parts[4], mutable=True)
-
-        querystring[redirect_field_name] = next
-
-        login_url_parts[4] = querystring.urlencode(safe='/')
-
-
-
-    return HttpResponseRedirect(urlunparse(login_url_parts))
-
-
-
-
-
-# 4 views for password reset:
-
-# - password_reset sends the mail
-
-# - password_reset_done shows a success message for the above
-
-# - password_reset_confirm checks the link the user clicked and
-
-#   prompts for a new password
-
-# - password_reset_complete shows a success message for the above
-
-
-
-@csrf_protect
-
-def password_reset(request, is_admin_site=False,
-
-                   template_name='registration/password_reset_form.html',
-
-                   email_template_name='registration/password_reset_email.html',
-
-                   subject_template_name='registration/password_reset_subject.txt',
-
-                   password_reset_form=PasswordResetForm,
-
-                   token_generator=default_token_generator,
-
-                   post_reset_redirect=None,
-
-                   from_email=None,
-
-                   current_app=None,
-
-                   extra_context=None):
-
-    if post_reset_redirect is None:
-
-        post_reset_redirect = reverse('django.contrib.auth.views.password_reset_done')
-
-    if request.method == "POST":
-
-        form = password_reset_form(request.POST)
-
-        if form.is_valid():
-
-            opts = {
-
-                'use_https': request.is_secure(),
-
-                'token_generator': token_generator,
-
-                'from_email': from_email,
-
-                'email_template_name': email_template_name,
-
-                'subject_template_name': subject_template_name,
-
-                'request': request,
-
-            }
-
-            if is_admin_site:
-
-                opts = dict(opts, domain_override=request.META['HTTP_HOST'])
-
-            form.save(**opts)
-
-            return HttpResponseRedirect(post_reset_redirect)
-
-    else:
-
-        form = password_reset_form()
-
-    context = {
-
-        'form': form,
-
-    }
-
-    if extra_context is not None:
-
-        context.update(extra_context)
-
-    return TemplateResponse(request, template_name, context,
-
-                            current_app=current_app)
-
-
-
-
-
-def password_reset_done(request,
-
-                        template_name='registration/password_reset_done.html',
-
-                        current_app=None, extra_context=None):
-
-    context = {}
-
-    if extra_context is not None:
-
-        context.update(extra_context)
-
-    return TemplateResponse(request, template_name, context,
-
-                            current_app=current_app)
-
-
-
-
-
-# Doesn't need csrf_protect since no-one can guess the URL
-
-@sensitive_post_parameters()
-
-@never_cache
-
-def password_reset_confirm(request, uidb36=None, token=None,
-
-                           template_name='registration/password_reset_confirm.html',
-
-                           token_generator=default_token_generator,
-
-                           set_password_form=SetPasswordForm,
-
-                           post_reset_redirect=None,
-
-                           current_app=None, extra_context=None):
-
-    """
-
-    View that checks the hash in a password reset link and presents a
-
-    form for entering a new password.
-
-    """
-
-    UserModel = get_user_model()
-
-    assert uidb36 is not None and token is not None  # checked by URLconf
-
-    if post_reset_redirect is None:
-
-        post_reset_redirect = reverse('django.contrib.auth.views.password_reset_complete')
-
-    try:
-
-        uid_int = base36_to_int(uidb36)
-
-        user = UserModel.objects.get(id=uid_int)
-
-    except (ValueError, OverflowError, UserModel.DoesNotExist):
-
-        user = None
-
-
-
-    if user is not None and token_generator.check_token(user, token):
-
-        validlink = True
-
-        if request.method == 'POST':
-
-            form = set_password_form(user, request.POST)
-
-            if form.is_valid():
-
-                form.save()
-
-                return HttpResponseRedirect(post_reset_redirect)
-
-        else:
-
-            form = set_password_form(None)
-
-    else:
-
-        validlink = False
-
-        form = None
-
-    context = {
-
-        'form': form,
-
-        'validlink': validlink,
-
-    }
-
-    if extra_context is not None:
-
-        context.update(extra_context)
-
-    return TemplateResponse(request, template_name, context,
-
-                            current_app=current_app)
-
-
-
-
-
-def password_reset_complete(request,
-
-                            template_name='registration/password_reset_complete.html',
-
-                            current_app=None, extra_context=None):
-
-    context = {
-
-        'login_url': resolve_url(settings.LOGIN_URL)
-
-    }
-
-    if extra_context is not None:
-
-        context.update(extra_context)
-
-    return TemplateResponse(request, template_name, context,
-
-                            current_app=current_app)
-
-
-
-
-
-@sensitive_post_parameters()
-
-@csrf_protect
-
-@login_required
-
-def password_change(request,
-
-                    template_name='registration/password_change_form.html',
-
-                    post_change_redirect=None,
-
-                    password_change_form=PasswordChangeForm,
-
-                    current_app=None, extra_context=None):
-
-    if post_change_redirect is None:
-
-        post_change_redirect = reverse('django.contrib.auth.views.password_change_done')
-
-    if request.method == "POST":
-
-        form = password_change_form(user=request.user, data=request.POST)
-
-        if form.is_valid():
-
-            form.save()
-
-            return HttpResponseRedirect(post_change_redirect)
-
-    else:
-
-        form = password_change_form(user=request.user)
-
-    context = {
-
-        'form': form,
-
-    }
-
-    if extra_context is not None:
-
-        context.update(extra_context)
-
-    return TemplateResponse(request, template_name, context,
-
-                            current_app=current_app)
-
-
-
-
-
-@login_required
-
-def password_change_done(request,
-
-                         template_name='registration/password_change_done.html',
-
-                         current_app=None, extra_context=None):
-
-    context = {}
-
-    if extra_context is not None:
-
-        context.update(extra_context)
-
-    return TemplateResponse(request, template_name, context,
-
-                            current_app=current_app)
+  test.main()

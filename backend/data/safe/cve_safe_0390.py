@@ -2,330 +2,156 @@
 # Safety: safe
 # Category: safe
 
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
+import time
 
+from pydoc import locate
 
 
-# Copyright 2012 United States Government as represented by the
 
-# Administrator of the National Aeronautics and Space Administration.
+from django.conf import settings
 
-# All Rights Reserved.
 
-#
 
-# Copyright 2012 Nebula, Inc.
+DEFAULT_CONFIG = {
 
-#
+    'config_version': 4,
 
-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+    'flag_prefix': 'ractf',
 
-#    not use this file except in compliance with the License. You may obtain
+    'graph_members': 10,
 
-#    a copy of the License at
+    'register_end_time': -1,
 
-#
+    'end_time': time.time() + 7 * 24 * 60 * 60,
 
-#         http://www.apache.org/licenses/LICENSE-2.0
+    'start_time': time.time(),
 
-#
+    'register_start_time': time.time(),
 
-#    Unless required by applicable law or agreed to in writing, software
+    'team_size': -1,
 
-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+    'email_regex': '',
 
-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+    'email_domain': '',
 
-#    License for the specific language governing permissions and limitations
+    'login_provider': 'basic_auth',
 
-#    under the License.
+    'registration_provider': 'basic_auth',
 
-"""
+    'token_provider': 'basic_auth',
 
-Classes and methods related to user handling in Horizon.
+    'enable_bot_users': True,
 
-"""
+    'enable_ctftime': True,
 
+    'enable_flag_submission': True,
 
+    'enable_flag_submission_after_competition': True,
 
-import logging
+    'enable_force_admin_2fa': False,
 
+    'enable_track_incorrect_submissions': True,
 
+    'enable_login': True,
 
-from django.utils.translation import ugettext as _
+    'enable_prelogin': True,
 
+    'enable_maintenance_mode': False,
 
+    'enable_registration': True,
 
-from horizon import api
+    'enable_scoreboard': True,
 
-from horizon import exceptions
+    'enable_scoring': True,
 
+    'enable_solve_broadcast': True,
 
+    'enable_teams': True,
 
+    'enable_team_join': True,
 
+    'enable_view_challenges_after_competion': True,
 
-LOG = logging.getLogger(__name__)
+    'enable_team_leave': False,
 
+    'invite_required': False,
 
+    'hide_scoreboard_at': -1,
 
+    'setup_wizard_complete': False,
 
+    'sensitive_fields': ['sensitive_fields', 'enable_force_admin_2fa']
 
-def get_user_from_request(request):
+}
 
-    """ Checks the current session and returns a :class:`~horizon.users.User`.
 
 
+backend = locate(settings.CONFIG['BACKEND'])()
 
-    If the session contains user data the User will be treated as
+backend.load(defaults=DEFAULT_CONFIG)
 
-    authenticated and the :class:`~horizon.users.User` will have all
 
-    its attributes set.
 
 
 
-    If not, the :class:`~horizon.users.User` will have no attributes set.
+def get(key):
 
+    return backend.get(key)
 
 
-    If the session contains invalid data,
 
-    :exc:`~horizon.exceptions.NotAuthorized` will be raised.
 
-    """
 
-    if 'user_id' not in request.session:
+def set(key, value):
 
-        return User()
+    backend.set(key, value)
 
-    try:
 
-        return User(id=request.session['user_id'],
 
-                    token=request.session['token'],
 
-                    user=request.session['user_name'],
 
-                    tenant_id=request.session['tenant_id'],
+def get_all():
 
-                    tenant_name=request.session['tenant'],
+    return backend.get_all()
 
-                    service_catalog=request.session['serviceCatalog'],
 
-                    roles=request.session['roles'],
 
-                    request=request)
 
-    except KeyError:
 
-        # If any of those keys are missing from the session it is
+def get_all_non_sensitive():
 
-        # overwhelmingly likely that we're dealing with an outdated session.
+    sensitive = backend.get('sensitive_fields')
 
-        LOG.exception("Error while creating User from session.")
+    config = backend.get_all()
 
-        request.user_logout()
+    for field in sensitive:
 
-        raise exceptions.NotAuthorized(_("Your session has expired. "
+        del config[field]
 
-                                         "Please log in again."))
+    return config
 
 
 
 
 
-class LazyUser(object):
+def is_sensitive(key):
 
-    def __get__(self, request, obj_type=None):
+    return key in backend.get('sensitive_fields')
 
-        if not hasattr(request, '_cached_user'):
 
-            request._cached_user = get_user_from_request(request)
 
-        return request._cached_user
 
 
+def set_bulk(values: dict):
 
+    for key, value in values.items():
 
+        set(key, value)
 
-class User(object):
 
-    """ The main user class which Horizon expects.
 
 
 
-    .. attribute:: token
+def add_plugin_config(name, config):
 
-
-
-        The id of the Keystone token associated with the current user/tenant.
-
-
-
-    .. attribute:: username
-
-
-
-        The name of the current user.
-
-
-
-    .. attribute:: tenant_id
-
-
-
-        The id of the Keystone tenant for the current user/token.
-
-
-
-    .. attribute:: tenant_name
-
-
-
-        The name of the Keystone tenant for the current user/token.
-
-
-
-    .. attribute:: service_catalog
-
-
-
-        The ``ServiceCatalog`` data returned by Keystone.
-
-
-
-    .. attribute:: roles
-
-
-
-        A list of dictionaries containing role names and ids as returned
-
-        by Keystone.
-
-
-
-    .. attribute:: admin
-
-
-
-        Boolean value indicating whether or not this user has admin
-
-        privileges. Internally mapped to :meth:`horizon.users.User.is_admin`.
-
-    """
-
-    def __init__(self, id=None, token=None, user=None, tenant_id=None,
-
-                    service_catalog=None, tenant_name=None, roles=None,
-
-                    authorized_tenants=None, request=None):
-
-        self.id = id
-
-        self.token = token
-
-        self.username = user
-
-        self.tenant_id = tenant_id
-
-        self.tenant_name = tenant_name
-
-        self.service_catalog = service_catalog
-
-        self.roles = roles or []
-
-        self._authorized_tenants = authorized_tenants
-
-        # Store the request for lazy fetching of auth'd tenants
-
-        self._request = request
-
-
-
-    def is_authenticated(self):
-
-        """
-
-        Evaluates whether this :class:`.User` instance has been authenticated.
-
-        Returns ``True`` or ``False``.
-
-        """
-
-        # TODO: deal with token expiration
-
-        return self.token
-
-
-
-    @property
-
-    def admin(self):
-
-        return self.is_admin()
-
-
-
-    def is_admin(self):
-
-        """
-
-        Evaluates whether this user has admin privileges. Returns
-
-        ``True`` or ``False``.
-
-        """
-
-        for role in self.roles:
-
-            if role['name'].lower() == 'admin':
-
-                return True
-
-        return False
-
-
-
-    def get_and_delete_messages(self):
-
-        """
-
-        Placeholder function for parity with
-
-        ``django.contrib.auth.models.User``.
-
-        """
-
-        return []
-
-
-
-    @property
-
-    def authorized_tenants(self):
-
-        if self.is_authenticated() and self._authorized_tenants is None:
-
-            try:
-
-                token = self._request.session.get("unscoped_token", self.token)
-
-                authd = api.tenant_list_for_token(self._request, token)
-
-            except:
-
-                authd = []
-
-                LOG.exception('Could not retrieve tenant list.')
-
-            self._authorized_tenants = authd
-
-        return self._authorized_tenants
-
-
-
-    @authorized_tenants.setter
-
-    def authorized_tenants(self, tenant_list):
-
-        self._authorized_tenants = tenant_list
+    DEFAULT_CONFIG[name] = config

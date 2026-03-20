@@ -2,1390 +2,1458 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
+# coding: utf-8
 
+import hashlib
 
+import warnings
 
-# Copyright 2012 OpenStack, LLC
+import logging
 
-# All Rights Reserved.
+import io
 
-#
+import ssl
 
-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+import socket
 
-#    not use this file except in compliance with the License. You may obtain
+from itertools import chain
 
-#    a copy of the License at
 
-#
 
-#         http://www.apache.org/licenses/LICENSE-2.0
+from mock import patch, Mock
 
-#
+import pytest
 
-#    Unless required by applicable law or agreed to in writing, software
 
-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+from urllib3 import add_stderr_logger, disable_warnings
 
-#    License for the specific language governing permissions and limitations
+from urllib3.util.request import make_headers, rewind_body, _FAILEDTELL
 
-#    under the License.
+from urllib3.util.response import assert_header_parsing
 
+from urllib3.util.retry import Retry
 
+from urllib3.util.timeout import Timeout
 
-import json
+from urllib3.util.url import (
 
+    get_host,
 
+    parse_url,
 
-import requests
+    split_first,
 
+    Url,
 
+)
 
-from glance.common import utils
+from urllib3.util.ssl_ import (
 
-from glance.tests import functional
+    resolve_cert_reqs,
 
+    resolve_ssl_version,
 
+    ssl_wrap_socket,
 
+    _const_compare_digest_backport,
 
+)
 
-TENANT1 = utils.generate_uuid()
+from urllib3.exceptions import (
 
-TENANT2 = utils.generate_uuid()
+    LocationParseError,
 
-TENANT3 = utils.generate_uuid()
+    TimeoutStateError,
 
-TENANT4 = utils.generate_uuid()
+    InsecureRequestWarning,
 
+    SNIMissingWarning,
 
+    InvalidHeader,
 
+    UnrewindableBodyError,
 
+)
 
-class TestImages(functional.FunctionalTest):
+from urllib3.util.connection import (
 
+    allowed_gai_family,
 
+    _has_ipv6
 
-    def setUp(self):
+)
 
-        super(TestImages, self).setUp()
+from urllib3.util import is_fp_closed, ssl_
 
-        self.cleanup()
+from urllib3.packages import six
 
-        self.api_server.deployment_flavor = 'noauth'
 
-        self.start_servers(**self.__dict__.copy())
 
+from . import clear_warnings
 
 
-    def _url(self, path):
 
-        return 'http://127.0.0.1:%d%s' % (self.api_port, path)
+from test import onlyPy3, onlyPy2, onlyBrotlipy, notBrotlipy
 
 
 
-    def _headers(self, custom_headers=None):
+# This number represents a time in seconds, it doesn't mean anything in
 
-        base_headers = {
+# isolation. Setting to a high-ish value to avoid conflicts with the smaller
 
-            'X-Identity-Status': 'Confirmed',
+# numbers used for timeouts
 
-            'X-Auth-Token': '932c5c84-02ac-4fe5-a9ba-620af0e2bb96',
+TIMEOUT_EPOCH = 1000
 
-            'X-User-Id': 'f9a41d13-0c13-47e9-bee2-ce4e8bfe958e',
 
-            'X-Tenant-Id': TENANT1,
 
-            'X-Roles': 'member',
 
-        }
 
-        base_headers.update(custom_headers or {})
+class TestUtil(object):
 
-        return base_headers
 
 
+    url_host_map = [
 
-    def test_image_lifecycle(self):
+        # Hosts
 
-        # Image list should be empty
+        ('http://google.com/mail', ('http', 'google.com', None)),
 
-        path = self._url('/v2/images')
+        ('http://google.com/mail/', ('http', 'google.com', None)),
 
-        response = requests.get(path, headers=self._headers())
+        ('google.com/mail', ('http', 'google.com', None)),
 
-        self.assertEqual(200, response.status_code)
+        ('http://google.com/', ('http', 'google.com', None)),
 
-        images = json.loads(response.text)['images']
+        ('http://google.com', ('http', 'google.com', None)),
 
-        self.assertEqual(0, len(images))
+        ('http://www.google.com', ('http', 'www.google.com', None)),
 
+        ('http://mail.google.com', ('http', 'mail.google.com', None)),
 
+        ('http://google.com:8000/mail/', ('http', 'google.com', 8000)),
 
-        # Create an image (with a deployer-defined property)
+        ('http://google.com:8000', ('http', 'google.com', 8000)),
 
-        path = self._url('/v2/images')
+        ('https://google.com', ('https', 'google.com', None)),
 
-        headers = self._headers({'content-type': 'application/json'})
+        ('https://google.com:8000', ('https', 'google.com', 8000)),
 
-        data = json.dumps({'name': 'image-1', 'type': 'kernel', 'foo': 'bar'})
+        ('http://user:password@127.0.0.1:1234', ('http', '127.0.0.1', 1234)),
 
-        response = requests.post(path, headers=headers, data=data)
+        ('http://google.com/foo=http://bar:42/baz', ('http', 'google.com', None)),
 
-        self.assertEqual(201, response.status_code)
+        ('http://google.com?foo=http://bar:42/baz', ('http', 'google.com', None)),
 
-        image_location_header = response.headers['Location']
+        ('http://google.com#foo=http://bar:42/baz', ('http', 'google.com', None)),
 
 
 
-        # Returned image entity should have a generated id and status
+        # IPv4
 
-        image = json.loads(response.text)
+        ('173.194.35.7', ('http', '173.194.35.7', None)),
 
-        image_id = image['id']
+        ('http://173.194.35.7', ('http', '173.194.35.7', None)),
 
-        self.assertEqual(image['status'], 'queued')
+        ('http://173.194.35.7/test', ('http', '173.194.35.7', None)),
 
+        ('http://173.194.35.7:80', ('http', '173.194.35.7', 80)),
 
+        ('http://173.194.35.7:80/test', ('http', '173.194.35.7', 80)),
 
-        # Image list should now have one entry
 
-        path = self._url('/v2/images')
 
-        response = requests.get(path, headers=self._headers())
+        # IPv6
 
-        self.assertEqual(200, response.status_code)
+        ('[2a00:1450:4001:c01::67]', ('http', '[2a00:1450:4001:c01::67]', None)),
 
-        images = json.loads(response.text)['images']
+        ('http://[2a00:1450:4001:c01::67]', ('http', '[2a00:1450:4001:c01::67]', None)),
 
-        self.assertEqual(1, len(images))
+        ('http://[2a00:1450:4001:c01::67]/test', ('http', '[2a00:1450:4001:c01::67]', None)),
 
-        self.assertEqual(images[0]['id'], image_id)
+        ('http://[2a00:1450:4001:c01::67]:80', ('http', '[2a00:1450:4001:c01::67]', 80)),
 
+        ('http://[2a00:1450:4001:c01::67]:80/test', ('http', '[2a00:1450:4001:c01::67]', 80)),
 
 
-        # Get the image using the returned Location header
 
-        response = requests.get(image_location_header, headers=self._headers())
+        # More IPv6 from http://www.ietf.org/rfc/rfc2732.txt
 
-        self.assertEqual(200, response.status_code)
+        ('http://[fedc:ba98:7654:3210:fedc:ba98:7654:3210]:8000/index.html', (
 
-        image = json.loads(response.text)
+            'http', '[fedc:ba98:7654:3210:fedc:ba98:7654:3210]', 8000)),
 
-        self.assertEqual(image_id, image['id'])
+        ('http://[1080:0:0:0:8:800:200c:417a]/index.html', (
 
-        self.assertFalse('checksum' in image)
+            'http', '[1080:0:0:0:8:800:200c:417a]', None)),
 
-        self.assertFalse('size' in image)
+        ('http://[3ffe:2a00:100:7031::1]', ('http', '[3ffe:2a00:100:7031::1]', None)),
 
-        self.assertEqual('bar', image['foo'])
+        ('http://[1080::8:800:200c:417a]/foo', ('http', '[1080::8:800:200c:417a]', None)),
 
-        self.assertEqual(False, image['protected'])
+        ('http://[::192.9.5.5]/ipng', ('http', '[::192.9.5.5]', None)),
 
-        self.assertEqual('kernel', image['type'])
+        ('http://[::ffff:129.144.52.38]:42/index.html', ('http', '[::ffff:129.144.52.38]', 42)),
 
-        self.assertTrue(image['created_at'])
+        ('http://[2010:836b:4179::836b:4179]', ('http', '[2010:836b:4179::836b:4179]', None)),
 
-        self.assertTrue(image['updated_at'])
 
-        self.assertEqual(image['updated_at'], image['created_at'])
 
+        # Hosts
 
+        ('HTTP://GOOGLE.COM/mail/', ('http', 'google.com', None)),
 
-        # The image should be mutable, including adding and removing properties
+        ('GOogle.COM/mail', ('http', 'google.com', None)),
 
-        path = self._url('/v2/images/%s' % image_id)
+        ('HTTP://GoOgLe.CoM:8000/mail/', ('http', 'google.com', 8000)),
 
-        media_type = 'application/openstack-images-v2.0-json-patch'
+        ('HTTP://user:password@EXAMPLE.COM:1234', ('http', 'example.com', 1234)),
 
-        headers = self._headers({'content-type': media_type})
+        ('173.194.35.7', ('http', '173.194.35.7', None)),
 
-        data = json.dumps([
+        ('HTTP://173.194.35.7', ('http', '173.194.35.7', None)),
 
-            {'replace': '/name', 'value': 'image-2'},
+        ('HTTP://[2a00:1450:4001:c01::67]:80/test', ('http', '[2a00:1450:4001:c01::67]', 80)),
 
-            {'replace': '/disk_format', 'value': 'vhd'},
+        ('HTTP://[FEDC:BA98:7654:3210:FEDC:BA98:7654:3210]:8000/index.html', (
 
-            {'replace': '/foo', 'value': 'baz'},
+            'http', '[fedc:ba98:7654:3210:fedc:ba98:7654:3210]', 8000)),
 
-            {'add': '/ping', 'value': 'pong'},
+        ('HTTPS://[1080:0:0:0:8:800:200c:417A]/index.html', (
 
-            {'replace': '/protected', 'value': True},
+            'https', '[1080:0:0:0:8:800:200c:417a]', None)),
 
-            {'remove': '/type'},
+        ('abOut://eXamPlE.com?info=1', ('about', 'eXamPlE.com', None)),
 
-        ])
+        ('http+UNIX://%2fvar%2frun%2fSOCKET/path', (
 
-        response = requests.patch(path, headers=headers, data=data)
+            'http+unix', '%2fvar%2frun%2fSOCKET', None)),
 
-        self.assertEqual(200, response.status_code, response.text)
+    ]
 
 
 
-        # Returned image entity should reflect the changes
+    @pytest.mark.parametrize('url, expected_host', url_host_map)
 
-        image = json.loads(response.text)
+    def test_get_host(self, url, expected_host):
 
-        self.assertEqual('image-2', image['name'])
+        returned_host = get_host(url)
 
-        self.assertEqual('vhd', image['disk_format'])
+        assert returned_host == expected_host
 
-        self.assertEqual('baz', image['foo'])
 
-        self.assertEqual('pong', image['ping'])
 
-        self.assertEqual(True, image['protected'])
+    # TODO: Add more tests
 
-        self.assertFalse('type' in image, response.text)
+    @pytest.mark.parametrize('location', [
 
+        'http://google.com:foo',
 
+        'http://::1/',
 
-        # Updates should persist across requests
+        'http://::1:80/',
 
-        path = self._url('/v2/images/%s' % image_id)
+        'http://google.com:-80',
 
-        response = requests.get(path, headers=self._headers())
+        six.u('http://google.com:\xb2\xb2'),  # \xb2 = ^2
 
-        self.assertEqual(200, response.status_code)
+    ])
 
-        image = json.loads(response.text)
+    def test_invalid_host(self, location):
 
-        self.assertEqual(image_id, image['id'])
+        with pytest.raises(LocationParseError):
 
-        self.assertEqual('image-2', image['name'])
+            get_host(location)
 
-        self.assertEqual('baz', image['foo'])
 
-        self.assertEqual('pong', image['ping'])
 
-        self.assertEqual(True, image['protected'])
+    @pytest.mark.parametrize('url', [
 
-        self.assertFalse('type' in image, response.text)
+        'http://user\\@google.com',
 
+        'http://google\\.com',
 
+        'user\\@google.com',
 
-        # Try to download data before its uploaded
+        'http://google.com#fragment#',
 
-        path = self._url('/v2/images/%s/file' % image_id)
+        'http://user@user@google.com/',
 
-        headers = self._headers()
+    ])
 
-        response = requests.get(path, headers=headers)
+    def test_invalid_url(self, url):
 
-        self.assertEqual(404, response.status_code)
+        with pytest.raises(LocationParseError):
 
+            parse_url(url)
 
 
-        # Upload some image data
 
-        path = self._url('/v2/images/%s/file' % image_id)
+    @pytest.mark.parametrize('url, expected_normalized_url', [
 
-        headers = self._headers({'Content-Type': 'application/octet-stream'})
+        ('HTTP://GOOGLE.COM/MAIL/', 'http://google.com/MAIL/'),
 
-        response = requests.put(path, headers=headers, data='ZZZZZ')
+        ('HTTP://JeremyCline:Hunter2@Example.com:8080/',
 
-        self.assertEqual(201, response.status_code)
+         'http://JeremyCline:Hunter2@example.com:8080/'),
 
+        ('HTTPS://Example.Com/?Key=Value', 'https://example.com/?Key=Value'),
 
+        ('Https://Example.Com/#Fragment', 'https://example.com/#Fragment'),
 
-        # Checksum should be populated automatically
+        ('[::Ff%etH0%Ff]/%ab%Af', '[::ff%25etH0%Ff]/%AB%AF'),
 
-        path = self._url('/v2/images/%s' % image_id)
+    ])
 
-        response = requests.get(path, headers=self._headers())
+    def test_parse_url_normalization(self, url, expected_normalized_url):
 
-        self.assertEqual(200, response.status_code)
+        """Assert parse_url normalizes the scheme/host, and only the scheme/host"""
 
-        image = json.loads(response.text)
+        actual_normalized_url = parse_url(url).url
 
-        self.assertEqual('8f113e38d28a79a5a451b16048cc2b72', image['checksum'])
+        assert actual_normalized_url == expected_normalized_url
 
 
 
-        # Try to download the data that was just uploaded
+    parse_url_host_map = [
 
-        path = self._url('/v2/images/%s/file' % image_id)
+        ('http://google.com/mail', Url('http', host='google.com', path='/mail')),
 
-        headers = self._headers()
+        ('http://google.com/mail/', Url('http', host='google.com', path='/mail/')),
 
-        response = requests.get(path, headers=headers)
+        ('http://google.com/mail', Url('http', host='google.com', path='mail')),
 
-        self.assertEqual(200, response.status_code)
+        ('google.com/mail', Url(host='google.com', path='/mail')),
 
-        self.assertEqual('8f113e38d28a79a5a451b16048cc2b72',
+        ('http://google.com/', Url('http', host='google.com', path='/')),
 
-                         response.headers['Content-MD5'])
+        ('http://google.com', Url('http', host='google.com')),
 
-        self.assertEqual(response.text, 'ZZZZZ')
+        ('http://google.com?foo', Url('http', host='google.com', path='', query='foo')),
 
 
 
-        # Uploading duplicate data should be rejected with a 409
+        # Path/query/fragment
 
-        path = self._url('/v2/images/%s/file' % image_id)
+        ('', Url()),
 
-        headers = self._headers({'Content-Type': 'application/octet-stream'})
+        ('/', Url(path='/')),
 
-        response = requests.put(path, headers=headers, data='XXX')
+        ('#?/!google.com/?foo', Url(path='', fragment='?/!google.com/?foo')),
 
-        self.assertEqual(409, response.status_code)
+        ('/foo', Url(path='/foo')),
 
+        ('/foo?bar=baz', Url(path='/foo', query='bar=baz')),
 
+        ('/foo?bar=baz#banana?apple/orange', Url(path='/foo',
 
-        # Ensure the size is updated to reflect the data uploaded
+                                                 query='bar=baz',
 
-        path = self._url('/v2/images/%s' % image_id)
+                                                 fragment='banana?apple/orange')),
 
-        headers = self._headers()
+        ('/redirect?target=http://localhost:61020/', Url(path='redirect',
 
-        response = requests.get(path, headers=headers)
+                                                         query='target=http://localhost:61020/')),
 
-        self.assertEqual(200, response.status_code)
 
-        self.assertEqual(5, json.loads(response.text)['size'])
 
+        # Port
 
+        ('http://google.com/', Url('http', host='google.com', path='/')),
 
-        # Deletion should not work on protected images
+        ('http://google.com:80/', Url('http', host='google.com', port=80, path='/')),
 
-        path = self._url('/v2/images/%s' % image_id)
+        ('http://google.com:80', Url('http', host='google.com', port=80)),
 
-        response = requests.delete(path, headers=self._headers())
 
-        self.assertEqual(403, response.status_code)
 
+        # Auth
 
+        ('http://foo:bar@localhost/', Url('http', auth='foo:bar', host='localhost', path='/')),
 
-        # Unprotect image for deletion
+        ('http://foo@localhost/', Url('http', auth='foo', host='localhost', path='/')),
 
-        path = self._url('/v2/images/%s' % image_id)
+        ('http://foo:bar@localhost/', Url('http',
 
-        media_type = 'application/openstack-images-v2.0-json-patch'
+                                          auth='foo:bar',
 
-        headers = self._headers({'content-type': media_type})
+                                          host='localhost',
 
-        data = json.dumps([{'replace': '/protected', 'value': False}])
+                                          path='/')),
 
-        response = requests.patch(path, headers=headers, data=data)
 
-        self.assertEqual(200, response.status_code, response.text)
 
+        # Unicode type (Python 2.x)
 
+        (u'http://foo:bar@localhost/', Url(u'http',
 
-        # Deletion should work
+                                           auth=u'foo:bar',
 
-        path = self._url('/v2/images/%s' % image_id)
+                                           host=u'localhost',
 
-        response = requests.delete(path, headers=self._headers())
+                                           path=u'/')),
 
-        self.assertEqual(204, response.status_code)
+        ('http://foo:bar@localhost/', Url('http',
 
+                                          auth='foo:bar',
 
+                                          host='localhost',
 
-        # This image should be no longer be directly accessible
+                                          path='/')),
 
-        path = self._url('/v2/images/%s' % image_id)
+    ]
 
-        response = requests.get(path, headers=self._headers())
 
-        self.assertEqual(404, response.status_code)
 
+    non_round_tripping_parse_url_host_map = [
 
+        # Path/query/fragment
 
-        # And neither should its data
+        ('?', Url(path='', query='')),
 
-        path = self._url('/v2/images/%s/file' % image_id)
+        ('#', Url(path='', fragment='')),
 
-        headers = self._headers()
 
-        response = requests.get(path, headers=headers)
 
-        self.assertEqual(404, response.status_code)
+        # Path normalization
 
+        ('/abc/../def', Url(path="/def")),
 
 
-        # Image list should now be empty
 
-        path = self._url('/v2/images')
+        # Empty Port
 
-        response = requests.get(path, headers=self._headers())
+        ('http://google.com:', Url('http', host='google.com')),
 
-        self.assertEqual(200, response.status_code)
+        ('http://google.com:/', Url('http', host='google.com', path='/')),
 
-        images = json.loads(response.text)['images']
 
-        self.assertEqual(0, len(images))
 
+        # Uppercase IRI
 
+        (u'http://Königsgäßchen.de/straße',
 
-        self.stop_servers()
+         Url('http', host='xn--knigsgchen-b4a3dun.de', path='/stra%C3%9Fe'))
 
+    ]
 
 
-    def test_permissions(self):
 
-        # Create an image that belongs to TENANT1
+    @pytest.mark.parametrize(
 
-        path = self._url('/v2/images')
+        'url, expected_url',
 
-        headers = self._headers({'Content-Type': 'application/json'})
+        chain(parse_url_host_map, non_round_tripping_parse_url_host_map)
 
-        data = json.dumps({'name': 'image-1'})
+    )
 
-        response = requests.post(path, headers=headers, data=data)
+    def test_parse_url(self, url, expected_url):
 
-        self.assertEqual(201, response.status_code)
+        returned_url = parse_url(url)
 
-        image_id = json.loads(response.text)['id']
+        assert returned_url == expected_url
 
 
 
-        # TENANT1 should see the image in their list
+    @pytest.mark.parametrize('url, expected_url', parse_url_host_map)
 
-        path = self._url('/v2/images')
+    def test_unparse_url(self, url, expected_url):
 
-        response = requests.get(path, headers=self._headers())
+        assert url == expected_url.url
 
-        self.assertEqual(200, response.status_code)
 
-        images = json.loads(response.text)['images']
 
-        self.assertEqual(image_id, images[0]['id'])
+    @pytest.mark.parametrize(
 
+        ['url', 'expected_url'],
 
+        [
 
-        # TENANT1 should be able to access the image directly
+            # RFC 3986 5.2.4
 
-        path = self._url('/v2/images/%s' % image_id)
+            ('/abc/../def', Url(path="/def")),
 
-        response = requests.get(path, headers=self._headers())
+            ('/..', Url(path="/")),
 
-        self.assertEqual(200, response.status_code)
+            ('/./abc/./def/', Url(path='/abc/def/')),
 
+            ('/.', Url(path='/')),
 
+            ('/./', Url(path='/')),
 
-        # TENANT2 should not see the image in their list
-
-        path = self._url('/v2/images')
-
-        headers = self._headers({'X-Tenant-Id': TENANT2})
-
-        response = requests.get(path, headers=headers)
-
-        self.assertEqual(200, response.status_code)
-
-        images = json.loads(response.text)['images']
-
-        self.assertEqual(0, len(images))
-
-
-
-        # TENANT2 should not be able to access the image directly
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        headers = self._headers({'X-Tenant-Id': TENANT2})
-
-        response = requests.get(path, headers=headers)
-
-        self.assertEqual(404, response.status_code)
-
-
-
-        # TENANT2 should not be able to modify the image, either
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        headers = self._headers({
-
-            'Content-Type': 'application/openstack-images-v2.0-json-patch',
-
-            'X-Tenant-Id': TENANT2,
-
-        })
-
-        data = json.dumps([{'replace': '/name', 'value': 'image-2'}])
-
-        response = requests.patch(path, headers=headers, data=data)
-
-        self.assertEqual(404, response.status_code)
-
-
-
-        # TENANT2 should not be able to delete the image, either
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        headers = self._headers({'X-Tenant-Id': TENANT2})
-
-        response = requests.delete(path, headers=headers)
-
-        self.assertEqual(404, response.status_code)
-
-
-
-        # Publicize the image as an admin of TENANT1
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        headers = self._headers({
-
-            'Content-Type': 'application/openstack-images-v2.0-json-patch',
-
-            'X-Roles': 'admin',
-
-        })
-
-        data = json.dumps([{'replace': '/visibility', 'value': 'public'}])
-
-        response = requests.patch(path, headers=headers, data=data)
-
-        self.assertEqual(200, response.status_code)
-
-
-
-        # TENANT3 should now see the image in their list
-
-        path = self._url('/v2/images')
-
-        headers = self._headers({'X-Tenant-Id': TENANT3})
-
-        response = requests.get(path, headers=headers)
-
-        self.assertEqual(200, response.status_code)
-
-        images = json.loads(response.text)['images']
-
-        self.assertEqual(image_id, images[0]['id'])
-
-
-
-        # TENANT3 should also be able to access the image directly
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        headers = self._headers({'X-Tenant-Id': TENANT3})
-
-        response = requests.get(path, headers=headers)
-
-        self.assertEqual(200, response.status_code)
-
-
-
-        # TENANT3 still should not be able to modify the image
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        headers = self._headers({
-
-            'Content-Type': 'application/openstack-images-v2.0-json-patch',
-
-            'X-Tenant-Id': TENANT3,
-
-        })
-
-        data = json.dumps([{'replace': '/name', 'value': 'image-2'}])
-
-        response = requests.patch(path, headers=headers, data=data)
-
-        self.assertEqual(404, response.status_code)
-
-
-
-        # TENANT3 should not be able to delete the image, either
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        headers = self._headers({'X-Tenant-Id': TENANT3})
-
-        response = requests.delete(path, headers=headers)
-
-        self.assertEqual(404, response.status_code)
-
-
-
-        self.stop_servers()
-
-
-
-    def test_tag_lifecycle(self):
-
-        # Create an image with a tag - duplicate should be ignored
-
-        path = self._url('/v2/images')
-
-        headers = self._headers({'Content-Type': 'application/json'})
-
-        data = json.dumps({'name': 'image-1', 'tags': ['sniff', 'sniff']})
-
-        response = requests.post(path, headers=headers, data=data)
-
-        self.assertEqual(201, response.status_code)
-
-        image_id = json.loads(response.text)['id']
-
-
-
-        # Image should show a list with a single tag
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        response = requests.get(path, headers=self._headers())
-
-        self.assertEqual(200, response.status_code)
-
-        tags = json.loads(response.text)['tags']
-
-        self.assertEqual(['sniff'], tags)
-
-
-
-        # Update image with duplicate tag - it should be ignored
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        media_type = 'application/openstack-images-v2.0-json-patch'
-
-        headers = self._headers({'content-type': media_type})
-
-        data = json.dumps([{'replace': '/tags',
-
-                            'value': ['sniff', 'snozz', 'snozz']}])
-
-        response = requests.patch(path, headers=headers, data=data)
-
-        self.assertEqual(200, response.status_code)
-
-        tags = json.loads(response.text)['tags']
-
-        self.assertEqual(['snozz', 'sniff'], tags)
-
-
-
-        # Image should show the appropriate tags
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        response = requests.get(path, headers=self._headers())
-
-        self.assertEqual(200, response.status_code)
-
-        tags = json.loads(response.text)['tags']
-
-        self.assertEqual(['sniff', 'snozz'], tags)
-
-
-
-        # Attempt to tag the image with a duplicate should be ignored
-
-        path = self._url('/v2/images/%s/tags/snozz' % image_id)
-
-        response = requests.put(path, headers=self._headers())
-
-        self.assertEqual(204, response.status_code)
-
-
-
-        # Create another more complex tag
-
-        path = self._url('/v2/images/%s/tags/gabe%%40example.com' % image_id)
-
-        response = requests.put(path, headers=self._headers())
-
-        self.assertEqual(204, response.status_code)
-
-
-
-        # Double-check that the tags container on the image is populated
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        response = requests.get(path, headers=self._headers())
-
-        self.assertEqual(200, response.status_code)
-
-        tags = json.loads(response.text)['tags']
-
-        self.assertEqual(['sniff', 'snozz', 'gabe@example.com'], tags)
-
-
-
-        # The tag should be deletable
-
-        path = self._url('/v2/images/%s/tags/gabe%%40example.com' % image_id)
-
-        response = requests.delete(path, headers=self._headers())
-
-        self.assertEqual(204, response.status_code)
-
-
-
-        # List of tags should reflect the deletion
-
-        path = self._url('/v2/images/%s' % image_id)
-
-        response = requests.get(path, headers=self._headers())
-
-        self.assertEqual(200, response.status_code)
-
-        tags = json.loads(response.text)['tags']
-
-        self.assertEqual(['sniff', 'snozz'], tags)
-
-
-
-        # Deleting the same tag should return a 404
-
-        path = self._url('/v2/images/%s/tags/gabe%%40example.com' % image_id)
-
-        response = requests.delete(path, headers=self._headers())
-
-        self.assertEqual(404, response.status_code)
-
-
-
-        self.stop_servers()
-
-
-
-    def test_images_container(self):
-
-        # Image list should be empty and no next link should be present
-
-        path = self._url('/v2/images')
-
-        response = requests.get(path, headers=self._headers())
-
-        self.assertEqual(200, response.status_code)
-
-        images = json.loads(response.text)['images']
-
-        first = json.loads(response.text)['first']
-
-        self.assertEqual(0, len(images))
-
-        self.assertTrue('next' not in json.loads(response.text))
-
-        self.assertEqual('/v2/images', first)
-
-
-
-        # Create 7 images
-
-        images = []
-
-        fixtures = [
-
-            {'name': 'image-3', 'type': 'kernel', 'ping': 'pong'},
-
-            {'name': 'image-4', 'type': 'kernel', 'ping': 'pong'},
-
-            {'name': 'image-1', 'type': 'kernel', 'ping': 'pong'},
-
-            {'name': 'image-3', 'type': 'ramdisk', 'ping': 'pong'},
-
-            {'name': 'image-2', 'type': 'kernel', 'ping': 'ding'},
-
-            {'name': 'image-3', 'type': 'kernel', 'ping': 'pong'},
-
-            {'name': 'image-2', 'type': 'kernel', 'ping': 'pong'},
+            ('/abc/./.././d/././e/.././f/./../../ghi', Url(path='/ghi'))
 
         ]
 
-        path = self._url('/v2/images')
+    )
 
-        headers = self._headers({'content-type': 'application/json'})
+    def test_parse_and_normalize_url_paths(self, url, expected_url):
 
-        for fixture in fixtures:
+        actual_url = parse_url(url)
 
-            data = json.dumps(fixture)
+        assert actual_url == expected_url
 
-            response = requests.post(path, headers=headers, data=data)
+        assert actual_url.url == expected_url.url
 
-            self.assertEqual(201, response.status_code)
 
-            images.append(json.loads(response.text))
 
+    def test_parse_url_invalid_IPv6(self):
 
+        with pytest.raises(LocationParseError):
 
-        # Image list should contain 7 images
+            parse_url('[::1')
 
-        path = self._url('/v2/images')
 
-        response = requests.get(path, headers=self._headers())
 
-        self.assertEqual(200, response.status_code)
+    def test_parse_url_negative_port(self):
 
-        body = json.loads(response.text)
+        with pytest.raises(LocationParseError):
 
-        self.assertEqual(7, len(body['images']))
+            parse_url("https://www.google.com:-80/")
 
-        self.assertEqual('/v2/images', body['first'])
 
-        self.assertFalse('next' in json.loads(response.text))
 
+    def test_Url_str(self):
 
+        U = Url('http', host='google.com')
 
-        # Begin pagination after the first image
+        assert str(U) == U.url
 
-        template_url = ('/v2/images?limit=2&sort_dir=asc&sort_key=name'
 
-                        '&marker=%s&type=kernel&ping=pong')
 
-        path = self._url(template_url % images[2]['id'])
+    request_uri_map = [
 
-        response = requests.get(path, headers=self._headers())
+        ('http://google.com/mail', '/mail'),
 
-        self.assertEqual(200, response.status_code)
+        ('http://google.com/mail/', '/mail/'),
 
-        body = json.loads(response.text)
+        ('http://google.com/', '/'),
 
-        self.assertEqual(2, len(body['images']))
+        ('http://google.com', '/'),
 
-        response_ids = [image['id'] for image in body['images']]
+        ('', '/'),
 
-        self.assertEqual([images[6]['id'], images[0]['id']], response_ids)
+        ('/', '/'),
 
+        ('?', '/?'),
 
+        ('#', '/'),
 
-        # Continue pagination using next link from previous request
+        ('/foo?bar=baz', '/foo?bar=baz'),
 
-        path = self._url(body['next'])
+    ]
 
-        response = requests.get(path, headers=self._headers())
 
-        self.assertEqual(200, response.status_code)
 
-        body = json.loads(response.text)
+    @pytest.mark.parametrize('url, expected_request_uri', request_uri_map)
 
-        self.assertEqual(2, len(body['images']))
+    def test_request_uri(self, url, expected_request_uri):
 
-        response_ids = [image['id'] for image in body['images']]
+        returned_url = parse_url(url)
 
-        self.assertEqual([images[5]['id'], images[1]['id']], response_ids)
+        assert returned_url.request_uri == expected_request_uri
 
 
 
-        # Continue pagination - expect no results
+    url_netloc_map = [
 
-        path = self._url(body['next'])
+        ('http://google.com/mail', 'google.com'),
 
-        response = requests.get(path, headers=self._headers())
+        ('http://google.com:80/mail', 'google.com:80'),
 
-        self.assertEqual(200, response.status_code)
+        ('google.com/foobar', 'google.com'),
 
-        body = json.loads(response.text)
+        ('google.com:12345', 'google.com:12345'),
 
-        self.assertEqual(0, len(body['images']))
+    ]
 
 
 
-        # Delete first image
+    @pytest.mark.parametrize('url, expected_netloc', url_netloc_map)
 
-        path = self._url('/v2/images/%s' % images[0]['id'])
+    def test_netloc(self, url, expected_netloc):
 
-        response = requests.delete(path, headers=self._headers())
+        assert parse_url(url).netloc == expected_netloc
 
-        self.assertEqual(204, response.status_code)
 
 
+    url_vulnerabilities = [
 
-        # Ensure bad request for using a deleted image as marker
+        # urlparse doesn't follow RFC 3986 Section 3.2
 
-        path = self._url('/v2/images?marker=%s' % images[0]['id'])
+        ("http://google.com#@evil.com/", Url("http",
 
-        response = requests.get(path, headers=self._headers())
+                                             host="google.com",
 
-        self.assertEqual(400, response.status_code)
+                                             path="",
 
+                                             fragment="@evil.com/")),
 
 
-        self.stop_servers()
 
+        # CVE-2016-5699
 
+        ("http://127.0.0.1%0d%0aConnection%3a%20keep-alive",
 
-    def test_image_visibility_to_different_users(self):
+         Url("http", host="127.0.0.1%0d%0aconnection%3a%20keep-alive")),
 
-        self.cleanup()
 
-        self.api_server.deployment_flavor = 'fakeauth'
 
-        self.registry_server.deployment_flavor = 'fakeauth'
+        # NodeJS unicode -> double dot
 
-        self.start_servers(**self.__dict__.copy())
+        (u"http://google.com/\uff2e\uff2e/abc", Url("http",
 
+                                                    host="google.com",
 
+                                                    path='/%EF%BC%AE%EF%BC%AE/abc')),
 
-        owners = ['admin', 'tenant1', 'tenant2', 'none']
 
-        visibilities = ['public', 'private']
 
+        # Scheme without ://
 
+        ("javascript:a='@google.com:12345/';alert(0)",
 
-        for owner in owners:
+         Url(scheme="javascript",
 
-            for visibility in visibilities:
+             path="a='@google.com:12345/';alert(0)")),
 
-                path = self._url('/v2/images')
 
-                headers = self._headers({
 
-                    'content-type': 'application/json',
+        ("//google.com/a/b/c", Url(host="google.com", path="/a/b/c")),
 
-                    'X-Auth-Token': 'createuser:%s:admin' % owner,
 
-                })
 
-                data = json.dumps({
+        # International URLs
 
-                    'name': '%s-%s' % (owner, visibility),
+        (u'http://ヒ:キ@ヒ.abc.ニ/ヒ?キ#ワ', Url(u'http',
 
-                    'visibility': visibility,
+                                          host=u'xn--pdk.abc.xn--idk',
 
-                })
+                                          auth=u'%E3%83%92:%E3%82%AD',
 
-                response = requests.post(path, headers=headers, data=data)
+                                          path=u'/%E3%83%92',
 
-                self.assertEqual(201, response.status_code)
+                                          query=u'%E3%82%AD',
 
+                                          fragment=u'%E3%83%AF')),
 
 
-        def list_images(tenant, role='', visibility=None):
 
-            auth_token = 'user:%s:%s' % (tenant, role)
+        # Injected headers (CVE-2016-5699, CVE-2019-9740, CVE-2019-9947)
 
-            headers = {'X-Auth-Token': auth_token}
+        ("10.251.0.83:7777?a=1 HTTP/1.1\r\nX-injected: header",
 
-            path = self._url('/v2/images')
+         Url(host='10.251.0.83', port=7777, path='',
 
-            if visibility is not None:
+             query='a=1%20HTTP/1.1%0D%0AX-injected:%20header')),
 
-                path += '?visibility=%s' % visibility
 
-            response = requests.get(path, headers=headers)
 
-            self.assertEqual(response.status_code, 200)
+        ("http://127.0.0.1:6379?\r\nSET test failure12\r\n:8080/test/?test=a",
 
-            return json.loads(response.text)['images']
+         Url(scheme='http', host='127.0.0.1', port=6379, path='',
 
+             query='%0D%0ASET%20test%20failure12%0D%0A:8080/test/?test=a')),
 
+    ]
 
-        # 1. Known user sees public and their own images
 
-        images = list_images('tenant1')
 
-        self.assertEquals(len(images), 5)
+    @pytest.mark.parametrize("url, expected_url", url_vulnerabilities)
 
-        for image in images:
+    def test_url_vulnerabilities(self, url, expected_url):
 
-            self.assertTrue(image['visibility'] == 'public'
+        if expected_url is False:
 
-                            or 'tenant1' in image['name'])
+            with pytest.raises(LocationParseError):
 
+                parse_url(url)
 
+        else:
 
-        # 2. Known user, visibility=public, sees all public images
+            assert parse_url(url) == expected_url
 
-        images = list_images('tenant1', visibility='public')
 
-        self.assertEquals(len(images), 4)
 
-        for image in images:
+    @onlyPy2
 
-            self.assertEquals(image['visibility'], 'public')
+    def test_parse_url_bytes_to_str_python_2(self):
 
+        url = parse_url(b"https://www.google.com/")
 
+        assert url == Url('https', host='www.google.com', path='/')
 
-        # 3. Known user, visibility=private, sees only their private image
 
-        images = list_images('tenant1', visibility='private')
 
-        self.assertEquals(len(images), 1)
+        assert isinstance(url.scheme, str)
 
-        image = images[0]
+        assert isinstance(url.host, str)
 
-        self.assertEquals(image['visibility'], 'private')
+        assert isinstance(url.path, str)
 
-        self.assertTrue('tenant1' in image['name'])
 
 
+    @onlyPy2
 
-        # 4. Unknown user sees only public images
+    def test_parse_url_unicode_python_2(self):
 
-        images = list_images('none')
+        url = parse_url(u"https://www.google.com/")
 
-        self.assertEquals(len(images), 4)
+        assert url == Url(u'https', host=u'www.google.com', path=u'/')
 
-        for image in images:
 
-            self.assertEquals(image['visibility'], 'public')
 
+        assert isinstance(url.scheme, six.text_type)
 
+        assert isinstance(url.host, six.text_type)
 
-        # 5. Unknown user, visibility=public, sees only public images
+        assert isinstance(url.path, six.text_type)
 
-        images = list_images('none', visibility='public')
 
-        self.assertEquals(len(images), 4)
 
-        for image in images:
+    @onlyPy3
 
-            self.assertEquals(image['visibility'], 'public')
+    def test_parse_url_bytes_type_error_python_3(self):
 
+        with pytest.raises(TypeError):
 
+            parse_url(b"https://www.google.com/")
 
-        # 6. Unknown user, visibility=private, sees no images
 
-        images = list_images('none', visibility='private')
 
-        self.assertEquals(len(images), 0)
+    @pytest.mark.parametrize('kwargs, expected', [
 
+        pytest.param(
 
+            {'accept_encoding': True},
 
-        # 7. Unknown admin sees all images
+            {'accept-encoding': 'gzip,deflate,br'},
 
-        images = list_images('none', role='admin')
+            marks=onlyBrotlipy(),
 
-        self.assertEquals(len(images), 8)
+        ),
 
+        pytest.param(
 
+            {'accept_encoding': True},
 
-        # 8. Unknown admin, visibility=public, shows only public images
+            {'accept-encoding': 'gzip,deflate'},
 
-        images = list_images('none', role='admin', visibility='public')
+            marks=notBrotlipy(),
 
-        self.assertEquals(len(images), 4)
+        ),
 
-        for image in images:
+        ({'accept_encoding': 'foo,bar'},
 
-            self.assertEquals(image['visibility'], 'public')
+         {'accept-encoding': 'foo,bar'}),
 
+        ({'accept_encoding': ['foo', 'bar']},
 
+         {'accept-encoding': 'foo,bar'}),
 
-        # 9. Unknown admin, visibility=private, sees only private images
+        pytest.param(
 
-        images = list_images('none', role='admin', visibility='private')
+            {'accept_encoding': True, 'user_agent': 'banana'},
 
-        self.assertEquals(len(images), 4)
+            {'accept-encoding': 'gzip,deflate,br', 'user-agent': 'banana'},
 
-        for image in images:
+            marks=onlyBrotlipy(),
 
-            self.assertEquals(image['visibility'], 'private')
+        ),
 
+        pytest.param(
 
+            {'accept_encoding': True, 'user_agent': 'banana'},
 
-        # 10. Known admin sees all images
+            {'accept-encoding': 'gzip,deflate', 'user-agent': 'banana'},
 
-        images = list_images('admin', role='admin')
+            marks=notBrotlipy(),
 
-        self.assertEquals(len(images), 8)
+        ),
 
+        ({'user_agent': 'banana'},
 
+         {'user-agent': 'banana'}),
 
-        # 11. Known admin, visibility=public, sees all public images
+        ({'keep_alive': True},
 
-        images = list_images('admin', role='admin', visibility='public')
+         {'connection': 'keep-alive'}),
 
-        self.assertEquals(len(images), 4)
+        ({'basic_auth': 'foo:bar'},
 
-        for image in images:
+         {'authorization': 'Basic Zm9vOmJhcg=='}),
 
-            self.assertEqual(image['visibility'], 'public')
+        ({'proxy_basic_auth': 'foo:bar'},
 
+         {'proxy-authorization': 'Basic Zm9vOmJhcg=='}),
 
+        ({'disable_cache': True},
 
-        # 12. Known admin, visibility=private, sees all private images
+         {'cache-control': 'no-cache'}),
 
-        images = list_images('admin', role='admin', visibility='private')
+    ])
 
-        self.assertEquals(len(images), 4)
+    def test_make_headers(self, kwargs, expected):
 
-        for image in images:
+        assert make_headers(**kwargs) == expected
 
-            self.assertEquals(image['visibility'], 'private')
 
 
+    def test_rewind_body(self):
 
-        self.stop_servers()
+        body = io.BytesIO(b'test data')
 
+        assert body.read() == b'test data'
 
 
 
+        # Assert the file object has been consumed
 
-class TestImageDirectURLVisibility(functional.FunctionalTest):
+        assert body.read() == b''
 
 
 
-    def setUp(self):
+        # Rewind it back to just be b'data'
 
-        super(TestImageDirectURLVisibility, self).setUp()
+        rewind_body(body, 5)
 
-        self.cleanup()
+        assert body.read() == b'data'
 
-        self.api_server.deployment_flavor = 'noauth'
 
 
+    def test_rewind_body_failed_tell(self):
 
-    def _url(self, path):
+        body = io.BytesIO(b'test data')
 
-        return 'http://127.0.0.1:%d%s' % (self.api_port, path)
+        body.read()  # Consume body
 
 
 
-    def _headers(self, custom_headers=None):
+        # Simulate failed tell()
 
-        base_headers = {
+        body_pos = _FAILEDTELL
 
-            'X-Identity-Status': 'Confirmed',
+        with pytest.raises(UnrewindableBodyError):
 
-            'X-Auth-Token': '932c5c84-02ac-4fe5-a9ba-620af0e2bb96',
+            rewind_body(body, body_pos)
 
-            'X-User-Id': 'f9a41d13-0c13-47e9-bee2-ce4e8bfe958e',
 
-            'X-Tenant-Id': TENANT1,
 
-            'X-Roles': 'member',
+    def test_rewind_body_bad_position(self):
 
-        }
+        body = io.BytesIO(b'test data')
 
-        base_headers.update(custom_headers or {})
+        body.read()  # Consume body
 
-        return base_headers
 
 
+        # Pass non-integer position
 
-    def test_v2_not_enabled(self):
+        with pytest.raises(ValueError):
 
-        self.api_server.enable_v2_api = False
+            rewind_body(body, body_pos=None)
 
-        self.start_servers(**self.__dict__.copy())
+        with pytest.raises(ValueError):
 
-        path = self._url('/v2/images')
+            rewind_body(body, body_pos=object())
 
-        response = requests.get(path, headers=self._headers())
 
-        self.assertEqual(300, response.status_code)
 
-        self.stop_servers()
+    def test_rewind_body_failed_seek(self):
 
+        class BadSeek():
 
 
-    def test_v2_enabled(self):
 
-        self.api_server.enable_v2_api = True
+            def seek(self, pos, offset=0):
 
-        self.start_servers(**self.__dict__.copy())
+                raise IOError
 
-        path = self._url('/v2/images')
 
-        response = requests.get(path, headers=self._headers())
 
-        self.assertEqual(200, response.status_code)
+        with pytest.raises(UnrewindableBodyError):
 
-        self.stop_servers()
+            rewind_body(BadSeek(), body_pos=2)
 
 
 
-    def test_image_direct_url_visible(self):
+    @pytest.mark.parametrize('input, expected', [
 
+        (('abcd', 'b'),  ('a', 'cd', 'b')),
 
+        (('abcd', 'cb'), ('a', 'cd', 'b')),
 
-        self.api_server.show_image_direct_url = True
+        (('abcd', ''),   ('abcd', '', None)),
 
-        self.start_servers(**self.__dict__.copy())
+        (('abcd', 'a'),  ('', 'bcd', 'a')),
 
+        (('abcd', 'ab'), ('', 'bcd', 'a')),
 
+        (('abcd', 'eb'), ('a', 'cd', 'b')),
 
-        # Image list should be empty
+    ])
 
-        path = self._url('/v2/images')
+    def test_split_first(self, input, expected):
 
-        response = requests.get(path, headers=self._headers())
+        output = split_first(*input)
 
-        self.assertEqual(200, response.status_code)
+        assert output == expected
 
-        images = json.loads(response.text)['images']
 
-        self.assertEqual(0, len(images))
 
+    def test_add_stderr_logger(self):
 
+        handler = add_stderr_logger(level=logging.INFO)  # Don't actually print debug
 
-        # Create an image
+        logger = logging.getLogger('urllib3')
 
-        path = self._url('/v2/images')
+        assert handler in logger.handlers
 
-        headers = self._headers({'content-type': 'application/json'})
 
-        data = json.dumps({'name': 'image-1', 'type': 'kernel', 'foo': 'bar'})
 
-        response = requests.post(path, headers=headers, data=data)
+        logger.debug('Testing add_stderr_logger')
 
-        self.assertEqual(201, response.status_code)
+        logger.removeHandler(handler)
 
 
 
-        # Get the image id
+    def test_disable_warnings(self):
 
-        image = json.loads(response.text)
+        with warnings.catch_warnings(record=True) as w:
 
-        image_id = image['id']
+            clear_warnings()
 
+            warnings.warn('This is a test.', InsecureRequestWarning)
 
+            assert len(w) == 1
 
-        # Image direct_url should not be visible before location is set
+            disable_warnings()
 
-        path = self._url('/v2/images/%s' % image_id)
+            warnings.warn('This is a test.', InsecureRequestWarning)
 
-        headers = self._headers({'Content-Type': 'application/json'})
+            assert len(w) == 1
 
-        response = requests.get(path, headers=headers)
 
-        self.assertEqual(200, response.status_code)
 
-        image = json.loads(response.text)
+    def _make_time_pass(self, seconds, timeout, time_mock):
 
-        self.assertFalse('direct_url' in image)
+        """ Make some time pass for the timeout object """
 
+        time_mock.return_value = TIMEOUT_EPOCH
 
+        timeout.start_connect()
 
-        # Upload some image data, setting the image location
+        time_mock.return_value = TIMEOUT_EPOCH + seconds
 
-        path = self._url('/v2/images/%s/file' % image_id)
+        return timeout
 
-        headers = self._headers({'Content-Type': 'application/octet-stream'})
 
-        response = requests.put(path, headers=headers, data='ZZZZZ')
 
-        self.assertEqual(201, response.status_code)
+    @pytest.mark.parametrize('kwargs, message', [
 
+        ({'total': -1},                 'less than'),
 
+        ({'connect': 2, 'total': -1},   'less than'),
 
-        # Image direct_url should be visible
+        ({'read': -1},                  'less than'),
 
-        path = self._url('/v2/images/%s' % image_id)
+        ({'connect': False},            'cannot be a boolean'),
 
-        headers = self._headers({'Content-Type': 'application/json'})
+        ({'read': True},                'cannot be a boolean'),
 
-        response = requests.get(path, headers=headers)
+        ({'connect': 0},                'less than or equal'),
 
-        self.assertEqual(200, response.status_code)
+        ({'read': 'foo'},               'int, float or None')
 
-        image = json.loads(response.text)
+    ])
 
-        self.assertTrue('direct_url' in image)
+    def test_invalid_timeouts(self, kwargs, message):
 
+        with pytest.raises(ValueError) as e:
 
+            Timeout(**kwargs)
 
-        # Image direct_url should be visible in a list
+        assert message in str(e.value)
 
-        path = self._url('/v2/images')
 
-        headers = self._headers({'Content-Type': 'application/json'})
 
-        response = requests.get(path, headers=headers)
+    @patch('urllib3.util.timeout.current_time')
 
-        self.assertEqual(200, response.status_code)
+    def test_timeout(self, current_time):
 
-        image = json.loads(response.text)['images'][0]
+        timeout = Timeout(total=3)
 
-        self.assertTrue('direct_url' in image)
 
 
+        # make 'no time' elapse
 
-        self.stop_servers()
+        timeout = self._make_time_pass(seconds=0, timeout=timeout,
 
+                                       time_mock=current_time)
 
+        assert timeout.read_timeout == 3
 
-    def test_image_direct_url_not_visible(self):
+        assert timeout.connect_timeout == 3
 
 
 
-        self.api_server.show_image_direct_url = False
+        timeout = Timeout(total=3, connect=2)
 
-        self.start_servers(**self.__dict__.copy())
+        assert timeout.connect_timeout == 2
 
 
 
-        # Image list should be empty
+        timeout = Timeout()
 
-        path = self._url('/v2/images')
+        assert timeout.connect_timeout == Timeout.DEFAULT_TIMEOUT
 
-        response = requests.get(path, headers=self._headers())
 
-        self.assertEqual(200, response.status_code)
 
-        images = json.loads(response.text)['images']
+        # Connect takes 5 seconds, leaving 5 seconds for read
 
-        self.assertEqual(0, len(images))
+        timeout = Timeout(total=10, read=7)
 
+        timeout = self._make_time_pass(seconds=5, timeout=timeout,
 
+                                       time_mock=current_time)
 
-        # Create an image
+        assert timeout.read_timeout == 5
 
-        path = self._url('/v2/images')
 
-        headers = self._headers({'content-type': 'application/json'})
 
-        data = json.dumps({'name': 'image-1', 'type': 'kernel', 'foo': 'bar'})
+        # Connect takes 2 seconds, read timeout still 7 seconds
 
-        response = requests.post(path, headers=headers, data=data)
+        timeout = Timeout(total=10, read=7)
 
-        self.assertEqual(201, response.status_code)
+        timeout = self._make_time_pass(seconds=2, timeout=timeout,
 
+                                       time_mock=current_time)
 
+        assert timeout.read_timeout == 7
 
-        # Get the image id
 
-        image = json.loads(response.text)
 
-        image_id = image['id']
+        timeout = Timeout(total=10, read=7)
 
+        assert timeout.read_timeout == 7
 
 
-        # Upload some image data, setting the image location
 
-        path = self._url('/v2/images/%s/file' % image_id)
+        timeout = Timeout(total=None, read=None, connect=None)
 
-        headers = self._headers({'Content-Type': 'application/octet-stream'})
+        assert timeout.connect_timeout is None
 
-        response = requests.put(path, headers=headers, data='ZZZZZ')
+        assert timeout.read_timeout is None
 
-        self.assertEqual(201, response.status_code)
+        assert timeout.total is None
 
 
 
-        # Image direct_url should not be visible
+        timeout = Timeout(5)
 
-        path = self._url('/v2/images/%s' % image_id)
+        assert timeout.total == 5
 
-        headers = self._headers({'Content-Type': 'application/json'})
 
-        response = requests.get(path, headers=headers)
 
-        self.assertEqual(200, response.status_code)
+    def test_timeout_str(self):
 
-        image = json.loads(response.text)
+        timeout = Timeout(connect=1, read=2, total=3)
 
-        self.assertFalse('direct_url' in image)
+        assert str(timeout) == "Timeout(connect=1, read=2, total=3)"
 
+        timeout = Timeout(connect=1, read=None, total=3)
 
+        assert str(timeout) == "Timeout(connect=1, read=None, total=3)"
 
-        # Image direct_url should not be visible in a list
 
-        path = self._url('/v2/images')
 
-        headers = self._headers({'Content-Type': 'application/json'})
+    @patch('urllib3.util.timeout.current_time')
 
-        response = requests.get(path, headers=headers)
+    def test_timeout_elapsed(self, current_time):
 
-        self.assertEqual(200, response.status_code)
+        current_time.return_value = TIMEOUT_EPOCH
 
-        image = json.loads(response.text)['images'][0]
+        timeout = Timeout(total=3)
 
-        self.assertFalse('direct_url' in image)
+        with pytest.raises(TimeoutStateError):
 
+            timeout.get_connect_duration()
 
 
-        self.stop_servers()
+
+        timeout.start_connect()
+
+        with pytest.raises(TimeoutStateError):
+
+            timeout.start_connect()
+
+
+
+        current_time.return_value = TIMEOUT_EPOCH + 2
+
+        assert timeout.get_connect_duration() == 2
+
+        current_time.return_value = TIMEOUT_EPOCH + 37
+
+        assert timeout.get_connect_duration() == 37
+
+
+
+    @pytest.mark.parametrize('candidate, requirements', [
+
+        (None, ssl.CERT_REQUIRED),
+
+        (ssl.CERT_NONE, ssl.CERT_NONE),
+
+        (ssl.CERT_REQUIRED, ssl.CERT_REQUIRED),
+
+        ('REQUIRED', ssl.CERT_REQUIRED),
+
+        ('CERT_REQUIRED', ssl.CERT_REQUIRED),
+
+    ])
+
+    def test_resolve_cert_reqs(self, candidate, requirements):
+
+        assert resolve_cert_reqs(candidate) == requirements
+
+
+
+    @pytest.mark.parametrize('candidate, version', [
+
+        (ssl.PROTOCOL_TLSv1, ssl.PROTOCOL_TLSv1),
+
+        ("PROTOCOL_TLSv1", ssl.PROTOCOL_TLSv1),
+
+        ("TLSv1", ssl.PROTOCOL_TLSv1),
+
+        (ssl.PROTOCOL_SSLv23, ssl.PROTOCOL_SSLv23),
+
+    ])
+
+    def test_resolve_ssl_version(self, candidate, version):
+
+        assert resolve_ssl_version(candidate) == version
+
+
+
+    def test_is_fp_closed_object_supports_closed(self):
+
+        class ClosedFile(object):
+
+            @property
+
+            def closed(self):
+
+                return True
+
+
+
+        assert is_fp_closed(ClosedFile())
+
+
+
+    def test_is_fp_closed_object_has_none_fp(self):
+
+        class NoneFpFile(object):
+
+            @property
+
+            def fp(self):
+
+                return None
+
+
+
+        assert is_fp_closed(NoneFpFile())
+
+
+
+    def test_is_fp_closed_object_has_fp(self):
+
+        class FpFile(object):
+
+            @property
+
+            def fp(self):
+
+                return True
+
+
+
+        assert not is_fp_closed(FpFile())
+
+
+
+    def test_is_fp_closed_object_has_neither_fp_nor_closed(self):
+
+        class NotReallyAFile(object):
+
+            pass
+
+
+
+        with pytest.raises(ValueError):
+
+            is_fp_closed(NotReallyAFile())
+
+
+
+    def test_ssl_wrap_socket_loads_the_cert_chain(self):
+
+        socket = object()
+
+        mock_context = Mock()
+
+        ssl_wrap_socket(ssl_context=mock_context, sock=socket,
+
+                        certfile='/path/to/certfile')
+
+
+
+        mock_context.load_cert_chain.assert_called_once_with(
+
+            '/path/to/certfile', None
+
+        )
+
+
+
+    @patch('urllib3.util.ssl_.create_urllib3_context')
+
+    def test_ssl_wrap_socket_creates_new_context(self,
+
+                                                 create_urllib3_context):
+
+        socket = object()
+
+        ssl_wrap_socket(sock=socket, cert_reqs='CERT_REQUIRED')
+
+
+
+        create_urllib3_context.assert_called_once_with(
+
+            None, 'CERT_REQUIRED', ciphers=None
+
+        )
+
+
+
+    def test_ssl_wrap_socket_loads_verify_locations(self):
+
+        socket = object()
+
+        mock_context = Mock()
+
+        ssl_wrap_socket(ssl_context=mock_context, ca_certs='/path/to/pem',
+
+                        sock=socket)
+
+        mock_context.load_verify_locations.assert_called_once_with(
+
+            '/path/to/pem', None
+
+        )
+
+
+
+    def test_ssl_wrap_socket_loads_certificate_directories(self):
+
+        socket = object()
+
+        mock_context = Mock()
+
+        ssl_wrap_socket(ssl_context=mock_context, ca_cert_dir='/path/to/pems',
+
+                        sock=socket)
+
+        mock_context.load_verify_locations.assert_called_once_with(
+
+            None, '/path/to/pems'
+
+        )
+
+
+
+    def test_ssl_wrap_socket_with_no_sni_warns(self):
+
+        socket = object()
+
+        mock_context = Mock()
+
+        # Ugly preservation of original value
+
+        HAS_SNI = ssl_.HAS_SNI
+
+        ssl_.HAS_SNI = False
+
+        try:
+
+            with patch('warnings.warn') as warn:
+
+                ssl_wrap_socket(ssl_context=mock_context, sock=socket,
+
+                                server_hostname='www.google.com')
+
+            mock_context.wrap_socket.assert_called_once_with(socket)
+
+            assert warn.call_count >= 1
+
+            warnings = [call[0][1] for call in warn.call_args_list]
+
+            assert SNIMissingWarning in warnings
+
+        finally:
+
+            ssl_.HAS_SNI = HAS_SNI
+
+
+
+    def test_const_compare_digest_fallback(self):
+
+        target = hashlib.sha256(b'abcdef').digest()
+
+        assert _const_compare_digest_backport(target, target)
+
+
+
+        prefix = target[:-1]
+
+        assert not _const_compare_digest_backport(target, prefix)
+
+
+
+        suffix = target + b'0'
+
+        assert not _const_compare_digest_backport(target, suffix)
+
+
+
+        incorrect = hashlib.sha256(b'xyz').digest()
+
+        assert not _const_compare_digest_backport(target, incorrect)
+
+
+
+    def test_has_ipv6_disabled_on_compile(self):
+
+        with patch('socket.has_ipv6', False):
+
+            assert not _has_ipv6('::1')
+
+
+
+    def test_has_ipv6_enabled_but_fails(self):
+
+        with patch('socket.has_ipv6', True):
+
+            with patch('socket.socket') as mock:
+
+                instance = mock.return_value
+
+                instance.bind = Mock(side_effect=Exception('No IPv6 here!'))
+
+                assert not _has_ipv6('::1')
+
+
+
+    def test_has_ipv6_enabled_and_working(self):
+
+        with patch('socket.has_ipv6', True):
+
+            with patch('socket.socket') as mock:
+
+                instance = mock.return_value
+
+                instance.bind.return_value = True
+
+                assert _has_ipv6('::1')
+
+
+
+    def test_has_ipv6_disabled_on_appengine(self):
+
+        gae_patch = patch(
+
+            'urllib3.contrib._appengine_environ.is_appengine_sandbox',
+
+            return_value=True)
+
+        with gae_patch:
+
+            assert not _has_ipv6('::1')
+
+
+
+    def test_ip_family_ipv6_enabled(self):
+
+        with patch('urllib3.util.connection.HAS_IPV6', True):
+
+            assert allowed_gai_family() == socket.AF_UNSPEC
+
+
+
+    def test_ip_family_ipv6_disabled(self):
+
+        with patch('urllib3.util.connection.HAS_IPV6', False):
+
+            assert allowed_gai_family() == socket.AF_INET
+
+
+
+    @pytest.mark.parametrize('value', [
+
+        "-1",
+
+        "+1",
+
+        "1.0",
+
+        six.u("\xb2"),  # \xb2 = ^2
+
+    ])
+
+    def test_parse_retry_after_invalid(self, value):
+
+        retry = Retry()
+
+        with pytest.raises(InvalidHeader):
+
+            retry.parse_retry_after(value)
+
+
+
+    @pytest.mark.parametrize('value, expected', [
+
+        ("0", 0),
+
+        ("1000", 1000),
+
+        ("\t42 ", 42),
+
+    ])
+
+    def test_parse_retry_after(self, value, expected):
+
+        retry = Retry()
+
+        assert retry.parse_retry_after(value) == expected
+
+
+
+    @pytest.mark.parametrize('headers', [
+
+        b'foo',
+
+        None,
+
+        object,
+
+    ])
+
+    def test_assert_header_parsing_throws_typeerror_with_non_headers(self, headers):
+
+        with pytest.raises(TypeError):
+
+            assert_header_parsing(headers)

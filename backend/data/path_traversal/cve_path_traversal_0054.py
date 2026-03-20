@@ -2,3378 +2,3214 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-from __future__ import division, absolute_import, print_function
+# vim: ft=python fileencoding=utf-8 sts=4 sw=4 et:
 
 
 
-import sys
+# Copyright 2016-2020 Florian Bruhin (The Compiler) <mail@qutebrowser.org>
 
-import gzip
+#
 
-import os
+# This file is part of qutebrowser.
 
-import threading
+#
 
-from tempfile import mkstemp, mktemp, NamedTemporaryFile
+# qutebrowser is free software: you can redistribute it and/or modify
 
-import time
+# it under the terms of the GNU General Public License as published by
 
-import warnings
+# the Free Software Foundation, either version 3 of the License, or
 
-import gc
+# (at your option) any later version.
 
-from io import BytesIO
+#
 
-from datetime import datetime
+# qutebrowser is distributed in the hope that it will be useful,
 
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
 
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 
-import numpy as np
+# GNU General Public License for more details.
 
-import numpy.ma as ma
+#
 
-from numpy.lib._iotools import (ConverterError, ConverterLockError,
+# You should have received a copy of the GNU General Public License
 
-                                ConversionWarning)
-
-from numpy.compat import asbytes, asbytes_nested, bytes, asstr
-
-from nose import SkipTest
-
-from numpy.ma.testutils import (TestCase, assert_equal, assert_array_equal,
-
-                                assert_raises, run_module_suite)
-
-from numpy.testing import assert_warns, assert_, build_err_msg
+# along with qutebrowser.  If not, see <http://www.gnu.org/licenses/>.
 
 
 
-
-
-class TextIO(BytesIO):
-
-    """Helper IO class.
+"""Wrapper over a QWebEngineView."""
 
 
 
-    Writes encode strings to bytes if needed, reads return bytes.
+import math
 
-    This makes it easier to emulate files opened in binary mode
+import functools
 
-    without needing to explicitly convert strings to bytes in
+import re
 
-    setting up the test data.
+import html as html_utils
+
+import typing
 
 
+
+from PyQt5.QtCore import (pyqtSignal, pyqtSlot, Qt, QPoint, QPointF, QUrl,
+
+                          QTimer, QObject)
+
+from PyQt5.QtNetwork import QAuthenticator
+
+from PyQt5.QtWidgets import QApplication, QWidget
+
+from PyQt5.QtWebEngineWidgets import QWebEnginePage, QWebEngineScript
+
+
+
+from qutebrowser.config import configdata, config
+
+from qutebrowser.browser import (browsertab, eventfilter, shared, webelem,
+
+                                 history, greasemonkey)
+
+from qutebrowser.browser.webengine import (webview, webengineelem, tabhistory,
+
+                                           interceptor, webenginequtescheme,
+
+                                           cookies, webenginedownloads,
+
+                                           webenginesettings, certificateerror)
+
+from qutebrowser.misc import miscwidgets, objects
+
+from qutebrowser.utils import (usertypes, qtutils, log, javascript, utils,
+
+                               message, objreg, jinja, debug)
+
+from qutebrowser.qt import sip
+
+
+
+
+
+_qute_scheme_handler = None
+
+
+
+
+
+def init():
+
+    """Initialize QtWebEngine-specific modules."""
+
+    # For some reason we need to keep a reference, otherwise the scheme handler
+
+    # won't work...
+
+    # https://www.riverbankcomputing.com/pipermail/pyqt/2016-September/038075.html
+
+    global _qute_scheme_handler
+
+
+
+    app = QApplication.instance()
+
+    log.init.debug("Initializing qute://* handler...")
+
+    _qute_scheme_handler = webenginequtescheme.QuteSchemeHandler(parent=app)
+
+    _qute_scheme_handler.install(webenginesettings.default_profile)
+
+    if webenginesettings.private_profile:
+
+        _qute_scheme_handler.install(webenginesettings.private_profile)
+
+
+
+    log.init.debug("Initializing request interceptor...")
+
+    req_interceptor = interceptor.RequestInterceptor(parent=app)
+
+    req_interceptor.install(webenginesettings.default_profile)
+
+    if webenginesettings.private_profile:
+
+        req_interceptor.install(webenginesettings.private_profile)
+
+
+
+    log.init.debug("Initializing QtWebEngine downloads...")
+
+    download_manager = webenginedownloads.DownloadManager(parent=app)
+
+    download_manager.install(webenginesettings.default_profile)
+
+    if webenginesettings.private_profile:
+
+        download_manager.install(webenginesettings.private_profile)
+
+    objreg.register('webengine-download-manager', download_manager)
+
+
+
+    log.init.debug("Initializing cookie filter...")
+
+    cookies.install_filter(webenginesettings.default_profile)
+
+    if webenginesettings.private_profile:
+
+        cookies.install_filter(webenginesettings.private_profile)
+
+
+
+    # Clear visited links on web history clear
+
+    for p in [webenginesettings.default_profile,
+
+              webenginesettings.private_profile]:
+
+        if not p:
+
+            continue
+
+        history.web_history.history_cleared.connect(p.clearAllVisitedLinks)
+
+        history.web_history.url_cleared.connect(
+
+            lambda url, profile=p: profile.clearVisitedLinks([url]))
+
+
+
+
+
+# Mapping worlds from usertypes.JsWorld to QWebEngineScript world IDs.
+
+_JS_WORLD_MAP = {
+
+    usertypes.JsWorld.main: QWebEngineScript.MainWorld,
+
+    usertypes.JsWorld.application: QWebEngineScript.ApplicationWorld,
+
+    usertypes.JsWorld.user: QWebEngineScript.UserWorld,
+
+    usertypes.JsWorld.jseval: QWebEngineScript.UserWorld + 1,
+
+}
+
+
+
+
+
+class WebEngineAction(browsertab.AbstractAction):
+
+
+
+    """QtWebEngine implementations related to web actions."""
+
+
+
+    action_class = QWebEnginePage
+
+    action_base = QWebEnginePage.WebAction
+
+
+
+    def exit_fullscreen(self):
+
+        self._widget.triggerPageAction(QWebEnginePage.ExitFullScreen)
+
+
+
+    def save_page(self):
+
+        """Save the current page."""
+
+        self._widget.triggerPageAction(QWebEnginePage.SavePage)
+
+
+
+    def show_source(self, pygments=False):
+
+        if pygments:
+
+            self._show_source_pygments()
+
+            return
+
+
+
+        try:
+
+            self._widget.triggerPageAction(QWebEnginePage.ViewSource)
+
+        except AttributeError:
+
+            # Qt < 5.8
+
+            tb = objreg.get('tabbed-browser', scope='window',
+
+                            window=self._tab.win_id)
+
+            urlstr = self._tab.url().toString(
+
+                QUrl.RemoveUserInfo)  # type: ignore
+
+            # The original URL becomes the path of a view-source: URL
+
+            # (without a host), but query/fragment should stay.
+
+            url = QUrl('view-source:' + urlstr)
+
+            tb.tabopen(url, background=False, related=True)
+
+
+
+
+
+class WebEnginePrinting(browsertab.AbstractPrinting):
+
+
+
+    """QtWebEngine implementations related to printing."""
+
+
+
+    def check_pdf_support(self):
+
+        pass
+
+
+
+    def check_printer_support(self):
+
+        if not hasattr(self._widget.page(), 'print'):
+
+            raise browsertab.WebTabError(
+
+                "Printing is unsupported with QtWebEngine on Qt < 5.8")
+
+
+
+    def check_preview_support(self):
+
+        raise browsertab.WebTabError(
+
+            "Print previews are unsupported with QtWebEngine")
+
+
+
+    def to_pdf(self, filename):
+
+        self._widget.page().printToPdf(filename)
+
+
+
+    def to_printer(self, printer, callback=None):
+
+        if callback is None:
+
+            callback = lambda _ok: None
+
+        self._widget.page().print(printer, callback)
+
+
+
+
+
+class WebEngineSearch(browsertab.AbstractSearch):
+
+
+
+    """QtWebEngine implementations related to searching on the page.
+
+
+
+    Attributes:
+
+        _flags: The QWebEnginePage.FindFlags of the last search.
+
+        _pending_searches: How many searches have been started but not called
+
+                           back yet.
 
     """
 
-    def __init__(self, s=""):
-
-        BytesIO.__init__(self, asbytes(s))
 
 
+    def __init__(self, tab, parent=None):
 
-    def write(self, s):
+        super().__init__(tab, parent)
 
-        BytesIO.write(self, asbytes(s))
+        self._flags = QWebEnginePage.FindFlags(0)  # type: ignore
 
-
-
-    def writelines(self, lines):
-
-        BytesIO.writelines(self, [asbytes(s) for s in lines])
+        self._pending_searches = 0
 
 
 
+    def _find(self, text, flags, callback, caller):
 
+        """Call findText on the widget."""
 
-MAJVER, MINVER = sys.version_info[:2]
+        self.search_displayed = True
 
-IS_64BIT = sys.maxsize > 2**32
-
-
-
-
-
-def strptime(s, fmt=None):
-
-    """This function is available in the datetime module only
-
-    from Python >= 2.5.
+        self._pending_searches += 1
 
 
 
-    """
+        def wrapped_callback(found):
 
-    if sys.version_info[0] >= 3:
+            """Wrap the callback to do debug logging."""
 
-        return datetime(*time.strptime(s.decode('latin1'), fmt)[:3])
+            self._pending_searches -= 1
 
-    else:
+            if self._pending_searches > 0:
 
-        return datetime(*time.strptime(s, fmt)[:3])
+                # See https://github.com/qutebrowser/qutebrowser/issues/2442
 
+                # and https://github.com/qt/qtwebengine/blob/5.10/src/core/web_contents_adapter.cpp#L924-L934
 
+                log.webview.debug("Ignoring cancelled search callback with "
 
+                                  "{} pending searches".format(
 
+                                      self._pending_searches))
 
-class RoundtripTest(object):
-
-    def roundtrip(self, save_func, *args, **kwargs):
-
-        """
-
-        save_func : callable
-
-            Function used to save arrays to file.
-
-        file_on_disk : bool
-
-            If true, store the file on disk, instead of in a
-
-            string buffer.
-
-        save_kwds : dict
-
-            Parameters passed to `save_func`.
-
-        load_kwds : dict
-
-            Parameters passed to `numpy.load`.
-
-        args : tuple of arrays
-
-            Arrays stored to file.
+                return
 
 
 
-        """
+            if sip.isdeleted(self._widget):
 
-        save_kwds = kwargs.get('save_kwds', {})
+                # This happens when starting a search, and closing the tab
 
-        load_kwds = kwargs.get('load_kwds', {})
+                # before results arrive.
 
-        file_on_disk = kwargs.get('file_on_disk', False)
+                log.webview.debug("Ignoring finished search for deleted "
+
+                                  "widget")
+
+                return
 
 
 
-        if file_on_disk:
+            found_text = 'found' if found else "didn't find"
 
-            # Do not delete the file on windows, because we can't
+            if flags:
 
-            # reopen an already opened file on that platform, so we
+                flag_text = 'with flags {}'.format(debug.qflags_key(
 
-            # need to close the file and reopen it, implying no
-
-            # automatic deletion.
-
-            if sys.platform == 'win32' and MAJVER >= 2 and MINVER >= 6:
-
-                target_file = NamedTemporaryFile(delete=False)
+                    QWebEnginePage, flags, klass=QWebEnginePage.FindFlag))
 
             else:
 
-                target_file = NamedTemporaryFile()
+                flag_text = ''
 
-            load_file = target_file.name
+            log.webview.debug(' '.join([caller, found_text, text, flag_text])
+
+                              .strip())
+
+
+
+            if callback is not None:
+
+                callback(found)
+
+            self.finished.emit(found)
+
+
+
+        self._widget.findText(text, flags, wrapped_callback)
+
+
+
+    def search(self, text, *, ignore_case=usertypes.IgnoreCase.never,
+
+               reverse=False, result_cb=None):
+
+        # Don't go to next entry on duplicate search
+
+        if self.text == text and self.search_displayed:
+
+            log.webview.debug("Ignoring duplicate search request"
+
+                              " for {}".format(text))
+
+            return
+
+
+
+        self.text = text
+
+        self._flags = QWebEnginePage.FindFlags(0)  # type: ignore
+
+        if self._is_case_sensitive(ignore_case):
+
+            self._flags |= QWebEnginePage.FindCaseSensitively
+
+        if reverse:
+
+            self._flags |= QWebEnginePage.FindBackward
+
+
+
+        self._find(text, self._flags, result_cb, 'search')
+
+
+
+    def clear(self):
+
+        if self.search_displayed:
+
+            self.cleared.emit()
+
+        self.search_displayed = False
+
+        self._widget.findText('')
+
+
+
+    def prev_result(self, *, result_cb=None):
+
+        # The int() here makes sure we get a copy of the flags.
+
+        flags = QWebEnginePage.FindFlags(int(self._flags))  # type: ignore
+
+        if flags & QWebEnginePage.FindBackward:
+
+            flags &= ~QWebEnginePage.FindBackward
 
         else:
 
-            target_file = BytesIO()
+            flags |= QWebEnginePage.FindBackward
 
-            load_file = target_file
+        self._find(self.text, flags, result_cb, 'prev_result')
 
 
 
-        arr = args
+    def next_result(self, *, result_cb=None):
 
+        self._find(self.text, self._flags, result_cb, 'next_result')
 
 
-        save_func(target_file, *arr, **save_kwds)
 
-        target_file.flush()
 
-        target_file.seek(0)
 
+class WebEngineCaret(browsertab.AbstractCaret):
 
 
-        if sys.platform == 'win32' and not isinstance(target_file, BytesIO):
 
-            target_file.close()
+    """QtWebEngine implementations related to moving the cursor/selection."""
 
 
 
-        arr_reloaded = np.load(load_file, **load_kwds)
+    def _flags(self):
 
+        """Get flags to pass to JS."""
 
+        flags = set()
 
-        self.arr = arr
+        if qtutils.version_check('5.7.1', compiled=False):
 
-        self.arr_reloaded = arr_reloaded
+            flags.add('filter-prefix')
 
+        if utils.is_windows:
 
+            flags.add('windows')
 
-    def check_roundtrips(self, a):
+        return list(flags)
 
-        self.roundtrip(a)
 
-        self.roundtrip(a, file_on_disk=True)
 
-        self.roundtrip(np.asfortranarray(a))
+    @pyqtSlot(usertypes.KeyMode)
 
-        self.roundtrip(np.asfortranarray(a), file_on_disk=True)
+    def _on_mode_entered(self, mode):
 
-        if a.shape[0] > 1:
+        if mode != usertypes.KeyMode.caret:
 
-            # neither C nor Fortran contiguous for 2D arrays or more
+            return
 
-            self.roundtrip(np.asfortranarray(a)[1:])
 
-            self.roundtrip(np.asfortranarray(a)[1:], file_on_disk=True)
 
+        if self._tab.search.search_displayed:
 
+            # We are currently in search mode.
 
-    def test_array(self):
+            # convert the search to a blue selection so we can operate on it
 
-        a = np.array([], float)
+            # https://bugreports.qt.io/browse/QTBUG-60673
 
-        self.check_roundtrips(a)
+            self._tab.search.clear()
 
 
 
-        a = np.array([[1, 2], [3, 4]], float)
+        self._tab.run_js_async(
 
-        self.check_roundtrips(a)
+            javascript.assemble('caret', 'setFlags', self._flags()))
 
 
 
-        a = np.array([[1, 2], [3, 4]], int)
+        self._js_call('setInitialCursor', callback=self._selection_cb)
 
-        self.check_roundtrips(a)
 
 
+    def _selection_cb(self, enabled):
 
-        a = np.array([[1 + 5j, 2 + 6j], [3 + 7j, 4 + 8j]], dtype=np.csingle)
+        """Emit selection_toggled based on setInitialCursor."""
 
-        self.check_roundtrips(a)
+        if self._mode_manager.mode != usertypes.KeyMode.caret:
 
+            log.webview.debug("Ignoring selection cb due to mode change.")
 
+            return
 
-        a = np.array([[1 + 5j, 2 + 6j], [3 + 7j, 4 + 8j]], dtype=np.cdouble)
+        if enabled is None:
 
-        self.check_roundtrips(a)
+            log.webview.debug("Ignoring selection status None")
 
+            return
 
+        self.selection_toggled.emit(enabled)
 
-    def test_array_object(self):
 
-        if sys.version_info[:2] >= (2, 7):
 
-            a = np.array([], object)
+    @pyqtSlot(usertypes.KeyMode)
 
-            self.check_roundtrips(a)
+    def _on_mode_left(self, mode):
 
+        if mode != usertypes.KeyMode.caret:
 
+            return
 
-            a = np.array([[1, 2], [3, 4]], object)
 
-            self.check_roundtrips(a)
 
-        # Fails with UnpicklingError: could not find MARK on Python 2.6
+        self.drop_selection()
 
+        self._js_call('disableCaret')
 
 
-    def test_1D(self):
 
-        a = np.array([1, 2, 3, 4], int)
+    def move_to_next_line(self, count=1):
 
-        self.roundtrip(a)
+        self._js_call('moveDown', count)
 
 
 
-    @np.testing.dec.knownfailureif(sys.platform == 'win32', "Fail on Win32")
+    def move_to_prev_line(self, count=1):
 
-    def test_mmap(self):
+        self._js_call('moveUp', count)
 
-        a = np.array([[1, 2.5], [4, 7.3]])
 
-        self.roundtrip(a, file_on_disk=True, load_kwds={'mmap_mode': 'r'})
 
+    def move_to_next_char(self, count=1):
 
+        self._js_call('moveRight', count)
 
-        a = np.asfortranarray([[1, 2.5], [4, 7.3]])
 
-        self.roundtrip(a, file_on_disk=True, load_kwds={'mmap_mode': 'r'})
 
+    def move_to_prev_char(self, count=1):
 
+        self._js_call('moveLeft', count)
 
-    def test_record(self):
 
-        a = np.array([(1, 2), (3, 4)], dtype=[('x', 'i4'), ('y', 'i4')])
 
-        self.check_roundtrips(a)
+    def move_to_end_of_word(self, count=1):
 
+        self._js_call('moveToEndOfWord', count)
 
 
 
+    def move_to_next_word(self, count=1):
 
-class TestSaveLoad(RoundtripTest, TestCase):
+        self._js_call('moveToNextWord', count)
 
-    def roundtrip(self, *args, **kwargs):
 
-        RoundtripTest.roundtrip(self, np.save, *args, **kwargs)
 
-        assert_equal(self.arr[0], self.arr_reloaded)
+    def move_to_prev_word(self, count=1):
 
-        assert_equal(self.arr[0].dtype, self.arr_reloaded.dtype)
+        self._js_call('moveToPreviousWord', count)
 
-        assert_equal(self.arr[0].flags.fnc, self.arr_reloaded.flags.fnc)
 
 
+    def move_to_start_of_line(self):
 
+        self._js_call('moveToStartOfLine')
 
 
-class TestSavezLoad(RoundtripTest, TestCase):
 
-    def roundtrip(self, *args, **kwargs):
+    def move_to_end_of_line(self):
 
-        RoundtripTest.roundtrip(self, np.savez, *args, **kwargs)
+        self._js_call('moveToEndOfLine')
 
-        for n, arr in enumerate(self.arr):
 
-            reloaded = self.arr_reloaded['arr_%d' % n]
 
-            assert_equal(arr, reloaded)
+    def move_to_start_of_next_block(self, count=1):
 
-            assert_equal(arr.dtype, reloaded.dtype)
+        self._js_call('moveToStartOfNextBlock', count)
 
-            assert_equal(arr.flags.fnc, reloaded.flags.fnc)
 
 
+    def move_to_start_of_prev_block(self, count=1):
 
-    @np.testing.dec.skipif(not IS_64BIT, "Works only with 64bit systems")
+        self._js_call('moveToStartOfPrevBlock', count)
 
-    @np.testing.dec.slow
 
-    def test_big_arrays(self):
 
-        L = (1 << 31) + 100000
+    def move_to_end_of_next_block(self, count=1):
 
-        tmp = mktemp(suffix='.npz')
+        self._js_call('moveToEndOfNextBlock', count)
 
-        a = np.empty(L, dtype=np.uint8)
 
-        np.savez(tmp, a=a)
 
-        del a
+    def move_to_end_of_prev_block(self, count=1):
 
-        npfile = np.load(tmp)
+        self._js_call('moveToEndOfPrevBlock', count)
 
-        a = npfile['a']
 
-        npfile.close()
 
-        os.remove(tmp)
+    def move_to_start_of_document(self):
 
+        self._js_call('moveToStartOfDocument')
 
 
-    def test_multiple_arrays(self):
 
-        a = np.array([[1, 2], [3, 4]], float)
+    def move_to_end_of_document(self):
 
-        b = np.array([[1 + 2j, 2 + 7j], [3 - 6j, 4 + 12j]], complex)
+        self._js_call('moveToEndOfDocument')
 
-        self.roundtrip(a, b)
 
 
+    def toggle_selection(self):
 
-    def test_named_arrays(self):
+        self._js_call('toggleSelection', callback=self.selection_toggled.emit)
 
-        a = np.array([[1, 2], [3, 4]], float)
 
-        b = np.array([[1 + 2j, 2 + 7j], [3 - 6j, 4 + 12j]], complex)
 
-        c = BytesIO()
+    def drop_selection(self):
 
-        np.savez(c, file_a=a, file_b=b)
+        self._js_call('dropSelection')
 
-        c.seek(0)
 
-        l = np.load(c)
 
-        assert_equal(a, l['file_a'])
+    def selection(self, callback):
 
-        assert_equal(b, l['file_b'])
+        # Not using selectedText() as WORKAROUND for
 
+        # https://bugreports.qt.io/browse/QTBUG-53134
 
+        # Even on Qt 5.10 selectedText() seems to work poorly, see
 
-    def test_savez_filename_clashes(self):
+        # https://github.com/qutebrowser/qutebrowser/issues/3523
 
-        # Test that issue #852 is fixed
+        self._tab.run_js_async(javascript.assemble('caret', 'getSelection'),
 
-        # and savez functions in multithreaded environment
+                               callback)
 
 
 
-        def writer(error_list):
+    def reverse_selection(self):
 
-            fd, tmp = mkstemp(suffix='.npz')
+        self._js_call('reverseSelection')
 
-            os.close(fd)
+
+
+    def _follow_selected_cb_wrapped(self, js_elem, tab):
+
+        try:
+
+            self._follow_selected_cb(js_elem, tab)
+
+        finally:
+
+            self.follow_selected_done.emit()
+
+
+
+    def _follow_selected_cb(self, js_elem, tab):
+
+        """Callback for javascript which clicks the selected element.
+
+
+
+        Args:
+
+            js_elem: The element serialized from javascript.
+
+            tab: Open in a new tab.
+
+        """
+
+        if js_elem is None:
+
+            return
+
+
+
+        if js_elem == "focused":
+
+            # we had a focused element, not a selected one. Just send <enter>
+
+            self._follow_enter(tab)
+
+            return
+
+
+
+        assert isinstance(js_elem, dict), js_elem
+
+        elem = webengineelem.WebEngineElement(js_elem, tab=self._tab)
+
+        if tab:
+
+            click_type = usertypes.ClickTarget.tab
+
+        else:
+
+            click_type = usertypes.ClickTarget.normal
+
+
+
+        # Only click if we see a link
+
+        if elem.is_link():
+
+            log.webview.debug("Found link in selection, clicking. ClickTarget "
+
+                              "{}, elem {}".format(click_type, elem))
 
             try:
 
-                arr = np.random.randn(500, 500)
+                elem.click(click_type)
+
+            except webelem.Error as e:
+
+                message.error(str(e))
+
+
+
+    def follow_selected(self, *, tab=False):
+
+        if self._tab.search.search_displayed:
+
+            # We are currently in search mode.
+
+            # let's click the link via a fake-click
+
+            # https://bugreports.qt.io/browse/QTBUG-60673
+
+            self._tab.search.clear()
+
+
+
+            log.webview.debug("Clicking a searched link via fake key press.")
+
+            # send a fake enter, clicking the orange selection box
+
+            self._follow_enter(tab)
+
+        else:
+
+            # click an existing blue selection
+
+            js_code = javascript.assemble('webelem',
+
+                                          'find_selected_focused_link')
+
+            self._tab.run_js_async(
+
+                js_code,
+
+                lambda jsret: self._follow_selected_cb_wrapped(jsret, tab))
+
+
+
+    def _js_call(self, command, *args, callback=None):
+
+        code = javascript.assemble('caret', command, *args)
+
+        self._tab.run_js_async(code, callback)
+
+
+
+
+
+class WebEngineScroller(browsertab.AbstractScroller):
+
+
+
+    """QtWebEngine implementations related to scrolling."""
+
+
+
+    def __init__(self, tab, parent=None):
+
+        super().__init__(tab, parent)
+
+        self._pos_perc = (0, 0)
+
+        self._pos_px = QPoint()
+
+        self._at_bottom = False
+
+
+
+    def _init_widget(self, widget):
+
+        super()._init_widget(widget)
+
+        page = widget.page()
+
+        page.scrollPositionChanged.connect(self._update_pos)
+
+
+
+    def _repeated_key_press(self, key, count=1, modifier=Qt.NoModifier):
+
+        """Send count fake key presses to this scroller's WebEngineTab."""
+
+        for _ in range(min(count, 1000)):
+
+            self._tab.fake_key_press(key, modifier)
+
+
+
+    @pyqtSlot(QPointF)
+
+    def _update_pos(self, pos):
+
+        """Update the scroll position attributes when it changed."""
+
+        self._pos_px = pos.toPoint()
+
+        contents_size = self._widget.page().contentsSize()
+
+
+
+        scrollable_x = contents_size.width() - self._widget.width()
+
+        if scrollable_x == 0:
+
+            perc_x = 0
+
+        else:
+
+            try:
+
+                perc_x = min(100, round(100 / scrollable_x * pos.x()))
+
+            except ValueError:
+
+                # https://github.com/qutebrowser/qutebrowser/issues/3219
+
+                log.misc.debug("Got ValueError for perc_x!")
+
+                log.misc.debug("contents_size.width(): {}".format(
+
+                    contents_size.width()))
+
+                log.misc.debug("self._widget.width(): {}".format(
+
+                    self._widget.width()))
+
+                log.misc.debug("scrollable_x: {}".format(scrollable_x))
+
+                log.misc.debug("pos.x(): {}".format(pos.x()))
+
+                raise
+
+
+
+        scrollable_y = contents_size.height() - self._widget.height()
+
+        if scrollable_y == 0:
+
+            perc_y = 0
+
+        else:
+
+            try:
+
+                perc_y = min(100, round(100 / scrollable_y * pos.y()))
+
+            except ValueError:
+
+                # https://github.com/qutebrowser/qutebrowser/issues/3219
+
+                log.misc.debug("Got ValueError for perc_y!")
+
+                log.misc.debug("contents_size.height(): {}".format(
+
+                    contents_size.height()))
+
+                log.misc.debug("self._widget.height(): {}".format(
+
+                    self._widget.height()))
+
+                log.misc.debug("scrollable_y: {}".format(scrollable_y))
+
+                log.misc.debug("pos.y(): {}".format(pos.y()))
+
+                raise
+
+
+
+        self._at_bottom = math.ceil(pos.y()) >= scrollable_y
+
+
+
+        if (self._pos_perc != (perc_x, perc_y) or
+
+                'no-scroll-filtering' in objects.debug_flags):
+
+            self._pos_perc = perc_x, perc_y
+
+            self.perc_changed.emit(*self._pos_perc)
+
+
+
+    def pos_px(self):
+
+        return self._pos_px
+
+
+
+    def pos_perc(self):
+
+        return self._pos_perc
+
+
+
+    def to_perc(self, x=None, y=None):
+
+        js_code = javascript.assemble('scroll', 'to_perc', x, y)
+
+        self._tab.run_js_async(js_code)
+
+
+
+    def to_point(self, point):
+
+        js_code = javascript.assemble('window', 'scroll', point.x(), point.y())
+
+        self._tab.run_js_async(js_code)
+
+
+
+    def to_anchor(self, name):
+
+        url = self._tab.url()
+
+        url.setFragment(name)
+
+        self._tab.load_url(url)
+
+
+
+    def delta(self, x=0, y=0):
+
+        self._tab.run_js_async(javascript.assemble('window', 'scrollBy', x, y))
+
+
+
+    def delta_page(self, x=0, y=0):
+
+        js_code = javascript.assemble('scroll', 'delta_page', x, y)
+
+        self._tab.run_js_async(js_code)
+
+
+
+    def up(self, count=1):
+
+        self._repeated_key_press(Qt.Key_Up, count)
+
+
+
+    def down(self, count=1):
+
+        self._repeated_key_press(Qt.Key_Down, count)
+
+
+
+    def left(self, count=1):
+
+        self._repeated_key_press(Qt.Key_Left, count)
+
+
+
+    def right(self, count=1):
+
+        self._repeated_key_press(Qt.Key_Right, count)
+
+
+
+    def top(self):
+
+        self._tab.fake_key_press(Qt.Key_Home)
+
+
+
+    def bottom(self):
+
+        self._tab.fake_key_press(Qt.Key_End)
+
+
+
+    def page_up(self, count=1):
+
+        self._repeated_key_press(Qt.Key_PageUp, count)
+
+
+
+    def page_down(self, count=1):
+
+        self._repeated_key_press(Qt.Key_PageDown, count)
+
+
+
+    def at_top(self):
+
+        return self.pos_px().y() == 0
+
+
+
+    def at_bottom(self):
+
+        return self._at_bottom
+
+
+
+
+
+class WebEngineHistoryPrivate(browsertab.AbstractHistoryPrivate):
+
+
+
+    """History-related methods which are not part of the extension API."""
+
+
+
+    def serialize(self):
+
+        if not qtutils.version_check('5.9', compiled=False):
+
+            # WORKAROUND for
+
+            # https://github.com/qutebrowser/qutebrowser/issues/2289
+
+            # Don't use the history's currentItem here, because of
+
+            # https://bugreports.qt.io/browse/QTBUG-59599 and because it doesn't
+
+            # contain view-source.
+
+            scheme = self._tab.url().scheme()
+
+            if scheme in ['view-source', 'chrome']:
+
+                raise browsertab.WebTabError("Can't serialize special URL!")
+
+        return qtutils.serialize(self._history)
+
+
+
+    def deserialize(self, data):
+
+        qtutils.deserialize(data, self._history)
+
+
+
+    def load_items(self, items):
+
+        if items:
+
+            self._tab.before_load_started.emit(items[-1].url)
+
+
+
+        stream, _data, cur_data = tabhistory.serialize(items)
+
+        qtutils.deserialize_stream(stream, self._history)
+
+
+
+        @pyqtSlot()
+
+        def _on_load_finished():
+
+            self._tab.scroller.to_point(cur_data['scroll-pos'])
+
+            self._tab.load_finished.disconnect(_on_load_finished)
+
+
+
+        if cur_data is not None:
+
+            if 'zoom' in cur_data:
+
+                self._tab.zoom.set_factor(cur_data['zoom'])
+
+            if ('scroll-pos' in cur_data and
+
+                    self._tab.scroller.pos_px() == QPoint(0, 0)):
+
+                self._tab.load_finished.connect(_on_load_finished)
+
+
+
+
+
+class WebEngineHistory(browsertab.AbstractHistory):
+
+
+
+    """QtWebEngine implementations related to page history."""
+
+
+
+    def __init__(self, tab):
+
+        super().__init__(tab)
+
+        self.private_api = WebEngineHistoryPrivate(tab)
+
+
+
+    def __len__(self):
+
+        return len(self._history)
+
+
+
+    def __iter__(self):
+
+        return iter(self._history.items())
+
+
+
+    def current_idx(self):
+
+        return self._history.currentItemIndex()
+
+
+
+    def can_go_back(self):
+
+        return self._history.canGoBack()
+
+
+
+    def can_go_forward(self):
+
+        return self._history.canGoForward()
+
+
+
+    def _item_at(self, i):
+
+        return self._history.itemAt(i)
+
+
+
+    def _go_to_item(self, item):
+
+        self._tab.before_load_started.emit(item.url())
+
+        self._history.goToItem(item)
+
+
+
+
+
+class WebEngineZoom(browsertab.AbstractZoom):
+
+
+
+    """QtWebEngine implementations related to zooming."""
+
+
+
+    def _set_factor_internal(self, factor):
+
+        self._widget.setZoomFactor(factor)
+
+
+
+
+
+class WebEngineElements(browsertab.AbstractElements):
+
+
+
+    """QtWebEngine implemementations related to elements on the page."""
+
+
+
+    def _js_cb_multiple(self, callback, error_cb, js_elems):
+
+        """Handle found elements coming from JS and call the real callback.
+
+
+
+        Args:
+
+            callback: The callback to call with the found elements.
+
+            error_cb: The callback to call in case of an error.
+
+            js_elems: The elements serialized from javascript.
+
+        """
+
+        if js_elems is None:
+
+            error_cb(webelem.Error("Unknown error while getting "
+
+                                   "elements"))
+
+            return
+
+        elif not js_elems['success']:
+
+            error_cb(webelem.Error(js_elems['error']))
+
+            return
+
+
+
+        elems = []
+
+        for js_elem in js_elems['result']:
+
+            elem = webengineelem.WebEngineElement(js_elem, tab=self._tab)
+
+            elems.append(elem)
+
+        callback(elems)
+
+
+
+    def _js_cb_single(self, callback, js_elem):
+
+        """Handle a found focus elem coming from JS and call the real callback.
+
+
+
+        Args:
+
+            callback: The callback to call with the found element.
+
+                      Called with a WebEngineElement or None.
+
+            js_elem: The element serialized from javascript.
+
+        """
+
+        debug_str = ('None' if js_elem is None
+
+                     else utils.elide(repr(js_elem), 1000))
+
+        log.webview.debug("Got element from JS: {}".format(debug_str))
+
+
+
+        if js_elem is None:
+
+            callback(None)
+
+        else:
+
+            elem = webengineelem.WebEngineElement(js_elem, tab=self._tab)
+
+            callback(elem)
+
+
+
+    def find_css(self, selector, callback, error_cb, *,
+
+                 only_visible=False):
+
+        js_code = javascript.assemble('webelem', 'find_css', selector,
+
+                                      only_visible)
+
+        js_cb = functools.partial(self._js_cb_multiple, callback, error_cb)
+
+        self._tab.run_js_async(js_code, js_cb)
+
+
+
+    def find_id(self, elem_id, callback):
+
+        js_code = javascript.assemble('webelem', 'find_id', elem_id)
+
+        js_cb = functools.partial(self._js_cb_single, callback)
+
+        self._tab.run_js_async(js_code, js_cb)
+
+
+
+    def find_focused(self, callback):
+
+        js_code = javascript.assemble('webelem', 'find_focused')
+
+        js_cb = functools.partial(self._js_cb_single, callback)
+
+        self._tab.run_js_async(js_code, js_cb)
+
+
+
+    def find_at_pos(self, pos, callback):
+
+        assert pos.x() >= 0, pos
+
+        assert pos.y() >= 0, pos
+
+        pos /= self._tab.zoom.factor()
+
+        js_code = javascript.assemble('webelem', 'find_at_pos',
+
+                                      pos.x(), pos.y())
+
+        js_cb = functools.partial(self._js_cb_single, callback)
+
+        self._tab.run_js_async(js_code, js_cb)
+
+
+
+
+
+class WebEngineAudio(browsertab.AbstractAudio):
+
+
+
+    """QtWebEngine implemementations related to audio/muting.
+
+
+
+    Attributes:
+
+        _overridden: Whether the user toggled muting manually.
+
+                     If that's the case, we leave it alone.
+
+    """
+
+
+
+    def __init__(self, tab, parent=None):
+
+        super().__init__(tab, parent)
+
+        self._overridden = False
+
+
+
+    def _connect_signals(self):
+
+        page = self._widget.page()
+
+        page.audioMutedChanged.connect(self.muted_changed)
+
+        page.recentlyAudibleChanged.connect(self.recently_audible_changed)
+
+        self._tab.url_changed.connect(self._on_url_changed)
+
+        config.instance.changed.connect(self._on_config_changed)
+
+
+
+    def set_muted(self, muted: bool, override: bool = False) -> None:
+
+        self._overridden = override
+
+        assert self._widget is not None
+
+        page = self._widget.page()
+
+        page.setAudioMuted(muted)
+
+
+
+    def is_muted(self):
+
+        page = self._widget.page()
+
+        return page.isAudioMuted()
+
+
+
+    def is_recently_audible(self):
+
+        page = self._widget.page()
+
+        return page.recentlyAudible()
+
+
+
+    @pyqtSlot(QUrl)
+
+    def _on_url_changed(self, url):
+
+        if self._overridden:
+
+            return
+
+        mute = config.instance.get('content.mute', url=url)
+
+        self.set_muted(mute)
+
+
+
+    @config.change_filter('content.mute')
+
+    def _on_config_changed(self):
+
+        self._on_url_changed(self._tab.url())
+
+
+
+
+
+class _WebEnginePermissions(QObject):
+
+
+
+    """Handling of various permission-related signals."""
+
+
+
+    # Using 0 as WORKAROUND for:
+
+    # https://www.riverbankcomputing.com/pipermail/pyqt/2019-July/041903.html
+
+
+
+    _options = {
+
+        0: 'content.notifications',
+
+        QWebEnginePage.Geolocation: 'content.geolocation',
+
+        QWebEnginePage.MediaAudioCapture: 'content.media_capture',
+
+        QWebEnginePage.MediaVideoCapture: 'content.media_capture',
+
+        QWebEnginePage.MediaAudioVideoCapture: 'content.media_capture',
+
+    }
+
+
+
+    _messages = {
+
+        0: 'show notifications',
+
+        QWebEnginePage.Geolocation: 'access your location',
+
+        QWebEnginePage.MediaAudioCapture: 'record audio',
+
+        QWebEnginePage.MediaVideoCapture: 'record video',
+
+        QWebEnginePage.MediaAudioVideoCapture: 'record audio/video',
+
+    }
+
+
+
+    def __init__(self, tab, parent=None):
+
+        super().__init__(parent)
+
+        self._tab = tab
+
+        self._widget = typing.cast(QWidget, None)
+
+
+
+        try:
+
+            self._options.update({
+
+                QWebEnginePage.MouseLock:
+
+                    'content.mouse_lock',
+
+            })
+
+            self._messages.update({
+
+                QWebEnginePage.MouseLock:
+
+                    'hide your mouse pointer',
+
+            })
+
+        except AttributeError:
+
+            # Added in Qt 5.8
+
+            pass
+
+        try:
+
+            self._options.update({
+
+                QWebEnginePage.DesktopVideoCapture:
+
+                    'content.desktop_capture',
+
+                QWebEnginePage.DesktopAudioVideoCapture:
+
+                    'content.desktop_capture',
+
+            })
+
+            self._messages.update({
+
+                QWebEnginePage.DesktopVideoCapture:
+
+                    'capture your desktop',
+
+                QWebEnginePage.DesktopAudioVideoCapture:
+
+                    'capture your desktop and audio',
+
+            })
+
+        except AttributeError:
+
+            # Added in Qt 5.10
+
+            pass
+
+
+
+        assert self._options.keys() == self._messages.keys()
+
+
+
+    def connect_signals(self):
+
+        """Connect related signals from the QWebEnginePage."""
+
+        page = self._widget.page()
+
+        page.fullScreenRequested.connect(
+
+            self._on_fullscreen_requested)
+
+        page.featurePermissionRequested.connect(
+
+            self._on_feature_permission_requested)
+
+
+
+        if qtutils.version_check('5.11'):
+
+            page.quotaRequested.connect(
+
+                self._on_quota_requested)
+
+            page.registerProtocolHandlerRequested.connect(
+
+                self._on_register_protocol_handler_requested)
+
+
+
+    @pyqtSlot('QWebEngineFullScreenRequest')
+
+    def _on_fullscreen_requested(self, request):
+
+        request.accept()
+
+        on = request.toggleOn()
+
+
+
+        self._tab.data.fullscreen = on
+
+        self._tab.fullscreen_requested.emit(on)
+
+        if on:
+
+            notification = miscwidgets.FullscreenNotification(self._widget)
+
+            notification.show()
+
+            notification.set_timeout(3000)
+
+
+
+    @pyqtSlot(QUrl, 'QWebEnginePage::Feature')
+
+    def _on_feature_permission_requested(self, url, feature):
+
+        """Ask the user for approval for geolocation/media/etc.."""
+
+        page = self._widget.page()
+
+        grant_permission = functools.partial(
+
+            page.setFeaturePermission, url, feature,
+
+            QWebEnginePage.PermissionGrantedByUser)
+
+        deny_permission = functools.partial(
+
+            page.setFeaturePermission, url, feature,
+
+            QWebEnginePage.PermissionDeniedByUser)
+
+
+
+        if feature not in self._options:
+
+            log.webview.error("Unhandled feature permission {}".format(
+
+                debug.qenum_key(QWebEnginePage, feature)))
+
+            deny_permission()
+
+            return
+
+
+
+        if (
+
+                hasattr(QWebEnginePage, 'DesktopVideoCapture') and
+
+                feature in [QWebEnginePage.DesktopVideoCapture,
+
+                            QWebEnginePage.DesktopAudioVideoCapture] and
+
+                qtutils.version_check('5.13', compiled=False) and
+
+                not qtutils.version_check('5.13.2', compiled=False)
+
+        ):
+
+            # WORKAROUND for https://bugreports.qt.io/browse/QTBUG-78016
+
+            log.webview.warning("Ignoring desktop sharing request due to "
+
+                                "crashes in Qt < 5.13.2")
+
+            deny_permission()
+
+            return
+
+
+
+        question = shared.feature_permission(
+
+            url=url.adjusted(QUrl.RemovePath),
+
+            option=self._options[feature], msg=self._messages[feature],
+
+            yes_action=grant_permission, no_action=deny_permission,
+
+            abort_on=[self._tab.abort_questions])
+
+
+
+        if question is not None:
+
+            page.featurePermissionRequestCanceled.connect(
+
+                functools.partial(self._on_feature_permission_cancelled,
+
+                                  question, url, feature))
+
+
+
+    def _on_feature_permission_cancelled(self, question, url, feature,
+
+                                         cancelled_url, cancelled_feature):
+
+        """Slot invoked when a feature permission request was cancelled.
+
+
+
+        To be used with functools.partial.
+
+        """
+
+        if url == cancelled_url and feature == cancelled_feature:
+
+            try:
+
+                question.abort()
+
+            except RuntimeError:
+
+                # The question could already be deleted, e.g. because it was
+
+                # aborted after a loadStarted signal.
+
+                pass
+
+
+
+    def _on_quota_requested(self, request):
+
+        size = utils.format_size(request.requestedSize())
+
+        shared.feature_permission(
+
+            url=request.origin().adjusted(QUrl.RemovePath),
+
+            option='content.persistent_storage',
+
+            msg='use {} of persistent storage'.format(size),
+
+            yes_action=request.accept, no_action=request.reject,
+
+            abort_on=[self._tab.abort_questions],
+
+            blocking=True)
+
+
+
+    def _on_register_protocol_handler_requested(self, request):
+
+        shared.feature_permission(
+
+            url=request.origin().adjusted(QUrl.RemovePath),
+
+            option='content.register_protocol_handler',
+
+            msg='open all {} links'.format(request.scheme()),
+
+            yes_action=request.accept, no_action=request.reject,
+
+            abort_on=[self._tab.abort_questions],
+
+            blocking=True)
+
+
+
+
+
+class _WebEngineScripts(QObject):
+
+
+
+    def __init__(self, tab, parent=None):
+
+        super().__init__(parent)
+
+        self._tab = tab
+
+        self._widget = typing.cast(QWidget, None)
+
+        self._greasemonkey = greasemonkey.gm_manager
+
+
+
+    def connect_signals(self):
+
+        """Connect signals to our private slots."""
+
+        config.instance.changed.connect(self._on_config_changed)
+
+
+
+        self._tab.search.cleared.connect(functools.partial(
+
+            self._update_stylesheet, searching=False))
+
+        self._tab.search.finished.connect(self._update_stylesheet)
+
+
+
+    @pyqtSlot(str)
+
+    def _on_config_changed(self, option):
+
+        if option in ['scrolling.bar', 'content.user_stylesheets']:
+
+            self._init_stylesheet()
+
+            self._update_stylesheet()
+
+
+
+    @pyqtSlot(bool)
+
+    def _update_stylesheet(self, searching=False):
+
+        """Update the custom stylesheet in existing tabs."""
+
+        css = shared.get_user_stylesheet(searching=searching)
+
+        code = javascript.assemble('stylesheet', 'set_css', css)
+
+        self._tab.run_js_async(code)
+
+
+
+    def _inject_early_js(self, name, js_code, *,
+
+                         world=QWebEngineScript.ApplicationWorld,
+
+                         subframes=False):
+
+        """Inject the given script to run early on a page load.
+
+
+
+        This runs the script both on DocumentCreation and DocumentReady as on
+
+        some internal pages, DocumentCreation will not work.
+
+
+
+        That is a WORKAROUND for https://bugreports.qt.io/browse/QTBUG-66011
+
+        """
+
+        scripts = self._widget.page().scripts()
+
+        for injection in ['creation', 'ready']:
+
+            injection_points = {
+
+                'creation': QWebEngineScript.DocumentCreation,
+
+                'ready': QWebEngineScript.DocumentReady,
+
+            }
+
+            script = QWebEngineScript()
+
+            script.setInjectionPoint(injection_points[injection])
+
+            script.setSourceCode(js_code)
+
+            script.setWorldId(world)
+
+            script.setRunsOnSubFrames(subframes)
+
+            script.setName('_qute_{}_{}'.format(name, injection))
+
+            scripts.insert(script)
+
+
+
+    def _remove_early_js(self, name):
+
+        """Remove an early QWebEngineScript."""
+
+        scripts = self._widget.page().scripts()
+
+        for injection in ['creation', 'ready']:
+
+            full_name = '_qute_{}_{}'.format(name, injection)
+
+            script = scripts.findScript(full_name)
+
+            if not script.isNull():
+
+                scripts.remove(script)
+
+
+
+    def init(self):
+
+        """Initialize global qutebrowser JavaScript."""
+
+        js_code = javascript.wrap_global(
+
+            'scripts',
+
+            utils.read_file('javascript/scroll.js'),
+
+            utils.read_file('javascript/webelem.js'),
+
+            utils.read_file('javascript/caret.js'),
+
+        )
+
+        if not qtutils.version_check('5.12'):
+
+            # WORKAROUND for Qt versions < 5.12 not exposing window.print().
+
+            # Qt 5.12 has a printRequested() signal so we don't need this hack
+
+            # anymore.
+
+            self._inject_early_js('js',
+
+                                  utils.read_file('javascript/print.js'),
+
+                                  subframes=True,
+
+                                  world=QWebEngineScript.MainWorld)
+
+        # FIXME:qtwebengine what about subframes=True?
+
+        self._inject_early_js('js', js_code, subframes=True)
+
+        self._init_stylesheet()
+
+
+
+        # The Greasemonkey metadata block support in QtWebEngine only starts at
+
+        # Qt 5.8. With 5.7.1, we need to inject the scripts ourselves in
+
+        # response to urlChanged.
+
+        if not qtutils.version_check('5.8'):
+
+            self._tab.url_changed.connect(
+
+                self._inject_greasemonkey_scripts_for_url)
+
+        else:
+
+            self._greasemonkey.scripts_reloaded.connect(
+
+                self._inject_all_greasemonkey_scripts)
+
+            self._inject_all_greasemonkey_scripts()
+
+
+
+    def _init_stylesheet(self):
+
+        """Initialize custom stylesheets.
+
+
+
+        Partially inspired by QupZilla:
+
+        https://github.com/QupZilla/qupzilla/blob/v2.0/src/lib/app/mainapplication.cpp#L1063-L1101
+
+        """
+
+        self._remove_early_js('stylesheet')
+
+        css = shared.get_user_stylesheet()
+
+        js_code = javascript.wrap_global(
+
+            'stylesheet',
+
+            utils.read_file('javascript/stylesheet.js'),
+
+            javascript.assemble('stylesheet', 'set_css', css),
+
+        )
+
+        self._inject_early_js('stylesheet', js_code, subframes=True)
+
+
+
+    @pyqtSlot(QUrl)
+
+    def _inject_greasemonkey_scripts_for_url(self, url):
+
+        matching_scripts = self._greasemonkey.scripts_for(url)
+
+        self._inject_greasemonkey_scripts(
+
+            matching_scripts.start, QWebEngineScript.DocumentCreation, True)
+
+        self._inject_greasemonkey_scripts(
+
+            matching_scripts.end, QWebEngineScript.DocumentReady, False)
+
+        self._inject_greasemonkey_scripts(
+
+            matching_scripts.idle, QWebEngineScript.Deferred, False)
+
+
+
+    @pyqtSlot()
+
+    def _inject_all_greasemonkey_scripts(self):
+
+        scripts = self._greasemonkey.all_scripts()
+
+        self._inject_greasemonkey_scripts(scripts)
+
+
+
+    def _remove_all_greasemonkey_scripts(self):
+
+        page_scripts = self._widget.page().scripts()
+
+        for script in page_scripts.toList():
+
+            if script.name().startswith("GM-"):
+
+                log.greasemonkey.debug('Removing script: {}'
+
+                                       .format(script.name()))
+
+                removed = page_scripts.remove(script)
+
+                assert removed, script.name()
+
+
+
+    def _inject_greasemonkey_scripts(self, scripts=None, injection_point=None,
+
+                                     remove_first=True):
+
+        """Register user JavaScript files with the current tab.
+
+
+
+        Args:
+
+            scripts: A list of GreasemonkeyScripts, or None to add all
+
+                     known by the Greasemonkey subsystem.
+
+            injection_point: The QWebEngineScript::InjectionPoint stage
+
+                             to inject the script into, None to use
+
+                             auto-detection.
+
+            remove_first: Whether to remove all previously injected
+
+                          scripts before adding these ones.
+
+        """
+
+        if sip.isdeleted(self._widget):
+
+            return
+
+
+
+        # Since we are inserting scripts into a per-tab collection,
+
+        # rather than just injecting scripts on page load, we need to
+
+        # make sure we replace existing scripts, not just add new ones.
+
+        # While, taking care not to remove any other scripts that might
+
+        # have been added elsewhere, like the one for stylesheets.
+
+        page_scripts = self._widget.page().scripts()
+
+        if remove_first:
+
+            self._remove_all_greasemonkey_scripts()
+
+
+
+        if not scripts:
+
+            return
+
+
+
+        for script in scripts:
+
+            new_script = QWebEngineScript()
+
+            try:
+
+                world = int(script.jsworld)
+
+                if not 0 <= world <= qtutils.MAX_WORLD_ID:
+
+                    log.greasemonkey.error(
+
+                        "script {} has invalid value for '@qute-js-world'"
+
+                        ": {}, should be between 0 and {}"
+
+                        .format(
+
+                            script.name,
+
+                            script.jsworld,
+
+                            qtutils.MAX_WORLD_ID))
+
+                    continue
+
+            except ValueError:
 
                 try:
 
-                    np.savez(tmp, arr=arr)
+                    world = _JS_WORLD_MAP[usertypes.JsWorld[
 
-                except OSError as err:
+                        script.jsworld.lower()]]
 
-                    error_list.append(err)
+                except KeyError:
 
-            finally:
+                    log.greasemonkey.error(
 
-                os.remove(tmp)
+                        "script {} has invalid value for '@qute-js-world'"
 
+                        ": {}".format(script.name, script.jsworld))
 
+                    continue
 
-        errors = []
+            new_script.setWorldId(world)
 
-        threads = [threading.Thread(target=writer, args=(errors,))
+            new_script.setSourceCode(script.code())
 
-                   for j in range(3)]
+            new_script.setName("GM-{}".format(script.name))
 
-        for t in threads:
+            new_script.setRunsOnSubFrames(script.runs_on_sub_frames)
 
-            t.start()
 
-        for t in threads:
 
-            t.join()
+            # Override the @run-at value parsed by QWebEngineScript if desired.
 
+            if injection_point:
 
+                new_script.setInjectionPoint(injection_point)
 
-        if errors:
+            elif script.needs_document_end_workaround():
 
-            raise AssertionError(errors)
+                log.greasemonkey.debug("Forcing @run-at document-end for {}"
 
+                                       .format(script.name))
 
+                new_script.setInjectionPoint(QWebEngineScript.DocumentReady)
 
-    def test_not_closing_opened_fid(self):
 
-        # Test that issue #2178 is fixed:
 
-        # verify could seek on 'loaded' file
+            log.greasemonkey.debug('adding script: {}'
 
+                                   .format(new_script.name()))
 
+            page_scripts.insert(new_script)
 
-        fd, tmp = mkstemp(suffix='.npz')
 
-        os.close(fd)
 
-        try:
 
-            fp = open(tmp, 'wb')
 
-            np.savez(fp, data='LOVELY LOAD')
+class WebEngineTabPrivate(browsertab.AbstractTabPrivate):
 
-            fp.close()
 
 
+    """QtWebEngine-related methods which aren't part of the public API."""
 
-            fp = open(tmp, 'rb', 10000)
 
-            fp.seek(0)
 
-            assert_(not fp.closed)
+    def networkaccessmanager(self):
 
-            _ = np.load(fp)['data']
+        return None
 
-            assert_(not fp.closed)
 
-                    # must not get closed by .load(opened fp)
 
-            fp.seek(0)
+    def user_agent(self):
 
-            assert_(not fp.closed)
+        return None
 
 
 
-        finally:
+    def clear_ssl_errors(self):
 
-            fp.close()
+        raise browsertab.UnsupportedOperationError
 
-            os.remove(tmp)
 
 
+    def event_target(self):
 
-    def test_closing_fid(self):
+        return self._widget.render_widget()
 
-        # Test that issue #1517 (too many opened files) remains closed
 
-        # It might be a "weak" test since failed to get triggered on
 
-        # e.g. Debian sid of 2012 Jul 05 but was reported to
+    def shutdown(self):
 
-        # trigger the failure on Ubuntu 10.04:
+        self._tab.shutting_down.emit()
 
-        # http://projects.scipy.org/numpy/ticket/1517#comment:2
+        self._tab.action.exit_fullscreen()
 
-        fd, tmp = mkstemp(suffix='.npz')
+        self._widget.shutdown()
 
-        os.close(fd)
 
 
 
-        try:
 
-            fp = open(tmp, 'wb')
+class WebEngineTab(browsertab.AbstractTab):
 
-            np.savez(fp, data='LOVELY LOAD')
 
-            fp.close()
 
-            # We need to check if the garbage collector can properly close
+    """A QtWebEngine tab in the browser.
 
-            # numpy npz file returned by np.load when their reference count
 
-            # goes to zero.  Python 3 running in debug mode raises a
 
-            # ResourceWarning when file closing is left to the garbage
+    Signals:
 
-            # collector, so we catch the warnings.  Because ResourceWarning
+        abort_questions: Emitted when a new load started or we're shutting
 
-            # is unknown in Python < 3.x, we take the easy way out and
+            down.
 
-            # catch all warnings.
+    """
 
-            with warnings.catch_warnings():
 
-                warnings.simplefilter("ignore")
 
-                for i in range(1, 1025):
+    abort_questions = pyqtSignal()
 
-                    try:
 
-                        np.load(tmp)["data"]
 
-                    except Exception as e:
+    def __init__(self, *, win_id, mode_manager, private, parent=None):
 
-                        msg = "Failed to load data from a file: %s" % e
+        super().__init__(win_id=win_id, private=private, parent=parent)
 
-                        raise AssertionError(msg)
+        widget = webview.WebEngineView(tabdata=self.data, win_id=win_id,
 
-        finally:
+                                       private=private)
 
-            os.remove(tmp)
+        self.history = WebEngineHistory(tab=self)
 
+        self.scroller = WebEngineScroller(tab=self, parent=self)
 
+        self.caret = WebEngineCaret(mode_manager=mode_manager,
 
-    def test_closing_zipfile_after_load(self):
+                                    tab=self, parent=self)
 
-        # Check that zipfile owns file and can close it.
+        self.zoom = WebEngineZoom(tab=self, parent=self)
 
-        # This needs to pass a file name to load for the
+        self.search = WebEngineSearch(tab=self, parent=self)
 
-        # test.
+        self.printing = WebEnginePrinting(tab=self)
 
-        fd, tmp = mkstemp(suffix='.npz')
+        self.elements = WebEngineElements(tab=self)
 
-        os.close(fd)
+        self.action = WebEngineAction(tab=self)
 
-        np.savez(tmp, lab='place holder')
+        self.audio = WebEngineAudio(tab=self, parent=self)
 
-        data = np.load(tmp)
+        self.private_api = WebEngineTabPrivate(mode_manager=mode_manager,
 
-        fp = data.zip.fp
+                                               tab=self)
 
-        data.close()
+        self._permissions = _WebEnginePermissions(tab=self, parent=self)
 
-        assert_(fp.closed)
+        self._scripts = _WebEngineScripts(tab=self, parent=self)
 
+        # We're assigning settings in _set_widget
 
+        self.settings = webenginesettings.WebEngineSettings(settings=None)
 
+        self._set_widget(widget)
 
+        self._connect_signals()
 
-class TestSaveTxt(TestCase):
+        self.backend = usertypes.Backend.QtWebEngine
 
-    def test_array(self):
+        self._child_event_filter = None
 
-        a = np.array([[1, 2], [3, 4]], float)
+        self._saved_zoom = None
 
-        fmt = "%.18e"
+        self._reload_url = None  # type: typing.Optional[QUrl]
 
-        c = BytesIO()
+        self._scripts.init()
 
-        np.savetxt(c, a, fmt=fmt)
 
-        c.seek(0)
 
-        assert_equal(c.readlines(),
+    def _set_widget(self, widget):
 
-                     [asbytes((fmt + ' ' + fmt + '\n') % (1, 2)),
+        # pylint: disable=protected-access
 
-                      asbytes((fmt + ' ' + fmt + '\n') % (3, 4))])
+        super()._set_widget(widget)
 
+        self._permissions._widget = widget
 
+        self._scripts._widget = widget
 
-        a = np.array([[1, 2], [3, 4]], int)
 
-        c = BytesIO()
 
-        np.savetxt(c, a, fmt='%d')
+    def _install_event_filter(self):
 
-        c.seek(0)
+        fp = self._widget.focusProxy()
 
-        assert_equal(c.readlines(), [b'1 2\n', b'3 4\n'])
+        if fp is not None:
 
+            fp.installEventFilter(self._tab_event_filter)
 
+        self._child_event_filter = eventfilter.ChildEventFilter(
 
-    def test_1D(self):
+            eventfilter=self._tab_event_filter, widget=self._widget,
 
-        a = np.array([1, 2, 3, 4], int)
+            win_id=self.win_id, parent=self)
 
-        c = BytesIO()
+        self._widget.installEventFilter(self._child_event_filter)
 
-        np.savetxt(c, a, fmt='%d')
 
-        c.seek(0)
 
-        lines = c.readlines()
+    @pyqtSlot()
 
-        assert_equal(lines, [b'1\n', b'2\n', b'3\n', b'4\n'])
+    def _restore_zoom(self):
 
+        if sip.isdeleted(self._widget):
 
+            # https://github.com/qutebrowser/qutebrowser/issues/3498
 
-    def test_record(self):
+            return
 
-        a = np.array([(1, 2), (3, 4)], dtype=[('x', 'i4'), ('y', 'i4')])
+        if self._saved_zoom is None:
 
-        c = BytesIO()
+            return
 
-        np.savetxt(c, a, fmt='%d')
+        self.zoom.set_factor(self._saved_zoom)
 
-        c.seek(0)
+        self._saved_zoom = None
 
-        assert_equal(c.readlines(), [b'1 2\n', b'3 4\n'])
 
 
+    def load_url(self, url, *, emit_before_load_started=True):
 
-    def test_delimiter(self):
+        """Load the given URL in this tab.
 
-        a = np.array([[1., 2.], [3., 4.]])
 
-        c = BytesIO()
 
-        np.savetxt(c, a, delimiter=',', fmt='%d')
+        Arguments:
 
-        c.seek(0)
+            url: The QUrl to load.
 
-        assert_equal(c.readlines(), [b'1,2\n', b'3,4\n'])
+            emit_before_load_started: If set to False, before_load_started is
 
-
-
-    def test_format(self):
-
-        a = np.array([(1, 2), (3, 4)])
-
-        c = BytesIO()
-
-        # Sequence of formats
-
-        np.savetxt(c, a, fmt=['%02d', '%3.1f'])
-
-        c.seek(0)
-
-        assert_equal(c.readlines(), [b'01 2.0\n', b'03 4.0\n'])
-
-
-
-        # A single multiformat string
-
-        c = BytesIO()
-
-        np.savetxt(c, a, fmt='%02d : %3.1f')
-
-        c.seek(0)
-
-        lines = c.readlines()
-
-        assert_equal(lines, [b'01 : 2.0\n', b'03 : 4.0\n'])
-
-
-
-        # Specify delimiter, should be overiden
-
-        c = BytesIO()
-
-        np.savetxt(c, a, fmt='%02d : %3.1f', delimiter=',')
-
-        c.seek(0)
-
-        lines = c.readlines()
-
-        assert_equal(lines, [b'01 : 2.0\n', b'03 : 4.0\n'])
-
-
-
-        # Bad fmt, should raise a ValueError
-
-        c = BytesIO()
-
-        assert_raises(ValueError, np.savetxt, c, a, fmt=99)
-
-
-
-    def test_header_footer(self):
+                                      not emitted.
 
         """
 
-        Test the functionality of the header and footer keyword argument.
+        if sip.isdeleted(self._widget):
+
+            # https://github.com/qutebrowser/qutebrowser/issues/3896
+
+            return
+
+        self._saved_zoom = self.zoom.factor()
+
+        self._load_url_prepare(
+
+            url, emit_before_load_started=emit_before_load_started)
+
+        self._widget.load(url)
+
+
+
+    def url(self, *, requested=False):
+
+        page = self._widget.page()
+
+        if requested:
+
+            return page.requestedUrl()
+
+        else:
+
+            return page.url()
+
+
+
+    def dump_async(self, callback, *, plain=False):
+
+        if plain:
+
+            self._widget.page().toPlainText(callback)
+
+        else:
+
+            self._widget.page().toHtml(callback)
+
+
+
+    def run_js_async(self, code, callback=None, *, world=None):
+
+        world_id_type = typing.Union[QWebEngineScript.ScriptWorldId, int]
+
+        if world is None:
+
+            world_id = QWebEngineScript.ApplicationWorld  # type: world_id_type
+
+        elif isinstance(world, int):
+
+            world_id = world
+
+            if not 0 <= world_id <= qtutils.MAX_WORLD_ID:
+
+                raise browsertab.WebTabError(
+
+                    "World ID should be between 0 and {}"
+
+                    .format(qtutils.MAX_WORLD_ID))
+
+        else:
+
+            world_id = _JS_WORLD_MAP[world]
+
+
+
+        if callback is None:
+
+            self._widget.page().runJavaScript(code, world_id)
+
+        else:
+
+            self._widget.page().runJavaScript(code, world_id, callback)
+
+
+
+    def reload(self, *, force=False):
+
+        if force:
+
+            action = QWebEnginePage.ReloadAndBypassCache
+
+        else:
+
+            action = QWebEnginePage.Reload
+
+        self._widget.triggerPageAction(action)
+
+
+
+    def stop(self):
+
+        self._widget.stop()
+
+
+
+    def title(self):
+
+        return self._widget.title()
+
+
+
+    def icon(self):
+
+        return self._widget.icon()
+
+
+
+    def set_html(self, html, base_url=QUrl()):
+
+        # FIXME:qtwebengine
+
+        # check this and raise an exception if too big:
+
+        # Warning: The content will be percent encoded before being sent to the
+
+        # renderer via IPC. This may increase its size. The maximum size of the
+
+        # percent encoded content is 2 megabytes minus 30 bytes.
+
+        self._widget.setHtml(html, base_url)
+
+
+
+    def _show_error_page(self, url, error):
+
+        """Show an error page in the tab."""
+
+        log.misc.debug("Showing error page for {}".format(error))
+
+        url_string = url.toDisplayString()
+
+        error_page = jinja.render(
+
+            'error.html',
+
+            title="Error loading page: {}".format(url_string),
+
+            url=url_string, error=error)
+
+        self.set_html(error_page)
+
+
+
+    @pyqtSlot()
+
+    def _on_history_trigger(self):
+
+        try:
+
+            self._widget.page()
+
+        except RuntimeError:
+
+            # Looks like this slot can be triggered on destroyed tabs:
+
+            # https://crashes.qutebrowser.org/view/3abffbed (Qt 5.9.1)
+
+            # wrapped C/C++ object of type WebEngineView has been deleted
+
+            log.misc.debug("Ignoring history trigger for destroyed tab")
+
+            return
+
+
+
+        url = self.url()
+
+        requested_url = self.url(requested=True)
+
+
+
+        # Don't save the title if it's generated from the URL
+
+        title = self.title()
+
+        title_url = QUrl(url)
+
+        title_url.setScheme('')
+
+        title_url_str = title_url.toDisplayString(
+
+            QUrl.RemoveScheme)  # type: ignore
+
+        if title == title_url_str.strip('/'):
+
+            title = ""
+
+
+
+        # Don't add history entry if the URL is invalid anyways
+
+        if not url.isValid():
+
+            log.misc.debug("Ignoring invalid URL being added to history")
+
+            return
+
+
+
+        self.history_item_triggered.emit(url, requested_url, title)
+
+
+
+    @pyqtSlot(QUrl, 'QAuthenticator*', 'QString')
+
+    def _on_proxy_authentication_required(self, url, authenticator,
+
+                                          proxy_host):
+
+        """Called when a proxy needs authentication."""
+
+        msg = "<b>{}</b> requires a username and password.".format(
+
+            html_utils.escape(proxy_host))
+
+        urlstr = url.toString(QUrl.RemovePassword | QUrl.FullyEncoded)
+
+        answer = message.ask(
+
+            title="Proxy authentication required", text=msg,
+
+            mode=usertypes.PromptMode.user_pwd,
+
+            abort_on=[self.abort_questions], url=urlstr)
+
+        if answer is not None:
+
+            authenticator.setUser(answer.user)
+
+            authenticator.setPassword(answer.password)
+
+        else:
+
+            try:
+
+                sip.assign(authenticator, QAuthenticator())  # type: ignore
+
+            except AttributeError:
+
+                self._show_error_page(url, "Proxy authentication required")
+
+
+
+    @pyqtSlot(QUrl, 'QAuthenticator*')
+
+    def _on_authentication_required(self, url, authenticator):
+
+        log.network.debug("Authentication requested for {}, netrc_used {}"
+
+                          .format(url.toDisplayString(), self.data.netrc_used))
+
+
+
+        netrc_success = False
+
+        if not self.data.netrc_used:
+
+            self.data.netrc_used = True
+
+            netrc_success = shared.netrc_authentication(url, authenticator)
+
+
+
+        if not netrc_success:
+
+            log.network.debug("Asking for credentials")
+
+            answer = shared.authentication_required(
+
+                url, authenticator, abort_on=[self.abort_questions])
+
+        if not netrc_success and answer is None:
+
+            log.network.debug("Aborting auth")
+
+            try:
+
+                sip.assign(authenticator, QAuthenticator())  # type: ignore
+
+            except AttributeError:
+
+                # WORKAROUND for
+
+                # https://www.riverbankcomputing.com/pipermail/pyqt/2016-December/038400.html
+
+                self._show_error_page(url, "Authentication required")
+
+
+
+    @pyqtSlot()
+
+    def _on_load_started(self):
+
+        """Clear search when a new load is started if needed."""
+
+        # WORKAROUND for
+
+        # https://bugreports.qt.io/browse/QTBUG-61506
+
+        # (seems to be back in later Qt versions as well)
+
+        self.search.clear()
+
+        super()._on_load_started()
+
+        self.data.netrc_used = False
+
+
+
+    @pyqtSlot(QWebEnginePage.RenderProcessTerminationStatus, int)
+
+    def _on_render_process_terminated(self, status, exitcode):
+
+        """Show an error when the renderer process terminated."""
+
+        if (status == QWebEnginePage.AbnormalTerminationStatus and
+
+                exitcode == 256):
+
+            # WORKAROUND for https://bugreports.qt.io/browse/QTBUG-58697
+
+            status = QWebEnginePage.CrashedTerminationStatus
+
+
+
+        status_map = {
+
+            QWebEnginePage.NormalTerminationStatus:
+
+                browsertab.TerminationStatus.normal,
+
+            QWebEnginePage.AbnormalTerminationStatus:
+
+                browsertab.TerminationStatus.abnormal,
+
+            QWebEnginePage.CrashedTerminationStatus:
+
+                browsertab.TerminationStatus.crashed,
+
+            QWebEnginePage.KilledTerminationStatus:
+
+                browsertab.TerminationStatus.killed,
+
+            -1:
+
+                browsertab.TerminationStatus.unknown,
+
+        }
+
+        self.renderer_process_terminated.emit(status_map[status], exitcode)
+
+
+
+    def _error_page_workaround(self, js_enabled, html):
+
+        """Check if we're displaying a Chromium error page.
+
+
+
+        This gets called if we got a loadFinished(False), so we can display at
+
+        least some error page in situations where Chromium's can't be
+
+        displayed.
+
+
+
+        WORKAROUND for https://bugreports.qt.io/browse/QTBUG-66643
+
+        WORKAROUND for https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=882805
+
+
+
+        Needs to check the page content as a WORKAROUND for
+
+        https://bugreports.qt.io/browse/QTBUG-66661
 
         """
 
-        c = BytesIO()
+        missing_jst = 'jstProcess(' in html and 'jstProcess=' not in html
 
-        a = np.array([(1, 2), (3, 4)], dtype=np.int)
+        if js_enabled and not missing_jst:
 
-        test_header_footer = 'Test header / footer'
-
-        # Test the header keyword argument
-
-        np.savetxt(c, a, fmt='%1d', header=test_header_footer)
-
-        c.seek(0)
-
-        assert_equal(c.read(),
-
-                     asbytes('# ' + test_header_footer + '\n1 2\n3 4\n'))
-
-        # Test the footer keyword argument
-
-        c = BytesIO()
-
-        np.savetxt(c, a, fmt='%1d', footer=test_header_footer)
-
-        c.seek(0)
-
-        assert_equal(c.read(),
-
-                     asbytes('1 2\n3 4\n# ' + test_header_footer + '\n'))
-
-        # Test the commentstr keyword argument used on the header
-
-        c = BytesIO()
-
-        commentstr = '% '
-
-        np.savetxt(c, a, fmt='%1d',
-
-                   header=test_header_footer, comments=commentstr)
-
-        c.seek(0)
-
-        assert_equal(c.read(),
-
-                     asbytes(commentstr + test_header_footer + '\n' + '1 2\n3 4\n'))
-
-        # Test the commentstr keyword argument used on the footer
-
-        c = BytesIO()
-
-        commentstr = '% '
-
-        np.savetxt(c, a, fmt='%1d',
-
-                   footer=test_header_footer, comments=commentstr)
-
-        c.seek(0)
-
-        assert_equal(c.read(),
-
-                     asbytes('1 2\n3 4\n' + commentstr + test_header_footer + '\n'))
+            return
 
 
 
-    def test_file_roundtrip(self):
+        match = re.search(r'"errorCode":"([^"]*)"', html)
 
-        f, name = mkstemp()
+        if match is None:
 
-        os.close(f)
+            return
+
+        self._show_error_page(self.url(), error=match.group(1))
+
+
+
+    @pyqtSlot(int)
+
+    def _on_load_progress(self, perc: int) -> None:
+
+        """QtWebEngine-specific loadProgress workarounds.
+
+
+
+        WORKAROUND for https://bugreports.qt.io/browse/QTBUG-65223
+
+        """
+
+        super()._on_load_progress(perc)
+
+        if (perc == 100 and
+
+                qtutils.version_check('5.10', compiled=False) and
+
+                self.load_status() != usertypes.LoadStatus.error):
+
+            self._update_load_status(ok=True)
+
+
+
+    @pyqtSlot(bool)
+
+    def _on_load_finished(self, ok: bool) -> None:
+
+        """QtWebEngine-specific loadFinished workarounds."""
+
+        super()._on_load_finished(ok)
+
+
+
+        # WORKAROUND for https://bugreports.qt.io/browse/QTBUG-65223
+
+        if qtutils.version_check('5.10', compiled=False):
+
+            if not ok:
+
+                self._update_load_status(ok)
+
+        else:
+
+            self._update_load_status(ok)
+
+
+
+        if not ok:
+
+            self.dump_async(functools.partial(
+
+                self._error_page_workaround,
+
+                self.settings.test_attribute('content.javascript.enabled')))
+
+
+
+        if ok and self._reload_url is not None:
+
+            # WORKAROUND for https://bugreports.qt.io/browse/QTBUG-66656
+
+            log.config.debug(
+
+                "Loading {} again because of config change".format(
+
+                    self._reload_url.toDisplayString()))
+
+            QTimer.singleShot(100, functools.partial(
+
+                self.load_url, self._reload_url,
+
+                emit_before_load_started=False))
+
+            self._reload_url = None
+
+
+
+    @pyqtSlot(certificateerror.CertificateErrorWrapper)
+
+    def _on_ssl_errors(self, error):
+
+        self._has_ssl_errors = True
+
+
+
+        url = error.url()
+
+        log.webview.debug("Certificate error: {}".format(error))
+
+
+
+        if error.is_overridable():
+
+            error.ignore = shared.ignore_certificate_errors(
+
+                url, [error], abort_on=[self.abort_questions])
+
+        else:
+
+            log.webview.error("Non-overridable certificate error: "
+
+                              "{}".format(error))
+
+
+
+        log.webview.debug("ignore {}, URL {}, requested {}".format(
+
+            error.ignore, url, self.url(requested=True)))
+
+
+
+        # WORKAROUND for https://bugreports.qt.io/browse/QTBUG-56207
+
+        show_cert_error = (
+
+            not qtutils.version_check('5.9') and
+
+            not error.ignore
+
+        )
+
+        # WORKAROUND for https://codereview.qt-project.org/c/qt/qtwebengine/+/270556
+
+        show_non_overr_cert_error = (
+
+            not error.is_overridable() and (
+
+                # Affected Qt versions:
+
+                # 5.13 before 5.13.2
+
+                # 5.12 before 5.12.6
+
+                # < 5.12
+
+                (qtutils.version_check('5.13') and
+
+                 not qtutils.version_check('5.13.2')) or
+
+                (qtutils.version_check('5.12') and
+
+                 not qtutils.version_check('5.12.6')) or
+
+                not qtutils.version_check('5.12')
+
+            )
+
+        )
+
+
+
+        # We can't really know when to show an error page, as the error might
+
+        # have happened when loading some resource.
+
+        # However, self.url() is not available yet and the requested URL
+
+        # might not match the URL we get from the error - so we just apply a
+
+        # heuristic here.
+
+        if ((show_cert_error or show_non_overr_cert_error) and
+
+                url.matches(self.data.last_navigation.url, QUrl.RemoveScheme)):
+
+            self._show_error_page(url, str(error))
+
+
+
+    @pyqtSlot(QUrl)
+
+    def _on_before_load_started(self, url):
+
+        """If we know we're going to visit a URL soon, change the settings.
+
+
+
+        This is a WORKAROUND for https://bugreports.qt.io/browse/QTBUG-66656
+
+        """
+
+        super()._on_before_load_started(url)
+
+        if not qtutils.version_check('5.11.1', compiled=False):
+
+            self.settings.update_for_url(url)
+
+
+
+    @pyqtSlot()
+
+    def _on_print_requested(self):
+
+        """Slot for window.print() in JS."""
 
         try:
 
-            a = np.array([(1, 2), (3, 4)])
+            self.printing.show_dialog()
 
-            np.savetxt(name, a)
+        except browsertab.WebTabError as e:
 
-            b = np.loadtxt(name)
+            message.error(str(e))
 
-            assert_array_equal(a, b)
 
-        finally:
 
-            os.unlink(name)
+    @pyqtSlot(usertypes.NavigationRequest)
 
+    def _on_navigation_request(self, navigation):
 
+        super()._on_navigation_request(navigation)
 
-    def test_complex_arrays(self):
 
-        ncols = 2
 
-        nrows = 2
+        if navigation.url == QUrl('qute://print'):
 
-        a = np.zeros((ncols, nrows), dtype=np.complex128)
+            self._on_print_requested()
 
-        re = np.pi
+            navigation.accepted = False
 
-        im = np.e
 
-        a[:] = re + 1.0j * im
 
+        if not navigation.accepted or not navigation.is_main_frame:
 
+            return
 
-        # One format only
 
-        c = BytesIO()
 
-        np.savetxt(c, a, fmt=' %+.3e')
+        settings_needing_reload = {
 
-        c.seek(0)
+            'content.plugins',
 
-        lines = c.readlines()
+            'content.javascript.enabled',
 
-        assert_equal(
+            'content.javascript.can_access_clipboard',
 
-            lines,
+            'content.print_element_backgrounds',
 
-            [b' ( +3.142e+00+ +2.718e+00j)  ( +3.142e+00+ +2.718e+00j)\n',
+            'input.spatial_navigation',
 
-             b' ( +3.142e+00+ +2.718e+00j)  ( +3.142e+00+ +2.718e+00j)\n'])
+        }
 
+        assert settings_needing_reload.issubset(configdata.DATA)
 
 
-        # One format for each real and imaginary part
 
-        c = BytesIO()
+        changed = self.settings.update_for_url(navigation.url)
 
-        np.savetxt(c, a, fmt='  %+.3e' * 2 * ncols)
+        reload_needed = bool(changed & settings_needing_reload)
 
-        c.seek(0)
 
-        lines = c.readlines()
 
-        assert_equal(
+        # On Qt < 5.11, we don't don't need a reload when type == link_clicked.
 
-            lines,
+        # On Qt 5.11.0, we always need a reload.
 
-            [b'  +3.142e+00  +2.718e+00  +3.142e+00  +2.718e+00\n',
+        # On Qt > 5.11.0, we never need a reload:
 
-             b'  +3.142e+00  +2.718e+00  +3.142e+00  +2.718e+00\n'])
+        # https://codereview.qt-project.org/#/c/229525/1
 
+        # WORKAROUND for https://bugreports.qt.io/browse/QTBUG-66656
 
+        if qtutils.version_check('5.11.1', compiled=False):
 
-        # One format for each complex number
+            reload_needed = False
 
-        c = BytesIO()
+        elif not qtutils.version_check('5.11.0', exact=True, compiled=False):
 
-        np.savetxt(c, a, fmt=['(%.3e%+.3ej)'] * ncols)
+            if navigation.navigation_type == navigation.Type.link_clicked:
 
-        c.seek(0)
+                reload_needed = False
 
-        lines = c.readlines()
 
-        assert_equal(
 
-            lines,
+        if reload_needed:
 
-            [b'(3.142e+00+2.718e+00j) (3.142e+00+2.718e+00j)\n',
+            self._reload_url = navigation.url
 
-             b'(3.142e+00+2.718e+00j) (3.142e+00+2.718e+00j)\n'])
 
 
+    def _on_select_client_certificate(self, selection):
 
-    def test_custom_writer(self):
+        """Handle client certificates.
 
 
 
-        class CustomWriter(list):
+        Currently, we simply pick the first available certificate and show an
 
-            def write(self, text):
+        additional note if there are multiple matches.
 
-                self.extend(text.split(b'\n'))
+        """
 
+        certificate = selection.certificates()[0]
 
+        text = ('<b>Subject:</b> {subj}<br/>'
 
-        w = CustomWriter()
+                '<b>Issuer:</b> {issuer}<br/>'
 
-        a = np.array([(1, 2), (3, 4)])
+                '<b>Serial:</b> {serial}'.format(
 
-        np.savetxt(w, a)
+                    subj=html_utils.escape(certificate.subjectDisplayName()),
 
-        b = np.loadtxt(w)
+                    issuer=html_utils.escape(certificate.issuerDisplayName()),
 
-        assert_array_equal(a, b)
+                    serial=bytes(certificate.serialNumber()).decode('ascii')))
 
+        if len(selection.certificates()) > 1:
 
+            text += ('<br/><br/><b>Note:</b> Multiple matching certificates '
 
+                     'were found, but certificate selection is not '
 
+                     'implemented yet!')
 
-class TestLoadTxt(TestCase):
+        urlstr = selection.host().host()
 
-    def test_record(self):
 
-        c = TextIO()
 
-        c.write('1 2\n3 4')
+        present = message.ask(
 
-        c.seek(0)
+            title='Present client certificate to {}?'.format(urlstr),
 
-        x = np.loadtxt(c, dtype=[('x', np.int32), ('y', np.int32)])
+            text=text,
 
-        a = np.array([(1, 2), (3, 4)], dtype=[('x', 'i4'), ('y', 'i4')])
+            mode=usertypes.PromptMode.yesno,
 
-        assert_array_equal(x, a)
+            abort_on=[self.abort_questions],
 
+            url=urlstr)
 
 
-        d = TextIO()
 
-        d.write('M 64.0 75.0\nF 25.0 60.0')
+        if present:
 
-        d.seek(0)
+            selection.select(certificate)
 
-        mydescriptor = {'names': ('gender', 'age', 'weight'),
+        else:
 
-                        'formats': ('S1', 'i4', 'f4')}
+            selection.selectNone()
 
-        b = np.array([('M', 64.0, 75.0),
 
-                      ('F', 25.0, 60.0)], dtype=mydescriptor)
 
-        y = np.loadtxt(d, dtype=mydescriptor)
+    def _connect_signals(self):
 
-        assert_array_equal(y, b)
+        view = self._widget
 
+        page = view.page()
 
 
-    def test_array(self):
 
-        c = TextIO()
+        page.windowCloseRequested.connect(self.window_close_requested)
 
-        c.write('1 2\n3 4')
+        page.linkHovered.connect(self.link_hovered)
 
+        page.loadProgress.connect(self._on_load_progress)
 
+        page.loadStarted.connect(self._on_load_started)
 
-        c.seek(0)
+        page.certificate_error.connect(self._on_ssl_errors)
 
-        x = np.loadtxt(c, dtype=np.int)
+        page.authenticationRequired.connect(self._on_authentication_required)
 
-        a = np.array([[1, 2], [3, 4]], int)
+        page.proxyAuthenticationRequired.connect(
 
-        assert_array_equal(x, a)
+            self._on_proxy_authentication_required)
 
+        page.contentsSizeChanged.connect(self.contents_size_changed)
 
+        page.navigation_request.connect(self._on_navigation_request)
 
-        c.seek(0)
 
-        x = np.loadtxt(c, dtype=float)
 
-        a = np.array([[1, 2], [3, 4]], float)
+        if qtutils.version_check('5.12'):
 
-        assert_array_equal(x, a)
-
-
-
-    def test_1D(self):
-
-        c = TextIO()
-
-        c.write('1\n2\n3\n4\n')
-
-        c.seek(0)
-
-        x = np.loadtxt(c, dtype=int)
-
-        a = np.array([1, 2, 3, 4], int)
-
-        assert_array_equal(x, a)
-
-
-
-        c = TextIO()
-
-        c.write('1,2,3,4\n')
-
-        c.seek(0)
-
-        x = np.loadtxt(c, dtype=int, delimiter=',')
-
-        a = np.array([1, 2, 3, 4], int)
-
-        assert_array_equal(x, a)
-
-
-
-    def test_missing(self):
-
-        c = TextIO()
-
-        c.write('1,2,3,,5\n')
-
-        c.seek(0)
-
-        x = np.loadtxt(c, dtype=int, delimiter=',',
-
-                       converters={3: lambda s: int(s or - 999)})
-
-        a = np.array([1, 2, 3, -999, 5], int)
-
-        assert_array_equal(x, a)
-
-
-
-    def test_converters_with_usecols(self):
-
-        c = TextIO()
-
-        c.write('1,2,3,,5\n6,7,8,9,10\n')
-
-        c.seek(0)
-
-        x = np.loadtxt(c, dtype=int, delimiter=',',
-
-                       converters={3: lambda s: int(s or - 999)},
-
-                       usecols=(1, 3,))
-
-        a = np.array([[2, -999], [7, 9]], int)
-
-        assert_array_equal(x, a)
-
-
-
-    def test_comments(self):
-
-        c = TextIO()
-
-        c.write('# comment\n1,2,3,5\n')
-
-        c.seek(0)
-
-        x = np.loadtxt(c, dtype=int, delimiter=',',
-
-                       comments='#')
-
-        a = np.array([1, 2, 3, 5], int)
-
-        assert_array_equal(x, a)
-
-
-
-    def test_skiprows(self):
-
-        c = TextIO()
-
-        c.write('comment\n1,2,3,5\n')
-
-        c.seek(0)
-
-        x = np.loadtxt(c, dtype=int, delimiter=',',
-
-                       skiprows=1)
-
-        a = np.array([1, 2, 3, 5], int)
-
-        assert_array_equal(x, a)
-
-
-
-        c = TextIO()
-
-        c.write('# comment\n1,2,3,5\n')
-
-        c.seek(0)
-
-        x = np.loadtxt(c, dtype=int, delimiter=',',
-
-                       skiprows=1)
-
-        a = np.array([1, 2, 3, 5], int)
-
-        assert_array_equal(x, a)
-
-
-
-    def test_usecols(self):
-
-        a = np.array([[1, 2], [3, 4]], float)
-
-        c = BytesIO()
-
-        np.savetxt(c, a)
-
-        c.seek(0)
-
-        x = np.loadtxt(c, dtype=float, usecols=(1,))
-
-        assert_array_equal(x, a[:, 1])
-
-
-
-        a = np.array([[1, 2, 3], [3, 4, 5]], float)
-
-        c = BytesIO()
-
-        np.savetxt(c, a)
-
-        c.seek(0)
-
-        x = np.loadtxt(c, dtype=float, usecols=(1, 2))
-
-        assert_array_equal(x, a[:, 1:])
-
-
-
-        # Testing with arrays instead of tuples.
-
-        c.seek(0)
-
-        x = np.loadtxt(c, dtype=float, usecols=np.array([1, 2]))
-
-        assert_array_equal(x, a[:, 1:])
-
-
-
-        # Checking with dtypes defined converters.
-
-        data = '''JOE 70.1 25.3
-
-                BOB 60.5 27.9
-
-                '''
-
-        c = TextIO(data)
-
-        names = ['stid', 'temp']
-
-        dtypes = ['S4', 'f8']
-
-        arr = np.loadtxt(c, usecols=(0, 2), dtype=list(zip(names, dtypes)))
-
-        assert_equal(arr['stid'], [b"JOE", b"BOB"])
-
-        assert_equal(arr['temp'], [25.3, 27.9])
-
-
-
-    def test_fancy_dtype(self):
-
-        c = TextIO()
-
-        c.write('1,2,3.0\n4,5,6.0\n')
-
-        c.seek(0)
-
-        dt = np.dtype([('x', int), ('y', [('t', int), ('s', float)])])
-
-        x = np.loadtxt(c, dtype=dt, delimiter=',')
-
-        a = np.array([(1, (2, 3.0)), (4, (5, 6.0))], dt)
-
-        assert_array_equal(x, a)
-
-
-
-    def test_shaped_dtype(self):
-
-        c = TextIO("aaaa  1.0  8.0  1 2 3 4 5 6")
-
-        dt = np.dtype([('name', 'S4'), ('x', float), ('y', float),
-
-                       ('block', int, (2, 3))])
-
-        x = np.loadtxt(c, dtype=dt)
-
-        a = np.array([('aaaa', 1.0, 8.0, [[1, 2, 3], [4, 5, 6]])],
-
-                     dtype=dt)
-
-        assert_array_equal(x, a)
-
-
-
-    def test_3d_shaped_dtype(self):
-
-        c = TextIO("aaaa  1.0  8.0  1 2 3 4 5 6 7 8 9 10 11 12")
-
-        dt = np.dtype([('name', 'S4'), ('x', float), ('y', float),
-
-                       ('block', int, (2, 2, 3))])
-
-        x = np.loadtxt(c, dtype=dt)
-
-        a = np.array([('aaaa', 1.0, 8.0,
-
-                       [[[1, 2, 3], [4, 5, 6]], [[7, 8, 9], [10, 11, 12]]])],
-
-                     dtype=dt)
-
-        assert_array_equal(x, a)
-
-
-
-    def test_empty_file(self):
-
-        with warnings.catch_warnings():
-
-            warnings.filterwarnings("ignore",
-
-                                    message="loadtxt: Empty input file:")
-
-            c = TextIO()
-
-            x = np.loadtxt(c)
-
-            assert_equal(x.shape, (0,))
-
-            x = np.loadtxt(c, dtype=np.int64)
-
-            assert_equal(x.shape, (0,))
-
-            assert_(x.dtype == np.int64)
-
-
-
-    def test_unused_converter(self):
-
-        c = TextIO()
-
-        c.writelines(['1 21\n', '3 42\n'])
-
-        c.seek(0)
-
-        data = np.loadtxt(c, usecols=(1,),
-
-                          converters={0: lambda s: int(s, 16)})
-
-        assert_array_equal(data, [21, 42])
-
-
-
-        c.seek(0)
-
-        data = np.loadtxt(c, usecols=(1,),
-
-                          converters={1: lambda s: int(s, 16)})
-
-        assert_array_equal(data, [33, 66])
-
-
-
-    def test_dtype_with_object(self):
-
-        "Test using an explicit dtype with an object"
-
-        from datetime import date
-
-        import time
-
-        data = """ 1; 2001-01-01
-
-                   2; 2002-01-31 """
-
-        ndtype = [('idx', int), ('code', np.object)]
-
-        func = lambda s: strptime(s.strip(), "%Y-%m-%d")
-
-        converters = {1: func}
-
-        test = np.loadtxt(TextIO(data), delimiter=";", dtype=ndtype,
-
-                          converters=converters)
-
-        control = np.array(
-
-            [(1, datetime(2001, 1, 1)), (2, datetime(2002, 1, 31))],
-
-            dtype=ndtype)
-
-        assert_equal(test, control)
-
-
-
-    def test_uint64_type(self):
-
-        tgt = (9223372043271415339, 9223372043271415853)
-
-        c = TextIO()
-
-        c.write("%s %s" % tgt)
-
-        c.seek(0)
-
-        res = np.loadtxt(c, dtype=np.uint64)
-
-        assert_equal(res, tgt)
-
-
-
-    def test_int64_type(self):
-
-        tgt = (-9223372036854775807, 9223372036854775807)
-
-        c = TextIO()
-
-        c.write("%s %s" % tgt)
-
-        c.seek(0)
-
-        res = np.loadtxt(c, dtype=np.int64)
-
-        assert_equal(res, tgt)
-
-
-
-    def test_universal_newline(self):
-
-        f, name = mkstemp()
-
-        os.write(f, b'1 21\r3 42\r')
-
-        os.close(f)
+            page.printRequested.connect(self._on_print_requested)
 
 
 
         try:
 
-            data = np.loadtxt(name)
+            # pylint: disable=unused-import
 
-            assert_array_equal(data, [[1, 21], [3, 42]])
+            from PyQt5.QtWebEngineWidgets import (  # type: ignore
 
-        finally:
+                QWebEngineClientCertificateSelection)
 
-            os.unlink(name)
-
-
-
-    def test_empty_field_after_tab(self):
-
-        c = TextIO()
-
-        c.write('1 \t2 \t3\tstart \n4\t5\t6\t  \n7\t8\t9.5\t')
-
-        c.seek(0)
-
-        dt = {'names': ('x', 'y', 'z', 'comment'),
-
-              'formats': ('<i4', '<i4', '<f4', '|S8')}
-
-        x = np.loadtxt(c, dtype=dt, delimiter='\t')
-
-        a = np.array([b'start ', b'  ', b''])
-
-        assert_array_equal(x['comment'], a)
-
-
-
-    def test_structure_unpack(self):
-
-        txt = TextIO("M 21 72\nF 35 58")
-
-        dt = {'names': ('a', 'b', 'c'), 'formats': ('|S1', '<i4', '<f4')}
-
-        a, b, c = np.loadtxt(txt, dtype=dt, unpack=True)
-
-        assert_(a.dtype.str == '|S1')
-
-        assert_(b.dtype.str == '<i4')
-
-        assert_(c.dtype.str == '<f4')
-
-        assert_array_equal(a, np.array([b'M', b'F']))
-
-        assert_array_equal(b, np.array([21, 35]))
-
-        assert_array_equal(c, np.array([72.,  58.]))
-
-
-
-    def test_ndmin_keyword(self):
-
-        c = TextIO()
-
-        c.write('1,2,3\n4,5,6')
-
-        c.seek(0)
-
-        assert_raises(ValueError, np.loadtxt, c, ndmin=3)
-
-        c.seek(0)
-
-        assert_raises(ValueError, np.loadtxt, c, ndmin=1.5)
-
-        c.seek(0)
-
-        x = np.loadtxt(c, dtype=int, delimiter=',', ndmin=1)
-
-        a = np.array([[1, 2, 3], [4, 5, 6]])
-
-        assert_array_equal(x, a)
-
-
-
-        d = TextIO()
-
-        d.write('0,1,2')
-
-        d.seek(0)
-
-        x = np.loadtxt(d, dtype=int, delimiter=',', ndmin=2)
-
-        assert_(x.shape == (1, 3))
-
-        d.seek(0)
-
-        x = np.loadtxt(d, dtype=int, delimiter=',', ndmin=1)
-
-        assert_(x.shape == (3,))
-
-        d.seek(0)
-
-        x = np.loadtxt(d, dtype=int, delimiter=',', ndmin=0)
-
-        assert_(x.shape == (3,))
-
-
-
-        e = TextIO()
-
-        e.write('0\n1\n2')
-
-        e.seek(0)
-
-        x = np.loadtxt(e, dtype=int, delimiter=',', ndmin=2)
-
-        assert_(x.shape == (3, 1))
-
-        e.seek(0)
-
-        x = np.loadtxt(e, dtype=int, delimiter=',', ndmin=1)
-
-        assert_(x.shape == (3,))
-
-        e.seek(0)
-
-        x = np.loadtxt(e, dtype=int, delimiter=',', ndmin=0)
-
-        assert_(x.shape == (3,))
-
-
-
-        # Test ndmin kw with empty file.
-
-        with warnings.catch_warnings():
-
-            warnings.filterwarnings("ignore",
-
-                                    message="loadtxt: Empty input file:")
-
-            f = TextIO()
-
-            assert_(np.loadtxt(f, ndmin=2).shape == (0, 1,))
-
-            assert_(np.loadtxt(f, ndmin=1).shape == (0,))
-
-
-
-    def test_generator_source(self):
-
-        def count():
-
-            for i in range(10):
-
-                yield "%d" % i
-
-
-
-        res = np.loadtxt(count())
-
-        assert_array_equal(res, np.arange(10))
-
-
-
-
-
-class Testfromregex(TestCase):
-
-    # np.fromregex expects files opened in binary mode.
-
-    def test_record(self):
-
-        c = TextIO()
-
-        c.write('1.312 foo\n1.534 bar\n4.444 qux')
-
-        c.seek(0)
-
-
-
-        dt = [('num', np.float64), ('val', 'S3')]
-
-        x = np.fromregex(c, r"([0-9.]+)\s+(...)", dt)
-
-        a = np.array([(1.312, 'foo'), (1.534, 'bar'), (4.444, 'qux')],
-
-                     dtype=dt)
-
-        assert_array_equal(x, a)
-
-
-
-    def test_record_2(self):
-
-        c = TextIO()
-
-        c.write('1312 foo\n1534 bar\n4444 qux')
-
-        c.seek(0)
-
-
-
-        dt = [('num', np.int32), ('val', 'S3')]
-
-        x = np.fromregex(c, r"(\d+)\s+(...)", dt)
-
-        a = np.array([(1312, 'foo'), (1534, 'bar'), (4444, 'qux')],
-
-                     dtype=dt)
-
-        assert_array_equal(x, a)
-
-
-
-    def test_record_3(self):
-
-        c = TextIO()
-
-        c.write('1312 foo\n1534 bar\n4444 qux')
-
-        c.seek(0)
-
-
-
-        dt = [('num', np.float64)]
-
-        x = np.fromregex(c, r"(\d+)\s+...", dt)
-
-        a = np.array([(1312,), (1534,), (4444,)], dtype=dt)
-
-        assert_array_equal(x, a)
-
-
-
-
-
-#####--------------------------------------------------------------------------
-
-
-
-
-
-class TestFromTxt(TestCase):
-
-    #
-
-    def test_record(self):
-
-        "Test w/ explicit dtype"
-
-        data = TextIO('1 2\n3 4')
-
-#        data.seek(0)
-
-        test = np.ndfromtxt(data, dtype=[('x', np.int32), ('y', np.int32)])
-
-        control = np.array([(1, 2), (3, 4)], dtype=[('x', 'i4'), ('y', 'i4')])
-
-        assert_equal(test, control)
-
-        #
-
-        data = TextIO('M 64.0 75.0\nF 25.0 60.0')
-
-#        data.seek(0)
-
-        descriptor = {'names': ('gender', 'age', 'weight'),
-
-                      'formats': ('S1', 'i4', 'f4')}
-
-        control = np.array([('M', 64.0, 75.0), ('F', 25.0, 60.0)],
-
-                           dtype=descriptor)
-
-        test = np.ndfromtxt(data, dtype=descriptor)
-
-        assert_equal(test, control)
-
-
-
-    def test_array(self):
-
-        "Test outputing a standard ndarray"
-
-        data = TextIO('1 2\n3 4')
-
-        control = np.array([[1, 2], [3, 4]], dtype=int)
-
-        test = np.ndfromtxt(data, dtype=int)
-
-        assert_array_equal(test, control)
-
-        #
-
-        data.seek(0)
-
-        control = np.array([[1, 2], [3, 4]], dtype=float)
-
-        test = np.loadtxt(data, dtype=float)
-
-        assert_array_equal(test, control)
-
-
-
-    def test_1D(self):
-
-        "Test squeezing to 1D"
-
-        control = np.array([1, 2, 3, 4], int)
-
-        #
-
-        data = TextIO('1\n2\n3\n4\n')
-
-        test = np.ndfromtxt(data, dtype=int)
-
-        assert_array_equal(test, control)
-
-        #
-
-        data = TextIO('1,2,3,4\n')
-
-        test = np.ndfromtxt(data, dtype=int, delimiter=',')
-
-        assert_array_equal(test, control)
-
-
-
-    def test_comments(self):
-
-        "Test the stripping of comments"
-
-        control = np.array([1, 2, 3, 5], int)
-
-        # Comment on its own line
-
-        data = TextIO('# comment\n1,2,3,5\n')
-
-        test = np.ndfromtxt(data, dtype=int, delimiter=',', comments='#')
-
-        assert_equal(test, control)
-
-        # Comment at the end of a line
-
-        data = TextIO('1,2,3,5# comment\n')
-
-        test = np.ndfromtxt(data, dtype=int, delimiter=',', comments='#')
-
-        assert_equal(test, control)
-
-
-
-    def test_skiprows(self):
-
-        "Test row skipping"
-
-        control = np.array([1, 2, 3, 5], int)
-
-        kwargs = dict(dtype=int, delimiter=',')
-
-        #
-
-        data = TextIO('comment\n1,2,3,5\n')
-
-        test = np.ndfromtxt(data, skip_header=1, **kwargs)
-
-        assert_equal(test, control)
-
-        #
-
-        data = TextIO('# comment\n1,2,3,5\n')
-
-        test = np.loadtxt(data, skiprows=1, **kwargs)
-
-        assert_equal(test, control)
-
-
-
-    def test_skip_footer(self):
-
-        data = ["# %i" % i for i in range(1, 6)]
-
-        data.append("A, B, C")
-
-        data.extend(["%i,%3.1f,%03s" % (i, i, i) for i in range(51)])
-
-        data[-1] = "99,99"
-
-        kwargs = dict(delimiter=",", names=True, skip_header=5, skip_footer=10)
-
-        test = np.genfromtxt(TextIO("\n".join(data)), **kwargs)
-
-        ctrl = np.array([("%f" % i, "%f" % i, "%f" % i) for i in range(41)],
-
-                        dtype=[(_, float) for _ in "ABC"])
-
-        assert_equal(test, ctrl)
-
-
-
-    def test_skip_footer_with_invalid(self):
-
-        with warnings.catch_warnings():
-
-            warnings.filterwarnings("ignore")
-
-            basestr = '1 1\n2 2\n3 3\n4 4\n5  \n6  \n7  \n'
-
-            # Footer too small to get rid of all invalid values
-
-            assert_raises(ValueError, np.genfromtxt,
-
-                          TextIO(basestr), skip_footer=1)
-
-    #        except ValueError:
-
-    #            pass
-
-            a = np.genfromtxt(
-
-                TextIO(basestr), skip_footer=1, invalid_raise=False)
-
-            assert_equal(a, np.array([[1., 1.], [2., 2.], [3., 3.], [4., 4.]]))
-
-            #
-
-            a = np.genfromtxt(TextIO(basestr), skip_footer=3)
-
-            assert_equal(a, np.array([[1., 1.], [2., 2.], [3., 3.], [4., 4.]]))
-
-            #
-
-            basestr = '1 1\n2  \n3 3\n4 4\n5  \n6 6\n7 7\n'
-
-            a = np.genfromtxt(
-
-                TextIO(basestr), skip_footer=1, invalid_raise=False)
-
-            assert_equal(a, np.array([[1., 1.], [3., 3.], [4., 4.], [6., 6.]]))
-
-            a = np.genfromtxt(
-
-                TextIO(basestr), skip_footer=3, invalid_raise=False)
-
-            assert_equal(a, np.array([[1., 1.], [3., 3.], [4., 4.]]))
-
-
-
-    def test_header(self):
-
-        "Test retrieving a header"
-
-        data = TextIO('gender age weight\nM 64.0 75.0\nF 25.0 60.0')
-
-        test = np.ndfromtxt(data, dtype=None, names=True)
-
-        control = {'gender': np.array([b'M', b'F']),
-
-                   'age': np.array([64.0, 25.0]),
-
-                   'weight': np.array([75.0, 60.0])}
-
-        assert_equal(test['gender'], control['gender'])
-
-        assert_equal(test['age'], control['age'])
-
-        assert_equal(test['weight'], control['weight'])
-
-
-
-    def test_auto_dtype(self):
-
-        "Test the automatic definition of the output dtype"
-
-        data = TextIO('A 64 75.0 3+4j True\nBCD 25 60.0 5+6j False')
-
-        test = np.ndfromtxt(data, dtype=None)
-
-        control = [np.array([b'A', b'BCD']),
-
-                   np.array([64, 25]),
-
-                   np.array([75.0, 60.0]),
-
-                   np.array([3 + 4j, 5 + 6j]),
-
-                   np.array([True, False]), ]
-
-        assert_equal(test.dtype.names, ['f0', 'f1', 'f2', 'f3', 'f4'])
-
-        for (i, ctrl) in enumerate(control):
-
-            assert_equal(test['f%i' % i], ctrl)
-
-
-
-    def test_auto_dtype_uniform(self):
-
-        "Tests whether the output dtype can be uniformized"
-
-        data = TextIO('1 2 3 4\n5 6 7 8\n')
-
-        test = np.ndfromtxt(data, dtype=None)
-
-        control = np.array([[1, 2, 3, 4], [5, 6, 7, 8]])
-
-        assert_equal(test, control)
-
-
-
-    def test_fancy_dtype(self):
-
-        "Check that a nested dtype isn't MIA"
-
-        data = TextIO('1,2,3.0\n4,5,6.0\n')
-
-        fancydtype = np.dtype([('x', int), ('y', [('t', int), ('s', float)])])
-
-        test = np.ndfromtxt(data, dtype=fancydtype, delimiter=',')
-
-        control = np.array([(1, (2, 3.0)), (4, (5, 6.0))], dtype=fancydtype)
-
-        assert_equal(test, control)
-
-
-
-    def test_names_overwrite(self):
-
-        "Test overwriting the names of the dtype"
-
-        descriptor = {'names': ('g', 'a', 'w'),
-
-                      'formats': ('S1', 'i4', 'f4')}
-
-        data = TextIO(b'M 64.0 75.0\nF 25.0 60.0')
-
-        names = ('gender', 'age', 'weight')
-
-        test = np.ndfromtxt(data, dtype=descriptor, names=names)
-
-        descriptor['names'] = names
-
-        control = np.array([('M', 64.0, 75.0),
-
-                            ('F', 25.0, 60.0)], dtype=descriptor)
-
-        assert_equal(test, control)
-
-
-
-    def test_commented_header(self):
-
-        "Check that names can be retrieved even if the line is commented out."
-
-        data = TextIO("""
-
-#gender age weight
-
-M   21  72.100000
-
-F   35  58.330000
-
-M   33  21.99
-
-        """)
-
-        # The # is part of the first name and should be deleted automatically.
-
-        test = np.genfromtxt(data, names=True, dtype=None)
-
-        ctrl = np.array([('M', 21, 72.1), ('F', 35, 58.33), ('M', 33, 21.99)],
-
-                        dtype=[('gender', '|S1'), ('age', int), ('weight', float)])
-
-        assert_equal(test, ctrl)
-
-        # Ditto, but we should get rid of the first element
-
-        data = TextIO(b"""
-
-# gender age weight
-
-M   21  72.100000
-
-F   35  58.330000
-
-M   33  21.99
-
-        """)
-
-        test = np.genfromtxt(data, names=True, dtype=None)
-
-        assert_equal(test, ctrl)
-
-
-
-    def test_autonames_and_usecols(self):
-
-        "Tests names and usecols"
-
-        data = TextIO('A B C D\n aaaa 121 45 9.1')
-
-        test = np.ndfromtxt(data, usecols=('A', 'C', 'D'),
-
-                            names=True, dtype=None)
-
-        control = np.array(('aaaa', 45, 9.1),
-
-                           dtype=[('A', '|S4'), ('C', int), ('D', float)])
-
-        assert_equal(test, control)
-
-
-
-    def test_converters_with_usecols(self):
-
-        "Test the combination user-defined converters and usecol"
-
-        data = TextIO('1,2,3,,5\n6,7,8,9,10\n')
-
-        test = np.ndfromtxt(data, dtype=int, delimiter=',',
-
-                            converters={3: lambda s: int(s or - 999)},
-
-                            usecols=(1, 3,))
-
-        control = np.array([[2, -999], [7, 9]], int)
-
-        assert_equal(test, control)
-
-
-
-    def test_converters_with_usecols_and_names(self):
-
-        "Tests names and usecols"
-
-        data = TextIO('A B C D\n aaaa 121 45 9.1')
-
-        test = np.ndfromtxt(data, usecols=('A', 'C', 'D'), names=True,
-
-                            dtype=None, converters={'C': lambda s: 2 * int(s)})
-
-        control = np.array(('aaaa', 90, 9.1),
-
-                           dtype=[('A', '|S4'), ('C', int), ('D', float)])
-
-        assert_equal(test, control)
-
-
-
-    def test_converters_cornercases(self):
-
-        "Test the conversion to datetime."
-
-        converter = {
-
-            'date': lambda s: strptime(s, '%Y-%m-%d %H:%M:%SZ')}
-
-        data = TextIO('2009-02-03 12:00:00Z, 72214.0')
-
-        test = np.ndfromtxt(data, delimiter=',', dtype=None,
-
-                            names=['date', 'stid'], converters=converter)
-
-        control = np.array((datetime(2009, 2, 3), 72214.),
-
-                           dtype=[('date', np.object_), ('stid', float)])
-
-        assert_equal(test, control)
-
-
-
-    def test_converters_cornercases2(self):
-
-        "Test the conversion to datetime64."
-
-        converter = {
-
-            'date': lambda s: np.datetime64(strptime(s, '%Y-%m-%d %H:%M:%SZ'))}
-
-        data = TextIO('2009-02-03 12:00:00Z, 72214.0')
-
-        test = np.ndfromtxt(data, delimiter=',', dtype=None,
-
-                            names=['date', 'stid'], converters=converter)
-
-        control = np.array((datetime(2009, 2, 3), 72214.),
-
-                           dtype=[('date', 'datetime64[us]'), ('stid', float)])
-
-        assert_equal(test, control)
-
-
-
-    def test_unused_converter(self):
-
-        "Test whether unused converters are forgotten"
-
-        data = TextIO("1 21\n  3 42\n")
-
-        test = np.ndfromtxt(data, usecols=(1,),
-
-                            converters={0: lambda s: int(s, 16)})
-
-        assert_equal(test, [21, 42])
-
-        #
-
-        data.seek(0)
-
-        test = np.ndfromtxt(data, usecols=(1,),
-
-                            converters={1: lambda s: int(s, 16)})
-
-        assert_equal(test, [33, 66])
-
-
-
-    def test_invalid_converter(self):
-
-        strip_rand = lambda x: float((b'r' in x.lower() and x.split()[-1]) or
-
-                                     (b'r' not in x.lower() and x.strip() or 0.0))
-
-        strip_per = lambda x: float((b'%' in x.lower() and x.split()[0]) or
-
-                                    (b'%' not in x.lower() and x.strip() or 0.0))
-
-        s = TextIO("D01N01,10/1/2003 ,1 %,R 75,400,600\r\n"
-
-                   "L24U05,12/5/2003, 2 %,1,300, 150.5\r\n"
-
-                   "D02N03,10/10/2004,R 1,,7,145.55")
-
-        kwargs = dict(
-
-            converters={2: strip_per, 3: strip_rand}, delimiter=",",
-
-            dtype=None)
-
-        assert_raises(ConverterError, np.genfromtxt, s, **kwargs)
-
-
-
-    def test_tricky_converter_bug1666(self):
-
-        "Test some corner case"
-
-        s = TextIO('q1,2\nq3,4')
-
-        cnv = lambda s: float(s[1:])
-
-        test = np.genfromtxt(s, delimiter=',', converters={0: cnv})
-
-        control = np.array([[1., 2.], [3., 4.]])
-
-        assert_equal(test, control)
-
-
-
-    def test_dtype_with_converters(self):
-
-        dstr = "2009; 23; 46"
-
-        test = np.ndfromtxt(TextIO(dstr,),
-
-                            delimiter=";", dtype=float, converters={0: bytes})
-
-        control = np.array([('2009', 23., 46)],
-
-                           dtype=[('f0', '|S4'), ('f1', float), ('f2', float)])
-
-        assert_equal(test, control)
-
-        test = np.ndfromtxt(TextIO(dstr,),
-
-                            delimiter=";", dtype=float, converters={0: float})
-
-        control = np.array([2009., 23., 46],)
-
-        assert_equal(test, control)
-
-
-
-    def test_dtype_with_object(self):
-
-        "Test using an explicit dtype with an object"
-
-        from datetime import date
-
-        import time
-
-        data = """ 1; 2001-01-01
-
-                   2; 2002-01-31 """
-
-        ndtype = [('idx', int), ('code', np.object)]
-
-        func = lambda s: strptime(s.strip(), "%Y-%m-%d")
-
-        converters = {1: func}
-
-        test = np.genfromtxt(TextIO(data), delimiter=";", dtype=ndtype,
-
-                             converters=converters)
-
-        control = np.array(
-
-            [(1, datetime(2001, 1, 1)), (2, datetime(2002, 1, 31))],
-
-            dtype=ndtype)
-
-        assert_equal(test, control)
-
-        #
-
-        ndtype = [('nest', [('idx', int), ('code', np.object)])]
-
-        try:
-
-            test = np.genfromtxt(TextIO(data), delimiter=";",
-
-                                 dtype=ndtype, converters=converters)
-
-        except NotImplementedError:
+        except ImportError:
 
             pass
 
         else:
 
-            errmsg = "Nested dtype involving objects should be supported."
+            page.selectClientCertificate.connect(
 
-            raise AssertionError(errmsg)
+                self._on_select_client_certificate)
 
 
 
-    def test_userconverters_with_explicit_dtype(self):
+        view.titleChanged.connect(self.title_changed)
 
-        "Test user_converters w/ explicit (standard) dtype"
+        view.urlChanged.connect(self._on_url_changed)
 
-        data = TextIO('skip,skip,2001-01-01,1.0,skip')
+        view.renderProcessTerminated.connect(
 
-        test = np.genfromtxt(data, delimiter=",", names=None, dtype=float,
+            self._on_render_process_terminated)
 
-                             usecols=(2, 3), converters={2: bytes})
+        view.iconChanged.connect(self.icon_changed)
 
-        control = np.array([('2001-01-01', 1.)],
 
-                           dtype=[('', '|S10'), ('', float)])
 
-        assert_equal(test, control)
+        page.loadFinished.connect(self._on_history_trigger)
 
+        page.loadFinished.connect(self._restore_zoom)
 
+        page.loadFinished.connect(self._on_load_finished)
 
-    def test_spacedelimiter(self):
 
-        "Test space delimiter"
 
-        data = TextIO("1  2  3  4   5\n6  7  8  9  10")
+        self.before_load_started.connect(self._on_before_load_started)
 
-        test = np.ndfromtxt(data)
+        self.shutting_down.connect(self.abort_questions)  # type: ignore
 
-        control = np.array([[1., 2., 3., 4., 5.],
+        self.load_started.connect(self.abort_questions)  # type: ignore
 
-                            [6., 7., 8., 9., 10.]])
 
-        assert_equal(test, control)
 
+        # pylint: disable=protected-access
 
+        self.audio._connect_signals()
 
-    def test_integer_delimiter(self):
+        self._permissions.connect_signals()
 
-        "Test using an integer for delimiter"
-
-        data = "  1  2  3\n  4  5 67\n890123  4"
-
-        test = np.genfromtxt(TextIO(data), delimiter=3)
-
-        control = np.array([[1, 2, 3], [4, 5, 67], [890, 123, 4]])
-
-        assert_equal(test, control)
-
-
-
-    def test_missing(self):
-
-        data = TextIO('1,2,3,,5\n')
-
-        test = np.ndfromtxt(data, dtype=int, delimiter=',',
-
-                            converters={3: lambda s: int(s or - 999)})
-
-        control = np.array([1, 2, 3, -999, 5], int)
-
-        assert_equal(test, control)
-
-
-
-    def test_missing_with_tabs(self):
-
-        "Test w/ a delimiter tab"
-
-        txt = "1\t2\t3\n\t2\t\n1\t\t3"
-
-        test = np.genfromtxt(TextIO(txt), delimiter="\t",
-
-                             usemask=True,)
-
-        ctrl_d = np.array([(1, 2, 3), (np.nan, 2, np.nan), (1, np.nan, 3)],)
-
-        ctrl_m = np.array([(0, 0, 0), (1, 0, 1), (0, 1, 0)], dtype=bool)
-
-        assert_equal(test.data, ctrl_d)
-
-        assert_equal(test.mask, ctrl_m)
-
-
-
-    def test_usecols(self):
-
-        "Test the selection of columns"
-
-        # Select 1 column
-
-        control = np.array([[1, 2], [3, 4]], float)
-
-        data = TextIO()
-
-        np.savetxt(data, control)
-
-        data.seek(0)
-
-        test = np.ndfromtxt(data, dtype=float, usecols=(1,))
-
-        assert_equal(test, control[:, 1])
-
-        #
-
-        control = np.array([[1, 2, 3], [3, 4, 5]], float)
-
-        data = TextIO()
-
-        np.savetxt(data, control)
-
-        data.seek(0)
-
-        test = np.ndfromtxt(data, dtype=float, usecols=(1, 2))
-
-        assert_equal(test, control[:, 1:])
-
-        # Testing with arrays instead of tuples.
-
-        data.seek(0)
-
-        test = np.ndfromtxt(data, dtype=float, usecols=np.array([1, 2]))
-
-        assert_equal(test, control[:, 1:])
-
-
-
-    def test_usecols_as_css(self):
-
-        "Test giving usecols with a comma-separated string"
-
-        data = "1 2 3\n4 5 6"
-
-        test = np.genfromtxt(TextIO(data),
-
-                             names="a, b, c", usecols="a, c")
-
-        ctrl = np.array([(1, 3), (4, 6)], dtype=[(_, float) for _ in "ac"])
-
-        assert_equal(test, ctrl)
-
-
-
-    def test_usecols_with_structured_dtype(self):
-
-        "Test usecols with an explicit structured dtype"
-
-        data = TextIO("JOE 70.1 25.3\nBOB 60.5 27.9")
-
-        names = ['stid', 'temp']
-
-        dtypes = ['S4', 'f8']
-
-        test = np.ndfromtxt(
-
-            data, usecols=(0, 2), dtype=list(zip(names, dtypes)))
-
-        assert_equal(test['stid'], [b"JOE", b"BOB"])
-
-        assert_equal(test['temp'], [25.3, 27.9])
-
-
-
-    def test_usecols_with_integer(self):
-
-        "Test usecols with an integer"
-
-        test = np.genfromtxt(TextIO(b"1 2 3\n4 5 6"), usecols=0)
-
-        assert_equal(test, np.array([1., 4.]))
-
-
-
-    def test_usecols_with_named_columns(self):
-
-        "Test usecols with named columns"
-
-        ctrl = np.array([(1, 3), (4, 6)], dtype=[('a', float), ('c', float)])
-
-        data = "1 2 3\n4 5 6"
-
-        kwargs = dict(names="a, b, c")
-
-        test = np.genfromtxt(TextIO(data), usecols=(0, -1), **kwargs)
-
-        assert_equal(test, ctrl)
-
-        test = np.genfromtxt(TextIO(data),
-
-                             usecols=('a', 'c'), **kwargs)
-
-        assert_equal(test, ctrl)
-
-
-
-    def test_empty_file(self):
-
-        "Test that an empty file raises the proper warning."
-
-        with warnings.catch_warnings():
-
-            warnings.filterwarnings("ignore",
-
-                                    message="genfromtxt: Empty input file:")
-
-            data = TextIO()
-
-            test = np.genfromtxt(data)
-
-            assert_equal(test, np.array([]))
-
-
-
-    def test_fancy_dtype_alt(self):
-
-        "Check that a nested dtype isn't MIA"
-
-        data = TextIO('1,2,3.0\n4,5,6.0\n')
-
-        fancydtype = np.dtype([('x', int), ('y', [('t', int), ('s', float)])])
-
-        test = np.mafromtxt(data, dtype=fancydtype, delimiter=',')
-
-        control = ma.array([(1, (2, 3.0)), (4, (5, 6.0))], dtype=fancydtype)
-
-        assert_equal(test, control)
-
-
-
-    def test_shaped_dtype(self):
-
-        c = TextIO("aaaa  1.0  8.0  1 2 3 4 5 6")
-
-        dt = np.dtype([('name', 'S4'), ('x', float), ('y', float),
-
-                       ('block', int, (2, 3))])
-
-        x = np.ndfromtxt(c, dtype=dt)
-
-        a = np.array([('aaaa', 1.0, 8.0, [[1, 2, 3], [4, 5, 6]])],
-
-                     dtype=dt)
-
-        assert_array_equal(x, a)
-
-
-
-    def test_withmissing(self):
-
-        data = TextIO('A,B\n0,1\n2,N/A')
-
-        kwargs = dict(delimiter=",", missing_values="N/A", names=True)
-
-        test = np.mafromtxt(data, dtype=None, **kwargs)
-
-        control = ma.array([(0, 1), (2, -1)],
-
-                           mask=[(False, False), (False, True)],
-
-                           dtype=[('A', np.int), ('B', np.int)])
-
-        assert_equal(test, control)
-
-        assert_equal(test.mask, control.mask)
-
-        #
-
-        data.seek(0)
-
-        test = np.mafromtxt(data, **kwargs)
-
-        control = ma.array([(0, 1), (2, -1)],
-
-                           mask=[(False, False), (False, True)],
-
-                           dtype=[('A', np.float), ('B', np.float)])
-
-        assert_equal(test, control)
-
-        assert_equal(test.mask, control.mask)
-
-
-
-    def test_user_missing_values(self):
-
-        data = "A, B, C\n0, 0., 0j\n1, N/A, 1j\n-9, 2.2, N/A\n3, -99, 3j"
-
-        basekwargs = dict(dtype=None, delimiter=",", names=True,)
-
-        mdtype = [('A', int), ('B', float), ('C', complex)]
-
-        #
-
-        test = np.mafromtxt(TextIO(data), missing_values="N/A",
-
-                            **basekwargs)
-
-        control = ma.array([(0, 0.0, 0j), (1, -999, 1j),
-
-                            (-9, 2.2, -999j), (3, -99, 3j)],
-
-                           mask=[(0, 0, 0), (0, 1, 0), (0, 0, 1), (0, 0, 0)],
-
-                           dtype=mdtype)
-
-        assert_equal(test, control)
-
-        #
-
-        basekwargs['dtype'] = mdtype
-
-        test = np.mafromtxt(TextIO(data),
-
-                            missing_values={0: -9, 1: -99, 2: -999j}, **basekwargs)
-
-        control = ma.array([(0, 0.0, 0j), (1, -999, 1j),
-
-                            (-9, 2.2, -999j), (3, -99, 3j)],
-
-                           mask=[(0, 0, 0), (0, 1, 0), (1, 0, 1), (0, 1, 0)],
-
-                           dtype=mdtype)
-
-        assert_equal(test, control)
-
-        #
-
-        test = np.mafromtxt(TextIO(data),
-
-                            missing_values={0: -9, 'B': -99, 'C': -999j},
-
-                            **basekwargs)
-
-        control = ma.array([(0, 0.0, 0j), (1, -999, 1j),
-
-                            (-9, 2.2, -999j), (3, -99, 3j)],
-
-                           mask=[(0, 0, 0), (0, 1, 0), (1, 0, 1), (0, 1, 0)],
-
-                           dtype=mdtype)
-
-        assert_equal(test, control)
-
-
-
-    def test_user_filling_values(self):
-
-        "Test with missing and filling values"
-
-        ctrl = np.array([(0, 3), (4, -999)], dtype=[('a', int), ('b', int)])
-
-        data = "N/A, 2, 3\n4, ,???"
-
-        kwargs = dict(delimiter=",",
-
-                      dtype=int,
-
-                      names="a,b,c",
-
-                      missing_values={0: "N/A", 'b': " ", 2: "???"},
-
-                      filling_values={0: 0, 'b': 0, 2: -999})
-
-        test = np.genfromtxt(TextIO(data), **kwargs)
-
-        ctrl = np.array([(0, 2, 3), (4, 0, -999)],
-
-                        dtype=[(_, int) for _ in "abc"])
-
-        assert_equal(test, ctrl)
-
-        #
-
-        test = np.genfromtxt(TextIO(data), usecols=(0, -1), **kwargs)
-
-        ctrl = np.array([(0, 3), (4, -999)], dtype=[(_, int) for _ in "ac"])
-
-        assert_equal(test, ctrl)
-
-
-
-    def test_withmissing_float(self):
-
-        data = TextIO('A,B\n0,1.5\n2,-999.00')
-
-        test = np.mafromtxt(data, dtype=None, delimiter=',',
-
-                            missing_values='-999.0', names=True,)
-
-        control = ma.array([(0, 1.5), (2, -1.)],
-
-                           mask=[(False, False), (False, True)],
-
-                           dtype=[('A', np.int), ('B', np.float)])
-
-        assert_equal(test, control)
-
-        assert_equal(test.mask, control.mask)
-
-
-
-    def test_with_masked_column_uniform(self):
-
-        "Test masked column"
-
-        data = TextIO('1 2 3\n4 5 6\n')
-
-        test = np.genfromtxt(data, dtype=None,
-
-                             missing_values='2,5', usemask=True)
-
-        control = ma.array([[1, 2, 3], [4, 5, 6]], mask=[[0, 1, 0], [0, 1, 0]])
-
-        assert_equal(test, control)
-
-
-
-    def test_with_masked_column_various(self):
-
-        "Test masked column"
-
-        data = TextIO('True 2 3\nFalse 5 6\n')
-
-        test = np.genfromtxt(data, dtype=None,
-
-                             missing_values='2,5', usemask=True)
-
-        control = ma.array([(1, 2, 3), (0, 5, 6)],
-
-                           mask=[(0, 1, 0), (0, 1, 0)],
-
-                           dtype=[('f0', bool), ('f1', bool), ('f2', int)])
-
-        assert_equal(test, control)
-
-
-
-    def test_invalid_raise(self):
-
-        "Test invalid raise"
-
-        data = ["1, 1, 1, 1, 1"] * 50
-
-        for i in range(5):
-
-            data[10 * i] = "2, 2, 2, 2 2"
-
-        data.insert(0, "a, b, c, d, e")
-
-        mdata = TextIO("\n".join(data))
-
-        #
-
-        kwargs = dict(delimiter=",", dtype=None, names=True)
-
-        # XXX: is there a better way to get the return value of the callable in
-
-        # assert_warns ?
-
-        ret = {}
-
-
-
-        def f(_ret={}):
-
-            _ret['mtest'] = np.ndfromtxt(mdata, invalid_raise=False, **kwargs)
-
-        assert_warns(ConversionWarning, f, _ret=ret)
-
-        mtest = ret['mtest']
-
-        assert_equal(len(mtest), 45)
-
-        assert_equal(mtest, np.ones(45, dtype=[(_, int) for _ in 'abcde']))
-
-        #
-
-        mdata.seek(0)
-
-        assert_raises(ValueError, np.ndfromtxt, mdata,
-
-                      delimiter=",", names=True)
-
-
-
-    def test_invalid_raise_with_usecols(self):
-
-        "Test invalid_raise with usecols"
-
-        data = ["1, 1, 1, 1, 1"] * 50
-
-        for i in range(5):
-
-            data[10 * i] = "2, 2, 2, 2 2"
-
-        data.insert(0, "a, b, c, d, e")
-
-        mdata = TextIO("\n".join(data))
-
-        kwargs = dict(delimiter=",", dtype=None, names=True,
-
-                      invalid_raise=False)
-
-        # XXX: is there a better way to get the return value of the callable in
-
-        # assert_warns ?
-
-        ret = {}
-
-
-
-        def f(_ret={}):
-
-            _ret['mtest'] = np.ndfromtxt(mdata, usecols=(0, 4), **kwargs)
-
-        assert_warns(ConversionWarning, f, _ret=ret)
-
-        mtest = ret['mtest']
-
-        assert_equal(len(mtest), 45)
-
-        assert_equal(mtest, np.ones(45, dtype=[(_, int) for _ in 'ae']))
-
-        #
-
-        mdata.seek(0)
-
-        mtest = np.ndfromtxt(mdata, usecols=(0, 1), **kwargs)
-
-        assert_equal(len(mtest), 50)
-
-        control = np.ones(50, dtype=[(_, int) for _ in 'ab'])
-
-        control[[10 * _ for _ in range(5)]] = (2, 2)
-
-        assert_equal(mtest, control)
-
-
-
-    def test_inconsistent_dtype(self):
-
-        "Test inconsistent dtype"
-
-        data = ["1, 1, 1, 1, -1.1"] * 50
-
-        mdata = TextIO("\n".join(data))
-
-
-
-        converters = {4: lambda x: "(%s)" % x}
-
-        kwargs = dict(delimiter=",", converters=converters,
-
-                      dtype=[(_, int) for _ in 'abcde'],)
-
-        assert_raises(ValueError, np.genfromtxt, mdata, **kwargs)
-
-
-
-    def test_default_field_format(self):
-
-        "Test default format"
-
-        data = "0, 1, 2.3\n4, 5, 6.7"
-
-        mtest = np.ndfromtxt(TextIO(data),
-
-                             delimiter=",", dtype=None, defaultfmt="f%02i")
-
-        ctrl = np.array([(0, 1, 2.3), (4, 5, 6.7)],
-
-                        dtype=[("f00", int), ("f01", int), ("f02", float)])
-
-        assert_equal(mtest, ctrl)
-
-
-
-    def test_single_dtype_wo_names(self):
-
-        "Test single dtype w/o names"
-
-        data = "0, 1, 2.3\n4, 5, 6.7"
-
-        mtest = np.ndfromtxt(TextIO(data),
-
-                             delimiter=",", dtype=float, defaultfmt="f%02i")
-
-        ctrl = np.array([[0., 1., 2.3], [4., 5., 6.7]], dtype=float)
-
-        assert_equal(mtest, ctrl)
-
-
-
-    def test_single_dtype_w_explicit_names(self):
-
-        "Test single dtype w explicit names"
-
-        data = "0, 1, 2.3\n4, 5, 6.7"
-
-        mtest = np.ndfromtxt(TextIO(data),
-
-                             delimiter=",", dtype=float, names="a, b, c")
-
-        ctrl = np.array([(0., 1., 2.3), (4., 5., 6.7)],
-
-                        dtype=[(_, float) for _ in "abc"])
-
-        assert_equal(mtest, ctrl)
-
-
-
-    def test_single_dtype_w_implicit_names(self):
-
-        "Test single dtype w implicit names"
-
-        data = "a, b, c\n0, 1, 2.3\n4, 5, 6.7"
-
-        mtest = np.ndfromtxt(TextIO(data),
-
-                             delimiter=",", dtype=float, names=True)
-
-        ctrl = np.array([(0., 1., 2.3), (4., 5., 6.7)],
-
-                        dtype=[(_, float) for _ in "abc"])
-
-        assert_equal(mtest, ctrl)
-
-
-
-    def test_easy_structured_dtype(self):
-
-        "Test easy structured dtype"
-
-        data = "0, 1, 2.3\n4, 5, 6.7"
-
-        mtest = np.ndfromtxt(TextIO(data), delimiter=",",
-
-                             dtype=(int, float, float), defaultfmt="f_%02i")
-
-        ctrl = np.array([(0, 1., 2.3), (4, 5., 6.7)],
-
-                        dtype=[("f_00", int), ("f_01", float), ("f_02", float)])
-
-        assert_equal(mtest, ctrl)
-
-
-
-    def test_autostrip(self):
-
-        "Test autostrip"
-
-        data = "01/01/2003  , 1.3,   abcde"
-
-        kwargs = dict(delimiter=",", dtype=None)
-
-        mtest = np.ndfromtxt(TextIO(data), **kwargs)
-
-        ctrl = np.array([('01/01/2003  ', 1.3, '   abcde')],
-
-                        dtype=[('f0', '|S12'), ('f1', float), ('f2', '|S8')])
-
-        assert_equal(mtest, ctrl)
-
-        mtest = np.ndfromtxt(TextIO(data), autostrip=True, **kwargs)
-
-        ctrl = np.array([('01/01/2003', 1.3, 'abcde')],
-
-                        dtype=[('f0', '|S10'), ('f1', float), ('f2', '|S5')])
-
-        assert_equal(mtest, ctrl)
-
-
-
-    def test_replace_space(self):
-
-        "Test the 'replace_space' option"
-
-        txt = "A.A, B (B), C:C\n1, 2, 3.14"
-
-        # Test default: replace ' ' by '_' and delete non-alphanum chars
-
-        test = np.genfromtxt(TextIO(txt),
-
-                             delimiter=",", names=True, dtype=None)
-
-        ctrl_dtype = [("AA", int), ("B_B", int), ("CC", float)]
-
-        ctrl = np.array((1, 2, 3.14), dtype=ctrl_dtype)
-
-        assert_equal(test, ctrl)
-
-        # Test: no replace, no delete
-
-        test = np.genfromtxt(TextIO(txt),
-
-                             delimiter=",", names=True, dtype=None,
-
-                             replace_space='', deletechars='')
-
-        ctrl_dtype = [("A.A", int), ("B (B)", int), ("C:C", float)]
-
-        ctrl = np.array((1, 2, 3.14), dtype=ctrl_dtype)
-
-        assert_equal(test, ctrl)
-
-        # Test: no delete (spaces are replaced by _)
-
-        test = np.genfromtxt(TextIO(txt),
-
-                             delimiter=",", names=True, dtype=None,
-
-                             deletechars='')
-
-        ctrl_dtype = [("A.A", int), ("B_(B)", int), ("C:C", float)]
-
-        ctrl = np.array((1, 2, 3.14), dtype=ctrl_dtype)
-
-        assert_equal(test, ctrl)
-
-
-
-    def test_incomplete_names(self):
-
-        "Test w/ incomplete names"
-
-        data = "A,,C\n0,1,2\n3,4,5"
-
-        kwargs = dict(delimiter=",", names=True)
-
-        # w/ dtype=None
-
-        ctrl = np.array([(0, 1, 2), (3, 4, 5)],
-
-                        dtype=[(_, int) for _ in ('A', 'f0', 'C')])
-
-        test = np.ndfromtxt(TextIO(data), dtype=None, **kwargs)
-
-        assert_equal(test, ctrl)
-
-        # w/ default dtype
-
-        ctrl = np.array([(0, 1, 2), (3, 4, 5)],
-
-                        dtype=[(_, float) for _ in ('A', 'f0', 'C')])
-
-        test = np.ndfromtxt(TextIO(data), **kwargs)
-
-
-
-    def test_names_auto_completion(self):
-
-        "Make sure that names are properly completed"
-
-        data = "1 2 3\n 4 5 6"
-
-        test = np.genfromtxt(TextIO(data),
-
-                             dtype=(int, float, int), names="a")
-
-        ctrl = np.array([(1, 2, 3), (4, 5, 6)],
-
-                        dtype=[('a', int), ('f0', float), ('f1', int)])
-
-        assert_equal(test, ctrl)
-
-
-
-    def test_names_with_usecols_bug1636(self):
-
-        "Make sure we pick up the right names w/ usecols"
-
-        data = "A,B,C,D,E\n0,1,2,3,4\n0,1,2,3,4\n0,1,2,3,4"
-
-        ctrl_names = ("A", "C", "E")
-
-        test = np.genfromtxt(TextIO(data),
-
-                             dtype=(int, int, int), delimiter=",",
-
-                             usecols=(0, 2, 4), names=True)
-
-        assert_equal(test.dtype.names, ctrl_names)
-
-        #
-
-        test = np.genfromtxt(TextIO(data),
-
-                             dtype=(int, int, int), delimiter=",",
-
-                             usecols=("A", "C", "E"), names=True)
-
-        assert_equal(test.dtype.names, ctrl_names)
-
-        #
-
-        test = np.genfromtxt(TextIO(data),
-
-                             dtype=int, delimiter=",",
-
-                             usecols=("A", "C", "E"), names=True)
-
-        assert_equal(test.dtype.names, ctrl_names)
-
-
-
-    def test_fixed_width_names(self):
-
-        "Test fix-width w/ names"
-
-        data = "    A    B   C\n    0    1 2.3\n   45   67   9."
-
-        kwargs = dict(delimiter=(5, 5, 4), names=True, dtype=None)
-
-        ctrl = np.array([(0, 1, 2.3), (45, 67, 9.)],
-
-                        dtype=[('A', int), ('B', int), ('C', float)])
-
-        test = np.ndfromtxt(TextIO(data), **kwargs)
-
-        assert_equal(test, ctrl)
-
-        #
-
-        kwargs = dict(delimiter=5, names=True, dtype=None)
-
-        ctrl = np.array([(0, 1, 2.3), (45, 67, 9.)],
-
-                        dtype=[('A', int), ('B', int), ('C', float)])
-
-        test = np.ndfromtxt(TextIO(data), **kwargs)
-
-        assert_equal(test, ctrl)
-
-
-
-    def test_filling_values(self):
-
-        "Test missing values"
-
-        data = b"1, 2, 3\n1, , 5\n0, 6, \n"
-
-        kwargs = dict(delimiter=",", dtype=None, filling_values=-999)
-
-        ctrl = np.array([[1, 2, 3], [1, -999, 5], [0, 6, -999]], dtype=int)
-
-        test = np.ndfromtxt(TextIO(data), **kwargs)
-
-        assert_equal(test, ctrl)
-
-
-
-    def test_comments_is_none(self):
-
-        # Github issue 329 (None was previously being converted to 'None').
-
-        test = np.genfromtxt(TextIO("test1,testNonetherestofthedata"),
-
-                             dtype=None, comments=None, delimiter=',')
-
-        assert_equal(test[1], b'testNonetherestofthedata')
-
-        test = np.genfromtxt(TextIO("test1, testNonetherestofthedata"),
-
-                             dtype=None, comments=None, delimiter=',')
-
-        assert_equal(test[1], b' testNonetherestofthedata')
-
-
-
-    def test_recfromtxt(self):
-
-        #
-
-        data = TextIO('A,B\n0,1\n2,3')
-
-        kwargs = dict(delimiter=",", missing_values="N/A", names=True)
-
-        test = np.recfromtxt(data, **kwargs)
-
-        control = np.array([(0, 1), (2, 3)],
-
-                           dtype=[('A', np.int), ('B', np.int)])
-
-        self.assertTrue(isinstance(test, np.recarray))
-
-        assert_equal(test, control)
-
-        #
-
-        data = TextIO('A,B\n0,1\n2,N/A')
-
-        test = np.recfromtxt(data, dtype=None, usemask=True, **kwargs)
-
-        control = ma.array([(0, 1), (2, -1)],
-
-                           mask=[(False, False), (False, True)],
-
-                           dtype=[('A', np.int), ('B', np.int)])
-
-        assert_equal(test, control)
-
-        assert_equal(test.mask, control.mask)
-
-        assert_equal(test.A, [0, 2])
-
-
-
-    def test_recfromcsv(self):
-
-        #
-
-        data = TextIO('A,B\n0,1\n2,3')
-
-        kwargs = dict(missing_values="N/A", names=True, case_sensitive=True)
-
-        test = np.recfromcsv(data, dtype=None, **kwargs)
-
-        control = np.array([(0, 1), (2, 3)],
-
-                           dtype=[('A', np.int), ('B', np.int)])
-
-        self.assertTrue(isinstance(test, np.recarray))
-
-        assert_equal(test, control)
-
-        #
-
-        data = TextIO('A,B\n0,1\n2,N/A')
-
-        test = np.recfromcsv(data, dtype=None, usemask=True, **kwargs)
-
-        control = ma.array([(0, 1), (2, -1)],
-
-                           mask=[(False, False), (False, True)],
-
-                           dtype=[('A', np.int), ('B', np.int)])
-
-        assert_equal(test, control)
-
-        assert_equal(test.mask, control.mask)
-
-        assert_equal(test.A, [0, 2])
-
-        #
-
-        data = TextIO('A,B\n0,1\n2,3')
-
-        test = np.recfromcsv(data, missing_values='N/A',)
-
-        control = np.array([(0, 1), (2, 3)],
-
-                           dtype=[('a', np.int), ('b', np.int)])
-
-        self.assertTrue(isinstance(test, np.recarray))
-
-        assert_equal(test, control)
-
-
-
-    def test_gft_using_filename(self):
-
-        # Test that we can load data from a filename as well as a file object
-
-        wanted = np.arange(6).reshape((2, 3))
-
-        if sys.version_info[0] >= 3:
-
-            # python 3k is known to fail for '\r'
-
-            linesep = ('\n', '\r\n')
-
-        else:
-
-            linesep = ('\n', '\r\n', '\r')
-
-
-
-        for sep in linesep:
-
-            data = '0 1 2' + sep + '3 4 5'
-
-            f, name = mkstemp()
-
-            # We can't use NamedTemporaryFile on windows, because we cannot
-
-            # reopen the file.
-
-            try:
-
-                os.write(f, asbytes(data))
-
-                assert_array_equal(np.genfromtxt(name), wanted)
-
-            finally:
-
-                os.close(f)
-
-                os.unlink(name)
-
-
-
-    def test_gft_using_generator(self):
-
-        # gft doesn't work with unicode.
-
-        def count():
-
-            for i in range(10):
-
-                yield asbytes("%d" % i)
-
-
-
-        res = np.genfromtxt(count())
-
-        assert_array_equal(res, np.arange(10))
-
-
-
-
-
-def test_gzip_load():
-
-    a = np.random.random((5, 5))
-
-
-
-    s = BytesIO()
-
-    f = gzip.GzipFile(fileobj=s, mode="w")
-
-
-
-    np.save(f, a)
-
-    f.close()
-
-    s.seek(0)
-
-
-
-    f = gzip.GzipFile(fileobj=s, mode="r")
-
-    assert_array_equal(np.load(f), a)
-
-
-
-
-
-def test_gzip_loadtxt():
-
-    # Thanks to another windows brokeness, we can't use
-
-    # NamedTemporaryFile: a file created from this function cannot be
-
-    # reopened by another open call. So we first put the gzipped string
-
-    # of the test reference array, write it to a securely opened file,
-
-    # which is then read from by the loadtxt function
-
-    s = BytesIO()
-
-    g = gzip.GzipFile(fileobj=s, mode='w')
-
-    g.write(b'1 2 3\n')
-
-    g.close()
-
-    s.seek(0)
-
-
-
-    f, name = mkstemp(suffix='.gz')
-
-    try:
-
-        os.write(f, s.read())
-
-        s.close()
-
-        assert_array_equal(np.loadtxt(name), [1, 2, 3])
-
-    finally:
-
-        os.close(f)
-
-        os.unlink(name)
-
-
-
-
-
-def test_gzip_loadtxt_from_string():
-
-    s = BytesIO()
-
-    f = gzip.GzipFile(fileobj=s, mode="w")
-
-    f.write(b'1 2 3\n')
-
-    f.close()
-
-    s.seek(0)
-
-
-
-    f = gzip.GzipFile(fileobj=s, mode="r")
-
-    assert_array_equal(np.loadtxt(f), [1, 2, 3])
-
-
-
-
-
-def test_npzfile_dict():
-
-    s = BytesIO()
-
-    x = np.zeros((3, 3))
-
-    y = np.zeros((3, 3))
-
-
-
-    np.savez(s, x=x, y=y)
-
-    s.seek(0)
-
-
-
-    z = np.load(s)
-
-
-
-    assert_('x' in z)
-
-    assert_('y' in z)
-
-    assert_('x' in z.keys())
-
-    assert_('y' in z.keys())
-
-
-
-    for f, a in z.items():
-
-        assert_(f in ['x', 'y'])
-
-        assert_equal(a.shape, (3, 3))
-
-
-
-    assert_(len(z.items()) == 2)
-
-
-
-    for f in z:
-
-        assert_(f in ['x', 'y'])
-
-
-
-    assert_('x' in z.keys())
-
-
-
-
-
-def test_load_refcount():
-
-    # Check that objects returned by np.load are directly freed based on
-
-    # their refcount, rather than needing the gc to collect them.
-
-
-
-    f = BytesIO()
-
-    np.savez(f, [1, 2, 3])
-
-    f.seek(0)
-
-
-
-    gc.collect()
-
-    n_before = len(gc.get_objects())
-
-    np.load(f)
-
-    n_after = len(gc.get_objects())
-
-
-
-    assert_equal(n_before, n_after)
-
-
-
-if __name__ == "__main__":
-
-    run_module_suite()
+        self._scripts.connect_signals()

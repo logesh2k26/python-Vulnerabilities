@@ -2,762 +2,1004 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# -*- coding: utf-8 -*-
+from __future__ import with_statement
 
-from __future__ import unicode_literals
+import os
+
+import re
+
+import urllib
 
 
 
-from unittest import skipUnless
+from django.conf import settings
 
+from django.contrib.sites.models import Site, RequestSite
 
+from django.contrib.auth.models import User
 
-from django.conf.global_settings import PASSWORD_HASHERS
+from django.core import mail
 
-from django.contrib.auth.hashers import (
+from django.core.exceptions import SuspiciousOperation
 
-    UNUSABLE_PASSWORD_PREFIX, UNUSABLE_PASSWORD_SUFFIX_LENGTH,
+from django.core.urlresolvers import reverse, NoReverseMatch
 
-    BasePasswordHasher, PBKDF2PasswordHasher, PBKDF2SHA1PasswordHasher,
+from django.http import QueryDict
 
-    check_password, get_hasher, identify_hasher, is_password_usable,
+from django.utils.encoding import force_unicode
 
-    make_password,
+from django.utils.html import escape
 
-)
-
-from django.test import SimpleTestCase
+from django.test import TestCase
 
 from django.test.utils import override_settings
 
-from django.utils import six
 
 
+from django.contrib.auth import SESSION_KEY, REDIRECT_FIELD_NAME
 
-try:
+from django.contrib.auth.forms import (AuthenticationForm, PasswordChangeForm,
 
-    import crypt
+                SetPasswordForm, PasswordResetForm)
 
-except ImportError:
 
-    crypt = None
 
 
 
-try:
+class AuthViewsTestCase(TestCase):
 
-    import bcrypt
+    """
 
-except ImportError:
+    Helper base class for all the follow test cases.
 
-    bcrypt = None
+    """
 
+    fixtures = ['authtestdata.json']
 
+    urls = 'django.contrib.auth.tests.urls'
 
 
 
-class PBKDF2SingleIterationHasher(PBKDF2PasswordHasher):
+    def setUp(self):
 
-    iterations = 1
+        self.old_LANGUAGES = settings.LANGUAGES
 
+        self.old_LANGUAGE_CODE = settings.LANGUAGE_CODE
 
+        settings.LANGUAGES = (('en', 'English'),)
 
+        settings.LANGUAGE_CODE = 'en'
 
+        self.old_TEMPLATE_DIRS = settings.TEMPLATE_DIRS
 
-@override_settings(PASSWORD_HASHERS=PASSWORD_HASHERS)
+        settings.TEMPLATE_DIRS = (
 
-class TestUtilsHashPass(SimpleTestCase):
+            os.path.join(os.path.dirname(__file__), 'templates'),
 
+        )
 
 
-    def test_simple(self):
 
-        encoded = make_password('lètmein')
+    def tearDown(self):
 
-        self.assertTrue(encoded.startswith('pbkdf2_sha256$'))
+        settings.LANGUAGES = self.old_LANGUAGES
 
-        self.assertTrue(is_password_usable(encoded))
+        settings.LANGUAGE_CODE = self.old_LANGUAGE_CODE
 
-        self.assertTrue(check_password('lètmein', encoded))
+        settings.TEMPLATE_DIRS = self.old_TEMPLATE_DIRS
 
-        self.assertFalse(check_password('lètmeinz', encoded))
 
-        # Blank passwords
 
-        blank_encoded = make_password('')
+    def login(self, password='password'):
 
-        self.assertTrue(blank_encoded.startswith('pbkdf2_sha256$'))
+        response = self.client.post('/login/', {
 
-        self.assertTrue(is_password_usable(blank_encoded))
+            'username': 'testclient',
 
-        self.assertTrue(check_password('', blank_encoded))
+            'password': password,
 
-        self.assertFalse(check_password(' ', blank_encoded))
+            })
 
+        self.assertEqual(response.status_code, 302)
 
+        self.assertTrue(response['Location'].endswith(settings.LOGIN_REDIRECT_URL))
 
-    def test_pbkdf2(self):
+        self.assertTrue(SESSION_KEY in self.client.session)
 
-        encoded = make_password('lètmein', 'seasalt', 'pbkdf2_sha256')
 
-        self.assertEqual(encoded,
 
-            'pbkdf2_sha256$30000$seasalt$VrX+V8drCGo68wlvy6rfu8i1d1pfkdeXA4LJkRGJodY=')
+    def assertContainsEscaped(self, response, text, **kwargs):
 
-        self.assertTrue(is_password_usable(encoded))
+        return self.assertContains(response, escape(force_unicode(text)), **kwargs)
 
-        self.assertTrue(check_password('lètmein', encoded))
 
-        self.assertFalse(check_password('lètmeinz', encoded))
 
-        self.assertEqual(identify_hasher(encoded).algorithm, "pbkdf2_sha256")
+AuthViewsTestCase = override_settings(USE_TZ=False)(AuthViewsTestCase)
 
-        # Blank passwords
 
-        blank_encoded = make_password('', 'seasalt', 'pbkdf2_sha256')
 
-        self.assertTrue(blank_encoded.startswith('pbkdf2_sha256$'))
 
-        self.assertTrue(is_password_usable(blank_encoded))
 
-        self.assertTrue(check_password('', blank_encoded))
+class AuthViewNamedURLTests(AuthViewsTestCase):
 
-        self.assertFalse(check_password(' ', blank_encoded))
+    urls = 'django.contrib.auth.urls'
 
 
 
-    @override_settings(PASSWORD_HASHERS=['django.contrib.auth.hashers.SHA1PasswordHasher'])
+    def test_named_urls(self):
 
-    def test_sha1(self):
+        "Named URLs should be reversible"
 
-        encoded = make_password('lètmein', 'seasalt', 'sha1')
+        expected_named_urls = [
 
-        self.assertEqual(encoded,
+            ('login', [], {}),
 
-            'sha1$seasalt$cff36ea83f5706ce9aa7454e63e431fc726b2dc8')
+            ('logout', [], {}),
 
-        self.assertTrue(is_password_usable(encoded))
+            ('password_change', [], {}),
 
-        self.assertTrue(check_password('lètmein', encoded))
+            ('password_change_done', [], {}),
 
-        self.assertFalse(check_password('lètmeinz', encoded))
+            ('password_reset', [], {}),
 
-        self.assertEqual(identify_hasher(encoded).algorithm, "sha1")
+            ('password_reset_done', [], {}),
 
-        # Blank passwords
+            ('password_reset_confirm', [], {
 
-        blank_encoded = make_password('', 'seasalt', 'sha1')
+                'uidb36': 'aaaaaaa',
 
-        self.assertTrue(blank_encoded.startswith('sha1$'))
+                'token': '1111-aaaaa',
 
-        self.assertTrue(is_password_usable(blank_encoded))
+            }),
 
-        self.assertTrue(check_password('', blank_encoded))
+            ('password_reset_complete', [], {}),
 
-        self.assertFalse(check_password(' ', blank_encoded))
+        ]
 
+        for name, args, kwargs in expected_named_urls:
 
+            try:
 
-    @override_settings(PASSWORD_HASHERS=['django.contrib.auth.hashers.MD5PasswordHasher'])
+                reverse(name, args=args, kwargs=kwargs)
 
-    def test_md5(self):
+            except NoReverseMatch:
 
-        encoded = make_password('lètmein', 'seasalt', 'md5')
+                self.fail("Reversal of url named '%s' failed with NoReverseMatch" % name)
 
-        self.assertEqual(encoded,
 
-                         'md5$seasalt$3f86d0d3d465b7b458c231bf3555c0e3')
 
-        self.assertTrue(is_password_usable(encoded))
 
-        self.assertTrue(check_password('lètmein', encoded))
 
-        self.assertFalse(check_password('lètmeinz', encoded))
+class PasswordResetTest(AuthViewsTestCase):
 
-        self.assertEqual(identify_hasher(encoded).algorithm, "md5")
 
-        # Blank passwords
 
-        blank_encoded = make_password('', 'seasalt', 'md5')
+    def test_email_not_found(self):
 
-        self.assertTrue(blank_encoded.startswith('md5$'))
+        "Error is raised if the provided email address isn't currently registered"
 
-        self.assertTrue(is_password_usable(blank_encoded))
+        response = self.client.get('/password_reset/')
 
-        self.assertTrue(check_password('', blank_encoded))
+        self.assertEqual(response.status_code, 200)
 
-        self.assertFalse(check_password(' ', blank_encoded))
+        response = self.client.post('/password_reset/', {'email': 'not_a_real_email@email.com'})
 
+        self.assertContainsEscaped(response, PasswordResetForm.error_messages['unknown'])
 
+        self.assertEqual(len(mail.outbox), 0)
 
-    @override_settings(PASSWORD_HASHERS=['django.contrib.auth.hashers.UnsaltedMD5PasswordHasher'])
 
-    def test_unsalted_md5(self):
 
-        encoded = make_password('lètmein', '', 'unsalted_md5')
+    def test_email_found(self):
 
-        self.assertEqual(encoded, '88a434c88cca4e900f7874cd98123f43')
+        "Email is sent if a valid email address is provided for password reset"
 
-        self.assertTrue(is_password_usable(encoded))
+        response = self.client.post('/password_reset/', {'email': 'staffmember@example.com'})
 
-        self.assertTrue(check_password('lètmein', encoded))
+        self.assertEqual(response.status_code, 302)
 
-        self.assertFalse(check_password('lètmeinz', encoded))
+        self.assertEqual(len(mail.outbox), 1)
 
-        self.assertEqual(identify_hasher(encoded).algorithm, "unsalted_md5")
+        self.assertTrue("http://" in mail.outbox[0].body)
 
-        # Alternate unsalted syntax
+        self.assertEqual(settings.DEFAULT_FROM_EMAIL, mail.outbox[0].from_email)
 
-        alt_encoded = "md5$$%s" % encoded
 
-        self.assertTrue(is_password_usable(alt_encoded))
 
-        self.assertTrue(check_password('lètmein', alt_encoded))
+    def test_email_found_custom_from(self):
 
-        self.assertFalse(check_password('lètmeinz', alt_encoded))
+        "Email is sent if a valid email address is provided for password reset when a custom from_email is provided."
 
-        # Blank passwords
+        response = self.client.post('/password_reset_from_email/', {'email': 'staffmember@example.com'})
 
-        blank_encoded = make_password('', '', 'unsalted_md5')
+        self.assertEqual(response.status_code, 302)
 
-        self.assertTrue(is_password_usable(blank_encoded))
+        self.assertEqual(len(mail.outbox), 1)
 
-        self.assertTrue(check_password('', blank_encoded))
+        self.assertEqual("staffmember@example.com", mail.outbox[0].from_email)
 
-        self.assertFalse(check_password(' ', blank_encoded))
 
 
+    @override_settings(ALLOWED_HOSTS=['adminsite.com'])
 
-    @override_settings(PASSWORD_HASHERS=['django.contrib.auth.hashers.UnsaltedSHA1PasswordHasher'])
+    def test_admin_reset(self):
 
-    def test_unsalted_sha1(self):
+        "If the reset view is marked as being for admin, the HTTP_HOST header is used for a domain override."
 
-        encoded = make_password('lètmein', '', 'unsalted_sha1')
+        response = self.client.post('/admin_password_reset/',
 
-        self.assertEqual(encoded, 'sha1$$6d138ca3ae545631b3abd71a4f076ce759c5700b')
+            {'email': 'staffmember@example.com'},
 
-        self.assertTrue(is_password_usable(encoded))
+            HTTP_HOST='adminsite.com'
 
-        self.assertTrue(check_password('lètmein', encoded))
+        )
 
-        self.assertFalse(check_password('lètmeinz', encoded))
+        self.assertEqual(response.status_code, 302)
 
-        self.assertEqual(identify_hasher(encoded).algorithm, "unsalted_sha1")
+        self.assertEqual(len(mail.outbox), 1)
 
-        # Raw SHA1 isn't acceptable
+        self.assertTrue("http://adminsite.com" in mail.outbox[0].body)
 
-        alt_encoded = encoded[6:]
+        self.assertEqual(settings.DEFAULT_FROM_EMAIL, mail.outbox[0].from_email)
 
-        self.assertFalse(check_password('lètmein', alt_encoded))
 
-        # Blank passwords
 
-        blank_encoded = make_password('', '', 'unsalted_sha1')
+    # Skip any 500 handler action (like sending more mail...)
 
-        self.assertTrue(blank_encoded.startswith('sha1$'))
+    @override_settings(DEBUG_PROPAGATE_EXCEPTIONS=True)
 
-        self.assertTrue(is_password_usable(blank_encoded))
+    def test_poisoned_http_host(self):
 
-        self.assertTrue(check_password('', blank_encoded))
+        "Poisoned HTTP_HOST headers can't be used for reset emails"
 
-        self.assertFalse(check_password(' ', blank_encoded))
+        # This attack is based on the way browsers handle URLs. The colon
 
+        # should be used to separate the port, but if the URL contains an @,
 
+        # the colon is interpreted as part of a username for login purposes,
 
-    @skipUnless(crypt, "no crypt module to generate password.")
+        # making 'evil.com' the request domain. Since HTTP_HOST is used to
 
-    @override_settings(PASSWORD_HASHERS=['django.contrib.auth.hashers.CryptPasswordHasher'])
+        # produce a meaningful reset URL, we need to be certain that the
 
-    def test_crypt(self):
+        # HTTP_HOST header isn't poisoned. This is done as a check when get_host()
 
-        encoded = make_password('lètmei', 'ab', 'crypt')
+        # is invoked, but we check here as a practical consequence.
 
-        self.assertEqual(encoded, 'crypt$$ab1Hv2Lg7ltQo')
+        with self.assertRaises(SuspiciousOperation):
 
-        self.assertTrue(is_password_usable(encoded))
+            self.client.post('/password_reset/',
 
-        self.assertTrue(check_password('lètmei', encoded))
+                {'email': 'staffmember@example.com'},
 
-        self.assertFalse(check_password('lètmeiz', encoded))
+                HTTP_HOST='www.example:dr.frankenstein@evil.tld'
 
-        self.assertEqual(identify_hasher(encoded).algorithm, "crypt")
+            )
 
-        # Blank passwords
+        self.assertEqual(len(mail.outbox), 0)
 
-        blank_encoded = make_password('', 'ab', 'crypt')
 
-        self.assertTrue(blank_encoded.startswith('crypt$'))
 
-        self.assertTrue(is_password_usable(blank_encoded))
+    # Skip any 500 handler action (like sending more mail...)
 
-        self.assertTrue(check_password('', blank_encoded))
+    @override_settings(DEBUG_PROPAGATE_EXCEPTIONS=True)
 
-        self.assertFalse(check_password(' ', blank_encoded))
+    def test_poisoned_http_host_admin_site(self):
 
+        "Poisoned HTTP_HOST headers can't be used for reset emails on admin views"
 
+        with self.assertRaises(SuspiciousOperation):
 
-    @skipUnless(bcrypt, "bcrypt not installed")
+            self.client.post('/admin_password_reset/',
 
-    def test_bcrypt_sha256(self):
+                {'email': 'staffmember@example.com'},
 
-        encoded = make_password('lètmein', hasher='bcrypt_sha256')
+                HTTP_HOST='www.example:dr.frankenstein@evil.tld'
 
-        self.assertTrue(is_password_usable(encoded))
+            )
 
-        self.assertTrue(encoded.startswith('bcrypt_sha256$'))
+        self.assertEqual(len(mail.outbox), 0)
 
-        self.assertTrue(check_password('lètmein', encoded))
 
-        self.assertFalse(check_password('lètmeinz', encoded))
 
-        self.assertEqual(identify_hasher(encoded).algorithm, "bcrypt_sha256")
+    def _test_confirm_start(self):
 
+        # Start by creating the email
 
+        response = self.client.post('/password_reset/', {'email': 'staffmember@example.com'})
 
-        # Verify that password truncation no longer works
+        self.assertEqual(response.status_code, 302)
 
-        password = ('VSK0UYV6FFQVZ0KG88DYN9WADAADZO1CTSIVDJUNZSUML6IBX7LN7ZS3R5'
+        self.assertEqual(len(mail.outbox), 1)
 
-                    'JGB3RGZ7VI7G7DJQ9NI8BQFSRPTG6UWTTVESA5ZPUN')
+        return self._read_signup_email(mail.outbox[0])
 
-        encoded = make_password(password, hasher='bcrypt_sha256')
 
-        self.assertTrue(check_password(password, encoded))
 
-        self.assertFalse(check_password(password[:72], encoded))
+    def _read_signup_email(self, email):
 
-        # Blank passwords
+        urlmatch = re.search(r"https?://[^/]*(/.*reset/\S*)", email.body)
 
-        blank_encoded = make_password('', hasher='bcrypt_sha256')
+        self.assertTrue(urlmatch is not None, "No URL found in sent email")
 
-        self.assertTrue(blank_encoded.startswith('bcrypt_sha256$'))
+        return urlmatch.group(), urlmatch.groups()[0]
 
-        self.assertTrue(is_password_usable(blank_encoded))
 
-        self.assertTrue(check_password('', blank_encoded))
 
-        self.assertFalse(check_password(' ', blank_encoded))
+    def test_confirm_valid(self):
 
+        url, path = self._test_confirm_start()
 
+        response = self.client.get(path)
 
-    @skipUnless(bcrypt, "bcrypt not installed")
+        # redirect to a 'complete' page:
 
-    def test_bcrypt(self):
+        self.assertEqual(response.status_code, 200)
 
-        encoded = make_password('lètmein', hasher='bcrypt')
+        self.assertTrue("Please enter your new password" in response.content)
 
-        self.assertTrue(is_password_usable(encoded))
 
-        self.assertTrue(encoded.startswith('bcrypt$'))
 
-        self.assertTrue(check_password('lètmein', encoded))
+    def test_confirm_invalid(self):
 
-        self.assertFalse(check_password('lètmeinz', encoded))
+        url, path = self._test_confirm_start()
 
-        self.assertEqual(identify_hasher(encoded).algorithm, "bcrypt")
+        # Let's munge the token in the path, but keep the same length,
 
-        # Blank passwords
+        # in case the URLconf will reject a different length.
 
-        blank_encoded = make_password('', hasher='bcrypt')
+        path = path[:-5] + ("0" * 4) + path[-1]
 
-        self.assertTrue(blank_encoded.startswith('bcrypt$'))
 
-        self.assertTrue(is_password_usable(blank_encoded))
 
-        self.assertTrue(check_password('', blank_encoded))
+        response = self.client.get(path)
 
-        self.assertFalse(check_password(' ', blank_encoded))
+        self.assertEqual(response.status_code, 200)
 
+        self.assertTrue("The password reset link was invalid" in response.content)
 
 
-    @skipUnless(bcrypt, "bcrypt not installed")
 
-    def test_bcrypt_upgrade(self):
+    def test_confirm_invalid_user(self):
 
-        hasher = get_hasher('bcrypt')
+        # Ensure that we get a 200 response for a non-existant user, not a 404
 
-        self.assertEqual('bcrypt', hasher.algorithm)
+        response = self.client.get('/reset/123456-1-1/')
 
-        self.assertNotEqual(hasher.rounds, 4)
+        self.assertEqual(response.status_code, 200)
 
+        self.assertTrue("The password reset link was invalid" in response.content)
 
 
-        old_rounds = hasher.rounds
 
-        try:
+    def test_confirm_overflow_user(self):
 
-            # Generate a password with 4 rounds.
+        # Ensure that we get a 200 response for a base36 user id that overflows int
 
-            hasher.rounds = 4
+        response = self.client.get('/reset/zzzzzzzzzzzzz-1-1/')
 
-            encoded = make_password('letmein', hasher='bcrypt')
+        self.assertEqual(response.status_code, 200)
 
-            rounds = hasher.safe_summary(encoded)['work factor']
+        self.assertTrue("The password reset link was invalid" in response.content)
 
-            self.assertEqual(rounds, '04')
 
 
+    def test_confirm_invalid_post(self):
 
-            state = {'upgraded': False}
+        # Same as test_confirm_invalid, but trying
 
+        # to do a POST instead.
 
+        url, path = self._test_confirm_start()
 
-            def setter(password):
+        path = path[:-5] + ("0" * 4) + path[-1]
 
-                state['upgraded'] = True
 
 
+        self.client.post(path, {
 
-            # Check that no upgrade is triggered.
+            'new_password1': 'anewpassword',
 
-            self.assertTrue(check_password('letmein', encoded, setter, 'bcrypt'))
+            'new_password2': ' anewpassword',
 
-            self.assertFalse(state['upgraded'])
+        })
 
+        # Check the password has not been changed
 
+        u = User.objects.get(email='staffmember@example.com')
 
-            # Revert to the old rounds count and ...
+        self.assertTrue(not u.check_password("anewpassword"))
 
-            hasher.rounds = old_rounds
 
 
+    def test_confirm_complete(self):
 
-            # ... check if the password would get updated to the new count.
+        url, path = self._test_confirm_start()
 
-            self.assertTrue(check_password('letmein', encoded, setter, 'bcrypt'))
+        response = self.client.post(path, {'new_password1': 'anewpassword',
 
-            self.assertTrue(state['upgraded'])
+                                           'new_password2': 'anewpassword'})
 
-        finally:
+        # It redirects us to a 'complete' page:
 
-            hasher.rounds = old_rounds
+        self.assertEqual(response.status_code, 302)
 
+        # Check the password has been changed
 
+        u = User.objects.get(email='staffmember@example.com')
 
-    def test_unusable(self):
+        self.assertTrue(u.check_password("anewpassword"))
 
-        encoded = make_password(None)
 
-        self.assertEqual(len(encoded), len(UNUSABLE_PASSWORD_PREFIX) + UNUSABLE_PASSWORD_SUFFIX_LENGTH)
 
-        self.assertFalse(is_password_usable(encoded))
+        # Check we can't use the link again
 
-        self.assertFalse(check_password(None, encoded))
+        response = self.client.get(path)
 
-        self.assertFalse(check_password(encoded, encoded))
+        self.assertEqual(response.status_code, 200)
 
-        self.assertFalse(check_password(UNUSABLE_PASSWORD_PREFIX, encoded))
+        self.assertTrue("The password reset link was invalid" in response.content)
 
-        self.assertFalse(check_password('', encoded))
 
-        self.assertFalse(check_password('lètmein', encoded))
 
-        self.assertFalse(check_password('lètmeinz', encoded))
+    def test_confirm_different_passwords(self):
 
-        with self.assertRaises(ValueError):
+        url, path = self._test_confirm_start()
 
-            identify_hasher(encoded)
+        response = self.client.post(path, {'new_password1': 'anewpassword',
 
-        # Assert that the unusable passwords actually contain a random part.
+                                           'new_password2': 'x'})
 
-        # This might fail one day due to a hash collision.
+        self.assertEqual(response.status_code, 200)
 
-        self.assertNotEqual(encoded, make_password(None), "Random password collision?")
+        self.assertContainsEscaped(response, SetPasswordForm.error_messages['password_mismatch'])
 
 
 
-    def test_unspecified_password(self):
 
-        """
 
-        Makes sure specifying no plain password with a valid encoded password
+class ChangePasswordTest(AuthViewsTestCase):
 
-        returns `False`.
 
-        """
 
-        self.assertFalse(check_password(None, make_password('lètmein')))
+    def fail_login(self, password='password'):
 
+        response = self.client.post('/login/', {
 
+            'username': 'testclient',
 
-    def test_bad_algorithm(self):
+            'password': password,
 
-        with self.assertRaises(ValueError):
+        })
 
-            make_password('lètmein', hasher='lolcat')
+        self.assertEqual(response.status_code, 200)
 
-        with self.assertRaises(ValueError):
+        self.assertContainsEscaped(response, AuthenticationForm.error_messages['invalid_login'])
 
-            identify_hasher('lolcat$salt$hash')
 
 
+    def logout(self):
 
-    def test_bad_encoded(self):
+        response = self.client.get('/logout/')
 
-        self.assertFalse(is_password_usable('lètmein_badencoded'))
 
-        self.assertFalse(is_password_usable(''))
 
+    def test_password_change_fails_with_invalid_old_password(self):
 
+        self.login()
 
-    def test_low_level_pbkdf2(self):
+        response = self.client.post('/password_change/', {
 
-        hasher = PBKDF2PasswordHasher()
+            'old_password': 'donuts',
 
-        encoded = hasher.encode('lètmein', 'seasalt2')
+            'new_password1': 'password1',
 
-        self.assertEqual(encoded,
+            'new_password2': 'password1',
 
-            'pbkdf2_sha256$30000$seasalt2$a75qzbogeVhNFeMqhdgyyoqGKpIzYUo651sq57RERew=')
+        })
 
-        self.assertTrue(hasher.verify('lètmein', encoded))
+        self.assertEqual(response.status_code, 200)
 
+        self.assertContainsEscaped(response, PasswordChangeForm.error_messages['password_incorrect'])
 
 
-    def test_low_level_pbkdf2_sha1(self):
 
-        hasher = PBKDF2SHA1PasswordHasher()
+    def test_password_change_fails_with_mismatched_passwords(self):
 
-        encoded = hasher.encode('lètmein', 'seasalt2')
+        self.login()
 
-        self.assertEqual(encoded,
+        response = self.client.post('/password_change/', {
 
-            'pbkdf2_sha1$30000$seasalt2$pMzU1zNPcydf6wjnJFbiVKwgULc=')
+            'old_password': 'password',
 
-        self.assertTrue(hasher.verify('lètmein', encoded))
+            'new_password1': 'password1',
 
+            'new_password2': 'donuts',
 
+        })
 
-    @override_settings(
+        self.assertEqual(response.status_code, 200)
 
-        PASSWORD_HASHERS=[
+        self.assertContainsEscaped(response, SetPasswordForm.error_messages['password_mismatch'])
 
-            'django.contrib.auth.hashers.PBKDF2PasswordHasher',
 
-            'django.contrib.auth.hashers.SHA1PasswordHasher',
 
-            'django.contrib.auth.hashers.MD5PasswordHasher',
+    def test_password_change_succeeds(self):
 
-        ],
+        self.login()
 
-    )
+        response = self.client.post('/password_change/', {
 
-    def test_upgrade(self):
+            'old_password': 'password',
 
-        self.assertEqual('pbkdf2_sha256', get_hasher('default').algorithm)
+            'new_password1': 'password1',
 
-        for algo in ('sha1', 'md5'):
+            'new_password2': 'password1',
 
-            encoded = make_password('lètmein', hasher=algo)
+        })
 
-            state = {'upgraded': False}
+        self.assertEqual(response.status_code, 302)
 
+        self.assertTrue(response['Location'].endswith('/password_change/done/'))
 
+        self.fail_login()
 
-            def setter(password):
+        self.login(password='password1')
 
-                state['upgraded'] = True
 
-            self.assertTrue(check_password('lètmein', encoded, setter))
 
-            self.assertTrue(state['upgraded'])
+    def test_password_change_done_succeeds(self):
 
+        self.login()
 
+        response = self.client.post('/password_change/', {
 
-    def test_no_upgrade(self):
+            'old_password': 'password',
 
-        encoded = make_password('lètmein')
+            'new_password1': 'password1',
 
-        state = {'upgraded': False}
+            'new_password2': 'password1',
 
+        })
 
+        self.assertEqual(response.status_code, 302)
 
-        def setter():
+        self.assertTrue(response['Location'].endswith('/password_change/done/'))
 
-            state['upgraded'] = True
 
-        self.assertFalse(check_password('WRONG', encoded, setter))
 
-        self.assertFalse(state['upgraded'])
+    def test_password_change_done_fails(self):
 
+        with self.settings(LOGIN_URL='/login/'):
 
+            response = self.client.get('/password_change/done/')
 
-    @override_settings(
+            self.assertEqual(response.status_code, 302)
 
-        PASSWORD_HASHERS=[
+            self.assertTrue(response['Location'].endswith('/login/?next=/password_change/done/'))
 
-            'django.contrib.auth.hashers.PBKDF2PasswordHasher',
 
-            'django.contrib.auth.hashers.SHA1PasswordHasher',
 
-            'django.contrib.auth.hashers.MD5PasswordHasher',
 
-        ],
 
-    )
+class LoginTest(AuthViewsTestCase):
 
-    def test_no_upgrade_on_incorrect_pass(self):
 
-        self.assertEqual('pbkdf2_sha256', get_hasher('default').algorithm)
 
-        for algo in ('sha1', 'md5'):
+    def test_current_site_in_context_after_login(self):
 
-            encoded = make_password('lètmein', hasher=algo)
+        response = self.client.get(reverse('django.contrib.auth.views.login'))
 
-            state = {'upgraded': False}
+        self.assertEqual(response.status_code, 200)
 
+        if Site._meta.installed:
 
+            site = Site.objects.get_current()
 
-            def setter():
+            self.assertEqual(response.context['site'], site)
 
-                state['upgraded'] = True
+            self.assertEqual(response.context['site_name'], site.name)
 
-            self.assertFalse(check_password('WRONG', encoded, setter))
+        else:
 
-            self.assertFalse(state['upgraded'])
+            self.assertIsInstance(response.context['site'], RequestSite)
 
+        self.assertTrue(isinstance(response.context['form'], AuthenticationForm),
 
+                     'Login form is not an AuthenticationForm')
 
-    def test_pbkdf2_upgrade(self):
 
-        hasher = get_hasher('default')
 
-        self.assertEqual('pbkdf2_sha256', hasher.algorithm)
+    def test_security_check(self, password='password'):
 
-        self.assertNotEqual(hasher.iterations, 1)
+        login_url = reverse('django.contrib.auth.views.login')
 
 
 
-        old_iterations = hasher.iterations
+        # Those URLs should not pass the security check
 
-        try:
+        for bad_url in ('http://example.com',
 
-            # Generate a password with 1 iteration.
+                        'https://example.com',
 
-            hasher.iterations = 1
+                        'ftp://exampel.com',
 
-            encoded = make_password('letmein')
+                        '//example.com'):
 
-            algo, iterations, salt, hash = encoded.split('$', 3)
 
-            self.assertEqual(iterations, '1')
 
+            nasty_url = '%(url)s?%(next)s=%(bad_url)s' % {
 
+                'url': login_url,
 
-            state = {'upgraded': False}
+                'next': REDIRECT_FIELD_NAME,
 
+                'bad_url': urllib.quote(bad_url),
 
+            }
 
-            def setter(password):
+            response = self.client.post(nasty_url, {
 
-                state['upgraded'] = True
+                'username': 'testclient',
 
+                'password': password,
 
+            })
 
-            # Check that no upgrade is triggered
+            self.assertEqual(response.status_code, 302)
 
-            self.assertTrue(check_password('letmein', encoded, setter))
+            self.assertFalse(bad_url in response['Location'],
 
-            self.assertFalse(state['upgraded'])
+                             "%s should be blocked" % bad_url)
 
 
 
-            # Revert to the old iteration count and ...
+        # These URLs *should* still pass the security check
 
-            hasher.iterations = old_iterations
+        for good_url in ('/view/?param=http://example.com',
 
+                         '/view/?param=https://example.com',
 
+                         '/view?param=ftp://exampel.com',
 
-            # ... check if the password would get updated to the new iteration count.
+                         'view/?param=//example.com',
 
-            self.assertTrue(check_password('letmein', encoded, setter))
+                         'https:///',
 
-            self.assertTrue(state['upgraded'])
+                         '//testserver/',
 
-        finally:
+                         '/url%20with%20spaces/'):  # see ticket #12534
 
-            hasher.iterations = old_iterations
+            safe_url = '%(url)s?%(next)s=%(good_url)s' % {
 
+                'url': login_url,
 
+                'next': REDIRECT_FIELD_NAME,
 
-    def test_pbkdf2_upgrade_new_hasher(self):
+                'good_url': urllib.quote(good_url),
 
-        hasher = get_hasher('default')
+            }
 
-        self.assertEqual('pbkdf2_sha256', hasher.algorithm)
+            response = self.client.post(safe_url, {
 
-        self.assertNotEqual(hasher.iterations, 1)
+                    'username': 'testclient',
 
+                    'password': password,
 
+            })
 
-        state = {'upgraded': False}
+            self.assertEqual(response.status_code, 302)
 
+            self.assertTrue(good_url in response['Location'],
 
+                            "%s should be allowed" % good_url)
 
-        def setter(password):
 
-            state['upgraded'] = True
 
 
 
-        with self.settings(PASSWORD_HASHERS=[
+class LoginURLSettings(AuthViewsTestCase):
 
-                'auth_tests.test_hashers.PBKDF2SingleIterationHasher']):
 
-            encoded = make_password('letmein')
 
-            algo, iterations, salt, hash = encoded.split('$', 3)
+    def setUp(self):
 
-            self.assertEqual(iterations, '1')
+        super(LoginURLSettings, self).setUp()
 
+        self.old_LOGIN_URL = settings.LOGIN_URL
 
 
-            # Check that no upgrade is triggered
 
-            self.assertTrue(check_password('letmein', encoded, setter))
+    def tearDown(self):
 
-            self.assertFalse(state['upgraded'])
+        super(LoginURLSettings, self).tearDown()
 
+        settings.LOGIN_URL = self.old_LOGIN_URL
 
 
-        # Revert to the old iteration count and check if the password would get
 
-        # updated to the new iteration count.
+    def get_login_required_url(self, login_url):
 
-        with self.settings(PASSWORD_HASHERS=[
+        settings.LOGIN_URL = login_url
 
-                'django.contrib.auth.hashers.PBKDF2PasswordHasher',
+        response = self.client.get('/login_required/')
 
-                'auth_tests.test_hashers.PBKDF2SingleIterationHasher']):
+        self.assertEqual(response.status_code, 302)
 
-            self.assertTrue(check_password('letmein', encoded, setter))
+        return response['Location']
 
-            self.assertTrue(state['upgraded'])
 
 
+    def test_standard_login_url(self):
 
-    def test_load_library_no_algorithm(self):
+        login_url = '/login/'
 
-        with self.assertRaises(ValueError) as e:
+        login_required_url = self.get_login_required_url(login_url)
 
-            BasePasswordHasher()._load_library()
+        querystring = QueryDict('', mutable=True)
 
-        self.assertEqual("Hasher 'BasePasswordHasher' doesn't specify a "
+        querystring['next'] = '/login_required/'
 
-                         "library attribute", str(e.exception))
+        self.assertEqual(login_required_url, 'http://testserver%s?%s' %
 
+                         (login_url, querystring.urlencode('/')))
 
 
-    def test_load_library_importerror(self):
 
-        PlainHasher = type(str('PlainHasher'), (BasePasswordHasher,),
+    def test_remote_login_url(self):
 
-                           {'algorithm': 'plain', 'library': 'plain'})
+        login_url = 'http://remote.example.com/login'
 
-        # Python 3 adds quotes around module name
+        login_required_url = self.get_login_required_url(login_url)
 
-        with six.assertRaisesRegex(self, ValueError,
+        querystring = QueryDict('', mutable=True)
 
-                "Couldn't load 'PlainHasher' algorithm library: No module named '?plain'?"):
+        querystring['next'] = 'http://testserver/login_required/'
 
-            PlainHasher()._load_library()
+        self.assertEqual(login_required_url,
+
+                         '%s?%s' % (login_url, querystring.urlencode('/')))
+
+
+
+    def test_https_login_url(self):
+
+        login_url = 'https:///login/'
+
+        login_required_url = self.get_login_required_url(login_url)
+
+        querystring = QueryDict('', mutable=True)
+
+        querystring['next'] = 'http://testserver/login_required/'
+
+        self.assertEqual(login_required_url,
+
+                         '%s?%s' % (login_url, querystring.urlencode('/')))
+
+
+
+    def test_login_url_with_querystring(self):
+
+        login_url = '/login/?pretty=1'
+
+        login_required_url = self.get_login_required_url(login_url)
+
+        querystring = QueryDict('pretty=1', mutable=True)
+
+        querystring['next'] = '/login_required/'
+
+        self.assertEqual(login_required_url, 'http://testserver/login/?%s' %
+
+                         querystring.urlencode('/'))
+
+
+
+    def test_remote_login_url_with_next_querystring(self):
+
+        login_url = 'http://remote.example.com/login/'
+
+        login_required_url = self.get_login_required_url('%s?next=/default/' %
+
+                                                         login_url)
+
+        querystring = QueryDict('', mutable=True)
+
+        querystring['next'] = 'http://testserver/login_required/'
+
+        self.assertEqual(login_required_url, '%s?%s' % (login_url,
+
+                                                    querystring.urlencode('/')))
+
+
+
+
+
+class LogoutTest(AuthViewsTestCase):
+
+
+
+    def confirm_logged_out(self):
+
+        self.assertTrue(SESSION_KEY not in self.client.session)
+
+
+
+    def test_logout_default(self):
+
+        "Logout without next_page option renders the default template"
+
+        self.login()
+
+        response = self.client.get('/logout/')
+
+        self.assertEqual(200, response.status_code)
+
+        self.assertTrue('Logged out' in response.content)
+
+        self.confirm_logged_out()
+
+
+
+    def test_14377(self):
+
+        # Bug 14377
+
+        self.login()
+
+        response = self.client.get('/logout/')
+
+        self.assertTrue('site' in response.context)
+
+
+
+    def test_logout_with_overridden_redirect_url(self):
+
+        # Bug 11223
+
+        self.login()
+
+        response = self.client.get('/logout/next_page/')
+
+        self.assertEqual(response.status_code, 302)
+
+        self.assertTrue(response['Location'].endswith('/somewhere/'))
+
+
+
+        response = self.client.get('/logout/next_page/?next=/login/')
+
+        self.assertEqual(response.status_code, 302)
+
+        self.assertTrue(response['Location'].endswith('/login/'))
+
+
+
+        self.confirm_logged_out()
+
+
+
+    def test_logout_with_next_page_specified(self):
+
+        "Logout with next_page option given redirects to specified resource"
+
+        self.login()
+
+        response = self.client.get('/logout/next_page/')
+
+        self.assertEqual(response.status_code, 302)
+
+        self.assertTrue(response['Location'].endswith('/somewhere/'))
+
+        self.confirm_logged_out()
+
+
+
+    def test_logout_with_redirect_argument(self):
+
+        "Logout with query string redirects to specified resource"
+
+        self.login()
+
+        response = self.client.get('/logout/?next=/login/')
+
+        self.assertEqual(response.status_code, 302)
+
+        self.assertTrue(response['Location'].endswith('/login/'))
+
+        self.confirm_logged_out()
+
+
+
+    def test_logout_with_custom_redirect_argument(self):
+
+        "Logout with custom query string redirects to specified resource"
+
+        self.login()
+
+        response = self.client.get('/logout/custom_query/?follow=/somewhere/')
+
+        self.assertEqual(response.status_code, 302)
+
+        self.assertTrue(response['Location'].endswith('/somewhere/'))
+
+        self.confirm_logged_out()
+
+
+
+    def test_security_check(self, password='password'):
+
+        logout_url = reverse('django.contrib.auth.views.logout')
+
+
+
+        # Those URLs should not pass the security check
+
+        for bad_url in ('http://example.com',
+
+                        'https://example.com',
+
+                        'ftp://exampel.com',
+
+                        '//example.com'):
+
+            nasty_url = '%(url)s?%(next)s=%(bad_url)s' % {
+
+                'url': logout_url,
+
+                'next': REDIRECT_FIELD_NAME,
+
+                'bad_url': urllib.quote(bad_url),
+
+            }
+
+            self.login()
+
+            response = self.client.get(nasty_url)
+
+            self.assertEqual(response.status_code, 302)
+
+            self.assertFalse(bad_url in response['Location'],
+
+                             "%s should be blocked" % bad_url)
+
+            self.confirm_logged_out()
+
+
+
+        # These URLs *should* still pass the security check
+
+        for good_url in ('/view/?param=http://example.com',
+
+                         '/view/?param=https://example.com',
+
+                         '/view?param=ftp://exampel.com',
+
+                         'view/?param=//example.com',
+
+                         'https:///',
+
+                         '//testserver/',
+
+                         '/url%20with%20spaces/'):  # see ticket #12534
+
+            safe_url = '%(url)s?%(next)s=%(good_url)s' % {
+
+                'url': logout_url,
+
+                'next': REDIRECT_FIELD_NAME,
+
+                'good_url': urllib.quote(good_url),
+
+            }
+
+            self.login()
+
+            response = self.client.get(safe_url)
+
+            self.assertEqual(response.status_code, 302)
+
+            self.assertTrue(good_url in response['Location'],
+
+                            "%s should be allowed" % good_url)
+
+            self.confirm_logged_out()

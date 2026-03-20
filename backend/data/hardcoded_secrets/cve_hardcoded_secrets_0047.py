@@ -2,244 +2,514 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-"""Tornado handlers for the sessions web service."""
+"""
+
+Authenticator to use GitHub OAuth with JupyterHub
+
+"""
 
 
-
-# Copyright (c) IPython Development Team.
-
-# Distributed under the terms of the Modified BSD License.
 
 
 
 import json
 
+import os
 
+import re
+
+import string
+
+import warnings
+
+
+
+from tornado.auth import OAuth2Mixin
 
 from tornado import web
 
 
 
-from ...base.handlers import IPythonHandler, json_errors
+from tornado.httputil import url_concat
 
-from IPython.utils.jsonutil import date_default
-
-from IPython.html.utils import url_path_join, url_escape
-
-from IPython.kernel.kernelspec import NoSuchKernel
+from tornado.httpclient import HTTPRequest, AsyncHTTPClient, HTTPError
 
 
 
-
-
-class SessionRootHandler(IPythonHandler):
-
-
-
-    @web.authenticated
-
-    @json_errors
-
-    def get(self):
-
-        # Return a list of running sessions
-
-        sm = self.session_manager
-
-        sessions = sm.list_sessions()
-
-        self.finish(json.dumps(sessions, default=date_default))
+from jupyterhub.auth import LocalAuthenticator
 
 
 
-    @web.authenticated
-
-    @json_errors
-
-    def post(self):
-
-        # Creates a new session
-
-        #(unless a session already exists for the named nb)
-
-        sm = self.session_manager
-
-        cm = self.contents_manager
-
-        km = self.kernel_manager
+from traitlets import List, Set, Unicode, default, observe
 
 
 
-        model = self.get_json_body()
+from .common import next_page_from_links
 
-        if model is None:
-
-            raise web.HTTPError(400, "No JSON data provided")
-
-        try:
-
-            path = model['notebook']['path']
-
-        except KeyError:
-
-            raise web.HTTPError(400, "Missing field in JSON data: notebook.path")
-
-        try:
-
-            kernel_name = model['kernel']['name']
-
-        except KeyError:
-
-            self.log.debug("No kernel name specified, using default kernel")
-
-            kernel_name = None
+from .oauth2 import OAuthLoginHandler, OAuthenticator
 
 
 
-        # Check to see if session exists
 
-        if sm.session_exists(path=path):
 
-            model = sm.get_session(path=path)
+def _api_headers(access_token):
+
+    return {
+
+        "Accept": "application/json",
+
+        "User-Agent": "JupyterHub",
+
+        "Authorization": "token {}".format(access_token),
+
+    }
+
+
+
+
+
+class GitHubOAuthenticator(OAuthenticator):
+
+
+
+    # see github_scopes.md for details about scope config
+
+    # set scopes via config, e.g.
+
+    # c.GitHubOAuthenticator.scope = ['read:org']
+
+
+
+    _deprecated_aliases = {
+
+        "github_organization_whitelist": ("allowed_organizations", "0.12.0"),
+
+    }
+
+
+
+    @observe(*list(_deprecated_aliases))
+
+    def _deprecated_trait(self, change):
+
+        super()._deprecated_trait(change)
+
+
+
+    login_service = "GitHub"
+
+
+
+    github_url = Unicode("https://github.com", config=True)
+
+
+
+    @default("github_url")
+
+    def _github_url_default(self):
+
+        github_url = os.environ.get("GITHUB_URL")
+
+        if not github_url:
+
+            # fallback on older GITHUB_HOST config,
+
+            # treated the same as GITHUB_URL
+
+            host = os.environ.get("GITHUB_HOST")
+
+            if host:
+
+                if os.environ.get("GITHUB_HTTP"):
+
+                    protocol = "http"
+
+                    warnings.warn(
+
+                        'Use of GITHUB_HOST with GITHUB_HTTP might be deprecated in the future. '
+
+                        'Use GITHUB_URL=http://{} to set host and protocol together.'.format(
+
+                            host
+
+                        ),
+
+                        PendingDeprecationWarning,
+
+                    )
+
+                else:
+
+                    protocol = "https"
+
+                github_url = "{}://{}".format(protocol, host)
+
+
+
+        if github_url:
+
+            if '://' not in github_url:
+
+                # ensure protocol is included, assume https if missing
+
+                github_url = 'https://' + github_url
+
+
+
+            return github_url
+
+        else:
+
+            # nothing specified, this is the true default
+
+            github_url = "https://github.com"
+
+
+
+        # ensure no trailing slash
+
+        return github_url.rstrip("/")
+
+
+
+    github_api = Unicode("https://api.github.com", config=True)
+
+
+
+    @default("github_api")
+
+    def _github_api_default(self):
+
+        if self.github_url == "https://github.com":
+
+            return "https://api.github.com"
+
+        else:
+
+            return self.github_url + "/api/v3"
+
+
+
+    @default("authorize_url")
+
+    def _authorize_url_default(self):
+
+        return "%s/login/oauth/authorize" % (self.github_url)
+
+
+
+    @default("token_url")
+
+    def _token_url_default(self):
+
+        return "%s/login/oauth/access_token" % (self.github_url)
+
+
+
+    # deprecated names
+
+    github_client_id = Unicode(config=True, help="DEPRECATED")
+
+
+
+    def _github_client_id_changed(self, name, old, new):
+
+        self.log.warning("github_client_id is deprecated, use client_id")
+
+        self.client_id = new
+
+
+
+    github_client_secret = Unicode(config=True, help="DEPRECATED")
+
+
+
+    def _github_client_secret_changed(self, name, old, new):
+
+        self.log.warning("github_client_secret is deprecated, use client_secret")
+
+        self.client_secret = new
+
+
+
+    client_id_env = 'GITHUB_CLIENT_ID'
+
+    client_secret_env = 'GITHUB_CLIENT_SECRET'
+
+
+
+    github_organization_whitelist = Set(help="Deprecated, use `GitHubOAuthenticator.allowed_organizations`", config=True,)
+
+
+
+    allowed_organizations = Set(
+
+        config=True, help="Automatically allow members of selected organizations"
+
+    )
+
+
+
+    async def authenticate(self, handler, data=None):
+
+        """We set up auth_state based on additional GitHub info if we
+
+        receive it.
+
+        """
+
+        code = handler.get_argument("code")
+
+        # TODO: Configure the curl_httpclient for tornado
+
+        http_client = AsyncHTTPClient()
+
+
+
+        # Exchange the OAuth code for a GitHub Access Token
+
+        #
+
+        # See: https://developer.github.com/v3/oauth/
+
+
+
+        # GitHub specifies a POST request yet requires URL parameters
+
+        params = dict(
+
+            client_id=self.client_id, client_secret=self.client_secret, code=code
+
+        )
+
+
+
+        url = url_concat(self.token_url, params)
+
+
+
+        req = HTTPRequest(
+
+            url,
+
+            method="POST",
+
+            headers={"Accept": "application/json"},
+
+            body='',  # Body is required for a POST...
+
+            validate_cert=self.validate_server_cert,
+
+        )
+
+
+
+        resp = await http_client.fetch(req)
+
+        resp_json = json.loads(resp.body.decode('utf8', 'replace'))
+
+
+
+        if 'access_token' in resp_json:
+
+            access_token = resp_json['access_token']
+
+        elif 'error_description' in resp_json:
+
+            raise HTTPError(
+
+                403,
+
+                "An access token was not returned: {}".format(
+
+                    resp_json['error_description']
+
+                ),
+
+            )
+
+        else:
+
+            raise HTTPError(500, "Bad response: {}".format(resp))
+
+
+
+        # Determine who the logged in user is
+
+        req = HTTPRequest(
+
+            self.github_api + "/user",
+
+            method="GET",
+
+            headers=_api_headers(access_token),
+
+            validate_cert=self.validate_server_cert,
+
+        )
+
+        resp = await http_client.fetch(req)
+
+        resp_json = json.loads(resp.body.decode('utf8', 'replace'))
+
+
+
+        username = resp_json["login"]
+
+        # username is now the GitHub userid.
+
+        if not username:
+
+            return None
+
+        # Check if user is a member of any allowed organizations.
+
+        # This check is performed here, as it requires `access_token`.
+
+        if self.allowed_organizations:
+
+            for org in self.allowed_organizations:
+
+                user_in_org = await self._check_membership_allowed_organizations(
+
+                    org, username, access_token
+
+                )
+
+                if user_in_org:
+
+                    break
+
+            else:  # User not found in member list for any organisation
+
+                self.log.warning("User %s is not in allowed org list", username)
+
+                return None
+
+        userdict = {"name": username}
+
+        # Now we set up auth_state
+
+        userdict["auth_state"] = auth_state = {}
+
+        # Save the access token and full GitHub reply (name, id, email) in auth state
+
+        # These can be used for user provisioning in the Lab/Notebook environment.
+
+        # e.g.
+
+        #  1) stash the access token
+
+        #  2) use the GitHub ID as the id
+
+        #  3) set up name/email for .gitconfig
+
+        auth_state['access_token'] = access_token
+
+        # store the whole user model in auth_state.github_user
+
+        auth_state['github_user'] = resp_json
+
+        # A public email will return in the initial query (assuming default scope).
+
+        # Private will not.
+
+
+
+        return userdict
+
+
+
+    async def _check_membership_allowed_organizations(self, org, username, access_token):
+
+        http_client = AsyncHTTPClient()
+
+        headers = _api_headers(access_token)
+
+        # Check membership of user `username` for organization `org` via api [check-membership](https://developer.github.com/v3/orgs/members/#check-membership)
+
+        # With empty scope (even if authenticated by an org member), this
+
+        #  will only await public org members.  You want 'read:org' in order
+
+        #  to be able to iterate through all members.
+
+        check_membership_url = "%s/orgs/%s/members/%s" % (
+
+            self.github_api,
+
+            org,
+
+            username,
+
+        )
+
+        req = HTTPRequest(
+
+            check_membership_url,
+
+            method="GET",
+
+            headers=headers,
+
+            validate_cert=self.validate_server_cert,
+
+        )
+
+        self.log.debug(
+
+            "Checking GitHub organization membership: %s in %s?", username, org
+
+        )
+
+        resp = await http_client.fetch(req, raise_error=False)
+
+        print(resp)
+
+        if resp.code == 204:
+
+            self.log.info("Allowing %s as member of %s", username, org)
+
+            return True
 
         else:
 
             try:
 
-                model = sm.create_session(path=path, kernel_name=kernel_name)
+                resp_json = json.loads((resp.body or b'').decode('utf8', 'replace'))
 
-            except NoSuchKernel:
+                message = resp_json.get('message', '')
 
-                msg = ("The '%s' kernel is not available. Please pick another "
+            except ValueError:
 
-                       "suitable kernel instead, or install that kernel." % kernel_name)
+                message = ''
 
-                status_msg = '%s not found' % kernel_name
+            self.log.debug(
 
-                self.log.warn('Kernel not found: %s' % kernel_name)
+                "%s does not appear to be a member of %s (status=%s): %s",
 
-                self.set_status(501)
+                username,
 
-                self.finish(json.dumps(dict(message=msg, short_message=status_msg)))
+                org,
 
-                return
+                resp.code,
 
+                message,
 
+            )
 
-        location = url_path_join(self.base_url, 'api', 'sessions', model['id'])
+        return False
 
-        self.set_header('Location', url_escape(location))
 
-        self.set_status(201)
 
-        self.finish(json.dumps(model, default=date_default))
 
 
+class LocalGitHubOAuthenticator(LocalAuthenticator, GitHubOAuthenticator):
 
-class SessionHandler(IPythonHandler):
 
 
+    """A version that mixes in local system user creation"""
 
-    SUPPORTED_METHODS = ('GET', 'PATCH', 'DELETE')
 
 
-
-    @web.authenticated
-
-    @json_errors
-
-    def get(self, session_id):
-
-        # Returns the JSON model for a single session
-
-        sm = self.session_manager
-
-        model = sm.get_session(session_id=session_id)
-
-        self.finish(json.dumps(model, default=date_default))
-
-
-
-    @web.authenticated
-
-    @json_errors
-
-    def patch(self, session_id):
-
-        # Currently, this handler is strictly for renaming notebooks
-
-        sm = self.session_manager
-
-        model = self.get_json_body()
-
-        if model is None:
-
-            raise web.HTTPError(400, "No JSON data provided")
-
-        changes = {}
-
-        if 'notebook' in model:
-
-            notebook = model['notebook']
-
-            if 'path' in notebook:
-
-                changes['path'] = notebook['path']
-
-
-
-        sm.update_session(session_id, **changes)
-
-        model = sm.get_session(session_id=session_id)
-
-        self.finish(json.dumps(model, default=date_default))
-
-
-
-    @web.authenticated
-
-    @json_errors
-
-    def delete(self, session_id):
-
-        # Deletes the session with given session_id
-
-        sm = self.session_manager
-
-        try:
-
-            sm.delete_session(session_id)
-
-        except KeyError:
-
-            # the kernel was deleted but the session wasn't!
-
-            raise web.HTTPError(410, "Kernel deleted before session")
-
-        self.set_status(204)
-
-        self.finish()
-
-
-
-
-
-#-----------------------------------------------------------------------------
-
-# URL to handler mappings
-
-#-----------------------------------------------------------------------------
-
-
-
-_session_id_regex = r"(?P<session_id>\w+-\w+-\w+-\w+-\w+)"
-
-
-
-default_handlers = [
-
-    (r"/api/sessions/%s" % _session_id_regex, SessionHandler),
-
-    (r"/api/sessions",  SessionRootHandler)
-
-]
+    pass

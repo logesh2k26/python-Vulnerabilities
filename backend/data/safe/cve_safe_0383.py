@@ -2,262 +2,656 @@
 # Safety: safe
 # Category: safe
 
-#
+import base64
 
-# Copyright (C) 2006-2010 Red Hat, Inc.
+import hashlib
 
-#
+import hmac
 
-# This program is free software; you can redistribute it and/or modify
+import struct
 
-# it under the terms of the GNU General Public License as published by
-
-# the Free Software Foundation; either version 2 of the License, or
-
-# (at your option) any later version.
-
-#
-
-# This program is distributed in the hope that it will be useful,
-
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-
-# GNU General Public License for more details.
-
-#
-
-# You should have received a copy of the GNU General Public License
-
-# along with this program; if not, write to the Free Software
-
-# Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
-
-#
-
-
-
-import gettext
-
-translation=gettext.translation('setroubleshoot-plugins', fallback=True)
-
-_=translation.gettext
-
-
-
-from setroubleshoot.util import *
-
-from setroubleshoot.Plugin import Plugin
-
-
-
-import subprocess
+import six
 
 import sys
 
 
 
-def is_execstack(path):
+import Crypto.Hash.SHA256
 
-    if path[0] != "/":
+import Crypto.Hash.SHA384
 
-        return False
+import Crypto.Hash.SHA512
 
 
 
-    x = subprocess.check_output(["execstack",  "-q", path], universal_newlines=True).split()
+from Crypto.PublicKey import RSA
 
-    return ( x[0] == "X" )
+from Crypto.Signature import PKCS1_v1_5
 
+from Crypto.Util.asn1 import DerSequence
 
 
-def find_execstack(exe, pid):
 
-    execstacklist = []
+import ecdsa
 
-    for path in subprocess.check_output(["ldd", exe], universal_newlines=True).split():
 
-        if is_execstack(path) and path not in execstacklist:
 
-                execstacklist.append(path)
+from jose.constants import ALGORITHMS
 
-    try:
+from jose.exceptions import JWKError
 
-        fd = open("/proc/%s/maps" % pid , "r")
+from jose.utils import base64url_decode
 
-        for rec in fd.readlines():
+from jose.utils import constant_time_string_compare
 
-            for path in rec.split():
 
-                if is_execstack(path) and path not in execstacklist:
 
-                    execstacklist.append(path)
+# PyCryptodome's RSA module doesn't have PyCrypto's _RSAobj class
 
-    except IOError:
+# Instead it has a class named RsaKey, which serves the same purpose.
 
-        pass
+if hasattr(RSA, '_RSAobj'):
 
+    _RSAKey = RSA._RSAobj
 
+else:
 
-    return execstacklist
+    _RSAKey = RSA.RsaKey
 
 
 
-class plugin(Plugin):
+# Deal with integer compatibilities between Python 2 and 3.
 
-    summary =_('''
+# Using `from builtins import int` is not supported on AppEngine.
 
-    SELinux is preventing $SOURCE_PATH from making the program stack executable.
+if sys.version_info > (3,):
 
-    ''')
+    long = int
 
 
 
-    problem_description = _('''
 
-    The $SOURCE application attempted to make its stack
 
-    executable.  This is a potential security problem.  This should
+def int_arr_to_long(arr):
 
-    never ever be necessary. Stack memory is not executable on most
+    return long(''.join(["%02x" % byte for byte in arr]), 16)
 
-    OSes these days and this will not change. Executable stack memory
 
-    is one of the biggest security problems. An execstack error might
 
-    in fact be most likely raised by malicious code. Applications are
 
-    sometimes coded incorrectly and request this permission.  The
 
-    <a href="http://people.redhat.com/drepper/selinux-mem.html">SELinux Memory Protection Tests</a>
+def base64_to_long(data):
 
-    web page explains how to remove this requirement.  If $SOURCE does not
+    if isinstance(data, six.text_type):
 
-    work and you need it to work, you can configure SELinux
+        data = data.encode("ascii")
 
-    temporarily to allow this access until the application is fixed. Please
 
-file a bug report.
 
-    ''')
+    # urlsafe_b64decode will happily convert b64encoded data
 
+    _d = base64.urlsafe_b64decode(bytes(data) + b'==')
 
+    return int_arr_to_long(struct.unpack('%sB' % len(_d), _d))
 
-    fix_description = _('''
 
-    Sometimes a library is accidentally marked with the execstack flag,
 
-    if you find a library with this flag you can clear it with the
 
-    execstack -c LIBRARY_PATH.  Then retry your application.  If the
 
-    app continues to not work, you can turn the flag back on with
+def construct(key_data, algorithm=None):
 
-    execstack -s LIBRARY_PATH.
+    """
 
-    ''')
+    Construct a Key object for the given algorithm with the given
 
+    key_data.
 
+    """
 
-    fix_cmd = ""
 
 
+    # Allow for pulling the algorithm off of the passed in jwk.
 
-    if_text = _("you do not think $SOURCE_PATH should need to map stack memory that is both writable and executable.")
+    if not algorithm and isinstance(key_data, dict):
 
-    then_text = _("you need to report a bug. \nThis is a potentially dangerous access.")
+        algorithm = key_data.get('alg', None)
 
-    do_text = _("Contact your security administrator and report this issue.")
 
 
+    if not algorithm:
 
-    def get_if_text(self, avc, args):
+        raise JWKError('Unable to find a algorithm for key: %s' % key_data)
+
+
+
+    if algorithm in ALGORITHMS.HMAC:
+
+        return HMACKey(key_data, algorithm)
+
+
+
+    if algorithm in ALGORITHMS.RSA:
+
+        return RSAKey(key_data, algorithm)
+
+
+
+    if algorithm in ALGORITHMS.EC:
+
+        return ECKey(key_data, algorithm)
+
+
+
+
+
+def get_algorithm_object(algorithm):
+
+
+
+    algorithms = {
+
+        ALGORITHMS.HS256: HMACKey.SHA256,
+
+        ALGORITHMS.HS384: HMACKey.SHA384,
+
+        ALGORITHMS.HS512: HMACKey.SHA512,
+
+        ALGORITHMS.RS256: RSAKey.SHA256,
+
+        ALGORITHMS.RS384: RSAKey.SHA384,
+
+        ALGORITHMS.RS512: RSAKey.SHA512,
+
+        ALGORITHMS.ES256: ECKey.SHA256,
+
+        ALGORITHMS.ES384: ECKey.SHA384,
+
+        ALGORITHMS.ES512: ECKey.SHA512,
+
+    }
+
+
+
+    return algorithms.get(algorithm, None)
+
+
+
+
+
+class Key(object):
+
+    """
+
+    A simple interface for implementing JWK keys.
+
+    """
+
+    prepared_key = None
+
+    hash_alg = None
+
+
+
+    def _process_jwk(self, jwk_dict):
+
+        raise NotImplementedError()
+
+
+
+    def sign(self, msg):
+
+        raise NotImplementedError()
+
+
+
+    def verify(self, msg, sig):
+
+        raise NotImplementedError()
+
+
+
+
+
+class HMACKey(Key):
+
+    """
+
+    Performs signing and verification operations using HMAC
+
+    and the specified hash function.
+
+    """
+
+    SHA256 = hashlib.sha256
+
+    SHA384 = hashlib.sha384
+
+    SHA512 = hashlib.sha512
+
+    valid_hash_algs = ALGORITHMS.HMAC
+
+
+
+    prepared_key = None
+
+    hash_alg = None
+
+
+
+    def __init__(self, key, algorithm):
+
+        if algorithm not in self.valid_hash_algs:
+
+            raise JWKError('hash_alg: %s is not a valid hash algorithm' % algorithm)
+
+        self.hash_alg = get_algorithm_object(algorithm)
+
+
+
+        if isinstance(key, dict):
+
+            self.prepared_key = self._process_jwk(key)
+
+            return
+
+
+
+        if not isinstance(key, six.string_types) and not isinstance(key, bytes):
+
+            raise JWKError('Expecting a string- or bytes-formatted key.')
+
+
+
+        if isinstance(key, six.text_type):
+
+            key = key.encode('utf-8')
+
+
+
+        invalid_strings = [
+
+            b'-----BEGIN PUBLIC KEY-----',
+
+            b'-----BEGIN CERTIFICATE-----',
+
+            b'ssh-rsa'
+
+        ]
+
+
+
+        if any([string_value in key for string_value in invalid_strings]):
+
+            raise JWKError(
+
+                'The specified key is an asymmetric key or x509 certificate and'
+
+                ' should not be used as an HMAC secret.')
+
+
+
+        self.prepared_key = key
+
+
+
+    def _process_jwk(self, jwk_dict):
+
+        if not jwk_dict.get('kty') == 'oct':
+
+            raise JWKError("Incorrect key type.  Expected: 'oct', Recieved: %s" % jwk_dict.get('kty'))
+
+
+
+        k = jwk_dict.get('k')
+
+        k = k.encode('utf-8')
+
+        k = bytes(k)
+
+        k = base64url_decode(k)
+
+
+
+        return k
+
+
+
+    def sign(self, msg):
+
+        return hmac.new(self.prepared_key, msg, self.hash_alg).digest()
+
+
+
+    def verify(self, msg, sig):
+
+        return constant_time_string_compare(sig, self.sign(msg))
+
+
+
+
+
+class RSAKey(Key):
+
+    """
+
+    Performs signing and verification operations using
+
+    RSASSA-PKCS-v1_5 and the specified hash function.
+
+    This class requires PyCrypto package to be installed.
+
+    This is based off of the implementation in PyJWT 0.3.2
+
+    """
+
+
+
+    SHA256 = Crypto.Hash.SHA256
+
+    SHA384 = Crypto.Hash.SHA384
+
+    SHA512 = Crypto.Hash.SHA512
+
+    valid_hash_algs = ALGORITHMS.RSA
+
+
+
+    prepared_key = None
+
+    hash_alg = None
+
+
+
+    def __init__(self, key, algorithm):
+
+
+
+        if algorithm not in self.valid_hash_algs:
+
+            raise JWKError('hash_alg: %s is not a valid hash algorithm' % algorithm)
+
+        self.hash_alg = get_algorithm_object(algorithm)
+
+
+
+        if isinstance(key, _RSAKey):
+
+            self.prepared_key = key
+
+            return
+
+
+
+        if isinstance(key, dict):
+
+            self._process_jwk(key)
+
+            return
+
+
+
+        if isinstance(key, six.string_types):
+
+            if isinstance(key, six.text_type):
+
+                key = key.encode('utf-8')
+
+
+
+            if key.startswith(b'-----BEGIN CERTIFICATE-----'):
+
+                try:
+
+                    self._process_cert(key)
+
+                except Exception as e:
+
+                    raise JWKError(e)
+
+                return
+
+
+
+            try:
+
+                self.prepared_key = RSA.importKey(key)
+
+            except Exception as e:
+
+                raise JWKError(e)
+
+            return
+
+
+
+        raise JWKError('Unable to parse an RSA_JWK from key: %s' % key)
+
+
+
+    def _process_jwk(self, jwk_dict):
+
+        if not jwk_dict.get('kty') == 'RSA':
+
+            raise JWKError("Incorrect key type.  Expected: 'RSA', Recieved: %s" % jwk_dict.get('kty'))
+
+
+
+        e = base64_to_long(jwk_dict.get('e', 256))
+
+        n = base64_to_long(jwk_dict.get('n'))
+
+
+
+        self.prepared_key = RSA.construct((n, e))
+
+        return self.prepared_key
+
+
+
+    def _process_cert(self, key):
+
+        pemLines = key.replace(b' ', b'').split()
+
+        certDer = base64url_decode(b''.join(pemLines[1:-1]))
+
+        certSeq = DerSequence()
+
+        certSeq.decode(certDer)
+
+        tbsSeq = DerSequence()
+
+        tbsSeq.decode(certSeq[0])
+
+        self.prepared_key = RSA.importKey(tbsSeq[6])
+
+        return
+
+
+
+    def sign(self, msg):
 
         try:
 
-            path = args[0]
+            return PKCS1_v1_5.new(self.prepared_key).sign(self.hash_alg.new(msg))
 
-            if not path:
+        except Exception as e:
 
-                return self.if_text
-
-
-
-            return _("you believe that \n%s\nshould not require execstack") % path
-
-        except:
-
-            return self.if_text
+            raise JWKError(e)
 
 
 
-    def get_then_text(self, avc, args):
+    def verify(self, msg, sig):
 
         try:
 
-            path = args[0]
+            return PKCS1_v1_5.new(self.prepared_key).verify(self.hash_alg.new(msg), sig)
 
-            if not path:
+        except Exception as e:
 
-                return self.then_text
-
-            return _("you should clear the execstack flag and see if $SOURCE_PATH works correctly.\nReport this as a bug on %s.\nYou can clear the exestack flag by executing:") % path
-
-        except:
-
-            return self.then_text
+            raise JWKError(e)
 
 
 
-    def get_do_text(self, avc, args):
+
+
+class ECKey(Key):
+
+    """
+
+    Performs signing and verification operations using
+
+    ECDSA and the specified hash function
+
+
+
+    This class requires the ecdsa package to be installed.
+
+
+
+    This is based off of the implementation in PyJWT 0.3.2
+
+    """
+
+    SHA256 = hashlib.sha256
+
+    SHA384 = hashlib.sha384
+
+    SHA512 = hashlib.sha512
+
+    valid_hash_algs = ALGORITHMS.EC
+
+
+
+    curve_map = {
+
+        SHA256: ecdsa.curves.NIST256p,
+
+        SHA384: ecdsa.curves.NIST384p,
+
+        SHA512: ecdsa.curves.NIST521p,
+
+    }
+
+
+
+    prepared_key = None
+
+    hash_alg = None
+
+    curve = None
+
+
+
+    def __init__(self, key, algorithm):
+
+        if algorithm not in self.valid_hash_algs:
+
+            raise JWKError('hash_alg: %s is not a valid hash algorithm' % algorithm)
+
+        self.hash_alg = get_algorithm_object(algorithm)
+
+
+
+        self.curve = self.curve_map.get(self.hash_alg)
+
+
+
+        if isinstance(key, (ecdsa.SigningKey, ecdsa.VerifyingKey)):
+
+            self.prepared_key = key
+
+            return
+
+
+
+        if isinstance(key, dict):
+
+            self.prepared_key = self._process_jwk(key)
+
+            return
+
+
+
+        if isinstance(key, six.string_types):
+
+            if isinstance(key, six.text_type):
+
+                key = key.encode('utf-8')
+
+
+
+            # Attempt to load key. We don't know if it's
+
+            # a Signing Key or a Verifying Key, so we try
+
+            # the Verifying Key first.
+
+            try:
+
+                key = ecdsa.VerifyingKey.from_pem(key)
+
+            except ecdsa.der.UnexpectedDER:
+
+                key = ecdsa.SigningKey.from_pem(key)
+
+            except Exception as e:
+
+                raise JWKError(e)
+
+
+
+            self.prepared_key = key
+
+            return
+
+
+
+        raise JWKError('Unable to parse an ECKey from key: %s' % key)
+
+
+
+    def _process_jwk(self, jwk_dict):
+
+        if not jwk_dict.get('kty') == 'EC':
+
+            raise JWKError("Incorrect key type.  Expected: 'EC', Recieved: %s" % jwk_dict.get('kty'))
+
+
+
+        x = base64_to_long(jwk_dict.get('x'))
+
+        y = base64_to_long(jwk_dict.get('y'))
+
+
+
+        if not ecdsa.ecdsa.point_is_valid(self.curve.generator, x, y):
+
+            raise JWKError("Point: %s, %s is not a valid point" % (x, y))
+
+
+
+        point = ecdsa.ellipticcurve.Point(self.curve.curve, x, y, self.curve.order)
+
+        verifying_key = ecdsa.keys.VerifyingKey.from_public_point(point, self.curve)
+
+
+
+        return verifying_key
+
+
+
+    def sign(self, msg):
+
+        return self.prepared_key.sign(msg, hashfunc=self.hash_alg, sigencode=ecdsa.util.sigencode_string)
+
+
+
+    def verify(self, msg, sig):
 
         try:
 
-            path = args[0]
-
-            if not path:
-
-                return self.do_text
-
-
-
-            return _("execstack -c %s") % path
+            return self.prepared_key.verify(sig, msg, hashfunc=self.hash_alg, sigdecode=ecdsa.util.sigdecode_string)
 
         except:
 
-            return self.do_text
-
-
-
-    def __init__(self):
-
-        Plugin.__init__(self,__name__)
-
-
-
-    def analyze(self, avc):
-
-        if (avc.matches_source_types(['unconfined_t', 'staff_t', 'user_t', 'guest_t', 'xguest_t']) and
-
-           avc.has_any_access_in(['execstack'])):
-
-            reports = []
-
-            for i in find_execstack(avc.spath, avc.pid):
-
-                reports.append(self.report((i,avc)))
-
-
-
-            if len(reports) > 0:
-
-                return reports
-
-
-
-            return self.report((None,None))
-
-        else:
-
-            return None
+            return False

@@ -2,1064 +2,4040 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-#!/usr/bin/python
+from __future__ import absolute_import, division, print_function, with_statement
 
-from k5test import *
+from tornado import gen
 
-import time
+from tornado.escape import json_decode, utf8, to_unicode, recursive_unicode, native_str, to_basestring
 
-from itertools import imap
+from tornado.httputil import format_timestamp
 
+from tornado.iostream import IOStream
 
+from tornado.log import app_log, gen_log
 
-# Run kdbtest against the BDB module.
+from tornado.simple_httpclient import SimpleAsyncHTTPClient
 
-realm = K5Realm(create_kdb=False)
+from tornado.template import DictLoader
 
-realm.run(['./kdbtest'])
+from tornado.testing import AsyncHTTPTestCase, ExpectLog
 
+from tornado.test.util import unittest
 
+from tornado.util import u, bytes_type, ObjectDict, unicode_type
 
-# Set up an OpenLDAP test server if we can.
+from tornado.web import RequestHandler, authenticated, Application, asynchronous, url, HTTPError, StaticFileHandler, _create_signature_v1, create_signed_value, decode_signed_value, ErrorHandler, UIModule, MissingArgumentError
 
 
 
-if (not os.path.exists(os.path.join(plugins, 'kdb', 'kldap.so')) and
+import binascii
 
-    not os.path.exists(os.path.join(buildtop, 'lib', 'libkdb_ldap.a'))):
+import datetime
 
-    skip_rest('LDAP KDB tests', 'LDAP KDB module not built')
+import email.utils
 
+import logging
 
+import os
 
-if 'SLAPD' not in os.environ and not which('slapd'):
+import re
 
-    skip_rest('LDAP KDB tests', 'slapd not found')
+import socket
 
+import sys
 
 
-slapadd = which('slapadd')
 
-if not slapadd:
+try:
 
-    skip_rest('LDAP KDB tests', 'slapadd not found')
+    import urllib.parse as urllib_parse  # py3
 
+except ImportError:
 
+    import urllib as urllib_parse  # py2
 
-ldapdir = os.path.abspath('ldap')
 
-dbdir = os.path.join(ldapdir, 'ldap')
 
-slapd_conf = os.path.join(ldapdir, 'slapd.d')
+wsgi_safe_tests = []
 
-slapd_out = os.path.join(ldapdir, 'slapd.out')
 
-slapd_pidfile = os.path.join(ldapdir, 'pid')
 
-ldap_pwfile = os.path.join(ldapdir, 'pw')
+relpath = lambda *a: os.path.join(os.path.dirname(__file__), *a)
 
-ldap_sock = os.path.join(ldapdir, 'sock')
 
-ldap_uri = 'ldapi://%s/' % ldap_sock.replace(os.path.sep, '%2F')
 
-schema = os.path.join(srctop, 'plugins', 'kdb', 'ldap', 'libkdb_ldap',
 
-                      'kerberos.openldap.ldif')
 
-top_dn = 'cn=krb5'
+def wsgi_safe(cls):
 
-admin_dn = 'cn=admin,cn=krb5'
+    wsgi_safe_tests.append(cls)
 
-admin_pw = 'admin'
+    return cls
 
 
 
-shutil.rmtree(ldapdir, True)
 
-os.mkdir(ldapdir)
 
-os.mkdir(slapd_conf)
+class WebTestCase(AsyncHTTPTestCase):
 
-os.mkdir(dbdir)
+    """Base class for web tests that also supports WSGI mode.
 
 
 
-if 'SLAPD' in os.environ:
+    Override get_handlers and get_app_kwargs instead of get_app.
 
-    slapd = os.environ['SLAPD']
+    Append to wsgi_safe to have it run in wsgi_test as well.
 
-else:
+    """
 
-    # Some Linux installations have AppArmor or similar restrictions
+    def get_app(self):
 
-    # on the slapd binary, which would prevent it from accessing the
+        self.app = Application(self.get_handlers(), **self.get_app_kwargs())
 
-    # build directory.  Try to defeat this by copying the binary.
+        return self.app
 
-    system_slapd = which('slapd')
 
-    slapd = os.path.join(ldapdir, 'slapd')
 
-    shutil.copy(system_slapd, slapd)
+    def get_handlers(self):
 
+        raise NotImplementedError()
 
 
-def slap_add(ldif):
 
-    proc = subprocess.Popen([slapadd, '-b', 'cn=config', '-F', slapd_conf],
+    def get_app_kwargs(self):
 
-                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        return {}
 
-                            stderr=subprocess.STDOUT)
 
-    (out, dummy) = proc.communicate(ldif)
 
-    output(out)
 
-    return proc.wait()
 
+class SimpleHandlerTestCase(WebTestCase):
 
+    """Simplified base class for tests that work with a single handler class.
 
 
 
-# Configure the pid file and some authorization rules we will need for
+    To use, define a nested class named ``Handler``.
 
-# SASL testing.
+    """
 
-if slap_add('dn: cn=config\n'
+    def get_handlers(self):
 
-            'objectClass: olcGlobal\n'
+        return [('/', self.Handler)]
 
-            'olcPidFile: %s\n'
 
-            'olcAuthzRegexp: '
 
-            '".*uidNumber=%d,cn=peercred,cn=external,cn=auth" "%s"\n'
 
-            'olcAuthzRegexp: "uid=digestuser,cn=digest-md5,cn=auth" "%s"\n' %
 
-            (slapd_pidfile, os.geteuid(), admin_dn, admin_dn)) != 0:
+class HelloHandler(RequestHandler):
 
-    skip_rest('LDAP KDB tests', 'slapd basic configuration failed')
+    def get(self):
 
+        self.write('hello')
 
 
-# Find a working writable database type, trying mdb (added in OpenLDAP
 
-# 2.4.27) and bdb (deprecated and sometimes not built due to licensing
 
-# incompatibilities).
 
-for dbtype in ('mdb', 'bdb'):
+class CookieTestRequestHandler(RequestHandler):
 
-    # Try to load the module.  This could fail if OpenLDAP is built
+    # stub out enough methods to make the secure_cookie functions work
 
-    # without module support, so ignore errors.
+    def __init__(self):
 
-    slap_add('dn: cn=module,cn=config\n'
+        # don't call super.__init__
 
-             'objectClass: olcModuleList\n'
+        self._cookies = {}
 
-             'olcModuleLoad: back_%s\n' % dbtype)
+        self.application = ObjectDict(settings=dict(cookie_secret='0123456789'))
 
 
 
-    dbclass = 'olc%sConfig' % dbtype.capitalize()
+    def get_cookie(self, name):
 
-    if slap_add('dn: olcDatabase=%s,cn=config\n'
+        return self._cookies.get(name)
 
-                'objectClass: olcDatabaseConfig\n'
 
-                'objectClass: %s\n'
 
-                'olcSuffix: %s\n'
+    def set_cookie(self, name, value, expires_days=None):
 
-                'olcRootDN: %s\n'
+        self._cookies[name] = value
 
-                'olcRootPW: %s\n'
 
-                'olcDbDirectory: %s\n' %
 
-                (dbtype, dbclass, top_dn, admin_dn, admin_pw, dbdir)) == 0:
 
-        break
 
-else:
+# See SignedValueTest below for more.
 
-    skip_rest('LDAP KDB tests', 'could not find working slapd db type')
+class SecureCookieV1Test(unittest.TestCase):
 
+    def test_round_trip(self):
 
+        handler = CookieTestRequestHandler()
 
-if slap_add('include: file://%s\n' % schema) != 0:
+        handler.set_secure_cookie('foo', b'bar', version=1)
 
-    skip_rest('LDAP KDB tests', 'failed to load Kerberos schema')
+        self.assertEqual(handler.get_secure_cookie('foo', min_version=1),
 
+                         b'bar')
 
 
-# Load the core schema if we can.
 
-ldap_homes = ['/etc/ldap', '/etc/openldap', '/usr/local/etc/openldap',
+    def test_cookie_tampering_future_timestamp(self):
 
-              '/usr/local/etc/ldap']
+        handler = CookieTestRequestHandler()
 
-local_schema_path = '/schema/core.ldif'
+        # this string base64-encodes to '12345678'
 
-core_schema = next((i for i in imap(lambda x:x+local_schema_path, ldap_homes)
+        handler.set_secure_cookie('foo', binascii.a2b_hex(b'd76df8e7aefc'),
 
-                    if os.path.isfile(i)), None)
+                                  version=1)
 
-if core_schema:
+        cookie = handler._cookies['foo']
 
-    if slap_add('include: file://%s\n' % core_schema) != 0:
+        match = re.match(br'12345678\|([0-9]+)\|([0-9a-f]+)', cookie)
 
-        core_schema = None
+        self.assertTrue(match)
 
+        timestamp = match.group(1)
 
+        sig = match.group(2)
 
-slapd_pid = -1
+        self.assertEqual(
 
-def kill_slapd():
+            _create_signature_v1(handler.application.settings["cookie_secret"],
 
-    global slapd_pid
+                              'foo', '12345678', timestamp),
 
-    if slapd_pid != -1:
+            sig)
 
-        os.kill(slapd_pid, signal.SIGTERM)
+        # shifting digits from payload to timestamp doesn't alter signature
 
-        slapd_pid = -1
+        # (this is not desirable behavior, just confirming that that's how it
 
-atexit.register(kill_slapd)
+        # works)
 
+        self.assertEqual(
 
+            _create_signature_v1(handler.application.settings["cookie_secret"],
 
-out = open(slapd_out, 'w')
+                              'foo', '1234', b'5678' + timestamp),
 
-subprocess.call([slapd, '-h', ldap_uri, '-F', slapd_conf], stdout=out,
+            sig)
 
-                stderr=out)
+        # tamper with the cookie
 
-out.close()
+        handler._cookies['foo'] = utf8('1234|5678%s|%s' % (
 
-pidf = open(slapd_pidfile, 'r')
+            to_basestring(timestamp), to_basestring(sig)))
 
-slapd_pid = int(pidf.read())
+        # it gets rejected
 
-pidf.close()
+        with ExpectLog(gen_log, "Cookie timestamp in future"):
 
-output('*** Started slapd (pid %d, output in %s)\n' % (slapd_pid, slapd_out))
+            self.assertTrue(
 
+                handler.get_secure_cookie('foo', min_version=1) is None)
 
 
-# slapd detaches before it finishes setting up its listener sockets
 
-# (they are bound but listen() has not been called).  Give it a second
+    def test_arbitrary_bytes(self):
 
-# to finish.
+        # Secure cookies accept arbitrary data (which is base64 encoded).
 
-time.sleep(1)
+        # Note that normal cookies accept only a subset of ascii.
 
+        handler = CookieTestRequestHandler()
 
+        handler.set_secure_cookie('foo', b'\xe9', version=1)
 
-# Run kdbtest against the LDAP module.
+        self.assertEqual(handler.get_secure_cookie('foo', min_version=1), b'\xe9')
 
-conf = {'realms': {'$realm': {'database_module': 'ldap'}},
 
-        'dbmodules': {'ldap': {'db_library': 'kldap',
 
-                               'ldap_kerberos_container_dn': top_dn,
 
-                               'ldap_kdc_dn': admin_dn,
 
-                               'ldap_kadmind_dn': admin_dn,
+class CookieTest(WebTestCase):
 
-                               'ldap_service_password_file': ldap_pwfile,
+    def get_handlers(self):
 
-                               'ldap_servers': ldap_uri}}}
+        class SetCookieHandler(RequestHandler):
 
-realm = K5Realm(create_kdb=False, kdc_conf=conf)
+            def get(self):
 
-input = admin_pw + '\n' + admin_pw + '\n'
+                # Try setting cookies with different argument types
 
-realm.run([kdb5_ldap_util, 'stashsrvpw', admin_dn], input=input)
+                # to ensure that everything gets encoded correctly
 
-realm.run(['./kdbtest'])
+                self.set_cookie("str", "asdf")
 
+                self.set_cookie("unicode", u("qwer"))
 
+                self.set_cookie("bytes", b"zxcv")
 
-# Run a kdb5_ldap_util command using the test server's admin DN and password.
 
-def kldaputil(args, **kw):
 
-    return realm.run([kdb5_ldap_util, '-D', admin_dn, '-w', admin_pw] + args,
+        class GetCookieHandler(RequestHandler):
 
-                     **kw)
+            def get(self):
 
+                self.write(self.get_cookie("foo", "default"))
 
 
-# kdbtest can't currently clean up after itself since the LDAP module
 
-# doesn't support krb5_db_destroy.  So clean up after it with
+        class SetCookieDomainHandler(RequestHandler):
 
-# kdb5_ldap_util before proceeding.
+            def get(self):
 
-kldaputil(['destroy', '-f'])
+                # unicode domain and path arguments shouldn't break things
 
+                # either (see bug #285)
 
+                self.set_cookie("unicode_args", "blah", domain=u("foo.com"),
 
-ldapmodify = which('ldapmodify')
+                                path=u("/foo"))
 
-ldapsearch = which('ldapsearch')
 
-if not ldapmodify or not ldapsearch:
 
-    skip_rest('some LDAP KDB tests', 'ldapmodify or ldapsearch not found')
+        class SetCookieSpecialCharHandler(RequestHandler):
 
+            def get(self):
 
+                self.set_cookie("equals", "a=b")
 
-def ldap_search(args):
+                self.set_cookie("semicolon", "a;b")
 
-    proc = subprocess.Popen([ldapsearch, '-H', ldap_uri, '-b', top_dn,
+                self.set_cookie("quote", 'a"b')
 
-                             '-D', admin_dn, '-w', admin_pw, args],
 
-                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
 
-                            stderr=subprocess.STDOUT)
+        class SetCookieOverwriteHandler(RequestHandler):
 
-    (out, dummy) = proc.communicate()
+            def get(self):
 
-    return out
+                self.set_cookie("a", "b", domain="example.com")
 
+                self.set_cookie("c", "d", domain="example.com")
 
+                # A second call with the same name clobbers the first.
 
-def ldap_modify(ldif, args=[]):
+                # Attributes from the first call are not carried over.
 
-    proc = subprocess.Popen([ldapmodify, '-H', ldap_uri, '-D', admin_dn,
+                self.set_cookie("a", "e")
 
-                             '-x', '-w', admin_pw] + args,
 
-                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
 
-                            stderr=subprocess.STDOUT)
+        return [("/set", SetCookieHandler),
 
-    (out, dummy) = proc.communicate(ldif)
+                ("/get", GetCookieHandler),
 
-    output(out)
+                ("/set_domain", SetCookieDomainHandler),
 
+                ("/special_char", SetCookieSpecialCharHandler),
 
+                ("/set_overwrite", SetCookieOverwriteHandler),
 
-def ldap_add(dn, objectclass, attrs=[]):
+                ]
 
-    in_data = 'dn: %s\nobjectclass: %s\n' % (dn, objectclass)
 
-    in_data += '\n'.join(attrs) + '\n'
 
-    ldap_modify(in_data, ['-a'])
+    def test_set_cookie(self):
 
+        response = self.fetch("/set")
 
+        self.assertEqual(sorted(response.headers.get_list("Set-Cookie")),
 
-# Create krbContainer objects for use as subtrees.
+                         ["bytes=zxcv; Path=/",
 
-ldap_add('cn=t1,cn=krb5', 'krbContainer')
+                          "str=asdf; Path=/",
 
-ldap_add('cn=t2,cn=krb5', 'krbContainer')
+                          "unicode=qwer; Path=/",
 
-ldap_add('cn=x,cn=t1,cn=krb5', 'krbContainer')
+                          ])
 
-ldap_add('cn=y,cn=t2,cn=krb5', 'krbContainer')
 
 
+    def test_get_cookie(self):
 
-# Create a realm, exercising all of the realm options.
+        response = self.fetch("/get", headers={"Cookie": "foo=bar"})
 
-kldaputil(['create', '-s', '-P', 'master', '-subtrees', 'cn=t2,cn=krb5',
+        self.assertEqual(response.body, b"bar")
 
-           '-containerref', 'cn=t2,cn=krb5', '-sscope', 'one',
 
-           '-maxtktlife', '5min', '-maxrenewlife', '10min', '-allow_svr'])
 
+        response = self.fetch("/get", headers={"Cookie": 'foo="bar"'})
 
+        self.assertEqual(response.body, b"bar")
 
-# Modify the realm, exercising overlapping subtree pruning.
 
-kldaputil(['modify', '-subtrees',
 
-           'cn=x,cn=t1,cn=krb5:cn=t1,cn=krb5:cn=t2,cn=krb5:cn=y,cn=t2,cn=krb5',
+        response = self.fetch("/get", headers={"Cookie": "/=exception;"})
 
-           '-containerref', 'cn=t1,cn=krb5', '-sscope', 'sub',
+        self.assertEqual(response.body, b"default")
 
-           '-maxtktlife', '5hour', '-maxrenewlife', '10hour', '+allow_svr'])
 
 
+    def test_set_cookie_domain(self):
 
-out = kldaputil(['list'])
+        response = self.fetch("/set_domain")
 
-if out != 'KRBTEST.COM\n':
+        self.assertEqual(response.headers.get_list("Set-Cookie"),
 
-    fail('Unexpected kdb5_ldap_util list output')
+                         ["unicode_args=blah; Domain=foo.com; Path=/foo"])
 
 
 
-# Create a principal at a specified DN.  This is a little dodgy
+    def test_cookie_special_char(self):
 
-# because we're sticking a krbPrincipalAux objectclass onto a subtree
+        response = self.fetch("/special_char")
 
-# krbContainer, but it works and it avoids having to load core.schema
+        headers = sorted(response.headers.get_list("Set-Cookie"))
 
-# in the test LDAP server.
+        self.assertEqual(len(headers), 3)
 
-realm.run([kadminl, 'ank', '-randkey', '-x', 'dn=cn=krb5', 'princ1'],
+        self.assertEqual(headers[0], 'equals="a=b"; Path=/')
 
-          expected_code=1, expected_msg='DN is out of the realm subtree')
+        self.assertEqual(headers[1], 'quote="a\\"b"; Path=/')
 
-realm.run([kadminl, 'ank', '-randkey', '-x', 'dn=cn=t2,cn=krb5', 'princ1'])
+        # python 2.7 octal-escapes the semicolon; older versions leave it alone
 
-realm.run([kadminl, 'getprinc', 'princ1'], expected_msg='Principal: princ1')
+        self.assertTrue(headers[2] in ('semicolon="a;b"; Path=/',
 
-realm.run([kadminl, 'ank', '-randkey', '-x', 'dn=cn=t2,cn=krb5', 'again'],
+                                       'semicolon="a\\073b"; Path=/'),
 
-          expected_code=1, expected_msg='ldap object is already kerberized')
+                        headers[2])
 
-# Check that we can't set linkdn on a non-standalone object.
 
-realm.run([kadminl, 'modprinc', '-x', 'linkdn=cn=t1,cn=krb5', 'princ1'],
 
-          expected_code=1, expected_msg='link information can not be set')
+        data = [('foo=a=b', 'a=b'),
 
+                ('foo="a=b"', 'a=b'),
 
+                ('foo="a;b"', 'a;b'),
 
-# Create a principal with a specified linkdn.
+                # ('foo=a\\073b', 'a;b'),  # even encoded, ";" is a delimiter
 
-realm.run([kadminl, 'ank', '-randkey', '-x', 'linkdn=cn=krb5', 'princ2'],
+                ('foo="a\\073b"', 'a;b'),
 
-          expected_code=1, expected_msg='DN is out of the realm subtree')
+                ('foo="a\\"b"', 'a"b'),
 
-realm.run([kadminl, 'ank', '-randkey', '-x', 'linkdn=cn=t1,cn=krb5', 'princ2'])
+                ]
 
-# Check that we can't reset linkdn.
+        for header, expected in data:
 
-realm.run([kadminl, 'modprinc', '-x', 'linkdn=cn=t2,cn=krb5', 'princ2'],
+            logging.debug("trying %r", header)
 
-          expected_code=1, expected_msg='kerberos principal is already linked')
+            response = self.fetch("/get", headers={"Cookie": header})
 
+            self.assertEqual(response.body, utf8(expected))
 
 
-# Create a principal with a specified containerdn.
 
-realm.run([kadminl, 'ank', '-randkey', '-x', 'containerdn=cn=krb5', 'princ3'],
+    def test_set_cookie_overwrite(self):
 
-          expected_code=1, expected_msg='DN is out of the realm subtree')
+        response = self.fetch("/set_overwrite")
 
-realm.run([kadminl, 'ank', '-randkey', '-x', 'containerdn=cn=t1,cn=krb5',
+        headers = response.headers.get_list("Set-Cookie")
 
-           'princ3'])
+        self.assertEqual(sorted(headers),
 
-realm.run([kadminl, 'modprinc', '-x', 'containerdn=cn=t2,cn=krb5', 'princ3'],
+                         ["a=e; Path=/", "c=d; Domain=example.com; Path=/"])
 
-          expected_code=1, expected_msg='containerdn option not supported')
 
 
 
-# Create and modify a ticket policy.
 
-kldaputil(['create_policy', '-maxtktlife', '3hour', '-maxrenewlife', '6hour',
+class AuthRedirectRequestHandler(RequestHandler):
 
-           '-allow_forwardable', 'tktpol'])
+    def initialize(self, login_url):
 
-kldaputil(['modify_policy', '-maxtktlife', '4hour', '-maxrenewlife', '8hour',
+        self.login_url = login_url
 
-           '+requires_preauth', 'tktpol'])
 
-out = kldaputil(['view_policy', 'tktpol'])
 
-if ('Ticket policy: tktpol\n' not in out or
+    def get_login_url(self):
 
-    'Maximum ticket life: 0 days 04:00:00\n' not in out or
+        return self.login_url
 
-    'Maximum renewable life: 0 days 08:00:00\n' not in out or
 
-    'Ticket flags: DISALLOW_FORWARDABLE REQUIRES_PRE_AUTH' not in out):
 
-    fail('Unexpected kdb5_ldap_util view_policy output')
+    @authenticated
 
+    def get(self):
 
+        # we'll never actually get here because the test doesn't follow redirects
 
-out = kldaputil(['list_policy'])
+        self.send_error(500)
 
-if out != 'tktpol\n':
 
-    fail('Unexpected kdb5_ldap_util list_policy output')
 
 
 
-# Associate the ticket policy to a principal.
+class AuthRedirectTest(WebTestCase):
 
-realm.run([kadminl, 'ank', '-randkey', '-x', 'tktpolicy=tktpol', 'princ4'])
+    def get_handlers(self):
 
-out = realm.run([kadminl, 'getprinc', 'princ4'])
+        return [('/relative', AuthRedirectRequestHandler,
 
-if ('Maximum ticket life: 0 days 04:00:00\n' not in out or
+                 dict(login_url='/login')),
 
-    'Maximum renewable life: 0 days 08:00:00\n' not in out or
+                ('/absolute', AuthRedirectRequestHandler,
 
-    'Attributes: DISALLOW_FORWARDABLE REQUIRES_PRE_AUTH\n' not in out):
+                 dict(login_url='http://example.com/login'))]
 
-    fail('Unexpected getprinc output with ticket policy')
 
 
+    def test_relative_auth_redirect(self):
 
-# Destroying the policy should fail while a principal references it.
+        self.http_client.fetch(self.get_url('/relative'), self.stop,
 
-kldaputil(['destroy_policy', '-force', 'tktpol'], expected_code=1)
+                               follow_redirects=False)
 
+        response = self.wait()
 
+        self.assertEqual(response.code, 302)
 
-# Dissociate the ticket policy from the principal.
+        self.assertEqual(response.headers['Location'], '/login?next=%2Frelative')
 
-realm.run([kadminl, 'modprinc', '-x', 'tktpolicy=', 'princ4'])
 
-out = realm.run([kadminl, 'getprinc', 'princ4'])
 
-if ('Maximum ticket life: 0 days 05:00:00\n' not in out or
+    def test_absolute_auth_redirect(self):
 
-    'Maximum renewable life: 0 days 10:00:00\n' not in out or
+        self.http_client.fetch(self.get_url('/absolute'), self.stop,
 
-    'Attributes:\n' not in out):
+                               follow_redirects=False)
 
-    fail('Unexpected getprinc output without ticket policy')
+        response = self.wait()
 
+        self.assertEqual(response.code, 302)
 
+        self.assertTrue(re.match(
 
-# Destroy the ticket policy.
+            'http://example.com/login\?next=http%3A%2F%2Flocalhost%3A[0-9]+%2Fabsolute',
 
-kldaputil(['destroy_policy', '-force', 'tktpol'])
+            response.headers['Location']), response.headers['Location'])
 
-kldaputil(['view_policy', 'tktpol'], expected_code=1)
 
-out = kldaputil(['list_policy'])
 
-if out:
 
-    fail('Unexpected kdb5_ldap_util list_policy output after destroy')
 
+class ConnectionCloseHandler(RequestHandler):
 
+    def initialize(self, test):
 
-# Create another ticket policy to be destroyed with the realm.
+        self.test = test
 
-kldaputil(['create_policy', 'tktpol2'])
 
 
+    @asynchronous
 
-# Try to create a password policy conflicting with a ticket policy.
+    def get(self):
 
-realm.run([kadminl, 'addpol', 'tktpol2'], expected_code=1,
+        self.test.on_handler_waiting()
 
-          expected_msg='Already exists while creating policy "tktpol2"')
 
 
+    def on_connection_close(self):
 
-# Try to create a ticket policy conflicting with a password policy.
+        self.test.on_connection_close()
 
-realm.run([kadminl, 'addpol', 'pwpol'])
 
-out = kldaputil(['create_policy', 'pwpol'], expected_code=1)
 
-if 'Already exists while creating policy object' not in out:
 
-    fail('Expected error not seen in kdb5_ldap_util output')
 
+class ConnectionCloseTest(WebTestCase):
 
+    def get_handlers(self):
 
-# Try to use a password policy as a ticket policy.
+        return [('/', ConnectionCloseHandler, dict(test=self))]
 
-realm.run([kadminl, 'modprinc', '-x', 'tktpolicy=pwpol', 'princ4'],
 
-          expected_code=1, expected_msg='Object class violation')
 
+    def test_connection_close(self):
 
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
 
-# Use a ticket policy as a password policy (CVE-2014-5353).  This
+        s.connect(("localhost", self.get_http_port()))
 
-# works with a warning; use kadmin.local -q so the warning is shown.
+        self.stream = IOStream(s, io_loop=self.io_loop)
 
-realm.run([kadminl, '-q', 'modprinc -policy tktpol2 princ4'],
+        self.stream.write(b"GET / HTTP/1.0\r\n\r\n")
 
-          expected_msg='WARNING: policy "tktpol2" does not exist')
+        self.wait()
 
 
 
-# Do some basic tests with a KDC against the LDAP module, exercising the
+    def on_handler_waiting(self):
 
-# db_args processing code.
+        logging.debug('handler waiting')
 
-realm.start_kdc(['-x', 'nconns=3', '-x', 'host=' + ldap_uri,
+        self.stream.close()
 
-                 '-x', 'binddn=' + admin_dn, '-x', 'bindpwd=' + admin_pw])
 
-realm.addprinc(realm.user_princ, password('user'))
 
-realm.addprinc(realm.host_princ)
+    def on_connection_close(self):
 
-realm.extract_keytab(realm.host_princ, realm.keytab)
+        logging.debug('connection closed')
 
-realm.kinit(realm.user_princ, password('user'))
+        self.stop()
 
-realm.run([kvno, realm.host_princ])
 
-realm.klist(realm.user_princ, realm.host_princ)
 
 
 
-# Test auth indicator support
+class EchoHandler(RequestHandler):
 
-realm.addprinc('authind', password('authind'))
+    def get(self, *path_args):
 
-realm.run([kadminl, 'setstr', 'authind', 'require_auth', 'otp radius'])
+        # Type checks: web.py interfaces convert argument values to
 
+        # unicode strings (by default, but see also decode_argument).
 
+        # In httpserver.py (i.e. self.request.arguments), they're left
 
-out = ldap_search('(krbPrincipalName=authind*)')
+        # as bytes.  Keys are always native strings.
 
-if 'krbPrincipalAuthInd: otp' not in out:
+        for key in self.request.arguments:
 
-    fail('Expected krbPrincipalAuthInd value not in output')
+            if type(key) != str:
 
-if 'krbPrincipalAuthInd: radius' not in out:
+                raise Exception("incorrect type for key: %r" % type(key))
 
-    fail('Expected krbPrincipalAuthInd value not in output')
+            for value in self.request.arguments[key]:
 
+                if type(value) != bytes_type:
 
+                    raise Exception("incorrect type for value: %r" %
 
-realm.run([kadminl, 'getstrs', 'authind'],
+                                    type(value))
 
-          expected_msg='require_auth: otp radius')
+            for value in self.get_arguments(key):
 
+                if type(value) != unicode_type:
 
+                    raise Exception("incorrect type for value: %r" %
 
-# Test service principal aliases.
+                                    type(value))
 
-realm.addprinc('canon', password('canon'))
+        for arg in path_args:
 
-ldap_modify('dn: krbPrincipalName=canon@KRBTEST.COM,cn=t1,cn=krb5\n'
+            if type(arg) != unicode_type:
 
-            'changetype: modify\n'
+                raise Exception("incorrect type for path arg: %r" % type(arg))
 
-            'add: krbPrincipalName\n'
+        self.write(dict(path=self.request.path,
 
-            'krbPrincipalName: alias@KRBTEST.COM\n'
+                        path_args=path_args,
 
-            '-\n'
+                        args=recursive_unicode(self.request.arguments)))
 
-            'add: krbCanonicalName\n'
 
-            'krbCanonicalName: canon@KRBTEST.COM\n')
 
-realm.run([kadminl, 'getprinc', 'alias'],
 
-          expected_msg='Principal: canon@KRBTEST.COM\n')
 
-realm.run([kadminl, 'getprinc', 'canon'],
+class RequestEncodingTest(WebTestCase):
 
-          expected_msg='Principal: canon@KRBTEST.COM\n')
+    def get_handlers(self):
 
-realm.run([kvno, 'alias', 'canon'])
+        return [("/group/(.*)", EchoHandler),
 
-out = realm.run([klist])
+                ("/slashes/([^/]*)/([^/]*)", EchoHandler),
 
-if 'alias@KRBTEST.COM\n' not in out or 'canon@KRBTEST.COM' not in out:
+                ]
 
-    fail('After fetching alias and canon, klist is missing one or both')
 
-realm.kinit(realm.user_princ, password('user'), ['-S', 'alias'])
 
-realm.klist(realm.user_princ, 'alias@KRBTEST.COM')
+    def fetch_json(self, path):
 
+        return json_decode(self.fetch(path).body)
 
 
-# Make sure an alias to the local TGS is still treated like an alias.
 
-ldap_modify('dn: krbPrincipalName=krbtgt/KRBTEST.COM@KRBTEST.COM,'
+    def test_group_question_mark(self):
 
-            'cn=KRBTEST.COM,cn=krb5\n'
+        # Ensure that url-encoded question marks are handled properly
 
-            'changetype: modify\n'
+        self.assertEqual(self.fetch_json('/group/%3F'),
 
-            'add:krbPrincipalName\n'
+                         dict(path='/group/%3F', path_args=['?'], args={}))
 
-            'krbPrincipalName: tgtalias@KRBTEST.COM\n'
+        self.assertEqual(self.fetch_json('/group/%3F?%3F=%3F'),
 
-            '-\n'
+                         dict(path='/group/%3F', path_args=['?'], args={'?': ['?']}))
 
-            'add: krbCanonicalName\n'
 
-            'krbCanonicalName: krbtgt/KRBTEST.COM@KRBTEST.COM\n')
 
-realm.run([kadminl, 'getprinc', 'tgtalias'],
+    def test_group_encoding(self):
 
-          expected_msg='Principal: krbtgt/KRBTEST.COM@KRBTEST.COM')
+        # Path components and query arguments should be decoded the same way
 
-realm.kinit(realm.user_princ, password('user'))
+        self.assertEqual(self.fetch_json('/group/%C3%A9?arg=%C3%A9'),
 
-realm.run([kvno, 'tgtalias'])
+                         {u("path"): u("/group/%C3%A9"),
 
-realm.klist(realm.user_princ, 'tgtalias@KRBTEST.COM')
+                          u("path_args"): [u("\u00e9")],
 
+                          u("args"): {u("arg"): [u("\u00e9")]}})
 
 
-# Make sure aliases work in header tickets.
 
-realm.run([kadminl, 'modprinc', '-maxrenewlife', '3 hours', 'user'])
+    def test_slashes(self):
 
-realm.run([kadminl, 'modprinc', '-maxrenewlife', '3 hours',
+        # Slashes may be escaped to appear as a single "directory" in the path,
 
-           'krbtgt/KRBTEST.COM'])
+        # but they are then unescaped when passed to the get() method.
 
-realm.kinit(realm.user_princ, password('user'), ['-l', '1h', '-r', '2h'])
+        self.assertEqual(self.fetch_json('/slashes/foo/bar'),
 
-realm.run([kvno, 'alias'])
+                         dict(path="/slashes/foo/bar",
 
-realm.kinit(realm.user_princ, flags=['-R', '-S', 'alias'])
+                              path_args=["foo", "bar"],
 
-realm.klist(realm.user_princ, 'alias@KRBTEST.COM')
+                              args={}))
 
+        self.assertEqual(self.fetch_json('/slashes/a%2Fb/c%2Fd'),
 
+                         dict(path="/slashes/a%2Fb/c%2Fd",
 
-# Test client principal aliases, with and without preauth.
+                              path_args=["a/b", "c/d"],
 
-realm.kinit('canon', password('canon'))
+                              args={}))
 
-realm.kinit('alias', password('canon'), expected_code=1,
 
-            expected_msg='not found in Kerberos database')
 
-realm.kinit('alias', password('canon'), ['-C'])
 
-realm.run([kvno, 'alias'])
 
-realm.klist('canon@KRBTEST.COM', 'alias@KRBTEST.COM')
+class TypeCheckHandler(RequestHandler):
 
-realm.run([kadminl, 'modprinc', '+requires_preauth', 'canon'])
+    def prepare(self):
 
-realm.kinit('canon', password('canon'))
+        self.errors = {}
 
-realm.kinit('alias', password('canon'), ['-C'])
 
 
+        self.check_type('status', self.get_status(), int)
 
-# Test password history.
 
-def test_pwhist(nhist):
 
-    def cpw(n, **kwargs):
+        # get_argument is an exception from the general rule of using
 
-        realm.run([kadminl, 'cpw', '-pw', str(n), princ], **kwargs)
+        # type str for non-body data mainly for historical reasons.
 
-    def cpw_fail(n):
+        self.check_type('argument', self.get_argument('foo'), unicode_type)
 
-        cpw(n, expected_code=1)
+        self.check_type('cookie_key', list(self.cookies.keys())[0], str)
 
-    output('*** Testing password history of size %d\n' % nhist)
+        self.check_type('cookie_value', list(self.cookies.values())[0].value, str)
 
-    princ = 'pwhistprinc' + str(nhist)
 
-    pol = 'pwhistpol' + str(nhist)
 
-    realm.run([kadminl, 'addpol', '-history', str(nhist), pol])
+        # Secure cookies return bytes because they can contain arbitrary
 
-    realm.run([kadminl, 'addprinc', '-policy', pol, '-nokey', princ])
+        # data, but regular cookies are native strings.
 
-    for i in range(nhist):
+        if list(self.cookies.keys()) != ['asdf']:
 
-        # Set a password, then check that all previous passwords fail.
+            raise Exception("unexpected values for cookie keys: %r" %
 
-        cpw(i)
+                            self.cookies.keys())
 
-        for j in range(i + 1):
+        self.check_type('get_secure_cookie', self.get_secure_cookie('asdf'), bytes_type)
 
-            cpw_fail(j)
+        self.check_type('get_cookie', self.get_cookie('asdf'), str)
 
-    # Set one more new password, and make sure the oldest key is
 
-    # rotated out.
 
-    cpw(nhist)
+        self.check_type('xsrf_token', self.xsrf_token, bytes_type)
 
-    cpw_fail(1)
+        self.check_type('xsrf_form_html', self.xsrf_form_html(), str)
 
-    cpw(0)
 
 
+        self.check_type('reverse_url', self.reverse_url('typecheck', 'foo'), str)
 
-for n in (1, 2, 3, 4, 5):
 
-    test_pwhist(n)
 
+        self.check_type('request_summary', self._request_summary(), str)
 
 
-# Regression test for #8193: test password character class requirements.
 
-princ = 'charclassprinc'
+    def get(self, path_component):
 
-pol = 'charclasspol'
+        # path_component uses type unicode instead of str for consistency
 
-realm.run([kadminl, 'addpol', '-minclasses', '3', pol])
+        # with get_argument()
 
-realm.run([kadminl, 'addprinc', '-policy', pol, '-nokey', princ])
+        self.check_type('path_component', path_component, unicode_type)
 
-realm.run([kadminl, 'cpw', '-pw', 'abcdef', princ], expected_code=1)
+        self.write(self.errors)
 
-realm.run([kadminl, 'cpw', '-pw', 'Abcdef', princ], expected_code=1)
 
-realm.run([kadminl, 'cpw', '-pw', 'Abcdef1', princ])
 
+    def post(self, path_component):
 
+        self.check_type('path_component', path_component, unicode_type)
 
-# Test principal renaming and make sure last modified is changed
+        self.write(self.errors)
 
-def get_princ(princ):
 
-    out = realm.run([kadminl, 'getprinc', princ])
 
-    return dict(map(str.strip, x.split(":", 1)) for x in out.splitlines())
+    def check_type(self, name, obj, expected_type):
 
+        actual_type = type(obj)
 
+        if expected_type != actual_type:
 
-realm.addprinc("rename", password('rename'))
+            self.errors[name] = "expected %s, got %s" % (expected_type,
 
-renameprinc = get_princ("rename")
+                                                         actual_type)
 
-realm.run([kadminl, '-p', 'fake@KRBTEST.COM', 'renprinc', 'rename', 'renamed'])
 
-renamedprinc = get_princ("renamed")
 
-if renameprinc['Last modified'] == renamedprinc['Last modified']:
 
-    fail('Last modified data not updated when principal was renamed')
 
+class DecodeArgHandler(RequestHandler):
 
+    def decode_argument(self, value, name=None):
 
-# Regression test for #7980 (fencepost when dividing keys up by kvno).
+        if type(value) != bytes_type:
 
-realm.run([kadminl, 'addprinc', '-randkey', '-e', 'aes256-cts,aes128-cts',
+            raise Exception("unexpected type for value: %r" % type(value))
 
-           'kvnoprinc'])
+        # use self.request.arguments directly to avoid recursion
 
-realm.run([kadminl, 'cpw', '-randkey', '-keepold', '-e',
+        if 'encoding' in self.request.arguments:
 
-           'aes256-cts,aes128-cts', 'kvnoprinc'])
+            return value.decode(to_unicode(self.request.arguments['encoding'][0]))
 
-realm.run([kadminl, 'getprinc', 'kvnoprinc'], expected_msg='Number of keys: 4')
+        else:
 
-realm.run([kadminl, 'cpw', '-randkey', '-keepold', '-e',
+            return value
 
-           'aes256-cts,aes128-cts', 'kvnoprinc'])
 
-realm.run([kadminl, 'getprinc', 'kvnoprinc'], expected_msg='Number of keys: 6')
 
+    def get(self, arg):
 
+        def describe(s):
 
-# Regression test for #8041 (NULL dereference on keyless principals).
+            if type(s) == bytes_type:
 
-realm.run([kadminl, 'addprinc', '-nokey', 'keylessprinc'])
+                return ["bytes", native_str(binascii.b2a_hex(s))]
 
-realm.run([kadminl, 'getprinc', 'keylessprinc'],
+            elif type(s) == unicode_type:
 
-          expected_msg='Number of keys: 0')
+                return ["unicode", s]
 
-realm.run([kadminl, 'cpw', '-randkey', '-e', 'aes256-cts,aes128-cts',
+            raise Exception("unknown type")
 
-           'keylessprinc'])
+        self.write({'path': describe(arg),
 
-realm.run([kadminl, 'cpw', '-randkey', '-keepold', '-e',
+                    'query': describe(self.get_argument("foo")),
 
-           'aes256-cts,aes128-cts', 'keylessprinc'])
+                    })
 
-realm.run([kadminl, 'getprinc', 'keylessprinc'],
 
-          expected_msg='Number of keys: 4')
 
-realm.run([kadminl, 'purgekeys', '-all', 'keylessprinc'])
 
-realm.run([kadminl, 'getprinc', 'keylessprinc'],
 
-          expected_msg='Number of keys: 0')
+class LinkifyHandler(RequestHandler):
 
+    def get(self):
 
+        self.render("linkify.html", message="http://example.com")
 
-# Test for 8354 (old password history entries when -keepold is used)
 
-realm.run([kadminl, 'addpol', '-history', '2', 'keepoldpasspol'])
 
-realm.run([kadminl, 'addprinc', '-policy', 'keepoldpasspol', '-pw', 'aaaa',
 
-           'keepoldpassprinc'])
 
-for p in ('bbbb', 'cccc', 'aaaa'):
+class UIModuleResourceHandler(RequestHandler):
 
-    realm.run([kadminl, 'cpw', '-keepold', '-pw', p, 'keepoldpassprinc'])
+    def get(self):
 
+        self.render("page.html", entries=[1, 2])
 
 
-if runenv.sizeof_time_t <= 4:
 
-    skipped('y2038 LDAP test', 'platform has 32-bit time_t')
 
-else:
 
-    # Test storage of timestamps after y2038.
+class OptionalPathHandler(RequestHandler):
 
-    realm.run([kadminl, 'modprinc', '-pwexpire', '2040-02-03', 'user'])
+    def get(self, path):
 
-    realm.run([kadminl, 'getprinc', 'user'], expected_msg=' 2040\n')
+        self.write({"path": path})
 
 
 
-realm.stop()
 
 
+class FlowControlHandler(RequestHandler):
 
-# Briefly test dump and load.
+    # These writes are too small to demonstrate real flow control,
 
-dumpfile = os.path.join(realm.testdir, 'dump')
+    # but at least it shows that the callbacks get run.
 
-realm.run([kdb5_util, 'dump', dumpfile])
+    @asynchronous
 
-realm.run([kdb5_util, 'load', dumpfile], expected_code=1,
+    def get(self):
 
-          expected_msg='KDB module requires -update argument')
+        self.write("1")
 
-realm.run([kdb5_util, 'load', '-update', dumpfile])
+        self.flush(callback=self.step2)
 
 
 
-# Destroy the realm.
+    def step2(self):
 
-kldaputil(['destroy', '-f'])
+        self.write("2")
 
-out = kldaputil(['list'])
+        self.flush(callback=self.step3)
 
-if out:
 
-    fail('Unexpected kdb5_ldap_util list output after destroy')
 
+    def step3(self):
 
+        self.write("3")
 
-if not core_schema:
+        self.finish()
 
-    skip_rest('LDAP SASL tests', 'core schema not found')
 
 
 
-if runenv.have_sasl != 'yes':
 
-    skip_rest('LDAP SASL tests', 'SASL support not built')
+class MultiHeaderHandler(RequestHandler):
 
+    def get(self):
 
+        self.set_header("x-overwrite", "1")
 
-# Test SASL EXTERNAL auth.  Remove the DNs and service password file
+        self.set_header("X-Overwrite", 2)
 
-# from the DB module config.
+        self.add_header("x-multi", 3)
 
-os.remove(ldap_pwfile)
+        self.add_header("X-Multi", "4")
 
-dbmod = conf['dbmodules']['ldap']
 
-dbmod['ldap_kdc_sasl_mech'] = dbmod['ldap_kadmind_sasl_mech'] = 'EXTERNAL'
 
-del dbmod['ldap_service_password_file']
 
-del dbmod['ldap_kdc_dn'], dbmod['ldap_kadmind_dn']
 
-realm = K5Realm(create_kdb=False, kdc_conf=conf)
+class RedirectHandler(RequestHandler):
 
-realm.run([kdb5_ldap_util, 'create', '-s', '-P', 'master'])
+    def get(self):
 
-realm.start_kdc()
+        if self.get_argument('permanent', None) is not None:
 
-realm.addprinc(realm.user_princ, password('user'))
+            self.redirect('/', permanent=int(self.get_argument('permanent')))
 
-realm.kinit(realm.user_princ, password('user'))
+        elif self.get_argument('status', None) is not None:
 
-realm.stop()
+            self.redirect('/', status=int(self.get_argument('status')))
 
-realm.run([kdb5_ldap_util, 'destroy', '-f'])
+        else:
 
+            raise Exception("didn't get permanent or status arguments")
 
 
-# Test SASL DIGEST-MD5 auth.  We need to set a clear-text password for
 
-# the admin DN, so create a person entry (requires the core schema).
 
-# Restore the service password file in the config and set authcids.
 
-ldap_add('cn=admin,cn=krb5', 'person',
+class EmptyFlushCallbackHandler(RequestHandler):
 
-         ['sn: dummy', 'userPassword: admin'])
+    @gen.engine
 
-dbmod['ldap_kdc_sasl_mech'] = dbmod['ldap_kadmind_sasl_mech'] = 'DIGEST-MD5'
+    @asynchronous
 
-dbmod['ldap_kdc_sasl_authcid'] = 'digestuser'
+    def get(self):
 
-dbmod['ldap_kadmind_sasl_authcid'] = 'digestuser'
+        # Ensure that the flush callback is run whether or not there
 
-dbmod['ldap_service_password_file'] = ldap_pwfile
+        # was any output.
 
-realm = K5Realm(create_kdb=False, kdc_conf=conf)
+        yield gen.Task(self.flush)  # "empty" flush, but writes headers
 
-input = admin_pw + '\n' + admin_pw + '\n'
+        yield gen.Task(self.flush)  # empty flush
 
-realm.run([kdb5_ldap_util, 'stashsrvpw', 'digestuser'], input=input)
+        self.write("o")
 
-realm.run([kdb5_ldap_util, 'create', '-s', '-P', 'master'])
+        yield gen.Task(self.flush)  # flushes the "o"
 
-realm.start_kdc()
+        yield gen.Task(self.flush)  # empty flush
 
-realm.addprinc(realm.user_princ, password('user'))
+        self.finish("k")
 
-realm.kinit(realm.user_princ, password('user'))
 
-realm.stop()
 
-# Exercise DB options, which should cause binding to fail.
 
-realm.run([kadminl, '-x', 'sasl_authcid=ab', 'getprinc', 'user'],
 
-          expected_code=1, expected_msg='Cannot bind to LDAP server')
+class HeaderInjectionHandler(RequestHandler):
 
-realm.run([kadminl, '-x', 'bindpwd=wrong', 'getprinc', 'user'],
+    def get(self):
 
-          expected_code=1, expected_msg='Cannot bind to LDAP server')
+        try:
 
-realm.run([kdb5_ldap_util, 'destroy', '-f'])
+            self.set_header("X-Foo", "foo\r\nX-Bar: baz")
 
+            raise Exception("Didn't get expected exception")
 
+        except ValueError as e:
 
-# We could still use tests to exercise:
+            if "Unsafe header value" in str(e):
 
-# * DB arg handling in krb5_ldap_create
+                self.finish(b"ok")
 
-# * krbAllowedToDelegateTo attribute processing
+            else:
 
-# * A load operation overwriting a standalone principal entry which
+                raise
 
-#   already exists but doesn't have a krbPrincipalName attribute
 
-#   matching the principal name.
 
-# * A bunch of invalid-input error conditions
 
-#
 
-# There is no coverage for the following because it would be difficult:
+class GetArgumentHandler(RequestHandler):
 
-# * Out-of-memory error conditions
+    def prepare(self):
 
-# * Handling of failures from slapd (including krb5_retry_get_ldap_handle)
+        if self.get_argument('source', None) == 'query':
 
-# * Handling of servers which don't support mod-increment
+            method = self.get_query_argument
 
-# * krb5_ldap_delete_krbcontainer (only happens if krb5_ldap_create fails)
+        elif self.get_argument('source', None) == 'body':
 
+            method = self.get_body_argument
 
+        else:
 
-success('LDAP and DB2 KDB tests')
+            method = self.get_argument
+
+        self.finish(method("foo", "default"))
+
+
+
+
+
+class GetArgumentsHandler(RequestHandler):
+
+    def prepare(self):
+
+        self.finish(dict(default=self.get_arguments("foo"),
+
+                         query=self.get_query_arguments("foo"),
+
+                         body=self.get_body_arguments("foo")))
+
+
+
+
+
+# This test is shared with wsgi_test.py
+
+@wsgi_safe
+
+class WSGISafeWebTest(WebTestCase):
+
+    COOKIE_SECRET = "WebTest.COOKIE_SECRET"
+
+
+
+    def get_app_kwargs(self):
+
+        loader = DictLoader({
+
+            "linkify.html": "{% module linkify(message) %}",
+
+            "page.html": """\
+
+<html><head></head><body>
+
+{% for e in entries %}
+
+{% module Template("entry.html", entry=e) %}
+
+{% end %}
+
+</body></html>""",
+
+            "entry.html": """\
+
+{{ set_resources(embedded_css=".entry { margin-bottom: 1em; }", embedded_javascript="js_embed()", css_files=["/base.css", "/foo.css"], javascript_files="/common.js", html_head="<meta>", html_body='<script src="/analytics.js"/>') }}
+
+<div class="entry">...</div>""",
+
+        })
+
+        return dict(template_loader=loader,
+
+                    autoescape="xhtml_escape",
+
+                    cookie_secret=self.COOKIE_SECRET)
+
+
+
+    def tearDown(self):
+
+        super(WSGISafeWebTest, self).tearDown()
+
+        RequestHandler._template_loaders.clear()
+
+
+
+    def get_handlers(self):
+
+        urls = [
+
+            url("/typecheck/(.*)", TypeCheckHandler, name='typecheck'),
+
+            url("/decode_arg/(.*)", DecodeArgHandler, name='decode_arg'),
+
+            url("/decode_arg_kw/(?P<arg>.*)", DecodeArgHandler),
+
+            url("/linkify", LinkifyHandler),
+
+            url("/uimodule_resources", UIModuleResourceHandler),
+
+            url("/optional_path/(.+)?", OptionalPathHandler),
+
+            url("/multi_header", MultiHeaderHandler),
+
+            url("/redirect", RedirectHandler),
+
+            url("/header_injection", HeaderInjectionHandler),
+
+            url("/get_argument", GetArgumentHandler),
+
+            url("/get_arguments", GetArgumentsHandler),
+
+        ]
+
+        return urls
+
+
+
+    def fetch_json(self, *args, **kwargs):
+
+        response = self.fetch(*args, **kwargs)
+
+        response.rethrow()
+
+        return json_decode(response.body)
+
+
+
+    def test_types(self):
+
+        cookie_value = to_unicode(create_signed_value(self.COOKIE_SECRET,
+
+                                                      "asdf", "qwer"))
+
+        response = self.fetch("/typecheck/asdf?foo=bar",
+
+                              headers={"Cookie": "asdf=" + cookie_value})
+
+        data = json_decode(response.body)
+
+        self.assertEqual(data, {})
+
+
+
+        response = self.fetch("/typecheck/asdf?foo=bar", method="POST",
+
+                              headers={"Cookie": "asdf=" + cookie_value},
+
+                              body="foo=bar")
+
+
+
+    def test_decode_argument(self):
+
+        # These urls all decode to the same thing
+
+        urls = ["/decode_arg/%C3%A9?foo=%C3%A9&encoding=utf-8",
+
+                "/decode_arg/%E9?foo=%E9&encoding=latin1",
+
+                "/decode_arg_kw/%E9?foo=%E9&encoding=latin1",
+
+                ]
+
+        for url in urls:
+
+            response = self.fetch(url)
+
+            response.rethrow()
+
+            data = json_decode(response.body)
+
+            self.assertEqual(data, {u('path'): [u('unicode'), u('\u00e9')],
+
+                                    u('query'): [u('unicode'), u('\u00e9')],
+
+                                    })
+
+
+
+        response = self.fetch("/decode_arg/%C3%A9?foo=%C3%A9")
+
+        response.rethrow()
+
+        data = json_decode(response.body)
+
+        self.assertEqual(data, {u('path'): [u('bytes'), u('c3a9')],
+
+                                u('query'): [u('bytes'), u('c3a9')],
+
+                                })
+
+
+
+    def test_decode_argument_invalid_unicode(self):
+
+        # test that invalid unicode in URLs causes 400, not 500
+
+        with ExpectLog(gen_log, ".*Invalid unicode.*"):
+
+            response = self.fetch("/typecheck/invalid%FF")
+
+            self.assertEqual(response.code, 400)
+
+            response = self.fetch("/typecheck/invalid?foo=%FF")
+
+            self.assertEqual(response.code, 400)
+
+
+
+    def test_decode_argument_plus(self):
+
+        # These urls are all equivalent.
+
+        urls = ["/decode_arg/1%20%2B%201?foo=1%20%2B%201&encoding=utf-8",
+
+                "/decode_arg/1%20+%201?foo=1+%2B+1&encoding=utf-8"]
+
+        for url in urls:
+
+            response = self.fetch(url)
+
+            response.rethrow()
+
+            data = json_decode(response.body)
+
+            self.assertEqual(data, {u('path'): [u('unicode'), u('1 + 1')],
+
+                                    u('query'): [u('unicode'), u('1 + 1')],
+
+                                    })
+
+
+
+    def test_reverse_url(self):
+
+        self.assertEqual(self.app.reverse_url('decode_arg', 'foo'),
+
+                         '/decode_arg/foo')
+
+        self.assertEqual(self.app.reverse_url('decode_arg', 42),
+
+                         '/decode_arg/42')
+
+        self.assertEqual(self.app.reverse_url('decode_arg', b'\xe9'),
+
+                         '/decode_arg/%E9')
+
+        self.assertEqual(self.app.reverse_url('decode_arg', u('\u00e9')),
+
+                         '/decode_arg/%C3%A9')
+
+        self.assertEqual(self.app.reverse_url('decode_arg', '1 + 1'),
+
+                         '/decode_arg/1%20%2B%201')
+
+
+
+    def test_uimodule_unescaped(self):
+
+        response = self.fetch("/linkify")
+
+        self.assertEqual(response.body,
+
+                         b"<a href=\"http://example.com\">http://example.com</a>")
+
+
+
+    def test_uimodule_resources(self):
+
+        response = self.fetch("/uimodule_resources")
+
+        self.assertEqual(response.body, b"""\
+
+<html><head><link href="/base.css" type="text/css" rel="stylesheet"/><link href="/foo.css" type="text/css" rel="stylesheet"/>
+
+<style type="text/css">
+
+.entry { margin-bottom: 1em; }
+
+</style>
+
+<meta>
+
+</head><body>
+
+
+
+
+
+<div class="entry">...</div>
+
+
+
+
+
+<div class="entry">...</div>
+
+
+
+<script src="/common.js" type="text/javascript"></script>
+
+<script type="text/javascript">
+
+//<![CDATA[
+
+js_embed()
+
+//]]>
+
+</script>
+
+<script src="/analytics.js"/>
+
+</body></html>""")
+
+
+
+    def test_optional_path(self):
+
+        self.assertEqual(self.fetch_json("/optional_path/foo"),
+
+                         {u("path"): u("foo")})
+
+        self.assertEqual(self.fetch_json("/optional_path/"),
+
+                         {u("path"): None})
+
+
+
+    def test_multi_header(self):
+
+        response = self.fetch("/multi_header")
+
+        self.assertEqual(response.headers["x-overwrite"], "2")
+
+        self.assertEqual(response.headers.get_list("x-multi"), ["3", "4"])
+
+
+
+    def test_redirect(self):
+
+        response = self.fetch("/redirect?permanent=1", follow_redirects=False)
+
+        self.assertEqual(response.code, 301)
+
+        response = self.fetch("/redirect?permanent=0", follow_redirects=False)
+
+        self.assertEqual(response.code, 302)
+
+        response = self.fetch("/redirect?status=307", follow_redirects=False)
+
+        self.assertEqual(response.code, 307)
+
+
+
+    def test_header_injection(self):
+
+        response = self.fetch("/header_injection")
+
+        self.assertEqual(response.body, b"ok")
+
+
+
+    def test_get_argument(self):
+
+        response = self.fetch("/get_argument?foo=bar")
+
+        self.assertEqual(response.body, b"bar")
+
+        response = self.fetch("/get_argument?foo=")
+
+        self.assertEqual(response.body, b"")
+
+        response = self.fetch("/get_argument")
+
+        self.assertEqual(response.body, b"default")
+
+
+
+        # Test merging of query and body arguments.
+
+        # In singular form, body arguments take precedence over query arguments.
+
+        body = urllib_parse.urlencode(dict(foo="hello"))
+
+        response = self.fetch("/get_argument?foo=bar", method="POST", body=body)
+
+        self.assertEqual(response.body, b"hello")
+
+        # In plural methods they are merged.
+
+        response = self.fetch("/get_arguments?foo=bar",
+
+                              method="POST", body=body)
+
+        self.assertEqual(json_decode(response.body),
+
+                         dict(default=['bar', 'hello'],
+
+                              query=['bar'],
+
+                              body=['hello']))
+
+
+
+    def test_get_query_arguments(self):
+
+        # send as a post so we can ensure the separation between query
+
+        # string and body arguments.
+
+        body = urllib_parse.urlencode(dict(foo="hello"))
+
+        response = self.fetch("/get_argument?source=query&foo=bar",
+
+                              method="POST", body=body)
+
+        self.assertEqual(response.body, b"bar")
+
+        response = self.fetch("/get_argument?source=query&foo=",
+
+                              method="POST", body=body)
+
+        self.assertEqual(response.body, b"")
+
+        response = self.fetch("/get_argument?source=query",
+
+                              method="POST", body=body)
+
+        self.assertEqual(response.body, b"default")
+
+
+
+    def test_get_body_arguments(self):
+
+        body = urllib_parse.urlencode(dict(foo="bar"))
+
+        response = self.fetch("/get_argument?source=body&foo=hello",
+
+                              method="POST", body=body)
+
+        self.assertEqual(response.body, b"bar")
+
+
+
+        body = urllib_parse.urlencode(dict(foo=""))
+
+        response = self.fetch("/get_argument?source=body&foo=hello",
+
+                              method="POST", body=body)
+
+        self.assertEqual(response.body, b"")
+
+
+
+        body = urllib_parse.urlencode(dict())
+
+        response = self.fetch("/get_argument?source=body&foo=hello",
+
+                              method="POST", body=body)
+
+        self.assertEqual(response.body, b"default")
+
+
+
+    def test_no_gzip(self):
+
+        response = self.fetch('/get_argument')
+
+        self.assertNotIn('Accept-Encoding', response.headers.get('Vary', ''))
+
+        self.assertNotIn('gzip', response.headers.get('Content-Encoding', ''))
+
+
+
+
+
+class NonWSGIWebTests(WebTestCase):
+
+    def get_handlers(self):
+
+        return [("/flow_control", FlowControlHandler),
+
+                ("/empty_flush", EmptyFlushCallbackHandler),
+
+                ]
+
+
+
+    def test_flow_control(self):
+
+        self.assertEqual(self.fetch("/flow_control").body, b"123")
+
+
+
+    def test_empty_flush(self):
+
+        response = self.fetch("/empty_flush")
+
+        self.assertEqual(response.body, b"ok")
+
+
+
+
+
+@wsgi_safe
+
+class ErrorResponseTest(WebTestCase):
+
+    def get_handlers(self):
+
+        class DefaultHandler(RequestHandler):
+
+            def get(self):
+
+                if self.get_argument("status", None):
+
+                    raise HTTPError(int(self.get_argument("status")))
+
+                1 / 0
+
+
+
+        class WriteErrorHandler(RequestHandler):
+
+            def get(self):
+
+                if self.get_argument("status", None):
+
+                    self.send_error(int(self.get_argument("status")))
+
+                else:
+
+                    1 / 0
+
+
+
+            def write_error(self, status_code, **kwargs):
+
+                self.set_header("Content-Type", "text/plain")
+
+                if "exc_info" in kwargs:
+
+                    self.write("Exception: %s" % kwargs["exc_info"][0].__name__)
+
+                else:
+
+                    self.write("Status: %d" % status_code)
+
+
+
+        class GetErrorHtmlHandler(RequestHandler):
+
+            def get(self):
+
+                if self.get_argument("status", None):
+
+                    self.send_error(int(self.get_argument("status")))
+
+                else:
+
+                    1 / 0
+
+
+
+            def get_error_html(self, status_code, **kwargs):
+
+                self.set_header("Content-Type", "text/plain")
+
+                if "exception" in kwargs:
+
+                    self.write("Exception: %s" % sys.exc_info()[0].__name__)
+
+                else:
+
+                    self.write("Status: %d" % status_code)
+
+
+
+        class FailedWriteErrorHandler(RequestHandler):
+
+            def get(self):
+
+                1 / 0
+
+
+
+            def write_error(self, status_code, **kwargs):
+
+                raise Exception("exception in write_error")
+
+
+
+        return [url("/default", DefaultHandler),
+
+                url("/write_error", WriteErrorHandler),
+
+                url("/get_error_html", GetErrorHtmlHandler),
+
+                url("/failed_write_error", FailedWriteErrorHandler),
+
+                ]
+
+
+
+    def test_default(self):
+
+        with ExpectLog(app_log, "Uncaught exception"):
+
+            response = self.fetch("/default")
+
+            self.assertEqual(response.code, 500)
+
+            self.assertTrue(b"500: Internal Server Error" in response.body)
+
+
+
+            response = self.fetch("/default?status=503")
+
+            self.assertEqual(response.code, 503)
+
+            self.assertTrue(b"503: Service Unavailable" in response.body)
+
+
+
+    def test_write_error(self):
+
+        with ExpectLog(app_log, "Uncaught exception"):
+
+            response = self.fetch("/write_error")
+
+            self.assertEqual(response.code, 500)
+
+            self.assertEqual(b"Exception: ZeroDivisionError", response.body)
+
+
+
+            response = self.fetch("/write_error?status=503")
+
+            self.assertEqual(response.code, 503)
+
+            self.assertEqual(b"Status: 503", response.body)
+
+
+
+    def test_get_error_html(self):
+
+        with ExpectLog(app_log, "Uncaught exception"):
+
+            response = self.fetch("/get_error_html")
+
+            self.assertEqual(response.code, 500)
+
+            self.assertEqual(b"Exception: ZeroDivisionError", response.body)
+
+
+
+            response = self.fetch("/get_error_html?status=503")
+
+            self.assertEqual(response.code, 503)
+
+            self.assertEqual(b"Status: 503", response.body)
+
+
+
+    def test_failed_write_error(self):
+
+        with ExpectLog(app_log, "Uncaught exception"):
+
+            response = self.fetch("/failed_write_error")
+
+            self.assertEqual(response.code, 500)
+
+            self.assertEqual(b"", response.body)
+
+
+
+
+
+@wsgi_safe
+
+class StaticFileTest(WebTestCase):
+
+    # The expected MD5 hash of robots.txt, used in tests that call
+
+    # StaticFileHandler.get_version
+
+    robots_txt_hash = b"f71d20196d4caf35b6a670db8c70b03d"
+
+    static_dir = os.path.join(os.path.dirname(__file__), 'static')
+
+
+
+    def get_handlers(self):
+
+        class StaticUrlHandler(RequestHandler):
+
+            def get(self, path):
+
+                with_v = int(self.get_argument('include_version', 1))
+
+                self.write(self.static_url(path, include_version=with_v))
+
+
+
+        class AbsoluteStaticUrlHandler(StaticUrlHandler):
+
+            include_host = True
+
+
+
+        class OverrideStaticUrlHandler(RequestHandler):
+
+            def get(self, path):
+
+                do_include = bool(self.get_argument("include_host"))
+
+                self.include_host = not do_include
+
+
+
+                regular_url = self.static_url(path)
+
+                override_url = self.static_url(path, include_host=do_include)
+
+                if override_url == regular_url:
+
+                    return self.write(str(False))
+
+
+
+                protocol = self.request.protocol + "://"
+
+                protocol_length = len(protocol)
+
+                check_regular = regular_url.find(protocol, 0, protocol_length)
+
+                check_override = override_url.find(protocol, 0, protocol_length)
+
+
+
+                if do_include:
+
+                    result = (check_override == 0 and check_regular == -1)
+
+                else:
+
+                    result = (check_override == -1 and check_regular == 0)
+
+                self.write(str(result))
+
+
+
+        return [('/static_url/(.*)', StaticUrlHandler),
+
+                ('/abs_static_url/(.*)', AbsoluteStaticUrlHandler),
+
+                ('/override_static_url/(.*)', OverrideStaticUrlHandler)]
+
+
+
+    def get_app_kwargs(self):
+
+        return dict(static_path=relpath('static'))
+
+
+
+    def test_static_files(self):
+
+        response = self.fetch('/robots.txt')
+
+        self.assertTrue(b"Disallow: /" in response.body)
+
+
+
+        response = self.fetch('/static/robots.txt')
+
+        self.assertTrue(b"Disallow: /" in response.body)
+
+
+
+    def test_static_url(self):
+
+        response = self.fetch("/static_url/robots.txt")
+
+        self.assertEqual(response.body,
+
+                         b"/static/robots.txt?v=" + self.robots_txt_hash)
+
+
+
+    def test_absolute_static_url(self):
+
+        response = self.fetch("/abs_static_url/robots.txt")
+
+        self.assertEqual(response.body, (
+
+            utf8(self.get_url("/")) +
+
+            b"static/robots.txt?v=" +
+
+            self.robots_txt_hash
+
+        ))
+
+
+
+    def test_relative_version_exclusion(self):
+
+        response = self.fetch("/static_url/robots.txt?include_version=0")
+
+        self.assertEqual(response.body, b"/static/robots.txt")
+
+
+
+    def test_absolute_version_exclusion(self):
+
+        response = self.fetch("/abs_static_url/robots.txt?include_version=0")
+
+        self.assertEqual(response.body,
+
+                         utf8(self.get_url("/") + "static/robots.txt"))
+
+
+
+    def test_include_host_override(self):
+
+        self._trigger_include_host_check(False)
+
+        self._trigger_include_host_check(True)
+
+
+
+    def _trigger_include_host_check(self, include_host):
+
+        path = "/override_static_url/robots.txt?include_host=%s"
+
+        response = self.fetch(path % int(include_host))
+
+        self.assertEqual(response.body, utf8(str(True)))
+
+
+
+    def test_static_304_if_modified_since(self):
+
+        response1 = self.fetch("/static/robots.txt")
+
+        response2 = self.fetch("/static/robots.txt", headers={
+
+            'If-Modified-Since': response1.headers['Last-Modified']})
+
+        self.assertEqual(response2.code, 304)
+
+        self.assertTrue('Content-Length' not in response2.headers)
+
+        self.assertTrue('Last-Modified' not in response2.headers)
+
+
+
+    def test_static_304_if_none_match(self):
+
+        response1 = self.fetch("/static/robots.txt")
+
+        response2 = self.fetch("/static/robots.txt", headers={
+
+            'If-None-Match': response1.headers['Etag']})
+
+        self.assertEqual(response2.code, 304)
+
+
+
+    def test_static_if_modified_since_pre_epoch(self):
+
+        # On windows, the functions that work with time_t do not accept
+
+        # negative values, and at least one client (processing.js) seems
+
+        # to use if-modified-since 1/1/1960 as a cache-busting technique.
+
+        response = self.fetch("/static/robots.txt", headers={
+
+            'If-Modified-Since': 'Fri, 01 Jan 1960 00:00:00 GMT'})
+
+        self.assertEqual(response.code, 200)
+
+
+
+    def test_static_if_modified_since_time_zone(self):
+
+        # Instead of the value from Last-Modified, make requests with times
+
+        # chosen just before and after the known modification time
+
+        # of the file to ensure that the right time zone is being used
+
+        # when parsing If-Modified-Since.
+
+        stat = os.stat(relpath('static/robots.txt'))
+
+
+
+        response = self.fetch('/static/robots.txt', headers={
+
+            'If-Modified-Since': format_timestamp(stat.st_mtime - 1)})
+
+        self.assertEqual(response.code, 200)
+
+        response = self.fetch('/static/robots.txt', headers={
+
+            'If-Modified-Since': format_timestamp(stat.st_mtime + 1)})
+
+        self.assertEqual(response.code, 304)
+
+
+
+    def test_static_etag(self):
+
+        response = self.fetch('/static/robots.txt')
+
+        self.assertEqual(utf8(response.headers.get("Etag")),
+
+                         b'"' + self.robots_txt_hash + b'"')
+
+
+
+    def test_static_with_range(self):
+
+        response = self.fetch('/static/robots.txt', headers={
+
+            'Range': 'bytes=0-9'})
+
+        self.assertEqual(response.code, 206)
+
+        self.assertEqual(response.body, b"User-agent")
+
+        self.assertEqual(utf8(response.headers.get("Etag")),
+
+                         b'"' + self.robots_txt_hash + b'"')
+
+        self.assertEqual(response.headers.get("Content-Length"), "10")
+
+        self.assertEqual(response.headers.get("Content-Range"),
+
+                         "bytes 0-9/26")
+
+
+
+    def test_static_with_range_full_file(self):
+
+        response = self.fetch('/static/robots.txt', headers={
+
+            'Range': 'bytes=0-'})
+
+        # Note: Chrome refuses to play audio if it gets an HTTP 206 in response
+
+        # to ``Range: bytes=0-`` :(
+
+        self.assertEqual(response.code, 200)
+
+        robots_file_path = os.path.join(self.static_dir, "robots.txt")
+
+        with open(robots_file_path) as f:
+
+            self.assertEqual(response.body, utf8(f.read()))
+
+        self.assertEqual(response.headers.get("Content-Length"), "26")
+
+        self.assertEqual(response.headers.get("Content-Range"), None)
+
+
+
+    def test_static_with_range_full_past_end(self):
+
+        response = self.fetch('/static/robots.txt', headers={
+
+            'Range': 'bytes=0-10000000'})
+
+        self.assertEqual(response.code, 200)
+
+        robots_file_path = os.path.join(self.static_dir, "robots.txt")
+
+        with open(robots_file_path) as f:
+
+            self.assertEqual(response.body, utf8(f.read()))
+
+        self.assertEqual(response.headers.get("Content-Length"), "26")
+
+        self.assertEqual(response.headers.get("Content-Range"), None)
+
+
+
+    def test_static_with_range_partial_past_end(self):
+
+        response = self.fetch('/static/robots.txt', headers={
+
+            'Range': 'bytes=1-10000000'})
+
+        self.assertEqual(response.code, 206)
+
+        robots_file_path = os.path.join(self.static_dir, "robots.txt")
+
+        with open(robots_file_path) as f:
+
+            self.assertEqual(response.body, utf8(f.read()[1:]))
+
+        self.assertEqual(response.headers.get("Content-Length"), "25")
+
+        self.assertEqual(response.headers.get("Content-Range"), "bytes 1-25/26")
+
+
+
+    def test_static_with_range_end_edge(self):
+
+        response = self.fetch('/static/robots.txt', headers={
+
+            'Range': 'bytes=22-'})
+
+        self.assertEqual(response.body, b": /\n")
+
+        self.assertEqual(response.headers.get("Content-Length"), "4")
+
+        self.assertEqual(response.headers.get("Content-Range"),
+
+                         "bytes 22-25/26")
+
+
+
+    def test_static_with_range_neg_end(self):
+
+        response = self.fetch('/static/robots.txt', headers={
+
+            'Range': 'bytes=-4'})
+
+        self.assertEqual(response.body, b": /\n")
+
+        self.assertEqual(response.headers.get("Content-Length"), "4")
+
+        self.assertEqual(response.headers.get("Content-Range"),
+
+                         "bytes 22-25/26")
+
+
+
+    def test_static_invalid_range(self):
+
+        response = self.fetch('/static/robots.txt', headers={
+
+            'Range': 'asdf'})
+
+        self.assertEqual(response.code, 200)
+
+
+
+    def test_static_unsatisfiable_range_zero_suffix(self):
+
+        response = self.fetch('/static/robots.txt', headers={
+
+            'Range': 'bytes=-0'})
+
+        self.assertEqual(response.headers.get("Content-Range"),
+
+                         "bytes */26")
+
+        self.assertEqual(response.code, 416)
+
+
+
+    def test_static_unsatisfiable_range_invalid_start(self):
+
+        response = self.fetch('/static/robots.txt', headers={
+
+            'Range': 'bytes=26'})
+
+        self.assertEqual(response.code, 416)
+
+        self.assertEqual(response.headers.get("Content-Range"),
+
+                         "bytes */26")
+
+
+
+    def test_static_head(self):
+
+        response = self.fetch('/static/robots.txt', method='HEAD')
+
+        self.assertEqual(response.code, 200)
+
+        # No body was returned, but we did get the right content length.
+
+        self.assertEqual(response.body, b'')
+
+        self.assertEqual(response.headers['Content-Length'], '26')
+
+        self.assertEqual(utf8(response.headers['Etag']),
+
+                         b'"' + self.robots_txt_hash + b'"')
+
+
+
+    def test_static_head_range(self):
+
+        response = self.fetch('/static/robots.txt', method='HEAD',
+
+                              headers={'Range': 'bytes=1-4'})
+
+        self.assertEqual(response.code, 206)
+
+        self.assertEqual(response.body, b'')
+
+        self.assertEqual(response.headers['Content-Length'], '4')
+
+        self.assertEqual(utf8(response.headers['Etag']),
+
+                         b'"' + self.robots_txt_hash + b'"')
+
+
+
+    def test_static_range_if_none_match(self):
+
+        response = self.fetch('/static/robots.txt', headers={
+
+            'Range': 'bytes=1-4',
+
+            'If-None-Match': b'"' + self.robots_txt_hash + b'"'})
+
+        self.assertEqual(response.code, 304)
+
+        self.assertEqual(response.body, b'')
+
+        self.assertTrue('Content-Length' not in response.headers)
+
+        self.assertEqual(utf8(response.headers['Etag']),
+
+                         b'"' + self.robots_txt_hash + b'"')
+
+
+
+    def test_static_404(self):
+
+        response = self.fetch('/static/blarg')
+
+        self.assertEqual(response.code, 404)
+
+
+
+
+
+@wsgi_safe
+
+class StaticDefaultFilenameTest(WebTestCase):
+
+    def get_app_kwargs(self):
+
+        return dict(static_path=relpath('static'),
+
+                    static_handler_args=dict(default_filename='index.html'))
+
+
+
+    def get_handlers(self):
+
+        return []
+
+
+
+    def test_static_default_filename(self):
+
+        response = self.fetch('/static/dir/', follow_redirects=False)
+
+        self.assertEqual(response.code, 200)
+
+        self.assertEqual(b'this is the index\n', response.body)
+
+
+
+    def test_static_default_redirect(self):
+
+        response = self.fetch('/static/dir', follow_redirects=False)
+
+        self.assertEqual(response.code, 301)
+
+        self.assertTrue(response.headers['Location'].endswith('/static/dir/'))
+
+
+
+
+
+@wsgi_safe
+
+class StaticFileWithPathTest(WebTestCase):
+
+    def get_app_kwargs(self):
+
+        return dict(static_path=relpath('static'),
+
+                    static_handler_args=dict(default_filename='index.html'))
+
+
+
+    def get_handlers(self):
+
+        return [("/foo/(.*)", StaticFileHandler, {
+
+            "path": relpath("templates/"),
+
+        })]
+
+
+
+    def test_serve(self):
+
+        response = self.fetch("/foo/utf8.html")
+
+        self.assertEqual(response.body, b"H\xc3\xa9llo\n")
+
+
+
+
+
+@wsgi_safe
+
+class CustomStaticFileTest(WebTestCase):
+
+    def get_handlers(self):
+
+        class MyStaticFileHandler(StaticFileHandler):
+
+            @classmethod
+
+            def make_static_url(cls, settings, path):
+
+                version_hash = cls.get_version(settings, path)
+
+                extension_index = path.rindex('.')
+
+                before_version = path[:extension_index]
+
+                after_version = path[(extension_index + 1):]
+
+                return '/static/%s.%s.%s' % (before_version, version_hash,
+
+                                             after_version)
+
+
+
+            def parse_url_path(self, url_path):
+
+                extension_index = url_path.rindex('.')
+
+                version_index = url_path.rindex('.', 0, extension_index)
+
+                return '%s%s' % (url_path[:version_index],
+
+                                 url_path[extension_index:])
+
+
+
+            @classmethod
+
+            def get_absolute_path(cls, settings, path):
+
+                return 'CustomStaticFileTest:' + path
+
+
+
+            def validate_absolute_path(self, root, absolute_path):
+
+                return absolute_path
+
+
+
+            @classmethod
+
+            def get_content(self, path, start=None, end=None):
+
+                assert start is None and end is None
+
+                if path == 'CustomStaticFileTest:foo.txt':
+
+                    return b'bar'
+
+                raise Exception("unexpected path %r" % path)
+
+
+
+            def get_modified_time(self):
+
+                return None
+
+
+
+            @classmethod
+
+            def get_version(cls, settings, path):
+
+                return "42"
+
+
+
+        class StaticUrlHandler(RequestHandler):
+
+            def get(self, path):
+
+                self.write(self.static_url(path))
+
+
+
+        self.static_handler_class = MyStaticFileHandler
+
+
+
+        return [("/static_url/(.*)", StaticUrlHandler)]
+
+
+
+    def get_app_kwargs(self):
+
+        return dict(static_path="dummy",
+
+                    static_handler_class=self.static_handler_class)
+
+
+
+    def test_serve(self):
+
+        response = self.fetch("/static/foo.42.txt")
+
+        self.assertEqual(response.body, b"bar")
+
+
+
+    def test_static_url(self):
+
+        with ExpectLog(gen_log, "Could not open static file", required=False):
+
+            response = self.fetch("/static_url/foo.txt")
+
+            self.assertEqual(response.body, b"/static/foo.42.txt")
+
+
+
+
+
+@wsgi_safe
+
+class HostMatchingTest(WebTestCase):
+
+    class Handler(RequestHandler):
+
+        def initialize(self, reply):
+
+            self.reply = reply
+
+
+
+        def get(self):
+
+            self.write(self.reply)
+
+
+
+    def get_handlers(self):
+
+        return [("/foo", HostMatchingTest.Handler, {"reply": "wildcard"})]
+
+
+
+    def test_host_matching(self):
+
+        self.app.add_handlers("www.example.com",
+
+                              [("/foo", HostMatchingTest.Handler, {"reply": "[0]"})])
+
+        self.app.add_handlers(r"www\.example\.com",
+
+                              [("/bar", HostMatchingTest.Handler, {"reply": "[1]"})])
+
+        self.app.add_handlers("www.example.com",
+
+                              [("/baz", HostMatchingTest.Handler, {"reply": "[2]"})])
+
+
+
+        response = self.fetch("/foo")
+
+        self.assertEqual(response.body, b"wildcard")
+
+        response = self.fetch("/bar")
+
+        self.assertEqual(response.code, 404)
+
+        response = self.fetch("/baz")
+
+        self.assertEqual(response.code, 404)
+
+
+
+        response = self.fetch("/foo", headers={'Host': 'www.example.com'})
+
+        self.assertEqual(response.body, b"[0]")
+
+        response = self.fetch("/bar", headers={'Host': 'www.example.com'})
+
+        self.assertEqual(response.body, b"[1]")
+
+        response = self.fetch("/baz", headers={'Host': 'www.example.com'})
+
+        self.assertEqual(response.body, b"[2]")
+
+
+
+
+
+@wsgi_safe
+
+class NamedURLSpecGroupsTest(WebTestCase):
+
+    def get_handlers(self):
+
+        class EchoHandler(RequestHandler):
+
+            def get(self, path):
+
+                self.write(path)
+
+
+
+        return [("/str/(?P<path>.*)", EchoHandler),
+
+                (u("/unicode/(?P<path>.*)"), EchoHandler)]
+
+
+
+    def test_named_urlspec_groups(self):
+
+        response = self.fetch("/str/foo")
+
+        self.assertEqual(response.body, b"foo")
+
+
+
+        response = self.fetch("/unicode/bar")
+
+        self.assertEqual(response.body, b"bar")
+
+
+
+
+
+@wsgi_safe
+
+class ClearHeaderTest(SimpleHandlerTestCase):
+
+    class Handler(RequestHandler):
+
+        def get(self):
+
+            self.set_header("h1", "foo")
+
+            self.set_header("h2", "bar")
+
+            self.clear_header("h1")
+
+            self.clear_header("nonexistent")
+
+
+
+    def test_clear_header(self):
+
+        response = self.fetch("/")
+
+        self.assertTrue("h1" not in response.headers)
+
+        self.assertEqual(response.headers["h2"], "bar")
+
+
+
+
+
+@wsgi_safe
+
+class Header304Test(SimpleHandlerTestCase):
+
+    class Handler(RequestHandler):
+
+        def get(self):
+
+            self.set_header("Content-Language", "en_US")
+
+            self.write("hello")
+
+
+
+    def test_304_headers(self):
+
+        response1 = self.fetch('/')
+
+        self.assertEqual(response1.headers["Content-Length"], "5")
+
+        self.assertEqual(response1.headers["Content-Language"], "en_US")
+
+
+
+        response2 = self.fetch('/', headers={
+
+            'If-None-Match': response1.headers["Etag"]})
+
+        self.assertEqual(response2.code, 304)
+
+        self.assertTrue("Content-Length" not in response2.headers)
+
+        self.assertTrue("Content-Language" not in response2.headers)
+
+        # Not an entity header, but should not be added to 304s by chunking
+
+        self.assertTrue("Transfer-Encoding" not in response2.headers)
+
+
+
+
+
+@wsgi_safe
+
+class StatusReasonTest(SimpleHandlerTestCase):
+
+    class Handler(RequestHandler):
+
+        def get(self):
+
+            reason = self.request.arguments.get('reason', [])
+
+            self.set_status(int(self.get_argument('code')),
+
+                            reason=reason[0] if reason else None)
+
+
+
+    def get_http_client(self):
+
+        # simple_httpclient only: curl doesn't expose the reason string
+
+        return SimpleAsyncHTTPClient(io_loop=self.io_loop)
+
+
+
+    def test_status(self):
+
+        response = self.fetch("/?code=304")
+
+        self.assertEqual(response.code, 304)
+
+        self.assertEqual(response.reason, "Not Modified")
+
+        response = self.fetch("/?code=304&reason=Foo")
+
+        self.assertEqual(response.code, 304)
+
+        self.assertEqual(response.reason, "Foo")
+
+        response = self.fetch("/?code=682&reason=Bar")
+
+        self.assertEqual(response.code, 682)
+
+        self.assertEqual(response.reason, "Bar")
+
+        with ExpectLog(app_log, 'Uncaught exception'):
+
+            response = self.fetch("/?code=682")
+
+        self.assertEqual(response.code, 500)
+
+
+
+
+
+@wsgi_safe
+
+class DateHeaderTest(SimpleHandlerTestCase):
+
+    class Handler(RequestHandler):
+
+        def get(self):
+
+            self.write("hello")
+
+
+
+    def test_date_header(self):
+
+        response = self.fetch('/')
+
+        header_date = datetime.datetime(
+
+            *email.utils.parsedate(response.headers['Date'])[:6])
+
+        self.assertTrue(header_date - datetime.datetime.utcnow() <
+
+                        datetime.timedelta(seconds=2))
+
+
+
+
+
+@wsgi_safe
+
+class RaiseWithReasonTest(SimpleHandlerTestCase):
+
+    class Handler(RequestHandler):
+
+        def get(self):
+
+            raise HTTPError(682, reason="Foo")
+
+
+
+    def get_http_client(self):
+
+        # simple_httpclient only: curl doesn't expose the reason string
+
+        return SimpleAsyncHTTPClient(io_loop=self.io_loop)
+
+
+
+    def test_raise_with_reason(self):
+
+        response = self.fetch("/")
+
+        self.assertEqual(response.code, 682)
+
+        self.assertEqual(response.reason, "Foo")
+
+        self.assertIn(b'682: Foo', response.body)
+
+
+
+    def test_httperror_str(self):
+
+        self.assertEqual(str(HTTPError(682, reason="Foo")), "HTTP 682: Foo")
+
+
+
+
+
+@wsgi_safe
+
+class ErrorHandlerXSRFTest(WebTestCase):
+
+    def get_handlers(self):
+
+        # note that if the handlers list is empty we get the default_host
+
+        # redirect fallback instead of a 404, so test with both an
+
+        # explicitly defined error handler and an implicit 404.
+
+        return [('/error', ErrorHandler, dict(status_code=417))]
+
+
+
+    def get_app_kwargs(self):
+
+        return dict(xsrf_cookies=True)
+
+
+
+    def test_error_xsrf(self):
+
+        response = self.fetch('/error', method='POST', body='')
+
+        self.assertEqual(response.code, 417)
+
+
+
+    def test_404_xsrf(self):
+
+        response = self.fetch('/404', method='POST', body='')
+
+        self.assertEqual(response.code, 404)
+
+
+
+
+
+class GzipTestCase(SimpleHandlerTestCase):
+
+    class Handler(RequestHandler):
+
+        def get(self):
+
+            if self.get_argument('vary', None):
+
+                self.set_header('Vary', self.get_argument('vary'))
+
+            self.write('hello world')
+
+
+
+    def get_app_kwargs(self):
+
+        return dict(gzip=True)
+
+
+
+    def test_gzip(self):
+
+        response = self.fetch('/')
+
+        self.assertEqual(response.headers['Content-Encoding'], 'gzip')
+
+        self.assertEqual(response.headers['Vary'], 'Accept-Encoding')
+
+
+
+    def test_gzip_not_requested(self):
+
+        response = self.fetch('/', use_gzip=False)
+
+        self.assertNotIn('Content-Encoding', response.headers)
+
+        self.assertEqual(response.headers['Vary'], 'Accept-Encoding')
+
+
+
+    def test_vary_already_present(self):
+
+        response = self.fetch('/?vary=Accept-Language')
+
+        self.assertEqual(response.headers['Vary'],
+
+                         'Accept-Language, Accept-Encoding')
+
+
+
+
+
+@wsgi_safe
+
+class PathArgsInPrepareTest(WebTestCase):
+
+    class Handler(RequestHandler):
+
+        def prepare(self):
+
+            self.write(dict(args=self.path_args, kwargs=self.path_kwargs))
+
+
+
+        def get(self, path):
+
+            assert path == 'foo'
+
+            self.finish()
+
+
+
+    def get_handlers(self):
+
+        return [('/pos/(.*)', self.Handler),
+
+                ('/kw/(?P<path>.*)', self.Handler)]
+
+
+
+    def test_pos(self):
+
+        response = self.fetch('/pos/foo')
+
+        response.rethrow()
+
+        data = json_decode(response.body)
+
+        self.assertEqual(data, {'args': ['foo'], 'kwargs': {}})
+
+
+
+    def test_kw(self):
+
+        response = self.fetch('/kw/foo')
+
+        response.rethrow()
+
+        data = json_decode(response.body)
+
+        self.assertEqual(data, {'args': [], 'kwargs': {'path': 'foo'}})
+
+
+
+
+
+@wsgi_safe
+
+class ClearAllCookiesTest(SimpleHandlerTestCase):
+
+    class Handler(RequestHandler):
+
+        def get(self):
+
+            self.clear_all_cookies()
+
+            self.write('ok')
+
+
+
+    def test_clear_all_cookies(self):
+
+        response = self.fetch('/', headers={'Cookie': 'foo=bar; baz=xyzzy'})
+
+        set_cookies = sorted(response.headers.get_list('Set-Cookie'))
+
+        self.assertTrue(set_cookies[0].startswith('baz=;'))
+
+        self.assertTrue(set_cookies[1].startswith('foo=;'))
+
+
+
+
+
+class PermissionError(Exception):
+
+    pass
+
+
+
+
+
+@wsgi_safe
+
+class ExceptionHandlerTest(SimpleHandlerTestCase):
+
+    class Handler(RequestHandler):
+
+        def get(self):
+
+            exc = self.get_argument('exc')
+
+            if exc == 'http':
+
+                raise HTTPError(410, "no longer here")
+
+            elif exc == 'zero':
+
+                1 / 0
+
+            elif exc == 'permission':
+
+                raise PermissionError('not allowed')
+
+
+
+        def write_error(self, status_code, **kwargs):
+
+            if 'exc_info' in kwargs:
+
+                typ, value, tb = kwargs['exc_info']
+
+                if isinstance(value, PermissionError):
+
+                    self.set_status(403)
+
+                    self.write('PermissionError')
+
+                    return
+
+            RequestHandler.write_error(self, status_code, **kwargs)
+
+
+
+        def log_exception(self, typ, value, tb):
+
+            if isinstance(value, PermissionError):
+
+                app_log.warning('custom logging for PermissionError: %s',
+
+                                value.args[0])
+
+            else:
+
+                RequestHandler.log_exception(self, typ, value, tb)
+
+
+
+    def test_http_error(self):
+
+        # HTTPErrors are logged as warnings with no stack trace.
+
+        # TODO: extend ExpectLog to test this more precisely
+
+        with ExpectLog(gen_log, '.*no longer here'):
+
+            response = self.fetch('/?exc=http')
+
+            self.assertEqual(response.code, 410)
+
+
+
+    def test_unknown_error(self):
+
+        # Unknown errors are logged as errors with a stack trace.
+
+        with ExpectLog(app_log, 'Uncaught exception'):
+
+            response = self.fetch('/?exc=zero')
+
+            self.assertEqual(response.code, 500)
+
+
+
+    def test_known_error(self):
+
+        # log_exception can override logging behavior, and write_error
+
+        # can override the response.
+
+        with ExpectLog(app_log,
+
+                       'custom logging for PermissionError: not allowed'):
+
+            response = self.fetch('/?exc=permission')
+
+            self.assertEqual(response.code, 403)
+
+
+
+
+
+@wsgi_safe
+
+class UIMethodUIModuleTest(SimpleHandlerTestCase):
+
+    """Test that UI methods and modules are created correctly and
+
+    associated with the handler.
+
+    """
+
+    class Handler(RequestHandler):
+
+        def get(self):
+
+            self.render('foo.html')
+
+
+
+        def value(self):
+
+            return self.get_argument("value")
+
+
+
+    def get_app_kwargs(self):
+
+        def my_ui_method(handler, x):
+
+            return "In my_ui_method(%s) with handler value %s." % (
+
+                x, handler.value())
+
+        class MyModule(UIModule):
+
+            def render(self, x):
+
+                return "In MyModule(%s) with handler value %s." % (
+
+                    x, self.handler.value())
+
+
+
+        loader = DictLoader({
+
+            'foo.html': '{{ my_ui_method(42) }} {% module MyModule(123) %}',
+
+        })
+
+        return dict(template_loader=loader,
+
+                    ui_methods={'my_ui_method': my_ui_method},
+
+                    ui_modules={'MyModule': MyModule})
+
+
+
+    def tearDown(self):
+
+        super(UIMethodUIModuleTest, self).tearDown()
+
+        # TODO: fix template loader caching so this isn't necessary.
+
+        RequestHandler._template_loaders.clear()
+
+
+
+    def test_ui_method(self):
+
+        response = self.fetch('/?value=asdf')
+
+        self.assertEqual(response.body,
+
+                         b'In my_ui_method(42) with handler value asdf. '
+
+                         b'In MyModule(123) with handler value asdf.')
+
+
+
+
+
+@wsgi_safe
+
+class GetArgumentErrorTest(SimpleHandlerTestCase):
+
+    class Handler(RequestHandler):
+
+        def get(self):
+
+            try:
+
+                self.get_argument('foo')
+
+                self.write({})
+
+            except MissingArgumentError as e:
+
+                self.write({'arg_name': e.arg_name,
+
+                            'log_message': e.log_message})
+
+
+
+    def test_catch_error(self):
+
+        response = self.fetch('/')
+
+        self.assertEqual(json_decode(response.body),
+
+                         {'arg_name': 'foo',
+
+                          'log_message': 'Missing argument foo'})
+
+
+
+
+
+class MultipleExceptionTest(SimpleHandlerTestCase):
+
+    class Handler(RequestHandler):
+
+        exc_count = 0
+
+
+
+        @asynchronous
+
+        def get(self):
+
+            from tornado.ioloop import IOLoop
+
+            IOLoop.current().add_callback(lambda: 1 / 0)
+
+            IOLoop.current().add_callback(lambda: 1 / 0)
+
+
+
+        def log_exception(self, typ, value, tb):
+
+            MultipleExceptionTest.Handler.exc_count += 1
+
+
+
+    def test_multi_exception(self):
+
+        # This test verifies that multiple exceptions raised into the same
+
+        # ExceptionStackContext do not generate extraneous log entries
+
+        # due to "Cannot send error response after headers written".
+
+        # log_exception is called, but it does not proceed to send_error.
+
+        response = self.fetch('/')
+
+        self.assertEqual(response.code, 500)
+
+        response = self.fetch('/')
+
+        self.assertEqual(response.code, 500)
+
+        # Each of our two requests generated two exceptions, we should have
+
+        # seen at least three of them by now (the fourth may still be
+
+        # in the queue).
+
+        self.assertGreater(MultipleExceptionTest.Handler.exc_count, 2)
+
+
+
+
+
+@wsgi_safe
+
+class SetCurrentUserTest(SimpleHandlerTestCase):
+
+    class Handler(RequestHandler):
+
+        def prepare(self):
+
+            self.current_user = 'Ben'
+
+
+
+        def get(self):
+
+            self.write('Hello %s' % self.current_user)
+
+
+
+    def test_set_current_user(self):
+
+        # Ensure that current_user can be assigned to normally for apps
+
+        # that want to forgo the lazy get_current_user property
+
+        response = self.fetch('/')
+
+        self.assertEqual(response.body, b'Hello Ben')
+
+
+
+
+
+@wsgi_safe
+
+class GetCurrentUserTest(WebTestCase):
+
+    def get_app_kwargs(self):
+
+        class WithoutUserModule(UIModule):
+
+            def render(self):
+
+                return ''
+
+
+
+        class WithUserModule(UIModule):
+
+            def render(self):
+
+                return str(self.current_user)
+
+
+
+        loader = DictLoader({
+
+            'without_user.html': '',
+
+            'with_user.html': '{{ current_user }}',
+
+            'without_user_module.html': '{% module WithoutUserModule() %}',
+
+            'with_user_module.html': '{% module WithUserModule() %}',
+
+        })
+
+        return dict(template_loader=loader,
+
+                    ui_modules={'WithUserModule': WithUserModule,
+
+                                'WithoutUserModule': WithoutUserModule})
+
+
+
+    def tearDown(self):
+
+        super(GetCurrentUserTest, self).tearDown()
+
+        RequestHandler._template_loaders.clear()
+
+
+
+    def get_handlers(self):
+
+        class CurrentUserHandler(RequestHandler):
+
+            def prepare(self):
+
+                self.has_loaded_current_user = False
+
+
+
+            def get_current_user(self):
+
+                self.has_loaded_current_user = True
+
+                return ''
+
+
+
+        class WithoutUserHandler(CurrentUserHandler):
+
+            def get(self):
+
+                self.render_string('without_user.html')
+
+                self.finish(str(self.has_loaded_current_user))
+
+
+
+        class WithUserHandler(CurrentUserHandler):
+
+            def get(self):
+
+                self.render_string('with_user.html')
+
+                self.finish(str(self.has_loaded_current_user))
+
+
+
+        class CurrentUserModuleHandler(CurrentUserHandler):
+
+            def get_template_namespace(self):
+
+                # If RequestHandler.get_template_namespace is called, then
+
+                # get_current_user is evaluated. Until #820 is fixed, this
+
+                # is a small hack to circumvent the issue.
+
+                return self.ui
+
+
+
+        class WithoutUserModuleHandler(CurrentUserModuleHandler):
+
+            def get(self):
+
+                self.render_string('without_user_module.html')
+
+                self.finish(str(self.has_loaded_current_user))
+
+
+
+        class WithUserModuleHandler(CurrentUserModuleHandler):
+
+            def get(self):
+
+                self.render_string('with_user_module.html')
+
+                self.finish(str(self.has_loaded_current_user))
+
+
+
+        return [('/without_user', WithoutUserHandler),
+
+                ('/with_user', WithUserHandler),
+
+                ('/without_user_module', WithoutUserModuleHandler),
+
+                ('/with_user_module', WithUserModuleHandler)]
+
+
+
+    @unittest.skip('needs fix')
+
+    def test_get_current_user_is_lazy(self):
+
+        # TODO: Make this test pass. See #820.
+
+        response = self.fetch('/without_user')
+
+        self.assertEqual(response.body, b'False')
+
+
+
+    def test_get_current_user_works(self):
+
+        response = self.fetch('/with_user')
+
+        self.assertEqual(response.body, b'True')
+
+
+
+    def test_get_current_user_from_ui_module_is_lazy(self):
+
+        response = self.fetch('/without_user_module')
+
+        self.assertEqual(response.body, b'False')
+
+
+
+    def test_get_current_user_from_ui_module_works(self):
+
+        response = self.fetch('/with_user_module')
+
+        self.assertEqual(response.body, b'True')
+
+
+
+
+
+@wsgi_safe
+
+class UnimplementedHTTPMethodsTest(SimpleHandlerTestCase):
+
+    class Handler(RequestHandler):
+
+        pass
+
+
+
+    def test_unimplemented_standard_methods(self):
+
+        for method in ['HEAD', 'GET', 'DELETE', 'OPTIONS']:
+
+            response = self.fetch('/', method=method)
+
+            self.assertEqual(response.code, 405)
+
+        for method in ['POST', 'PUT']:
+
+            response = self.fetch('/', method=method, body=b'')
+
+            self.assertEqual(response.code, 405)
+
+
+
+
+
+class UnimplementedNonStandardMethodsTest(SimpleHandlerTestCase):
+
+    # wsgiref.validate complains about unknown methods in a way that makes
+
+    # this test not wsgi_safe.
+
+    class Handler(RequestHandler):
+
+        def other(self):
+
+            # Even though this method exists, it won't get called automatically
+
+            # because it is not in SUPPORTED_METHODS.
+
+            self.write('other')
+
+
+
+    def test_unimplemented_patch(self):
+
+        # PATCH is recently standardized; Tornado supports it by default
+
+        # but wsgiref.validate doesn't like it.
+
+        response = self.fetch('/', method='PATCH', body=b'')
+
+        self.assertEqual(response.code, 405)
+
+
+
+    def test_unimplemented_other(self):
+
+        response = self.fetch('/', method='OTHER',
+
+                              allow_nonstandard_methods=True)
+
+        self.assertEqual(response.code, 405)
+
+
+
+
+
+@wsgi_safe
+
+class AllHTTPMethodsTest(SimpleHandlerTestCase):
+
+    class Handler(RequestHandler):
+
+        def method(self):
+
+            self.write(self.request.method)
+
+
+
+        get = delete = options = post = put = method
+
+
+
+    def test_standard_methods(self):
+
+        response = self.fetch('/', method='HEAD')
+
+        self.assertEqual(response.body, b'')
+
+        for method in ['GET', 'DELETE', 'OPTIONS']:
+
+            response = self.fetch('/', method=method)
+
+            self.assertEqual(response.body, utf8(method))
+
+        for method in ['POST', 'PUT']:
+
+            response = self.fetch('/', method=method, body=b'')
+
+            self.assertEqual(response.body, utf8(method))
+
+
+
+
+
+class PatchMethodTest(SimpleHandlerTestCase):
+
+    class Handler(RequestHandler):
+
+        SUPPORTED_METHODS = RequestHandler.SUPPORTED_METHODS + ('OTHER',)
+
+
+
+        def patch(self):
+
+            self.write('patch')
+
+
+
+        def other(self):
+
+            self.write('other')
+
+
+
+    def test_patch(self):
+
+        response = self.fetch('/', method='PATCH', body=b'')
+
+        self.assertEqual(response.body, b'patch')
+
+
+
+    def test_other(self):
+
+        response = self.fetch('/', method='OTHER',
+
+                              allow_nonstandard_methods=True)
+
+        self.assertEqual(response.body, b'other')
+
+
+
+
+
+@wsgi_safe
+
+class FinishInPrepareTest(SimpleHandlerTestCase):
+
+    class Handler(RequestHandler):
+
+        def prepare(self):
+
+            self.finish('done')
+
+
+
+        def get(self):
+
+            # It's difficult to assert for certain that a method did not
+
+            # or will not be called in an asynchronous context, but this
+
+            # will be logged noisily if it is reached.
+
+            raise Exception('should not reach this method')
+
+
+
+    def test_finish_in_prepare(self):
+
+        response = self.fetch('/')
+
+        self.assertEqual(response.body, b'done')
+
+
+
+
+
+@wsgi_safe
+
+class Default404Test(WebTestCase):
+
+    def get_handlers(self):
+
+        # If there are no handlers at all a default redirect handler gets added.
+
+        return [('/foo', RequestHandler)]
+
+
+
+    def test_404(self):
+
+        response = self.fetch('/')
+
+        self.assertEqual(response.code, 404)
+
+        self.assertEqual(response.body,
+
+                         b'<html><title>404: Not Found</title>'
+
+                         b'<body>404: Not Found</body></html>')
+
+
+
+
+
+@wsgi_safe
+
+class Custom404Test(WebTestCase):
+
+    def get_handlers(self):
+
+        return [('/foo', RequestHandler)]
+
+
+
+    def get_app_kwargs(self):
+
+        class Custom404Handler(RequestHandler):
+
+            def get(self):
+
+                self.set_status(404)
+
+                self.write('custom 404 response')
+
+
+
+        return dict(default_handler_class=Custom404Handler)
+
+
+
+    def test_404(self):
+
+        response = self.fetch('/')
+
+        self.assertEqual(response.code, 404)
+
+        self.assertEqual(response.body, b'custom 404 response')
+
+
+
+
+
+@wsgi_safe
+
+class DefaultHandlerArgumentsTest(WebTestCase):
+
+    def get_handlers(self):
+
+        return [('/foo', RequestHandler)]
+
+
+
+    def get_app_kwargs(self):
+
+        return dict(default_handler_class=ErrorHandler,
+
+                    default_handler_args=dict(status_code=403))
+
+
+
+    def test_403(self):
+
+        response = self.fetch('/')
+
+        self.assertEqual(response.code, 403)
+
+
+
+
+
+@wsgi_safe
+
+class HandlerByNameTest(WebTestCase):
+
+    def get_handlers(self):
+
+        # All three are equivalent.
+
+        return [('/hello1', HelloHandler),
+
+                ('/hello2', 'tornado.test.web_test.HelloHandler'),
+
+                url('/hello3', 'tornado.test.web_test.HelloHandler'),
+
+                ]
+
+
+
+    def test_handler_by_name(self):
+
+        resp = self.fetch('/hello1')
+
+        self.assertEqual(resp.body, b'hello')
+
+        resp = self.fetch('/hello2')
+
+        self.assertEqual(resp.body, b'hello')
+
+        resp = self.fetch('/hello3')
+
+        self.assertEqual(resp.body, b'hello')
+
+
+
+
+
+class SignedValueTest(unittest.TestCase):
+
+    SECRET = "It's a secret to everybody"
+
+
+
+    def past(self):
+
+        return self.present() - 86400 * 32
+
+
+
+    def present(self):
+
+        return 1300000000
+
+
+
+    def test_known_values(self):
+
+        signed_v1 = create_signed_value(SignedValueTest.SECRET, "key", "value",
+
+                                        version=1, clock=self.present)
+
+        self.assertEqual(
+
+            signed_v1,
+
+            b"dmFsdWU=|1300000000|31c934969f53e48164c50768b40cbd7e2daaaa4f")
+
+
+
+        signed_v2 = create_signed_value(SignedValueTest.SECRET, "key", "value",
+
+                                        version=2, clock=self.present)
+
+        self.assertEqual(
+
+            signed_v2,
+
+            b"2|1:0|10:1300000000|3:key|8:dmFsdWU=|"
+
+            b"3d4e60b996ff9c5d5788e333a0cba6f238a22c6c0f94788870e1a9ecd482e152")
+
+
+
+        signed_default = create_signed_value(SignedValueTest.SECRET,
+
+                                             "key", "value", clock=self.present)
+
+        self.assertEqual(signed_default, signed_v2)
+
+
+
+        decoded_v1 = decode_signed_value(SignedValueTest.SECRET, "key",
+
+                                         signed_v1, min_version=1,
+
+                                         clock=self.present)
+
+        self.assertEqual(decoded_v1, b"value")
+
+
+
+        decoded_v2 = decode_signed_value(SignedValueTest.SECRET, "key",
+
+                                         signed_v2, min_version=2,
+
+                                         clock=self.present)
+
+        self.assertEqual(decoded_v2, b"value")
+
+
+
+    def test_name_swap(self):
+
+        signed1 = create_signed_value(SignedValueTest.SECRET, "key1", "value",
+
+                                      clock=self.present)
+
+        signed2 = create_signed_value(SignedValueTest.SECRET, "key2", "value",
+
+                                      clock=self.present)
+
+        # Try decoding each string with the other's "name"
+
+        decoded1 = decode_signed_value(SignedValueTest.SECRET, "key2", signed1,
+
+                                       clock=self.present)
+
+        self.assertIs(decoded1, None)
+
+        decoded2 = decode_signed_value(SignedValueTest.SECRET, "key1", signed2,
+
+                                       clock=self.present)
+
+        self.assertIs(decoded2, None)
+
+
+
+    def test_expired(self):
+
+        signed = create_signed_value(SignedValueTest.SECRET, "key1", "value",
+
+                                     clock=self.past)
+
+        decoded_past = decode_signed_value(SignedValueTest.SECRET, "key1",
+
+                                           signed, clock=self.past)
+
+        self.assertEqual(decoded_past, b"value")
+
+        decoded_present = decode_signed_value(SignedValueTest.SECRET, "key1",
+
+                                              signed, clock=self.present)
+
+        self.assertIs(decoded_present, None)
+
+
+
+    def test_payload_tampering(self):
+
+        # These cookies are variants of the one in test_known_values.
+
+        sig = "3d4e60b996ff9c5d5788e333a0cba6f238a22c6c0f94788870e1a9ecd482e152"
+
+        def validate(prefix):
+
+            return (b'value' ==
+
+                    decode_signed_value(SignedValueTest.SECRET, "key",
+
+                                        prefix + sig, clock=self.present))
+
+        self.assertTrue(validate("2|1:0|10:1300000000|3:key|8:dmFsdWU=|"))
+
+        # Change key version
+
+        self.assertFalse(validate("2|1:1|10:1300000000|3:key|8:dmFsdWU=|"))
+
+        # length mismatch (field too short)
+
+        self.assertFalse(validate("2|1:0|10:130000000|3:key|8:dmFsdWU=|"))
+
+        # length mismatch (field too long)
+
+        self.assertFalse(validate("2|1:0|10:1300000000|3:keey|8:dmFsdWU=|"))
+
+
+
+    def test_signature_tampering(self):
+
+        prefix = "2|1:0|10:1300000000|3:key|8:dmFsdWU=|"
+
+        def validate(sig):
+
+            return (b'value' ==
+
+                    decode_signed_value(SignedValueTest.SECRET, "key",
+
+                                        prefix + sig, clock=self.present))
+
+        self.assertTrue(validate(
+
+            "3d4e60b996ff9c5d5788e333a0cba6f238a22c6c0f94788870e1a9ecd482e152"))
+
+        # All zeros
+
+        self.assertFalse(validate("0" * 32))
+
+        # Change one character
+
+        self.assertFalse(validate(
+
+            "4d4e60b996ff9c5d5788e333a0cba6f238a22c6c0f94788870e1a9ecd482e152"))
+
+        # Change another character
+
+        self.assertFalse(validate(
+
+            "3d4e60b996ff9c5d5788e333a0cba6f238a22c6c0f94788870e1a9ecd482e153"))
+
+        # Truncate
+
+        self.assertFalse(validate(
+
+            "3d4e60b996ff9c5d5788e333a0cba6f238a22c6c0f94788870e1a9ecd482e15"))
+
+        # Lengthen
+
+        self.assertFalse(validate(
+
+            "3d4e60b996ff9c5d5788e333a0cba6f238a22c6c0f94788870e1a9ecd482e1538"))
+
+
+
+    def test_non_ascii(self):
+
+        value = b"\xe9"
+
+        signed = create_signed_value(SignedValueTest.SECRET, "key", value,
+
+                                     clock=self.present)
+
+        decoded = decode_signed_value(SignedValueTest.SECRET, "key", signed,
+
+                                      clock=self.present)
+
+        self.assertEqual(value, decoded)
+
+
+
+
+
+@wsgi_safe
+
+class XSRFTest(SimpleHandlerTestCase):
+
+    class Handler(RequestHandler):
+
+        def get(self):
+
+            self.write(self.xsrf_token)
+
+
+
+        def post(self):
+
+            self.write("ok")
+
+
+
+    def get_app_kwargs(self):
+
+        return dict(xsrf_cookies=True)
+
+
+
+    def setUp(self):
+
+        super(XSRFTest, self).setUp()
+
+        self.xsrf_token = self.get_token()
+
+
+
+    def get_token(self, old_token=None):
+
+        if old_token is not None:
+
+            headers = self.cookie_headers(old_token)
+
+        else:
+
+            headers = None
+
+        response = self.fetch("/", headers=headers)
+
+        response.rethrow()
+
+        return native_str(response.body)
+
+
+
+    def cookie_headers(self, token=None):
+
+        if token is None:
+
+            token = self.xsrf_token
+
+        return {"Cookie": "_xsrf=" + token}
+
+
+
+    def test_xsrf_fail_no_token(self):
+
+        with ExpectLog(gen_log, ".*'_xsrf' argument missing"):
+
+            response = self.fetch("/", method="POST", body=b"")
+
+        self.assertEqual(response.code, 403)
+
+
+
+    def test_xsrf_fail_body_no_cookie(self):
+
+        with ExpectLog(gen_log, ".*XSRF cookie does not match POST"):
+
+            response = self.fetch(
+
+                "/", method="POST",
+
+                body=urllib_parse.urlencode(dict(_xsrf=self.xsrf_token)))
+
+        self.assertEqual(response.code, 403)
+
+
+
+    def test_xsrf_fail_cookie_no_body(self):
+
+        with ExpectLog(gen_log, ".*'_xsrf' argument missing"):
+
+            response = self.fetch(
+
+                "/", method="POST", body=b"",
+
+                headers=self.cookie_headers())
+
+        self.assertEqual(response.code, 403)
+
+
+
+    def test_xsrf_success_post_body(self):
+
+        response = self.fetch(
+
+            "/", method="POST",
+
+            body=urllib_parse.urlencode(dict(_xsrf=self.xsrf_token)),
+
+            headers=self.cookie_headers())
+
+        self.assertEqual(response.code, 200)
+
+
+
+    def test_xsrf_success_query_string(self):
+
+        response = self.fetch(
+
+            "/?" + urllib_parse.urlencode(dict(_xsrf=self.xsrf_token)),
+
+            method="POST", body=b"",
+
+            headers=self.cookie_headers())
+
+        self.assertEqual(response.code, 200)
+
+
+
+    def test_xsrf_success_header(self):
+
+        response = self.fetch("/", method="POST", body=b"",
+
+                              headers=dict({"X-Xsrftoken": self.xsrf_token},
+
+                                           **self.cookie_headers()))
+
+        self.assertEqual(response.code, 200)
+
+
+
+    def test_distinct_tokens(self):
+
+        # Every request gets a distinct token.
+
+        NUM_TOKENS = 10
+
+        tokens = set()
+
+        for i in range(NUM_TOKENS):
+
+            tokens.add(self.get_token())
+
+        self.assertEqual(len(tokens), NUM_TOKENS)
+
+
+
+    def test_cross_user(self):
+
+        token2 = self.get_token()
+
+        # Each token can be used to authenticate its own request.
+
+        for token in (self.xsrf_token, token2):
+
+            response  = self.fetch(
+
+                "/", method="POST",
+
+                body=urllib_parse.urlencode(dict(_xsrf=token)),
+
+                headers=self.cookie_headers(token))
+
+            self.assertEqual(response.code, 200)
+
+        # Sending one in the cookie and the other in the body is not allowed.
+
+        for cookie_token, body_token in ((self.xsrf_token, token2),
+
+                                         (token2, self.xsrf_token)):
+
+            with ExpectLog(gen_log, '.*XSRF cookie does not match POST'):
+
+                response = self.fetch(
+
+                    "/", method="POST",
+
+                    body=urllib_parse.urlencode(dict(_xsrf=body_token)),
+
+                    headers=self.cookie_headers(cookie_token))
+
+            self.assertEqual(response.code, 403)
+
+
+
+    def test_refresh_token(self):
+
+        token = self.xsrf_token
+
+        # A user's token is stable over time.  Refreshing the page in one tab
+
+        # might update the cookie while an older tab still has the old cookie
+
+        # in its DOM.  Simulate this scenario by passing a constant token
+
+        # in the body and re-querying for the token.
+
+        for i in range(5):
+
+            token = self.get_token(token)
+
+            # Implementation detail: the same token is returned each time
+
+            self.assertEqual(token, self.xsrf_token)
+
+            response = self.fetch(
+
+                "/", method="POST",
+
+                body=urllib_parse.urlencode(dict(_xsrf=self.xsrf_token)),
+
+                headers=self.cookie_headers(token))
+
+            self.assertEqual(response.code, 200)

@@ -2,410 +2,592 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# -*- coding: utf-8 -*-
+# tests.conf_tests
 
+# Testing the configuration module for Confire
 
+#
 
-import datetime
+# Author:   Benjamin Bengfort <benjamin@bengfort.com>
 
-from typing import Any
+# Created:  Sun Jul 20 09:43:33 2014 -0400
 
+#
 
+# Copyright (C) 2014 Bengfort.com
 
-import django
+# For license information, see LICENSE.txt
 
-import mock
+#
 
-from django.conf import settings
+# ID: conf_tests.py [] benjamin@bengfort.com $
 
-from django.core import mail
 
-from django.http import HttpResponse
 
-from django.urls import reverse
+"""
 
-from django.utils.timezone import now
+Testing the configuration module for Confire
 
 
 
-from confirmation.models import Confirmation, generate_key, confirmation_url
+TODO: Write test for None values in config
 
-from zerver.lib.actions import do_start_email_change_process, do_set_realm_property
+TODO: Ensure that "empty" values e.g. [], and {} override on config
 
-from zerver.lib.test_classes import (
+TODO: Ensure that configure method is working correctly
 
-    ZulipTestCase,
+TODO: Ensure that testing is not dependent on a user's configuration
 
-)
+"""
 
-from zerver.lib.send_email import FromAddress
 
-from zerver.models import get_user, EmailChangeStatus, Realm, get_realm
 
+##########################################################################
 
+## Imports
 
+##########################################################################
 
 
-class EmailChangeTestCase(ZulipTestCase):
 
-    def test_confirm_email_change_with_non_existent_key(self):
+import os
 
-        # type: () -> None
+import shutil
 
-        self.login(self.example_email("hamlet"))
+import pytest
 
-        key = generate_key()
 
-        url = confirmation_url(key, 'testserver', Confirmation.EMAIL_CHANGE)
 
-        response = self.client_get(url)
+from copy import copy
 
-        self.assert_in_success_response(["Whoops. We couldn't find your confirmation link in the system."], response)
+from confire.config import *
 
+from confire.exceptions import *
 
 
-    def test_confirm_email_change_with_invalid_key(self):
 
-        # type: () -> None
 
-        self.login(self.example_email("hamlet"))
 
-        key = 'invalid key'
+##########################################################################
 
-        url = confirmation_url(key, 'testserver', Confirmation.EMAIL_CHANGE)
+## Fixtures
 
-        response = self.client_get(url)
+##########################################################################
 
-        self.assert_in_success_response(["Whoops. The confirmation link is malformed."], response)
 
 
+os.environ['TESTING_CONFIRE_PASSWORD'] = 'supersecretsquirrel'
 
-    def test_email_change_when_not_logging_in(self):
+TESTDATA = os.path.join(os.path.dirname(__file__), "testdata")
 
-        # type: () -> None
+TESTCONF = os.path.join(TESTDATA, "testconf.yaml")
 
-        key = generate_key()
 
-        url = confirmation_url(key, 'testserver', Confirmation.EMAIL_CHANGE)
 
-        response = self.client_get(url)
 
-        self.assertEqual(response.status_code, 302)
 
+class SubNestedConfiguration(Configuration):
 
 
-    def test_confirm_email_change_when_time_exceeded(self):
 
-        # type: () -> None
+    level = 2
 
-        user_profile = self.example_user('hamlet')
 
-        old_email = user_profile.email
 
-        new_email = 'hamlet-new@zulip.com'
 
-        self.login(self.example_email("hamlet"))
 
-        obj = EmailChangeStatus.objects.create(new_email=new_email,
+class NestedConfiguration(Configuration):
 
-                                               old_email=old_email,
 
-                                               user_profile=user_profile,
 
-                                               realm=user_profile.realm)
+    level  = 1
 
-        key = generate_key()
+    empty  = []
 
-        date_sent = now() - datetime.timedelta(days=2)
+    nested_path = path_setting(raises=False, required=False)
 
-        Confirmation.objects.create(content_object=obj,
+    nested = SubNestedConfiguration()
 
-                                    date_sent=date_sent,
 
-                                    confirmation_key=key,
 
-                                    type=Confirmation.EMAIL_CHANGE)
 
-        url = confirmation_url(key, user_profile.realm.host, Confirmation.EMAIL_CHANGE)
 
-        response = self.client_get(url)
+class MockConfiguration(Configuration):
 
-        self.assert_in_success_response(["Whoops. The confirmation link has expired."], response)
+    """
 
+    A subclass of the Configuration class for testing purposes.
 
+    """
 
-    def test_confirm_email_change(self):
 
-        # type: () -> None
 
-        user_profile = self.example_user('hamlet')
+    _notanopt = "joe"
 
-        old_email = user_profile.email
+    NOTANOPT  = "bob"
 
-        new_email = 'hamlet-new@zulip.com'
+    mysetting = True
 
-        new_realm = get_realm('zulip')
+    anoption  = 42
 
-        self.login(self.example_email('hamlet'))
+    paththere = "/var/log/there.pth"
 
-        obj = EmailChangeStatus.objects.create(new_email=new_email,
+    nested    = NestedConfiguration()
 
-                                               old_email=old_email,
+    password  = environ_setting('TESTING_CONFIRE_PASSWORD')
 
-                                               user_profile=user_profile,
+    myfile    = path_setting(raises=False)
 
-                                               realm=user_profile.realm)
+    datadir   = path_setting(default='/tmp/data/', raises=False)
 
-        key = generate_key()
 
-        Confirmation.objects.create(content_object=obj,
 
-                                    date_sent=now(),
+    def amethod(self):
 
-                                    confirmation_key=key,
+        return True
 
-                                    type=Confirmation.EMAIL_CHANGE)
 
-        url = confirmation_url(key, user_profile.realm.host, Confirmation.EMAIL_CHANGE)
 
-        response = self.client_get(url)
 
 
+@pytest.fixture(scope='function')
 
-        self.assertEqual(response.status_code, 200)
+def emptyconfig():
 
-        self.assert_in_success_response(["This confirms that the email address for your Zulip"],
+    """
 
-                                        response)
+    Remove default config paths to ensure clean tests
 
-        user_profile = get_user(new_email, new_realm)
+    """
 
-        self.assertTrue(bool(user_profile))
+    original_conf_paths = copy(Configuration.CONF_PATHS)
 
-        obj.refresh_from_db()
+    Configuration.CONF_PATHS = []
 
-        self.assertEqual(obj.status, 1)
+    yield original_conf_paths
 
+    Configuration.CONF_PATHS = original_conf_paths
 
 
-    def test_start_email_change_process(self):
 
-        # type: () -> None
 
-        user_profile = self.example_user('hamlet')
 
-        do_start_email_change_process(user_profile, 'hamlet-new@zulip.com')
+@pytest.fixture(scope='function')
 
-        self.assertEqual(EmailChangeStatus.objects.count(), 1)
+def testconfig(tmpdir, emptyconfig):
 
+    """
 
+    Copy the testconf.yaml file to a temporary directory and modify the
 
-    def test_end_to_end_flow(self):
+    lookup path of the Configuration object to look for it.
 
-        # type: () -> None
+    """
 
-        data = {'email': 'hamlet-new@zulip.com'}
+    f = tmpdir.mkdir("conf").join("test.yaml")
 
-        email = self.example_email("hamlet")
+    path = str(f)
 
-        self.login(email)
+    shutil.copy2(TESTCONF, path)
 
-        url = '/json/settings'
+    Configuration.CONF_PATHS = [path]
 
-        self.assertEqual(len(mail.outbox), 0)
+    yield path
 
-        result = self.client_patch(url, data)
+    f.remove()
 
-        self.assertEqual(len(mail.outbox), 1)
 
-        self.assert_in_success_response(['Check your email for a confirmation link.'], result)
 
-        email_message = mail.outbox[0]
 
-        self.assertEqual(
 
-            email_message.subject,
+##########################################################################
 
-            'Verify your new email address'
+## Configuration Unit Tests
 
-        )
+##########################################################################
 
-        body = email_message.body
 
-        from_email = email_message.from_email
 
-        self.assertIn('We received a request to change the email', body)
+class TestConfig(object):
 
-        self.assertIn('Zulip Account Security', from_email)
 
-        self.assertIn(FromAddress.NOREPLY, email_message.from_email)
 
+    def test_search_path(self):
 
+        """
 
-        activation_url = [s for s in body.split('\n') if s][4]
+        Assert there are default directories to search for configuration
 
-        response = self.client_get(activation_url)
+        """
 
+        assert len(Configuration.CONF_PATHS) > 0
 
 
-        self.assert_in_success_response(["This confirms that the email address"],
 
-                                        response)
+    def test_empty_conf_path(self, emptyconfig):
 
+        """
 
+        Test that an empty conf path raises no exceptions
 
-        # Now confirm trying to change your email back doesn't throw an immediate error
+        """
 
-        result = self.client_patch(url, {"email": "hamlet@zulip.com"})
+        config = MockConfiguration.load()
 
-        self.assert_in_success_response(['Check your email for a confirmation link.'], result)
+        assert len(Configuration.CONF_PATHS) == 0
 
+        assert config['mysetting']
 
+        assert config.get('myprop') is None
 
-    def test_unauthorized_email_change(self):
 
-        # type: () -> None
 
-        data = {'email': 'hamlet-new@zulip.com'}
+    @pytest.mark.filterwarnings("ignore")
 
-        user_profile = self.example_user('hamlet')
+    def test_load_config(self, testconfig):
 
-        email = user_profile.email
+        """
 
-        self.login(email)
+        Assert config can load from YAML
 
-        do_set_realm_property(user_profile.realm, 'email_changes_disabled', True)
+        """
 
-        url = '/json/settings'
 
-        result = self.client_patch(url, data)
 
-        self.assertEqual(len(mail.outbox), 0)
+        config = MockConfiguration.load()
 
-        self.assertEqual(result.status_code, 400)
 
-        self.assert_in_response("Email address changes are disabled in this organization.",
 
-                                result)
+        assert config.get('myfile') is not None
 
+        assert config.get('myprop') is not None
 
+        assert isinstance(config.get('nested'), NestedConfiguration)
 
-    def test_email_change_already_taken(self):
+        assert config.get("nested").get("level") == "floor"
 
-        # type: () -> None
 
-        data = {'email': 'cordelia@zulip.com'}
 
-        user_profile = self.example_user('hamlet')
+    @pytest.mark.filterwarnings("ignore")
 
-        email = user_profile.email
+    def test_load_override(self, testconfig):
 
-        self.login(email)
+        """
 
+        Assert that loading config overrides default
 
+        """
 
-        url = '/json/settings'
+        config = MockConfiguration.load()
 
-        result = self.client_patch(url, data)
+        assert not config["mysetting"]
 
-        self.assertEqual(len(mail.outbox), 0)
 
-        self.assertEqual(result.status_code, 400)
 
-        self.assert_in_response("Already has an account",
+    def test_configure_by_dict(self):
 
-                                result)
+        """
 
+        Check configuration by dictionary
 
+        """
 
-    def test_unauthorized_email_change_from_email_confirmation_link(self):
+        config = MockConfiguration.load()
 
-        # type: () -> None
+        config.configure({"anoption":45, "foo":"bar"})
 
-        data = {'email': 'hamlet-new@zulip.com'}
+        assert config["anoption"] == 45
 
-        user_profile = self.example_user('hamlet')
+        assert config["foo"] == "bar"
 
-        email = user_profile.email
 
-        self.login(email)
 
-        url = '/json/settings'
+    @pytest.mark.filterwarnings("ignore")
 
-        self.assertEqual(len(mail.outbox), 0)
+    def test_configure_by_conf(self):
 
-        result = self.client_patch(url, data)
+        """
 
-        self.assertEqual(len(mail.outbox), 1)
+        Check configuration by other configuration
 
-        self.assert_in_success_response(['Check your email for a confirmation link.'], result)
+        """
 
-        email_message = mail.outbox[0]
 
-        self.assertEqual(
 
-            email_message.subject,
+        configa = MockConfiguration.load()
 
-            'Verify your new email address'
+        configb = MockConfiguration.load()
 
-        )
 
-        body = email_message.body
 
-        self.assertIn('We received a request to change the email', body)
+        assert configa["anoption"] == configb["anoption"]
 
 
 
-        do_set_realm_property(user_profile.realm, 'email_changes_disabled', True)
+        configa.anoption = 80
 
+        assert configa["anoption"] != configb["anoption"]
 
 
-        activation_url = [s for s in body.split('\n') if s][4]
 
-        response = self.client_get(activation_url)
+        configb.configure(configa)
 
+        assert configa["anoption"] == configb["anoption"]
 
 
-        self.assertEqual(response.status_code, 400)
 
-        self.assert_in_response("Email address changes are disabled in this organization.",
+    @pytest.mark.filterwarnings("ignore")
 
-                                response)
+    def test_configure_with_none(self):
 
+        """
 
+        Ensure None passed to configure doesn't break
 
-    def test_post_invalid_email(self):
+        """
 
-        # type: () -> None
+        config = MockConfiguration.load()
 
-        data = {'email': 'hamlet-new'}
+        try:
 
-        email = self.example_email("hamlet")
+            config.configure(None)
 
-        self.login(email)
+        except Exception:
 
-        url = '/json/settings'
+            pytest.fail("None passed to configure raised an error!")
 
-        result = self.client_patch(url, data)
 
-        self.assert_in_response('Invalid address', result)
 
+    @pytest.mark.filterwarnings("ignore")
 
+    def test_nested_configure(self):
 
-    def test_post_same_email(self):
+        """
 
-        # type: () -> None
+        Ensure nested configurations work
 
-        data = {'email': self.example_email("hamlet")}
+        """
 
-        email = self.example_email("hamlet")
+        config = MockConfiguration.load()
 
-        self.login(email)
+        data   = {"nested": {"nested": {"level":"basement"}, "level": "lobby"}}
 
-        url = '/json/settings'
+        config.configure(data)
 
-        result = self.client_patch(url, data)
+        assert isinstance(config.get('nested'), NestedConfiguration)
 
-        self.assertEqual('success', result.json()['result'])
+        assert isinstance(config.get('nested').get('nested'), SubNestedConfiguration)
 
-        self.assertEqual('', result.json()['msg'])
+        assert config.get('nested').get('level') == 'lobby'
+
+        assert config.get('nested').get('nested').get('level') == 'basement'
+
+
+
+    @pytest.mark.filterwarnings("ignore")
+
+    def test_environ_configuration(self):
+
+        """
+
+        Test the environ setting on a config
+
+        """
+
+        config = MockConfiguration.load()
+
+        assert config.get('password') == 'supersecretsquirrel'
+
+
+
+    @pytest.mark.filterwarnings("ignore")
+
+    def test_settings_file_environ_override(self, testconfig):
+
+        """
+
+        Test that the settings file overrides the environ
+
+        """
+
+        config = MockConfiguration.load()
+
+        assert config.get('password') == 'knockknock'
+
+
+
+    def test_path_configuration(self, tmpdir):
+
+        """
+
+        Test the path setting on a config
+
+        """
+
+        config = MockConfiguration.load()
+
+        with pytest.raises(ImproperlyConfigured):
+
+            config.myfile
+
+
+
+        assert config.datadir == '/tmp/data/'
+
+
+
+    @pytest.mark.filterwarnings("ignore")
+
+    def test_settings_file_path_configuration(self, testconfig):
+
+        """
+
+        Test the paths loaded from the settings file
+
+        """
+
+        config = MockConfiguration.load()
+
+        assert os.path.expanduser('~/tmp/data.txt') == config.myfile
+
+        assert '/tmp/data/' == config.datadir
+
+
+
+    @pytest.mark.filterwarnings("ignore")
+
+    def test_nested_path(self, testconfig):
+
+        """
+
+        Tested nested path configuration
+
+        """
+
+        config = MockConfiguration.load()
+
+        assert config.nested.nested_path == '/tmp'
+
+        assert config['nested']['nested_path'] == '/tmp'
+
+        assert config['NESTED']['NESTED_PATH'] == '/tmp'
+
+
+
+    def test_options(self):
+
+        """
+
+        Test the options method
+
+        """
+
+        config = MockConfiguration.load()
+
+        options = dict(config.options())
+
+
+
+        assert "mysetting" in options
+
+        assert "anoption" in options
+
+        assert "paththere" in options
+
+
+
+        assert "_notanopt" not in options
+
+        assert "amethod" not in options
+
+        assert "NOTANOPT" not in options
+
+
+
+    def test_get(self):
+
+        """
+
+        Assert that get returns default or key
+
+        """
+
+        config = MockConfiguration.load()
+
+        assert config.get("mysetting")
+
+        assert "notanopt" not in dict(config.options())
+
+        assert config.get("notanopt", 1) == 1
+
+
+
+    def test__get__(self):
+
+        """
+
+        Check the getkey method
+
+        """
+
+        config = MockConfiguration.load()
+
+        assert config["mysetting"]
+
+
+
+    def test_case_insensitivity(self):
+
+        """
+
+        Assert case insensitivity in getitem
+
+        """
+
+        config = MockConfiguration.load()
+
+        assert config["MYSETTING"]
+
+
+
+    def test_key_error(self):
+
+        """
+
+        Assert not found key raises an exception
+
+        """
+
+        with pytest.raises(KeyError):
+
+            config = MockConfiguration.load()
+
+            assert config["notanopt"]
+
+
+
+    @pytest.mark.filterwarnings("ignore")
+
+    def test_configure_back_to_empty(self, testconfig):
+
+        """
+
+        Can override an empty list or dictionary from configuration
+
+        """
+
+        # Setup normal configuration
+
+        config = MockConfiguration.load()
+
+        assert len(config.nested.empty) > 0, "configuration was not loaded"
+
+
+
+        # Now reoverride with original settings - like the TestingConfig
+
+        config.nested.configure(NestedConfiguration())
+
+        assert len(config.nested.empty) == 0
+
+        assert config.nested.level == 1

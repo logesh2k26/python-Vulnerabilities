@@ -2,2294 +2,1466 @@
 # Safety: safe
 # Category: safe
 
-# vim: ft=python fileencoding=utf-8 sts=4 sw=4 et:
+# Copyright 2012 OpenStack LLC.
 
-
-
-# Copyright 2016-2020 Florian Bruhin (The Compiler) <mail@qutebrowser.org>
+# All Rights Reserved.
 
 #
 
-# This file is part of qutebrowser.
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+
+#    not use this file except in compliance with the License. You may obtain
+
+#    a copy of the License at
 
 #
 
-# qutebrowser is free software: you can redistribute it and/or modify
-
-# it under the terms of the GNU General Public License as published by
-
-# the Free Software Foundation, either version 3 of the License, or
-
-# (at your option) any later version.
+#         http://www.apache.org/licenses/LICENSE-2.0
 
 #
 
-# qutebrowser is distributed in the hope that it will be useful,
+#    Unless required by applicable law or agreed to in writing, software
 
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
-# GNU General Public License for more details.
+#    License for the specific language governing permissions and limitations
 
-#
+#    under the License.
 
-# You should have received a copy of the GNU General Public License
 
-# along with qutebrowser.  If not, see <http://www.gnu.org/licenses/>.
 
+import copy
 
+import datetime
 
-"""Base class for a wrapper over QWebView/QWebEngineView."""
+import json
 
+import re
 
+import urllib
 
-import enum
 
-import itertools
 
-import typing
+import webob.exc
 
-import functools
 
 
+from glance.api import policy
 
-import attr
+import glance.api.v2 as v2
 
-from PyQt5.QtCore import (pyqtSignal, pyqtSlot, QUrl, QObject, QSizeF, Qt,
+from glance.common import exception
 
-                          QEvent, QPoint)
+from glance.common import utils
 
-from PyQt5.QtGui import QKeyEvent, QIcon
+from glance.common import wsgi
 
-from PyQt5.QtWidgets import QWidget, QApplication, QDialog
+import glance.db
 
-from PyQt5.QtPrintSupport import QPrintDialog, QPrinter
+import glance.notifier
 
-from PyQt5.QtNetwork import QNetworkAccessManager
+from glance.openstack.common import cfg
 
+import glance.openstack.common.log as logging
 
+from glance.openstack.common import timeutils
 
-if typing.TYPE_CHECKING:
+import glance.schema
 
-    from PyQt5.QtWebKit import QWebHistory
+import glance.store
 
-    from PyQt5.QtWebEngineWidgets import QWebEngineHistory
 
 
 
-import pygments
 
-import pygments.lexers
+LOG = logging.getLogger(__name__)
 
-import pygments.formatters
 
 
+CONF = cfg.CONF
 
-from qutebrowser.keyinput import modeman
 
-from qutebrowser.config import config
 
-from qutebrowser.utils import (utils, objreg, usertypes, log, qtutils,
 
-                               urlutils, message)
 
-from qutebrowser.misc import miscwidgets, objects, sessions
+class ImagesController(object):
 
-from qutebrowser.browser import eventfilter
+    def __init__(self, db_api=None, policy_enforcer=None, notifier=None,
 
-from qutebrowser.qt import sip
+            store_api=None):
 
+        self.db_api = db_api or glance.db.get_api()
 
+        self.db_api.configure_db()
 
-if typing.TYPE_CHECKING:
+        self.policy = policy_enforcer or policy.Enforcer()
 
-    from qutebrowser.browser import webelem
+        self.notifier = notifier or glance.notifier.Notifier()
 
-    from qutebrowser.browser.inspector import AbstractWebInspector
+        self.store_api = store_api or glance.store
 
+        self.store_api.create_stores()
 
 
 
+    def _enforce(self, req, action):
 
-tab_id_gen = itertools.count(0)
-
-
-
-
-
-def create(win_id: int,
-
-           private: bool,
-
-           parent: QWidget = None) -> 'AbstractTab':
-
-    """Get a QtWebKit/QtWebEngine tab object.
-
-
-
-    Args:
-
-        win_id: The window ID where the tab will be shown.
-
-        private: Whether the tab is a private/off the record tab.
-
-        parent: The Qt parent to set.
-
-    """
-
-    # Importing modules here so we don't depend on QtWebEngine without the
-
-    # argument and to avoid circular imports.
-
-    mode_manager = modeman.instance(win_id)
-
-    if objects.backend == usertypes.Backend.QtWebEngine:
-
-        from qutebrowser.browser.webengine import webenginetab
-
-        tab_class = webenginetab.WebEngineTab
-
-    else:
-
-        from qutebrowser.browser.webkit import webkittab
-
-        tab_class = webkittab.WebKitTab
-
-    return tab_class(win_id=win_id, mode_manager=mode_manager, private=private,
-
-                     parent=parent)
-
-
-
-
-
-def init() -> None:
-
-    """Initialize backend-specific modules."""
-
-    if objects.backend == usertypes.Backend.QtWebEngine:
-
-        from qutebrowser.browser.webengine import webenginetab
-
-        webenginetab.init()
-
-
-
-
-
-class WebTabError(Exception):
-
-
-
-    """Base class for various errors."""
-
-
-
-
-
-class UnsupportedOperationError(WebTabError):
-
-
-
-    """Raised when an operation is not supported with the given backend."""
-
-
-
-
-
-TerminationStatus = enum.Enum('TerminationStatus', [
-
-    'normal',
-
-    'abnormal',  # non-zero exit status
-
-    'crashed',   # e.g. segfault
-
-    'killed',
-
-    'unknown',
-
-])
-
-
-
-
-
-@attr.s
-
-class TabData:
-
-
-
-    """A simple namespace with a fixed set of attributes.
-
-
-
-    Attributes:
-
-        keep_icon: Whether the (e.g. cloned) icon should not be cleared on page
-
-                   load.
-
-        inspector: The QWebInspector used for this webview.
-
-        viewing_source: Set if we're currently showing a source view.
-
-                        Only used when sources are shown via pygments.
-
-        open_target: Where to open the next link.
-
-                     Only used for QtWebKit.
-
-        override_target: Override for open_target for fake clicks (like hints).
-
-                         Only used for QtWebKit.
-
-        pinned: Flag to pin the tab.
-
-        fullscreen: Whether the tab has a video shown fullscreen currently.
-
-        netrc_used: Whether netrc authentication was performed.
-
-        input_mode: current input mode for the tab.
-
-    """
-
-
-
-    keep_icon = attr.ib(False)  # type: bool
-
-    viewing_source = attr.ib(False)  # type: bool
-
-    inspector = attr.ib(None)  # type: typing.Optional[AbstractWebInspector]
-
-    open_target = attr.ib(
-
-        usertypes.ClickTarget.normal)  # type: usertypes.ClickTarget
-
-    override_target = attr.ib(
-
-        None)  # type: typing.Optional[usertypes.ClickTarget]
-
-    pinned = attr.ib(False)  # type: bool
-
-    fullscreen = attr.ib(False)  # type: bool
-
-    netrc_used = attr.ib(False)  # type: bool
-
-    input_mode = attr.ib(usertypes.KeyMode.normal)  # type: usertypes.KeyMode
-
-    last_navigation = attr.ib(None)  # type: usertypes.NavigationRequest
-
-
-
-    def should_show_icon(self) -> bool:
-
-        return (config.val.tabs.favicons.show == 'always' or
-
-                config.val.tabs.favicons.show == 'pinned' and self.pinned)
-
-
-
-
-
-class AbstractAction:
-
-
-
-    """Attribute ``action`` of AbstractTab for Qt WebActions."""
-
-
-
-    # The class actions are defined on (QWeb{Engine,}Page)
-
-    action_class = None  # type: type
-
-    # The type of the actions (QWeb{Engine,}Page.WebAction)
-
-    action_base = None  # type: type
-
-
-
-    def __init__(self, tab: 'AbstractTab') -> None:
-
-        self._widget = typing.cast(QWidget, None)
-
-        self._tab = tab
-
-
-
-    def exit_fullscreen(self) -> None:
-
-        """Exit the fullscreen mode."""
-
-        raise NotImplementedError
-
-
-
-    def save_page(self) -> None:
-
-        """Save the current page."""
-
-        raise NotImplementedError
-
-
-
-    def run_string(self, name: str) -> None:
-
-        """Run a webaction based on its name."""
-
-        member = getattr(self.action_class, name, None)
-
-        if not isinstance(member, self.action_base):
-
-            raise WebTabError("{} is not a valid web action!".format(name))
-
-        self._widget.triggerPageAction(member)
-
-
-
-    def show_source(
-
-            self,
-
-            pygments: bool = False  # pylint: disable=redefined-outer-name
-
-    ) -> None:
-
-        """Show the source of the current page in a new tab."""
-
-        raise NotImplementedError
-
-
-
-    def _show_source_pygments(self) -> None:
-
-
-
-        def show_source_cb(source: str) -> None:
-
-            """Show source as soon as it's ready."""
-
-            # WORKAROUND for https://github.com/PyCQA/pylint/issues/491
-
-            # pylint: disable=no-member
-
-            lexer = pygments.lexers.HtmlLexer()
-
-            formatter = pygments.formatters.HtmlFormatter(
-
-                full=True, linenos='table')
-
-            # pylint: enable=no-member
-
-            highlighted = pygments.highlight(source, lexer, formatter)
-
-
-
-            tb = objreg.get('tabbed-browser', scope='window',
-
-                            window=self._tab.win_id)
-
-            new_tab = tb.tabopen(background=False, related=True)
-
-            new_tab.set_html(highlighted, self._tab.url())
-
-            new_tab.data.viewing_source = True
-
-
-
-        self._tab.dump_async(show_source_cb)
-
-
-
-
-
-class AbstractPrinting:
-
-
-
-    """Attribute ``printing`` of AbstractTab for printing the page."""
-
-
-
-    def __init__(self, tab: 'AbstractTab') -> None:
-
-        self._widget = typing.cast(QWidget, None)
-
-        self._tab = tab
-
-
-
-    def check_pdf_support(self) -> None:
-
-        """Check whether writing to PDFs is supported.
-
-
-
-        If it's not supported (by the current Qt version), a WebTabError is
-
-        raised.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def check_printer_support(self) -> None:
-
-        """Check whether writing to a printer is supported.
-
-
-
-        If it's not supported (by the current Qt version), a WebTabError is
-
-        raised.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def check_preview_support(self) -> None:
-
-        """Check whether showing a print preview is supported.
-
-
-
-        If it's not supported (by the current Qt version), a WebTabError is
-
-        raised.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def to_pdf(self, filename: str) -> bool:
-
-        """Print the tab to a PDF with the given filename."""
-
-        raise NotImplementedError
-
-
-
-    def to_printer(self, printer: QPrinter,
-
-                   callback: typing.Callable[[bool], None] = None) -> None:
-
-        """Print the tab.
-
-
-
-        Args:
-
-            printer: The QPrinter to print to.
-
-            callback: Called with a boolean
-
-                      (True if printing succeeded, False otherwise)
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def show_dialog(self) -> None:
-
-        """Print with a QPrintDialog."""
-
-        self.check_printer_support()
-
-
-
-        def print_callback(ok: bool) -> None:
-
-            """Called when printing finished."""
-
-            if not ok:
-
-                message.error("Printing failed!")
-
-            diag.deleteLater()
-
-
-
-        def do_print() -> None:
-
-            """Called when the dialog was closed."""
-
-            self.to_printer(diag.printer(), print_callback)
-
-
-
-        diag = QPrintDialog(self._tab)
-
-        if utils.is_mac:
-
-            # For some reason we get a segfault when using open() on macOS
-
-            ret = diag.exec_()
-
-            if ret == QDialog.Accepted:
-
-                do_print()
-
-        else:
-
-            diag.open(do_print)
-
-
-
-
-
-class AbstractSearch(QObject):
-
-
-
-    """Attribute ``search`` of AbstractTab for doing searches.
-
-
-
-    Attributes:
-
-        text: The last thing this view was searched for.
-
-        search_displayed: Whether we're currently displaying search results in
-
-                          this view.
-
-        _flags: The flags of the last search (needs to be set by subclasses).
-
-        _widget: The underlying WebView widget.
-
-    """
-
-
-
-    #: Signal emitted when a search was finished
-
-    #: (True if the text was found, False otherwise)
-
-    finished = pyqtSignal(bool)
-
-    #: Signal emitted when an existing search was cleared.
-
-    cleared = pyqtSignal()
-
-
-
-    _Callback = typing.Callable[[bool], None]
-
-
-
-    def __init__(self, tab: 'AbstractTab', parent: QWidget = None):
-
-        super().__init__(parent)
-
-        self._tab = tab
-
-        self._widget = typing.cast(QWidget, None)
-
-        self.text = None  # type: typing.Optional[str]
-
-        self.search_displayed = False
-
-
-
-    def _is_case_sensitive(self, ignore_case: usertypes.IgnoreCase) -> bool:
-
-        """Check if case-sensitivity should be used.
-
-
-
-        This assumes self.text is already set properly.
-
-
-
-        Arguments:
-
-            ignore_case: The ignore_case value from the config.
-
-        """
-
-        assert self.text is not None
-
-        mapping = {
-
-            usertypes.IgnoreCase.smart: not self.text.islower(),
-
-            usertypes.IgnoreCase.never: True,
-
-            usertypes.IgnoreCase.always: False,
-
-        }
-
-        return mapping[ignore_case]
-
-
-
-    def search(self, text: str, *,
-
-               ignore_case: usertypes.IgnoreCase = usertypes.IgnoreCase.never,
-
-               reverse: bool = False,
-
-               result_cb: _Callback = None) -> None:
-
-        """Find the given text on the page.
-
-
-
-        Args:
-
-            text: The text to search for.
-
-            ignore_case: Search case-insensitively.
-
-            reverse: Reverse search direction.
-
-            result_cb: Called with a bool indicating whether a match was found.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def clear(self) -> None:
-
-        """Clear the current search."""
-
-        raise NotImplementedError
-
-
-
-    def prev_result(self, *, result_cb: _Callback = None) -> None:
-
-        """Go to the previous result of the current search.
-
-
-
-        Args:
-
-            result_cb: Called with a bool indicating whether a match was found.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def next_result(self, *, result_cb: _Callback = None) -> None:
-
-        """Go to the next result of the current search.
-
-
-
-        Args:
-
-            result_cb: Called with a bool indicating whether a match was found.
-
-        """
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractZoom(QObject):
-
-
-
-    """Attribute ``zoom`` of AbstractTab for controlling zoom."""
-
-
-
-    def __init__(self, tab: 'AbstractTab', parent: QWidget = None) -> None:
-
-        super().__init__(parent)
-
-        self._tab = tab
-
-        self._widget = typing.cast(QWidget, None)
-
-        # Whether zoom was changed from the default.
-
-        self._default_zoom_changed = False
-
-        self._init_neighborlist()
-
-        config.instance.changed.connect(self._on_config_changed)
-
-        self._zoom_factor = float(config.val.zoom.default) / 100
-
-
-
-    @pyqtSlot(str)
-
-    def _on_config_changed(self, option: str) -> None:
-
-        if option in ['zoom.levels', 'zoom.default']:
-
-            if not self._default_zoom_changed:
-
-                factor = float(config.val.zoom.default) / 100
-
-                self.set_factor(factor)
-
-            self._init_neighborlist()
-
-
-
-    def _init_neighborlist(self) -> None:
-
-        """Initialize self._neighborlist.
-
-
-
-        It is a NeighborList with the zoom levels."""
-
-        levels = config.val.zoom.levels
-
-        self._neighborlist = usertypes.NeighborList(
-
-            levels, mode=usertypes.NeighborList.Modes.edge
-
-        )  # type: usertypes.NeighborList[float]
-
-        self._neighborlist.fuzzyval = config.val.zoom.default
-
-
-
-    def apply_offset(self, offset: int) -> float:
-
-        """Increase/Decrease the zoom level by the given offset.
-
-
-
-        Args:
-
-            offset: The offset in the zoom level list.
-
-
-
-        Return:
-
-            The new zoom level.
-
-        """
-
-        level = self._neighborlist.getitem(offset)
-
-        self.set_factor(float(level) / 100, fuzzyval=False)
-
-        return level
-
-
-
-    def _set_factor_internal(self, factor: float) -> None:
-
-        raise NotImplementedError
-
-
-
-    def set_factor(self, factor: float, *, fuzzyval: bool = True) -> None:
-
-        """Zoom to a given zoom factor.
-
-
-
-        Args:
-
-            factor: The zoom factor as float.
-
-            fuzzyval: Whether to set the NeighborLists fuzzyval.
-
-        """
-
-        if fuzzyval:
-
-            self._neighborlist.fuzzyval = int(factor * 100)
-
-        if factor < 0:
-
-            raise ValueError("Can't zoom to factor {}!".format(factor))
-
-
-
-        default_zoom_factor = float(config.val.zoom.default) / 100
-
-        self._default_zoom_changed = (factor != default_zoom_factor)
-
-
-
-        self._zoom_factor = factor
-
-        self._set_factor_internal(factor)
-
-
-
-    def factor(self) -> float:
-
-        return self._zoom_factor
-
-
-
-    def apply_default(self) -> None:
-
-        self._set_factor_internal(float(config.val.zoom.default) / 100)
-
-
-
-    def reapply(self) -> None:
-
-        self._set_factor_internal(self._zoom_factor)
-
-
-
-
-
-class AbstractCaret(QObject):
-
-
-
-    """Attribute ``caret`` of AbstractTab for caret browsing."""
-
-
-
-    #: Signal emitted when the selection was toggled.
-
-    #: (argument - whether the selection is now active)
-
-    selection_toggled = pyqtSignal(bool)
-
-    #: Emitted when a ``follow_selection`` action is done.
-
-    follow_selected_done = pyqtSignal()
-
-
-
-    def __init__(self,
-
-                 tab: 'AbstractTab',
-
-                 mode_manager: modeman.ModeManager,
-
-                 parent: QWidget = None) -> None:
-
-        super().__init__(parent)
-
-        self._tab = tab
-
-        self._widget = typing.cast(QWidget, None)
-
-        self.selection_enabled = False
-
-        self._mode_manager = mode_manager
-
-        mode_manager.entered.connect(self._on_mode_entered)
-
-        mode_manager.left.connect(self._on_mode_left)
-
-
-
-    def _on_mode_entered(self, mode: usertypes.KeyMode) -> None:
-
-        raise NotImplementedError
-
-
-
-    def _on_mode_left(self, mode: usertypes.KeyMode) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_next_line(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_prev_line(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_next_char(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_prev_char(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_end_of_word(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_next_word(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_prev_word(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_start_of_line(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_end_of_line(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_start_of_next_block(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_start_of_prev_block(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_end_of_next_block(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_end_of_prev_block(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_start_of_document(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def move_to_end_of_document(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def toggle_selection(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def drop_selection(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def selection(self, callback: typing.Callable[[str], None]) -> None:
-
-        raise NotImplementedError
-
-
-
-    def reverse_selection(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def _follow_enter(self, tab: bool) -> None:
-
-        """Follow a link by faking an enter press."""
-
-        if tab:
-
-            self._tab.fake_key_press(Qt.Key_Enter, modifier=Qt.ControlModifier)
-
-        else:
-
-            self._tab.fake_key_press(Qt.Key_Enter)
-
-
-
-    def follow_selected(self, *, tab: bool = False) -> None:
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractScroller(QObject):
-
-
-
-    """Attribute ``scroller`` of AbstractTab to manage scroll position."""
-
-
-
-    #: Signal emitted when the scroll position changed (int, int)
-
-    perc_changed = pyqtSignal(int, int)
-
-    #: Signal emitted before the user requested a jump.
-
-    #: Used to set the special ' mark so the user can return.
-
-    before_jump_requested = pyqtSignal()
-
-
-
-    def __init__(self, tab: 'AbstractTab', parent: QWidget = None):
-
-        super().__init__(parent)
-
-        self._tab = tab
-
-        self._widget = typing.cast(QWidget, None)
-
-        if 'log-scroll-pos' in objects.debug_flags:
-
-            self.perc_changed.connect(self._log_scroll_pos_change)
-
-
-
-    @pyqtSlot()
-
-    def _log_scroll_pos_change(self) -> None:
-
-        log.webview.vdebug(  # type: ignore
-
-            "Scroll position changed to {}".format(self.pos_px()))
-
-
-
-    def _init_widget(self, widget: QWidget) -> None:
-
-        self._widget = widget
-
-
-
-    def pos_px(self) -> int:
-
-        raise NotImplementedError
-
-
-
-    def pos_perc(self) -> int:
-
-        raise NotImplementedError
-
-
-
-    def to_perc(self, x: int = None, y: int = None) -> None:
-
-        raise NotImplementedError
-
-
-
-    def to_point(self, point: QPoint) -> None:
-
-        raise NotImplementedError
-
-
-
-    def to_anchor(self, name: str) -> None:
-
-        raise NotImplementedError
-
-
-
-    def delta(self, x: int = 0, y: int = 0) -> None:
-
-        raise NotImplementedError
-
-
-
-    def delta_page(self, x: float = 0, y: float = 0) -> None:
-
-        raise NotImplementedError
-
-
-
-    def up(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def down(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def left(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def right(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def top(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def bottom(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def page_up(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def page_down(self, count: int = 1) -> None:
-
-        raise NotImplementedError
-
-
-
-    def at_top(self) -> bool:
-
-        raise NotImplementedError
-
-
-
-    def at_bottom(self) -> bool:
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractHistoryPrivate:
-
-
-
-    """Private API related to the history."""
-
-
-
-    def __init__(self, tab: 'AbstractTab'):
-
-        self._tab = tab
-
-        self._history = typing.cast(
-
-            typing.Union['QWebHistory', 'QWebEngineHistory'], None)
-
-
-
-    def serialize(self) -> bytes:
-
-        """Serialize into an opaque format understood by self.deserialize."""
-
-        raise NotImplementedError
-
-
-
-    def deserialize(self, data: bytes) -> None:
-
-        """Deserialize from a format produced by self.serialize."""
-
-        raise NotImplementedError
-
-
-
-    def load_items(self, items: typing.Sequence) -> None:
-
-        """Deserialize from a list of WebHistoryItems."""
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractHistory:
-
-
-
-    """The history attribute of a AbstractTab."""
-
-
-
-    def __init__(self, tab: 'AbstractTab') -> None:
-
-        self._tab = tab
-
-        self._history = typing.cast(
-
-            typing.Union['QWebHistory', 'QWebEngineHistory'], None)
-
-        self.private_api = AbstractHistoryPrivate(tab)
-
-
-
-    def __len__(self) -> int:
-
-        raise NotImplementedError
-
-
-
-    def __iter__(self) -> typing.Iterable:
-
-        raise NotImplementedError
-
-
-
-    def _check_count(self, count: int) -> None:
-
-        """Check whether the count is positive."""
-
-        if count < 0:
-
-            raise WebTabError("count needs to be positive!")
-
-
-
-    def current_idx(self) -> int:
-
-        raise NotImplementedError
-
-
-
-    def back(self, count: int = 1) -> None:
-
-        """Go back in the tab's history."""
-
-        self._check_count(count)
-
-        idx = self.current_idx() - count
-
-        if idx >= 0:
-
-            self._go_to_item(self._item_at(idx))
-
-        else:
-
-            self._go_to_item(self._item_at(0))
-
-            raise WebTabError("At beginning of history.")
-
-
-
-    def forward(self, count: int = 1) -> None:
-
-        """Go forward in the tab's history."""
-
-        self._check_count(count)
-
-        idx = self.current_idx() + count
-
-        if idx < len(self):
-
-            self._go_to_item(self._item_at(idx))
-
-        else:
-
-            self._go_to_item(self._item_at(len(self) - 1))
-
-            raise WebTabError("At end of history.")
-
-
-
-    def can_go_back(self) -> bool:
-
-        raise NotImplementedError
-
-
-
-    def can_go_forward(self) -> bool:
-
-        raise NotImplementedError
-
-
-
-    def _item_at(self, i: int) -> typing.Any:
-
-        raise NotImplementedError
-
-
-
-    def _go_to_item(self, item: typing.Any) -> None:
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractElements:
-
-
-
-    """Finding and handling of elements on the page."""
-
-
-
-    _MultiCallback = typing.Callable[
-
-        [typing.Sequence['webelem.AbstractWebElement']], None]
-
-    _SingleCallback = typing.Callable[
-
-        [typing.Optional['webelem.AbstractWebElement']], None]
-
-    _ErrorCallback = typing.Callable[[Exception], None]
-
-
-
-    def __init__(self, tab: 'AbstractTab') -> None:
-
-        self._widget = typing.cast(QWidget, None)
-
-        self._tab = tab
-
-
-
-    def find_css(self, selector: str,
-
-                 callback: _MultiCallback,
-
-                 error_cb: _ErrorCallback, *,
-
-                 only_visible: bool = False) -> None:
-
-        """Find all HTML elements matching a given selector async.
-
-
-
-        If there's an error, the callback is called with a webelem.Error
-
-        instance.
-
-
-
-        Args:
-
-            callback: The callback to be called when the search finished.
-
-            error_cb: The callback to be called when an error occurred.
-
-            selector: The CSS selector to search for.
-
-            only_visible: Only show elements which are visible on screen.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def find_id(self, elem_id: str, callback: _SingleCallback) -> None:
-
-        """Find the HTML element with the given ID async.
-
-
-
-        Args:
-
-            callback: The callback to be called when the search finished.
-
-                      Called with a WebEngineElement or None.
-
-            elem_id: The ID to search for.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def find_focused(self, callback: _SingleCallback) -> None:
-
-        """Find the focused element on the page async.
-
-
-
-        Args:
-
-            callback: The callback to be called when the search finished.
-
-                      Called with a WebEngineElement or None.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def find_at_pos(self, pos: QPoint, callback: _SingleCallback) -> None:
-
-        """Find the element at the given position async.
-
-
-
-        This is also called "hit test" elsewhere.
-
-
-
-        Args:
-
-            pos: The QPoint to get the element for.
-
-            callback: The callback to be called when the search finished.
-
-                      Called with a WebEngineElement or None.
-
-        """
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractAudio(QObject):
-
-
-
-    """Handling of audio/muting for this tab."""
-
-
-
-    muted_changed = pyqtSignal(bool)
-
-    recently_audible_changed = pyqtSignal(bool)
-
-
-
-    def __init__(self, tab: 'AbstractTab', parent: QWidget = None) -> None:
-
-        super().__init__(parent)
-
-        self._widget = typing.cast(QWidget, None)
-
-        self._tab = tab
-
-
-
-    def set_muted(self, muted: bool, override: bool = False) -> None:
-
-        """Set this tab as muted or not.
-
-
-
-        Arguments:
-
-            override: If set to True, muting/unmuting was done manually and
-
-                      overrides future automatic mute/unmute changes based on
-
-                      the URL.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def is_muted(self) -> bool:
-
-        raise NotImplementedError
-
-
-
-    def is_recently_audible(self) -> bool:
-
-        """Whether this tab has had audio playing recently."""
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractTabPrivate:
-
-
-
-    """Tab-related methods which are only needed in the core.
-
-
-
-    Those methods are not part of the API which is exposed to extensions, and
-
-    should ideally be removed at some point in the future.
-
-    """
-
-
-
-    def __init__(self, mode_manager: modeman.ModeManager,
-
-                 tab: 'AbstractTab') -> None:
-
-        self._widget = typing.cast(QWidget, None)
-
-        self._tab = tab
-
-        self._mode_manager = mode_manager
-
-
-
-    def event_target(self) -> QWidget:
-
-        """Return the widget events should be sent to."""
-
-        raise NotImplementedError
-
-
-
-    def handle_auto_insert_mode(self, ok: bool) -> None:
-
-        """Handle `input.insert_mode.auto_load` after loading finished."""
-
-        if not ok or not config.cache['input.insert_mode.auto_load']:
-
-            return
-
-
-
-        cur_mode = self._mode_manager.mode
-
-        if cur_mode == usertypes.KeyMode.insert:
-
-            return
-
-
-
-        def _auto_insert_mode_cb(
-
-                elem: typing.Optional['webelem.AbstractWebElement']
-
-        ) -> None:
-
-            """Called from JS after finding the focused element."""
-
-            if elem is None:
-
-                log.webview.debug("No focused element!")
-
-                return
-
-            if elem.is_editable():
-
-                modeman.enter(self._tab.win_id, usertypes.KeyMode.insert,
-
-                              'load finished', only_if_normal=True)
-
-
-
-        self._tab.elements.find_focused(_auto_insert_mode_cb)
-
-
-
-    def clear_ssl_errors(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def networkaccessmanager(self) -> typing.Optional[QNetworkAccessManager]:
-
-        """Get the QNetworkAccessManager for this tab.
-
-
-
-        This is only implemented for QtWebKit.
-
-        For QtWebEngine, always returns None.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def shutdown(self) -> None:
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractTab(QWidget):
-
-
-
-    """An adapter for QWebView/QWebEngineView representing a single tab."""
-
-
-
-    #: Signal emitted when a website requests to close this tab.
-
-    window_close_requested = pyqtSignal()
-
-    #: Signal emitted when a link is hovered (the hover text)
-
-    link_hovered = pyqtSignal(str)
-
-    #: Signal emitted when a page started loading
-
-    load_started = pyqtSignal()
-
-    #: Signal emitted when a page is loading (progress percentage)
-
-    load_progress = pyqtSignal(int)
-
-    #: Signal emitted when a page finished loading (success as bool)
-
-    load_finished = pyqtSignal(bool)
-
-    #: Signal emitted when a page's favicon changed (icon as QIcon)
-
-    icon_changed = pyqtSignal(QIcon)
-
-    #: Signal emitted when a page's title changed (new title as str)
-
-    title_changed = pyqtSignal(str)
-
-    #: Signal emitted when a new tab should be opened (url as QUrl)
-
-    new_tab_requested = pyqtSignal(QUrl)
-
-    #: Signal emitted when a page's URL changed (url as QUrl)
-
-    url_changed = pyqtSignal(QUrl)
-
-    #: Signal emitted when a tab's content size changed
-
-    #: (new size as QSizeF)
-
-    contents_size_changed = pyqtSignal(QSizeF)
-
-    #: Signal emitted when a page requested full-screen (bool)
-
-    fullscreen_requested = pyqtSignal(bool)
-
-    #: Signal emitted before load starts (URL as QUrl)
-
-    before_load_started = pyqtSignal(QUrl)
-
-
-
-    # Signal emitted when a page's load status changed
-
-    # (argument: usertypes.LoadStatus)
-
-    load_status_changed = pyqtSignal(usertypes.LoadStatus)
-
-    # Signal emitted before shutting down
-
-    shutting_down = pyqtSignal()
-
-    # Signal emitted when a history item should be added
-
-    history_item_triggered = pyqtSignal(QUrl, QUrl, str)
-
-    # Signal emitted when the underlying renderer process terminated.
-
-    # arg 0: A TerminationStatus member.
-
-    # arg 1: The exit code.
-
-    renderer_process_terminated = pyqtSignal(TerminationStatus, int)
-
-
-
-    # Hosts for which a certificate error happened. Shared between all tabs.
-
-    #
-
-    # Note that we remember hosts here, without scheme/port:
-
-    # QtWebEngine/Chromium also only remembers hostnames, and certificates are
-
-    # for a given hostname anyways.
-
-    _insecure_hosts = set()  # type: typing.Set[str]
-
-
-
-    def __init__(self, *, win_id: int, private: bool,
-
-                 parent: QWidget = None) -> None:
-
-        self.is_private = private
-
-        self.win_id = win_id
-
-        self.tab_id = next(tab_id_gen)
-
-        super().__init__(parent)
-
-
-
-        self.registry = objreg.ObjectRegistry()
-
-        tab_registry = objreg.get('tab-registry', scope='window',
-
-                                  window=win_id)
-
-        tab_registry[self.tab_id] = self
-
-        objreg.register('tab', self, registry=self.registry)
-
-
-
-        self.data = TabData()
-
-        self._layout = miscwidgets.WrapperLayout(self)
-
-        self._widget = typing.cast(QWidget, None)
-
-        self._progress = 0
-
-        self._load_status = usertypes.LoadStatus.none
-
-        self._tab_event_filter = eventfilter.TabEventFilter(
-
-            self, parent=self)
-
-        self.backend = None  # type: typing.Optional[usertypes.Backend]
-
-
-
-        # If true, this tab has been requested to be removed (or is removed).
-
-        self.pending_removal = False
-
-        self.shutting_down.connect(functools.partial(
-
-            setattr, self, 'pending_removal', True))
-
-
-
-        self.before_load_started.connect(self._on_before_load_started)
-
-
-
-    def _set_widget(self, widget: QWidget) -> None:
-
-        # pylint: disable=protected-access
-
-        self._widget = widget
-
-        self._layout.wrap(self, widget)
-
-        self.history._history = widget.history()
-
-        self.history.private_api._history = widget.history()
-
-        self.scroller._init_widget(widget)
-
-        self.caret._widget = widget
-
-        self.zoom._widget = widget
-
-        self.search._widget = widget
-
-        self.printing._widget = widget
-
-        self.action._widget = widget
-
-        self.elements._widget = widget
-
-        self.audio._widget = widget
-
-        self.private_api._widget = widget
-
-        self.settings._settings = widget.settings()
-
-
-
-        self._install_event_filter()
-
-        self.zoom.apply_default()
-
-
-
-    def _install_event_filter(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def _set_load_status(self, val: usertypes.LoadStatus) -> None:
-
-        """Setter for load_status."""
-
-        if not isinstance(val, usertypes.LoadStatus):
-
-            raise TypeError("Type {} is no LoadStatus member!".format(val))
-
-        log.webview.debug("load status for {}: {}".format(repr(self), val))
-
-        self._load_status = val
-
-        self.load_status_changed.emit(val)
-
-
-
-    def send_event(self, evt: QEvent) -> None:
-
-        """Send the given event to the underlying widget.
-
-
-
-        The event will be sent via QApplication.postEvent.
-
-        Note that a posted event must not be re-used in any way!
-
-        """
-
-        # This only gives us some mild protection against re-using events, but
-
-        # it's certainly better than a segfault.
-
-        if getattr(evt, 'posted', False):
-
-            raise utils.Unreachable("Can't re-use an event which was already "
-
-                                    "posted!")
-
-
-
-        recipient = self.private_api.event_target()
-
-        if recipient is None:
-
-            # https://github.com/qutebrowser/qutebrowser/issues/3888
-
-            log.webview.warning("Unable to find event target!")
-
-            return
-
-
-
-        evt.posted = True
-
-        QApplication.postEvent(recipient, evt)
-
-
-
-    def navigation_blocked(self) -> bool:
-
-        """Test if navigation is allowed on the current tab."""
-
-        return self.data.pinned and config.val.tabs.pinned.frozen
-
-
-
-    @pyqtSlot(QUrl)
-
-    def _on_before_load_started(self, url: QUrl) -> None:
-
-        """Adjust the title if we are going to visit a URL soon."""
-
-        qtutils.ensure_valid(url)
-
-        url_string = url.toDisplayString()
-
-        log.webview.debug("Going to start loading: {}".format(url_string))
-
-        self.title_changed.emit(url_string)
-
-
-
-    @pyqtSlot(QUrl)
-
-    def _on_url_changed(self, url: QUrl) -> None:
-
-        """Update title when URL has changed and no title is available."""
-
-        if url.isValid() and not self.title():
-
-            self.title_changed.emit(url.toDisplayString())
-
-        self.url_changed.emit(url)
-
-
-
-    @pyqtSlot()
-
-    def _on_load_started(self) -> None:
-
-        self._progress = 0
-
-        self.data.viewing_source = False
-
-        self._set_load_status(usertypes.LoadStatus.loading)
-
-        self.load_started.emit()
-
-
-
-    @pyqtSlot(usertypes.NavigationRequest)
-
-    def _on_navigation_request(
-
-            self,
-
-            navigation: usertypes.NavigationRequest
-
-    ) -> None:
-
-        """Handle common acceptNavigationRequest code."""
-
-        url = utils.elide(navigation.url.toDisplayString(), 100)
-
-        log.webview.debug("navigation request: url {}, type {}, is_main_frame "
-
-                          "{}".format(url,
-
-                                      navigation.navigation_type,
-
-                                      navigation.is_main_frame))
-
-
-
-        if navigation.is_main_frame:
-
-            self.data.last_navigation = navigation
-
-
-
-        if not navigation.url.isValid():
-
-            # Also a WORKAROUND for missing IDNA 2008 support in QUrl, see
-
-            # https://bugreports.qt.io/browse/QTBUG-60364
-
-
-
-            if navigation.navigation_type == navigation.Type.link_clicked:
-
-                msg = urlutils.get_errstring(navigation.url,
-
-                                             "Invalid link clicked")
-
-                message.error(msg)
-
-                self.data.open_target = usertypes.ClickTarget.normal
-
-
-
-            log.webview.debug("Ignoring invalid URL {} in "
-
-                              "acceptNavigationRequest: {}".format(
-
-                                  navigation.url.toDisplayString(),
-
-                                  navigation.url.errorString()))
-
-            navigation.accepted = False
-
-
-
-    @pyqtSlot(bool)
-
-    def _on_load_finished(self, ok: bool) -> None:
-
-        assert self._widget is not None
-
-        if sip.isdeleted(self._widget):
-
-            # https://github.com/qutebrowser/qutebrowser/issues/3498
-
-            return
-
-
-
-        if sessions.session_manager is not None:
-
-            sessions.session_manager.save_autosave()
-
-
-
-        self.load_finished.emit(ok)
-
-
-
-        if not self.title():
-
-            self.title_changed.emit(self.url().toDisplayString())
-
-
-
-        self.zoom.reapply()
-
-
-
-    def _update_load_status(self, ok: bool) -> None:
-
-        """Update the load status after a page finished loading.
-
-
-
-        Needs to be called by subclasses to trigger a load status update, e.g.
-
-        as a response to a loadFinished signal.
-
-        """
-
-        if ok:
-
-            if self.url().scheme() == 'https':
-
-                if self.url().host() in self._insecure_hosts:
-
-                    self._set_load_status(usertypes.LoadStatus.warn)
-
-                else:
-
-                    self._set_load_status(usertypes.LoadStatus.success_https)
-
-            else:
-
-                self._set_load_status(usertypes.LoadStatus.success)
-
-        elif ok:
-
-            self._set_load_status(usertypes.LoadStatus.warn)
-
-        else:
-
-            self._set_load_status(usertypes.LoadStatus.error)
-
-
-
-    @pyqtSlot()
-
-    def _on_history_trigger(self) -> None:
-
-        """Emit history_item_triggered based on backend-specific signal."""
-
-        raise NotImplementedError
-
-
-
-    @pyqtSlot(int)
-
-    def _on_load_progress(self, perc: int) -> None:
-
-        self._progress = perc
-
-        self.load_progress.emit(perc)
-
-
-
-    def url(self, *, requested: bool = False) -> QUrl:
-
-        raise NotImplementedError
-
-
-
-    def progress(self) -> int:
-
-        return self._progress
-
-
-
-    def load_status(self) -> usertypes.LoadStatus:
-
-        return self._load_status
-
-
-
-    def _load_url_prepare(self, url: QUrl, *,
-
-                          emit_before_load_started: bool = True) -> None:
-
-        qtutils.ensure_valid(url)
-
-        if emit_before_load_started:
-
-            self.before_load_started.emit(url)
-
-
-
-    def load_url(self, url: QUrl, *,
-
-                 emit_before_load_started: bool = True) -> None:
-
-        raise NotImplementedError
-
-
-
-    def reload(self, *, force: bool = False) -> None:
-
-        raise NotImplementedError
-
-
-
-    def stop(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def fake_key_press(self,
-
-                       key: Qt.Key,
-
-                       modifier: Qt.KeyboardModifier = Qt.NoModifier) -> None:
-
-        """Send a fake key event to this tab."""
-
-        press_evt = QKeyEvent(QEvent.KeyPress, key, modifier, 0, 0, 0)
-
-        release_evt = QKeyEvent(QEvent.KeyRelease, key, modifier,
-
-                                0, 0, 0)
-
-        self.send_event(press_evt)
-
-        self.send_event(release_evt)
-
-
-
-    def dump_async(self,
-
-                   callback: typing.Callable[[str], None], *,
-
-                   plain: bool = False) -> None:
-
-        """Dump the current page's html asynchronously.
-
-
-
-        The given callback will be called with the result when dumping is
-
-        complete.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def run_js_async(
-
-            self,
-
-            code: str,
-
-            callback: typing.Callable[[typing.Any], None] = None, *,
-
-            world: typing.Union[usertypes.JsWorld, int] = None
-
-    ) -> None:
-
-        """Run javascript async.
-
-
-
-        The given callback will be called with the result when running JS is
-
-        complete.
-
-
-
-        Args:
-
-            code: The javascript code to run.
-
-            callback: The callback to call with the result, or None.
-
-            world: A world ID (int or usertypes.JsWorld member) to run the JS
-
-                   in the main world or in another isolated world.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def title(self) -> str:
-
-        raise NotImplementedError
-
-
-
-    def icon(self) -> None:
-
-        raise NotImplementedError
-
-
-
-    def set_html(self, html: str, base_url: QUrl = QUrl()) -> None:
-
-        raise NotImplementedError
-
-
-
-    def __repr__(self) -> str:
+        """Authorize an action against our policies"""
 
         try:
 
-            qurl = self.url()
+            self.policy.enforce(req.context, action, {})
 
-            url = qurl.toDisplayString(QUrl.EncodeUnicode)  # type: ignore
+        except exception.Forbidden:
 
-        except (AttributeError, RuntimeError) as exc:
+            raise webob.exc.HTTPForbidden()
 
-            url = '<{}>'.format(exc.__class__.__name__)
+
+
+    def _normalize_properties(self, image):
+
+        """Convert the properties from the stored format to a dict
+
+
+
+        The db api returns a list of dicts that look like
+
+        {'name': <key>, 'value': <value>}, while it expects a format
+
+        like {<key>: <value>} in image create and update calls. This
+
+        function takes the extra step that the db api should be
+
+        responsible for in the image get calls.
+
+
+
+        The db api will also return deleted image properties that must
+
+        be filtered out.
+
+        """
+
+        properties = [(p['name'], p['value'])
+
+                      for p in image['properties'] if not p['deleted']]
+
+        image['properties'] = dict(properties)
+
+        return image
+
+
+
+    def _extract_tags(self, image):
+
+        try:
+
+            #NOTE(bcwaldon): cast to set to make the list unique, then
+
+            # cast back to list since that's a more sane response type
+
+            return list(set(image.pop('tags')))
+
+        except KeyError:
+
+            pass
+
+
+
+    def _append_tags(self, context, image):
+
+        image['tags'] = self.db_api.image_tag_get_all(context, image['id'])
+
+        return image
+
+
+
+    @utils.mutating
+
+    def create(self, req, image):
+
+        self._enforce(req, 'add_image')
+
+        is_public = image.get('is_public')
+
+        if is_public:
+
+            self._enforce(req, 'publicize_image')
+
+        image['owner'] = req.context.owner
+
+        image['status'] = 'queued'
+
+
+
+        tags = self._extract_tags(image)
+
+
+
+        image = dict(self.db_api.image_create(req.context, image))
+
+
+
+        if tags is not None:
+
+            self.db_api.image_tag_set_all(req.context, image['id'], tags)
+
+            image['tags'] = tags
 
         else:
 
-            url = utils.elide(url, 100)
-
-        return utils.get_repr(self, tab_id=self.tab_id, url=url)
+            image['tags'] = []
 
 
 
-    def is_deleted(self) -> bool:
+        v2.update_image_read_acl(req, self.store_api, self.db_api, image)
 
-        assert self._widget is not None
+        image = self._normalize_properties(dict(image))
 
-        return sip.isdeleted(self._widget)
+        self.notifier.info('image.update', image)
+
+        return image
+
+
+
+    def index(self, req, marker=None, limit=None, sort_key='created_at',
+
+              sort_dir='desc', filters={}):
+
+        self._enforce(req, 'get_images')
+
+        filters['deleted'] = False
+
+        #NOTE(bcwaldon): is_public=True gets public images and those
+
+        # owned by the authenticated tenant
+
+        result = {}
+
+        filters.setdefault('is_public', True)
+
+        if limit is None:
+
+            limit = CONF.limit_param_default
+
+        limit = min(CONF.api_limit_max, limit)
+
+
+
+        try:
+
+            images = self.db_api.image_get_all(req.context, filters=filters,
+
+                                               marker=marker, limit=limit,
+
+                                               sort_key=sort_key,
+
+                                               sort_dir=sort_dir)
+
+            if len(images) != 0 and len(images) == limit:
+
+                result['next_marker'] = images[-1]['id']
+
+        except exception.InvalidFilterRangeValue as e:
+
+            raise webob.exc.HTTPBadRequest(explanation=unicode(e))
+
+        except exception.InvalidSortKey as e:
+
+            raise webob.exc.HTTPBadRequest(explanation=unicode(e))
+
+        except exception.NotFound as e:
+
+            raise webob.exc.HTTPBadRequest(explanation=unicode(e))
+
+        images = [self._normalize_properties(dict(image)) for image in images]
+
+        result['images'] = [self._append_tags(req.context, image)
+
+                            for image in images]
+
+        return result
+
+
+
+    def _get_image(self, context, image_id):
+
+        try:
+
+            return self.db_api.image_get(context, image_id)
+
+        except (exception.NotFound, exception.Forbidden):
+
+            raise webob.exc.HTTPNotFound()
+
+
+
+    def show(self, req, image_id):
+
+        self._enforce(req, 'get_image')
+
+        image = self._get_image(req.context, image_id)
+
+        image = self._normalize_properties(dict(image))
+
+        return self._append_tags(req.context, image)
+
+
+
+    @utils.mutating
+
+    def update(self, req, image_id, changes):
+
+        self._enforce(req, 'modify_image')
+
+        context = req.context
+
+        try:
+
+            image = self.db_api.image_get(context, image_id)
+
+        except (exception.NotFound, exception.Forbidden):
+
+            msg = ("Failed to find image %(image_id)s to update" % locals())
+
+            LOG.info(msg)
+
+            raise webob.exc.HTTPNotFound(explanation=msg)
+
+
+
+        image = self._normalize_properties(dict(image))
+
+        updates = self._extract_updates(req, image, changes)
+
+
+
+        tags = None
+
+        if len(updates) > 0:
+
+            tags = self._extract_tags(updates)
+
+            purge_props = 'properties' in updates
+
+            try:
+
+                image = self.db_api.image_update(context, image_id, updates,
+
+                                                 purge_props)
+
+            except (exception.NotFound, exception.Forbidden):
+
+                raise webob.exc.HTTPNotFound()
+
+            image = self._normalize_properties(dict(image))
+
+
+
+        v2.update_image_read_acl(req, self.store_api, self.db_api, image)
+
+
+
+        if tags is not None:
+
+            self.db_api.image_tag_set_all(req.context, image_id, tags)
+
+            image['tags'] = tags
+
+        else:
+
+            self._append_tags(req.context, image)
+
+
+
+        self.notifier.info('image.update', image)
+
+        return image
+
+
+
+    def _extract_updates(self, req, image, changes):
+
+        """ Determine the updates to pass to the database api.
+
+
+
+        Given the current image, convert a list of changes to be made
+
+        into the corresponding update dictionary that should be passed to
+
+        db_api.image_update.
+
+
+
+        Changes have the following parts
+
+        op    - 'add' a new attribute, 'replace' an existing attribute, or
+
+                'remove' an existing attribute.
+
+        path  - A list of path parts for determining which attribute the
+
+                the operation applies to.
+
+        value - For 'add' and 'replace', the new value the attribute should
+
+                assume.
+
+
+
+        For the current use case, there are two types of valid paths. For base
+
+        attributes (fields stored directly on the Image object) the path
+
+        must take the form ['<attribute name>']. These attributes are always
+
+        present so the only valid operation on them is 'replace'. For image
+
+        properties, the path takes the form ['properties', '<property name>']
+
+        and all operations are valid.
+
+
+
+        Future refactoring should simplify this code by hardening the image
+
+        abstraction such that database details such as how image properties
+
+        are stored do not have any influence here.
+
+        """
+
+        updates = {}
+
+        property_updates = image['properties']
+
+        for change in changes:
+
+            path = change['path']
+
+            if len(path) == 1:
+
+                assert change['op'] == 'replace'
+
+                key = change['path'][0]
+
+                if key == 'is_public' and change['value']:
+
+                    self._enforce(req, 'publicize_image')
+
+                updates[key] = change['value']
+
+            else:
+
+                assert len(path) == 2
+
+                assert path[0] == 'properties'
+
+                update_method_name = '_do_%s_property' % change['op']
+
+                assert hasattr(self, update_method_name)
+
+                update_method = getattr(self, update_method_name)
+
+                update_method(property_updates, change)
+
+                updates['properties'] = property_updates
+
+        return updates
+
+
+
+    def _do_replace_property(self, updates, change):
+
+        """ Replace a single image property, ensuring it's present. """
+
+        key = change['path'][1]
+
+        if key not in updates:
+
+            msg = _("Property %s does not exist.")
+
+            raise webob.exc.HTTPConflict(msg % key)
+
+        updates[key] = change['value']
+
+
+
+    def _do_add_property(self, updates, change):
+
+        """ Add a new image property, ensuring it does not already exist. """
+
+        key = change['path'][1]
+
+        if key in updates:
+
+            msg = _("Property %s already present.")
+
+            raise webob.exc.HTTPConflict(msg % key)
+
+        updates[key] = change['value']
+
+
+
+    def _do_remove_property(self, updates, change):
+
+        """ Remove an image property, ensuring it's present. """
+
+        key = change['path'][1]
+
+        if key not in updates:
+
+            msg = _("Property %s does not exist.")
+
+            raise webob.exc.HTTPConflict(msg % key)
+
+        del updates[key]
+
+
+
+    @utils.mutating
+
+    def delete(self, req, image_id):
+
+        self._enforce(req, 'delete_image')
+
+        image = self._get_image(req.context, image_id)
+
+
+
+        if image['protected']:
+
+            msg = _("Unable to delete as image %(image_id)s is protected"
+
+                    % locals())
+
+            raise webob.exc.HTTPForbidden(explanation=msg)
+
+
+
+        if image['location'] and CONF.delayed_delete:
+
+            status = 'pending_delete'
+
+        else:
+
+            status = 'deleted'
+
+
+
+        try:
+
+            self.db_api.image_update(req.context, image_id, {'status': status})
+
+            self.db_api.image_destroy(req.context, image_id)
+
+
+
+            if image['location']:
+
+                if CONF.delayed_delete:
+
+                    self.store_api.schedule_delayed_delete_from_backend(
+
+                                    image['location'], id)
+
+                else:
+
+                    self.store_api.safe_delete_from_backend(image['location'],
+
+                                                            req.context, id)
+
+        except (exception.NotFound, exception.Forbidden):
+
+            msg = ("Failed to find image %(image_id)s to delete" % locals())
+
+            LOG.info(msg)
+
+            raise webob.exc.HTTPNotFound()
+
+        else:
+
+            self.notifier.info('image.delete', image)
+
+
+
+
+
+class RequestDeserializer(wsgi.JSONRequestDeserializer):
+
+
+
+    _readonly_properties = ['created_at', 'updated_at', 'status', 'checksum',
+
+            'size', 'direct_url', 'self', 'file', 'schema']
+
+    _reserved_properties = ['owner', 'is_public', 'location',
+
+            'deleted', 'deleted_at']
+
+    _base_properties = ['checksum', 'created_at', 'container_format',
+
+            'disk_format', 'id', 'min_disk', 'min_ram', 'name', 'size',
+
+            'status', 'tags', 'updated_at', 'visibility', 'protected']
+
+
+
+    def __init__(self, schema=None):
+
+        super(RequestDeserializer, self).__init__()
+
+        self.schema = schema or get_schema()
+
+
+
+    def _parse_image(self, request):
+
+        body = self._get_request_body(request)
+
+        try:
+
+            self.schema.validate(body)
+
+        except exception.InvalidObject as e:
+
+            raise webob.exc.HTTPBadRequest(explanation=unicode(e))
+
+
+
+        # Ensure all specified properties are allowed
+
+        self._check_readonly(body)
+
+        self._check_reserved(body)
+
+
+
+        # Create a dict of base image properties, with user- and deployer-
+
+        # defined properties contained in a 'properties' dictionary
+
+        image = {'properties': body}
+
+        for key in self._base_properties:
+
+            try:
+
+                image[key] = image['properties'].pop(key)
+
+            except KeyError:
+
+                pass
+
+
+
+        if 'visibility' in image:
+
+            image['is_public'] = image.pop('visibility') == 'public'
+
+
+
+        return {'image': image}
+
+
+
+    def _get_request_body(self, request):
+
+        output = super(RequestDeserializer, self).default(request)
+
+        if not 'body' in output:
+
+            msg = _('Body expected in request.')
+
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+        return output['body']
+
+
+
+    @classmethod
+
+    def _check_readonly(cls, image):
+
+        for key in cls._readonly_properties:
+
+            if key in image:
+
+                msg = "Attribute \'%s\' is read-only." % key
+
+                raise webob.exc.HTTPForbidden(explanation=unicode(msg))
+
+
+
+    @classmethod
+
+    def _check_reserved(cls, image):
+
+        for key in cls._reserved_properties:
+
+            if key in image:
+
+                msg = "Attribute \'%s\' is reserved." % key
+
+                raise webob.exc.HTTPForbidden(explanation=unicode(msg))
+
+
+
+    def create(self, request):
+
+        return self._parse_image(request)
+
+
+
+    def _get_change_operation(self, raw_change):
+
+        op = None
+
+        for key in ['replace', 'add', 'remove']:
+
+            if key in raw_change:
+
+                if op is not None:
+
+                    msg = _('Operation objects must contain only one member'
+
+                            ' named "add", "remove", or "replace".')
+
+                    raise webob.exc.HTTPBadRequest(explanation=msg)
+
+                op = key
+
+        if op is None:
+
+            msg = _('Operation objects must contain exactly one member'
+
+                    ' named "add", "remove", or "replace".')
+
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+        return op
+
+
+
+    def _get_change_path(self, raw_change, op):
+
+        key = self._decode_json_pointer(raw_change[op])
+
+        if key in self._readonly_properties:
+
+            msg = "Attribute \'%s\' is read-only." % key
+
+            raise webob.exc.HTTPForbidden(explanation=unicode(msg))
+
+        if key in self._reserved_properties:
+
+            msg = "Attribute \'%s\' is reserved." % key
+
+            raise webob.exc.HTTPForbidden(explanation=unicode(msg))
+
+
+
+        # For image properties, we need to put "properties" at the beginning
+
+        if key not in self._base_properties:
+
+            return ['properties', key]
+
+        return [key]
+
+
+
+    def _decode_json_pointer(self, pointer):
+
+        """ Parse a json pointer.
+
+
+
+        Json Pointers are defined in
+
+        http://tools.ietf.org/html/draft-pbryan-zyp-json-pointer .
+
+        The pointers use '/' for separation between object attributes, such
+
+        that '/A/B' would evaluate to C in {"A": {"B": "C"}}. A '/' character
+
+        in an attribute name is encoded as "~1" and a '~' character is encoded
+
+        as "~0".
+
+        """
+
+        self._validate_json_pointer(pointer)
+
+        return pointer.lstrip('/').replace('~1', '/').replace('~0', '~')
+
+
+
+    def _validate_json_pointer(self, pointer):
+
+        """ Validate a json pointer.
+
+
+
+        We only accept a limited form of json pointers. Specifically, we do
+
+        not allow multiple levels of indirection, so there can only be one '/'
+
+        in the pointer, located at the start of the string.
+
+        """
+
+        if not pointer.startswith('/'):
+
+            msg = _('Pointer `%s` does not start with "/".' % pointer)
+
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+        if '/' in pointer[1:]:
+
+            msg = _('Pointer `%s` contains more than one "/".' % pointer)
+
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+        if re.match('~[^01]', pointer):
+
+            msg = _('Pointer `%s` contains "~" not part of'
+
+                    ' a recognized escape sequence.' % pointer)
+
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+
+
+    def _get_change_value(self, raw_change, op):
+
+        if 'value' not in raw_change:
+
+            msg = _('Operation "%s" requires a member named "value".')
+
+            raise webob.exc.HTTPBadRequest(explanation=msg % op)
+
+        return raw_change['value']
+
+
+
+    def _validate_change(self, change):
+
+        if change['op'] == 'delete':
+
+            return
+
+        partial_image = {change['path'][-1]: change['value']}
+
+        try:
+
+            self.schema.validate(partial_image)
+
+        except exception.InvalidObject as e:
+
+            raise webob.exc.HTTPBadRequest(explanation=unicode(e))
+
+
+
+    def update(self, request):
+
+        changes = []
+
+        valid_content_types = [
+
+            'application/openstack-images-v2.0-json-patch'
+
+        ]
+
+        if request.content_type not in valid_content_types:
+
+            headers = {'Accept-Patch': ','.join(valid_content_types)}
+
+            raise webob.exc.HTTPUnsupportedMediaType(headers=headers)
+
+        body = self._get_request_body(request)
+
+        if not isinstance(body, list):
+
+            msg = _('Request body must be a JSON array of operation objects.')
+
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+        for raw_change in body:
+
+            if not isinstance(raw_change, dict):
+
+                msg = _('Operations must be JSON objects.')
+
+                raise webob.exc.HTTPBadRequest(explanation=msg)
+
+            op = self._get_change_operation(raw_change)
+
+            path = self._get_change_path(raw_change, op)
+
+            change = {'op': op, 'path': path}
+
+            if not op == 'remove':
+
+                change['value'] = self._get_change_value(raw_change, op)
+
+                self._validate_change(change)
+
+                if change['path'] == ['visibility']:
+
+                    change['path'] = ['is_public']
+
+                    change['value'] = change['value'] == 'public'
+
+            changes.append(change)
+
+        return {'changes': changes}
+
+
+
+    def _validate_limit(self, limit):
+
+        try:
+
+            limit = int(limit)
+
+        except ValueError:
+
+            msg = _("limit param must be an integer")
+
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+
+
+        if limit < 0:
+
+            msg = _("limit param must be positive")
+
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+
+
+        return limit
+
+
+
+    def _validate_sort_dir(self, sort_dir):
+
+        if sort_dir not in ['asc', 'desc']:
+
+            msg = _('Invalid sort direction: %s' % sort_dir)
+
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+
+
+        return sort_dir
+
+
+
+    def _get_filters(self, filters):
+
+        visibility = filters.pop('visibility', None)
+
+        if visibility:
+
+            if visibility in ['public', 'private']:
+
+                filters['is_public'] = visibility == 'public'
+
+            else:
+
+                msg = _('Invalid visibility value: %s') % visibility
+
+                raise webob.exc.HTTPBadRequest(explanation=msg)
+
+
+
+        return filters
+
+
+
+    def index(self, request):
+
+        params = request.params.copy()
+
+        limit = params.pop('limit', None)
+
+        marker = params.pop('marker', None)
+
+        sort_dir = params.pop('sort_dir', 'desc')
+
+        query_params = {
+
+            'sort_key': params.pop('sort_key', 'created_at'),
+
+            'sort_dir': self._validate_sort_dir(sort_dir),
+
+            'filters': self._get_filters(params),
+
+        }
+
+
+
+        if marker is not None:
+
+            query_params['marker'] = marker
+
+
+
+        if limit is not None:
+
+            query_params['limit'] = self._validate_limit(limit)
+
+
+
+        return query_params
+
+
+
+
+
+class ResponseSerializer(wsgi.JSONResponseSerializer):
+
+    def __init__(self, schema=None):
+
+        super(ResponseSerializer, self).__init__()
+
+        self.schema = schema or get_schema()
+
+
+
+    def _get_image_href(self, image, subcollection=''):
+
+        base_href = '/v2/images/%s' % image['id']
+
+        if subcollection:
+
+            base_href = '%s/%s' % (base_href, subcollection)
+
+        return base_href
+
+
+
+    def _get_image_links(self, image):
+
+        return [
+
+            {'rel': 'self', 'href': self._get_image_href(image)},
+
+            {'rel': 'file', 'href': self._get_image_href(image, 'file')},
+
+            {'rel': 'describedby', 'href': '/v2/schemas/image'},
+
+        ]
+
+
+
+    def _format_image(self, image):
+
+        #NOTE(bcwaldon): merge the contained properties dict with the
+
+        # top-level image object
+
+        image_view = image['properties']
+
+        attributes = ['id', 'name', 'disk_format', 'container_format',
+
+                      'size', 'status', 'checksum', 'tags', 'protected',
+
+                      'created_at', 'updated_at', 'min_ram', 'min_disk']
+
+        for key in attributes:
+
+            image_view[key] = image[key]
+
+
+
+        location = image['location']
+
+        if CONF.show_image_direct_url and location is not None:
+
+            image_view['direct_url'] = location
+
+
+
+        visibility = 'public' if image['is_public'] else 'private'
+
+        image_view['visibility'] = visibility
+
+
+
+        image_view['self'] = self._get_image_href(image)
+
+        image_view['file'] = self._get_image_href(image, 'file')
+
+        image_view['schema'] = '/v2/schemas/image'
+
+
+
+        self._serialize_datetimes(image_view)
+
+        image_view = self.schema.filter(image_view)
+
+
+
+        return image_view
+
+
+
+    @staticmethod
+
+    def _serialize_datetimes(image):
+
+        for (key, value) in image.iteritems():
+
+            if isinstance(value, datetime.datetime):
+
+                image[key] = timeutils.isotime(value)
+
+
+
+    def create(self, response, image):
+
+        response.status_int = 201
+
+        body = json.dumps(self._format_image(image), ensure_ascii=False)
+
+        response.unicode_body = unicode(body)
+
+        response.content_type = 'application/json'
+
+        response.location = self._get_image_href(image)
+
+
+
+    def show(self, response, image):
+
+        body = json.dumps(self._format_image(image), ensure_ascii=False)
+
+        response.unicode_body = unicode(body)
+
+        response.content_type = 'application/json'
+
+
+
+    def update(self, response, image):
+
+        body = json.dumps(self._format_image(image), ensure_ascii=False)
+
+        response.unicode_body = unicode(body)
+
+        response.content_type = 'application/json'
+
+
+
+    def index(self, response, result):
+
+        params = dict(response.request.params)
+
+        params.pop('marker', None)
+
+        query = urllib.urlencode(params)
+
+        body = {
+
+               'images': [self._format_image(i) for i in result['images']],
+
+               'first': '/v2/images',
+
+               'schema': '/v2/schemas/images',
+
+        }
+
+        if query:
+
+            body['first'] = '%s?%s' % (body['first'], query)
+
+        if 'next_marker' in result:
+
+            params['marker'] = result['next_marker']
+
+            next_query = urllib.urlencode(params)
+
+            body['next'] = '/v2/images?%s' % next_query
+
+        response.unicode_body = unicode(json.dumps(body, ensure_ascii=False))
+
+        response.content_type = 'application/json'
+
+
+
+    def delete(self, response, result):
+
+        response.status_int = 204
+
+
+
+
+
+_BASE_PROPERTIES = {
+
+    'id': {
+
+        'type': 'string',
+
+        'description': 'An identifier for the image',
+
+        'pattern': ('^([0-9a-fA-F]){8}-([0-9a-fA-F]){4}-([0-9a-fA-F]){4}'
+
+                    '-([0-9a-fA-F]){4}-([0-9a-fA-F]){12}$'),
+
+    },
+
+    'name': {
+
+        'type': 'string',
+
+        'description': 'Descriptive name for the image',
+
+        'maxLength': 255,
+
+    },
+
+    'status': {
+
+      'type': 'string',
+
+      'description': 'Status of the image',
+
+      'enum': ['queued', 'saving', 'active', 'killed',
+
+               'deleted', 'pending_delete'],
+
+    },
+
+    'visibility': {
+
+        'type': 'string',
+
+        'description': 'Scope of image accessibility',
+
+        'enum': ['public', 'private'],
+
+    },
+
+    'protected': {
+
+        'type': 'boolean',
+
+        'description': 'If true, image will not be deletable.',
+
+    },
+
+    'checksum': {
+
+        'type': 'string',
+
+        'description': 'md5 hash of image contents.',
+
+        'type': 'string',
+
+        'maxLength': 32,
+
+    },
+
+    'size': {
+
+        'type': 'integer',
+
+        'description': 'Size of image file in bytes',
+
+    },
+
+    'container_format': {
+
+        'type': 'string',
+
+        'description': '',
+
+        'type': 'string',
+
+        'enum': ['bare', 'ovf', 'ami', 'aki', 'ari'],
+
+    },
+
+    'disk_format': {
+
+        'type': 'string',
+
+        'description': '',
+
+        'type': 'string',
+
+        'enum': ['raw', 'vhd', 'vmdk', 'vdi', 'iso', 'qcow2',
+
+                 'aki', 'ari', 'ami'],
+
+    },
+
+    'created_at': {
+
+        'type': 'string',
+
+        'description': 'Date and time of image registration',
+
+        #TODO(bcwaldon): our jsonschema library doesn't seem to like the
+
+        # format attribute, figure out why!
+
+        #'format': 'date-time',
+
+    },
+
+    'updated_at': {
+
+        'type': 'string',
+
+        'description': 'Date and time of the last image modification',
+
+        #'format': 'date-time',
+
+    },
+
+    'tags': {
+
+        'type': 'array',
+
+        'description': 'List of strings related to the image',
+
+        'items': {
+
+            'type': 'string',
+
+            'maxLength': 255,
+
+        },
+
+    },
+
+    'direct_url': {
+
+        'type': 'string',
+
+        'description': 'URL to access the image file kept in external store',
+
+    },
+
+    'min_ram': {
+
+        'type': 'integer',
+
+        'description': 'Amount of ram (in MB) required to boot image.',
+
+    },
+
+    'min_disk': {
+
+        'type': 'integer',
+
+        'description': 'Amount of disk space (in GB) required to boot image.',
+
+    },
+
+    'self': {'type': 'string'},
+
+    'file': {'type': 'string'},
+
+    'schema': {'type': 'string'},
+
+}
+
+
+
+_BASE_LINKS = [
+
+    {'rel': 'self', 'href': '{self}'},
+
+    {'rel': 'enclosure', 'href': '{file}'},
+
+    {'rel': 'describedby', 'href': '{schema}'},
+
+]
+
+
+
+
+
+def get_schema(custom_properties=None):
+
+    properties = copy.deepcopy(_BASE_PROPERTIES)
+
+    links = copy.deepcopy(_BASE_LINKS)
+
+    if CONF.allow_additional_image_properties:
+
+        schema = glance.schema.PermissiveSchema('image', properties, links)
+
+    else:
+
+        schema = glance.schema.Schema('image', properties)
+
+    schema.merge_properties(custom_properties or {})
+
+    return schema
+
+
+
+
+
+def get_collection_schema(custom_properties=None):
+
+    image_schema = get_schema(custom_properties)
+
+    return glance.schema.CollectionSchema('images', image_schema)
+
+
+
+
+
+def load_custom_properties():
+
+    """Find the schema properties files and load them into a dict."""
+
+    filename = 'schema-image.json'
+
+    match = CONF.find_file(filename)
+
+    if match:
+
+        schema_file = open(match)
+
+        schema_data = schema_file.read()
+
+        return json.loads(schema_data)
+
+    else:
+
+        msg = _('Could not find schema properties file %s. Continuing '
+
+                'without custom properties')
+
+        LOG.warn(msg % filename)
+
+        return {}
+
+
+
+
+
+def create_resource(custom_properties=None):
+
+    """Images resource factory method"""
+
+    schema = get_schema(custom_properties)
+
+    deserializer = RequestDeserializer(schema)
+
+    serializer = ResponseSerializer(schema)
+
+    controller = ImagesController()
+
+    return wsgi.Resource(controller, deserializer, serializer)

@@ -2,1112 +2,1678 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# SPDX-License-Identifier: EUPL-1.2
-
-# Copyright (C) 2019 - 2020 Dimpact
-
-import datetime
-
-import os
+from typing import List, Optional, Tuple
 
 
 
-from django.urls import reverse_lazy
+import graphene
+
+from django.conf import settings
+
+from django.core.exceptions import ObjectDoesNotExist, ValidationError
+
+from django.db import transaction
+
+from django.db.models import Prefetch
 
 
 
-import git
+from ...account.error_codes import AccountErrorCode
 
-import sentry_sdk
+from ...checkout import models
 
-from sentry_sdk.integrations import django, redis
+from ...checkout.error_codes import CheckoutErrorCode
 
+from ...checkout.utils import (
 
+    abort_order_data,
 
-# NLX directory urls
+    add_promo_code_to_checkout,
 
-from openzaak.config.constants import NLXDirectories
+    add_variant_to_checkout,
 
+    change_billing_address_in_checkout,
 
+    change_shipping_address_in_checkout,
 
-from ...utils.monitoring import filter_sensitive_data
+    clean_checkout,
 
-from .api import *  # noqa
+    create_order,
 
-from .environ import config
+    get_user_checkout,
 
-from .plugins import PLUGIN_INSTALLED_APPS
+    get_valid_shipping_methods_for_checkout,
 
+    prepare_order_data,
 
+    recalculate_checkout_discount,
 
-# Build paths inside the project, so further paths can be defined relative to
-
-# the code root.
-
-DJANGO_PROJECT_DIR = os.path.abspath(
-
-    os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir)
-
-)
-
-BASE_DIR = os.path.abspath(
-
-    os.path.join(DJANGO_PROJECT_DIR, os.path.pardir, os.path.pardir)
+    remove_promo_code_from_checkout,
 
 )
 
+from ...core import analytics
 
+from ...core.exceptions import InsufficientStock
 
-#
+from ...core.permissions import OrderPermissions
 
-# Core Django settings
+from ...core.taxes import TaxError
 
-#
+from ...core.utils.url import validate_storefront_url
 
-SITE_ID = config("SITE_ID", default=1)
+from ...discount import models as voucher_model
 
+from ...payment import PaymentError, gateway, models as payment_models
 
+from ...payment.interface import AddressData
 
-# SECURITY WARNING: keep the secret key used in production secret!
+from ...payment.utils import store_customer_id
 
-SECRET_KEY = config("SECRET_KEY")
+from ...product import models as product_models
 
+from ...warehouse.availability import check_stock_quantity, get_available_quantity
 
+from ..account.i18n import I18nMixin
 
-# NEVER run with DEBUG=True in production-like environments
+from ..account.types import AddressInput, User
 
-DEBUG = config("DEBUG", default=False)
+from ..core.mutations import (
 
+    BaseMutation,
 
+    ClearMetaBaseMutation,
 
-# = domains we're running on
+    ModelMutation,
 
-ALLOWED_HOSTS = config("ALLOWED_HOSTS", default="", split=True)
-
-
-
-IS_HTTPS = config("IS_HTTPS", default=not DEBUG)
-
-
-
-# Internationalization
-
-# https://docs.djangoproject.com/en/2.0/topics/i18n/
-
-
-
-LANGUAGE_CODE = "nl-nl"
-
-
-
-TIME_ZONE = "UTC"  # note: this *may* affect the output of DRF datetimes
-
-
-
-USE_I18N = True
-
-
-
-USE_L10N = True
-
-
-
-USE_TZ = True
-
-
-
-USE_THOUSAND_SEPARATOR = True
-
-
-
-#
-
-# DATABASE and CACHING setup
-
-#
-
-DATABASES = {
-
-    "default": {
-
-        "ENGINE": "django.contrib.gis.db.backends.postgis",
-
-        "NAME": config("DB_NAME", "openzaak"),
-
-        "USER": config("DB_USER", "openzaak"),
-
-        "PASSWORD": config("DB_PASSWORD", "openzaak"),
-
-        "HOST": config("DB_HOST", "localhost"),
-
-        "PORT": config("DB_PORT", 5432),
-
-    }
-
-}
-
-
-
-CACHES = {
-
-    "default": {
-
-        "BACKEND": "django_redis.cache.RedisCache",
-
-        "LOCATION": f"redis://{config('CACHE_DEFAULT', 'localhost:6379/0')}",
-
-        "OPTIONS": {
-
-            "CLIENT_CLASS": "django_redis.client.DefaultClient",
-
-            "IGNORE_EXCEPTIONS": True,
-
-        },
-
-    },
-
-    "axes": {
-
-        "BACKEND": "django_redis.cache.RedisCache",
-
-        "LOCATION": f"redis://{config('CACHE_AXES', 'localhost:6379/0')}",
-
-        "OPTIONS": {
-
-            "CLIENT_CLASS": "django_redis.client.DefaultClient",
-
-            "IGNORE_EXCEPTIONS": True,
-
-        },
-
-    },
-
-}
-
-
-
-#
-
-# APPLICATIONS enabled for this project
-
-#
-
-INSTALLED_APPS = [
-
-    # Note: contenttypes should be first, see Django ticket #10827
-
-    "django.contrib.contenttypes",
-
-    "django.contrib.auth",
-
-    "django.contrib.sessions",
-
-    # Note: If enabled, at least one Site object is required
-
-    "django.contrib.sites",
-
-    "django.contrib.messages",
-
-    "django.contrib.staticfiles",
-
-    # Optional applications.
-
-    "ordered_model",
-
-    "django_admin_index",
-
-    "django.contrib.admin",
-
-    "django.contrib.gis",
-
-    # 'django.contrib.admindocs',
-
-    # 'django.contrib.humanize',
-
-    # External applications.
-
-    "axes",
-
-    "django_auth_adfs",
-
-    "django_auth_adfs_db",
-
-    "django_filters",
-
-    "django_db_logger",
-
-    "corsheaders",
-
-    "extra_views",
-
-    "vng_api_common",  # before drf_yasg to override the management command
-
-    "vng_api_common.authorizations",
-
-    "vng_api_common.audittrails",
-
-    "vng_api_common.notifications",
-
-    "nlx_url_rewriter",
-
-    "drf_yasg",
-
-    "rest_framework",
-
-    "rest_framework_gis",
-
-    "django_markup",
-
-    "solo",
-
-    "sniplates",
-
-    "privates",
-
-    "django_better_admin_arrayfield.apps.DjangoBetterAdminArrayfieldConfig",
-
-    "django_loose_fk",
-
-    "zgw_consumers",
-
-    "drc_cmis",
-
-    # Project applications.
-
-    "openzaak",
-
-    "openzaak.accounts",
-
-    "openzaak.utils",
-
-    "openzaak.components.autorisaties",
-
-    "openzaak.components.zaken",
-
-    "openzaak.components.besluiten",
-
-    "openzaak.components.documenten",
-
-    "openzaak.components.catalogi",
-
-    "openzaak.config",
-
-    "openzaak.selectielijst",
-
-    "openzaak.notifications",
-
-] + PLUGIN_INSTALLED_APPS
-
-
-
-MIDDLEWARE = [
-
-    "django.middleware.security.SecurityMiddleware",
-
-    "openzaak.utils.middleware.LogHeadersMiddleware",
-
-    "django.contrib.sessions.middleware.SessionMiddleware",
-
-    # 'django.middleware.locale.LocaleMiddleware',
-
-    "django.middleware.common.CommonMiddleware",
-
-    "django.middleware.csrf.CsrfViewMiddleware",
-
-    "django.contrib.auth.middleware.AuthenticationMiddleware",
-
-    "openzaak.components.autorisaties.middleware.AuthMiddleware",
-
-    "django.contrib.messages.middleware.MessageMiddleware",
-
-    "django.middleware.clickjacking.XFrameOptionsMiddleware",
-
-    "corsheaders.middleware.CorsMiddleware",
-
-    "openzaak.utils.middleware.APIVersionHeaderMiddleware",
-
-    "openzaak.utils.middleware.EnabledMiddleware",
-
-]
-
-
-
-ROOT_URLCONF = "openzaak.urls"
-
-
-
-# List of callables that know how to import templates from various sources.
-
-TEMPLATE_LOADERS = (
-
-    "django.template.loaders.filesystem.Loader",
-
-    "django.template.loaders.app_directories.Loader",
+    UpdateMetaBaseMutation,
 
 )
 
+from ..core.types.common import CheckoutError
 
+from ..core.utils import from_global_id_strict_type
 
-TEMPLATES = [
+from ..order.types import Order
 
-    {
+from ..product.types import ProductVariant
 
-        "BACKEND": "django.template.backends.django.DjangoTemplates",
+from ..shipping.types import ShippingMethod
 
-        "DIRS": [os.path.join(DJANGO_PROJECT_DIR, "templates")],
+from .types import Checkout, CheckoutLine
 
-        "APP_DIRS": False,  # conflicts with explicity specifying the loaders
 
-        "OPTIONS": {
 
-            "context_processors": [
+ERROR_DOES_NOT_SHIP = "This checkout doesn't need shipping"
 
-                "django.template.context_processors.debug",
 
-                "django.template.context_processors.request",
 
-                "django.contrib.auth.context_processors.auth",
 
-                "django.contrib.messages.context_processors.messages",
 
-                "openzaak.utils.context_processors.settings",
+def clean_shipping_method(
 
-                "django_admin_index.context_processors.dashboard",
+    checkout: models.Checkout, method: Optional[models.ShippingMethod], discounts
 
-            ],
+) -> bool:
 
-            "loaders": TEMPLATE_LOADERS,
+    """Check if current shipping method is valid."""
 
-        },
 
-    }
 
-]
+    if not method:
 
+        # no shipping method was provided, it is valid
 
+        return True
 
-WSGI_APPLICATION = "openzaak.wsgi.application"
 
 
+    if not checkout.is_shipping_required():
 
-# Translations
+        raise ValidationError(
 
-LOCALE_PATHS = (os.path.join(DJANGO_PROJECT_DIR, "conf", "locale"),)
+            ERROR_DOES_NOT_SHIP, code=CheckoutErrorCode.SHIPPING_NOT_REQUIRED.value
 
+        )
 
 
-#
 
-# SERVING of static and media files
+    if not checkout.shipping_address:
 
-#
+        raise ValidationError(
 
+            "Cannot choose a shipping method for a checkout without the "
 
+            "shipping address.",
 
-STATIC_URL = "/static/"
+            code=CheckoutErrorCode.SHIPPING_ADDRESS_NOT_SET.value,
 
+        )
 
 
-STATIC_ROOT = os.path.join(BASE_DIR, "static")
 
+    valid_methods = get_valid_shipping_methods_for_checkout(checkout, discounts)
 
+    return method in valid_methods
 
-# Additional locations of static files
 
-STATICFILES_DIRS = [os.path.join(DJANGO_PROJECT_DIR, "static")]
 
 
 
-# List of finder classes that know how to find static files in
+def update_checkout_shipping_method_if_invalid(checkout: models.Checkout, discounts):
 
-# various locations.
+    # remove shipping method when empty checkout
 
-STATICFILES_FINDERS = [
+    if checkout.quantity == 0 or not checkout.is_shipping_required():
 
-    "django.contrib.staticfiles.finders.FileSystemFinder",
+        checkout.shipping_method = None
 
-    "django.contrib.staticfiles.finders.AppDirectoriesFinder",
+        checkout.save(update_fields=["shipping_method", "last_change"])
 
-]
 
 
+    is_valid = clean_shipping_method(
 
-MEDIA_ROOT = os.path.join(BASE_DIR, "media")
-
-
-
-MEDIA_URL = "/media/"
-
-
-
-#
-
-# Sending EMAIL
-
-#
-
-EMAIL_HOST = config("EMAIL_HOST", default="localhost")
-
-EMAIL_PORT = config(
-
-    "EMAIL_PORT", default=25
-
-)  # disabled on Google Cloud, use 487 instead
-
-EMAIL_HOST_USER = config("EMAIL_HOST_USER", default="")
-
-EMAIL_HOST_PASSWORD = config("EMAIL_HOST_PASSWORD", default="")
-
-EMAIL_USE_TLS = config("EMAIL_USE_TLS", default=False)
-
-EMAIL_TIMEOUT = 10
-
-
-
-DEFAULT_FROM_EMAIL = "openzaak@example.com"
-
-
-
-#
-
-# LOGGING
-
-#
-
-LOG_STDOUT = config("LOG_STDOUT", default=False)
-
-
-
-LOGGING_DIR = os.path.join(BASE_DIR, "log")
-
-
-
-LOGGING = {
-
-    "version": 1,
-
-    "disable_existing_loggers": False,
-
-    "formatters": {
-
-        "verbose": {
-
-            "format": "%(asctime)s %(levelname)s %(name)s %(module)s %(process)d %(thread)d  %(message)s"
-
-        },
-
-        "timestamped": {"format": "%(asctime)s %(levelname)s %(name)s  %(message)s"},
-
-        "simple": {"format": "%(levelname)s  %(message)s"},
-
-        "performance": {"format": "%(asctime)s %(process)d | %(thread)d | %(message)s"},
-
-    },
-
-    "filters": {
-
-        "require_debug_false": {"()": "django.utils.log.RequireDebugFalse"},
-
-        "failed_notification": {
-
-            "()": "openzaak.notifications.filters.FailedNotificationFilter"
-
-        },
-
-    },
-
-    "handlers": {
-
-        "mail_admins": {
-
-            "level": "ERROR",
-
-            "filters": ["require_debug_false"],
-
-            "class": "django.utils.log.AdminEmailHandler",
-
-        },
-
-        "null": {"level": "DEBUG", "class": "logging.NullHandler"},
-
-        "console": {
-
-            "level": "DEBUG",
-
-            "class": "logging.StreamHandler",
-
-            "formatter": "timestamped",
-
-        },
-
-        "django": {
-
-            "level": "DEBUG",
-
-            "class": "logging.handlers.RotatingFileHandler",
-
-            "filename": os.path.join(LOGGING_DIR, "django.log"),
-
-            "formatter": "verbose",
-
-            "maxBytes": 1024 * 1024 * 10,  # 10 MB
-
-            "backupCount": 10,
-
-        },
-
-        "project": {
-
-            "level": "DEBUG",
-
-            "class": "logging.handlers.RotatingFileHandler",
-
-            "filename": os.path.join(LOGGING_DIR, "openzaak.log"),
-
-            "formatter": "verbose",
-
-            "maxBytes": 1024 * 1024 * 10,  # 10 MB
-
-            "backupCount": 10,
-
-        },
-
-        "performance": {
-
-            "level": "INFO",
-
-            "class": "logging.handlers.RotatingFileHandler",
-
-            "filename": os.path.join(LOGGING_DIR, "performance.log"),
-
-            "formatter": "performance",
-
-            "maxBytes": 1024 * 1024 * 10,  # 10 MB
-
-            "backupCount": 10,
-
-        },
-
-        "requests": {
-
-            "level": "DEBUG",
-
-            "class": "logging.handlers.RotatingFileHandler",
-
-            "filename": os.path.join(LOGGING_DIR, "requests.log"),
-
-            "formatter": "timestamped",
-
-            "maxBytes": 1024 * 1024 * 10,  # 10 MB
-
-            "backupCount": 10,
-
-        },
-
-        "failed_notification": {
-
-            "level": "DEBUG",
-
-            "filters": ["failed_notification"],
-
-            "class": "openzaak.notifications.handlers.DatabaseLogHandler",
-
-        },
-
-    },
-
-    "loggers": {
-
-        "openzaak": {
-
-            "handlers": ["project"] if not LOG_STDOUT else ["console"],
-
-            "level": "INFO",
-
-            "propagate": True,
-
-        },
-
-        "openzaak.utils.middleware": {
-
-            "handlers": ["requests"] if not LOG_STDOUT else ["console"],
-
-            "level": "DEBUG",
-
-            "propagate": False,
-
-        },
-
-        "vng_api_common": {"handlers": ["console"], "level": "INFO", "propagate": True},
-
-        "django.request": {
-
-            "handlers": ["django"] if not LOG_STDOUT else ["console"],
-
-            "level": "ERROR",
-
-            "propagate": True,
-
-        },
-
-        "django.template": {
-
-            "handlers": ["console"],
-
-            "level": "INFO",
-
-            "propagate": True,
-
-        },
-
-        "vng_api_common.notifications.viewsets": {
-
-            "handlers": [
-
-                "failed_notification",  # always log this to the database!
-
-                "project" if not LOG_STDOUT else "console",
-
-            ],
-
-            "level": "WARNING",
-
-            "propagate": True,
-
-        },
-
-    },
-
-}
-
-
-
-
-
-#
-
-# AUTH settings - user accounts, passwords, backends...
-
-#
-
-AUTH_USER_MODEL = "accounts.User"
-
-
-
-AUTH_PASSWORD_VALIDATORS = [
-
-    {
-
-        "NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"
-
-    },
-
-    {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator"},
-
-    {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
-
-    {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
-
-]
-
-
-
-
-
-# Allow logging in with both username+password and email+password
-
-AUTHENTICATION_BACKENDS = [
-
-    "openzaak.accounts.backends.UserModelEmailBackend",
-
-    "django.contrib.auth.backends.ModelBackend",
-
-    "django_auth_adfs_db.backends.AdfsAuthCodeBackend",
-
-]
-
-
-
-SESSION_COOKIE_NAME = "openzaak_sessionid"
-
-SESSION_ENGINE = "django.contrib.sessions.backends.cache"
-
-
-
-LOGIN_URL = reverse_lazy("admin:login")
-
-LOGIN_REDIRECT_URL = reverse_lazy("admin:index")
-
-
-
-#
-
-# SECURITY settings
-
-#
-
-SESSION_COOKIE_SECURE = IS_HTTPS
-
-SESSION_COOKIE_HTTPONLY = True
-
-
-
-CSRF_COOKIE_SECURE = IS_HTTPS
-
-
-
-X_FRAME_OPTIONS = "DENY"
-
-
-
-#
-
-# Silenced checks
-
-#
-
-SILENCED_SYSTEM_CHECKS = ["rest_framework.W001"]
-
-
-
-#
-
-# Custom settings
-
-#
-
-PROJECT_NAME = "Open Zaak"
-
-SITE_TITLE = "API dashboard"
-
-
-
-ENVIRONMENT = None
-
-ENVIRONMENT_SHOWN_IN_ADMIN = True
-
-
-
-# settings for uploading large files
-
-MIN_UPLOAD_SIZE = config("MIN_UPLOAD_SIZE", 4 * 2 ** 30)
-
-
-
-# urls for OAS3 specifications
-
-SPEC_URL = {
-
-    "zaken": os.path.join(
-
-        BASE_DIR, "src", "openzaak", "components", "zaken", "openapi.yaml"
-
-    ),
-
-    "besluiten": os.path.join(
-
-        BASE_DIR, "src", "openzaak", "components", "besluiten", "openapi.yaml"
-
-    ),
-
-    "documenten": os.path.join(
-
-        BASE_DIR, "src", "openzaak", "components", "documenten", "openapi.yaml"
-
-    ),
-
-    "catalogi": os.path.join(
-
-        BASE_DIR, "src", "openzaak", "components", "catalogi", "openapi.yaml"
-
-    ),
-
-    "autorisaties": os.path.join(
-
-        BASE_DIR, "src", "openzaak", "components", "autorisaties", "openapi.yaml"
-
-    ),
-
-}
-
-
-
-# Generating the schema, depending on the component
-
-subpath = config("SUBPATH", None)
-
-if subpath:
-
-    if not subpath.startswith("/"):
-
-        subpath = f"/{subpath}"
-
-    SUBPATH = subpath
-
-
-
-if "GIT_SHA" in os.environ:
-
-    GIT_SHA = config("GIT_SHA", "")
-
-# in docker (build) context, there is no .git directory
-
-elif os.path.exists(os.path.join(BASE_DIR, ".git")):
-
-    repo = git.Repo(search_parent_directories=True)
-
-    GIT_SHA = repo.head.object.hexsha
-
-else:
-
-    GIT_SHA = None
-
-
-
-RELEASE = config("RELEASE", GIT_SHA)
-
-
-
-##############################
-
-#                            #
-
-# 3RD PARTY LIBRARY SETTINGS #
-
-#                            #
-
-##############################
-
-
-
-#
-
-# AUTH-ADFS
-
-#
-
-AUTH_ADFS = {"SETTINGS_CLASS": "django_auth_adfs_db.settings.Settings"}
-
-
-
-#
-
-# DJANGO-AXES
-
-#
-
-AXES_CACHE = "axes"  # refers to CACHES setting
-
-AXES_LOGIN_FAILURE_LIMIT = 5  # Default: 3
-
-AXES_LOCK_OUT_AT_FAILURE = True  # Default: True
-
-AXES_USE_USER_AGENT = False  # Default: False
-
-AXES_COOLOFF_TIME = datetime.timedelta(minutes=5)  # One hour
-
-AXES_BEHIND_REVERSE_PROXY = IS_HTTPS  # We have either Ingress or Nginx
-
-AXES_ONLY_USER_FAILURES = (
-
-    False  # Default: False (you might want to block on username rather than IP)
-
-)
-
-AXES_LOCK_OUT_BY_COMBINATION_USER_AND_IP = (
-
-    False  # Default: False (you might want to block on username and IP)
-
-)
-
-
-
-#
-
-# DJANGO-HIJACK
-
-#
-
-HIJACK_LOGIN_REDIRECT_URL = reverse_lazy("home")
-
-HIJACK_LOGOUT_REDIRECT_URL = reverse_lazy("admin:accounts_user_changelist")
-
-HIJACK_REGISTER_ADMIN = False
-
-# This is a CSRF-security risk.
-
-# See: http://django-hijack.readthedocs.io/en/latest/configuration/#allowing-get-method-for-hijack-views
-
-HIJACK_ALLOW_GET_REQUESTS = True
-
-
-
-#
-
-# DJANGO-CORS-MIDDLEWARE
-
-#
-
-CORS_ORIGIN_ALLOW_ALL = True
-
-CORS_ALLOW_HEADERS = (
-
-    "x-requested-with",
-
-    "content-type",
-
-    "accept",
-
-    "origin",
-
-    "authorization",
-
-    "x-csrftoken",
-
-    "user-agent",
-
-    "accept-encoding",
-
-    "accept-crs",
-
-    "content-crs",
-
-)
-
-
-
-#
-
-# DJANGO-PRIVATES -- safely serve files after authorization
-
-#
-
-PRIVATE_MEDIA_ROOT = os.path.join(BASE_DIR, "private-media")
-
-PRIVATE_MEDIA_URL = "/private-media/"
-
-
-
-# requires an nginx container running in front
-
-SENDFILE_BACKEND = config("SENDFILE_BACKEND", "django_sendfile.backends.nginx")
-
-SENDFILE_ROOT = PRIVATE_MEDIA_ROOT
-
-SENDFILE_URL = PRIVATE_MEDIA_URL
-
-
-
-#
-
-# DJANGO-LOOSE-FK -- handle internal and external API resources
-
-#
-
-DEFAULT_LOOSE_FK_LOADER = "openzaak.loaders.AuthorizedRequestsLoader"
-
-
-
-#
-
-# RAVEN/SENTRY - error monitoring
-
-#
-
-SENTRY_DSN = config("SENTRY_DSN", None)
-
-
-
-SENTRY_SDK_INTEGRATIONS = [
-
-    django.DjangoIntegration(),
-
-    redis.RedisIntegration(),
-
-]
-
-
-
-if SENTRY_DSN:
-
-    SENTRY_CONFIG = {
-
-        "dsn": SENTRY_DSN,
-
-        "release": RELEASE or "RELEASE not set",
-
-    }
-
-
-
-    sentry_sdk.init(
-
-        **SENTRY_CONFIG,
-
-        integrations=SENTRY_SDK_INTEGRATIONS,
-
-        send_default_pii=True,
-
-        before_send=filter_sensitive_data,
+        checkout=checkout, method=checkout.shipping_method, discounts=discounts
 
     )
 
 
 
-#
+    if not is_valid:
 
-# DJANGO-ADMIN-INDEX
+        cheapest_alternative = get_valid_shipping_methods_for_checkout(
 
-#
+            checkout, discounts
 
-ADMIN_INDEX_SHOW_REMAINING_APPS_TO_SUPERUSERS = False
+        ).first()
 
-ADMIN_INDEX_AUTO_CREATE_APP_GROUP = False
+        checkout.shipping_method = cheapest_alternative
 
-
-
-#
-
-# OpenZaak configuration
-
-#
+        checkout.save(update_fields=["shipping_method", "last_change"])
 
 
 
-OPENZAAK_API_CONTACT_EMAIL = "support@maykinmedia.nl"
-
-OPENZAAK_API_CONTACT_URL = "https://www.maykinmedia.nl"
-
-STORE_FAILED_NOTIFS = True
 
 
+def check_lines_quantity(variants, quantities, country):
 
-# Expiry time in seconds for JWT
+    """Check if stock is sufficient for each line in the list of dicts."""
 
-JWT_EXPIRY = config("JWT_EXPIRY", default=3600)
+    for variant, quantity in zip(variants, quantities):
+
+        if quantity < 0:
+
+            raise ValidationError(
+
+                {
+
+                    "quantity": ValidationError(
+
+                        "The quantity should be higher than zero.",
+
+                        code=CheckoutErrorCode.ZERO_QUANTITY,
+
+                    )
+
+                }
+
+            )
+
+        if quantity > settings.MAX_CHECKOUT_LINE_QUANTITY:
+
+            raise ValidationError(
+
+                {
+
+                    "quantity": ValidationError(
+
+                        "Cannot add more than %d times this item."
+
+                        "" % settings.MAX_CHECKOUT_LINE_QUANTITY,
+
+                        code=CheckoutErrorCode.QUANTITY_GREATER_THAN_LIMIT,
+
+                    )
+
+                }
+
+            )
+
+        try:
+
+            check_stock_quantity(variant, country, quantity)
+
+        except InsufficientStock as e:
+
+            available_quantity = get_available_quantity(e.item, country)
+
+            message = (
+
+                "Could not add item "
+
+                + "%(item_name)s. Only %(remaining)d remaining in stock."
+
+                % {
+
+                    "remaining": available_quantity,
+
+                    "item_name": e.item.display_product(),
+
+                }
+
+            )
+
+            raise ValidationError({"quantity": ValidationError(message, code=e.code)})
 
 
 
-NLX_DIRECTORY_URLS = {
 
-    NLXDirectories.demo: "https://directory.demo.nlx.io/",
 
-    NLXDirectories.preprod: "https://directory.preprod.nlx.io/",
+class CheckoutLineInput(graphene.InputObjectType):
 
-    NLXDirectories.prod: "https://directory.prod.nlx.io/",
+    quantity = graphene.Int(required=True, description="The number of items purchased.")
 
-}
+    variant_id = graphene.ID(required=True, description="ID of the product variant.")
 
 
 
-CUSTOM_CLIENT_FETCHER = "openzaak.utils.auth.get_client"
+
+
+class CheckoutCreateInput(graphene.InputObjectType):
+
+    lines = graphene.List(
+
+        CheckoutLineInput,
+
+        description=(
+
+            "A list of checkout lines, each containing information about "
+
+            "an item in the checkout."
+
+        ),
+
+        required=True,
+
+    )
+
+    email = graphene.String(description="The customer's email address.")
+
+    shipping_address = AddressInput(
+
+        description=(
+
+            "The mailing address to where the checkout will be shipped. "
+
+            "Note: the address will be ignored if the checkout "
+
+            "doesn't contain shippable items."
+
+        )
+
+    )
+
+    billing_address = AddressInput(description="Billing address of the customer.")
 
 
 
-CMIS_ENABLED = config("CMIS_ENABLED", default=False)
 
-CMIS_MAPPER_FILE = config(
 
-    "CMIS_MAPPER_FILE", default=os.path.join(BASE_DIR, "config", "cmis_mapper.json")
+class CheckoutCreate(ModelMutation, I18nMixin):
 
-)
+    created = graphene.Field(
+
+        graphene.Boolean,
+
+        description=(
+
+            "Whether the checkout was created or the current active one was returned. "
+
+            "Refer to checkoutLinesAdd and checkoutLinesUpdate to merge a cart "
+
+            "with an active checkout."
+
+        ),
+
+    )
+
+
+
+    class Arguments:
+
+        input = CheckoutCreateInput(
+
+            required=True, description="Fields required to create checkout."
+
+        )
+
+
+
+    class Meta:
+
+        description = "Create a new checkout."
+
+        model = models.Checkout
+
+        return_field_name = "checkout"
+
+        error_type_class = CheckoutError
+
+        error_type_field = "checkout_errors"
+
+
+
+    @classmethod
+
+    def process_checkout_lines(
+
+        cls, lines, country
+
+    ) -> Tuple[List[product_models.ProductVariant], List[int]]:
+
+        variant_ids = [line.get("variant_id") for line in lines]
+
+        variants = cls.get_nodes_or_error(
+
+            variant_ids,
+
+            "variant_id",
+
+            ProductVariant,
+
+            qs=product_models.ProductVariant.objects.prefetch_related(
+
+                "product__product_type"
+
+            ),
+
+        )
+
+        quantities = [line.get("quantity") for line in lines]
+
+
+
+        check_lines_quantity(variants, quantities, country)
+
+
+
+        return variants, quantities
+
+
+
+    @classmethod
+
+    def retrieve_shipping_address(cls, user, data: dict) -> Optional[models.Address]:
+
+        if "shipping_address" in data:
+
+            return cls.validate_address(data["shipping_address"])
+
+        if user.is_authenticated:
+
+            return user.default_shipping_address
+
+        return None
+
+
+
+    @classmethod
+
+    def retrieve_billing_address(cls, user, data: dict) -> Optional[models.Address]:
+
+        if "billing_address" in data:
+
+            return cls.validate_address(data["billing_address"])
+
+        if user.is_authenticated:
+
+            return user.default_billing_address
+
+        return None
+
+
+
+    @classmethod
+
+    def clean_input(cls, info, instance: models.Checkout, data, input_cls=None):
+
+        cleaned_input = super().clean_input(info, instance, data)
+
+        user = info.context.user
+
+        country = info.context.country.code
+
+
+
+        # Resolve and process the lines, retrieving the variants and quantities
+
+        lines = data.pop("lines", None)
+
+        if lines:
+
+            (
+
+                cleaned_input["variants"],
+
+                cleaned_input["quantities"],
+
+            ) = cls.process_checkout_lines(lines, country)
+
+
+
+        cleaned_input["shipping_address"] = cls.retrieve_shipping_address(user, data)
+
+        cleaned_input["billing_address"] = cls.retrieve_billing_address(user, data)
+
+
+
+        # Use authenticated user's email as default email
+
+        if user.is_authenticated:
+
+            email = data.pop("email", None)
+
+            cleaned_input["email"] = email or user.email
+
+
+
+        return cleaned_input
+
+
+
+    @classmethod
+
+    def save_addresses(cls, instance: models.Checkout, cleaned_input: dict):
+
+        shipping_address = cleaned_input.get("shipping_address")
+
+        billing_address = cleaned_input.get("billing_address")
+
+
+
+        updated_fields = ["last_change"]
+
+
+
+        if shipping_address and instance.is_shipping_required():
+
+            shipping_address.save()
+
+            instance.shipping_address = shipping_address.get_copy()
+
+            updated_fields.append("shipping_address")
+
+        if billing_address:
+
+            billing_address.save()
+
+            instance.billing_address = billing_address.get_copy()
+
+            updated_fields.append("billing_address")
+
+
+
+        # Note django will simply return if the list is empty
+
+        instance.save(update_fields=updated_fields)
+
+
+
+    @classmethod
+
+    @transaction.atomic()
+
+    def save(cls, info, instance: models.Checkout, cleaned_input):
+
+        # Create the checkout object
+
+        instance.save()
+
+        country = info.context.country
+
+        instance.set_country(country.code, commit=True)
+
+
+
+        # Retrieve the lines to create
+
+        variants = cleaned_input.get("variants")
+
+        quantities = cleaned_input.get("quantities")
+
+
+
+        # Create the checkout lines
+
+        if variants and quantities:
+
+            for variant, quantity in zip(variants, quantities):
+
+                try:
+
+                    add_variant_to_checkout(instance, variant, quantity)
+
+                except InsufficientStock as exc:
+
+                    raise ValidationError(
+
+                        f"Insufficient product stock: {exc.item}", code=exc.code
+
+                    )
+
+
+
+        # Save provided addresses and associate them to the checkout
+
+        cls.save_addresses(instance, cleaned_input)
+
+
+
+    @classmethod
+
+    def perform_mutation(cls, _root, info, **data):
+
+        user = info.context.user
+
+
+
+        # `perform_mutation` is overridden to properly get or create a checkout
+
+        # instance here and abort mutation if needed.
+
+        if user.is_authenticated:
+
+            checkout, _ = get_user_checkout(user)
+
+
+
+            if checkout is not None:
+
+                # If user has an active checkout, return it without any
+
+                # modifications.
+
+                return CheckoutCreate(checkout=checkout, created=False)
+
+
+
+            checkout = models.Checkout(user=user)
+
+        else:
+
+            checkout = models.Checkout()
+
+
+
+        cleaned_input = cls.clean_input(info, checkout, data.get("input"))
+
+        checkout = cls.construct_instance(checkout, cleaned_input)
+
+        cls.clean_instance(info, checkout)
+
+        cls.save(info, checkout, cleaned_input)
+
+        cls._save_m2m(info, checkout, cleaned_input)
+
+        return CheckoutCreate(checkout=checkout, created=True)
+
+
+
+
+
+class CheckoutLinesAdd(BaseMutation):
+
+    checkout = graphene.Field(Checkout, description="An updated checkout.")
+
+
+
+    class Arguments:
+
+        checkout_id = graphene.ID(description="The ID of the checkout.", required=True)
+
+        lines = graphene.List(
+
+            CheckoutLineInput,
+
+            required=True,
+
+            description=(
+
+                "A list of checkout lines, each containing information about "
+
+                "an item in the checkout."
+
+            ),
+
+        )
+
+
+
+    class Meta:
+
+        description = "Adds a checkout line to the existing checkout."
+
+        error_type_class = CheckoutError
+
+        error_type_field = "checkout_errors"
+
+
+
+    @classmethod
+
+    def perform_mutation(cls, _root, info, checkout_id, lines, replace=False):
+
+        checkout = cls.get_node_or_error(
+
+            info, checkout_id, only_type=Checkout, field="checkout_id"
+
+        )
+
+
+
+        variant_ids = [line.get("variant_id") for line in lines]
+
+        variants = cls.get_nodes_or_error(variant_ids, "variant_id", ProductVariant)
+
+        quantities = [line.get("quantity") for line in lines]
+
+
+
+        check_lines_quantity(variants, quantities, checkout.get_country())
+
+
+
+        if variants and quantities:
+
+            for variant, quantity in zip(variants, quantities):
+
+                try:
+
+                    add_variant_to_checkout(
+
+                        checkout, variant, quantity, replace=replace
+
+                    )
+
+                except InsufficientStock as exc:
+
+                    raise ValidationError(
+
+                        f"Insufficient product stock: {exc.item}", code=exc.code
+
+                    )
+
+
+
+        update_checkout_shipping_method_if_invalid(checkout, info.context.discounts)
+
+        recalculate_checkout_discount(checkout, info.context.discounts)
+
+
+
+        return CheckoutLinesAdd(checkout=checkout)
+
+
+
+
+
+class CheckoutLinesUpdate(CheckoutLinesAdd):
+
+    checkout = graphene.Field(Checkout, description="An updated checkout.")
+
+
+
+    class Meta:
+
+        description = "Updates checkout line in the existing checkout."
+
+        error_type_class = CheckoutError
+
+        error_type_field = "checkout_errors"
+
+
+
+    @classmethod
+
+    def perform_mutation(cls, root, info, checkout_id, lines):
+
+        return super().perform_mutation(root, info, checkout_id, lines, replace=True)
+
+
+
+
+
+class CheckoutLineDelete(BaseMutation):
+
+    checkout = graphene.Field(Checkout, description="An updated checkout.")
+
+
+
+    class Arguments:
+
+        checkout_id = graphene.ID(description="The ID of the checkout.", required=True)
+
+        line_id = graphene.ID(description="ID of the checkout line to delete.")
+
+
+
+    class Meta:
+
+        description = "Deletes a CheckoutLine."
+
+        error_type_class = CheckoutError
+
+        error_type_field = "checkout_errors"
+
+
+
+    @classmethod
+
+    def perform_mutation(cls, _root, info, checkout_id, line_id):
+
+        checkout = cls.get_node_or_error(
+
+            info, checkout_id, only_type=Checkout, field="checkout_id"
+
+        )
+
+        line = cls.get_node_or_error(
+
+            info, line_id, only_type=CheckoutLine, field="line_id"
+
+        )
+
+
+
+        if line and line in checkout.lines.all():
+
+            line.delete()
+
+
+
+        update_checkout_shipping_method_if_invalid(checkout, info.context.discounts)
+
+        recalculate_checkout_discount(checkout, info.context.discounts)
+
+
+
+        return CheckoutLineDelete(checkout=checkout)
+
+
+
+
+
+class CheckoutCustomerAttach(BaseMutation):
+
+    checkout = graphene.Field(Checkout, description="An updated checkout.")
+
+
+
+    class Arguments:
+
+        checkout_id = graphene.ID(required=True, description="ID of the checkout.")
+
+        customer_id = graphene.ID(required=True, description="The ID of the customer.")
+
+
+
+    class Meta:
+
+        description = "Sets the customer as the owner of the checkout."
+
+        error_type_class = CheckoutError
+
+        error_type_field = "checkout_errors"
+
+
+
+    @classmethod
+
+    def perform_mutation(cls, _root, info, checkout_id, customer_id):
+
+        checkout = cls.get_node_or_error(
+
+            info, checkout_id, only_type=Checkout, field="checkout_id"
+
+        )
+
+        customer = cls.get_node_or_error(
+
+            info, customer_id, only_type=User, field="customer_id"
+
+        )
+
+        checkout.user = customer
+
+        checkout.save(update_fields=["user", "last_change"])
+
+        return CheckoutCustomerAttach(checkout=checkout)
+
+
+
+
+
+class CheckoutCustomerDetach(BaseMutation):
+
+    checkout = graphene.Field(Checkout, description="An updated checkout.")
+
+
+
+    class Arguments:
+
+        checkout_id = graphene.ID(description="Checkout ID.", required=True)
+
+
+
+    class Meta:
+
+        description = "Removes the user assigned as the owner of the checkout."
+
+        error_type_class = CheckoutError
+
+        error_type_field = "checkout_errors"
+
+
+
+    @classmethod
+
+    def perform_mutation(cls, _root, info, checkout_id):
+
+        checkout = cls.get_node_or_error(
+
+            info, checkout_id, only_type=Checkout, field="checkout_id"
+
+        )
+
+        checkout.user = None
+
+        checkout.save(update_fields=["user", "last_change"])
+
+        return CheckoutCustomerDetach(checkout=checkout)
+
+
+
+
+
+class CheckoutShippingAddressUpdate(BaseMutation, I18nMixin):
+
+    checkout = graphene.Field(Checkout, description="An updated checkout.")
+
+
+
+    class Arguments:
+
+        checkout_id = graphene.ID(required=True, description="ID of the checkout.")
+
+        shipping_address = AddressInput(
+
+            required=True,
+
+            description="The mailing address to where the checkout will be shipped.",
+
+        )
+
+
+
+    class Meta:
+
+        description = "Update shipping address in the existing checkout."
+
+        error_type_class = CheckoutError
+
+        error_type_field = "checkout_errors"
+
+
+
+    @classmethod
+
+    def perform_mutation(cls, _root, info, checkout_id, shipping_address):
+
+        pk = from_global_id_strict_type(checkout_id, Checkout, field="checkout_id")
+
+
+
+        try:
+
+            checkout = models.Checkout.objects.prefetch_related(
+
+                "lines__variant__product__product_type"
+
+            ).get(pk=pk)
+
+        except ObjectDoesNotExist:
+
+            raise ValidationError(
+
+                {
+
+                    "checkout_id": ValidationError(
+
+                        f"Couldn't resolve to a node: {checkout_id}",
+
+                        code=CheckoutErrorCode.NOT_FOUND,
+
+                    )
+
+                }
+
+            )
+
+
+
+        if not checkout.is_shipping_required():
+
+            raise ValidationError(
+
+                {
+
+                    "shipping_address": ValidationError(
+
+                        ERROR_DOES_NOT_SHIP,
+
+                        code=CheckoutErrorCode.SHIPPING_NOT_REQUIRED,
+
+                    )
+
+                }
+
+            )
+
+
+
+        shipping_address = cls.validate_address(
+
+            shipping_address, instance=checkout.shipping_address, info=info
+
+        )
+
+
+
+        update_checkout_shipping_method_if_invalid(checkout, info.context.discounts)
+
+
+
+        with transaction.atomic():
+
+            shipping_address.save()
+
+            change_shipping_address_in_checkout(checkout, shipping_address)
+
+        recalculate_checkout_discount(checkout, info.context.discounts)
+
+
+
+        return CheckoutShippingAddressUpdate(checkout=checkout)
+
+
+
+
+
+class CheckoutBillingAddressUpdate(CheckoutShippingAddressUpdate):
+
+    checkout = graphene.Field(Checkout, description="An updated checkout.")
+
+
+
+    class Arguments:
+
+        checkout_id = graphene.ID(required=True, description="ID of the checkout.")
+
+        billing_address = AddressInput(
+
+            required=True, description="The billing address of the checkout."
+
+        )
+
+
+
+    class Meta:
+
+        description = "Update billing address in the existing checkout."
+
+        error_type_class = CheckoutError
+
+        error_type_field = "checkout_errors"
+
+
+
+    @classmethod
+
+    def perform_mutation(cls, _root, info, checkout_id, billing_address):
+
+        checkout = cls.get_node_or_error(
+
+            info, checkout_id, only_type=Checkout, field="checkout_id"
+
+        )
+
+
+
+        billing_address = cls.validate_address(
+
+            billing_address, instance=checkout.billing_address, info=info
+
+        )
+
+        with transaction.atomic():
+
+            billing_address.save()
+
+            change_billing_address_in_checkout(checkout, billing_address)
+
+        return CheckoutBillingAddressUpdate(checkout=checkout)
+
+
+
+
+
+class CheckoutEmailUpdate(BaseMutation):
+
+    checkout = graphene.Field(Checkout, description="An updated checkout.")
+
+
+
+    class Arguments:
+
+        checkout_id = graphene.ID(description="Checkout ID.")
+
+        email = graphene.String(required=True, description="email.")
+
+
+
+    class Meta:
+
+        description = "Updates email address in the existing checkout object."
+
+        error_type_class = CheckoutError
+
+        error_type_field = "checkout_errors"
+
+
+
+    @classmethod
+
+    def perform_mutation(cls, _root, info, checkout_id, email):
+
+        checkout = cls.get_node_or_error(
+
+            info, checkout_id, only_type=Checkout, field="checkout_id"
+
+        )
+
+
+
+        checkout.email = email
+
+        cls.clean_instance(info, checkout)
+
+        checkout.save(update_fields=["email", "last_change"])
+
+        return CheckoutEmailUpdate(checkout=checkout)
+
+
+
+
+
+class CheckoutShippingMethodUpdate(BaseMutation):
+
+    checkout = graphene.Field(Checkout, description="An updated checkout.")
+
+
+
+    class Arguments:
+
+        checkout_id = graphene.ID(description="Checkout ID.")
+
+        shipping_method_id = graphene.ID(required=True, description="Shipping method.")
+
+
+
+    class Meta:
+
+        description = "Updates the shipping address of the checkout."
+
+        error_type_class = CheckoutError
+
+        error_type_field = "checkout_errors"
+
+
+
+    @classmethod
+
+    def perform_mutation(cls, _root, info, checkout_id, shipping_method_id):
+
+        pk = from_global_id_strict_type(
+
+            checkout_id, only_type=Checkout, field="checkout_id"
+
+        )
+
+
+
+        try:
+
+            checkout = models.Checkout.objects.prefetch_related(
+
+                "lines__variant__product__collections",
+
+                "lines__variant__product__product_type",
+
+            ).get(pk=pk)
+
+        except ObjectDoesNotExist:
+
+            raise ValidationError(
+
+                {
+
+                    "checkout_id": ValidationError(
+
+                        f"Couldn't resolve to a node: {checkout_id}",
+
+                        code=CheckoutErrorCode.NOT_FOUND,
+
+                    )
+
+                }
+
+            )
+
+
+
+        if not checkout.is_shipping_required():
+
+            raise ValidationError(
+
+                {
+
+                    "shipping_method": ValidationError(
+
+                        ERROR_DOES_NOT_SHIP,
+
+                        code=CheckoutErrorCode.SHIPPING_NOT_REQUIRED,
+
+                    )
+
+                }
+
+            )
+
+
+
+        shipping_method = cls.get_node_or_error(
+
+            info,
+
+            shipping_method_id,
+
+            only_type=ShippingMethod,
+
+            field="shipping_method_id",
+
+        )
+
+
+
+        shipping_method_is_valid = clean_shipping_method(
+
+            checkout=checkout, method=shipping_method, discounts=info.context.discounts
+
+        )
+
+
+
+        if not shipping_method_is_valid:
+
+            raise ValidationError(
+
+                {
+
+                    "shipping_method": ValidationError(
+
+                        "This shipping method is not applicable.",
+
+                        code=CheckoutErrorCode.SHIPPING_METHOD_NOT_APPLICABLE,
+
+                    )
+
+                }
+
+            )
+
+
+
+        checkout.shipping_method = shipping_method
+
+        checkout.save(update_fields=["shipping_method", "last_change"])
+
+        recalculate_checkout_discount(checkout, info.context.discounts)
+
+
+
+        return CheckoutShippingMethodUpdate(checkout=checkout)
+
+
+
+
+
+class CheckoutComplete(BaseMutation):
+
+    order = graphene.Field(Order, description="Placed order.")
+
+
+
+    class Arguments:
+
+        checkout_id = graphene.ID(description="Checkout ID.", required=True)
+
+        store_source = graphene.Boolean(
+
+            default_value=False,
+
+            description=(
+
+                "Determines whether to store the payment source for future usage."
+
+            ),
+
+        )
+
+        redirect_url = graphene.String(
+
+            required=False,
+
+            description=(
+
+                "URL of a view where users should be redirected to "
+
+                "see the order details. URL in RFC 1808 format."
+
+            ),
+
+        )
+
+
+
+    class Meta:
+
+        description = (
+
+            "Completes the checkout. As a result a new order is created and "
+
+            "a payment charge is made. This action requires a successful "
+
+            "payment before it can be performed."
+
+        )
+
+        error_type_class = CheckoutError
+
+        error_type_field = "checkout_errors"
+
+
+
+    @classmethod
+
+    def perform_mutation(cls, _root, info, checkout_id, store_source, **data):
+
+        checkout = cls.get_node_or_error(
+
+            info,
+
+            checkout_id,
+
+            only_type=Checkout,
+
+            field="checkout_id",
+
+            qs=models.Checkout.objects.prefetch_related(
+
+                "gift_cards",
+
+                "lines",
+
+                Prefetch(
+
+                    "payments",
+
+                    queryset=payment_models.Payment.objects.prefetch_related(
+
+                        "order", "order__lines"
+
+                    ),
+
+                ),
+
+            ).select_related("shipping_method", "shipping_method__shipping_zone"),
+
+        )
+
+
+
+        discounts = info.context.discounts
+
+        user = info.context.user
+
+        clean_checkout(checkout, discounts)
+
+
+
+        payment = checkout.get_last_active_payment()
+
+
+
+        with transaction.atomic():
+
+            try:
+
+                order_data = prepare_order_data(
+
+                    checkout=checkout,
+
+                    tracking_code=analytics.get_client_id(info.context),
+
+                    discounts=discounts,
+
+                )
+
+            except InsufficientStock as e:
+
+                raise ValidationError(
+
+                    f"Insufficient product stock: {e.item}", code=e.code
+
+                )
+
+            except voucher_model.NotApplicable:
+
+                raise ValidationError(
+
+                    "Voucher not applicable",
+
+                    code=CheckoutErrorCode.VOUCHER_NOT_APPLICABLE,
+
+                )
+
+            except TaxError as tax_error:
+
+                return ValidationError(
+
+                    "Unable to calculate taxes - %s" % str(tax_error),
+
+                    code=CheckoutErrorCode.TAX_ERROR,
+
+                )
+
+
+
+        billing_address = order_data["billing_address"]
+
+        shipping_address = order_data.get("shipping_address", None)
+
+
+
+        billing_address = AddressData(**billing_address.as_data())
+
+
+
+        if shipping_address is not None:
+
+            shipping_address = AddressData(**shipping_address.as_data())
+
+
+
+        try:
+
+            txn = gateway.process_payment(
+
+                payment=payment, token=payment.token, store_source=store_source
+
+            )
+
+
+
+            if not txn.is_success:
+
+                raise PaymentError(txn.error)
+
+
+
+        except PaymentError as e:
+
+            abort_order_data(order_data)
+
+            raise ValidationError(str(e), code=CheckoutErrorCode.PAYMENT_ERROR)
+
+
+
+        if txn.customer_id and user.is_authenticated:
+
+            store_customer_id(user, payment.gateway, txn.customer_id)
+
+
+
+        redirect_url = data.get("redirect_url", "")
+
+        if redirect_url:
+
+            try:
+
+                validate_storefront_url(redirect_url)
+
+            except ValidationError as error:
+
+                raise ValidationError(
+
+                    {"redirect_url": error}, code=AccountErrorCode.INVALID
+
+                )
+
+
+
+        # create the order into the database
+
+        order = create_order(
+
+            checkout=checkout,
+
+            order_data=order_data,
+
+            user=user,
+
+            redirect_url=redirect_url,
+
+        )
+
+
+
+        # remove checkout after order is successfully paid
+
+        checkout.delete()
+
+
+
+        # return the success response with the newly created order data
+
+        return CheckoutComplete(order=order)
+
+
+
+
+
+class CheckoutAddPromoCode(BaseMutation):
+
+    checkout = graphene.Field(
+
+        Checkout, description="The checkout with the added gift card or voucher."
+
+    )
+
+
+
+    class Arguments:
+
+        checkout_id = graphene.ID(description="Checkout ID.", required=True)
+
+        promo_code = graphene.String(
+
+            description="Gift card code or voucher code.", required=True
+
+        )
+
+
+
+    class Meta:
+
+        description = "Adds a gift card or a voucher to a checkout."
+
+        error_type_class = CheckoutError
+
+        error_type_field = "checkout_errors"
+
+
+
+    @classmethod
+
+    def perform_mutation(cls, _root, info, checkout_id, promo_code):
+
+        checkout = cls.get_node_or_error(
+
+            info, checkout_id, only_type=Checkout, field="checkout_id"
+
+        )
+
+        add_promo_code_to_checkout(checkout, promo_code, info.context.discounts)
+
+        return CheckoutAddPromoCode(checkout=checkout)
+
+
+
+
+
+class CheckoutRemovePromoCode(BaseMutation):
+
+    checkout = graphene.Field(
+
+        Checkout, description="The checkout with the removed gift card or voucher."
+
+    )
+
+
+
+    class Arguments:
+
+        checkout_id = graphene.ID(description="Checkout ID.", required=True)
+
+        promo_code = graphene.String(
+
+            description="Gift card code or voucher code.", required=True
+
+        )
+
+
+
+    class Meta:
+
+        description = "Remove a gift card or a voucher from a checkout."
+
+        error_type_class = CheckoutError
+
+        error_type_field = "checkout_errors"
+
+
+
+    @classmethod
+
+    def perform_mutation(cls, _root, info, checkout_id, promo_code):
+
+        checkout = cls.get_node_or_error(
+
+            info, checkout_id, only_type=Checkout, field="checkout_id"
+
+        )
+
+        remove_promo_code_from_checkout(checkout, promo_code)
+
+        return CheckoutRemovePromoCode(checkout=checkout)
+
+
+
+
+
+class CheckoutUpdateMeta(UpdateMetaBaseMutation):
+
+    class Meta:
+
+        description = "Updates metadata for checkout."
+
+        permissions = (OrderPermissions.MANAGE_ORDERS,)
+
+        model = models.Checkout
+
+        public = True
+
+        error_type_class = CheckoutError
+
+        error_type_field = "checkout_errors"
+
+
+
+
+
+class CheckoutUpdatePrivateMeta(UpdateMetaBaseMutation):
+
+    class Meta:
+
+        description = "Updates private metadata for checkout."
+
+        permissions = (OrderPermissions.MANAGE_ORDERS,)
+
+        model = models.Checkout
+
+        public = False
+
+        error_type_class = CheckoutError
+
+        error_type_field = "checkout_errors"
+
+
+
+
+
+class CheckoutClearMeta(ClearMetaBaseMutation):
+
+    class Meta:
+
+        description = "Clear metadata for checkout."
+
+        permissions = (OrderPermissions.MANAGE_ORDERS,)
+
+        model = models.Checkout
+
+        public = True
+
+        error_type_class = CheckoutError
+
+        error_type_field = "checkout_errors"
+
+
+
+
+
+class CheckoutClearPrivateMeta(ClearMetaBaseMutation):
+
+    class Meta:
+
+        description = "Clear private metadata for checkout."
+
+        permissions = (OrderPermissions.MANAGE_ORDERS,)
+
+        model = models.Checkout
+
+        public = False
+
+        error_type_class = CheckoutError
+
+        error_type_field = "checkout_errors"

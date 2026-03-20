@@ -2,1264 +2,1102 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-import os
+from collections import defaultdict
 
-import shutil
+from datetime import datetime
 
-import sys
 
 
+from debts import settle
 
-from PIL import Image
+from flask import current_app, g
 
-from PIL._util import py3
+from flask_sqlalchemy import BaseQuery, SQLAlchemy
 
+from itsdangerous import (
 
+    BadSignature,
 
-from .helper import PillowTestCase, hopper, unittest
+    SignatureExpired,
 
+    TimedJSONWebSignatureSerializer,
 
+    URLSafeSerializer,
 
+)
 
+import sqlalchemy
 
-class TestImage(PillowTestCase):
+from sqlalchemy import orm
 
-    def test_image_modes_success(self):
+from sqlalchemy.sql import func
 
-        for mode in [
+from sqlalchemy_continuum import make_versioned, version_class
 
-            "1",
+from sqlalchemy_continuum.plugins import FlaskPlugin
 
-            "P",
+from werkzeug.security import generate_password_hash
 
-            "PA",
 
-            "L",
 
-            "LA",
+from ihatemoney.patch_sqlalchemy_continuum import PatchedBuilder
 
-            "La",
+from ihatemoney.versioning import (
 
-            "F",
+    ConditionalVersioningManager,
 
-            "I",
+    LoggingMode,
 
-            "I;16",
+    get_ip_if_allowed,
 
-            "I;16L",
+    version_privacy_predicate,
 
-            "I;16B",
+)
 
-            "I;16N",
 
-            "RGB",
 
-            "RGBX",
+make_versioned(
 
-            "RGBA",
+    user_cls=None,
 
-            "RGBa",
+    manager=ConditionalVersioningManager(
 
-            "CMYK",
+        # Conditionally Disable the versioning based on each
 
-            "YCbCr",
+        # project's privacy preferences
 
-            "LAB",
+        tracking_predicate=version_privacy_predicate,
 
-            "HSV",
+        # Patch in a fix to a SQLAchemy-Continuum Bug.
 
-        ]:
+        # See patch_sqlalchemy_continuum.py
 
-            Image.new(mode, (1, 1))
+        builder=PatchedBuilder(),
 
+    ),
 
+    plugins=[
 
-    def test_image_modes_fail(self):
+        FlaskPlugin(
 
-        for mode in [
+            # Redirect to our own function, which respects user preferences
 
-            "",
+            # on IP address collection
 
-            "bad",
+            remote_addr_factory=get_ip_if_allowed,
 
-            "very very long",
+            # Suppress the plugin's attempt to grab a user id,
 
-            "BGR;15",
+            # which imports the flask_login module (causing an error)
 
-            "BGR;16",
+            current_user_id_factory=lambda: None,
 
-            "BGR;24",
+        )
 
-            "BGR;32",
+    ],
 
-        ]:
+)
 
-            with self.assertRaises(ValueError) as e:
 
-                Image.new(mode, (1, 1))
 
-            self.assertEqual(str(e.exception), "unrecognized image mode")
+db = SQLAlchemy()
 
 
 
-    def test_sanity(self):
 
 
+class Project(db.Model):
 
-        im = Image.new("L", (100, 100))
+    class ProjectQuery(BaseQuery):
 
-        self.assertEqual(repr(im)[:45], "<PIL.Image.Image image mode=L size=100x100 at")
+        def get_by_name(self, name):
 
-        self.assertEqual(im.mode, "L")
+            return Project.query.filter(Project.name == name).one()
 
-        self.assertEqual(im.size, (100, 100))
 
 
+    # Direct SQLAlchemy-Continuum to track changes to this model
 
-        im = Image.new("RGB", (100, 100))
+    __versioned__ = {}
 
-        self.assertEqual(repr(im)[:45], "<PIL.Image.Image image mode=RGB size=100x100 ")
 
-        self.assertEqual(im.mode, "RGB")
 
-        self.assertEqual(im.size, (100, 100))
+    id = db.Column(db.String(64), primary_key=True)
 
 
 
-        Image.new("L", (100, 100), None)
+    name = db.Column(db.UnicodeText)
 
-        im2 = Image.new("L", (100, 100), 0)
+    password = db.Column(db.String(128))
 
-        im3 = Image.new("L", (100, 100), "black")
+    contact_email = db.Column(db.String(128))
 
+    logging_preference = db.Column(
 
+        db.Enum(LoggingMode),
 
-        self.assertEqual(im2.getcolors(), [(10000, 0)])
+        default=LoggingMode.default(),
 
-        self.assertEqual(im3.getcolors(), [(10000, 0)])
+        nullable=False,
 
-
-
-        self.assertRaises(ValueError, Image.new, "X", (100, 100))
-
-        self.assertRaises(ValueError, Image.new, "", (100, 100))
-
-        # self.assertRaises(MemoryError, Image.new, "L", (1000000, 1000000))
-
-
-
-    def test_width_height(self):
-
-        im = Image.new("RGB", (1, 2))
-
-        self.assertEqual(im.width, 1)
-
-        self.assertEqual(im.height, 2)
-
-
-
-        with self.assertRaises(AttributeError):
-
-            im.size = (3, 4)
-
-
-
-    def test_invalid_image(self):
-
-        if py3:
-
-            import io
-
-
-
-            im = io.BytesIO(b"")
-
-        else:
-
-            import StringIO
-
-
-
-            im = StringIO.StringIO("")
-
-        self.assertRaises(IOError, Image.open, im)
-
-
-
-    def test_bad_mode(self):
-
-        self.assertRaises(ValueError, Image.open, "filename", "bad mode")
-
-
-
-    @unittest.skipUnless(Image.HAS_PATHLIB, "requires pathlib/pathlib2")
-
-    def test_pathlib(self):
-
-        from PIL.Image import Path
-
-
-
-        im = Image.open(Path("Tests/images/multipage-mmap.tiff"))
-
-        self.assertEqual(im.mode, "P")
-
-        self.assertEqual(im.size, (10, 10))
-
-
-
-        im = Image.open(Path("Tests/images/hopper.jpg"))
-
-        self.assertEqual(im.mode, "RGB")
-
-        self.assertEqual(im.size, (128, 128))
-
-
-
-        temp_file = self.tempfile("temp.jpg")
-
-        if os.path.exists(temp_file):
-
-            os.remove(temp_file)
-
-        im.save(Path(temp_file))
-
-
-
-    def test_fp_name(self):
-
-        temp_file = self.tempfile("temp.jpg")
-
-
-
-        class FP(object):
-
-            def write(a, b):
-
-                pass
-
-
-
-        fp = FP()
-
-        fp.name = temp_file
-
-
-
-        im = hopper()
-
-        im.save(fp)
-
-
-
-    def test_tempfile(self):
-
-        # see #1460, pathlib support breaks tempfile.TemporaryFile on py27
-
-        # Will error out on save on 3.0.0
-
-        import tempfile
-
-
-
-        im = hopper()
-
-        with tempfile.TemporaryFile() as fp:
-
-            im.save(fp, "JPEG")
-
-            fp.seek(0)
-
-            reloaded = Image.open(fp)
-
-            self.assert_image_similar(im, reloaded, 20)
-
-
-
-    def test_unknown_extension(self):
-
-        im = hopper()
-
-        temp_file = self.tempfile("temp.unknown")
-
-        self.assertRaises(ValueError, im.save, temp_file)
-
-
-
-    def test_internals(self):
-
-        im = Image.new("L", (100, 100))
-
-        im.readonly = 1
-
-        im._copy()
-
-        self.assertFalse(im.readonly)
-
-
-
-        im.readonly = 1
-
-        im.paste(0, (0, 0, 100, 100))
-
-        self.assertFalse(im.readonly)
-
-
-
-    @unittest.skipIf(
-
-        sys.platform.startswith("win32"), "Test requires opening tempfile twice"
+        server_default=LoggingMode.default().name,
 
     )
 
-    def test_readonly_save(self):
+    members = db.relationship("Person", backref="project")
 
-        temp_file = self.tempfile("temp.bmp")
 
-        shutil.copy("Tests/images/rgb32bf-rgba.bmp", temp_file)
 
+    query_class = ProjectQuery
 
+    default_currency = db.Column(db.String(3))
 
-        im = Image.open(temp_file)
 
-        self.assertTrue(im.readonly)
 
-        im.save(temp_file)
+    @property
 
+    def _to_serialize(self):
 
+        obj = {
 
-    def test_dump(self):
+            "id": self.id,
 
-        im = Image.new("L", (10, 10))
+            "name": self.name,
 
-        im._dump(self.tempfile("temp_L.ppm"))
+            "contact_email": self.contact_email,
 
+            "logging_preference": self.logging_preference.value,
 
+            "members": [],
 
-        im = Image.new("RGB", (10, 10))
+            "default_currency": self.default_currency,
 
-        im._dump(self.tempfile("temp_RGB.ppm"))
+        }
 
 
 
-        im = Image.new("HSV", (10, 10))
+        balance = self.balance
 
-        self.assertRaises(ValueError, im._dump, self.tempfile("temp_HSV.ppm"))
+        for member in self.members:
 
+            member_obj = member._to_serialize
 
+            member_obj["balance"] = balance.get(member.id, 0)
 
-    def test_comparison_with_other_type(self):
+            obj["members"].append(member_obj)
 
-        # Arrange
 
-        item = Image.new("RGB", (25, 25), "#000")
 
-        num = 12
+        return obj
 
 
 
-        # Act/Assert
+    @property
 
-        # Shouldn't cause AttributeError (#774)
+    def active_members(self):
 
-        self.assertFalse(item is None)
+        return [m for m in self.members if m.activated]
 
-        self.assertFalse(item == num)
 
 
+    @property
 
-    def test_expand_x(self):
+    def balance(self):
 
-        # Arrange
 
-        im = hopper()
 
-        orig_size = im.size
+        balances, should_pay, should_receive = (defaultdict(int) for time in (1, 2, 3))
 
-        xmargin = 5
 
 
+        # for each person
 
-        # Act
+        for person in self.members:
 
-        im = im._expand(xmargin)
+            # get the list of bills he has to pay
 
+            bills = Bill.query.options(orm.subqueryload(Bill.owers)).filter(
 
+                Bill.owers.contains(person)
 
-        # Assert
+            )
 
-        self.assertEqual(im.size[0], orig_size[0] + 2 * xmargin)
+            for bill in bills.all():
 
-        self.assertEqual(im.size[1], orig_size[1] + 2 * xmargin)
+                if person != bill.payer:
 
+                    share = bill.pay_each() * person.weight
 
+                    should_pay[person] += share
 
-    def test_expand_xy(self):
+                    should_receive[bill.payer] += share
 
-        # Arrange
 
-        im = hopper()
 
-        orig_size = im.size
+        for person in self.members:
 
-        xmargin = 5
+            balance = should_receive[person] - should_pay[person]
 
-        ymargin = 3
+            balances[person.id] = balance
 
 
 
-        # Act
+        return balances
 
-        im = im._expand(xmargin, ymargin)
 
 
+    @property
 
-        # Assert
+    def members_stats(self):
 
-        self.assertEqual(im.size[0], orig_size[0] + 2 * xmargin)
+        """Compute what each member has paid
 
-        self.assertEqual(im.size[1], orig_size[1] + 2 * ymargin)
 
 
+        :return: one stat dict per member
 
-    def test_getbands(self):
+        :rtype list:
 
-        # Assert
+        """
 
-        self.assertEqual(hopper("RGB").getbands(), ("R", "G", "B"))
+        return [
 
-        self.assertEqual(hopper("YCbCr").getbands(), ("Y", "Cb", "Cr"))
+            {
 
+                "member": member,
 
+                "paid": sum(
 
-    def test_getchannel_wrong_params(self):
+                    [
 
-        im = hopper()
+                        bill.converted_amount
 
+                        for bill in self.get_member_bills(member.id).all()
 
+                    ]
 
-        self.assertRaises(ValueError, im.getchannel, -1)
+                ),
 
-        self.assertRaises(ValueError, im.getchannel, 3)
+                "spent": sum(
 
-        self.assertRaises(ValueError, im.getchannel, "Z")
+                    [
 
-        self.assertRaises(ValueError, im.getchannel, "1")
+                        bill.pay_each() * member.weight
 
+                        for bill in self.get_bills().all()
 
+                        if member in bill.owers
 
-    def test_getchannel(self):
+                    ]
 
-        im = hopper("YCbCr")
+                ),
 
-        Y, Cb, Cr = im.split()
+                "balance": self.balance[member.id],
 
+            }
 
+            for member in self.active_members
 
-        self.assert_image_equal(Y, im.getchannel(0))
+        ]
 
-        self.assert_image_equal(Y, im.getchannel("Y"))
 
-        self.assert_image_equal(Cb, im.getchannel(1))
 
-        self.assert_image_equal(Cb, im.getchannel("Cb"))
+    @property
 
-        self.assert_image_equal(Cr, im.getchannel(2))
+    def monthly_stats(self):
 
-        self.assert_image_equal(Cr, im.getchannel("Cr"))
+        """Compute expenses by month
 
 
 
-    def test_getbbox(self):
+        :return: a dict of years mapping to a dict of months mapping to the amount
 
-        # Arrange
+        :rtype dict:
 
-        im = hopper()
+        """
 
+        monthly = defaultdict(lambda: defaultdict(float))
 
+        for bill in self.get_bills().all():
 
-        # Act
+            monthly[bill.date.year][bill.date.month] += bill.converted_amount
 
-        bbox = im.getbbox()
+        return monthly
 
 
 
-        # Assert
+    @property
 
-        self.assertEqual(bbox, (0, 0, 128, 128))
+    def uses_weights(self):
 
+        return len([i for i in self.members if i.weight != 1]) > 0
 
 
-    def test_ne(self):
 
-        # Arrange
+    def get_transactions_to_settle_bill(self, pretty_output=False):
 
-        im1 = Image.new("RGB", (25, 25), "black")
+        """Return a list of transactions that could be made to settle the bill"""
 
-        im2 = Image.new("RGB", (25, 25), "white")
 
 
+        def prettify(transactions, pretty_output):
 
-        # Act / Assert
+            """ Return pretty transactions
 
-        self.assertNotEqual(im1, im2)
+            """
 
+            if not pretty_output:
 
+                return transactions
 
-    def test_alpha_composite(self):
+            pretty_transactions = []
 
-        # https://stackoverflow.com/questions/3374878
+            for transaction in transactions:
 
-        # Arrange
+                pretty_transactions.append(
 
-        from PIL import ImageDraw
+                    {
 
+                        "ower": transaction["ower"].name,
 
+                        "receiver": transaction["receiver"].name,
 
-        expected_colors = sorted(
+                        "amount": round(transaction["amount"], 2),
 
-            [
+                    }
 
-                (1122, (128, 127, 0, 255)),
+                )
 
-                (1089, (0, 255, 0, 255)),
+            return pretty_transactions
 
-                (3300, (255, 0, 0, 255)),
 
-                (1156, (170, 85, 0, 192)),
 
-                (1122, (0, 255, 0, 128)),
+        # cache value for better performance
 
-                (1122, (255, 0, 0, 128)),
+        members = {person.id: person for person in self.members}
 
-                (1089, (0, 255, 0, 0)),
+        settle_plan = settle(self.balance.items()) or []
 
-            ]
 
-        )
 
+        transactions = [
 
+            {
 
-        dst = Image.new("RGBA", size=(100, 100), color=(0, 255, 0, 255))
+                "ower": members[ower_id],
 
-        draw = ImageDraw.Draw(dst)
+                "receiver": members[receiver_id],
 
-        draw.rectangle((0, 33, 100, 66), fill=(0, 255, 0, 128))
+                "amount": amount,
 
-        draw.rectangle((0, 67, 100, 100), fill=(0, 255, 0, 0))
+            }
 
-        src = Image.new("RGBA", size=(100, 100), color=(255, 0, 0, 255))
+            for ower_id, amount, receiver_id in settle_plan
 
-        draw = ImageDraw.Draw(src)
+        ]
 
-        draw.rectangle((33, 0, 66, 100), fill=(255, 0, 0, 128))
 
-        draw.rectangle((67, 0, 100, 100), fill=(255, 0, 0, 0))
 
+        return prettify(transactions, pretty_output)
 
 
-        # Act
 
-        img = Image.alpha_composite(dst, src)
+    def exactmatch(self, credit, debts):
 
+        """Recursively try and find subsets of 'debts' whose sum is equal to credit"""
 
+        if not debts:
 
-        # Assert
+            return None
 
-        img_colors = sorted(img.getcolors())
+        if debts[0]["balance"] > credit:
 
-        self.assertEqual(img_colors, expected_colors)
+            return self.exactmatch(credit, debts[1:])
 
+        elif debts[0]["balance"] == credit:
 
+            return [debts[0]]
 
-    def test_alpha_inplace(self):
+        else:
 
-        src = Image.new("RGBA", (128, 128), "blue")
+            match = self.exactmatch(credit - debts[0]["balance"], debts[1:])
 
+            if match:
 
-
-        over = Image.new("RGBA", (128, 128), "red")
-
-        mask = hopper("L")
-
-        over.putalpha(mask)
-
-
-
-        target = Image.alpha_composite(src, over)
-
-
-
-        # basic
-
-        full = src.copy()
-
-        full.alpha_composite(over)
-
-        self.assert_image_equal(full, target)
-
-
-
-        # with offset down to right
-
-        offset = src.copy()
-
-        offset.alpha_composite(over, (64, 64))
-
-        self.assert_image_equal(
-
-            offset.crop((64, 64, 127, 127)), target.crop((0, 0, 63, 63))
-
-        )
-
-        self.assertEqual(offset.size, (128, 128))
-
-
-
-        # offset and crop
-
-        box = src.copy()
-
-        box.alpha_composite(over, (64, 64), (0, 0, 32, 32))
-
-        self.assert_image_equal(box.crop((64, 64, 96, 96)), target.crop((0, 0, 32, 32)))
-
-        self.assert_image_equal(box.crop((96, 96, 128, 128)), src.crop((0, 0, 32, 32)))
-
-        self.assertEqual(box.size, (128, 128))
-
-
-
-        # source point
-
-        source = src.copy()
-
-        source.alpha_composite(over, (32, 32), (32, 32, 96, 96))
-
-
-
-        self.assert_image_equal(
-
-            source.crop((32, 32, 96, 96)), target.crop((32, 32, 96, 96))
-
-        )
-
-        self.assertEqual(source.size, (128, 128))
-
-
-
-        # errors
-
-        self.assertRaises(ValueError, source.alpha_composite, over, "invalid source")
-
-        self.assertRaises(
-
-            ValueError, source.alpha_composite, over, (0, 0), "invalid destination"
-
-        )
-
-        self.assertRaises(ValueError, source.alpha_composite, over, 0)
-
-        self.assertRaises(ValueError, source.alpha_composite, over, (0, 0), 0)
-
-        self.assertRaises(ValueError, source.alpha_composite, over, (0, -1))
-
-        self.assertRaises(ValueError, source.alpha_composite, over, (0, 0), (0, -1))
-
-
-
-    def test_registered_extensions_uninitialized(self):
-
-        # Arrange
-
-        Image._initialized = 0
-
-        extension = Image.EXTENSION
-
-        Image.EXTENSION = {}
-
-
-
-        # Act
-
-        Image.registered_extensions()
-
-
-
-        # Assert
-
-        self.assertEqual(Image._initialized, 2)
-
-
-
-        # Restore the original state and assert
-
-        Image.EXTENSION = extension
-
-        self.assertTrue(Image.EXTENSION)
-
-
-
-    def test_registered_extensions(self):
-
-        # Arrange
-
-        # Open an image to trigger plugin registration
-
-        Image.open("Tests/images/rgb.jpg")
-
-
-
-        # Act
-
-        extensions = Image.registered_extensions()
-
-
-
-        # Assert
-
-        self.assertTrue(extensions)
-
-        for ext in [".cur", ".icns", ".tif", ".tiff"]:
-
-            self.assertIn(ext, extensions)
-
-
-
-    def test_effect_mandelbrot(self):
-
-        # Arrange
-
-        size = (512, 512)
-
-        extent = (-3, -2.5, 2, 2.5)
-
-        quality = 100
-
-
-
-        # Act
-
-        im = Image.effect_mandelbrot(size, extent, quality)
-
-
-
-        # Assert
-
-        self.assertEqual(im.size, (512, 512))
-
-        im2 = Image.open("Tests/images/effect_mandelbrot.png")
-
-        self.assert_image_equal(im, im2)
-
-
-
-    def test_effect_mandelbrot_bad_arguments(self):
-
-        # Arrange
-
-        size = (512, 512)
-
-        # Get coordinates the wrong way round:
-
-        extent = (+3, +2.5, -2, -2.5)
-
-        # Quality < 2:
-
-        quality = 1
-
-
-
-        # Act/Assert
-
-        self.assertRaises(ValueError, Image.effect_mandelbrot, size, extent, quality)
-
-
-
-    def test_effect_noise(self):
-
-        # Arrange
-
-        size = (100, 100)
-
-        sigma = 128
-
-
-
-        # Act
-
-        im = Image.effect_noise(size, sigma)
-
-
-
-        # Assert
-
-        self.assertEqual(im.size, (100, 100))
-
-        self.assertEqual(im.mode, "L")
-
-        p0 = im.getpixel((0, 0))
-
-        p1 = im.getpixel((0, 1))
-
-        p2 = im.getpixel((0, 2))
-
-        p3 = im.getpixel((0, 3))
-
-        p4 = im.getpixel((0, 4))
-
-        self.assert_not_all_same([p0, p1, p2, p3, p4])
-
-
-
-    def test_effect_spread(self):
-
-        # Arrange
-
-        im = hopper()
-
-        distance = 10
-
-
-
-        # Act
-
-        im2 = im.effect_spread(distance)
-
-
-
-        # Assert
-
-        self.assertEqual(im.size, (128, 128))
-
-        im3 = Image.open("Tests/images/effect_spread.png")
-
-        self.assert_image_similar(im2, im3, 110)
-
-
-
-    def test_check_size(self):
-
-        # Checking that the _check_size function throws value errors
-
-        # when we want it to.
-
-        with self.assertRaises(ValueError):
-
-            Image.new("RGB", 0)  # not a tuple
-
-        with self.assertRaises(ValueError):
-
-            Image.new("RGB", (0,))  # Tuple too short
-
-        with self.assertRaises(ValueError):
-
-            Image.new("RGB", (-1, -1))  # w,h < 0
-
-
-
-        # this should pass with 0 sized images, #2259
-
-        im = Image.new("L", (0, 0))
-
-        self.assertEqual(im.size, (0, 0))
-
-
-
-        im = Image.new("L", (0, 100))
-
-        self.assertEqual(im.size, (0, 100))
-
-
-
-        im = Image.new("L", (100, 0))
-
-        self.assertEqual(im.size, (100, 0))
-
-
-
-        self.assertTrue(Image.new("RGB", (1, 1)))
-
-        # Should pass lists too
-
-        i = Image.new("RGB", [1, 1])
-
-        self.assertIsInstance(i.size, tuple)
-
-
-
-    def test_storage_neg(self):
-
-        # Storage.c accepted negative values for xsize, ysize.  Was
-
-        # test_neg_ppm, but the core function for that has been
-
-        # removed Calling directly into core to test the error in
-
-        # Storage.c, rather than the size check above
-
-
-
-        with self.assertRaises(ValueError):
-
-            Image.core.fill("RGB", (2, -2), (0, 0, 0))
-
-
-
-    def test_offset_not_implemented(self):
-
-        # Arrange
-
-        im = hopper()
-
-
-
-        # Act / Assert
-
-        self.assertRaises(NotImplementedError, im.offset, None)
-
-
-
-    def test_fromstring(self):
-
-        self.assertRaises(NotImplementedError, Image.fromstring)
-
-
-
-    def test_linear_gradient_wrong_mode(self):
-
-        # Arrange
-
-        wrong_mode = "RGB"
-
-
-
-        # Act / Assert
-
-        self.assertRaises(ValueError, Image.linear_gradient, wrong_mode)
-
-
-
-    def test_linear_gradient(self):
-
-
-
-        # Arrange
-
-        target_file = "Tests/images/linear_gradient.png"
-
-        for mode in ["L", "P"]:
-
-
-
-            # Act
-
-            im = Image.linear_gradient(mode)
-
-
-
-            # Assert
-
-            self.assertEqual(im.size, (256, 256))
-
-            self.assertEqual(im.mode, mode)
-
-            self.assertEqual(im.getpixel((0, 0)), 0)
-
-            self.assertEqual(im.getpixel((255, 255)), 255)
-
-            target = Image.open(target_file).convert(mode)
-
-            self.assert_image_equal(im, target)
-
-
-
-    def test_radial_gradient_wrong_mode(self):
-
-        # Arrange
-
-        wrong_mode = "RGB"
-
-
-
-        # Act / Assert
-
-        self.assertRaises(ValueError, Image.radial_gradient, wrong_mode)
-
-
-
-    def test_radial_gradient(self):
-
-
-
-        # Arrange
-
-        target_file = "Tests/images/radial_gradient.png"
-
-        for mode in ["L", "P"]:
-
-
-
-            # Act
-
-            im = Image.radial_gradient(mode)
-
-
-
-            # Assert
-
-            self.assertEqual(im.size, (256, 256))
-
-            self.assertEqual(im.mode, mode)
-
-            self.assertEqual(im.getpixel((0, 0)), 255)
-
-            self.assertEqual(im.getpixel((128, 128)), 0)
-
-            target = Image.open(target_file).convert(mode)
-
-            self.assert_image_equal(im, target)
-
-
-
-    def test_register_extensions(self):
-
-        test_format = "a"
-
-        exts = ["b", "c"]
-
-        for ext in exts:
-
-            Image.register_extension(test_format, ext)
-
-        ext_individual = Image.EXTENSION.copy()
-
-        for ext in exts:
-
-            del Image.EXTENSION[ext]
-
-
-
-        Image.register_extensions(test_format, exts)
-
-        ext_multiple = Image.EXTENSION.copy()
-
-        for ext in exts:
-
-            del Image.EXTENSION[ext]
-
-
-
-        self.assertEqual(ext_individual, ext_multiple)
-
-
-
-    def test_remap_palette(self):
-
-        # Test illegal image mode
-
-        im = hopper()
-
-        self.assertRaises(ValueError, im.remap_palette, None)
-
-
-
-    def test__new(self):
-
-        from PIL import ImagePalette
-
-
-
-        im = hopper("RGB")
-
-        im_p = hopper("P")
-
-
-
-        blank_p = Image.new("P", (10, 10))
-
-        blank_pa = Image.new("PA", (10, 10))
-
-        blank_p.palette = None
-
-        blank_pa.palette = None
-
-
-
-        def _make_new(base_image, im, palette_result=None):
-
-            new_im = base_image._new(im)
-
-            self.assertEqual(new_im.mode, im.mode)
-
-            self.assertEqual(new_im.size, im.size)
-
-            self.assertEqual(new_im.info, base_image.info)
-
-            if palette_result is not None:
-
-                self.assertEqual(new_im.palette.tobytes(), palette_result.tobytes())
+                match.append(debts[0])
 
             else:
 
-                self.assertIsNone(new_im.palette)
+                match = self.exactmatch(credit, debts[1:])
+
+            return match
 
 
 
-        _make_new(im, im_p, im_p.palette)
+    def has_bills(self):
 
-        _make_new(im_p, im, None)
+        """return if the project do have bills or not"""
 
-        _make_new(im, blank_p, ImagePalette.ImagePalette())
-
-        _make_new(im, blank_pa, ImagePalette.ImagePalette())
+        return self.get_bills().count() > 0
 
 
 
-    def test_p_from_rgb_rgba(self):
+    def get_bills(self):
 
-        for mode, color in [
+        """Return the list of bills related to this project"""
 
-            ("RGB", "#DDEEFF"),
+        return (
 
-            ("RGB", (221, 238, 255)),
+            Bill.query.join(Person, Project)
 
-            ("RGBA", (221, 238, 255, 255)),
+            .filter(Bill.payer_id == Person.id)
 
-        ]:
+            .filter(Person.project_id == Project.id)
 
-            im = Image.new("P", (100, 100), color)
+            .filter(Project.id == self.id)
 
-            expected = Image.new(mode, (100, 100), color)
+            .order_by(Bill.date.desc())
 
-            self.assert_image_equal(im.convert(mode), expected)
+            .order_by(Bill.creation_date.desc())
 
+            .order_by(Bill.id.desc())
 
-
-    def test_no_resource_warning_on_save(self):
-
-        # https://github.com/python-pillow/Pillow/issues/835
-
-        # Arrange
-
-        test_file = "Tests/images/hopper.png"
-
-        temp_file = self.tempfile("temp.jpg")
+        )
 
 
 
-        # Act/Assert
+    def get_member_bills(self, member_id):
 
-        with Image.open(test_file) as im:
+        """Return the list of bills related to a specific member"""
 
-            self.assert_warning(None, im.save, temp_file)
+        return (
 
+            Bill.query.join(Person, Project)
 
+            .filter(Bill.payer_id == Person.id)
 
-    def test_load_on_nonexclusive_multiframe(self):
+            .filter(Person.project_id == Project.id)
 
-        with open("Tests/images/frozenpond.mpo", "rb") as fp:
+            .filter(Person.id == member_id)
 
+            .filter(Project.id == self.id)
 
+            .order_by(Bill.date.desc())
 
-            def act(fp):
+            .order_by(Bill.id.desc())
 
-                im = Image.open(fp)
-
-                im.load()
-
-
-
-            act(fp)
+        )
 
 
 
-            with Image.open(fp) as im:
+    def get_pretty_bills(self, export_format="json"):
 
-                im.load()
+        """Return a list of project's bills with pretty formatting"""
+
+        bills = self.get_bills()
+
+        pretty_bills = []
+
+        for bill in bills:
+
+            if export_format == "json":
+
+                owers = [ower.name for ower in bill.owers]
+
+            else:
+
+                owers = ", ".join([ower.name for ower in bill.owers])
 
 
 
-            self.assertFalse(fp.closed)
+            pretty_bills.append(
+
+                {
+
+                    "what": bill.what,
+
+                    "amount": round(bill.amount, 2),
+
+                    "date": str(bill.date),
+
+                    "payer_name": Person.query.get(bill.payer_id).name,
+
+                    "payer_weight": Person.query.get(bill.payer_id).weight,
+
+                    "owers": owers,
+
+                }
+
+            )
+
+        return pretty_bills
 
 
 
-    def test_overrun(self):
+    def remove_member(self, member_id):
 
-        for file in ["fli_overrun.bin", "sgi_overrun.bin", "pcx_overrun.bin"]:
+        """Remove a member from the project.
 
-            im = Image.open(os.path.join("Tests/images", file))
+
+
+        If the member is not bound to a bill, then he is deleted, otherwise
+
+        he is only deactivated.
+
+
+
+        This method returns the status DELETED or DEACTIVATED regarding the
+
+        changes made.
+
+        """
+
+        try:
+
+            person = Person.query.get(member_id, self)
+
+        except orm.exc.NoResultFound:
+
+            return None
+
+        if not person.has_bills():
+
+            db.session.delete(person)
+
+            db.session.commit()
+
+        else:
+
+            person.activated = False
+
+            db.session.commit()
+
+        return person
+
+
+
+    def remove_project(self):
+
+        db.session.delete(self)
+
+        db.session.commit()
+
+
+
+    def generate_token(self, expiration=0):
+
+        """Generate a timed and serialized JsonWebToken
+
+
+
+        :param expiration: Token expiration time (in seconds)
+
+        """
+
+        if expiration:
+
+            serializer = TimedJSONWebSignatureSerializer(
+
+                current_app.config["SECRET_KEY"], expiration
+
+            )
+
+            token = serializer.dumps({"project_id": self.id}).decode("utf-8")
+
+        else:
+
+            serializer = URLSafeSerializer(current_app.config["SECRET_KEY"])
+
+            token = serializer.dumps({"project_id": self.id})
+
+        return token
+
+
+
+    @staticmethod
+
+    def verify_token(token, token_type="timed_token"):
+
+        """Return the project id associated to the provided token,
+
+        None if the provided token is expired or not valid.
+
+
+
+        :param token: Serialized TimedJsonWebToken
+
+        """
+
+        if token_type == "timed_token":
+
+            serializer = TimedJSONWebSignatureSerializer(
+
+                current_app.config["SECRET_KEY"]
+
+            )
+
+        else:
+
+            serializer = URLSafeSerializer(current_app.config["SECRET_KEY"])
+
+        try:
+
+            data = serializer.loads(token)
+
+        except SignatureExpired:
+
+            return None
+
+        except BadSignature:
+
+            return None
+
+        return data["project_id"]
+
+
+
+    def __str__(self):
+
+        return self.name
+
+
+
+    def __repr__(self):
+
+        return f"<Project {self.name}>"
+
+
+
+    @staticmethod
+
+    def create_demo_project():
+
+        project = Project(
+
+            id="demo",
+
+            name="demonstration",
+
+            password=generate_password_hash("demo"),
+
+            contact_email="demo@notmyidea.org",
+
+            default_currency="EUR",
+
+        )
+
+        db.session.add(project)
+
+        db.session.commit()
+
+
+
+        members = {}
+
+        for name in ("Amina", "Georg", "Alice"):
+
+            person = Person()
+
+            person.name = name
+
+            person.project = project
+
+            person.weight = 1
+
+            db.session.add(person)
+
+
+
+            members[name] = person
+
+
+
+        db.session.commit()
+
+
+
+        operations = (
+
+            ("Georg", 200, ("Amina", "Georg", "Alice"), "Food shopping"),
+
+            ("Alice", 20, ("Amina", "Alice"), "Beer !"),
+
+            ("Amina", 50, ("Amina", "Alice", "Georg"), "AMAP"),
+
+        )
+
+        for (payer, amount, owers, subject) in operations:
+
+            bill = Bill()
+
+            bill.payer_id = members[payer].id
+
+            bill.what = subject
+
+            bill.owers = [members[name] for name in owers]
+
+            bill.amount = amount
+
+            bill.original_currency = "EUR"
+
+            bill.converted_amount = amount
+
+
+
+            db.session.add(bill)
+
+
+
+        db.session.commit()
+
+        return project
+
+
+
+
+
+class Person(db.Model):
+
+    class PersonQuery(BaseQuery):
+
+        def get_by_name(self, name, project):
+
+            return (
+
+                Person.query.filter(Person.name == name)
+
+                .filter(Project.id == project.id)
+
+                .one()
+
+            )
+
+
+
+        def get(self, id, project=None):
+
+            if not project:
+
+                project = g.project
+
+            return (
+
+                Person.query.filter(Person.id == id)
+
+                .filter(Project.id == project.id)
+
+                .one()
+
+            )
+
+
+
+    query_class = PersonQuery
+
+
+
+    # Direct SQLAlchemy-Continuum to track changes to this model
+
+    __versioned__ = {}
+
+
+
+    __table_args__ = {"sqlite_autoincrement": True}
+
+
+
+    id = db.Column(db.Integer, primary_key=True)
+
+    project_id = db.Column(db.String(64), db.ForeignKey("project.id"))
+
+    bills = db.relationship("Bill", backref="payer")
+
+
+
+    name = db.Column(db.UnicodeText)
+
+    weight = db.Column(db.Float, default=1)
+
+    activated = db.Column(db.Boolean, default=True)
+
+
+
+    @property
+
+    def _to_serialize(self):
+
+        return {
+
+            "id": self.id,
+
+            "name": self.name,
+
+            "weight": self.weight,
+
+            "activated": self.activated,
+
+        }
+
+
+
+    def has_bills(self):
+
+        """return if the user do have bills or not"""
+
+        bills_as_ower_number = (
+
+            db.session.query(billowers)
+
+            .filter(billowers.columns.get("person_id") == self.id)
+
+            .count()
+
+        )
+
+        return bills_as_ower_number != 0 or len(self.bills) != 0
+
+
+
+    def __str__(self):
+
+        return self.name
+
+
+
+    def __repr__(self):
+
+        return f"<Person {self.name} for project {self.project.name}>"
+
+
+
+
+
+# We need to manually define a join table for m2m relations
+
+billowers = db.Table(
+
+    "billowers",
+
+    db.Column("bill_id", db.Integer, db.ForeignKey("bill.id"), primary_key=True),
+
+    db.Column("person_id", db.Integer, db.ForeignKey("person.id"), primary_key=True),
+
+    sqlite_autoincrement=True,
+
+)
+
+
+
+
+
+class Bill(db.Model):
+
+    class BillQuery(BaseQuery):
+
+        def get(self, project, id):
 
             try:
 
-                im.load()
+                return (
 
-                self.assertFail()
+                    self.join(Person, Project)
 
-            except IOError as e:
+                    .filter(Bill.payer_id == Person.id)
 
-                self.assertEqual(str(e), "buffer overrun when reading image file")
+                    .filter(Person.project_id == Project.id)
 
+                    .filter(Project.id == project.id)
 
+                    .filter(Bill.id == id)
 
+                    .one()
 
+                )
 
-class MockEncoder(object):
+            except orm.exc.NoResultFound:
 
-    pass
-
-
-
-
-
-def mock_encode(*args):
-
-    encoder = MockEncoder()
-
-    encoder.args = args
-
-    return encoder
+                return None
 
 
 
+        def delete(self, project, id):
 
+            bill = self.get(project, id)
 
-class TestRegistry(PillowTestCase):
+            if bill:
 
-    def test_encode_registry(self):
+                db.session.delete(bill)
 
-
-
-        Image.register_encoder("MOCK", mock_encode)
-
-        self.assertIn("MOCK", Image.ENCODERS)
-
-
-
-        enc = Image._getencoder("RGB", "MOCK", ("args",), extra=("extra",))
+            return bill
 
 
 
-        self.assertIsInstance(enc, MockEncoder)
-
-        self.assertEqual(enc.args, ("RGB", "args", "extra"))
+    query_class = BillQuery
 
 
 
-    def test_encode_registry_fail(self):
+    # Direct SQLAlchemy-Continuum to track changes to this model
 
-        self.assertRaises(
+    __versioned__ = {}
 
-            IOError,
 
-            Image._getencoder,
 
-            "RGB",
+    __table_args__ = {"sqlite_autoincrement": True}
 
-            "DoesNotExist",
 
-            ("args",),
 
-            extra=("extra",),
+    id = db.Column(db.Integer, primary_key=True)
+
+
+
+    payer_id = db.Column(db.Integer, db.ForeignKey("person.id"))
+
+    owers = db.relationship(Person, secondary=billowers)
+
+
+
+    amount = db.Column(db.Float)
+
+    date = db.Column(db.Date, default=datetime.now)
+
+    creation_date = db.Column(db.Date, default=datetime.now)
+
+    what = db.Column(db.UnicodeText)
+
+    external_link = db.Column(db.UnicodeText)
+
+
+
+    original_currency = db.Column(db.String(3))
+
+    converted_amount = db.Column(db.Float)
+
+
+
+    archive = db.Column(db.Integer, db.ForeignKey("archive.id"))
+
+
+
+    @property
+
+    def _to_serialize(self):
+
+        return {
+
+            "id": self.id,
+
+            "payer_id": self.payer_id,
+
+            "owers": self.owers,
+
+            "amount": self.amount,
+
+            "date": self.date,
+
+            "creation_date": self.creation_date,
+
+            "what": self.what,
+
+            "external_link": self.external_link,
+
+            "original_currency": self.original_currency,
+
+            "converted_amount": self.converted_amount,
+
+        }
+
+
+
+    def pay_each_default(self, amount):
+
+        """Compute what each share has to pay"""
+
+        if self.owers:
+
+            weights = (
+
+                db.session.query(func.sum(Person.weight))
+
+                .join(billowers, Bill)
+
+                .filter(Bill.id == self.id)
+
+            ).scalar()
+
+            return amount / weights
+
+        else:
+
+            return 0
+
+
+
+    def __str__(self):
+
+        return self.what
+
+
+
+    def pay_each(self):
+
+        return self.pay_each_default(self.converted_amount)
+
+
+
+    def __repr__(self):
+
+        return (
+
+            f"<Bill of {self.amount} from {self.payer} for "
+
+            f"{', '.join([o.name for o in self.owers])}>"
 
         )
+
+
+
+
+
+class Archive(db.Model):
+
+    id = db.Column(db.Integer, primary_key=True)
+
+    project_id = db.Column(db.String(64), db.ForeignKey("project.id"))
+
+    name = db.Column(db.UnicodeText)
+
+
+
+    @property
+
+    def start_date(self):
+
+        pass
+
+
+
+    @property
+
+    def end_date(self):
+
+        pass
+
+
+
+    def __repr__(self):
+
+        return "<Archive>"
+
+
+
+
+
+sqlalchemy.orm.configure_mappers()
+
+
+
+PersonVersion = version_class(Person)
+
+ProjectVersion = version_class(Project)
+
+BillVersion = version_class(Bill)

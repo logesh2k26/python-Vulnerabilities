@@ -2,298 +2,1288 @@
 # Safety: safe
 # Category: safe
 
-import warnings
+import os
 
+import shutil
 
+import sys
 
-import six
 
-from django.http import HttpResponse
 
-from django.utils.crypto import constant_time_compare
+from PIL import Image
 
-from django.utils.decorators import method_decorator
+from PIL._util import py3
 
-from django.views.decorators.csrf import csrf_exempt
 
-from django.views.generic import View
 
+from .helper import PillowTestCase, hopper, unittest
 
 
-from ..exceptions import AnymailInsecureWebhookWarning, AnymailWebhookValidationFailure
 
-from ..utils import get_anymail_setting, collect_all_methods, get_request_basic_auth
 
 
+class TestImage(PillowTestCase):
 
+    def test_image_modes_success(self):
 
+        for mode in [
 
-class AnymailBasicAuthMixin(object):
+            "1",
 
-    """Implements webhook basic auth as mixin to AnymailBaseWebhookView."""
+            "P",
 
+            "PA",
 
+            "L",
 
-    # Whether to warn if basic auth is not configured.
+            "LA",
 
-    # For most ESPs, basic auth is the only webhook security,
+            "La",
 
-    # so the default is True. Subclasses can set False if
+            "F",
 
-    # they enforce other security (like signed webhooks).
+            "I",
 
-    warn_if_no_basic_auth = True
+            "I;16",
 
+            "I;16L",
 
+            "I;16B",
 
-    # List of allowable HTTP basic-auth 'user:pass' strings.
+            "I;16N",
 
-    basic_auth = None  # (Declaring class attr allows override by kwargs in View.as_view.)
+            "RGB",
 
+            "RGBX",
 
+            "RGBA",
 
-    def __init__(self, **kwargs):
+            "RGBa",
 
-        self.basic_auth = get_anymail_setting('webhook_secret', default=[],
+            "CMYK",
 
-                                              kwargs=kwargs)  # no esp_name -- auth is shared between ESPs
+            "YCbCr",
 
-        if not self.basic_auth:
+            "LAB",
 
-            # Temporarily allow deprecated WEBHOOK_AUTHORIZATION setting
+            "HSV",
 
-            self.basic_auth = get_anymail_setting('webhook_authorization', default=[], kwargs=kwargs)
+        ]:
 
+            Image.new(mode, (1, 1))
 
 
-        # Allow a single string:
 
-        if isinstance(self.basic_auth, six.string_types):
+    def test_image_modes_fail(self):
 
-            self.basic_auth = [self.basic_auth]
+        for mode in [
 
-        if self.warn_if_no_basic_auth and len(self.basic_auth) < 1:
+            "",
 
-            warnings.warn(
+            "bad",
 
-                "Your Anymail webhooks are insecure and open to anyone on the web. "
+            "very very long",
 
-                "You should set WEBHOOK_SECRET in your ANYMAIL settings. "
+            "BGR;15",
 
-                "See 'Securing webhooks' in the Anymail docs.",
+            "BGR;16",
 
-                AnymailInsecureWebhookWarning)
+            "BGR;24",
 
-        # noinspection PyArgumentList
+            "BGR;32",
 
-        super(AnymailBasicAuthMixin, self).__init__(**kwargs)
+        ]:
 
+            with self.assertRaises(ValueError) as e:
 
+                Image.new(mode, (1, 1))
 
-    def validate_request(self, request):
+            self.assertEqual(str(e.exception), "unrecognized image mode")
 
-        """If configured for webhook basic auth, validate request has correct auth."""
 
-        if self.basic_auth:
 
-            request_auth = get_request_basic_auth(request)
+    def test_sanity(self):
 
-            # Use constant_time_compare to avoid timing attack on basic auth. (It's OK that any()
 
-            # can terminate early: we're not trying to protect how many auth strings are allowed,
 
-            # just the contents of each individual auth string.)
+        im = Image.new("L", (100, 100))
 
-            auth_ok = any(constant_time_compare(request_auth, allowed_auth)
+        self.assertEqual(repr(im)[:45], "<PIL.Image.Image image mode=L size=100x100 at")
 
-                          for allowed_auth in self.basic_auth)
+        self.assertEqual(im.mode, "L")
 
-            if not auth_ok:
+        self.assertEqual(im.size, (100, 100))
 
-                # noinspection PyUnresolvedReferences
 
-                raise AnymailWebhookValidationFailure(
 
-                    "Missing or invalid basic auth in Anymail %s webhook" % self.esp_name)
+        im = Image.new("RGB", (100, 100))
 
+        self.assertEqual(repr(im)[:45], "<PIL.Image.Image image mode=RGB size=100x100 ")
 
+        self.assertEqual(im.mode, "RGB")
 
+        self.assertEqual(im.size, (100, 100))
 
 
-# Mixin note: Django's View.__init__ doesn't cooperate with chaining,
 
-# so all mixins that need __init__ must appear before View in MRO.
+        Image.new("L", (100, 100), None)
 
-class AnymailBaseWebhookView(AnymailBasicAuthMixin, View):
+        im2 = Image.new("L", (100, 100), 0)
 
-    """Base view for processing ESP event webhooks
+        im3 = Image.new("L", (100, 100), "black")
 
 
 
-    ESP-specific implementations should subclass
+        self.assertEqual(im2.getcolors(), [(10000, 0)])
 
-    and implement parse_events. They may also
+        self.assertEqual(im3.getcolors(), [(10000, 0)])
 
-    want to implement validate_request
 
-    if additional security is available.
 
-    """
+        self.assertRaises(ValueError, Image.new, "X", (100, 100))
 
+        self.assertRaises(ValueError, Image.new, "", (100, 100))
 
+        # self.assertRaises(MemoryError, Image.new, "L", (1000000, 1000000))
 
-    def __init__(self, **kwargs):
 
-        super(AnymailBaseWebhookView, self).__init__(**kwargs)
 
-        self.validators = collect_all_methods(self.__class__, 'validate_request')
+    def test_width_height(self):
 
+        im = Image.new("RGB", (1, 2))
 
+        self.assertEqual(im.width, 1)
 
-    # Subclass implementation:
+        self.assertEqual(im.height, 2)
 
 
 
-    # Where to send events: either ..signals.inbound or ..signals.tracking
+        with self.assertRaises(AttributeError):
 
-    signal = None
+            im.size = (3, 4)
 
 
 
-    def validate_request(self, request):
+    def test_invalid_image(self):
 
-        """Check validity of webhook post, or raise AnymailWebhookValidationFailure.
+        if py3:
 
+            import io
 
 
-        AnymailBaseWebhookView includes basic auth validation.
 
-        Subclasses can implement (or provide via mixins) if the ESP supports
+            im = io.BytesIO(b"")
 
-        additional validation (such as signature checking).
+        else:
 
+            import StringIO
 
 
-        *All* definitions of this method in the class chain (including mixins)
 
-        will be called. There is no need to chain to the superclass.
+            im = StringIO.StringIO("")
 
-        (See self.run_validators and collect_all_methods.)
+        self.assertRaises(IOError, Image.open, im)
 
 
 
-        Security note: use django.utils.crypto.constant_time_compare for string
+    def test_bad_mode(self):
 
-        comparisons, to avoid exposing your validation to a timing attack.
+        self.assertRaises(ValueError, Image.open, "filename", "bad mode")
 
-        """
 
-        # if not constant_time_compare(request.POST['signature'], expected_signature):
 
-        #     raise AnymailWebhookValidationFailure("...message...")
+    @unittest.skipUnless(Image.HAS_PATHLIB, "requires pathlib/pathlib2")
 
-        # (else just do nothing)
+    def test_pathlib(self):
 
-        pass
+        from PIL.Image import Path
 
 
 
-    def parse_events(self, request):
+        im = Image.open(Path("Tests/images/multipage-mmap.tiff"))
 
-        """Return a list of normalized AnymailWebhookEvent extracted from ESP post data.
+        self.assertEqual(im.mode, "P")
 
+        self.assertEqual(im.size, (10, 10))
 
 
-        Subclasses must implement.
 
-        """
+        im = Image.open(Path("Tests/images/hopper.jpg"))
 
-        raise NotImplementedError()
+        self.assertEqual(im.mode, "RGB")
 
+        self.assertEqual(im.size, (128, 128))
 
 
-    # HTTP handlers (subclasses shouldn't need to override):
 
+        temp_file = self.tempfile("temp.jpg")
 
+        if os.path.exists(temp_file):
 
-    http_method_names = ["post", "head", "options"]
+            os.remove(temp_file)
 
+        im.save(Path(temp_file))
 
 
-    @method_decorator(csrf_exempt)
 
-    def dispatch(self, request, *args, **kwargs):
+    def test_fp_name(self):
 
-        return super(AnymailBaseWebhookView, self).dispatch(request, *args, **kwargs)
+        temp_file = self.tempfile("temp.jpg")
 
 
 
-    def head(self, request, *args, **kwargs):
+        class FP(object):
 
-        # Some ESPs verify the webhook with a HEAD request at configuration time
+            def write(a, b):
 
-        return HttpResponse()
+                pass
 
 
 
-    def post(self, request, *args, **kwargs):
+        fp = FP()
 
-        # Normal Django exception handling will do the right thing:
+        fp.name = temp_file
 
-        # - AnymailWebhookValidationFailure will turn into an HTTP 400 response
 
-        #   (via Django SuspiciousOperation handling)
 
-        # - Any other errors (e.g., in signal dispatch) will turn into HTTP 500
+        im = hopper()
 
-        #   responses (via normal Django error handling). ESPs generally
+        im.save(fp)
 
-        #   treat that as "try again later".
 
-        self.run_validators(request)
 
-        events = self.parse_events(request)
+    def test_tempfile(self):
 
-        esp_name = self.esp_name
+        # see #1460, pathlib support breaks tempfile.TemporaryFile on py27
 
-        for event in events:
+        # Will error out on save on 3.0.0
 
-            self.signal.send(sender=self.__class__, event=event, esp_name=esp_name)
+        import tempfile
 
-        return HttpResponse()
 
 
+        im = hopper()
 
-    # Request validation (subclasses shouldn't need to override):
+        with tempfile.TemporaryFile() as fp:
 
+            im.save(fp, "JPEG")
 
+            fp.seek(0)
 
-    def run_validators(self, request):
+            reloaded = Image.open(fp)
 
-        for validator in self.validators:
+            self.assert_image_similar(im, reloaded, 20)
 
-            validator(self, request)
 
 
+    def test_unknown_extension(self):
 
-    @property
+        im = hopper()
 
-    def esp_name(self):
+        temp_file = self.tempfile("temp.unknown")
 
-        """
+        self.assertRaises(ValueError, im.save, temp_file)
 
-        Read-only name of the ESP for this webhook view.
 
 
+    def test_internals(self):
 
-        Subclasses must override with class attr. E.g.:
+        im = Image.new("L", (100, 100))
 
-            esp_name = "Postmark"
+        im.readonly = 1
 
-            esp_name = "SendGrid"  # (use ESP's preferred capitalization)
+        im._copy()
 
-        """
+        self.assertFalse(im.readonly)
 
-        raise NotImplementedError("%s.%s must declare esp_name class attr" %
 
-                                  (self.__class__.__module__, self.__class__.__name__))
+
+        im.readonly = 1
+
+        im.paste(0, (0, 0, 100, 100))
+
+        self.assertFalse(im.readonly)
+
+
+
+    @unittest.skipIf(
+
+        sys.platform.startswith("win32"), "Test requires opening tempfile twice"
+
+    )
+
+    def test_readonly_save(self):
+
+        temp_file = self.tempfile("temp.bmp")
+
+        shutil.copy("Tests/images/rgb32bf-rgba.bmp", temp_file)
+
+
+
+        im = Image.open(temp_file)
+
+        self.assertTrue(im.readonly)
+
+        im.save(temp_file)
+
+
+
+    def test_dump(self):
+
+        im = Image.new("L", (10, 10))
+
+        im._dump(self.tempfile("temp_L.ppm"))
+
+
+
+        im = Image.new("RGB", (10, 10))
+
+        im._dump(self.tempfile("temp_RGB.ppm"))
+
+
+
+        im = Image.new("HSV", (10, 10))
+
+        self.assertRaises(ValueError, im._dump, self.tempfile("temp_HSV.ppm"))
+
+
+
+    def test_comparison_with_other_type(self):
+
+        # Arrange
+
+        item = Image.new("RGB", (25, 25), "#000")
+
+        num = 12
+
+
+
+        # Act/Assert
+
+        # Shouldn't cause AttributeError (#774)
+
+        self.assertFalse(item is None)
+
+        self.assertFalse(item == num)
+
+
+
+    def test_expand_x(self):
+
+        # Arrange
+
+        im = hopper()
+
+        orig_size = im.size
+
+        xmargin = 5
+
+
+
+        # Act
+
+        im = im._expand(xmargin)
+
+
+
+        # Assert
+
+        self.assertEqual(im.size[0], orig_size[0] + 2 * xmargin)
+
+        self.assertEqual(im.size[1], orig_size[1] + 2 * xmargin)
+
+
+
+    def test_expand_xy(self):
+
+        # Arrange
+
+        im = hopper()
+
+        orig_size = im.size
+
+        xmargin = 5
+
+        ymargin = 3
+
+
+
+        # Act
+
+        im = im._expand(xmargin, ymargin)
+
+
+
+        # Assert
+
+        self.assertEqual(im.size[0], orig_size[0] + 2 * xmargin)
+
+        self.assertEqual(im.size[1], orig_size[1] + 2 * ymargin)
+
+
+
+    def test_getbands(self):
+
+        # Assert
+
+        self.assertEqual(hopper("RGB").getbands(), ("R", "G", "B"))
+
+        self.assertEqual(hopper("YCbCr").getbands(), ("Y", "Cb", "Cr"))
+
+
+
+    def test_getchannel_wrong_params(self):
+
+        im = hopper()
+
+
+
+        self.assertRaises(ValueError, im.getchannel, -1)
+
+        self.assertRaises(ValueError, im.getchannel, 3)
+
+        self.assertRaises(ValueError, im.getchannel, "Z")
+
+        self.assertRaises(ValueError, im.getchannel, "1")
+
+
+
+    def test_getchannel(self):
+
+        im = hopper("YCbCr")
+
+        Y, Cb, Cr = im.split()
+
+
+
+        self.assert_image_equal(Y, im.getchannel(0))
+
+        self.assert_image_equal(Y, im.getchannel("Y"))
+
+        self.assert_image_equal(Cb, im.getchannel(1))
+
+        self.assert_image_equal(Cb, im.getchannel("Cb"))
+
+        self.assert_image_equal(Cr, im.getchannel(2))
+
+        self.assert_image_equal(Cr, im.getchannel("Cr"))
+
+
+
+    def test_getbbox(self):
+
+        # Arrange
+
+        im = hopper()
+
+
+
+        # Act
+
+        bbox = im.getbbox()
+
+
+
+        # Assert
+
+        self.assertEqual(bbox, (0, 0, 128, 128))
+
+
+
+    def test_ne(self):
+
+        # Arrange
+
+        im1 = Image.new("RGB", (25, 25), "black")
+
+        im2 = Image.new("RGB", (25, 25), "white")
+
+
+
+        # Act / Assert
+
+        self.assertNotEqual(im1, im2)
+
+
+
+    def test_alpha_composite(self):
+
+        # https://stackoverflow.com/questions/3374878
+
+        # Arrange
+
+        from PIL import ImageDraw
+
+
+
+        expected_colors = sorted(
+
+            [
+
+                (1122, (128, 127, 0, 255)),
+
+                (1089, (0, 255, 0, 255)),
+
+                (3300, (255, 0, 0, 255)),
+
+                (1156, (170, 85, 0, 192)),
+
+                (1122, (0, 255, 0, 128)),
+
+                (1122, (255, 0, 0, 128)),
+
+                (1089, (0, 255, 0, 0)),
+
+            ]
+
+        )
+
+
+
+        dst = Image.new("RGBA", size=(100, 100), color=(0, 255, 0, 255))
+
+        draw = ImageDraw.Draw(dst)
+
+        draw.rectangle((0, 33, 100, 66), fill=(0, 255, 0, 128))
+
+        draw.rectangle((0, 67, 100, 100), fill=(0, 255, 0, 0))
+
+        src = Image.new("RGBA", size=(100, 100), color=(255, 0, 0, 255))
+
+        draw = ImageDraw.Draw(src)
+
+        draw.rectangle((33, 0, 66, 100), fill=(255, 0, 0, 128))
+
+        draw.rectangle((67, 0, 100, 100), fill=(255, 0, 0, 0))
+
+
+
+        # Act
+
+        img = Image.alpha_composite(dst, src)
+
+
+
+        # Assert
+
+        img_colors = sorted(img.getcolors())
+
+        self.assertEqual(img_colors, expected_colors)
+
+
+
+    def test_alpha_inplace(self):
+
+        src = Image.new("RGBA", (128, 128), "blue")
+
+
+
+        over = Image.new("RGBA", (128, 128), "red")
+
+        mask = hopper("L")
+
+        over.putalpha(mask)
+
+
+
+        target = Image.alpha_composite(src, over)
+
+
+
+        # basic
+
+        full = src.copy()
+
+        full.alpha_composite(over)
+
+        self.assert_image_equal(full, target)
+
+
+
+        # with offset down to right
+
+        offset = src.copy()
+
+        offset.alpha_composite(over, (64, 64))
+
+        self.assert_image_equal(
+
+            offset.crop((64, 64, 127, 127)), target.crop((0, 0, 63, 63))
+
+        )
+
+        self.assertEqual(offset.size, (128, 128))
+
+
+
+        # offset and crop
+
+        box = src.copy()
+
+        box.alpha_composite(over, (64, 64), (0, 0, 32, 32))
+
+        self.assert_image_equal(box.crop((64, 64, 96, 96)), target.crop((0, 0, 32, 32)))
+
+        self.assert_image_equal(box.crop((96, 96, 128, 128)), src.crop((0, 0, 32, 32)))
+
+        self.assertEqual(box.size, (128, 128))
+
+
+
+        # source point
+
+        source = src.copy()
+
+        source.alpha_composite(over, (32, 32), (32, 32, 96, 96))
+
+
+
+        self.assert_image_equal(
+
+            source.crop((32, 32, 96, 96)), target.crop((32, 32, 96, 96))
+
+        )
+
+        self.assertEqual(source.size, (128, 128))
+
+
+
+        # errors
+
+        self.assertRaises(ValueError, source.alpha_composite, over, "invalid source")
+
+        self.assertRaises(
+
+            ValueError, source.alpha_composite, over, (0, 0), "invalid destination"
+
+        )
+
+        self.assertRaises(ValueError, source.alpha_composite, over, 0)
+
+        self.assertRaises(ValueError, source.alpha_composite, over, (0, 0), 0)
+
+        self.assertRaises(ValueError, source.alpha_composite, over, (0, -1))
+
+        self.assertRaises(ValueError, source.alpha_composite, over, (0, 0), (0, -1))
+
+
+
+    def test_registered_extensions_uninitialized(self):
+
+        # Arrange
+
+        Image._initialized = 0
+
+        extension = Image.EXTENSION
+
+        Image.EXTENSION = {}
+
+
+
+        # Act
+
+        Image.registered_extensions()
+
+
+
+        # Assert
+
+        self.assertEqual(Image._initialized, 2)
+
+
+
+        # Restore the original state and assert
+
+        Image.EXTENSION = extension
+
+        self.assertTrue(Image.EXTENSION)
+
+
+
+    def test_registered_extensions(self):
+
+        # Arrange
+
+        # Open an image to trigger plugin registration
+
+        Image.open("Tests/images/rgb.jpg")
+
+
+
+        # Act
+
+        extensions = Image.registered_extensions()
+
+
+
+        # Assert
+
+        self.assertTrue(extensions)
+
+        for ext in [".cur", ".icns", ".tif", ".tiff"]:
+
+            self.assertIn(ext, extensions)
+
+
+
+    def test_effect_mandelbrot(self):
+
+        # Arrange
+
+        size = (512, 512)
+
+        extent = (-3, -2.5, 2, 2.5)
+
+        quality = 100
+
+
+
+        # Act
+
+        im = Image.effect_mandelbrot(size, extent, quality)
+
+
+
+        # Assert
+
+        self.assertEqual(im.size, (512, 512))
+
+        im2 = Image.open("Tests/images/effect_mandelbrot.png")
+
+        self.assert_image_equal(im, im2)
+
+
+
+    def test_effect_mandelbrot_bad_arguments(self):
+
+        # Arrange
+
+        size = (512, 512)
+
+        # Get coordinates the wrong way round:
+
+        extent = (+3, +2.5, -2, -2.5)
+
+        # Quality < 2:
+
+        quality = 1
+
+
+
+        # Act/Assert
+
+        self.assertRaises(ValueError, Image.effect_mandelbrot, size, extent, quality)
+
+
+
+    def test_effect_noise(self):
+
+        # Arrange
+
+        size = (100, 100)
+
+        sigma = 128
+
+
+
+        # Act
+
+        im = Image.effect_noise(size, sigma)
+
+
+
+        # Assert
+
+        self.assertEqual(im.size, (100, 100))
+
+        self.assertEqual(im.mode, "L")
+
+        p0 = im.getpixel((0, 0))
+
+        p1 = im.getpixel((0, 1))
+
+        p2 = im.getpixel((0, 2))
+
+        p3 = im.getpixel((0, 3))
+
+        p4 = im.getpixel((0, 4))
+
+        self.assert_not_all_same([p0, p1, p2, p3, p4])
+
+
+
+    def test_effect_spread(self):
+
+        # Arrange
+
+        im = hopper()
+
+        distance = 10
+
+
+
+        # Act
+
+        im2 = im.effect_spread(distance)
+
+
+
+        # Assert
+
+        self.assertEqual(im.size, (128, 128))
+
+        im3 = Image.open("Tests/images/effect_spread.png")
+
+        self.assert_image_similar(im2, im3, 110)
+
+
+
+    def test_check_size(self):
+
+        # Checking that the _check_size function throws value errors
+
+        # when we want it to.
+
+        with self.assertRaises(ValueError):
+
+            Image.new("RGB", 0)  # not a tuple
+
+        with self.assertRaises(ValueError):
+
+            Image.new("RGB", (0,))  # Tuple too short
+
+        with self.assertRaises(ValueError):
+
+            Image.new("RGB", (-1, -1))  # w,h < 0
+
+
+
+        # this should pass with 0 sized images, #2259
+
+        im = Image.new("L", (0, 0))
+
+        self.assertEqual(im.size, (0, 0))
+
+
+
+        im = Image.new("L", (0, 100))
+
+        self.assertEqual(im.size, (0, 100))
+
+
+
+        im = Image.new("L", (100, 0))
+
+        self.assertEqual(im.size, (100, 0))
+
+
+
+        self.assertTrue(Image.new("RGB", (1, 1)))
+
+        # Should pass lists too
+
+        i = Image.new("RGB", [1, 1])
+
+        self.assertIsInstance(i.size, tuple)
+
+
+
+    def test_storage_neg(self):
+
+        # Storage.c accepted negative values for xsize, ysize.  Was
+
+        # test_neg_ppm, but the core function for that has been
+
+        # removed Calling directly into core to test the error in
+
+        # Storage.c, rather than the size check above
+
+
+
+        with self.assertRaises(ValueError):
+
+            Image.core.fill("RGB", (2, -2), (0, 0, 0))
+
+
+
+    def test_offset_not_implemented(self):
+
+        # Arrange
+
+        im = hopper()
+
+
+
+        # Act / Assert
+
+        self.assertRaises(NotImplementedError, im.offset, None)
+
+
+
+    def test_fromstring(self):
+
+        self.assertRaises(NotImplementedError, Image.fromstring)
+
+
+
+    def test_linear_gradient_wrong_mode(self):
+
+        # Arrange
+
+        wrong_mode = "RGB"
+
+
+
+        # Act / Assert
+
+        self.assertRaises(ValueError, Image.linear_gradient, wrong_mode)
+
+
+
+    def test_linear_gradient(self):
+
+
+
+        # Arrange
+
+        target_file = "Tests/images/linear_gradient.png"
+
+        for mode in ["L", "P"]:
+
+
+
+            # Act
+
+            im = Image.linear_gradient(mode)
+
+
+
+            # Assert
+
+            self.assertEqual(im.size, (256, 256))
+
+            self.assertEqual(im.mode, mode)
+
+            self.assertEqual(im.getpixel((0, 0)), 0)
+
+            self.assertEqual(im.getpixel((255, 255)), 255)
+
+            target = Image.open(target_file).convert(mode)
+
+            self.assert_image_equal(im, target)
+
+
+
+    def test_radial_gradient_wrong_mode(self):
+
+        # Arrange
+
+        wrong_mode = "RGB"
+
+
+
+        # Act / Assert
+
+        self.assertRaises(ValueError, Image.radial_gradient, wrong_mode)
+
+
+
+    def test_radial_gradient(self):
+
+
+
+        # Arrange
+
+        target_file = "Tests/images/radial_gradient.png"
+
+        for mode in ["L", "P"]:
+
+
+
+            # Act
+
+            im = Image.radial_gradient(mode)
+
+
+
+            # Assert
+
+            self.assertEqual(im.size, (256, 256))
+
+            self.assertEqual(im.mode, mode)
+
+            self.assertEqual(im.getpixel((0, 0)), 255)
+
+            self.assertEqual(im.getpixel((128, 128)), 0)
+
+            target = Image.open(target_file).convert(mode)
+
+            self.assert_image_equal(im, target)
+
+
+
+    def test_register_extensions(self):
+
+        test_format = "a"
+
+        exts = ["b", "c"]
+
+        for ext in exts:
+
+            Image.register_extension(test_format, ext)
+
+        ext_individual = Image.EXTENSION.copy()
+
+        for ext in exts:
+
+            del Image.EXTENSION[ext]
+
+
+
+        Image.register_extensions(test_format, exts)
+
+        ext_multiple = Image.EXTENSION.copy()
+
+        for ext in exts:
+
+            del Image.EXTENSION[ext]
+
+
+
+        self.assertEqual(ext_individual, ext_multiple)
+
+
+
+    def test_remap_palette(self):
+
+        # Test illegal image mode
+
+        im = hopper()
+
+        self.assertRaises(ValueError, im.remap_palette, None)
+
+
+
+    def test__new(self):
+
+        from PIL import ImagePalette
+
+
+
+        im = hopper("RGB")
+
+        im_p = hopper("P")
+
+
+
+        blank_p = Image.new("P", (10, 10))
+
+        blank_pa = Image.new("PA", (10, 10))
+
+        blank_p.palette = None
+
+        blank_pa.palette = None
+
+
+
+        def _make_new(base_image, im, palette_result=None):
+
+            new_im = base_image._new(im)
+
+            self.assertEqual(new_im.mode, im.mode)
+
+            self.assertEqual(new_im.size, im.size)
+
+            self.assertEqual(new_im.info, base_image.info)
+
+            if palette_result is not None:
+
+                self.assertEqual(new_im.palette.tobytes(), palette_result.tobytes())
+
+            else:
+
+                self.assertIsNone(new_im.palette)
+
+
+
+        _make_new(im, im_p, im_p.palette)
+
+        _make_new(im_p, im, None)
+
+        _make_new(im, blank_p, ImagePalette.ImagePalette())
+
+        _make_new(im, blank_pa, ImagePalette.ImagePalette())
+
+
+
+    def test_p_from_rgb_rgba(self):
+
+        for mode, color in [
+
+            ("RGB", "#DDEEFF"),
+
+            ("RGB", (221, 238, 255)),
+
+            ("RGBA", (221, 238, 255, 255)),
+
+        ]:
+
+            im = Image.new("P", (100, 100), color)
+
+            expected = Image.new(mode, (100, 100), color)
+
+            self.assert_image_equal(im.convert(mode), expected)
+
+
+
+    def test_no_resource_warning_on_save(self):
+
+        # https://github.com/python-pillow/Pillow/issues/835
+
+        # Arrange
+
+        test_file = "Tests/images/hopper.png"
+
+        temp_file = self.tempfile("temp.jpg")
+
+
+
+        # Act/Assert
+
+        with Image.open(test_file) as im:
+
+            self.assert_warning(None, im.save, temp_file)
+
+
+
+    def test_load_on_nonexclusive_multiframe(self):
+
+        with open("Tests/images/frozenpond.mpo", "rb") as fp:
+
+
+
+            def act(fp):
+
+                im = Image.open(fp)
+
+                im.load()
+
+
+
+            act(fp)
+
+
+
+            with Image.open(fp) as im:
+
+                im.load()
+
+
+
+            self.assertFalse(fp.closed)
+
+
+
+    def test_overrun(self):
+
+        for file in [
+
+            "fli_overrun.bin",
+
+            "sgi_overrun.bin",
+
+            "pcx_overrun.bin",
+
+            "pcx_overrun2.bin",
+
+        ]:
+
+            im = Image.open(os.path.join("Tests/images", file))
+
+            try:
+
+                im.load()
+
+                self.assertFail()
+
+            except IOError as e:
+
+                self.assertEqual(str(e), "buffer overrun when reading image file")
+
+
+
+        with Image.open("Tests/images/fli_overrun2.bin") as im:
+
+            try:
+
+                im.seek(1)
+
+                self.assertFail()
+
+            except IOError as e:
+
+                self.assertEqual(str(e), "buffer overrun when reading image file")
+
+
+
+
+
+class MockEncoder(object):
+
+    pass
+
+
+
+
+
+def mock_encode(*args):
+
+    encoder = MockEncoder()
+
+    encoder.args = args
+
+    return encoder
+
+
+
+
+
+class TestRegistry(PillowTestCase):
+
+    def test_encode_registry(self):
+
+
+
+        Image.register_encoder("MOCK", mock_encode)
+
+        self.assertIn("MOCK", Image.ENCODERS)
+
+
+
+        enc = Image._getencoder("RGB", "MOCK", ("args",), extra=("extra",))
+
+
+
+        self.assertIsInstance(enc, MockEncoder)
+
+        self.assertEqual(enc.args, ("RGB", "args", "extra"))
+
+
+
+    def test_encode_registry_fail(self):
+
+        self.assertRaises(
+
+            IOError,
+
+            Image._getencoder,
+
+            "RGB",
+
+            "DoesNotExist",
+
+            ("args",),
+
+            extra=("extra",),
+
+        )

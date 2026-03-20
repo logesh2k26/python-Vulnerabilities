@@ -2,598 +2,1062 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# Copyright 2012 OpenStack LLC
+##############################################################################
 
 #
 
-# Licensed under the Apache License, Version 2.0 (the "License"); you may
+# Copyright (c) 2002 Zope Foundation and Contributors.
 
-# not use this file except in compliance with the License. You may obtain
-
-# a copy of the License at
+# All Rights Reserved.
 
 #
 
-#      http://www.apache.org/licenses/LICENSE-2.0
+# This software is subject to the provisions of the Zope Public License,
+
+# Version 2.1 (ZPL).  A copy of the ZPL should accompany this distribution.
+
+# THIS SOFTWARE IS PROVIDED "AS IS" AND ANY AND ALL EXPRESS OR IMPLIED
+
+# WARRANTIES ARE DISCLAIMED, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+
+# WARRANTIES OF TITLE, MERCHANTABILITY, AGAINST INFRINGEMENT, AND FITNESS
+
+# FOR A PARTICULAR PURPOSE.
 
 #
 
-# Unless required by applicable law or agreed to in writing, software
+##############################################################################
 
-# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+"""HTTP Request Parser tests
 
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+"""
 
-# License for the specific language governing permissions and limitations
-
-# under the License.
+import unittest
 
 
 
-import uuid
-
-
-
-import default_fixtures
-
-
-
-from keystone import exception
-
-from keystone import identity
-
-from keystone import service
-
-from keystone import test
-
-from keystone.identity.backends import kvs as kvs_identity
-
-from keystone.openstack.common import timeutils
+from waitress.compat import text_, tobytes
 
 
 
 
 
-def _build_user_auth(token=None, username=None,
-
-                     password=None, tenant_name=None):
-
-    """Build auth dictionary.
-
-
-
-    It will create an auth dictionary based on all the arguments
-
-    that it receives.
-
-    """
-
-    auth_json = {}
-
-    if token is not None:
-
-        auth_json['token'] = token
-
-    if username or password:
-
-        auth_json['passwordCredentials'] = {}
-
-    if username is not None:
-
-        auth_json['passwordCredentials']['username'] = username
-
-    if password is not None:
-
-        auth_json['passwordCredentials']['password'] = password
-
-    if tenant_name is not None:
-
-        auth_json['tenantName'] = tenant_name
-
-    return auth_json
-
-
-
-
-
-class TokenControllerTest(test.TestCase):
+class TestHTTPRequestParser(unittest.TestCase):
 
     def setUp(self):
 
-        super(TokenControllerTest, self).setUp()
+        from waitress.parser import HTTPRequestParser
 
-        self.identity_api = kvs_identity.Identity()
-
-        self.load_fixtures(default_fixtures)
-
-        self.api = service.TokenController()
+        from waitress.adjustments import Adjustments
 
 
 
-    def assertEqualTokens(self, a, b):
+        my_adj = Adjustments()
 
-        """Assert that two tokens are equal.
-
-
-
-        Compare two tokens except for their ids. This also truncates
-
-        the time in the comparison.
-
-        """
-
-        def normalize(token):
-
-            token['access']['token']['id'] = 'dummy'
-
-            del token['access']['token']['expires']
-
-            del token['access']['token']['issued_at']
-
-            return token
+        self.parser = HTTPRequestParser(my_adj)
 
 
 
-        self.assertCloseEnoughForGovernmentWork(
+    def test_get_body_stream_None(self):
 
-            timeutils.parse_isotime(a['access']['token']['expires']),
+        self.parser.body_recv = None
 
-            timeutils.parse_isotime(b['access']['token']['expires']))
+        result = self.parser.get_body_stream()
 
-        self.assertCloseEnoughForGovernmentWork(
-
-            timeutils.parse_isotime(a['access']['token']['issued_at']),
-
-            timeutils.parse_isotime(b['access']['token']['issued_at']))
-
-        return self.assertDictEqual(normalize(a), normalize(b))
+        self.assertEqual(result.getvalue(), b"")
 
 
 
+    def test_get_body_stream_nonNone(self):
+
+        body_rcv = DummyBodyStream()
+
+        self.parser.body_rcv = body_rcv
+
+        result = self.parser.get_body_stream()
+
+        self.assertEqual(result, body_rcv)
 
 
-class AuthBadRequests(TokenControllerTest):
+
+    def test_received_get_no_headers(self):
+
+        data = b"HTTP/1.0 GET /foobar\r\n\r\n"
+
+        result = self.parser.received(data)
+
+        self.assertEqual(result, 24)
+
+        self.assertTrue(self.parser.completed)
+
+        self.assertEqual(self.parser.headers, {})
+
+
+
+    def test_received_bad_host_header(self):
+
+        from waitress.utilities import BadRequest
+
+
+
+        data = b"HTTP/1.0 GET /foobar\r\n Host: foo\r\n\r\n"
+
+        result = self.parser.received(data)
+
+        self.assertEqual(result, 36)
+
+        self.assertTrue(self.parser.completed)
+
+        self.assertEqual(self.parser.error.__class__, BadRequest)
+
+
+
+    def test_received_nonsense_nothing(self):
+
+        data = b"\r\n\r\n"
+
+        result = self.parser.received(data)
+
+        self.assertEqual(result, 4)
+
+        self.assertTrue(self.parser.completed)
+
+        self.assertEqual(self.parser.headers, {})
+
+
+
+    def test_received_no_doublecr(self):
+
+        data = b"GET /foobar HTTP/8.4\r\n"
+
+        result = self.parser.received(data)
+
+        self.assertEqual(result, 22)
+
+        self.assertFalse(self.parser.completed)
+
+        self.assertEqual(self.parser.headers, {})
+
+
+
+    def test_received_already_completed(self):
+
+        self.parser.completed = True
+
+        result = self.parser.received(b"a")
+
+        self.assertEqual(result, 0)
+
+
+
+    def test_received_cl_too_large(self):
+
+        from waitress.utilities import RequestEntityTooLarge
+
+
+
+        self.parser.adj.max_request_body_size = 2
+
+        data = b"GET /foobar HTTP/8.4\r\nContent-Length: 10\r\n\r\n"
+
+        result = self.parser.received(data)
+
+        self.assertEqual(result, 44)
+
+        self.assertTrue(self.parser.completed)
+
+        self.assertTrue(isinstance(self.parser.error, RequestEntityTooLarge))
+
+
+
+    def test_received_headers_too_large(self):
+
+        from waitress.utilities import RequestHeaderFieldsTooLarge
+
+
+
+        self.parser.adj.max_request_header_size = 2
+
+        data = b"GET /foobar HTTP/8.4\r\nX-Foo: 1\r\n\r\n"
+
+        result = self.parser.received(data)
+
+        self.assertEqual(result, 34)
+
+        self.assertTrue(self.parser.completed)
+
+        self.assertTrue(isinstance(self.parser.error, RequestHeaderFieldsTooLarge))
+
+
+
+    def test_received_body_too_large(self):
+
+        from waitress.utilities import RequestEntityTooLarge
+
+
+
+        self.parser.adj.max_request_body_size = 2
+
+        data = (
+
+            b"GET /foobar HTTP/1.1\r\n"
+
+            b"Transfer-Encoding: chunked\r\n"
+
+            b"X-Foo: 1\r\n"
+
+            b"\r\n"
+
+            b"1d;\r\n"
+
+            b"This string has 29 characters\r\n"
+
+            b"0\r\n\r\n"
+
+        )
+
+
+
+        result = self.parser.received(data)
+
+        self.assertEqual(result, 62)
+
+        self.parser.received(data[result:])
+
+        self.assertTrue(self.parser.completed)
+
+        self.assertTrue(isinstance(self.parser.error, RequestEntityTooLarge))
+
+
+
+    def test_received_error_from_parser(self):
+
+        from waitress.utilities import BadRequest
+
+
+
+        data = (
+
+            b"GET /foobar HTTP/1.1\r\n"
+
+            b"Transfer-Encoding: chunked\r\n"
+
+            b"X-Foo: 1\r\n"
+
+            b"\r\n"
+
+            b"garbage\r\n"
+
+        )
+
+        # header
+
+        result = self.parser.received(data)
+
+        # body
+
+        result = self.parser.received(data[result:])
+
+        self.assertEqual(result, 9)
+
+        self.assertTrue(self.parser.completed)
+
+        self.assertTrue(isinstance(self.parser.error, BadRequest))
+
+
+
+    def test_received_chunked_completed_sets_content_length(self):
+
+        data = (
+
+            b"GET /foobar HTTP/1.1\r\n"
+
+            b"Transfer-Encoding: chunked\r\n"
+
+            b"X-Foo: 1\r\n"
+
+            b"\r\n"
+
+            b"1d;\r\n"
+
+            b"This string has 29 characters\r\n"
+
+            b"0\r\n\r\n"
+
+        )
+
+        result = self.parser.received(data)
+
+        self.assertEqual(result, 62)
+
+        data = data[result:]
+
+        result = self.parser.received(data)
+
+        self.assertTrue(self.parser.completed)
+
+        self.assertTrue(self.parser.error is None)
+
+        self.assertEqual(self.parser.headers["CONTENT_LENGTH"], "29")
+
+
+
+    def test_parse_header_gardenpath(self):
+
+        data = b"GET /foobar HTTP/8.4\r\nfoo: bar\r\n"
+
+        self.parser.parse_header(data)
+
+        self.assertEqual(self.parser.first_line, b"GET /foobar HTTP/8.4")
+
+        self.assertEqual(self.parser.headers["FOO"], "bar")
+
+
+
+    def test_parse_header_no_cr_in_headerplus(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        data = b"GET /foobar HTTP/8.4"
+
+
+
+        try:
+
+            self.parser.parse_header(data)
+
+        except ParsingError:
+
+            pass
+
+        else:  # pragma: nocover
+
+            self.assertTrue(False)
+
+
+
+    def test_parse_header_bad_content_length(self):
+
+        data = b"GET /foobar HTTP/8.4\r\ncontent-length: abc\r\n"
+
+        self.parser.parse_header(data)
+
+        self.assertEqual(self.parser.body_rcv, None)
+
+
+
+    def test_parse_header_11_te_chunked(self):
+
+        # NB: test that capitalization of header value is unimportant
+
+        data = b"GET /foobar HTTP/1.1\r\ntransfer-encoding: ChUnKed\r\n"
+
+        self.parser.parse_header(data)
+
+        self.assertEqual(self.parser.body_rcv.__class__.__name__, "ChunkedReceiver")
+
+
+
+    def test_parse_header_11_expect_continue(self):
+
+        data = b"GET /foobar HTTP/1.1\r\nexpect: 100-continue\r\n"
+
+        self.parser.parse_header(data)
+
+        self.assertEqual(self.parser.expect_continue, True)
+
+
+
+    def test_parse_header_connection_close(self):
+
+        data = b"GET /foobar HTTP/1.1\r\nConnection: close\r\n"
+
+        self.parser.parse_header(data)
+
+        self.assertEqual(self.parser.connection_close, True)
+
+
+
+    def test_close_with_body_rcv(self):
+
+        body_rcv = DummyBodyStream()
+
+        self.parser.body_rcv = body_rcv
+
+        self.parser.close()
+
+        self.assertTrue(body_rcv.closed)
+
+
+
+    def test_close_with_no_body_rcv(self):
+
+        self.parser.body_rcv = None
+
+        self.parser.close()  # doesn't raise
+
+
+
+    def test_parse_header_lf_only(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        data = b"GET /foobar HTTP/8.4\nfoo: bar"
+
+
+
+        try:
+
+            self.parser.parse_header(data)
+
+        except ParsingError:
+
+            pass
+
+        else:  # pragma: nocover
+
+            self.assertTrue(False)
+
+
+
+    def test_parse_header_cr_only(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        data = b"GET /foobar HTTP/8.4\rfoo: bar"
+
+        try:
+
+            self.parser.parse_header(data)
+
+        except ParsingError:
+
+            pass
+
+        else:  # pragma: nocover
+
+            self.assertTrue(False)
+
+
+
+    def test_parse_header_extra_lf_in_header(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        data = b"GET /foobar HTTP/8.4\r\nfoo: \nbar\r\n"
+
+        try:
+
+            self.parser.parse_header(data)
+
+        except ParsingError as e:
+
+            self.assertIn("Bare CR or LF found in header line", e.args[0])
+
+        else:  # pragma: nocover
+
+            self.assertTrue(False)
+
+
+
+    def test_parse_header_extra_lf_in_first_line(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        data = b"GET /foobar\n HTTP/8.4\r\n"
+
+        try:
+
+            self.parser.parse_header(data)
+
+        except ParsingError as e:
+
+            self.assertIn("Bare CR or LF found in HTTP message", e.args[0])
+
+        else:  # pragma: nocover
+
+            self.assertTrue(False)
+
+
+
+    def test_parse_header_invalid_whitespace(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        data = b"GET /foobar HTTP/8.4\r\nfoo : bar\r\n"
+
+        try:
+
+            self.parser.parse_header(data)
+
+        except ParsingError as e:
+
+            self.assertIn("Invalid whitespace after field-name", e.args[0])
+
+        else:  # pragma: nocover
+
+            self.assertTrue(False)
+
+
+
+
+
+class Test_split_uri(unittest.TestCase):
+
+    def _callFUT(self, uri):
+
+        from waitress.parser import split_uri
+
+
+
+        (
+
+            self.proxy_scheme,
+
+            self.proxy_netloc,
+
+            self.path,
+
+            self.query,
+
+            self.fragment,
+
+        ) = split_uri(uri)
+
+
+
+    def test_split_uri_unquoting_unneeded(self):
+
+        self._callFUT(b"http://localhost:8080/abc def")
+
+        self.assertEqual(self.path, "/abc def")
+
+
+
+    def test_split_uri_unquoting_needed(self):
+
+        self._callFUT(b"http://localhost:8080/abc%20def")
+
+        self.assertEqual(self.path, "/abc def")
+
+
+
+    def test_split_url_with_query(self):
+
+        self._callFUT(b"http://localhost:8080/abc?a=1&b=2")
+
+        self.assertEqual(self.path, "/abc")
+
+        self.assertEqual(self.query, "a=1&b=2")
+
+
+
+    def test_split_url_with_query_empty(self):
+
+        self._callFUT(b"http://localhost:8080/abc?")
+
+        self.assertEqual(self.path, "/abc")
+
+        self.assertEqual(self.query, "")
+
+
+
+    def test_split_url_with_fragment(self):
+
+        self._callFUT(b"http://localhost:8080/#foo")
+
+        self.assertEqual(self.path, "/")
+
+        self.assertEqual(self.fragment, "foo")
+
+
+
+    def test_split_url_https(self):
+
+        self._callFUT(b"https://localhost:8080/")
+
+        self.assertEqual(self.path, "/")
+
+        self.assertEqual(self.proxy_scheme, "https")
+
+        self.assertEqual(self.proxy_netloc, "localhost:8080")
+
+
+
+    def test_split_uri_unicode_error_raises_parsing_error(self):
+
+        # See https://github.com/Pylons/waitress/issues/64
+
+        from waitress.parser import ParsingError
+
+
+
+        # Either pass or throw a ParsingError, just don't throw another type of
+
+        # exception as that will cause the connection to close badly:
+
+        try:
+
+            self._callFUT(b"/\xd0")
+
+        except ParsingError:
+
+            pass
+
+
+
+    def test_split_uri_path(self):
+
+        self._callFUT(b"//testing/whatever")
+
+        self.assertEqual(self.path, "//testing/whatever")
+
+        self.assertEqual(self.proxy_scheme, "")
+
+        self.assertEqual(self.proxy_netloc, "")
+
+        self.assertEqual(self.query, "")
+
+        self.assertEqual(self.fragment, "")
+
+
+
+    def test_split_uri_path_query(self):
+
+        self._callFUT(b"//testing/whatever?a=1&b=2")
+
+        self.assertEqual(self.path, "//testing/whatever")
+
+        self.assertEqual(self.proxy_scheme, "")
+
+        self.assertEqual(self.proxy_netloc, "")
+
+        self.assertEqual(self.query, "a=1&b=2")
+
+        self.assertEqual(self.fragment, "")
+
+
+
+    def test_split_uri_path_query_fragment(self):
+
+        self._callFUT(b"//testing/whatever?a=1&b=2#fragment")
+
+        self.assertEqual(self.path, "//testing/whatever")
+
+        self.assertEqual(self.proxy_scheme, "")
+
+        self.assertEqual(self.proxy_netloc, "")
+
+        self.assertEqual(self.query, "a=1&b=2")
+
+        self.assertEqual(self.fragment, "fragment")
+
+
+
+
+
+class Test_get_header_lines(unittest.TestCase):
+
+    def _callFUT(self, data):
+
+        from waitress.parser import get_header_lines
+
+
+
+        return get_header_lines(data)
+
+
+
+    def test_get_header_lines(self):
+
+        result = self._callFUT(b"slam\r\nslim")
+
+        self.assertEqual(result, [b"slam", b"slim"])
+
+
+
+    def test_get_header_lines_folded(self):
+
+        # From RFC2616:
+
+        # HTTP/1.1 header field values can be folded onto multiple lines if the
+
+        # continuation line begins with a space or horizontal tab. All linear
+
+        # white space, including folding, has the same semantics as SP. A
+
+        # recipient MAY replace any linear white space with a single SP before
+
+        # interpreting the field value or forwarding the message downstream.
+
+
+
+        # We are just preserving the whitespace that indicates folding.
+
+        result = self._callFUT(b"slim\r\n slam")
+
+        self.assertEqual(result, [b"slim slam"])
+
+
+
+    def test_get_header_lines_tabbed(self):
+
+        result = self._callFUT(b"slam\r\n\tslim")
+
+        self.assertEqual(result, [b"slam\tslim"])
+
+
+
+    def test_get_header_lines_malformed(self):
+
+        # https://corte.si/posts/code/pathod/pythonservers/index.html
+
+        from waitress.parser import ParsingError
+
+
+
+        self.assertRaises(ParsingError, self._callFUT, b" Host: localhost\r\n\r\n")
+
+
+
+
+
+class Test_crack_first_line(unittest.TestCase):
+
+    def _callFUT(self, line):
+
+        from waitress.parser import crack_first_line
+
+
+
+        return crack_first_line(line)
+
+
+
+    def test_crack_first_line_matchok(self):
+
+        result = self._callFUT(b"GET / HTTP/1.0")
+
+        self.assertEqual(result, (b"GET", b"/", b"1.0"))
+
+
+
+    def test_crack_first_line_lowercase_method(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        self.assertRaises(ParsingError, self._callFUT, b"get / HTTP/1.0")
+
+
+
+    def test_crack_first_line_nomatch(self):
+
+        result = self._callFUT(b"GET / bleh")
+
+        self.assertEqual(result, (b"", b"", b""))
+
+
+
+        result = self._callFUT(b"GET /info?txtAirPlay&txtRAOP RTSP/1.0")
+
+        self.assertEqual(result, (b"", b"", b""))
+
+
+
+    def test_crack_first_line_missing_version(self):
+
+        result = self._callFUT(b"GET /")
+
+        self.assertEqual(result, (b"GET", b"/", b""))
+
+
+
+
+
+class TestHTTPRequestParserIntegration(unittest.TestCase):
 
     def setUp(self):
 
-        super(AuthBadRequests, self).setUp()
+        from waitress.parser import HTTPRequestParser
 
+        from waitress.adjustments import Adjustments
 
 
-    def test_no_external_auth(self):
 
-        """Verify that _authenticate_external() raises exception if
+        my_adj = Adjustments()
 
-        not applicable"""
+        self.parser = HTTPRequestParser(my_adj)
 
-        self.assertRaises(
 
-            service.ExternalAuthNotApplicable,
 
-            self.api._authenticate_external,
+    def feed(self, data):
 
-            {}, {})
+        parser = self.parser
 
 
 
-    def test_no_token_in_auth(self):
+        for n in range(100):  # make sure we never loop forever
 
-        """Verity that _authenticate_token() raises exception if no token"""
+            consumed = parser.received(data)
 
-        self.assertRaises(
+            data = data[consumed:]
 
-            exception.ValidationError,
 
-            self.api._authenticate_token,
 
-            None, {})
+            if parser.completed:
 
+                return
 
+        raise ValueError("Looping")  # pragma: no cover
 
-    def test_no_credentials_in_auth(self):
 
-        """Verity that _authenticate_local() raises exception if no creds"""
 
-        self.assertRaises(
+    def testSimpleGET(self):
 
-            exception.ValidationError,
+        data = (
 
-            self.api._authenticate_local,
+            b"GET /foobar HTTP/8.4\r\n"
 
-            None, {})
+            b"FirstName: mickey\r\n"
 
+            b"lastname: Mouse\r\n"
 
+            b"content-length: 6\r\n"
 
-    def test_authenticate_blank_request_body(self):
+            b"\r\n"
 
-        """Verify sending empty json dict raises the right exception."""
+            b"Hello."
 
-        self.assertRaises(exception.ValidationError, self.api.authenticate,
+        )
 
-                          {}, {})
+        parser = self.parser
 
+        self.feed(data)
 
+        self.assertTrue(parser.completed)
 
-    def test_authenticate_blank_auth(self):
+        self.assertEqual(parser.version, "8.4")
 
-        """Verify sending blank 'auth' raises the right exception."""
+        self.assertFalse(parser.empty)
 
-        body_dict = _build_user_auth()
+        self.assertEqual(
 
-        self.assertRaises(exception.ValidationError, self.api.authenticate,
+            parser.headers,
 
-                          {}, body_dict)
+            {"FIRSTNAME": "mickey", "LASTNAME": "Mouse", "CONTENT_LENGTH": "6",},
 
+        )
 
+        self.assertEqual(parser.path, "/foobar")
 
-    def test_authenticate_invalid_auth_content(self):
+        self.assertEqual(parser.command, "GET")
 
-        """Verify sending invalid 'auth' raises the right exception."""
+        self.assertEqual(parser.query, "")
 
-        self.assertRaises(exception.ValidationError, self.api.authenticate,
+        self.assertEqual(parser.proxy_scheme, "")
 
-                          {}, {'auth': 'abcd'})
+        self.assertEqual(parser.proxy_netloc, "")
 
+        self.assertEqual(parser.get_body_stream().getvalue(), b"Hello.")
 
 
 
+    def testComplexGET(self):
 
-class AuthWithToken(TokenControllerTest):
+        data = (
 
-    def setUp(self):
+            b"GET /foo/a+%2B%2F%C3%A4%3D%26a%3Aint?d=b+%2B%2F%3D%26b%3Aint&c+%2B%2F%3D%26c%3Aint=6 HTTP/8.4\r\n"
 
-        super(AuthWithToken, self).setUp()
+            b"FirstName: mickey\r\n"
 
+            b"lastname: Mouse\r\n"
 
+            b"content-length: 10\r\n"
 
-    def test_unscoped_token(self):
+            b"\r\n"
 
-        """Verify getting an unscoped token with password creds"""
+            b"Hello mickey."
 
-        body_dict = _build_user_auth(username='FOO',
+        )
 
-                                     password='foo2')
+        parser = self.parser
 
-        unscoped_token = self.api.authenticate({}, body_dict)
+        self.feed(data)
 
-        tenant = unscoped_token["access"]["token"].get("tenant", None)
+        self.assertEqual(parser.command, "GET")
 
-        self.assertEqual(tenant, None)
+        self.assertEqual(parser.version, "8.4")
 
+        self.assertFalse(parser.empty)
 
+        self.assertEqual(
 
-    def test_auth_invalid_token(self):
+            parser.headers,
 
-        """Verify exception is raised if invalid token"""
+            {"FIRSTNAME": "mickey", "LASTNAME": "Mouse", "CONTENT_LENGTH": "10"},
 
-        body_dict = _build_user_auth(token={"id": uuid.uuid4().hex})
+        )
 
-        self.assertRaises(
+        # path should be utf-8 encoded
 
-            exception.Unauthorized,
+        self.assertEqual(
 
-            self.api.authenticate,
+            tobytes(parser.path).decode("utf-8"),
 
-            {}, body_dict)
+            text_(b"/foo/a++/\xc3\xa4=&a:int", "utf-8"),
 
+        )
 
+        self.assertEqual(
 
-    def test_auth_bad_formatted_token(self):
+            parser.query, "d=b+%2B%2F%3D%26b%3Aint&c+%2B%2F%3D%26c%3Aint=6"
 
-        """Verify exception is raised if invalid token"""
+        )
 
-        body_dict = _build_user_auth(token={})
+        self.assertEqual(parser.get_body_stream().getvalue(), b"Hello mick")
 
-        self.assertRaises(
 
-            exception.ValidationError,
 
-            self.api.authenticate,
+    def testProxyGET(self):
 
-            {}, body_dict)
+        data = (
 
+            b"GET https://example.com:8080/foobar HTTP/8.4\r\n"
 
+            b"content-length: 6\r\n"
 
-    def test_auth_unscoped_token_no_tenant(self):
+            b"\r\n"
 
-        """Verify getting an unscoped token with an unscoped token"""
+            b"Hello."
 
-        body_dict = _build_user_auth(
+        )
 
-            username='FOO',
+        parser = self.parser
 
-            password='foo2')
+        self.feed(data)
 
-        unscoped_token = self.api.authenticate({}, body_dict)
+        self.assertTrue(parser.completed)
 
+        self.assertEqual(parser.version, "8.4")
 
+        self.assertFalse(parser.empty)
 
-        body_dict = _build_user_auth(
+        self.assertEqual(parser.headers, {"CONTENT_LENGTH": "6"})
 
-            token=unscoped_token["access"]["token"])
+        self.assertEqual(parser.path, "/foobar")
 
-        unscoped_token_2 = self.api.authenticate({}, body_dict)
+        self.assertEqual(parser.command, "GET")
 
+        self.assertEqual(parser.proxy_scheme, "https")
 
+        self.assertEqual(parser.proxy_netloc, "example.com:8080")
 
-        self.assertEqualTokens(unscoped_token, unscoped_token_2)
+        self.assertEqual(parser.command, "GET")
 
+        self.assertEqual(parser.query, "")
 
+        self.assertEqual(parser.get_body_stream().getvalue(), b"Hello.")
 
-    def test_auth_unscoped_token_tenant(self):
 
-        """Verify getting a token in a tenant with an unscoped token"""
 
-        # Get an unscoped tenant
+    def testDuplicateHeaders(self):
 
-        body_dict = _build_user_auth(
+        # Ensure that headers with the same key get concatenated as per
 
-            username='FOO',
+        # RFC2616.
 
-            password='foo2')
+        data = (
 
-        unscoped_token = self.api.authenticate({}, body_dict)
+            b"GET /foobar HTTP/8.4\r\n"
 
-        # Get a token on BAR tenant using the unscoped tenant
+            b"x-forwarded-for: 10.11.12.13\r\n"
 
-        body_dict = _build_user_auth(
+            b"x-forwarded-for: unknown,127.0.0.1\r\n"
 
-            token=unscoped_token["access"]["token"],
+            b"X-Forwarded_for: 255.255.255.255\r\n"
 
-            tenant_name="BAR")
+            b"content-length: 6\r\n"
 
-        scoped_token = self.api.authenticate({}, body_dict)
+            b"\r\n"
 
+            b"Hello."
 
+        )
 
-        tenant = scoped_token["access"]["token"]["tenant"]
+        self.feed(data)
 
-        self.assertEquals(tenant["id"], self.tenant_bar['id'])
+        self.assertTrue(self.parser.completed)
 
+        self.assertEqual(
 
+            self.parser.headers,
 
+            {
 
+                "CONTENT_LENGTH": "6",
 
-class AuthWithPasswordCredentials(TokenControllerTest):
+                "X_FORWARDED_FOR": "10.11.12.13, unknown,127.0.0.1",
 
-    def setUp(self):
+            },
 
-        super(AuthWithPasswordCredentials, self).setUp()
+        )
 
 
 
-    def test_auth_invalid_user(self):
+    def testSpoofedHeadersDropped(self):
 
-        """Verify exception is raised if invalid user"""
+        data = (
 
-        body_dict = _build_user_auth(
+            b"GET /foobar HTTP/8.4\r\n"
 
-            username=uuid.uuid4().hex,
+            b"x-auth_user: bob\r\n"
 
-            password=uuid.uuid4().hex)
+            b"content-length: 6\r\n"
 
-        self.assertRaises(
+            b"\r\n"
 
-            exception.Unauthorized,
+            b"Hello."
 
-            self.api.authenticate,
+        )
 
-            {}, body_dict)
+        self.feed(data)
 
+        self.assertTrue(self.parser.completed)
 
+        self.assertEqual(self.parser.headers, {"CONTENT_LENGTH": "6",})
 
-    def test_auth_valid_user_invalid_password(self):
 
-        """Verify exception is raised if invalid password"""
 
-        body_dict = _build_user_auth(
 
-            username="FOO",
 
-            password=uuid.uuid4().hex)
+class DummyBodyStream(object):
 
-        self.assertRaises(
+    def getfile(self):
 
-            exception.Unauthorized,
+        return self
 
-            self.api.authenticate,
 
-            {}, body_dict)
 
+    def getbuf(self):
 
+        return self
 
-    def test_auth_empty_password(self):
 
-        """Verify exception is raised if empty password"""
 
-        body_dict = _build_user_auth(
+    def close(self):
 
-            username="FOO",
-
-            password="")
-
-        self.assertRaises(
-
-            exception.Unauthorized,
-
-            self.api.authenticate,
-
-            {}, body_dict)
-
-
-
-    def test_auth_no_password(self):
-
-        """Verify exception is raised if empty password"""
-
-        body_dict = _build_user_auth(username="FOO")
-
-        self.assertRaises(
-
-            exception.ValidationError,
-
-            self.api.authenticate,
-
-            {}, body_dict)
-
-
-
-    def test_authenticate_blank_password_credentials(self):
-
-        """Verify sending empty json dict as passwordCredentials raises the
-
-        right exception."""
-
-        body_dict = {'passwordCredentials': {}, 'tenantName': 'demo'}
-
-        self.assertRaises(exception.ValidationError, self.api.authenticate,
-
-                          {}, body_dict)
-
-
-
-    def test_authenticate_no_username(self):
-
-        """Verify skipping username raises the right exception."""
-
-        body_dict = _build_user_auth(password="pass",
-
-                                     tenant_name="demo")
-
-        self.assertRaises(exception.ValidationError, self.api.authenticate,
-
-                          {}, body_dict)
-
-
-
-
-
-class AuthWithRemoteUser(TokenControllerTest):
-
-    def setUp(self):
-
-        super(AuthWithRemoteUser, self).setUp()
-
-
-
-    def test_unscoped_remote_authn(self):
-
-        """Verify getting an unscoped token with external authn"""
-
-        body_dict = _build_user_auth(
-
-            username='FOO',
-
-            password='foo2')
-
-        local_token = self.api.authenticate(
-
-            {}, body_dict)
-
-
-
-        body_dict = _build_user_auth()
-
-        remote_token = self.api.authenticate(
-
-            {'REMOTE_USER': 'FOO'}, body_dict)
-
-
-
-        self.assertEqualTokens(local_token, remote_token)
-
-
-
-    def test_unscoped_remote_authn_jsonless(self):
-
-        """Verify that external auth with invalid request fails"""
-
-        self.assertRaises(
-
-            exception.ValidationError,
-
-            self.api.authenticate,
-
-            {'REMOTE_USER': 'FOO'},
-
-            None)
-
-
-
-    def test_scoped_remote_authn(self):
-
-        """Verify getting a token with external authn"""
-
-        body_dict = _build_user_auth(
-
-            username='FOO',
-
-            password='foo2',
-
-            tenant_name='BAR')
-
-        local_token = self.api.authenticate(
-
-            {}, body_dict)
-
-
-
-        body_dict = _build_user_auth(
-
-            tenant_name='BAR')
-
-        remote_token = self.api.authenticate(
-
-            {'REMOTE_USER': 'FOO'}, body_dict)
-
-
-
-        self.assertEqualTokens(local_token, remote_token)
-
-
-
-    def test_scoped_nometa_remote_authn(self):
-
-        """Verify getting a token with external authn and no metadata"""
-
-        body_dict = _build_user_auth(
-
-            username='TWO',
-
-            password='two2',
-
-            tenant_name='BAZ')
-
-        local_token = self.api.authenticate(
-
-            {}, body_dict)
-
-
-
-        body_dict = _build_user_auth(tenant_name='BAZ')
-
-        remote_token = self.api.authenticate(
-
-            {'REMOTE_USER': 'TWO'}, body_dict)
-
-
-
-        self.assertEqualTokens(local_token, remote_token)
-
-
-
-    def test_scoped_remote_authn_invalid_user(self):
-
-        """Verify that external auth with invalid user fails"""
-
-        body_dict = _build_user_auth(tenant_name="BAR")
-
-        self.assertRaises(
-
-            exception.Unauthorized,
-
-            self.api.authenticate,
-
-            {'REMOTE_USER': uuid.uuid4().hex},
-
-            body_dict)
+        self.closed = True

@@ -2,184 +2,128 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# -*- coding: utf-8 -*-
+from django.conf.urls import patterns, url
 
-# Copyright 2014-2016 OpenMarket Ltd
+from django.contrib.auth import context_processors
 
-# Copyright 2017 Vector Creations Ltd
+from django.contrib.auth.urls import urlpatterns
 
-#
+from django.contrib.auth.views import password_reset
 
-# Licensed under the Apache License, Version 2.0 (the "License");
+from django.contrib.auth.decorators import login_required
 
-# you may not use this file except in compliance with the License.
+from django.contrib.messages.api import info
 
-# You may obtain a copy of the License at
+from django.http import HttpResponse
 
-#
+from django.shortcuts import render_to_response
 
-#     http://www.apache.org/licenses/LICENSE-2.0
+from django.template import Template, RequestContext
 
-#
+from django.views.decorators.cache import never_cache
 
-# Unless required by applicable law or agreed to in writing, software
 
-# distributed under the License is distributed on an "AS IS" BASIS,
 
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+@never_cache
 
-# See the License for the specific language governing permissions and
+def remote_user_auth_view(request):
 
-# limitations under the License.
+    "Dummy view for remote user tests"
 
+    t = Template("Username is {{ user }}.")
 
+    c = RequestContext(request, {})
 
-"""Contains constants from the specification."""
+    return HttpResponse(t.render(c))
 
 
 
+def auth_processor_no_attr_access(request):
 
+    r1 = render_to_response('context_processors/auth_attrs_no_access.html',
 
-class Membership(object):
+        RequestContext(request, {}, processors=[context_processors.auth]))
 
+    # *After* rendering, we check whether the session was accessed
 
+    return render_to_response('context_processors/auth_attrs_test_access.html',
 
-    """Represents the membership states of a user in a room."""
+        {'session_accessed':request.session.accessed})
 
-    INVITE = u"invite"
 
-    JOIN = u"join"
 
-    KNOCK = u"knock"
+def auth_processor_attr_access(request):
 
-    LEAVE = u"leave"
+    r1 = render_to_response('context_processors/auth_attrs_access.html',
 
-    BAN = u"ban"
+        RequestContext(request, {}, processors=[context_processors.auth]))
 
-    LIST = (INVITE, JOIN, KNOCK, LEAVE, BAN)
+    return render_to_response('context_processors/auth_attrs_test_access.html',
 
+        {'session_accessed':request.session.accessed})
 
 
 
+def auth_processor_user(request):
 
-class PresenceState(object):
+    return render_to_response('context_processors/auth_attrs_user.html',
 
-    """Represents the presence state of a user."""
+        RequestContext(request, {}, processors=[context_processors.auth]))
 
-    OFFLINE = u"offline"
 
-    UNAVAILABLE = u"unavailable"
 
-    ONLINE = u"online"
+def auth_processor_perms(request):
 
+    return render_to_response('context_processors/auth_attrs_perms.html',
 
+        RequestContext(request, {}, processors=[context_processors.auth]))
 
 
 
-class JoinRules(object):
+def auth_processor_messages(request):
 
-    PUBLIC = u"public"
+    info(request, "Message 1")
 
-    KNOCK = u"knock"
+    return render_to_response('context_processors/auth_attrs_messages.html',
 
-    INVITE = u"invite"
+         RequestContext(request, {}, processors=[context_processors.auth]))
 
-    PRIVATE = u"private"
 
 
+def userpage(request):
 
+    pass
 
 
-class LoginType(object):
 
-    PASSWORD = u"m.login.password"
+# special urls for auth test cases
 
-    EMAIL_IDENTITY = u"m.login.email.identity"
+urlpatterns = urlpatterns + patterns('',
 
-    MSISDN = u"m.login.msisdn"
+    (r'^logout/custom_query/$', 'django.contrib.auth.views.logout', dict(redirect_field_name='follow')),
 
-    RECAPTCHA = u"m.login.recaptcha"
+    (r'^logout/next_page/$', 'django.contrib.auth.views.logout', dict(next_page='/somewhere/')),
 
-    DUMMY = u"m.login.dummy"
+    (r'^remote_user/$', remote_user_auth_view),
 
+    (r'^password_reset_from_email/$', 'django.contrib.auth.views.password_reset', dict(from_email='staffmember@example.com')),
 
+    (r'^login_required/$', login_required(password_reset)),
 
-    # Only for C/S API v1
+    (r'^login_required_login_url/$', login_required(password_reset, login_url='/somewhere/')),
 
-    APPLICATION_SERVICE = u"m.login.application_service"
 
-    SHARED_SECRET = u"org.matrix.login.shared_secret"
 
+    (r'^auth_processor_no_attr_access/$', auth_processor_no_attr_access),
 
+    (r'^auth_processor_attr_access/$', auth_processor_attr_access),
 
+    (r'^auth_processor_user/$', auth_processor_user),
 
+    (r'^auth_processor_perms/$', auth_processor_perms),
 
-class EventTypes(object):
+    (r'^auth_processor_messages/$', auth_processor_messages),
 
-    Member = "m.room.member"
+    url(r'^userpage/(.+)/$', userpage, name="userpage"),
 
-    Create = "m.room.create"
-
-    JoinRules = "m.room.join_rules"
-
-    PowerLevels = "m.room.power_levels"
-
-    Aliases = "m.room.aliases"
-
-    Redaction = "m.room.redaction"
-
-    ThirdPartyInvite = "m.room.third_party_invite"
-
-
-
-    RoomHistoryVisibility = "m.room.history_visibility"
-
-    CanonicalAlias = "m.room.canonical_alias"
-
-    RoomAvatar = "m.room.avatar"
-
-    GuestAccess = "m.room.guest_access"
-
-
-
-    # These are used for validation
-
-    Message = "m.room.message"
-
-    Topic = "m.room.topic"
-
-    Name = "m.room.name"
-
-
-
-
-
-class RejectedReason(object):
-
-    AUTH_ERROR = "auth_error"
-
-    REPLACED = "replaced"
-
-    NOT_ANCESTOR = "not_ancestor"
-
-
-
-
-
-class RoomCreationPreset(object):
-
-    PRIVATE_CHAT = "private_chat"
-
-    PUBLIC_CHAT = "public_chat"
-
-    TRUSTED_PRIVATE_CHAT = "trusted_private_chat"
-
-
-
-
-
-class ThirdPartyEntityKind(object):
-
-    USER = "user"
-
-    LOCATION = "location"
+)

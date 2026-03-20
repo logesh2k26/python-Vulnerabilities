@@ -2,1374 +2,1864 @@
 # Safety: safe
 # Category: safe
 
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
+# encoding: utf-8
+
+from __future__ import unicode_literals
 
 
 
-# Copyright 2012 OpenStack LLC
+from datetime import datetime, timedelta
 
-#
-
-# Licensed under the Apache License, Version 2.0 (the "License"); you may
-
-# not use this file except in compliance with the License. You may obtain
-
-# a copy of the License at
-
-#
-
-#      http://www.apache.org/licenses/LICENSE-2.0
-
-#
-
-# Unless required by applicable law or agreed to in writing, software
-
-# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
-
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-
-# License for the specific language governing permissions and limitations
-
-# under the License.
+from unittest import TestCase
 
 
 
-"""Main entry point into the Identity service."""
+from django import forms
+
+from django.conf import settings
+
+from django.contrib import admin
+
+from django.contrib.admin import widgets
+
+from django.contrib.admin.tests import AdminSeleniumWebDriverTestCase
+
+from django.core.files.storage import default_storage
+
+from django.core.files.uploadedfile import SimpleUploadedFile
+
+from django.db.models import CharField, DateField
+
+from django.test import TestCase as DjangoTestCase
+
+from django.test.utils import override_settings
+
+from django.utils import six
+
+from django.utils import translation
+
+from django.utils.html import conditional_escape
 
 
 
-import urllib
+from . import models
 
-import urlparse
-
-import uuid
-
-
-
-from keystone.common import logging
-
-from keystone.common import manager
-
-from keystone.common import wsgi
-
-from keystone import config
-
-from keystone import exception
-
-from keystone import policy
-
-from keystone import token
+from .widgetadmin import site as widget_admin_site
 
 
 
 
 
-CONF = config.CONF
+admin_static_prefix = lambda: {
+
+    'ADMIN_STATIC_PREFIX': "%sadmin/" % settings.STATIC_URL,
+
+}
 
 
 
-LOG = logging.getLogger(__name__)
+class AdminFormfieldForDBFieldTests(TestCase):
 
+    """
 
-
-
-
-class Manager(manager.Manager):
-
-    """Default pivot point for the Identity backend.
-
-
-
-    See :mod:`keystone.common.manager.Manager` for more details on how this
-
-    dynamically calls the backend.
-
-
+    Tests for correct behavior of ModelAdmin.formfield_for_dbfield
 
     """
 
 
 
-    def __init__(self):
-
-        super(Manager, self).__init__(CONF.identity.driver)
-
-
-
-
-
-class Driver(object):
-
-    """Interface description for an Identity driver."""
-
-
-
-    def authenticate(self, user_id=None, tenant_id=None, password=None):
-
-        """Authenticate a given user, tenant and password.
-
-
-
-        :returns: (user_ref, tenant_ref, metadata_ref)
-
-        :raises: AssertionError
-
-
+    def assertFormfield(self, model, fieldname, widgetclass, **admin_overrides):
 
         """
 
-        raise exception.NotImplemented()
+        Helper to call formfield_for_dbfield for a given model and field name
 
-
-
-    def get_tenant(self, tenant_id):
-
-        """Get a tenant by id.
-
-
-
-        :returns: tenant_ref
-
-        :raises: keystone.exception.TenantNotFound
-
-
+        and verify that the returned formfield is appropriate.
 
         """
 
-        raise exception.NotImplemented()
+        # Override any settings on the model admin
+
+        class MyModelAdmin(admin.ModelAdmin):
+
+            pass
+
+        for k in admin_overrides:
+
+            setattr(MyModelAdmin, k, admin_overrides[k])
 
 
 
-    def get_tenant_by_name(self, tenant_name):
+        # Construct the admin, and ask it for a formfield
 
-        """Get a tenant by name.
+        ma = MyModelAdmin(model, admin.site)
 
-
-
-        :returns: tenant_ref
-
-        :raises: keystone.exception.TenantNotFound
+        ff = ma.formfield_for_dbfield(model._meta.get_field(fieldname), request=None)
 
 
+
+        # "unwrap" the widget wrapper, if needed
+
+        if isinstance(ff.widget, widgets.RelatedFieldWidgetWrapper):
+
+            widget = ff.widget.widget
+
+        else:
+
+            widget = ff.widget
+
+
+
+        # Check that we got a field of the right type
+
+        self.assertTrue(
+
+            isinstance(widget, widgetclass),
+
+            "Wrong widget for %s.%s: expected %s, got %s" % \
+
+                (model.__class__.__name__, fieldname, widgetclass, type(widget))
+
+        )
+
+
+
+        # Return the formfield so that other tests can continue
+
+        return ff
+
+
+
+    def testDateField(self):
+
+        self.assertFormfield(models.Event, 'start_date', widgets.AdminDateWidget)
+
+
+
+    def testDateTimeField(self):
+
+        self.assertFormfield(models.Member, 'birthdate', widgets.AdminSplitDateTime)
+
+
+
+    def testTimeField(self):
+
+        self.assertFormfield(models.Event, 'start_time', widgets.AdminTimeWidget)
+
+
+
+    def testTextField(self):
+
+        self.assertFormfield(models.Event, 'description', widgets.AdminTextareaWidget)
+
+
+
+    def testURLField(self):
+
+        self.assertFormfield(models.Event, 'link', widgets.AdminURLFieldWidget)
+
+
+
+    def testIntegerField(self):
+
+        self.assertFormfield(models.Event, 'min_age', widgets.AdminIntegerFieldWidget)
+
+
+
+    def testCharField(self):
+
+        self.assertFormfield(models.Member, 'name', widgets.AdminTextInputWidget)
+
+
+
+    def testEmailField(self):
+
+        self.assertFormfield(models.Member, 'email', widgets.AdminEmailInputWidget)
+
+
+
+    def testFileField(self):
+
+        self.assertFormfield(models.Album, 'cover_art', widgets.AdminFileWidget)
+
+
+
+    def testForeignKey(self):
+
+        self.assertFormfield(models.Event, 'main_band', forms.Select)
+
+
+
+    def testRawIDForeignKey(self):
+
+        self.assertFormfield(models.Event, 'main_band', widgets.ForeignKeyRawIdWidget,
+
+                             raw_id_fields=['main_band'])
+
+
+
+    def testRadioFieldsForeignKey(self):
+
+        ff = self.assertFormfield(models.Event, 'main_band', widgets.AdminRadioSelect,
+
+                                  radio_fields={'main_band':admin.VERTICAL})
+
+        self.assertEqual(ff.empty_label, None)
+
+
+
+    def testManyToMany(self):
+
+        self.assertFormfield(models.Band, 'members', forms.SelectMultiple)
+
+
+
+    def testRawIDManyTOMany(self):
+
+        self.assertFormfield(models.Band, 'members', widgets.ManyToManyRawIdWidget,
+
+                             raw_id_fields=['members'])
+
+
+
+    def testFilteredManyToMany(self):
+
+        self.assertFormfield(models.Band, 'members', widgets.FilteredSelectMultiple,
+
+                             filter_vertical=['members'])
+
+
+
+    def testFormfieldOverrides(self):
+
+        self.assertFormfield(models.Event, 'start_date', forms.TextInput,
+
+                             formfield_overrides={DateField: {'widget': forms.TextInput}})
+
+
+
+    def testFormfieldOverridesWidgetInstances(self):
 
         """
 
-        raise exception.NotImplemented()
+        Test that widget instances in formfield_overrides are not shared between
 
-
-
-    def get_user(self, user_id):
-
-        """Get a user by id.
-
-
-
-        :returns: user_ref
-
-        :raises: keystone.exception.UserNotFound
-
-
+        different fields. (#19423)
 
         """
 
-        raise exception.NotImplemented()
+        class BandAdmin(admin.ModelAdmin):
+
+            formfield_overrides = {
+
+                CharField: {'widget': forms.TextInput(attrs={'size':'10'})}
+
+            }
+
+        ma = BandAdmin(models.Band, admin.site)
+
+        f1 = ma.formfield_for_dbfield(models.Band._meta.get_field('name'), request=None)
+
+        f2 = ma.formfield_for_dbfield(models.Band._meta.get_field('style'), request=None)
+
+        self.assertNotEqual(f1.widget, f2.widget)
+
+        self.assertEqual(f1.widget.attrs['maxlength'], '100')
+
+        self.assertEqual(f2.widget.attrs['maxlength'], '20')
+
+        self.assertEqual(f2.widget.attrs['size'], '10')
 
 
 
-    def get_user_by_name(self, user_name):
+    def testFieldWithChoices(self):
 
-        """Get a user by name.
-
-
-
-        :returns: user_ref
-
-        :raises: keystone.exception.UserNotFound
+        self.assertFormfield(models.Member, 'gender', forms.Select)
 
 
 
-        """
+    def testChoicesWithRadioFields(self):
 
-        raise exception.NotImplemented()
+        self.assertFormfield(models.Member, 'gender', widgets.AdminRadioSelect,
 
-
-
-    def get_role(self, role_id):
-
-        """Get a role by id.
+                             radio_fields={'gender':admin.VERTICAL})
 
 
 
-        :returns: role_ref
+    def testInheritance(self):
 
-        :raises: keystone.exception.RoleNotFound
-
-
-
-        """
-
-        raise exception.NotImplemented()
+        self.assertFormfield(models.Album, 'backside_art', widgets.AdminFileWidget)
 
 
 
-    def list_users(self):
+    def test_m2m_widgets(self):
 
-        """List all users in the system.
+        """m2m fields help text as it applies to admin app (#9321)."""
 
+        class AdvisorAdmin(admin.ModelAdmin):
 
-
-        NOTE(termie): I'd prefer if this listed only the users for a given
-
-                      tenant.
+            filter_vertical=['companies']
 
 
 
-        :returns: a list of user_refs or an empty list
+        self.assertFormfield(models.Advisor, 'companies', widgets.FilteredSelectMultiple,
+
+                             filter_vertical=['companies'])
+
+        ma = AdvisorAdmin(models.Advisor, admin.site)
+
+        f = ma.formfield_for_dbfield(models.Advisor._meta.get_field('companies'), request=None)
+
+        self.assertEqual(six.text_type(f.help_text), ' Hold down "Control", or "Command" on a Mac, to select more than one.')
 
 
 
-        """
-
-        raise exception.NotImplemented()
 
 
+@override_settings(PASSWORD_HASHERS=('django.contrib.auth.hashers.SHA1PasswordHasher',))
 
-    def list_roles(self):
+class AdminFormfieldForDBFieldWithRequestTests(DjangoTestCase):
 
-        """List all roles in the system.
+    fixtures = ["admin-widgets-users.xml"]
 
 
 
-        :returns: a list of role_refs or an empty list.
-
-
-
-        """
-
-        raise exception.NotImplemented()
-
-
-
-    # NOTE(termie): seven calls below should probably be exposed by the api
-
-    #               more clearly when the api redesign happens
-
-    def add_user_to_tenant(self, tenant_id, user_id):
-
-        """Add user to a tenant without an explicit role relationship.
-
-
-
-        :raises: keystone.exception.TenantNotFound,
-
-                 keystone.exception.UserNotFound
-
-
+    def testFilterChoicesByRequestUser(self):
 
         """
 
-        raise exception.NotImplemented()
-
-
-
-    def remove_user_from_tenant(self, tenant_id, user_id):
-
-        """Remove user from a tenant without an explicit role relationship.
-
-
-
-        :raises: keystone.exception.TenantNotFound,
-
-                 keystone.exception.UserNotFound
-
-
+        Ensure the user can only see their own cars in the foreign key dropdown.
 
         """
 
-        raise exception.NotImplemented()
+        self.client.login(username="super", password="secret")
 
+        response = self.client.get("/widget_admin/admin_widgets/cartire/add/")
 
+        self.assertNotContains(response, "BMW M3")
 
-    def get_all_tenants(self):
+        self.assertContains(response, "Volkswagon Passat")
 
-        """FIXME(dolph): Lists all tenants in the system? I'm not sure how this
 
-                         is different from get_tenants, why get_tenants isn't
 
-                         documented as part of the driver, or why it's called
 
-                         get_tenants instead of list_tenants (i.e. list_roles
 
-                         and list_users)...
+@override_settings(PASSWORD_HASHERS=('django.contrib.auth.hashers.SHA1PasswordHasher',))
 
+class AdminForeignKeyWidgetChangeList(DjangoTestCase):
 
+    fixtures = ["admin-widgets-users.xml"]
 
-        :returns: a list of ... FIXME(dolph): tenant_refs or tenant_id's?
+    admin_root = '/widget_admin'
 
 
 
-        """
+    def setUp(self):
 
-        raise exception.NotImplemented()
+        self.client.login(username="super", password="secret")
 
 
 
-    def get_tenant_users(self, tenant_id):
+    def tearDown(self):
 
-        """FIXME(dolph): Lists all users with a relationship to the specified
+        self.client.logout()
 
-                         tenant?
 
 
+    def test_changelist_foreignkey(self):
 
-        :returns: a list of ... FIXME(dolph): user_refs or user_id's?
+        response = self.client.get('%s/admin_widgets/car/' % self.admin_root)
 
-        :raises: keystone.exception.UserNotFound
+        self.assertContains(response, '%s/auth/user/add/' % self.admin_root)
 
 
 
-        """
 
-        raise exception.NotImplemented()
 
+@override_settings(PASSWORD_HASHERS=('django.contrib.auth.hashers.SHA1PasswordHasher',))
 
+class AdminForeignKeyRawIdWidget(DjangoTestCase):
 
-    def get_tenants_for_user(self, user_id):
+    fixtures = ["admin-widgets-users.xml"]
 
-        """Get the tenants associated with a given user.
+    admin_root = '/widget_admin'
 
 
 
-        :returns: a list of tenant_id's.
+    def setUp(self):
 
-        :raises: keystone.exception.UserNotFound
+        self.client.login(username="super", password="secret")
 
 
 
-        """
+    def tearDown(self):
 
-        raise exception.NotImplemented()
+        self.client.logout()
 
 
 
-    def get_roles_for_user_and_tenant(self, user_id, tenant_id):
+    def test_nonexistent_target_id(self):
 
-        """Get the roles associated with a user within given tenant.
+        band = models.Band.objects.create(name='Bogey Blues')
 
+        pk = band.pk
 
+        band.delete()
 
-        :returns: a list of role ids.
+        post_data = {
 
-        :raises: keystone.exception.UserNotFound,
-
-                 keystone.exception.TenantNotFound
-
-
-
-        """
-
-        raise exception.NotImplemented()
-
-
-
-    def add_role_to_user_and_tenant(self, user_id, tenant_id, role_id):
-
-        """Add a role to a user within given tenant.
-
-
-
-        :raises: keystone.exception.UserNotFound,
-
-                 keystone.exception.TenantNotFound,
-
-                 keystone.exception.RoleNotFound
-
-        """
-
-        raise exception.NotImplemented()
-
-
-
-    def remove_role_from_user_and_tenant(self, user_id, tenant_id, role_id):
-
-        """Remove a role from a user within given tenant.
-
-
-
-        :raises: keystone.exception.UserNotFound,
-
-                 keystone.exception.TenantNotFound,
-
-                 keystone.exception.RoleNotFound
-
-
-
-        """
-
-        raise exception.NotImplemented()
-
-
-
-    # user crud
-
-    def create_user(self, user_id, user):
-
-        """Creates a new user.
-
-
-
-        :raises: keystone.exception.Conflict
-
-
-
-        """
-
-        raise exception.NotImplemented()
-
-
-
-    def update_user(self, user_id, user):
-
-        """Updates an existing user.
-
-
-
-        :raises: keystone.exception.UserNotFound, keystone.exception.Conflict
-
-
-
-        """
-
-        raise exception.NotImplemented()
-
-
-
-    def delete_user(self, user_id):
-
-        """Deletes an existing user.
-
-
-
-        :raises: keystone.exception.UserNotFound
-
-
-
-        """
-
-        raise exception.NotImplemented()
-
-
-
-    # tenant crud
-
-    def create_tenant(self, tenant_id, tenant):
-
-        """Creates a new tenant.
-
-
-
-        :raises: keystone.exception.Conflict
-
-
-
-        """
-
-        raise exception.NotImplemented()
-
-
-
-    def update_tenant(self, tenant_id, tenant):
-
-        """Updates an existing tenant.
-
-
-
-        :raises: keystone.exception.TenantNotFound, keystone.exception.Conflict
-
-
-
-        """
-
-        raise exception.NotImplemented()
-
-
-
-    def delete_tenant(self, tenant_id):
-
-        """Deletes an existing tenant.
-
-
-
-        :raises: keystone.exception.TenantNotFound
-
-
-
-        """
-
-        raise exception.NotImplemented()
-
-
-
-    # metadata crud
-
-    def get_metadata(self, user_id, tenant_id):
-
-        raise exception.NotImplemented()
-
-
-
-    def create_metadata(self, user_id, tenant_id, metadata):
-
-        raise exception.NotImplemented()
-
-
-
-    def update_metadata(self, user_id, tenant_id, metadata):
-
-        raise exception.NotImplemented()
-
-
-
-    def delete_metadata(self, user_id, tenant_id):
-
-        raise exception.NotImplemented()
-
-
-
-    # role crud
-
-    def create_role(self, role_id, role):
-
-        """Creates a new role.
-
-
-
-        :raises: keystone.exception.Conflict
-
-
-
-        """
-
-        raise exception.NotImplemented()
-
-
-
-    def update_role(self, role_id, role):
-
-        """Updates an existing role.
-
-
-
-        :raises: keystone.exception.RoleNotFound, keystone.exception.Conflict
-
-
-
-        """
-
-        raise exception.NotImplemented()
-
-
-
-    def delete_role(self, role_id):
-
-        """Deletes an existing role.
-
-
-
-        :raises: keystone.exception.RoleNotFound
-
-
-
-        """
-
-        raise exception.NotImplemented()
-
-
-
-
-
-class PublicRouter(wsgi.ComposableRouter):
-
-    def add_routes(self, mapper):
-
-        tenant_controller = TenantController()
-
-        mapper.connect('/tenants',
-
-                       controller=tenant_controller,
-
-                       action='get_tenants_for_token',
-
-                       conditions=dict(method=['GET']))
-
-
-
-
-
-class AdminRouter(wsgi.ComposableRouter):
-
-    def add_routes(self, mapper):
-
-        # Tenant Operations
-
-        tenant_controller = TenantController()
-
-        mapper.connect('/tenants',
-
-                       controller=tenant_controller,
-
-                       action='get_all_tenants',
-
-                       conditions=dict(method=['GET']))
-
-        mapper.connect('/tenants/{tenant_id}',
-
-                       controller=tenant_controller,
-
-                       action='get_tenant',
-
-                       conditions=dict(method=['GET']))
-
-
-
-        # User Operations
-
-        user_controller = UserController()
-
-        mapper.connect('/users/{user_id}',
-
-                       controller=user_controller,
-
-                       action='get_user',
-
-                       conditions=dict(method=['GET']))
-
-
-
-        # Role Operations
-
-        roles_controller = RoleController()
-
-        mapper.connect('/tenants/{tenant_id}/users/{user_id}/roles',
-
-                       controller=roles_controller,
-
-                       action='get_user_roles',
-
-                       conditions=dict(method=['GET']))
-
-        mapper.connect('/users/{user_id}/roles',
-
-                       controller=roles_controller,
-
-                       action='get_user_roles',
-
-                       conditions=dict(method=['GET']))
-
-
-
-
-
-class TenantController(wsgi.Application):
-
-    def __init__(self):
-
-        self.identity_api = Manager()
-
-        self.policy_api = policy.Manager()
-
-        self.token_api = token.Manager()
-
-        super(TenantController, self).__init__()
-
-
-
-    def get_all_tenants(self, context, **kw):
-
-        """Gets a list of all tenants for an admin user."""
-
-        self.assert_admin(context)
-
-        tenant_refs = self.identity_api.get_tenants(context)
-
-        params = {
-
-            'limit': context['query_string'].get('limit'),
-
-            'marker': context['query_string'].get('marker'),
+            "main_band": '%s' % pk,
 
         }
 
-        return self._format_tenant_list(tenant_refs, **params)
+        # Try posting with a non-existent pk in a raw id field: this
+
+        # should result in an error message, not a server exception.
+
+        response = self.client.post('%s/admin_widgets/event/add/' % self.admin_root,
+
+            post_data)
+
+        self.assertContains(response,
+
+            'Select a valid choice. That choice is not one of the available choices.')
 
 
 
-    def get_tenants_for_token(self, context, **kw):
-
-        """Get valid tenants for token based on token used to authenticate.
+    def test_invalid_target_id(self):
 
 
 
-        Pulls the token from the context, validates it and gets the valid
+        for test_str in ('Iñtërnâtiônàlizætiøn', "1234'", -1234):
 
-        tenants for the user in the token.
+            # This should result in an error message, not a server exception.
+
+            response = self.client.post('%s/admin_widgets/event/add/' % self.admin_root,
+
+                {"main_band": test_str})
 
 
 
-        Doesn't care about token scopedness.
+            self.assertContains(response,
+
+                'Select a valid choice. That choice is not one of the available choices.')
 
 
+
+    def test_url_params_from_lookup_dict_any_iterable(self):
+
+        lookup1 = widgets.url_params_from_lookup_dict({'color__in': ('red', 'blue')})
+
+        lookup2 = widgets.url_params_from_lookup_dict({'color__in': ['red', 'blue']})
+
+        self.assertEqual(lookup1, {'color__in': 'red,blue'})
+
+        self.assertEqual(lookup1, lookup2)
+
+
+
+    def test_url_params_from_lookup_dict_callable(self):
+
+        def my_callable():
+
+            return 'works'
+
+        lookup1 = widgets.url_params_from_lookup_dict({'myfield': my_callable})
+
+        lookup2 = widgets.url_params_from_lookup_dict({'myfield': my_callable()})
+
+        self.assertEqual(lookup1, lookup2)
+
+
+
+
+
+class FilteredSelectMultipleWidgetTest(DjangoTestCase):
+
+    def test_render(self):
+
+        w = widgets.FilteredSelectMultiple('test', False)
+
+        self.assertHTMLEqual(
+
+            conditional_escape(w.render('test', 'test')),
+
+            '<select multiple="multiple" name="test" class="selectfilter">\n</select><script type="text/javascript">addEvent(window, "load", function(e) {SelectFilter.init("id_test", "test", 0, "%(ADMIN_STATIC_PREFIX)s"); });</script>\n' % admin_static_prefix()
+
+        )
+
+
+
+    def test_stacked_render(self):
+
+        w = widgets.FilteredSelectMultiple('test', True)
+
+        self.assertHTMLEqual(
+
+            conditional_escape(w.render('test', 'test')),
+
+            '<select multiple="multiple" name="test" class="selectfilterstacked">\n</select><script type="text/javascript">addEvent(window, "load", function(e) {SelectFilter.init("id_test", "test", 1, "%(ADMIN_STATIC_PREFIX)s"); });</script>\n' % admin_static_prefix()
+
+        )
+
+
+
+class AdminDateWidgetTest(DjangoTestCase):
+
+    def test_attrs(self):
 
         """
 
-        try:
+        Ensure that user-supplied attrs are used.
 
-            token_ref = self.token_api.get_token(context=context,
-
-                                                 token_id=context['token_id'])
-
-        except exception.NotFound:
-
-            raise exception.Unauthorized()
-
-
-
-        user_ref = token_ref['user']
-
-        tenant_ids = self.identity_api.get_tenants_for_user(
-
-            context, user_ref['id'])
-
-        tenant_refs = []
-
-        for tenant_id in tenant_ids:
-
-            tenant_refs.append(self.identity_api.get_tenant(
-
-                context=context,
-
-                tenant_id=tenant_id))
-
-        params = {
-
-            'limit': context['query_string'].get('limit'),
-
-            'marker': context['query_string'].get('marker'),
-
-        }
-
-        return self._format_tenant_list(tenant_refs, **params)
-
-
-
-    def get_tenant(self, context, tenant_id):
-
-        # TODO(termie): this stuff should probably be moved to middleware
-
-        self.assert_admin(context)
-
-        return {'tenant': self.identity_api.get_tenant(context, tenant_id)}
-
-
-
-    # CRUD Extension
-
-    def create_tenant(self, context, tenant):
-
-        tenant_ref = self._normalize_dict(tenant)
-
-
-
-        if not 'name' in tenant_ref or not tenant_ref['name']:
-
-            msg = 'Name field is required and cannot be empty'
-
-            raise exception.ValidationError(message=msg)
-
-
-
-        self.assert_admin(context)
-
-        tenant_ref['id'] = tenant_ref.get('id', uuid.uuid4().hex)
-
-        tenant = self.identity_api.create_tenant(
-
-            context, tenant_ref['id'], tenant_ref)
-
-        return {'tenant': tenant}
-
-
-
-    def update_tenant(self, context, tenant_id, tenant):
-
-        self.assert_admin(context)
-
-        tenant_ref = self.identity_api.update_tenant(
-
-            context, tenant_id, tenant)
-
-        return {'tenant': tenant_ref}
-
-
-
-    def delete_tenant(self, context, tenant_id):
-
-        self.assert_admin(context)
-
-        self.identity_api.delete_tenant(context, tenant_id)
-
-
-
-    def get_tenant_users(self, context, tenant_id, **kw):
-
-        self.assert_admin(context)
-
-        user_refs = self.identity_api.get_tenant_users(context, tenant_id)
-
-        return {'users': user_refs}
-
-
-
-    def _format_tenant_list(self, tenant_refs, **kwargs):
-
-        marker = kwargs.get('marker')
-
-        first_index = 0
-
-        if marker is not None:
-
-            for (marker_index, tenant) in enumerate(tenant_refs):
-
-                if tenant['id'] == marker:
-
-                    # we start pagination after the marker
-
-                    first_index = marker_index + 1
-
-                    break
-
-            else:
-
-                msg = 'Marker could not be found'
-
-                raise exception.ValidationError(message=msg)
-
-
-
-        limit = kwargs.get('limit')
-
-        last_index = None
-
-        if limit is not None:
-
-            try:
-
-                limit = int(limit)
-
-                if limit < 0:
-
-                    raise AssertionError()
-
-            except (ValueError, AssertionError):
-
-                msg = 'Invalid limit value'
-
-                raise exception.ValidationError(message=msg)
-
-            last_index = first_index + limit
-
-
-
-        tenant_refs = tenant_refs[first_index:last_index]
-
-
-
-        for x in tenant_refs:
-
-            if 'enabled' not in x:
-
-                x['enabled'] = True
-
-        o = {'tenants': tenant_refs,
-
-             'tenants_links': []}
-
-        return o
-
-
-
-
-
-class UserController(wsgi.Application):
-
-    def __init__(self):
-
-        self.identity_api = Manager()
-
-        self.policy_api = policy.Manager()
-
-        self.token_api = token.Manager()
-
-        super(UserController, self).__init__()
-
-
-
-    def get_user(self, context, user_id):
-
-        self.assert_admin(context)
-
-        return {'user': self.identity_api.get_user(context, user_id)}
-
-
-
-    def get_users(self, context):
-
-        # NOTE(termie): i can't imagine that this really wants all the data
-
-        #               about every single user in the system...
-
-        self.assert_admin(context)
-
-        return {'users': self.identity_api.list_users(context)}
-
-
-
-    # CRUD extension
-
-    def create_user(self, context, user):
-
-        user = self._normalize_dict(user)
-
-        self.assert_admin(context)
-
-
-
-        if not 'name' in user or not user['name']:
-
-            msg = 'Name field is required and cannot be empty'
-
-            raise exception.ValidationError(message=msg)
-
-
-
-        tenant_id = user.get('tenantId', None)
-
-        if (tenant_id is not None
-
-                and self.identity_api.get_tenant(context, tenant_id) is None):
-
-            raise exception.TenantNotFound(tenant_id=tenant_id)
-
-        user_id = uuid.uuid4().hex
-
-        user_ref = user.copy()
-
-        user_ref['id'] = user_id
-
-        new_user_ref = self.identity_api.create_user(
-
-            context, user_id, user_ref)
-
-        if tenant_id:
-
-            self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
-
-        return {'user': new_user_ref}
-
-
-
-    def update_user(self, context, user_id, user):
-
-        # NOTE(termie): this is really more of a patch than a put
-
-        self.assert_admin(context)
-
-        user_ref = self.identity_api.update_user(context, user_id, user)
-
-
-
-        # If the password was changed or the user was disabled we clear tokens
-
-        if user.get('password') or not user.get('enabled', True):
-
-            try:
-
-                for token_id in self.token_api.list_tokens(context, user_id):
-
-                    self.token_api.delete_token(context, token_id)
-
-            except exception.NotImplemented:
-
-                # The users status has been changed but tokens remain valid for
-
-                # backends that can't list tokens for users
-
-                LOG.warning('User %s status has changed, but existing tokens '
-
-                            'remain valid' % user_id)
-
-        return {'user': user_ref}
-
-
-
-    def delete_user(self, context, user_id):
-
-        self.assert_admin(context)
-
-        self.identity_api.delete_user(context, user_id)
-
-
-
-    def set_user_enabled(self, context, user_id, user):
-
-        return self.update_user(context, user_id, user)
-
-
-
-    def set_user_password(self, context, user_id, user):
-
-        return self.update_user(context, user_id, user)
-
-
-
-    def update_user_tenant(self, context, user_id, user):
-
-        """Update the default tenant."""
-
-        self.assert_admin(context)
-
-        # ensure that we're a member of that tenant
-
-        tenant_id = user.get('tenantId')
-
-        self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
-
-        return self.update_user(context, user_id, user)
-
-
-
-
-
-class RoleController(wsgi.Application):
-
-    def __init__(self):
-
-        self.identity_api = Manager()
-
-        self.token_api = token.Manager()
-
-        self.policy_api = policy.Manager()
-
-        super(RoleController, self).__init__()
-
-
-
-    # COMPAT(essex-3)
-
-    def get_user_roles(self, context, user_id, tenant_id=None):
-
-        """Get the roles for a user and tenant pair.
-
-
-
-        Since we're trying to ignore the idea of user-only roles we're
-
-        not implementing them in hopes that the idea will die off.
-
-
+        Refs #12073.
 
         """
 
-        self.assert_admin(context)
+        w = widgets.AdminDateWidget()
 
-        if tenant_id is None:
+        self.assertHTMLEqual(
 
-            raise exception.NotImplemented(message='User roles not supported: '
+            conditional_escape(w.render('test', datetime(2007, 12, 1, 9, 30))),
 
-                                                   'tenant ID required')
+            '<input value="2007-12-01" type="text" class="vDateField" name="test" size="10" />',
 
+        )
 
+        # pass attrs to widget
 
-        roles = self.identity_api.get_roles_for_user_and_tenant(
+        w = widgets.AdminDateWidget(attrs={'size': 20, 'class': 'myDateField'})
 
-            context, user_id, tenant_id)
+        self.assertHTMLEqual(
 
-        return {'roles': [self.identity_api.get_role(context, x)
+            conditional_escape(w.render('test', datetime(2007, 12, 1, 9, 30))),
 
-                          for x in roles]}
+            '<input value="2007-12-01" type="text" class="myDateField" name="test" size="20" />',
 
-
-
-    # CRUD extension
-
-    def get_role(self, context, role_id):
-
-        self.assert_admin(context)
-
-        return {'role': self.identity_api.get_role(context, role_id)}
+        )
 
 
 
-    def create_role(self, context, role):
+class AdminTimeWidgetTest(DjangoTestCase):
 
-        role = self._normalize_dict(role)
-
-        self.assert_admin(context)
-
-
-
-        if not 'name' in role or not role['name']:
-
-            msg = 'Name field is required and cannot be empty'
-
-            raise exception.ValidationError(message=msg)
-
-
-
-        role_id = uuid.uuid4().hex
-
-        role['id'] = role_id
-
-        role_ref = self.identity_api.create_role(context, role_id, role)
-
-        return {'role': role_ref}
-
-
-
-    def delete_role(self, context, role_id):
-
-        self.assert_admin(context)
-
-        self.identity_api.delete_role(context, role_id)
-
-
-
-    def get_roles(self, context):
-
-        self.assert_admin(context)
-
-        return {'roles': self.identity_api.list_roles(context)}
-
-
-
-    def add_role_to_user(self, context, user_id, role_id, tenant_id=None):
-
-        """Add a role to a user and tenant pair.
-
-
-
-        Since we're trying to ignore the idea of user-only roles we're
-
-        not implementing them in hopes that the idea will die off.
-
-
+    def test_attrs(self):
 
         """
 
-        self.assert_admin(context)
+        Ensure that user-supplied attrs are used.
 
-        if tenant_id is None:
-
-            raise exception.NotImplemented(message='User roles not supported: '
-
-                                                   'tenant_id required')
-
-
-
-        # This still has the weird legacy semantics that adding a role to
-
-        # a user also adds them to a tenant
-
-        self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
-
-        self.identity_api.add_role_to_user_and_tenant(
-
-            context, user_id, tenant_id, role_id)
-
-        role_ref = self.identity_api.get_role(context, role_id)
-
-        return {'role': role_ref}
-
-
-
-    def remove_role_from_user(self, context, user_id, role_id, tenant_id=None):
-
-        """Remove a role from a user and tenant pair.
-
-
-
-        Since we're trying to ignore the idea of user-only roles we're
-
-        not implementing them in hopes that the idea will die off.
-
-
+        Refs #12073.
 
         """
 
-        self.assert_admin(context)
+        w = widgets.AdminTimeWidget()
 
-        if tenant_id is None:
+        self.assertHTMLEqual(
 
-            raise exception.NotImplemented(message='User roles not supported: '
+            conditional_escape(w.render('test', datetime(2007, 12, 1, 9, 30))),
 
-                                                   'tenant_id required')
+            '<input value="09:30:00" type="text" class="vTimeField" name="test" size="8" />',
 
+        )
 
+        # pass attrs to widget
 
-        # This still has the weird legacy semantics that adding a role to
+        w = widgets.AdminTimeWidget(attrs={'size': 20, 'class': 'myTimeField'})
 
-        # a user also adds them to a tenant, so we must follow up on that
+        self.assertHTMLEqual(
 
-        self.identity_api.remove_role_from_user_and_tenant(
+            conditional_escape(w.render('test', datetime(2007, 12, 1, 9, 30))),
 
-            context, user_id, tenant_id, role_id)
+            '<input value="09:30:00" type="text" class="myTimeField" name="test" size="20" />',
 
-        roles = self.identity_api.get_roles_for_user_and_tenant(
-
-            context, user_id, tenant_id)
-
-        if not roles:
-
-            self.identity_api.remove_user_from_tenant(
-
-                context, tenant_id, user_id)
-
-        return
+        )
 
 
 
-    # COMPAT(diablo): CRUD extension
+class AdminSplitDateTimeWidgetTest(DjangoTestCase):
 
-    def get_role_refs(self, context, user_id):
+    def test_render(self):
 
-        """Ultimate hack to get around having to make role_refs first-class.
+        w = widgets.AdminSplitDateTime()
 
+        self.assertHTMLEqual(
 
+            conditional_escape(w.render('test', datetime(2007, 12, 1, 9, 30))),
 
-        This will basically iterate over the various roles the user has in
+            '<p class="datetime">Date: <input value="2007-12-01" type="text" class="vDateField" name="test_0" size="10" /><br />Time: <input value="09:30:00" type="text" class="vTimeField" name="test_1" size="8" /></p>',
 
-        all tenants the user is a member of and create fake role_refs where
-
-        the id encodes the user-tenant-role information so we can look
-
-        up the appropriate data when we need to delete them.
+        )
 
 
+
+    def test_localization(self):
+
+        w = widgets.AdminSplitDateTime()
+
+
+
+        with self.settings(USE_L10N=True):
+
+            with translation.override('de-at'):
+
+                w.is_localized = True
+
+                self.assertHTMLEqual(
+
+                    conditional_escape(w.render('test', datetime(2007, 12, 1, 9, 30))),
+
+                    '<p class="datetime">Datum: <input value="01.12.2007" type="text" class="vDateField" name="test_0" size="10" /><br />Zeit: <input value="09:30:00" type="text" class="vTimeField" name="test_1" size="8" /></p>',
+
+                )
+
+
+
+
+
+class AdminURLWidgetTest(DjangoTestCase):
+
+    def test_render(self):
+
+        w = widgets.AdminURLFieldWidget()
+
+        self.assertHTMLEqual(
+
+            conditional_escape(w.render('test', '')),
+
+            '<input class="vURLField" name="test" type="url" />'
+
+        )
+
+        self.assertHTMLEqual(
+
+            conditional_escape(w.render('test', 'http://example.com')),
+
+            '<p class="url">Currently:<a href="http://example.com">http://example.com</a><br />Change:<input class="vURLField" name="test" type="url" value="http://example.com" /></p>'
+
+        )
+
+
+
+    def test_render_idn(self):
+
+        w = widgets.AdminURLFieldWidget()
+
+        self.assertHTMLEqual(
+
+            conditional_escape(w.render('test', 'http://example-äüö.com')),
+
+            '<p class="url">Currently: <a href="http://xn--example--7za4pnc.com">http://example-äüö.com</a><br />Change:<input class="vURLField" name="test" type="url" value="http://example-äüö.com" /></p>'
+
+        )
+
+
+
+    def test_render_quoting(self):
+
+        # WARNING: Don't use assertHTMLEqual in that testcase!
+
+        # assertHTMLEqual will get rid of some escapes which are tested here!
+
+        w = widgets.AdminURLFieldWidget()
+
+        self.assertEqual(
+
+            w.render('test', 'http://example.com/<sometag>some text</sometag>'),
+
+            '<p class="url">Currently: <a href="http://example.com/%3Csometag%3Esome%20text%3C/sometag%3E">http://example.com/&lt;sometag&gt;some text&lt;/sometag&gt;</a><br />Change: <input class="vURLField" name="test" type="url" value="http://example.com/&lt;sometag&gt;some text&lt;/sometag&gt;" /></p>'
+
+        )
+
+        self.assertEqual(
+
+            w.render('test', 'http://example-äüö.com/<sometag>some text</sometag>'),
+
+            '<p class="url">Currently: <a href="http://xn--example--7za4pnc.com/%3Csometag%3Esome%20text%3C/sometag%3E">http://example-äüö.com/&lt;sometag&gt;some text&lt;/sometag&gt;</a><br />Change: <input class="vURLField" name="test" type="url" value="http://example-äüö.com/&lt;sometag&gt;some text&lt;/sometag&gt;" /></p>'
+
+        )
+
+        self.assertEqual(
+
+            w.render('test', 'http://www.example.com/%C3%A4"><script>alert("XSS!")</script>"'),
+
+            '<p class="url">Currently: <a href="http://www.example.com/%C3%A4%22%3E%3Cscript%3Ealert(%22XSS!%22)%3C/script%3E%22">http://www.example.com/%C3%A4&quot;&gt;&lt;script&gt;alert(&quot;XSS!&quot;)&lt;/script&gt;&quot;</a><br />Change: <input class="vURLField" name="test" type="url" value="http://www.example.com/%C3%A4&quot;&gt;&lt;script&gt;alert(&quot;XSS!&quot;)&lt;/script&gt;&quot;" /></p>'
+
+        )
+
+
+
+
+
+class AdminFileWidgetTest(DjangoTestCase):
+
+    def test_render(self):
+
+        band = models.Band.objects.create(name='Linkin Park')
+
+        album = band.album_set.create(
+
+            name='Hybrid Theory', cover_art=r'albums\hybrid_theory.jpg'
+
+        )
+
+
+
+        w = widgets.AdminFileWidget()
+
+        self.assertHTMLEqual(
+
+            conditional_escape(w.render('test', album.cover_art)),
+
+            '<p class="file-upload">Currently: <a href="%(STORAGE_URL)salbums/hybrid_theory.jpg">albums\hybrid_theory.jpg</a> <span class="clearable-file-input"><input type="checkbox" name="test-clear" id="test-clear_id" /> <label for="test-clear_id">Clear</label></span><br />Change: <input type="file" name="test" /></p>' % { 'STORAGE_URL': default_storage.url('') },
+
+        )
+
+
+
+        self.assertHTMLEqual(
+
+            conditional_escape(w.render('test', SimpleUploadedFile('test', b'content'))),
+
+            '<input type="file" name="test" />',
+
+        )
+
+
+
+
+
+class ForeignKeyRawIdWidgetTest(DjangoTestCase):
+
+    def test_render(self):
+
+        band = models.Band.objects.create(name='Linkin Park')
+
+        band.album_set.create(
+
+            name='Hybrid Theory', cover_art=r'albums\hybrid_theory.jpg'
+
+        )
+
+        rel = models.Album._meta.get_field('band').rel
+
+
+
+        w = widgets.ForeignKeyRawIdWidget(rel, widget_admin_site)
+
+        self.assertHTMLEqual(
+
+            conditional_escape(w.render('test', band.pk, attrs={})),
+
+            '<input type="text" name="test" value="%(bandpk)s" class="vForeignKeyRawIdAdminField" /><a href="/widget_admin/admin_widgets/band/?t=id" class="related-lookup" id="lookup_id_test" onclick="return showRelatedObjectLookupPopup(this);"> <img src="%(ADMIN_STATIC_PREFIX)simg/selector-search.gif" width="16" height="16" alt="Lookup" /></a>&nbsp;<strong>Linkin Park</strong>' % dict(admin_static_prefix(), bandpk=band.pk)
+
+        )
+
+
+
+    def test_relations_to_non_primary_key(self):
+
+        # Check that ForeignKeyRawIdWidget works with fields which aren't
+
+        # related to the model's primary key.
+
+        apple = models.Inventory.objects.create(barcode=86, name='Apple')
+
+        models.Inventory.objects.create(barcode=22, name='Pear')
+
+        core = models.Inventory.objects.create(
+
+            barcode=87, name='Core', parent=apple
+
+        )
+
+        rel = models.Inventory._meta.get_field('parent').rel
+
+        w = widgets.ForeignKeyRawIdWidget(rel, widget_admin_site)
+
+        self.assertHTMLEqual(
+
+            w.render('test', core.parent_id, attrs={}),
+
+            '<input type="text" name="test" value="86" class="vForeignKeyRawIdAdminField" /><a href="/widget_admin/admin_widgets/inventory/?t=barcode" class="related-lookup" id="lookup_id_test" onclick="return showRelatedObjectLookupPopup(this);"> <img src="%(ADMIN_STATIC_PREFIX)simg/selector-search.gif" width="16" height="16" alt="Lookup" /></a>&nbsp;<strong>Apple</strong>' % admin_static_prefix()
+
+        )
+
+
+
+    def test_fk_related_model_not_in_admin(self):
+
+        # FK to a model not registered with admin site. Raw ID widget should
+
+        # have no magnifying glass link. See #16542
+
+        big_honeycomb = models.Honeycomb.objects.create(location='Old tree')
+
+        big_honeycomb.bee_set.create()
+
+        rel = models.Bee._meta.get_field('honeycomb').rel
+
+
+
+        w = widgets.ForeignKeyRawIdWidget(rel, widget_admin_site)
+
+        self.assertHTMLEqual(
+
+            conditional_escape(w.render('honeycomb_widget', big_honeycomb.pk, attrs={})),
+
+            '<input type="text" name="honeycomb_widget" value="%(hcombpk)s" />&nbsp;<strong>Honeycomb object</strong>' % {'hcombpk': big_honeycomb.pk}
+
+        )
+
+
+
+    def test_fk_to_self_model_not_in_admin(self):
+
+        # FK to self, not registered with admin site. Raw ID widget should have
+
+        # no magnifying glass link. See #16542
+
+        subject1 = models.Individual.objects.create(name='Subject #1')
+
+        models.Individual.objects.create(name='Child', parent=subject1)
+
+        rel = models.Individual._meta.get_field('parent').rel
+
+
+
+        w = widgets.ForeignKeyRawIdWidget(rel, widget_admin_site)
+
+        self.assertHTMLEqual(
+
+            conditional_escape(w.render('individual_widget', subject1.pk, attrs={})),
+
+            '<input type="text" name="individual_widget" value="%(subj1pk)s" />&nbsp;<strong>Individual object</strong>' % {'subj1pk': subject1.pk}
+
+        )
+
+
+
+    def test_proper_manager_for_label_lookup(self):
+
+        # see #9258
+
+        rel = models.Inventory._meta.get_field('parent').rel
+
+        w = widgets.ForeignKeyRawIdWidget(rel, widget_admin_site)
+
+
+
+        hidden = models.Inventory.objects.create(
+
+            barcode=93, name='Hidden', hidden=True
+
+        )
+
+        child_of_hidden = models.Inventory.objects.create(
+
+            barcode=94, name='Child of hidden', parent=hidden
+
+        )
+
+        self.assertHTMLEqual(
+
+            w.render('test', child_of_hidden.parent_id, attrs={}),
+
+            '<input type="text" name="test" value="93" class="vForeignKeyRawIdAdminField" /><a href="/widget_admin/admin_widgets/inventory/?t=barcode" class="related-lookup" id="lookup_id_test" onclick="return showRelatedObjectLookupPopup(this);"> <img src="%(ADMIN_STATIC_PREFIX)simg/selector-search.gif" width="16" height="16" alt="Lookup" /></a>&nbsp;<strong>Hidden</strong>' % admin_static_prefix()
+
+        )
+
+
+
+
+
+class ManyToManyRawIdWidgetTest(DjangoTestCase):
+
+    def test_render(self):
+
+        band = models.Band.objects.create(name='Linkin Park')
+
+
+
+        m1 = models.Member.objects.create(name='Chester')
+
+        m2 = models.Member.objects.create(name='Mike')
+
+        band.members.add(m1, m2)
+
+        rel = models.Band._meta.get_field('members').rel
+
+
+
+        w = widgets.ManyToManyRawIdWidget(rel, widget_admin_site)
+
+        self.assertHTMLEqual(
+
+            conditional_escape(w.render('test', [m1.pk, m2.pk], attrs={})),
+
+            '<input type="text" name="test" value="%(m1pk)s,%(m2pk)s" class="vManyToManyRawIdAdminField" /><a href="/widget_admin/admin_widgets/member/" class="related-lookup" id="lookup_id_test" onclick="return showRelatedObjectLookupPopup(this);"> <img src="/static/admin/img/selector-search.gif" width="16" height="16" alt="Lookup" /></a>' % dict(admin_static_prefix(), m1pk=m1.pk, m2pk=m2.pk)
+
+        )
+
+
+
+        self.assertHTMLEqual(
+
+            conditional_escape(w.render('test', [m1.pk])),
+
+            '<input type="text" name="test" value="%(m1pk)s" class="vManyToManyRawIdAdminField" /><a href="/widget_admin/admin_widgets/member/" class="related-lookup" id="lookup_id_test" onclick="return showRelatedObjectLookupPopup(this);"> <img src="%(ADMIN_STATIC_PREFIX)simg/selector-search.gif" width="16" height="16" alt="Lookup" /></a>' % dict(admin_static_prefix(), m1pk=m1.pk)
+
+        )
+
+
+
+    def test_m2m_related_model_not_in_admin(self):
+
+        # M2M relationship with model not registered with admin site. Raw ID
+
+        # widget should have no magnifying glass link. See #16542
+
+        consultor1 = models.Advisor.objects.create(name='Rockstar Techie')
+
+
+
+        c1 = models.Company.objects.create(name='Doodle')
+
+        c2 = models.Company.objects.create(name='Pear')
+
+        consultor1.companies.add(c1, c2)
+
+        rel = models.Advisor._meta.get_field('companies').rel
+
+
+
+        w = widgets.ManyToManyRawIdWidget(rel, widget_admin_site)
+
+        self.assertHTMLEqual(
+
+            conditional_escape(w.render('company_widget1', [c1.pk, c2.pk], attrs={})),
+
+            '<input type="text" name="company_widget1" value="%(c1pk)s,%(c2pk)s" />' % {'c1pk': c1.pk, 'c2pk': c2.pk}
+
+        )
+
+
+
+        self.assertHTMLEqual(
+
+            conditional_escape(w.render('company_widget2', [c1.pk])),
+
+            '<input type="text" name="company_widget2" value="%(c1pk)s" />' % {'c1pk': c1.pk}
+
+        )
+
+
+
+class RelatedFieldWidgetWrapperTests(DjangoTestCase):
+
+    def test_no_can_add_related(self):
+
+        rel = models.Individual._meta.get_field('parent').rel
+
+        w = widgets.AdminRadioSelect()
+
+        # Used to fail with a name error.
+
+        w = widgets.RelatedFieldWidgetWrapper(w, rel, widget_admin_site)
+
+        self.assertFalse(w.can_add_related)
+
+
+
+
+
+
+
+@override_settings(PASSWORD_HASHERS=('django.contrib.auth.hashers.SHA1PasswordHasher',))
+
+class DateTimePickerSeleniumFirefoxTests(AdminSeleniumWebDriverTestCase):
+
+
+
+    available_apps = ['admin_widgets'] + AdminSeleniumWebDriverTestCase.available_apps
+
+    fixtures = ['admin-widgets-users.xml']
+
+    urls = "admin_widgets.urls"
+
+    webdriver_class = 'selenium.webdriver.firefox.webdriver.WebDriver'
+
+
+
+    def test_show_hide_date_time_picker_widgets(self):
 
         """
 
-        self.assert_admin(context)
+        Ensure that pressing the ESC key closes the date and time picker
 
-        # Ensure user exists by getting it first.
+        widgets.
 
-        self.identity_api.get_user(context, user_id)
-
-        tenant_ids = self.identity_api.get_tenants_for_user(context, user_id)
-
-        o = []
-
-        for tenant_id in tenant_ids:
-
-            role_ids = self.identity_api.get_roles_for_user_and_tenant(
-
-                context, user_id, tenant_id)
-
-            for role_id in role_ids:
-
-                ref = {'roleId': role_id,
-
-                       'tenantId': tenant_id,
-
-                       'userId': user_id}
-
-                ref['id'] = urllib.urlencode(ref)
-
-                o.append(ref)
-
-        return {'roles': o}
-
-
-
-    # COMPAT(diablo): CRUD extension
-
-    def create_role_ref(self, context, user_id, role):
-
-        """This is actually used for adding a user to a tenant.
-
-
-
-        In the legacy data model adding a user to a tenant required setting
-
-        a role.
-
-
+        Refs #17064.
 
         """
 
-        self.assert_admin(context)
-
-        # TODO(termie): for now we're ignoring the actual role
-
-        tenant_id = role.get('tenantId')
-
-        role_id = role.get('roleId')
-
-        self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
-
-        self.identity_api.add_role_to_user_and_tenant(
-
-            context, user_id, tenant_id, role_id)
-
-        role_ref = self.identity_api.get_role(context, role_id)
-
-        return {'role': role_ref}
+        from selenium.webdriver.common.keys import Keys
 
 
 
-    # COMPAT(diablo): CRUD extension
+        self.admin_login(username='super', password='secret', login_url='/')
 
-    def delete_role_ref(self, context, user_id, role_ref_id):
+        # Open a page that has a date and time picker widgets
 
-        """This is actually used for deleting a user from a tenant.
+        self.selenium.get('%s%s' % (self.live_server_url,
 
-
-
-        In the legacy data model removing a user from a tenant required
-
-        deleting a role.
+            '/admin_widgets/member/add/'))
 
 
 
-        To emulate this, we encode the tenant and role in the role_ref_id,
+        # First, with the date picker widget ---------------------------------
 
-        and if this happens to be the last role for the user-tenant pair,
+        # Check that the date picker is hidden
 
-        we remove the user from the tenant.
+        self.assertEqual(
+
+            self.get_css_value('#calendarbox0', 'display'), 'none')
+
+        # Click the calendar icon
+
+        self.selenium.find_element_by_id('calendarlink0').click()
+
+        # Check that the date picker is visible
+
+        self.assertEqual(
+
+            self.get_css_value('#calendarbox0', 'display'), 'block')
+
+        # Press the ESC key
+
+        self.selenium.find_element_by_tag_name('body').send_keys([Keys.ESCAPE])
+
+        # Check that the date picker is hidden again
+
+        self.assertEqual(
+
+            self.get_css_value('#calendarbox0', 'display'), 'none')
 
 
+
+        # Then, with the time picker widget ----------------------------------
+
+        # Check that the time picker is hidden
+
+        self.assertEqual(
+
+            self.get_css_value('#clockbox0', 'display'), 'none')
+
+        # Click the time icon
+
+        self.selenium.find_element_by_id('clocklink0').click()
+
+        # Check that the time picker is visible
+
+        self.assertEqual(
+
+            self.get_css_value('#clockbox0', 'display'), 'block')
+
+        # Press the ESC key
+
+        self.selenium.find_element_by_tag_name('body').send_keys([Keys.ESCAPE])
+
+        # Check that the time picker is hidden again
+
+        self.assertEqual(
+
+            self.get_css_value('#clockbox0', 'display'), 'none')
+
+
+
+class DateTimePickerSeleniumChromeTests(DateTimePickerSeleniumFirefoxTests):
+
+    webdriver_class = 'selenium.webdriver.chrome.webdriver.WebDriver'
+
+
+
+class DateTimePickerSeleniumIETests(DateTimePickerSeleniumFirefoxTests):
+
+    webdriver_class = 'selenium.webdriver.ie.webdriver.WebDriver'
+
+
+
+
+
+@override_settings(TIME_ZONE='Asia/Singapore')
+
+@override_settings(PASSWORD_HASHERS=('django.contrib.auth.hashers.SHA1PasswordHasher',))
+
+class DateTimePickerShortcutsSeleniumFirefoxTests(AdminSeleniumWebDriverTestCase):
+
+    available_apps = ['admin_widgets'] + AdminSeleniumWebDriverTestCase.available_apps
+
+    fixtures = ['admin-widgets-users.xml']
+
+    urls = "admin_widgets.urls"
+
+    webdriver_class = 'selenium.webdriver.firefox.webdriver.WebDriver'
+
+
+
+    def test_date_time_picker_shortcuts(self):
 
         """
 
-        self.assert_admin(context)
+        Ensure that date/time/datetime picker shortcuts work in the current time zone.
 
-        # TODO(termie): for now we're ignoring the actual role
+        Refs #20663.
 
-        role_ref_ref = urlparse.parse_qs(role_ref_id)
 
-        tenant_id = role_ref_ref.get('tenantId')[0]
 
-        role_id = role_ref_ref.get('roleId')[0]
+        This test case is fairly tricky, it relies on selenium still running the browser
 
-        self.identity_api.remove_role_from_user_and_tenant(
+        in the default time zone "America/Chicago" despite `override_settings` changing
 
-            context, user_id, tenant_id, role_id)
+        the time zone to "Asia/Singapore".
 
-        roles = self.identity_api.get_roles_for_user_and_tenant(
+        """
 
-            context, user_id, tenant_id)
+        self.admin_login(username='super', password='secret', login_url='/')
 
-        if not roles:
 
-            self.identity_api.remove_user_from_tenant(
 
-                context, tenant_id, user_id)
+        now = datetime.now()
+
+        error_margin = timedelta(seconds=10)
+
+
+
+        self.selenium.get('%s%s' % (self.live_server_url,
+
+            '/admin_widgets/member/add/'))
+
+
+
+        self.selenium.find_element_by_id('id_name').send_keys('test')
+
+
+
+        # Click on the "today" and "now" shortcuts.
+
+        shortcuts = self.selenium.find_elements_by_css_selector(
+
+            '.field-birthdate .datetimeshortcuts')
+
+
+
+        for shortcut in shortcuts:
+
+            shortcut.find_element_by_tag_name('a').click()
+
+
+
+        # Check that there is a time zone mismatch warning.
+
+        # Warning: This would effectively fail if the TIME_ZONE defined in the
+
+        # settings has the same UTC offset as "Asia/Singapore" because the
+
+        # mismatch warning would be rightfully missing from the page.
+
+        self.selenium.find_elements_by_css_selector(
+
+            '.field-birthdate .timezonewarning')
+
+
+
+        # Submit the form.
+
+        self.selenium.find_element_by_tag_name('form').submit()
+
+        self.wait_page_loaded()
+
+
+
+        # Make sure that "now" in javascript is within 10 seconds
+
+        # from "now" on the server side.
+
+        member = models.Member.objects.get(name='test')
+
+        self.assertGreater(member.birthdate, now - error_margin)
+
+        self.assertLess(member.birthdate, now + error_margin)
+
+
+
+class DateTimePickerShortcutsSeleniumChromeTests(DateTimePickerShortcutsSeleniumFirefoxTests):
+
+    webdriver_class = 'selenium.webdriver.chrome.webdriver.WebDriver'
+
+
+
+class DateTimePickerShortcutsSeleniumIETests(DateTimePickerShortcutsSeleniumFirefoxTests):
+
+    webdriver_class = 'selenium.webdriver.ie.webdriver.WebDriver'
+
+
+
+
+
+@override_settings(PASSWORD_HASHERS=('django.contrib.auth.hashers.SHA1PasswordHasher',))
+
+class HorizontalVerticalFilterSeleniumFirefoxTests(AdminSeleniumWebDriverTestCase):
+
+
+
+    available_apps = ['admin_widgets'] + AdminSeleniumWebDriverTestCase.available_apps
+
+    fixtures = ['admin-widgets-users.xml']
+
+    urls = "admin_widgets.urls"
+
+    webdriver_class = 'selenium.webdriver.firefox.webdriver.WebDriver'
+
+
+
+    def setUp(self):
+
+        self.lisa = models.Student.objects.create(name='Lisa')
+
+        self.john = models.Student.objects.create(name='John')
+
+        self.bob = models.Student.objects.create(name='Bob')
+
+        self.peter = models.Student.objects.create(name='Peter')
+
+        self.jenny = models.Student.objects.create(name='Jenny')
+
+        self.jason = models.Student.objects.create(name='Jason')
+
+        self.cliff = models.Student.objects.create(name='Cliff')
+
+        self.arthur = models.Student.objects.create(name='Arthur')
+
+        self.school = models.School.objects.create(name='School of Awesome')
+
+        super(HorizontalVerticalFilterSeleniumFirefoxTests, self).setUp()
+
+
+
+    def assertActiveButtons(self, mode, field_name, choose, remove,
+
+                             choose_all=None, remove_all=None):
+
+        choose_link = '#id_%s_add_link' % field_name
+
+        choose_all_link = '#id_%s_add_all_link' % field_name
+
+        remove_link = '#id_%s_remove_link' % field_name
+
+        remove_all_link = '#id_%s_remove_all_link' % field_name
+
+        self.assertEqual(self.has_css_class(choose_link, 'active'), choose)
+
+        self.assertEqual(self.has_css_class(remove_link, 'active'), remove)
+
+        if mode == 'horizontal':
+
+            self.assertEqual(self.has_css_class(choose_all_link, 'active'), choose_all)
+
+            self.assertEqual(self.has_css_class(remove_all_link, 'active'), remove_all)
+
+
+
+    def execute_basic_operations(self, mode, field_name):
+
+        from_box = '#id_%s_from' % field_name
+
+        to_box = '#id_%s_to' % field_name
+
+        choose_link = 'id_%s_add_link' % field_name
+
+        choose_all_link = 'id_%s_add_all_link' % field_name
+
+        remove_link = 'id_%s_remove_link' % field_name
+
+        remove_all_link = 'id_%s_remove_all_link' % field_name
+
+
+
+        # Initial positions ---------------------------------------------------
+
+        self.assertSelectOptions(from_box,
+
+                        [str(self.arthur.id), str(self.bob.id),
+
+                         str(self.cliff.id), str(self.jason.id),
+
+                         str(self.jenny.id), str(self.john.id)])
+
+        self.assertSelectOptions(to_box,
+
+                        [str(self.lisa.id), str(self.peter.id)])
+
+        self.assertActiveButtons(mode, field_name, False, False, True, True)
+
+
+
+        # Click 'Choose all' --------------------------------------------------
+
+        if mode == 'horizontal':
+
+            self.selenium.find_element_by_id(choose_all_link).click()
+
+        elif mode == 'vertical':
+
+            # There 's no 'Choose all' button in vertical mode, so individually
+
+            # select all options and click 'Choose'.
+
+            for option in self.selenium.find_elements_by_css_selector(from_box + ' > option'):
+
+                option.click()
+
+            self.selenium.find_element_by_id(choose_link).click()
+
+        self.assertSelectOptions(from_box, [])
+
+        self.assertSelectOptions(to_box,
+
+                        [str(self.lisa.id), str(self.peter.id),
+
+                         str(self.arthur.id), str(self.bob.id),
+
+                         str(self.cliff.id), str(self.jason.id),
+
+                         str(self.jenny.id), str(self.john.id)])
+
+        self.assertActiveButtons(mode, field_name, False, False, False, True)
+
+
+
+        # Click 'Remove all' --------------------------------------------------
+
+        if mode == 'horizontal':
+
+            self.selenium.find_element_by_id(remove_all_link).click()
+
+        elif mode == 'vertical':
+
+            # There 's no 'Remove all' button in vertical mode, so individually
+
+            # select all options and click 'Remove'.
+
+            for option in self.selenium.find_elements_by_css_selector(to_box + ' > option'):
+
+                option.click()
+
+            self.selenium.find_element_by_id(remove_link).click()
+
+        self.assertSelectOptions(from_box,
+
+                        [str(self.lisa.id), str(self.peter.id),
+
+                         str(self.arthur.id), str(self.bob.id),
+
+                         str(self.cliff.id), str(self.jason.id),
+
+                         str(self.jenny.id), str(self.john.id)])
+
+        self.assertSelectOptions(to_box, [])
+
+        self.assertActiveButtons(mode, field_name, False, False, True, False)
+
+
+
+        # Choose some options ------------------------------------------------
+
+        self.get_select_option(from_box, str(self.lisa.id)).click()
+
+        self.get_select_option(from_box, str(self.jason.id)).click()
+
+        self.get_select_option(from_box, str(self.bob.id)).click()
+
+        self.get_select_option(from_box, str(self.john.id)).click()
+
+        self.assertActiveButtons(mode, field_name, True, False, True, False)
+
+        self.selenium.find_element_by_id(choose_link).click()
+
+        self.assertActiveButtons(mode, field_name, False, False, True, True)
+
+
+
+        self.assertSelectOptions(from_box,
+
+                        [str(self.peter.id), str(self.arthur.id),
+
+                         str(self.cliff.id), str(self.jenny.id)])
+
+        self.assertSelectOptions(to_box,
+
+                        [str(self.lisa.id), str(self.bob.id),
+
+                         str(self.jason.id), str(self.john.id)])
+
+
+
+        # Remove some options -------------------------------------------------
+
+        self.get_select_option(to_box, str(self.lisa.id)).click()
+
+        self.get_select_option(to_box, str(self.bob.id)).click()
+
+        self.assertActiveButtons(mode, field_name, False, True, True, True)
+
+        self.selenium.find_element_by_id(remove_link).click()
+
+        self.assertActiveButtons(mode, field_name, False, False, True, True)
+
+
+
+        self.assertSelectOptions(from_box,
+
+                        [str(self.peter.id), str(self.arthur.id),
+
+                         str(self.cliff.id), str(self.jenny.id),
+
+                         str(self.lisa.id), str(self.bob.id)])
+
+        self.assertSelectOptions(to_box,
+
+                        [str(self.jason.id), str(self.john.id)])
+
+
+
+        # Choose some more options --------------------------------------------
+
+        self.get_select_option(from_box, str(self.arthur.id)).click()
+
+        self.get_select_option(from_box, str(self.cliff.id)).click()
+
+        self.selenium.find_element_by_id(choose_link).click()
+
+
+
+        self.assertSelectOptions(from_box,
+
+                        [str(self.peter.id), str(self.jenny.id),
+
+                         str(self.lisa.id), str(self.bob.id)])
+
+        self.assertSelectOptions(to_box,
+
+                        [str(self.jason.id), str(self.john.id),
+
+                         str(self.arthur.id), str(self.cliff.id)])
+
+
+
+    def test_basic(self):
+
+        self.school.students = [self.lisa, self.peter]
+
+        self.school.alumni = [self.lisa, self.peter]
+
+        self.school.save()
+
+
+
+        self.admin_login(username='super', password='secret', login_url='/')
+
+        self.selenium.get(
+
+            '%s%s' % (self.live_server_url, '/admin_widgets/school/%s/' % self.school.id))
+
+
+
+        self.wait_page_loaded()
+
+        self.execute_basic_operations('vertical', 'students')
+
+        self.execute_basic_operations('horizontal', 'alumni')
+
+
+
+        # Save and check that everything is properly stored in the database ---
+
+        self.selenium.find_element_by_xpath('//input[@value="Save"]').click()
+
+        self.wait_page_loaded()
+
+        self.school = models.School.objects.get(id=self.school.id)  # Reload from database
+
+        self.assertEqual(list(self.school.students.all()),
+
+                         [self.arthur, self.cliff, self.jason, self.john])
+
+        self.assertEqual(list(self.school.alumni.all()),
+
+                         [self.arthur, self.cliff, self.jason, self.john])
+
+
+
+    def test_filter(self):
+
+        """
+
+        Ensure that typing in the search box filters out options displayed in
+
+        the 'from' box.
+
+        """
+
+        from selenium.webdriver.common.keys import Keys
+
+
+
+        self.school.students = [self.lisa, self.peter]
+
+        self.school.alumni = [self.lisa, self.peter]
+
+        self.school.save()
+
+
+
+        self.admin_login(username='super', password='secret', login_url='/')
+
+        self.selenium.get(
+
+            '%s%s' % (self.live_server_url, '/admin_widgets/school/%s/' % self.school.id))
+
+
+
+
+
+        for field_name in ['students', 'alumni']:
+
+            from_box = '#id_%s_from' % field_name
+
+            to_box = '#id_%s_to' % field_name
+
+            choose_link = '#id_%s_add_link' % field_name
+
+            remove_link = '#id_%s_remove_link' % field_name
+
+            input = self.selenium.find_element_by_css_selector('#id_%s_input' % field_name)
+
+
+
+            # Initial values
+
+            self.assertSelectOptions(from_box,
+
+                        [str(self.arthur.id), str(self.bob.id),
+
+                         str(self.cliff.id), str(self.jason.id),
+
+                         str(self.jenny.id), str(self.john.id)])
+
+
+
+            # Typing in some characters filters out non-matching options
+
+            input.send_keys('a')
+
+            self.assertSelectOptions(from_box, [str(self.arthur.id), str(self.jason.id)])
+
+            input.send_keys('R')
+
+            self.assertSelectOptions(from_box, [str(self.arthur.id)])
+
+
+
+            # Clearing the text box makes the other options reappear
+
+            input.send_keys([Keys.BACK_SPACE])
+
+            self.assertSelectOptions(from_box, [str(self.arthur.id), str(self.jason.id)])
+
+            input.send_keys([Keys.BACK_SPACE])
+
+            self.assertSelectOptions(from_box,
+
+                        [str(self.arthur.id), str(self.bob.id),
+
+                         str(self.cliff.id), str(self.jason.id),
+
+                         str(self.jenny.id), str(self.john.id)])
+
+
+
+            # -----------------------------------------------------------------
+
+            # Check that chosing a filtered option sends it properly to the
+
+            # 'to' box.
+
+            input.send_keys('a')
+
+            self.assertSelectOptions(from_box, [str(self.arthur.id), str(self.jason.id)])
+
+            self.get_select_option(from_box, str(self.jason.id)).click()
+
+            self.selenium.find_element_by_css_selector(choose_link).click()
+
+            self.assertSelectOptions(from_box, [str(self.arthur.id)])
+
+            self.assertSelectOptions(to_box,
+
+                        [str(self.lisa.id), str(self.peter.id),
+
+                         str(self.jason.id)])
+
+
+
+            self.get_select_option(to_box, str(self.lisa.id)).click()
+
+            self.selenium.find_element_by_css_selector(remove_link).click()
+
+            self.assertSelectOptions(from_box,
+
+                        [str(self.arthur.id), str(self.lisa.id)])
+
+            self.assertSelectOptions(to_box,
+
+                        [str(self.peter.id), str(self.jason.id)])
+
+
+
+            input.send_keys([Keys.BACK_SPACE]) # Clear text box
+
+            self.assertSelectOptions(from_box,
+
+                        [str(self.arthur.id), str(self.bob.id),
+
+                         str(self.cliff.id), str(self.jenny.id),
+
+                         str(self.john.id), str(self.lisa.id)])
+
+            self.assertSelectOptions(to_box,
+
+                        [str(self.peter.id), str(self.jason.id)])
+
+
+
+        # Save and check that everything is properly stored in the database ---
+
+        self.selenium.find_element_by_xpath('//input[@value="Save"]').click()
+
+        self.wait_page_loaded()
+
+        self.school = models.School.objects.get(id=self.school.id) # Reload from database
+
+        self.assertEqual(list(self.school.students.all()),
+
+                         [self.jason, self.peter])
+
+        self.assertEqual(list(self.school.alumni.all()),
+
+                         [self.jason, self.peter])
+
+
+
+class HorizontalVerticalFilterSeleniumChromeTests(HorizontalVerticalFilterSeleniumFirefoxTests):
+
+    webdriver_class = 'selenium.webdriver.chrome.webdriver.WebDriver'
+
+
+
+class HorizontalVerticalFilterSeleniumIETests(HorizontalVerticalFilterSeleniumFirefoxTests):
+
+    webdriver_class = 'selenium.webdriver.ie.webdriver.WebDriver'
+
+
+
+
+
+@override_settings(PASSWORD_HASHERS=('django.contrib.auth.hashers.SHA1PasswordHasher',))
+
+class AdminRawIdWidgetSeleniumFirefoxTests(AdminSeleniumWebDriverTestCase):
+
+    available_apps = ['admin_widgets'] + AdminSeleniumWebDriverTestCase.available_apps
+
+    fixtures = ['admin-widgets-users.xml']
+
+    urls = "admin_widgets.urls"
+
+    webdriver_class = 'selenium.webdriver.firefox.webdriver.WebDriver'
+
+
+
+    def setUp(self):
+
+        models.Band.objects.create(id=42, name='Bogey Blues')
+
+        models.Band.objects.create(id=98, name='Green Potatoes')
+
+        super(AdminRawIdWidgetSeleniumFirefoxTests, self).setUp()
+
+
+
+    def test_foreignkey(self):
+
+        self.admin_login(username='super', password='secret', login_url='/')
+
+        self.selenium.get(
+
+            '%s%s' % (self.live_server_url, '/admin_widgets/event/add/'))
+
+        main_window = self.selenium.current_window_handle
+
+
+
+        # No value has been selected yet
+
+        self.assertEqual(
+
+            self.selenium.find_element_by_id('id_main_band').get_attribute('value'),
+
+            '')
+
+
+
+        # Open the popup window and click on a band
+
+        self.selenium.find_element_by_id('lookup_id_main_band').click()
+
+        self.selenium.switch_to_window('id_main_band')
+
+        self.wait_page_loaded()
+
+        link = self.selenium.find_element_by_link_text('Bogey Blues')
+
+        self.assertTrue('/band/42/' in link.get_attribute('href'))
+
+        link.click()
+
+
+
+        # The field now contains the selected band's id
+
+        self.selenium.switch_to_window(main_window)
+
+        self.assertEqual(
+
+            self.selenium.find_element_by_id('id_main_band').get_attribute('value'),
+
+            '42')
+
+
+
+        # Reopen the popup window and click on another band
+
+        self.selenium.find_element_by_id('lookup_id_main_band').click()
+
+        self.selenium.switch_to_window('id_main_band')
+
+        self.wait_page_loaded()
+
+        link = self.selenium.find_element_by_link_text('Green Potatoes')
+
+        self.assertTrue('/band/98/' in link.get_attribute('href'))
+
+        link.click()
+
+
+
+        # The field now contains the other selected band's id
+
+        self.selenium.switch_to_window(main_window)
+
+        self.assertEqual(
+
+            self.selenium.find_element_by_id('id_main_band').get_attribute('value'),
+
+            '98')
+
+
+
+    def test_many_to_many(self):
+
+        self.admin_login(username='super', password='secret', login_url='/')
+
+        self.selenium.get(
+
+            '%s%s' % (self.live_server_url, '/admin_widgets/event/add/'))
+
+        main_window = self.selenium.current_window_handle
+
+
+
+        # No value has been selected yet
+
+        self.assertEqual(
+
+            self.selenium.find_element_by_id('id_supporting_bands').get_attribute('value'),
+
+            '')
+
+
+
+        # Open the popup window and click on a band
+
+        self.selenium.find_element_by_id('lookup_id_supporting_bands').click()
+
+        self.selenium.switch_to_window('id_supporting_bands')
+
+        self.wait_page_loaded()
+
+        link = self.selenium.find_element_by_link_text('Bogey Blues')
+
+        self.assertTrue('/band/42/' in link.get_attribute('href'))
+
+        link.click()
+
+
+
+        # The field now contains the selected band's id
+
+        self.selenium.switch_to_window(main_window)
+
+        self.assertEqual(
+
+            self.selenium.find_element_by_id('id_supporting_bands').get_attribute('value'),
+
+            '42')
+
+
+
+        # Reopen the popup window and click on another band
+
+        self.selenium.find_element_by_id('lookup_id_supporting_bands').click()
+
+        self.selenium.switch_to_window('id_supporting_bands')
+
+        self.wait_page_loaded()
+
+        link = self.selenium.find_element_by_link_text('Green Potatoes')
+
+        self.assertTrue('/band/98/' in link.get_attribute('href'))
+
+        link.click()
+
+
+
+        # The field now contains the two selected bands' ids
+
+        self.selenium.switch_to_window(main_window)
+
+        self.assertEqual(
+
+            self.selenium.find_element_by_id('id_supporting_bands').get_attribute('value'),
+
+            '42,98')
+
+
+
+class AdminRawIdWidgetSeleniumChromeTests(AdminRawIdWidgetSeleniumFirefoxTests):
+
+    webdriver_class = 'selenium.webdriver.chrome.webdriver.WebDriver'
+
+
+
+class AdminRawIdWidgetSeleniumIETests(AdminRawIdWidgetSeleniumFirefoxTests):
+
+    webdriver_class = 'selenium.webdriver.ie.webdriver.WebDriver'

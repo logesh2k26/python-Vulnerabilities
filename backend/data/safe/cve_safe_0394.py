@@ -1,211 +1,171 @@
 # Source: CVEFixes dataset
-# Safety: safe
+# Safety: vulnerable
 # Category: safe
 
-#
+# coding: utf-8
 
-# djblets_js.py -- JavaScript-related template tags
 
-#
 
-# Copyright (c) 2007-2009  Christian Hammond
+from __future__ import division, absolute_import, unicode_literals
 
-# Copyright (c) 2007-2009  David Trowbridge
 
-#
 
-# Permission is hereby granted, free of charge, to any person obtaining
+from owlmixin import util
 
-# a copy of this software and associated documentation files (the
 
-# "Software"), to deal in the Software without restriction, including
 
-# without limitation the rights to use, copy, modify, merge, publish,
 
-# distribute, sublicense, and/or sell copies of the Software, and to
 
-# permit persons to whom the Software is furnished to do so, subject to
+class TestReplaceKeys:
 
-# the following conditions:
+    def test_need_not_snake(self):
 
-#
+        keymap = {
 
-# The above copyright notice and this permission notice shall be included
+            "self": "_self",
 
-# in all copies or substantial portions of the Software.
+            "before": "after"
 
-#
+        }
 
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+        d = {
 
-# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+            "before": 1,
 
-# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+            "before2": 2,
 
-# IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+            "self": 3,
 
-# CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+            "self2": 4,
 
-# TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+            "UpperCamelCase": True,
 
-# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+            "lowerCamelCase": True,
 
+            "snake_case": True,
 
+            "chain-case": True,
 
-from __future__ import unicode_literals
+        }
 
 
 
-import json
+        expected = {
 
+            "after": 1,
 
+            "before2": 2,
 
-from django import template
+            "_self": 3,
 
-from django.core.serializers import serialize
+            "self2": 4,
 
-from django.db.models.query import QuerySet
+            "UpperCamelCase": True,
 
-from django.utils import six
+            "lowerCamelCase": True,
 
-from django.utils.encoding import force_text
+            "snake_case": True,
 
-from django.utils.safestring import mark_safe
+            "chain-case": True
 
+        }
 
 
-from djblets.util.serializers import DjbletsJSONEncoder
 
+        assert util.replace_keys(d, keymap, False) == expected
 
 
 
+    def test_need_must_snake(self):
 
-register = template.Library()
+        keymap = {
 
+            "self": "_self",
 
+            "before": "after"
 
-_safe_js_escapes = {
+        }
 
-    ord('&'): '\\u0026',
+        d = {
 
-    ord('<'): '\\u003C',
+            "before": 1,
 
-    ord('>'): '\\u003E',
+            "before2": 2,
 
-}
+            "self": 3,
 
+            "self2": 4,
 
+            "UpperCamelCase": True,
 
+            "lowerCamelCase": True,
 
+            "snake_case": True,
 
-@register.simple_tag
+            "chain-case": True
 
-def form_dialog_fields(form):
+        }
 
-    """
 
-    Translates a Django Form object into a JavaScript list of fields.
 
-    The resulting list of fields can be used to represent the form
+        expected = {
 
-    dynamically.
+            "after": 1,
 
-    """
+            "before2": 2,
 
-    s = ''
+            "_self": 3,
 
+            "self2": 4,
 
+            "upper_camel_case": True,
 
-    for field in form:
+            "lower_camel_case": True,
 
-        s += "{ name: '%s', " % field.name
+            "snake_case": True,
 
+            "chain_case": True
 
+        }
 
-        if field.is_hidden:
 
-            s += "hidden: true, "
 
-        else:
+        assert util.replace_keys(d, keymap, True) == expected
 
-            s += "label: '%s', " % field.label_tag(field.label + ":")
 
 
 
-            if field.field.required:
 
-                s += "required: true, "
+class TestToSnake:
 
+    def test_lower_camel(self):
 
+        assert util.to_snake("lowerCamelCase") == "lower_camel_case"
 
-            if field.field.help_text:
 
-                s += "help_text: '%s', " % field.field.help_text
 
+    def test_upper_camel(self):
 
+        assert util.to_snake("UpperCamelCase") == "upper_camel_case"
 
-        s += "widget: '%s' }," % six.text_type(field)
 
 
+    def test_chain(self):
 
-    # Chop off the last ','
+        assert util.to_snake("chain-case-example") == "chain_case_example"
 
-    return "[ %s ]" % s[:-1]
 
 
+    def test_snake(self):
 
+        assert util.to_snake("snake_case_is_same") == "snake_case_is_same"
 
 
-@register.filter
 
-def json_dumps(value, indent=None):
+    def test_docopt(self):
 
-    if isinstance(value, QuerySet):
+        assert util.to_snake("<file_list>") == "file_list"
 
-        result = serialize('json', value, indent=indent)
+        assert util.to_snake("-o") == "o"
 
-    else:
-
-        result = json.dumps(value, indent=indent, cls=DjbletsJSONEncoder)
-
-
-
-    return mark_safe(force_text(result).translate(_safe_js_escapes))
-
-
-
-
-
-@register.filter
-
-def json_dumps_items(d, append=''):
-
-    """Dumps a list of keys/values from a dictionary, without braces.
-
-
-
-    This works very much like ``json_dumps``, but doesn't output the
-
-    surrounding braces. This allows it to be used within a JavaScript
-
-    object definition alongside other custom keys.
-
-
-
-    If the dictionary is not empty, and ``append`` is passed, it will be
-
-    appended onto the results. This is most useful when you want to append
-
-    a comma after all the dictionary items, in order to provide further
-
-    keys in the template.
-
-    """
-
-    if not d:
-
-        return ''
-
-
-
-    return mark_safe(json_dumps(d)[1:-1] + append)
+        assert util.to_snake("--detail-option") == "detail_option"

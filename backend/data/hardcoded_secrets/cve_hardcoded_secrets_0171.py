@@ -2,442 +2,308 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-from wagtail.core.models import Page
 
-from wagtail.tests.testapp.models import (
 
-    FormField, FormFieldWithCustomSubmission, FormPage, FormPageWithCustomSubmission,
+# Copyright 2011 OpenStack LLC.
 
-    FormPageWithRedirect, RedirectFormField)
+# All Rights Reserved.
 
+#
 
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
 
+#    not use this file except in compliance with the License. You may obtain
 
+#    a copy of the License at
 
-def make_form_page(**kwargs):
+#
 
-    kwargs.setdefault('title', "Contact us")
+#         http://www.apache.org/licenses/LICENSE-2.0
 
-    kwargs.setdefault('slug', "contact-us")
+#
 
-    kwargs.setdefault('to_address', "to@email.com")
+#    Unless required by applicable law or agreed to in writing, software
 
-    kwargs.setdefault('from_address', "from@email.com")
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-    kwargs.setdefault('subject', "The subject")
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
+#    License for the specific language governing permissions and limitations
 
+#    under the License.
 
-    home_page = Page.objects.get(url_path='/home/')
 
-    form_page = home_page.add_child(instance=FormPage(**kwargs))
 
+import json
 
+import webob
 
-    FormField.objects.create(
 
-        page=form_page,
 
-        sort_order=1,
+from nova import context
 
-        label="Your email",
+from nova import test
 
-        field_type='email',
+from nova.tests.api.openstack import fakes
 
-        required=True,
 
-    )
 
-    FormField.objects.create(
+from nova.api.openstack.contrib.quotas import QuotaSetsController
 
-        page=form_page,
 
-        sort_order=2,
 
-        label="Your message",
 
-        field_type='multiline',
 
-        required=True,
+def quota_set(id):
 
-    )
+    return {'quota_set': {'id': id, 'metadata_items': 128, 'volumes': 10,
 
-    FormField.objects.create(
+            'gigabytes': 1000, 'ram': 51200, 'floating_ips': 10,
 
-        page=form_page,
+            'instances': 10, 'injected_files': 5, 'cores': 20,
 
-        sort_order=3,
+            'injected_file_content_bytes': 10240}}
 
-        label="Your choices",
 
-        field_type='checkboxes',
 
-        required=False,
 
-        choices='foo,bar,baz',
 
-    )
+def quota_set_list():
 
+    return {'quota_set_list': [quota_set('1234'), quota_set('5678'),
 
+                               quota_set('update_me')]}
 
-    return form_page
 
 
 
 
+class QuotaSetsTest(test.TestCase):
 
-def make_form_page_with_custom_submission(**kwargs):
 
-    kwargs.setdefault('title', "Contact us")
 
-    kwargs.setdefault('intro', "<p>Boring intro text</p>")
+    def setUp(self):
 
-    kwargs.setdefault('thank_you_text', "<p>Thank you for your patience!</p>")
+        super(QuotaSetsTest, self).setUp()
 
-    kwargs.setdefault('slug', "contact-us")
+        self.controller = QuotaSetsController()
 
-    kwargs.setdefault('to_address', "to@email.com")
+        self.user_id = 'fake'
 
-    kwargs.setdefault('from_address', "from@email.com")
+        self.project_id = 'fake'
 
-    kwargs.setdefault('subject', "The subject")
+        self.user_context = context.RequestContext(self.user_id,
 
+                                                   self.project_id)
 
+        self.admin_context = context.RequestContext(self.user_id,
 
-    home_page = Page.objects.get(url_path='/home/')
+                                                    self.project_id,
 
-    form_page = home_page.add_child(instance=FormPageWithCustomSubmission(**kwargs))
+                                                    is_admin=True)
 
 
 
-    FormFieldWithCustomSubmission.objects.create(
+    def test_format_quota_set(self):
 
-        page=form_page,
+        raw_quota_set = {
 
-        sort_order=1,
+            'instances': 10,
 
-        label="Your email",
+            'cores': 20,
 
-        field_type='email',
+            'ram': 51200,
 
-        required=True,
+            'volumes': 10,
 
-    )
+            'floating_ips': 10,
 
-    FormFieldWithCustomSubmission.objects.create(
+            'metadata_items': 128,
 
-        page=form_page,
+            'gigabytes': 1000,
 
-        sort_order=2,
+            'injected_files': 5,
 
-        label="Your message",
+            'injected_file_content_bytes': 10240}
 
-        field_type='multiline',
 
-        required=True,
 
-    )
+        quota_set = QuotaSetsController()._format_quota_set('1234',
 
-    FormFieldWithCustomSubmission.objects.create(
+                                                            raw_quota_set)
 
-        page=form_page,
+        qs = quota_set['quota_set']
 
-        sort_order=3,
 
-        label="Your choices",
 
-        field_type='checkboxes',
+        self.assertEqual(qs['id'], '1234')
 
-        required=False,
+        self.assertEqual(qs['instances'], 10)
 
-        choices='foo,bar,baz',
+        self.assertEqual(qs['cores'], 20)
 
-    )
+        self.assertEqual(qs['ram'], 51200)
 
+        self.assertEqual(qs['volumes'], 10)
 
+        self.assertEqual(qs['gigabytes'], 1000)
 
-    return form_page
+        self.assertEqual(qs['floating_ips'], 10)
 
+        self.assertEqual(qs['metadata_items'], 128)
 
+        self.assertEqual(qs['injected_files'], 5)
 
+        self.assertEqual(qs['injected_file_content_bytes'], 10240)
 
 
-def make_form_page_with_redirect(**kwargs):
 
-    kwargs.setdefault('title', "Contact us")
+    def test_quotas_defaults(self):
 
-    kwargs.setdefault('slug', "contact-us")
+        uri = '/v1.1/fake_tenant/os-quota-sets/fake_tenant/defaults'
 
-    kwargs.setdefault('to_address', "to@email.com")
+        req = webob.Request.blank(uri)
 
-    kwargs.setdefault('from_address', "from@email.com")
+        req.method = 'GET'
 
-    kwargs.setdefault('subject', "The subject")
+        req.headers['Content-Type'] = 'application/json'
 
+        res = req.get_response(fakes.wsgi_app())
 
 
 
+        self.assertEqual(res.status_int, 200)
 
-    home_page = Page.objects.get(url_path='/home/')
+        expected = {'quota_set': {
 
-    kwargs.setdefault('thank_you_redirect_page', home_page)
+                    'id': 'fake_tenant',
 
-    form_page = home_page.add_child(instance=FormPageWithRedirect(**kwargs))
+                    'instances': 10,
 
-    # form_page.thank_you_redirect_page = home_page
+                    'cores': 20,
 
+                    'ram': 51200,
 
+                    'volumes': 10,
 
-    RedirectFormField.objects.create(
+                    'gigabytes': 1000,
 
-        page=form_page,
+                    'floating_ips': 10,
 
-        sort_order=1,
+                    'metadata_items': 128,
 
-        label="Your email",
+                    'injected_files': 5,
 
-        field_type='email',
+                    'injected_file_content_bytes': 10240}}
 
-        required=True,
 
-    )
 
-    RedirectFormField.objects.create(
+        self.assertEqual(json.loads(res.body), expected)
 
-        page=form_page,
 
-        sort_order=2,
 
-        label="Your message",
+    def test_quotas_show_as_admin(self):
 
-        field_type='multiline',
+        req = webob.Request.blank('/v1.1/1234/os-quota-sets/1234')
 
-        required=True,
+        req.method = 'GET'
 
-    )
+        req.headers['Content-Type'] = 'application/json'
 
-    RedirectFormField.objects.create(
+        res = req.get_response(fakes.wsgi_app(
 
-        page=form_page,
+                               fake_auth_context=self.admin_context))
 
-        sort_order=3,
 
-        label="Your choices",
 
-        field_type='checkboxes',
+        self.assertEqual(res.status_int, 200)
 
-        required=False,
+        self.assertEqual(json.loads(res.body), quota_set('1234'))
 
-        choices='foo,bar,baz',
 
-    )
 
+    def test_quotas_show_as_unauthorized_user(self):
 
+        req = webob.Request.blank('/v1.1/fake/os-quota-sets/1234')
 
-    return form_page
+        req.method = 'GET'
 
+        req.headers['Content-Type'] = 'application/json'
 
+        res = req.get_response(fakes.wsgi_app(
 
+                               fake_auth_context=self.user_context))
 
 
-def make_types_test_form_page(**kwargs):
 
-    kwargs.setdefault('title', "Contact us")
+        self.assertEqual(res.status_int, 403)
 
-    kwargs.setdefault('slug', "contact-us")
 
-    kwargs.setdefault('to_address', "to@email.com")
 
-    kwargs.setdefault('from_address', "from@email.com")
+    def test_quotas_update_as_admin(self):
 
-    kwargs.setdefault('subject', "The subject")
+        updated_quota_set = {'quota_set': {'instances': 50,
 
+                             'cores': 50, 'ram': 51200, 'volumes': 10,
 
+                             'gigabytes': 1000, 'floating_ips': 10,
 
-    home_page = Page.objects.get(url_path='/home/')
+                             'metadata_items': 128, 'injected_files': 5,
 
-    form_page = home_page.add_child(instance=FormPage(**kwargs))
+                             'injected_file_content_bytes': 10240}}
 
 
 
-    FormField.objects.create(
+        req = webob.Request.blank('/v1.1/1234/os-quota-sets/update_me')
 
-        page=form_page,
+        req.method = 'PUT'
 
-        sort_order=1,
+        req.body = json.dumps(updated_quota_set)
 
-        label="Single line text",
+        req.headers['Content-Type'] = 'application/json'
 
-        field_type='singleline',
 
-        required=False,
 
-    )
+        res = req.get_response(fakes.wsgi_app(
 
-    FormField.objects.create(
+                               fake_auth_context=self.admin_context))
 
-        page=form_page,
 
-        sort_order=2,
 
-        label="Multiline",
+        self.assertEqual(json.loads(res.body), updated_quota_set)
 
-        field_type='multiline',
 
-        required=False,
 
-    )
+    def test_quotas_update_as_user(self):
 
-    FormField.objects.create(
+        updated_quota_set = {'quota_set': {'instances': 50,
 
-        page=form_page,
+                             'cores': 50, 'ram': 51200, 'volumes': 10,
 
-        sort_order=3,
+                             'gigabytes': 1000, 'floating_ips': 10,
 
-        label="Email",
+                             'metadata_items': 128, 'injected_files': 5,
 
-        field_type='email',
+                             'injected_file_content_bytes': 10240}}
 
-        required=False,
 
-    )
 
-    FormField.objects.create(
+        req = webob.Request.blank('/v1.1/1234/os-quota-sets/update_me')
 
-        page=form_page,
+        req.method = 'PUT'
 
-        sort_order=4,
+        req.body = json.dumps(updated_quota_set)
 
-        label="Number",
+        req.headers['Content-Type'] = 'application/json'
 
-        field_type='number',
 
-        required=False,
 
-    )
+        res = req.get_response(fakes.wsgi_app(
 
-    FormField.objects.create(
+                               fake_auth_context=self.user_context))
 
-        page=form_page,
 
-        sort_order=5,
 
-        label="URL",
-
-        field_type='url',
-
-        required=False,
-
-    )
-
-    FormField.objects.create(
-
-        page=form_page,
-
-        sort_order=6,
-
-        label="Checkbox",
-
-        field_type='checkbox',
-
-        required=False,
-
-    )
-
-    FormField.objects.create(
-
-        page=form_page,
-
-        sort_order=7,
-
-        label="Checkboxes",
-
-        field_type='checkboxes',
-
-        required=False,
-
-        choices='foo,bar,baz',
-
-    )
-
-    FormField.objects.create(
-
-        page=form_page,
-
-        sort_order=8,
-
-        label="Drop down",
-
-        field_type='dropdown',
-
-        required=False,
-
-        choices='spam,ham,eggs',
-
-    )
-
-    FormField.objects.create(
-
-        page=form_page,
-
-        sort_order=9,
-
-        label="Multiple select",
-
-        field_type='multiselect',
-
-        required=False,
-
-        choices='qux,quux,quuz,corge',
-
-    )
-
-    FormField.objects.create(
-
-        page=form_page,
-
-        sort_order=10,
-
-        label="Radio buttons",
-
-        field_type='radio',
-
-        required=False,
-
-        choices='wibble,wobble,wubble',
-
-    )
-
-    FormField.objects.create(
-
-        page=form_page,
-
-        sort_order=11,
-
-        label="Date",
-
-        field_type='date',
-
-        required=False,
-
-    )
-
-    FormField.objects.create(
-
-        page=form_page,
-
-        sort_order=12,
-
-        label="Datetime",
-
-        field_type='datetime',
-
-        required=False,
-
-    )
-
-
-
-    return form_page
+        self.assertEqual(res.status_int, 403)

@@ -2,862 +2,1664 @@
 # Safety: vulnerable
 # Category: path_traversal
 
+#!/usr/bin/python
+
 # -*- coding: utf-8 -*-
 
-#
 
-# Copyright (C) 2008-2012  Red Hat, Inc.
 
-# Copyright (C) 2008  Ricky Zhou
+# Copyright: (c) 2019, Felix Fontein <felix@fontein.de>
 
-# This file is part of python-fedora
+# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 
-#
 
-# python-fedora is free software; you can redistribute it and/or
 
-# modify it under the terms of the GNU Lesser General Public
+from __future__ import absolute_import, division, print_function
 
-# License as published by the Free Software Foundation; either
+__metaclass__ = type
 
-# version 2.1 of the License, or (at your option) any later version.
 
-#
 
-# python-fedora is distributed in the hope that it will be useful,
 
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
 
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+DOCUMENTATION = r'''
 
-# Lesser General Public License for more details.
+---
 
-#
+module: x509_crl
 
-# You should have received a copy of the GNU Lesser General Public
+version_added: '1.0.0'
 
-# License along with python-fedora; if not, see <http://www.gnu.org/licenses/>
+short_description: Generate Certificate Revocation Lists (CRLs)
 
-#
+description:
+
+    - This module allows one to (re)generate or update Certificate Revocation Lists (CRLs).
+
+    - Certificates on the revocation list can be either specified via serial number and (optionally) their issuer,
+
+      or as a path to a certificate file in PEM format.
+
+requirements:
+
+    - cryptography >= 1.2
+
+author:
+
+    - Felix Fontein (@felixfontein)
+
+options:
+
+    state:
+
+        description:
+
+            - Whether the CRL file should exist or not, taking action if the state is different from what is stated.
+
+        type: str
+
+        default: present
+
+        choices: [ absent, present ]
+
+
+
+    mode:
+
+        description:
+
+            - Defines how to process entries of existing CRLs.
+
+            - If set to C(generate), makes sure that the CRL has the exact set of revoked certificates
+
+              as specified in I(revoked_certificates).
+
+            - If set to C(update), makes sure that the CRL contains the revoked certificates from
+
+              I(revoked_certificates), but can also contain other revoked certificates. If the CRL file
+
+              already exists, all entries from the existing CRL will also be included in the new CRL.
+
+              When using C(update), you might be interested in setting I(ignore_timestamps) to C(yes).
+
+        type: str
+
+        default: generate
+
+        choices: [ generate, update ]
+
+
+
+    force:
+
+        description:
+
+            - Should the CRL be forced to be regenerated.
+
+        type: bool
+
+        default: no
+
+
+
+    backup:
+
+        description:
+
+            - Create a backup file including a timestamp so you can get the original
+
+              CRL back if you overwrote it with a new one by accident.
+
+        type: bool
+
+        default: no
+
+
+
+    path:
+
+        description:
+
+            - Remote absolute path where the generated CRL file should be created or is already located.
+
+        type: path
+
+        required: yes
+
+
+
+    format:
+
+        description:
+
+            - Whether the CRL file should be in PEM or DER format.
+
+            - If an existing CRL file does match everything but I(format), it will be converted to the correct format
+
+              instead of regenerated.
+
+        type: str
+
+        choices: [pem, der]
+
+        default: pem
+
+
+
+    privatekey_path:
+
+        description:
+
+            - Path to the CA's private key to use when signing the CRL.
+
+            - Either I(privatekey_path) or I(privatekey_content) must be specified if I(state) is C(present), but not both.
+
+        type: path
+
+
+
+    privatekey_content:
+
+        description:
+
+            - The content of the CA's private key to use when signing the CRL.
+
+            - Either I(privatekey_path) or I(privatekey_content) must be specified if I(state) is C(present), but not both.
+
+        type: str
+
+
+
+    privatekey_passphrase:
+
+        description:
+
+            - The passphrase for the I(privatekey_path).
+
+            - This is required if the private key is password protected.
+
+        type: str
+
+
+
+    issuer:
+
+        description:
+
+            - Key/value pairs that will be present in the issuer name field of the CRL.
+
+            - If you need to specify more than one value with the same key, use a list as value.
+
+            - Required if I(state) is C(present).
+
+        type: dict
+
+
+
+    last_update:
+
+        description:
+
+            - The point in time from which this CRL can be trusted.
+
+            - Time can be specified either as relative time or as absolute timestamp.
+
+            - Time will always be interpreted as UTC.
+
+            - Valid format is C([+-]timespec | ASN.1 TIME) where timespec can be an integer
+
+              + C([w | d | h | m | s]) (e.g. C(+32w1d2h).
+
+            - Note that if using relative time this module is NOT idempotent, except when
+
+              I(ignore_timestamps) is set to C(yes).
+
+        type: str
+
+        default: "+0s"
+
+
+
+    next_update:
+
+        description:
+
+            - "The absolute latest point in time by which this I(issuer) is expected to have issued
+
+               another CRL. Many clients will treat a CRL as expired once I(next_update) occurs."
+
+            - Time can be specified either as relative time or as absolute timestamp.
+
+            - Time will always be interpreted as UTC.
+
+            - Valid format is C([+-]timespec | ASN.1 TIME) where timespec can be an integer
+
+              + C([w | d | h | m | s]) (e.g. C(+32w1d2h).
+
+            - Note that if using relative time this module is NOT idempotent, except when
+
+              I(ignore_timestamps) is set to C(yes).
+
+            - Required if I(state) is C(present).
+
+        type: str
+
+
+
+    digest:
+
+        description:
+
+            - Digest algorithm to be used when signing the CRL.
+
+        type: str
+
+        default: sha256
+
+
+
+    revoked_certificates:
+
+        description:
+
+            - List of certificates to be revoked.
+
+            - Required if I(state) is C(present).
+
+        type: list
+
+        elements: dict
+
+        suboptions:
+
+            path:
+
+                description:
+
+                    - Path to a certificate in PEM format.
+
+                    - The serial number and issuer will be extracted from the certificate.
+
+                    - Mutually exclusive with I(content) and I(serial_number). One of these three options
+
+                      must be specified.
+
+                type: path
+
+            content:
+
+                description:
+
+                    - Content of a certificate in PEM format.
+
+                    - The serial number and issuer will be extracted from the certificate.
+
+                    - Mutually exclusive with I(path) and I(serial_number). One of these three options
+
+                      must be specified.
+
+                type: str
+
+            serial_number:
+
+                description:
+
+                    - Serial number of the certificate.
+
+                    - Mutually exclusive with I(path) and I(content). One of these three options must
+
+                      be specified.
+
+                type: int
+
+            revocation_date:
+
+                description:
+
+                    - The point in time the certificate was revoked.
+
+                    - Time can be specified either as relative time or as absolute timestamp.
+
+                    - Time will always be interpreted as UTC.
+
+                    - Valid format is C([+-]timespec | ASN.1 TIME) where timespec can be an integer
+
+                      + C([w | d | h | m | s]) (e.g. C(+32w1d2h).
+
+                    - Note that if using relative time this module is NOT idempotent, except when
+
+                      I(ignore_timestamps) is set to C(yes).
+
+                type: str
+
+                default: "+0s"
+
+            issuer:
+
+                description:
+
+                    - The certificate's issuer.
+
+                    - "Example: C(DNS:ca.example.org)"
+
+                type: list
+
+                elements: str
+
+            issuer_critical:
+
+                description:
+
+                    - Whether the certificate issuer extension should be critical.
+
+                type: bool
+
+                default: no
+
+            reason:
+
+                description:
+
+                    - The value for the revocation reason extension.
+
+                type: str
+
+                choices:
+
+                    - unspecified
+
+                    - key_compromise
+
+                    - ca_compromise
+
+                    - affiliation_changed
+
+                    - superseded
+
+                    - cessation_of_operation
+
+                    - certificate_hold
+
+                    - privilege_withdrawn
+
+                    - aa_compromise
+
+                    - remove_from_crl
+
+            reason_critical:
+
+                description:
+
+                    - Whether the revocation reason extension should be critical.
+
+                type: bool
+
+                default: no
+
+            invalidity_date:
+
+                description:
+
+                    - The point in time it was known/suspected that the private key was compromised
+
+                      or that the certificate otherwise became invalid.
+
+                    - Time can be specified either as relative time or as absolute timestamp.
+
+                    - Time will always be interpreted as UTC.
+
+                    - Valid format is C([+-]timespec | ASN.1 TIME) where timespec can be an integer
+
+                      + C([w | d | h | m | s]) (e.g. C(+32w1d2h).
+
+                    - Note that if using relative time this module is NOT idempotent. This will NOT
+
+                      change when I(ignore_timestamps) is set to C(yes).
+
+                type: str
+
+            invalidity_date_critical:
+
+                description:
+
+                    - Whether the invalidity date extension should be critical.
+
+                type: bool
+
+                default: no
+
+
+
+    ignore_timestamps:
+
+        description:
+
+            - Whether the timestamps I(last_update), I(next_update) and I(revocation_date) (in
+
+              I(revoked_certificates)) should be ignored for idempotency checks. The timestamp
+
+              I(invalidity_date) in I(revoked_certificates) will never be ignored.
+
+            - Use this in combination with relative timestamps for these values to get idempotency.
+
+        type: bool
+
+        default: no
+
+
+
+    return_content:
+
+        description:
+
+            - If set to C(yes), will return the (current or generated) CRL's content as I(crl).
+
+        type: bool
+
+        default: no
+
+
+
+extends_documentation_fragment:
+
+    - files
+
+
+
+notes:
+
+    - All ASN.1 TIME values should be specified following the YYYYMMDDHHMMSSZ pattern.
+
+    - Date specified should be UTC. Minutes and seconds are mandatory.
 
 '''
 
-Miscellaneous functions of use on a TurboGears Server
 
 
+EXAMPLES = r'''
 
-.. versionchanged:: 0.3.14
+- name: Generate a CRL
 
-   Save the original turbogears.url function as :func:`fedora.tg.util.tg_url`
+  community.crypto.x509_crl:
 
+    path: /etc/ssl/my-ca.crl
 
+    privatekey_path: /etc/ssl/private/my-ca.pem
 
-.. versionchanged:: 0.3.17
+    issuer:
 
-   Renamed from fedora.tg.util
+      CN: My CA
 
+    last_update: "+0s"
 
+    next_update: "+7d"
 
-.. versionchanged:: 0.3.25
+    revoked_certificates:
 
-   Renamed from fedora.tg.tg1utils
+      - serial_number: 1234
 
+        revocation_date: 20190331202428Z
 
+        issuer:
 
-.. moduleauthor:: Toshio Kuratomi <tkuratom@redhat.com>
+          CN: My CA
 
-.. moduleauthor:: Ricky Zhou <ricky@fedoraproject.org>
+      - serial_number: 2345
+
+        revocation_date: 20191013152910Z
+
+        reason: affiliation_changed
+
+        invalidity_date: 20191001000000Z
+
+      - path: /etc/ssl/crt/revoked-cert.pem
+
+        revocation_date: 20191010010203Z
 
 '''
 
-from itertools import chain
 
-import cgi
+
+RETURN = r'''
+
+filename:
+
+    description: Path to the generated CRL
+
+    returned: changed or success
+
+    type: str
+
+    sample: /path/to/my-ca.crl
+
+backup_file:
+
+    description: Name of backup file created.
+
+    returned: changed and if I(backup) is C(yes)
+
+    type: str
+
+    sample: /path/to/my-ca.crl.2019-03-09@11:22~
+
+privatekey:
+
+    description: Path to the private CA key
+
+    returned: changed or success
+
+    type: str
+
+    sample: /path/to/my-ca.pem
+
+format:
+
+    description:
+
+        - Whether the CRL is in PEM format (C(pem)) or in DER format (C(der)).
+
+    returned: success
+
+    type: str
+
+    sample: pem
+
+issuer:
+
+    description:
+
+        - The CRL's issuer.
+
+        - Note that for repeated values, only the last one will be returned.
+
+    returned: success
+
+    type: dict
+
+    sample: '{"organizationName": "Ansible", "commonName": "ca.example.com"}'
+
+issuer_ordered:
+
+    description: The CRL's issuer as an ordered list of tuples.
+
+    returned: success
+
+    type: list
+
+    elements: list
+
+    sample: '[["organizationName", "Ansible"], ["commonName": "ca.example.com"]]'
+
+last_update:
+
+    description: The point in time from which this CRL can be trusted as ASN.1 TIME.
+
+    returned: success
+
+    type: str
+
+    sample: 20190413202428Z
+
+next_update:
+
+    description: The point in time from which a new CRL will be issued and the client has to check for it as ASN.1 TIME.
+
+    returned: success
+
+    type: str
+
+    sample: 20190413202428Z
+
+digest:
+
+    description: The signature algorithm used to sign the CRL.
+
+    returned: success
+
+    type: str
+
+    sample: sha256WithRSAEncryption
+
+revoked_certificates:
+
+    description: List of certificates to be revoked.
+
+    returned: success
+
+    type: list
+
+    elements: dict
+
+    contains:
+
+        serial_number:
+
+            description: Serial number of the certificate.
+
+            type: int
+
+            sample: 1234
+
+        revocation_date:
+
+            description: The point in time the certificate was revoked as ASN.1 TIME.
+
+            type: str
+
+            sample: 20190413202428Z
+
+        issuer:
+
+            description: The certificate's issuer.
+
+            type: list
+
+            elements: str
+
+            sample: '["DNS:ca.example.org"]'
+
+        issuer_critical:
+
+            description: Whether the certificate issuer extension is critical.
+
+            type: bool
+
+            sample: no
+
+        reason:
+
+            description:
+
+                - The value for the revocation reason extension.
+
+                - One of C(unspecified), C(key_compromise), C(ca_compromise), C(affiliation_changed), C(superseded),
+
+                  C(cessation_of_operation), C(certificate_hold), C(privilege_withdrawn), C(aa_compromise), and
+
+                  C(remove_from_crl).
+
+            type: str
+
+            sample: key_compromise
+
+        reason_critical:
+
+            description: Whether the revocation reason extension is critical.
+
+            type: bool
+
+            sample: no
+
+        invalidity_date:
+
+            description: |
+
+                The point in time it was known/suspected that the private key was compromised
+
+                or that the certificate otherwise became invalid as ASN.1 TIME.
+
+            type: str
+
+            sample: 20190413202428Z
+
+        invalidity_date_critical:
+
+            description: Whether the invalidity date extension is critical.
+
+            type: bool
+
+            sample: no
+
+crl:
+
+    description:
+
+        - The (current or generated) CRL's content.
+
+        - Will be the CRL itself if I(format) is C(pem), and Base64 of the
+
+          CRL if I(format) is C(der).
+
+    returned: if I(state) is C(present) and I(return_content) is C(yes)
+
+    type: str
+
+'''
+
+
+
+
+
+import base64
 
 import os
 
+import traceback
 
 
-import cherrypy
 
-from cherrypy import request
+from distutils.version import LooseVersion
 
-from decorator import decorator
 
-import pkg_resources
 
-import turbogears
+from ansible.module_utils.basic import AnsibleModule, missing_required_lib
 
-from turbogears import flash, redirect, config, identity
+from ansible.module_utils._text import to_native, to_text
 
-import turbogears.util as tg_util
 
-from turbogears.controllers import check_app_root
 
-from turbogears.identity.exceptions import RequestRequiredException
+from ansible_collections.community.crypto.plugins.module_utils.io import (
 
-import six
+    write_file,
 
-from six.moves.urllib.parse import urlencode, urlparse, urlunparse
+)
 
 
 
+from ansible_collections.community.crypto.plugins.module_utils.crypto.basic import (
 
+    OpenSSLObjectError,
 
-# Save this for people who need the original url() function
+    OpenSSLBadPassphraseError,
 
-tg_url = turbogears.url
+)
 
 
 
+from ansible_collections.community.crypto.plugins.module_utils.crypto.support import (
 
+    OpenSSLObject,
 
-def add_custom_stdvars(new_vars):
+    load_privatekey,
 
-    return new_vars.update({'fedora_template': fedora_template})
+    load_certificate,
 
+    parse_name_field,
 
+    get_relative_time_option,
 
+    select_message_digest,
 
+)
 
-def url(tgpath, tgparams=None, **kwargs):
 
-    '''Computes URLs.
 
+from ansible_collections.community.crypto.plugins.module_utils.crypto.cryptography_support import (
 
+    cryptography_get_name,
 
-    This is a replacement for :func:`turbogears.controllers.url` (aka
+    cryptography_name_to_oid,
 
-    :func:`tg.url` in the template).  In addition to the functionality that
+    cryptography_oid_to_name,
 
-    :func:`tg.url` provides, it adds a token to prevent :term:`CSRF` attacks.
+    cryptography_serial_number_of_cert,
 
+)
 
 
-    :arg tgpath:  a list or a string. If the path is absolute (starts
 
-        with a "/"), the :attr:`server.webpath`, :envvar:`SCRIPT_NAME` and
+from ansible_collections.community.crypto.plugins.module_utils.crypto.cryptography_crl import (
 
-        the approot of the application are prepended to the path. In order for
+    REVOCATION_REASON_MAP,
 
-        the approot to be detected properly, the root object should extend
+    TIMESTAMP_FORMAT,
 
-        :class:`turbogears.controllers.RootController`.
+    cryptography_decode_revoked_certificate,
 
-    :kwarg tgparams: See param: ``kwargs``
+    cryptography_dump_revoked,
 
-    :kwarg kwargs: Query parameters for the URL can be passed in as a
+    cryptography_get_signature_algorithm_oid_from_crl,
 
-        dictionary in the second argument *or* as keyword parameters.
+)
 
-        Values which are a list or a tuple are used to create multiple
 
-        key-value pairs.
 
-    :returns: The changed path
+from ansible_collections.community.crypto.plugins.module_utils.crypto.identify import (
 
+    identify_pem_format,
 
+)
 
-    .. versionadded:: 0.3.10
 
-       Modified from turbogears.controllers.url for :ref:`CSRF-Protection`
 
-    '''
+MINIMAL_CRYPTOGRAPHY_VERSION = '1.2'
 
-    if not isinstance(tgpath, six.string_types):
 
-        tgpath = '/'.join(list(tgpath))
 
-    if tgpath.startswith('/'):
+CRYPTOGRAPHY_IMP_ERR = None
 
-        webpath = (config.get('server.webpath') or '').rstrip('/')
+try:
 
-        if tg_util.request_available():
+    import cryptography
 
-            check_app_root()
+    from cryptography import x509
 
-            tgpath = request.app_root + tgpath
+    from cryptography.hazmat.backends import default_backend
 
-            try:
+    from cryptography.hazmat.primitives.serialization import Encoding
 
-                webpath += request.wsgi_environ['SCRIPT_NAME'].rstrip('/')
+    from cryptography.x509 import (
 
-            except (AttributeError, KeyError):  # pylint: disable-msg=W0704
+        CertificateRevocationListBuilder,
 
-                # :W0704: Lack of wsgi environ is fine... we still have
+        RevokedCertificateBuilder,
 
-                # server.webpath
+        NameAttribute,
 
-                pass
+        Name,
 
-        tgpath = webpath + tgpath
+    )
 
-    if tgparams is None:
+    CRYPTOGRAPHY_VERSION = LooseVersion(cryptography.__version__)
 
-        tgparams = kwargs
+except ImportError:
 
-    else:
+    CRYPTOGRAPHY_IMP_ERR = traceback.format_exc()
+
+    CRYPTOGRAPHY_FOUND = False
+
+else:
+
+    CRYPTOGRAPHY_FOUND = True
+
+
+
+
+
+class CRLError(OpenSSLObjectError):
+
+    pass
+
+
+
+
+
+class CRL(OpenSSLObject):
+
+
+
+    def __init__(self, module):
+
+        super(CRL, self).__init__(
+
+            module.params['path'],
+
+            module.params['state'],
+
+            module.params['force'],
+
+            module.check_mode
+
+        )
+
+
+
+        self.format = module.params['format']
+
+
+
+        self.update = module.params['mode'] == 'update'
+
+        self.ignore_timestamps = module.params['ignore_timestamps']
+
+        self.return_content = module.params['return_content']
+
+        self.crl_content = None
+
+
+
+        self.privatekey_path = module.params['privatekey_path']
+
+        self.privatekey_content = module.params['privatekey_content']
+
+        if self.privatekey_content is not None:
+
+            self.privatekey_content = self.privatekey_content.encode('utf-8')
+
+        self.privatekey_passphrase = module.params['privatekey_passphrase']
+
+
+
+        self.issuer = parse_name_field(module.params['issuer'])
+
+        self.issuer = [(entry[0], entry[1]) for entry in self.issuer if entry[1]]
+
+
+
+        self.last_update = get_relative_time_option(module.params['last_update'], 'last_update')
+
+        self.next_update = get_relative_time_option(module.params['next_update'], 'next_update')
+
+
+
+        self.digest = select_message_digest(module.params['digest'])
+
+        if self.digest is None:
+
+            raise CRLError('The digest "{0}" is not supported'.format(module.params['digest']))
+
+
+
+        self.revoked_certificates = []
+
+        for i, rc in enumerate(module.params['revoked_certificates']):
+
+            result = {
+
+                'serial_number': None,
+
+                'revocation_date': None,
+
+                'issuer': None,
+
+                'issuer_critical': False,
+
+                'reason': None,
+
+                'reason_critical': False,
+
+                'invalidity_date': None,
+
+                'invalidity_date_critical': False,
+
+            }
+
+            path_prefix = 'revoked_certificates[{0}].'.format(i)
+
+            if rc['path'] is not None or rc['content'] is not None:
+
+                # Load certificate from file or content
+
+                try:
+
+                    if rc['content'] is not None:
+
+                        rc['content'] = rc['content'].encode('utf-8')
+
+                    cert = load_certificate(rc['path'], content=rc['content'], backend='cryptography')
+
+                    result['serial_number'] = cryptography_serial_number_of_cert(cert)
+
+                except OpenSSLObjectError as e:
+
+                    if rc['content'] is not None:
+
+                        module.fail_json(
+
+                            msg='Cannot parse certificate from {0}content: {1}'.format(path_prefix, to_native(e))
+
+                        )
+
+                    else:
+
+                        module.fail_json(
+
+                            msg='Cannot read certificate "{1}" from {0}path: {2}'.format(path_prefix, rc['path'], to_native(e))
+
+                        )
+
+            else:
+
+                # Specify serial_number (and potentially issuer) directly
+
+                result['serial_number'] = rc['serial_number']
+
+            # All other options
+
+            if rc['issuer']:
+
+                result['issuer'] = [cryptography_get_name(issuer) for issuer in rc['issuer']]
+
+                result['issuer_critical'] = rc['issuer_critical']
+
+            result['revocation_date'] = get_relative_time_option(
+
+                rc['revocation_date'],
+
+                path_prefix + 'revocation_date'
+
+            )
+
+            if rc['reason']:
+
+                result['reason'] = REVOCATION_REASON_MAP[rc['reason']]
+
+                result['reason_critical'] = rc['reason_critical']
+
+            if rc['invalidity_date']:
+
+                result['invalidity_date'] = get_relative_time_option(
+
+                    rc['invalidity_date'],
+
+                    path_prefix + 'invalidity_date'
+
+                )
+
+                result['invalidity_date_critical'] = rc['invalidity_date_critical']
+
+            self.revoked_certificates.append(result)
+
+
+
+        self.module = module
+
+
+
+        self.backup = module.params['backup']
+
+        self.backup_file = None
+
+
 
         try:
 
-            tgparams = tgparams.copy()
+            self.privatekey = load_privatekey(
 
-            tgparams.update(kwargs)
+                path=self.privatekey_path,
 
-        except AttributeError:
+                content=self.privatekey_content,
 
-            raise TypeError(
+                passphrase=self.privatekey_passphrase,
 
-                'url() expects a dictionary for query parameters')
+                backend='cryptography'
 
-    args = []
+            )
 
-    # Add the _csrf_token
+        except OpenSSLBadPassphraseError as exc:
+
+            raise CRLError(exc)
+
+
+
+        self.crl = None
+
+        try:
+
+            with open(self.path, 'rb') as f:
+
+                data = f.read()
+
+            self.actual_format = 'pem' if identify_pem_format(data) else 'der'
+
+            if self.actual_format == 'pem':
+
+                self.crl = x509.load_pem_x509_crl(data, default_backend())
+
+                if self.return_content:
+
+                    self.crl_content = data
+
+            else:
+
+                self.crl = x509.load_der_x509_crl(data, default_backend())
+
+                if self.return_content:
+
+                    self.crl_content = base64.b64encode(data)
+
+        except Exception as dummy:
+
+            self.crl_content = None
+
+            self.actual_format = self.format
+
+
+
+    def remove(self):
+
+        if self.backup:
+
+            self.backup_file = self.module.backup_local(self.path)
+
+        super(CRL, self).remove(self.module)
+
+
+
+    def _compress_entry(self, entry):
+
+        if self.ignore_timestamps:
+
+            # Throw out revocation_date
+
+            return (
+
+                entry['serial_number'],
+
+                tuple(entry['issuer']) if entry['issuer'] is not None else None,
+
+                entry['issuer_critical'],
+
+                entry['reason'],
+
+                entry['reason_critical'],
+
+                entry['invalidity_date'],
+
+                entry['invalidity_date_critical'],
+
+            )
+
+        else:
+
+            return (
+
+                entry['serial_number'],
+
+                entry['revocation_date'],
+
+                tuple(entry['issuer']) if entry['issuer'] is not None else None,
+
+                entry['issuer_critical'],
+
+                entry['reason'],
+
+                entry['reason_critical'],
+
+                entry['invalidity_date'],
+
+                entry['invalidity_date_critical'],
+
+            )
+
+
+
+    def check(self, perms_required=True, ignore_conversion=True):
+
+        """Ensure the resource is in its desired state."""
+
+
+
+        state_and_perms = super(CRL, self).check(self.module, perms_required)
+
+
+
+        if not state_and_perms:
+
+            return False
+
+
+
+        if self.crl is None:
+
+            return False
+
+
+
+        if self.last_update != self.crl.last_update and not self.ignore_timestamps:
+
+            return False
+
+        if self.next_update != self.crl.next_update and not self.ignore_timestamps:
+
+            return False
+
+        if self.digest.name != self.crl.signature_hash_algorithm.name:
+
+            return False
+
+
+
+        want_issuer = [(cryptography_name_to_oid(entry[0]), entry[1]) for entry in self.issuer]
+
+        if want_issuer != [(sub.oid, sub.value) for sub in self.crl.issuer]:
+
+            return False
+
+
+
+        old_entries = [self._compress_entry(cryptography_decode_revoked_certificate(cert)) for cert in self.crl]
+
+        new_entries = [self._compress_entry(cert) for cert in self.revoked_certificates]
+
+        if self.update:
+
+            # We don't simply use a set so that duplicate entries are treated correctly
+
+            for entry in new_entries:
+
+                try:
+
+                    old_entries.remove(entry)
+
+                except ValueError:
+
+                    return False
+
+        else:
+
+            if old_entries != new_entries:
+
+                return False
+
+
+
+        if self.format != self.actual_format and not ignore_conversion:
+
+            return False
+
+
+
+        return True
+
+
+
+    def _generate_crl(self):
+
+        backend = default_backend()
+
+        crl = CertificateRevocationListBuilder()
+
+
+
+        try:
+
+            crl = crl.issuer_name(Name([
+
+                NameAttribute(cryptography_name_to_oid(entry[0]), to_text(entry[1]))
+
+                for entry in self.issuer
+
+            ]))
+
+        except ValueError as e:
+
+            raise CRLError(e)
+
+
+
+        crl = crl.last_update(self.last_update)
+
+        crl = crl.next_update(self.next_update)
+
+
+
+        if self.update and self.crl:
+
+            new_entries = set([self._compress_entry(entry) for entry in self.revoked_certificates])
+
+            for entry in self.crl:
+
+                decoded_entry = self._compress_entry(cryptography_decode_revoked_certificate(entry))
+
+                if decoded_entry not in new_entries:
+
+                    crl = crl.add_revoked_certificate(entry)
+
+        for entry in self.revoked_certificates:
+
+            revoked_cert = RevokedCertificateBuilder()
+
+            revoked_cert = revoked_cert.serial_number(entry['serial_number'])
+
+            revoked_cert = revoked_cert.revocation_date(entry['revocation_date'])
+
+            if entry['issuer'] is not None:
+
+                revoked_cert = revoked_cert.add_extension(
+
+                    x509.CertificateIssuer([
+
+                        cryptography_get_name(name) for name in entry['issuer']
+
+                    ]),
+
+                    entry['issuer_critical']
+
+                )
+
+            if entry['reason'] is not None:
+
+                revoked_cert = revoked_cert.add_extension(
+
+                    x509.CRLReason(entry['reason']),
+
+                    entry['reason_critical']
+
+                )
+
+            if entry['invalidity_date'] is not None:
+
+                revoked_cert = revoked_cert.add_extension(
+
+                    x509.InvalidityDate(entry['invalidity_date']),
+
+                    entry['invalidity_date_critical']
+
+                )
+
+            crl = crl.add_revoked_certificate(revoked_cert.build(backend))
+
+
+
+        self.crl = crl.sign(self.privatekey, self.digest, backend=backend)
+
+        if self.format == 'pem':
+
+            return self.crl.public_bytes(Encoding.PEM)
+
+        else:
+
+            return self.crl.public_bytes(Encoding.DER)
+
+
+
+    def generate(self):
+
+        result = None
+
+        if not self.check(perms_required=False, ignore_conversion=True) or self.force:
+
+            result = self._generate_crl()
+
+        elif not self.check(perms_required=False, ignore_conversion=False) and self.crl:
+
+            if self.format == 'pem':
+
+                result = self.crl.public_bytes(Encoding.PEM)
+
+            else:
+
+                result = self.crl.public_bytes(Encoding.DER)
+
+
+
+        if result is not None:
+
+            if self.return_content:
+
+                if self.format == 'pem':
+
+                    self.crl_content = result
+
+                else:
+
+                    self.crl_content = base64.b64encode(result)
+
+            if self.backup:
+
+                self.backup_file = self.module.backup_local(self.path)
+
+            write_file(self.module, result)
+
+            self.changed = True
+
+
+
+        file_args = self.module.load_file_common_arguments(self.module.params)
+
+        if self.module.set_fs_attributes_if_different(file_args, False):
+
+            self.changed = True
+
+
+
+    def dump(self, check_mode=False):
+
+        result = {
+
+            'changed': self.changed,
+
+            'filename': self.path,
+
+            'privatekey': self.privatekey_path,
+
+            'format': self.format,
+
+            'last_update': None,
+
+            'next_update': None,
+
+            'digest': None,
+
+            'issuer_ordered': None,
+
+            'issuer': None,
+
+            'revoked_certificates': [],
+
+        }
+
+        if self.backup_file:
+
+            result['backup_file'] = self.backup_file
+
+
+
+        if check_mode:
+
+            result['last_update'] = self.last_update.strftime(TIMESTAMP_FORMAT)
+
+            result['next_update'] = self.next_update.strftime(TIMESTAMP_FORMAT)
+
+            # result['digest'] = cryptography_oid_to_name(self.crl.signature_algorithm_oid)
+
+            result['digest'] = self.module.params['digest']
+
+            result['issuer_ordered'] = self.issuer
+
+            result['issuer'] = {}
+
+            for k, v in self.issuer:
+
+                result['issuer'][k] = v
+
+            result['revoked_certificates'] = []
+
+            for entry in self.revoked_certificates:
+
+                result['revoked_certificates'].append(cryptography_dump_revoked(entry))
+
+        elif self.crl:
+
+            result['last_update'] = self.crl.last_update.strftime(TIMESTAMP_FORMAT)
+
+            result['next_update'] = self.crl.next_update.strftime(TIMESTAMP_FORMAT)
+
+            result['digest'] = cryptography_oid_to_name(cryptography_get_signature_algorithm_oid_from_crl(self.crl))
+
+            issuer = []
+
+            for attribute in self.crl.issuer:
+
+                issuer.append([cryptography_oid_to_name(attribute.oid), attribute.value])
+
+            result['issuer_ordered'] = issuer
+
+            result['issuer'] = {}
+
+            for k, v in issuer:
+
+                result['issuer'][k] = v
+
+            result['revoked_certificates'] = []
+
+            for cert in self.crl:
+
+                entry = cryptography_decode_revoked_certificate(cert)
+
+                result['revoked_certificates'].append(cryptography_dump_revoked(entry))
+
+
+
+        if self.return_content:
+
+            result['crl'] = self.crl_content
+
+
+
+        return result
+
+
+
+
+
+def main():
+
+    module = AnsibleModule(
+
+        argument_spec=dict(
+
+            state=dict(type='str', default='present', choices=['present', 'absent']),
+
+            mode=dict(type='str', default='generate', choices=['generate', 'update']),
+
+            force=dict(type='bool', default=False),
+
+            backup=dict(type='bool', default=False),
+
+            path=dict(type='path', required=True),
+
+            format=dict(type='str', default='pem', choices=['pem', 'der']),
+
+            privatekey_path=dict(type='path'),
+
+            privatekey_content=dict(type='str'),
+
+            privatekey_passphrase=dict(type='str', no_log=True),
+
+            issuer=dict(type='dict'),
+
+            last_update=dict(type='str', default='+0s'),
+
+            next_update=dict(type='str'),
+
+            digest=dict(type='str', default='sha256'),
+
+            ignore_timestamps=dict(type='bool', default=False),
+
+            return_content=dict(type='bool', default=False),
+
+            revoked_certificates=dict(
+
+                type='list',
+
+                elements='dict',
+
+                options=dict(
+
+                    path=dict(type='path'),
+
+                    content=dict(type='str'),
+
+                    serial_number=dict(type='int'),
+
+                    revocation_date=dict(type='str', default='+0s'),
+
+                    issuer=dict(type='list', elements='str'),
+
+                    issuer_critical=dict(type='bool', default=False),
+
+                    reason=dict(
+
+                        type='str',
+
+                        choices=[
+
+                            'unspecified', 'key_compromise', 'ca_compromise', 'affiliation_changed',
+
+                            'superseded', 'cessation_of_operation', 'certificate_hold',
+
+                            'privilege_withdrawn', 'aa_compromise', 'remove_from_crl'
+
+                        ]
+
+                    ),
+
+                    reason_critical=dict(type='bool', default=False),
+
+                    invalidity_date=dict(type='str'),
+
+                    invalidity_date_critical=dict(type='bool', default=False),
+
+                ),
+
+                required_one_of=[['path', 'content', 'serial_number']],
+
+                mutually_exclusive=[['path', 'content', 'serial_number']],
+
+            ),
+
+        ),
+
+        required_if=[
+
+            ('state', 'present', ['privatekey_path', 'privatekey_content'], True),
+
+            ('state', 'present', ['issuer', 'next_update', 'revoked_certificates'], False),
+
+        ],
+
+        mutually_exclusive=(
+
+            ['privatekey_path', 'privatekey_content'],
+
+        ),
+
+        supports_check_mode=True,
+
+        add_file_common_args=True,
+
+    )
+
+
+
+    if not CRYPTOGRAPHY_FOUND:
+
+        module.fail_json(msg=missing_required_lib('cryptography >= {0}'.format(MINIMAL_CRYPTOGRAPHY_VERSION)),
+
+                         exception=CRYPTOGRAPHY_IMP_ERR)
+
+
 
     try:
 
-        if identity.current.csrf_token:
-
-            tgparams.update({'_csrf_token': identity.current.csrf_token})
-
-    except RequestRequiredException:  # pylint: disable-msg=W0704
-
-        # :W0704: If we are outside of a request (called from non-controller
-
-        # methods/ templates) just don't set the _csrf_token.
-
-        pass
+        crl = CRL(module)
 
 
 
-    # Check for query params in the current url
+        if module.params['state'] == 'present':
 
-    query_params = six.iteritems(tgparams)
+            if module.check_mode:
 
-    scheme, netloc, path, params, query_s, fragment = urlparse(tgpath)
+                result = crl.dump(check_mode=True)
 
-    if query_s:
+                result['changed'] = module.params['force'] or not crl.check() or not crl.check(ignore_conversion=False)
 
-        query_params = chain((p for p in cgi.parse_qsl(query_s) if p[0] !=
-
-                              '_csrf_token'), query_params)
+                module.exit_json(**result)
 
 
 
-    for key, value in query_params:
-
-        if value is None:
-
-            continue
-
-        if isinstance(value, (list, tuple)):
-
-            pairs = [(key, v) for v in value]
+            crl.generate()
 
         else:
 
-            pairs = [(key, value)]
+            if module.check_mode:
 
-        for key, value in pairs:
+                result = crl.dump(check_mode=True)
 
-            if value is None:
+                result['changed'] = os.path.exists(module.params['path'])
 
-                continue
+                module.exit_json(**result)
 
-            if isinstance(value, unicode):
 
-                value = value.encode('utf8')
 
-            args.append((key, str(value)))
+            crl.remove()
 
-    query_string = urlencode(args, True)
 
-    tgpath = urlunparse((scheme, netloc, path, params, query_string, fragment))
 
-    return tgpath
+        result = crl.dump()
 
+        module.exit_json(**result)
 
+    except OpenSSLObjectError as exc:
 
+        module.fail_json(msg=to_native(exc))
 
 
-# this is taken from turbogears 1.1 branch
 
-def _get_server_name():
 
-    """Return name of the server this application runs on.
 
+if __name__ == "__main__":
 
-
-    Respects 'Host' and 'X-Forwarded-Host' header.
-
-
-
-    See the docstring of the 'absolute_url' function for more information.
-
-
-
-    .. note:: This comes from turbogears 1.1 branch.  It is only needed for
-
-        _tg_absolute_url().  If we find that turbogears.get_server_name()
-
-        exists, we replace this function with that one.
-
-    """
-
-    get = config.get
-
-    h = request.headers
-
-    host = get('tg.url_domain') or h.get('X-Forwarded-Host', h.get('Host'))
-
-    if not host:
-
-        host = '%s:%s' % (get('server.socket_host', 'localhost'),
-
-                          get('server.socket_port', 8080))
-
-    return host
-
-
-
-
-
-# this is taken from turbogears 1.1 branch
-
-def tg_absolute_url(tgpath='/', params=None, **kw):
-
-    """Return absolute URL (including schema and host to this server).
-
-
-
-    Tries to account for 'Host' header and reverse proxying
-
-    ('X-Forwarded-Host').
-
-
-
-    The host name is determined this way:
-
-
-
-    * If the config setting 'tg.url_domain' is set and non-null, use this
-
-      value.
-
-    * Else, if the 'base_url_filter.use_x_forwarded_host' config setting is
-
-      True, use the value from the 'Host' or 'X-Forwarded-Host' request header.
-
-    * Else, if config setting 'base_url_filter.on' is True and
-
-      'base_url_filter.base_url' is non-null, use its value for the host AND
-
-      scheme part of the URL.
-
-    * As a last fallback, use the value of 'server.socket_host' and
-
-      'server.socket_port' config settings (defaults to 'localhost:8080').
-
-
-
-    The URL scheme ('http' or 'http') used is determined in the following way:
-
-
-
-    * If 'base_url_filter.base_url' is used, use the scheme from this URL.
-
-    * If there is a 'X-Use-SSL' request header, use 'https'.
-
-    * Else, if the config setting 'tg.url_scheme' is set, use its value.
-
-    * Else, use the value of 'cherrypy.request.scheme'.
-
-
-
-    .. note:: This comes from turbogears 1.1 branch with one change: we
-
-        call tg_url() rather than turbogears.url() so that it never adds the
-
-        csrf_token
-
-
-
-    .. versionadded:: 0.3.19
-
-       Modified from turbogears.absolute_url() for :ref:`CSRF-Protection`
-
-    """
-
-    get = config.get
-
-    use_xfh = get('base_url_filter.use_x_forwarded_host', False)
-
-    if request.headers.get('X-Use-SSL'):
-
-        scheme = 'https'
-
-    else:
-
-        scheme = get('tg.url_scheme')
-
-    if not scheme:
-
-        scheme = request.scheme
-
-    base_url = '%s://%s' % (scheme, _get_server_name())
-
-    if get('base_url_filter.on', False) and not use_xfh:
-
-        base_url = get('base_url_filter.base_url').rstrip('/')
-
-    return '%s%s' % (base_url, tg_url(tgpath, params, **kw))
-
-
-
-
-
-def absolute_url(tgpath='/', params=None, **kw):
-
-    """Return absolute URL (including schema and host to this server).
-
-
-
-    Tries to account for 'Host' header and reverse proxying
-
-    ('X-Forwarded-Host').
-
-
-
-    The host name is determined this way:
-
-
-
-    * If the config setting 'tg.url_domain' is set and non-null, use this
-
-      value.
-
-    * Else, if the 'base_url_filter.use_x_forwarded_host' config setting is
-
-      True, use the value from the 'Host' or 'X-Forwarded-Host' request header.
-
-    * Else, if config setting 'base_url_filter.on' is True and
-
-      'base_url_filter.base_url' is non-null, use its value for the host AND
-
-      scheme part of the URL.
-
-    * As a last fallback, use the value of 'server.socket_host' and
-
-      'server.socket_port' config settings (defaults to 'localhost:8080').
-
-
-
-    The URL scheme ('http' or 'http') used is determined in the following way:
-
-
-
-    * If 'base_url_filter.base_url' is used, use the scheme from this URL.
-
-    * If there is a 'X-Use-SSL' request header, use 'https'.
-
-    * Else, if the config setting 'tg.url_scheme' is set, use its value.
-
-    * Else, use the value of 'cherrypy.request.scheme'.
-
-
-
-    .. versionadded:: 0.3.19
-
-       Modified from turbogears.absolute_url() for :ref:`CSRF-Protection`
-
-    """
-
-    return url(tg_absolute_url(tgpath, params, **kw))
-
-
-
-
-
-def enable_csrf():
-
-    '''A startup function to setup :ref:`CSRF-Protection`.
-
-
-
-    This should be run at application startup.  Code like the following in the
-
-    start-APP script or the method in :file:`commands.py` that starts it::
-
-
-
-        from turbogears import startup
-
-        from fedora.tg.util import enable_csrf
-
-        startup.call_on_startup.append(enable_csrf)
-
-
-
-    If we can get the :ref:`CSRF-Protection` into upstream :term:`TurboGears`,
-
-    we might be able to remove this in the future.
-
-
-
-    .. versionadded:: 0.3.10
-
-       Added to enable :ref:`CSRF-Protection`
-
-    '''
-
-    # Override the turbogears.url function with our own
-
-    # Note, this also changes turbogears.absolute_url since that calls
-
-    # turbogears.url
-
-    turbogears.url = url
-
-    turbogears.controllers.url = url
-
-
-
-    # Ignore the _csrf_token parameter
-
-    ignore = config.get('tg.ignore_parameters', [])
-
-    if '_csrf_token' not in ignore:
-
-        ignore.append('_csrf_token')
-
-        config.update({'tg.ignore_parameters': ignore})
-
-
-
-    # Add a function to the template tg stdvars that looks up a template.
-
-    turbogears.view.variable_providers.append(add_custom_stdvars)
-
-
-
-
-
-def request_format():
-
-    '''Return the output format that was requested by the user.
-
-
-
-    The user is able to specify a specific output format using either the
-
-    ``Accept:`` HTTP header or the ``tg_format`` query parameter.  This
-
-    function checks both of those to determine what format the reply should
-
-    be in.
-
-
-
-    :rtype: string
-
-    :returns: The requested format.  If none was specified, 'default' is
-
-        returned
-
-
-
-    .. versionchanged:: 0.3.17
-
-        Return symbolic names for json, html, xhtml, and xml instead of
-
-        letting raw mime types through
-
-    '''
-
-    output_format = cherrypy.request.params.get('tg_format', '').lower()
-
-    if not output_format:
-
-        ### TODO: Two problems with this:
-
-        # 1) TG lets this be extended via as_format and accept_format.  We need
-
-        #    tie into that as well somehow.
-
-        # 2) Decide whether to standardize on "json" or "application/json"
-
-        accept = tg_util.simplify_http_accept_header(
-
-            request.headers.get('Accept', 'default').lower())
-
-        if accept in ('text/javascript', 'application/json'):
-
-            output_format = 'json'
-
-        elif accept == 'text/html':
-
-            output_format = 'html'
-
-        elif accept == 'text/plain':
-
-            output_format = 'plain'
-
-        elif accept == 'text/xhtml':
-
-            output_format = 'xhtml'
-
-        elif accept == 'text/xml':
-
-            output_format = 'xml'
-
-        else:
-
-            output_format = accept
-
-    return output_format
-
-
-
-
-
-def jsonify_validation_errors():
-
-    '''Return an error for :term:`JSON` if validation failed.
-
-
-
-    This function checks for two things:
-
-
-
-    1) We're expected to return :term:`JSON` data.
-
-    2) There were errors in the validation process.
-
-
-
-    If both of those are true, this function constructs a response that
-
-    will return the validation error messages as :term:`JSON` data.
-
-
-
-    All controller methods that are error_handlers need to use this::
-
-
-
-        @expose(template='templates.numberform')
-
-        def enter_number(self, number):
-
-            errors = fedora.tg.util.jsonify_validation_errors()
-
-            if errors:
-
-                return errors
-
-            [...]
-
-
-
-        @expose(allow_json=True)
-
-        @error_handler(enter_number)
-
-        @validate(form=number_form)
-
-        def save(self, number):
-
-            return dict(success=True)
-
-
-
-    :rtype: None or dict
-
-    :Returns: None if there are no validation errors or :term:`JSON` isn't
-
-        requested, otherwise a dictionary with the error that's suitable for
-
-        return from the controller.  The error message is set in tg_flash
-
-        whether :term:`JSON` was requested or not.
-
-    '''
-
-    # Check for validation errors
-
-    errors = getattr(cherrypy.request, 'validation_errors', None)
-
-    if not errors:
-
-        return None
-
-
-
-    # Set the message for both html and json output
-
-    message = u'\n'.join([u'%s: %s' % (param, msg) for param, msg in
-
-                          errors.items()])
-
-    format = request_format()
-
-    if format in ('html', 'xhtml'):
-
-        message.translate({ord('\n'): u'<br />\n'})
-
-    flash(message)
-
-
-
-    # If json, return additional information to make this an exception
-
-    if format == 'json':
-
-        # Note: explicit setting of tg_template is needed in TG < 1.0.4.4
-
-        # A fix has been applied for TG-1.0.4.5
-
-        return dict(exc='Invalid', tg_template='json')
-
-    return None
-
-
-
-
-
-def json_or_redirect(forward_url):
-
-    '''If :term:`JSON` is requested, return a dict, otherwise redirect.
-
-
-
-    This is a decorator to use with a method that returns :term:`JSON` by
-
-    default.  If :term:`JSON` is requested, then it will return the dict from
-
-    the method.  If :term:`JSON` is not requested, it will redirect to the
-
-    given URL.  The method that is decorated should be constructed so that it
-
-    calls turbogears.flash() with a message that will be displayed on the
-
-    forward_url page.
-
-
-
-    Use it like this::
-
-
-
-        import turbogears
-
-
-
-        @json_or_redirect('http://localhost/calc/')
-
-        @expose(allow_json=True)
-
-        def divide(self, dividend, divisor):
-
-            try:
-
-                answer = dividend * 1.0 / divisor
-
-            except ZeroDivisionError:
-
-                turbogears.flash('Division by zero not allowed')
-
-                return dict(exc='ZeroDivisionError')
-
-            turbogears.flash('The quotient is %s' % answer)
-
-            return dict(quotient=answer)
-
-
-
-    In the example, we return either an exception or an answer, using
-
-    :func:`turbogears.flash` to tell people of the result in either case.  If
-
-    :term:`JSON` data is requested, the user will get back a :term:`JSON`
-
-    string with the proper information.  If html is requested, we will be
-
-    redirected to 'http://localhost/calc/' where the flashed message will be
-
-    displayed.
-
-
-
-    :arg forward_url: If :term:`JSON` was not requested, redirect to this URL
-
-        after.
-
-
-
-    .. versionadded:: 0.3.7
-
-       To make writing methods that use validation easier
-
-    '''
-
-    def call(func, *args, **kwargs):
-
-        if request_format() == 'json':
-
-            return func(*args, **kwargs)
-
-        else:
-
-            func(*args, **kwargs)
-
-            raise redirect(forward_url)
-
-    return decorator(call)
-
-
-
-if hasattr(turbogears, 'get_server_name'):
-
-    _get_server_name = turbogears.get_server_name
-
-
-
-
-
-def fedora_template(template, template_type='genshi'):
-
-    '''Function to return the path to a template.
-
-
-
-    :arg template: filename of the template itself.  Ex: login.html
-
-    :kwarg template_type: template language we need the template written in
-
-        Defaults to 'genshi'
-
-    :returns: filesystem path to the template
-
-    '''
-
-    # :E1101: pkg_resources does have resource_filename
-
-    # pylint: disable-msg=E1101
-
-    return pkg_resources.resource_filename(
-
-        'fedora', os.path.join('tg',
-
-                               'templates', template_type, template))
-
-
-
-__all__ = (
-
-    'add_custom_stdvars', 'absolute_url', 'enable_csrf',
-
-    'fedora_template', 'jsonify_validation_errors', 'json_or_redirect',
-
-    'request_format', 'tg_absolute_url', 'tg_url', 'url')
+    main()

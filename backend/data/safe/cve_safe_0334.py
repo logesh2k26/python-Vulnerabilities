@@ -1,435 +1,373 @@
 # Source: CVEFixes dataset
-# Safety: safe
+# Safety: vulnerable
 # Category: safe
 
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
+# -*- coding: utf-8 -*-
 
+'''
 
+    feedgen.ext.media
 
-# Copyright 2010 United States Government as represented by the
+    ~~~~~~~~~~~~~~~~~
 
-# Administrator of the National Aeronautics and Space Administration.
 
-# All Rights Reserved.
 
-#
+    Extends the feedgen to produce media tags.
 
-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
 
-#    not use this file except in compliance with the License. You may obtain
 
-#    a copy of the License at
+    :copyright: 2013-2017, Lars Kiesow <lkiesow@uos.de>
 
-#
 
-#         http://www.apache.org/licenses/LICENSE-2.0
 
-#
+    :license: FreeBSD and LGPL, see license.* for more details.
 
-#    Unless required by applicable law or agreed to in writing, software
+'''
 
-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
-#    License for the specific language governing permissions and limitations
+from lxml import etree
 
-#    under the License.
 
 
+from feedgen.ext.base import BaseEntryExtension, BaseExtension
 
-"""Quotas for instances, volumes, and floating ips."""
+from feedgen.util import ensure_format
 
 
 
-from nova import db
+MEDIA_NS = 'http://search.yahoo.com/mrss/'
 
-from nova.openstack.common import cfg
 
-from nova import flags
 
 
 
+class MediaExtension(BaseExtension):
 
+    '''FeedGenerator extension for torrent feeds.
 
-quota_opts = [
+    '''
 
-    cfg.IntOpt('quota_instances',
 
-               default=10,
 
-               help='number of instances allowed per project'),
+    def extend_ns(self):
 
-    cfg.IntOpt('quota_cores',
+        return {'media': MEDIA_NS}
 
-               default=20,
 
-               help='number of instance cores allowed per project'),
 
-    cfg.IntOpt('quota_ram',
 
-               default=50 * 1024,
 
-               help='megabytes of instance ram allowed per project'),
+class MediaEntryExtension(BaseEntryExtension):
 
-    cfg.IntOpt('quota_volumes',
+    '''FeedEntry extension for media tags.
 
-               default=10,
+    '''
 
-               help='number of volumes allowed per project'),
 
-    cfg.IntOpt('quota_gigabytes',
 
-               default=1000,
+    def __init__(self):
 
-               help='number of volume gigabytes allowed per project'),
+        self.__media_content = []
 
-    cfg.IntOpt('quota_floating_ips',
+        self.__media_thumbnail = []
 
-               default=10,
 
-               help='number of floating ips allowed per project'),
 
-    cfg.IntOpt('quota_metadata_items',
+    def extend_atom(self, entry):
 
-               default=128,
+        '''Add additional fields to an RSS item.
 
-               help='number of metadata items allowed per instance'),
 
-    cfg.IntOpt('quota_max_injected_files',
 
-               default=5,
+        :param feed: The RSS item XML element to use.
 
-               help='number of injected files allowed'),
+        '''
 
-    cfg.IntOpt('quota_max_injected_file_content_bytes',
 
-               default=10 * 1024,
 
-               help='number of bytes allowed per injected file'),
+        groups = {None: entry}
 
-    cfg.IntOpt('quota_max_injected_file_path_bytes',
+        for media_content in self.__media_content:
 
-               default=255,
+            # Define current media:group
 
-               help='number of bytes allowed per injected file path'),
+            group = groups.get(media_content.get('group'))
 
-    cfg.IntOpt('quota_security_groups',
+            if group is None:
 
-               default=10,
+                group = etree.SubElement(entry, '{%s}group' % MEDIA_NS)
 
-               help='number of security groups per project'),
+                groups[media_content.get('group')] = group
 
-    cfg.IntOpt('quota_security_group_rules',
+            # Add content
 
-               default=20,
+            content = etree.SubElement(group, '{%s}content' % MEDIA_NS)
 
-               help='number of security rules per security group'),
+            for attr in ('url', 'fileSize', 'type', 'medium', 'isDefault',
 
-    ]
+                         'expression', 'bitrate', 'framerate', 'samplingrate',
 
+                         'channels', 'duration', 'height', 'width', 'lang'):
 
+                if media_content.get(attr):
 
-FLAGS = flags.FLAGS
+                    content.set(attr, media_content[attr])
 
-FLAGS.register_opts(quota_opts)
 
 
+        for media_thumbnail in self.__media_thumbnail:
 
+            # Define current media:group
 
+            group = groups.get(media_thumbnail.get('group'))
 
-def _get_default_quotas():
+            if group is None:
 
-    defaults = {
+                group = etree.SubElement(entry, '{%s}group' % MEDIA_NS)
 
-        'instances': FLAGS.quota_instances,
+                groups[media_thumbnail.get('group')] = group
 
-        'cores': FLAGS.quota_cores,
+            # Add thumbnails
 
-        'ram': FLAGS.quota_ram,
+            thumbnail = etree.SubElement(group, '{%s}thumbnail' % MEDIA_NS)
 
-        'volumes': FLAGS.quota_volumes,
+            for attr in ('url', 'height', 'width', 'time'):
 
-        'gigabytes': FLAGS.quota_gigabytes,
+                if media_thumbnail.get(attr):
 
-        'floating_ips': FLAGS.quota_floating_ips,
+                    thumbnail.set(attr, media_thumbnail[attr])
 
-        'metadata_items': FLAGS.quota_metadata_items,
 
-        'injected_files': FLAGS.quota_max_injected_files,
 
-        'injected_file_content_bytes':
+        return entry
 
-            FLAGS.quota_max_injected_file_content_bytes,
 
-        'security_groups': FLAGS.quota_security_groups,
 
-        'security_group_rules': FLAGS.quota_security_group_rules,
+    def extend_rss(self, item):
 
-    }
+        return self.extend_atom(item)
 
-    # -1 in the quota flags means unlimited
 
-    for key in defaults.keys():
 
-        if defaults[key] == -1:
+    def content(self, content=None, replace=False, group='default', **kwargs):
 
-            defaults[key] = None
+        '''Get or set media:content data.
 
-    return defaults
 
 
+        This method can be called with:
 
+        - the fields of a media:content as keyword arguments
 
+        - the fields of a media:content as a dictionary
 
-def get_project_quotas(context, project_id):
+        - a list of dictionaries containing the media:content fields
 
-    rval = _get_default_quotas()
 
-    quota = db.quota_get_all_by_project(context, project_id)
 
-    for key in rval.keys():
+        <media:content> is a sub-element of either <item> or <media:group>.
 
-        if key in quota:
+        Media objects that are not the same content should not be included in
 
-            rval[key] = quota[key]
+        the same <media:group> element. The sequence of these items implies
 
-    return rval
+        the order of presentation. While many of the attributes appear to be
 
+        audio/video specific, this element can be used to publish any type
 
+        of media. It contains 14 attributes, most of which are optional.
 
 
 
-def _get_request_allotment(requested, used, quota):
+        media:content has the following fields:
 
-    if quota is None:
+        - *url* should specify the direct URL to the media object.
 
-        return requested
+        - *fileSize* number of bytes of the media object.
 
-    return quota - used
+        - *type* standard MIME type of the object.
 
+        - *medium* type of object (image | audio | video | document |
 
+          executable).
 
+        - *isDefault* determines if this is the default object.
 
+        - *expression* determines if the object is a sample or the full version
 
-def allowed_instances(context, requested_instances, instance_type):
+          of the object, or even if it is a continuous stream (sample | full |
 
-    """Check quota and return min(requested_instances, allowed_instances)."""
+          nonstop).
 
-    project_id = context.project_id
+        - *bitrate* kilobits per second rate of media.
 
-    context = context.elevated()
+        - *framerate* number of frames per second for the media object.
 
-    requested_cores = requested_instances * instance_type['vcpus']
+        - *samplingrate* number of samples per second taken to create the media
 
-    requested_ram = requested_instances * instance_type['memory_mb']
+          object. It is expressed in thousands of samples per second (kHz).
 
-    usage = db.instance_data_get_for_project(context, project_id)
+        - *channels* number of audio channels in the media object.
 
-    used_instances, used_cores, used_ram = usage
+        - *duration* number of seconds the media object plays.
 
-    quota = get_project_quotas(context, project_id)
+        - *height* height of the media object.
 
-    allowed_instances = _get_request_allotment(requested_instances,
+        - *width* width of the media object.
 
-                                               used_instances,
+        - *lang* is the primary language encapsulated in the media object.
 
-                                               quota['instances'])
 
-    allowed_cores = _get_request_allotment(requested_cores, used_cores,
 
-                                           quota['cores'])
+        :param content: Dictionary or list of dictionaries with content data.
 
-    allowed_ram = _get_request_allotment(requested_ram, used_ram, quota['ram'])
+        :param replace: Add or replace old data.
 
-    if instance_type['vcpus']:
+        :param group: Media group to put this content in.
 
-        allowed_instances = min(allowed_instances,
 
-                                allowed_cores // instance_type['vcpus'])
 
-    if instance_type['memory_mb']:
+        :returns: The media content tag.
 
-        allowed_instances = min(allowed_instances,
+        '''
 
-                                allowed_ram // instance_type['memory_mb'])
+        # Handle kwargs
 
+        if content is None and kwargs:
 
+            content = kwargs
 
-    return min(requested_instances, allowed_instances)
+        # Handle new data
 
+        if content is not None:
 
+            # Reset data if we want to replace them
 
+            if replace or self.__media_content is None:
 
+                self.__media_content = []
 
-def allowed_volumes(context, requested_volumes, size):
+            # Ensure list
 
-    """Check quota and return min(requested_volumes, allowed_volumes)."""
+            if not isinstance(content, list):
 
-    project_id = context.project_id
+                content = [content]
 
-    context = context.elevated()
+            # define media group
 
-    size = int(size)
+            for c in content:
 
-    requested_gigabytes = requested_volumes * size
+                c['group'] = c.get('group', group)
 
-    used_volumes, used_gigabytes = db.volume_data_get_for_project(context,
+            self.__media_content += ensure_format(
 
-                                                                  project_id)
+                    content,
 
-    quota = get_project_quotas(context, project_id)
+                    set(['url', 'fileSize', 'type', 'medium', 'isDefault',
 
-    allowed_volumes = _get_request_allotment(requested_volumes, used_volumes,
+                         'expression', 'bitrate', 'framerate', 'samplingrate',
 
-                                             quota['volumes'])
+                         'channels', 'duration', 'height', 'width', 'lang',
 
-    allowed_gigabytes = _get_request_allotment(requested_gigabytes,
+                         'group']),
 
-                                               used_gigabytes,
+                    set(['url', 'group']))
 
-                                               quota['gigabytes'])
+        return self.__media_content
 
-    if size != 0:
 
-        allowed_volumes = min(allowed_volumes,
 
-                              int(allowed_gigabytes // size))
+    def thumbnail(self, thumbnail=None, replace=False, group='default',
 
-    return min(requested_volumes, allowed_volumes)
+                  **kwargs):
 
+        '''Get or set media:thumbnail data.
 
 
 
+        This method can be called with:
 
-def allowed_floating_ips(context, requested_floating_ips):
+        - the fields of a media:content as keyword arguments
 
-    """Check quota and return min(requested, allowed) floating ips."""
+        - the fields of a media:content as a dictionary
 
-    project_id = context.project_id
+        - a list of dictionaries containing the media:content fields
 
-    context = context.elevated()
 
-    used_floating_ips = db.floating_ip_count_by_project(context, project_id)
 
-    quota = get_project_quotas(context, project_id)
+        Allows particular images to be used as representative images for
 
-    allowed_floating_ips = _get_request_allotment(requested_floating_ips,
+        the media object. If multiple thumbnails are included, and time
 
-                                                  used_floating_ips,
+        coding is not at play, it is assumed that the images are in order
 
-                                                  quota['floating_ips'])
+        of importance. It has one required attribute and three optional
 
-    return min(requested_floating_ips, allowed_floating_ips)
+        attributes.
 
 
 
+        media:thumbnail has the following fields:
 
+        - *url* should specify the direct URL to the media object.
 
-def allowed_security_groups(context, requested_security_groups):
+        - *height* height of the media object.
 
-    """Check quota and return min(requested, allowed) security groups."""
+        - *width* width of the media object.
 
-    project_id = context.project_id
+        - *time* specifies the time offset in relation to the media object.
 
-    context = context.elevated()
 
-    used_sec_groups = db.security_group_count_by_project(context, project_id)
 
-    quota = get_project_quotas(context, project_id)
+        :param thumbnail: Dictionary or list of dictionaries with thumbnail
 
-    allowed_sec_groups = _get_request_allotment(requested_security_groups,
+                          data.
 
-                                                  used_sec_groups,
+        :param replace: Add or replace old data.
 
-                                                  quota['security_groups'])
+        :param group: Media group to put this content in.
 
-    return min(requested_security_groups, allowed_sec_groups)
 
 
+        :returns: The media thumbnail tag.
 
+        '''
 
+        # Handle kwargs
 
-def allowed_security_group_rules(context, security_group_id,
+        if thumbnail is None and kwargs:
 
-        requested_rules):
+            thumbnail = kwargs
 
-    """Check quota and return min(requested, allowed) sec group rules."""
+        # Handle new data
 
-    project_id = context.project_id
+        if thumbnail is not None:
 
-    context = context.elevated()
+            # Reset data if we want to replace them
 
-    used_rules = db.security_group_rule_count_by_group(context,
+            if replace or self.__media_thumbnail is None:
 
-                                                            security_group_id)
+                self.__media_thumbnail = []
 
-    quota = get_project_quotas(context, project_id)
+            # Ensure list
 
-    allowed_rules = _get_request_allotment(requested_rules,
+            if not isinstance(thumbnail, list):
 
-                                              used_rules,
+                thumbnail = [thumbnail]
 
-                                              quota['security_group_rules'])
+            # Define media group
 
-    return min(requested_rules, allowed_rules)
+            for t in thumbnail:
 
+                t['group'] = t.get('group', group)
 
+            self.__media_thumbnail += ensure_format(
 
+                    thumbnail,
 
+                    set(['url', 'height', 'width', 'time', 'group']),
 
-def _calculate_simple_quota(context, resource, requested):
+                    set(['url', 'group']))
 
-    """Check quota for resource; return min(requested, allowed)."""
-
-    quota = get_project_quotas(context, context.project_id)
-
-    allowed = _get_request_allotment(requested, 0, quota[resource])
-
-    return min(requested, allowed)
-
-
-
-
-
-def allowed_metadata_items(context, requested_metadata_items):
-
-    """Return the number of metadata items allowed."""
-
-    return _calculate_simple_quota(context, 'metadata_items',
-
-                                   requested_metadata_items)
-
-
-
-
-
-def allowed_injected_files(context, requested_injected_files):
-
-    """Return the number of injected files allowed."""
-
-    return _calculate_simple_quota(context, 'injected_files',
-
-                                   requested_injected_files)
-
-
-
-
-
-def allowed_injected_file_content_bytes(context, requested_bytes):
-
-    """Return the number of bytes allowed per injected file content."""
-
-    resource = 'injected_file_content_bytes'
-
-    return _calculate_simple_quota(context, resource, requested_bytes)
-
-
-
-
-
-def allowed_injected_file_path_bytes(context):
-
-    """Return the number of bytes allowed in an injected file path."""
-
-    return FLAGS.quota_max_injected_file_path_bytes
+        return self.__media_thumbnail

@@ -2,512 +2,852 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-#!/usr/bin/python
+from collections import OrderedDict
 
-from k5test import *
+import sys
 
+import warnings
 
 
-# Skip this test if pkinit wasn't built.
 
-if not os.path.exists(os.path.join(plugins, 'preauth', 'pkinit.so')):
+from django.core.exceptions import SuspiciousOperation, ImproperlyConfigured
 
-    skip_rest('PKINIT tests', 'PKINIT module not built')
+from django.core.paginator import InvalidPage
 
+from django.core.urlresolvers import reverse
 
+from django.db import models
 
-# Check if soft-pkcs11.so is available.
+from django.db.models.fields import FieldDoesNotExist
 
-try:
+from django.utils import six
 
-    import ctypes
+from django.utils.deprecation import RenameMethodsBase, RemovedInDjango18Warning
 
-    lib = ctypes.LibraryLoader(ctypes.CDLL).LoadLibrary('soft-pkcs11.so')
+from django.utils.encoding import force_text
 
-    del lib
+from django.utils.translation import ugettext, ugettext_lazy
 
-    have_soft_pkcs11 = True
+from django.utils.http import urlencode
 
-except:
 
-    have_soft_pkcs11 = False
 
+from django.contrib.admin import FieldListFilter
 
+from django.contrib.admin.exceptions import DisallowedModelAdminLookup
 
-# Construct a krb5.conf fragment configuring pkinit.
+from django.contrib.admin.options import IncorrectLookupParameters, IS_POPUP_VAR, TO_FIELD_VAR
 
-certs = os.path.join(srctop, 'tests', 'dejagnu', 'pkinit-certs')
+from django.contrib.admin.utils import (quote, get_fields_from_path,
 
-ca_pem = os.path.join(certs, 'ca.pem')
+    lookup_needs_distinct, prepare_lookup_value)
 
-kdc_pem = os.path.join(certs, 'kdc.pem')
 
-user_pem = os.path.join(certs, 'user.pem')
 
-privkey_pem = os.path.join(certs, 'privkey.pem')
+# Changelist settings
 
-privkey_enc_pem = os.path.join(certs, 'privkey-enc.pem')
+ALL_VAR = 'all'
 
-user_p12 = os.path.join(certs, 'user.p12')
+ORDER_VAR = 'o'
 
-user_enc_p12 = os.path.join(certs, 'user-enc.p12')
+ORDER_TYPE_VAR = 'ot'
 
-path = os.path.join(os.getcwd(), 'testdir', 'tmp-pkinit-certs')
+PAGE_VAR = 'p'
 
-path_enc = os.path.join(os.getcwd(), 'testdir', 'tmp-pkinit-certs-enc')
+SEARCH_VAR = 'q'
 
+ERROR_FLAG = 'e'
 
 
-pkinit_krb5_conf = {'realms': {'$realm': {
 
-            'pkinit_anchors': 'FILE:%s' % ca_pem}}}
+IGNORED_PARAMS = (
 
-pkinit_kdc_conf = {'realms': {'$realm': {
+    ALL_VAR, ORDER_VAR, ORDER_TYPE_VAR, SEARCH_VAR, IS_POPUP_VAR, TO_FIELD_VAR)
 
-            'default_principal_flags': '+preauth',
 
-            'pkinit_eku_checking': 'none',
 
-            'pkinit_identity': 'FILE:%s,%s' % (kdc_pem, privkey_pem),
+# Text to display within change-list table cells if the value is blank.
 
-            'pkinit_indicator': ['indpkinit1', 'indpkinit2']}}}
+EMPTY_CHANGELIST_VALUE = ugettext_lazy('(None)')
 
-restrictive_kdc_conf = {'realms': {'$realm': {
 
-            'restrict_anonymous_to_tgt': 'true' }}}
 
 
 
-file_identity = 'FILE:%s,%s' % (user_pem, privkey_pem)
+def _is_changelist_popup(request):
 
-file_enc_identity = 'FILE:%s,%s' % (user_pem, privkey_enc_pem)
+    """
 
-dir_identity = 'DIR:%s' % path
+    Returns True if the popup GET parameter is set.
 
-dir_enc_identity = 'DIR:%s' % path_enc
 
-dir_file_identity = 'FILE:%s,%s' % (os.path.join(path, 'user.crt'),
 
-                                    os.path.join(path, 'user.key'))
+    This function is introduced to facilitate deprecating the legacy
 
-dir_file_enc_identity = 'FILE:%s,%s' % (os.path.join(path_enc, 'user.crt'),
+    value for IS_POPUP_VAR and should be removed at the end of the
 
-                                        os.path.join(path_enc, 'user.key'))
+    deprecation cycle.
 
-p12_identity = 'PKCS12:%s' % user_p12
+    """
 
-p12_enc_identity = 'PKCS12:%s' % user_enc_p12
 
-p11_identity = 'PKCS11:soft-pkcs11.so'
 
-p11_token_identity = ('PKCS11:module_name=soft-pkcs11.so:'
+    if IS_POPUP_VAR in request.GET:
 
-                      'slotid=1:token=SoftToken (token)')
+        return True
 
 
 
-realm = K5Realm(krb5_conf=pkinit_krb5_conf, kdc_conf=pkinit_kdc_conf,
+    IS_LEGACY_POPUP_VAR = 'pop'
 
-                get_creds=False)
+    if IS_LEGACY_POPUP_VAR in request.GET:
 
+        warnings.warn(
 
+            "The `%s` GET parameter has been renamed to `%s`." %
 
-# Sanity check - password-based preauth should still work.
+            (IS_LEGACY_POPUP_VAR, IS_POPUP_VAR),
 
-realm.run(['./responder', '-r', 'password=%s' % password('user'),
+            RemovedInDjango18Warning, 2)
 
-           realm.user_princ])
+        return True
 
-realm.kinit(realm.user_princ, password=password('user'))
 
-realm.klist(realm.user_princ)
 
-realm.run([kvno, realm.host_princ])
+    return False
 
 
 
-# Test anonymous PKINIT.
 
-out = realm.kinit('@%s' % realm.realm, flags=['-n'], expected_code=1)
 
-if 'not found in Kerberos database' not in out:
+class RenameChangeListMethods(RenameMethodsBase):
 
-    fail('Wrong error for anonymous PKINIT without anonymous enabled')
+    renamed_methods = (
 
-realm.addprinc('WELLKNOWN/ANONYMOUS')
+        ('get_query_set', 'get_queryset', RemovedInDjango18Warning),
 
-realm.kinit('@%s' % realm.realm, flags=['-n'])
+    )
 
-realm.klist('WELLKNOWN/ANONYMOUS@WELLKNOWN:ANONYMOUS')
 
-realm.run([kvno, realm.host_princ])
 
-out = realm.run(['./adata', realm.host_princ])
 
-if '97:' in out:
 
-    fail('auth indicators seen in anonymous PKINIT ticket')
+class ChangeList(six.with_metaclass(RenameChangeListMethods)):
 
+    def __init__(self, request, model, list_display, list_display_links,
 
+            list_filter, date_hierarchy, search_fields, list_select_related,
 
-# Test anonymous kadmin.
+            list_per_page, list_max_show_all, list_editable, model_admin):
 
-f = open(os.path.join(realm.testdir, 'acl'), 'a')
+        self.model = model
 
-f.write('WELLKNOWN/ANONYMOUS@WELLKNOWN:ANONYMOUS a *')
+        self.opts = model._meta
 
-f.close()
+        self.lookup_opts = self.opts
 
-realm.start_kadmind()
+        self.root_queryset = model_admin.get_queryset(request)
 
-realm.run([kadmin, '-n', 'addprinc', '-pw', 'test', 'testadd'])
+        self.list_display = list_display
 
-out = realm.run([kadmin, '-n', 'getprinc', 'testadd'], expected_code=1)
+        self.list_display_links = list_display_links
 
-if "Operation requires ``get'' privilege" not in out:
+        self.list_filter = list_filter
 
-    fail('Anonymous kadmin has too much privilege')
+        self.date_hierarchy = date_hierarchy
 
-realm.stop_kadmind()
+        self.search_fields = search_fields
 
+        self.list_select_related = list_select_related
 
+        self.list_per_page = list_per_page
 
-# Test with anonymous restricted; FAST should work but kvno should fail.
+        self.list_max_show_all = list_max_show_all
 
-r_env = realm.special_env('restrict', True, kdc_conf=restrictive_kdc_conf)
+        self.model_admin = model_admin
 
-realm.stop_kdc()
+        self.preserved_filters = model_admin.get_preserved_filters(request)
 
-realm.start_kdc(env=r_env)
 
-realm.kinit('@%s' % realm.realm, flags=['-n'])
 
-realm.kinit('@%s' % realm.realm, flags=['-n', '-T', realm.ccache])
+        # Get search parameters from the query string.
 
-out = realm.run([kvno, realm.host_princ], expected_code=1)
+        try:
 
-if 'KDC policy rejects request' not in out:
+            self.page_num = int(request.GET.get(PAGE_VAR, 0))
 
-    fail('Wrong error for restricted anonymous PKINIT')
+        except ValueError:
 
+            self.page_num = 0
 
+        self.show_all = ALL_VAR in request.GET
 
-# Go back to a normal KDC and disable anonymous PKINIT.
+        self.is_popup = _is_changelist_popup(request)
 
-realm.stop_kdc()
+        self.to_field = request.GET.get(TO_FIELD_VAR)
 
-realm.start_kdc()
+        self.params = dict(request.GET.items())
 
-realm.run([kadminl, 'delprinc', 'WELLKNOWN/ANONYMOUS'])
+        if PAGE_VAR in self.params:
 
+            del self.params[PAGE_VAR]
 
+        if ERROR_FLAG in self.params:
 
-# Run the basic test - PKINIT with FILE: identity, with no password on the key.
+            del self.params[ERROR_FLAG]
 
-realm.run(['./responder', '-x', 'pkinit=',
 
-           '-X', 'X509_user_identity=%s' % file_identity, realm.user_princ])
 
-realm.kinit(realm.user_princ,
+        if self.is_popup:
 
-            flags=['-X', 'X509_user_identity=%s' % file_identity])
+            self.list_editable = ()
 
-realm.klist(realm.user_princ)
+        else:
 
-realm.run([kvno, realm.host_princ])
+            self.list_editable = list_editable
 
+        self.query = request.GET.get(SEARCH_VAR, '')
 
+        self.queryset = self.get_queryset(request)
 
-# Run the basic test - PKINIT with FILE: identity, with a password on the key,
+        self.get_results(request)
 
-# supplied by the prompter.
+        if self.is_popup:
 
-# Expect failure if the responder does nothing, and we have no prompter.
+            title = ugettext('Select %s')
 
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % file_enc_identity,
+        else:
 
-          '-X', 'X509_user_identity=%s' % file_enc_identity, realm.user_princ],
+            title = ugettext('Select %s to change')
 
-          expected_code=2)
+        self.title = title % force_text(self.opts.verbose_name)
 
-realm.kinit(realm.user_princ,
+        self.pk_attname = self.lookup_opts.pk.attname
 
-            flags=['-X', 'X509_user_identity=%s' % file_enc_identity],
 
-            password='encrypted')
 
-realm.klist(realm.user_princ)
+    @property
 
-realm.run([kvno, realm.host_princ])
+    def root_query_set(self):
 
-out = realm.run(['./adata', realm.host_princ])
+        warnings.warn("`ChangeList.root_query_set` is deprecated, "
 
-if '+97: [indpkinit1, indpkinit2]' not in out:
+                      "use `root_queryset` instead.",
 
-    fail('auth indicators not seen in PKINIT ticket')
+                      RemovedInDjango18Warning, 2)
 
+        return self.root_queryset
 
 
-# Run the basic test - PKINIT with FILE: identity, with a password on the key,
 
-# supplied by the responder.
+    @property
 
-# Supply the response in raw form.
+    def query_set(self):
 
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % file_enc_identity,
+        warnings.warn("`ChangeList.query_set` is deprecated, "
 
-           '-r', 'pkinit={"%s": "encrypted"}' % file_enc_identity,
+                      "use `queryset` instead.",
 
-           '-X', 'X509_user_identity=%s' % file_enc_identity,
+                      RemovedInDjango18Warning, 2)
 
-           realm.user_princ])
+        return self.queryset
 
-# Supply the response through the convenience API.
 
-realm.run(['./responder', '-X', 'X509_user_identity=%s' % file_enc_identity,
 
-           '-p', '%s=%s' % (file_enc_identity, 'encrypted'), realm.user_princ])
+    def get_filters_params(self, params=None):
 
-realm.klist(realm.user_princ)
+        """
 
-realm.run([kvno, realm.host_princ])
+        Returns all params except IGNORED_PARAMS
 
+        """
 
+        if not params:
 
-# PKINIT with DIR: identity, with no password on the key.
+            params = self.params
 
-os.mkdir(path)
+        lookup_params = params.copy()  # a dictionary of the query string
 
-os.mkdir(path_enc)
+        # Remove all the parameters that are globally and systematically
 
-shutil.copy(privkey_pem, os.path.join(path, 'user.key'))
+        # ignored.
 
-shutil.copy(privkey_enc_pem, os.path.join(path_enc, 'user.key'))
+        for ignored in IGNORED_PARAMS:
 
-shutil.copy(user_pem, os.path.join(path, 'user.crt'))
+            if ignored in lookup_params:
 
-shutil.copy(user_pem, os.path.join(path_enc, 'user.crt'))
+                del lookup_params[ignored]
 
-realm.run(['./responder', '-x', 'pkinit=', '-X',
+        return lookup_params
 
-           'X509_user_identity=%s' % dir_identity, realm.user_princ])
 
-realm.kinit(realm.user_princ,
 
-            flags=['-X', 'X509_user_identity=%s' % dir_identity])
+    def get_filters(self, request):
 
-realm.klist(realm.user_princ)
+        lookup_params = self.get_filters_params()
 
-realm.run([kvno, realm.host_princ])
+        use_distinct = False
 
 
 
-# PKINIT with DIR: identity, with a password on the key, supplied by the
+        for key, value in lookup_params.items():
 
-# prompter.
+            if not self.model_admin.lookup_allowed(key, value):
 
-# Expect failure if the responder does nothing, and we have no prompter.
+                raise DisallowedModelAdminLookup("Filtering by %s not allowed" % key)
 
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % dir_file_enc_identity,
 
-           '-X', 'X509_user_identity=%s' % dir_enc_identity, realm.user_princ],
 
-           expected_code=2)
+        filter_specs = []
 
-realm.kinit(realm.user_princ,
+        if self.list_filter:
 
-            flags=['-X', 'X509_user_identity=%s' % dir_enc_identity],
+            for list_filter in self.list_filter:
 
-            password='encrypted')
+                if callable(list_filter):
 
-realm.klist(realm.user_princ)
+                    # This is simply a custom list filter class.
 
-realm.run([kvno, realm.host_princ])
+                    spec = list_filter(request, lookup_params,
 
+                        self.model, self.model_admin)
 
+                else:
 
-# PKINIT with DIR: identity, with a password on the key, supplied by the
+                    field_path = None
 
-# responder.
+                    if isinstance(list_filter, (tuple, list)):
 
-# Supply the response in raw form.
+                        # This is a custom FieldListFilter class for a given field.
 
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % dir_file_enc_identity,
+                        field, field_list_filter_class = list_filter
 
-           '-r', 'pkinit={"%s": "encrypted"}' % dir_file_enc_identity,
+                    else:
 
-           '-X', 'X509_user_identity=%s' % dir_enc_identity, realm.user_princ])
+                        # This is simply a field name, so use the default
 
-# Supply the response through the convenience API.
+                        # FieldListFilter class that has been registered for
 
-realm.run(['./responder', '-X', 'X509_user_identity=%s' % dir_enc_identity,
+                        # the type of the given field.
 
-           '-p', '%s=%s' % (dir_file_enc_identity, 'encrypted'),
+                        field, field_list_filter_class = list_filter, FieldListFilter.create
 
-           realm.user_princ])
+                    if not isinstance(field, models.Field):
 
-realm.klist(realm.user_princ)
+                        field_path = field
 
-realm.run([kvno, realm.host_princ])
+                        field = get_fields_from_path(self.model, field_path)[-1]
 
+                    spec = field_list_filter_class(field, request, lookup_params,
 
+                        self.model, self.model_admin, field_path=field_path)
 
-# PKINIT with PKCS12: identity, with no password on the bundle.
+                    # Check if we need to use distinct()
 
-realm.run(['./responder', '-x', 'pkinit=',
+                    use_distinct = (use_distinct or
 
-           '-X', 'X509_user_identity=%s' % p12_identity, realm.user_princ])
+                                    lookup_needs_distinct(self.lookup_opts,
 
-realm.kinit(realm.user_princ,
+                                                          field_path))
 
-            flags=['-X', 'X509_user_identity=%s' % p12_identity])
+                if spec and spec.has_output():
 
-realm.klist(realm.user_princ)
+                    filter_specs.append(spec)
 
-realm.run([kvno, realm.host_princ])
 
 
+        # At this point, all the parameters used by the various ListFilters
 
-# PKINIT with PKCS12: identity, with a password on the bundle, supplied by the
+        # have been removed from lookup_params, which now only contains other
 
-# prompter.
+        # parameters passed via the query string. We now loop through the
 
-# Expect failure if the responder does nothing, and we have no prompter.
+        # remaining parameters both to ensure that all the parameters are valid
 
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % p12_enc_identity,
+        # fields and to determine if at least one of them needs distinct(). If
 
-           '-X', 'X509_user_identity=%s' % p12_enc_identity, realm.user_princ],
+        # the lookup parameters aren't real fields, then bail out.
 
-           expected_code=2)
+        try:
 
-realm.kinit(realm.user_princ,
+            for key, value in lookup_params.items():
 
-            flags=['-X', 'X509_user_identity=%s' % p12_enc_identity],
+                lookup_params[key] = prepare_lookup_value(key, value)
 
-            password='encrypted')
+                use_distinct = (use_distinct or
 
-realm.klist(realm.user_princ)
+                                lookup_needs_distinct(self.lookup_opts, key))
 
-realm.run([kvno, realm.host_princ])
+            return filter_specs, bool(filter_specs), lookup_params, use_distinct
 
+        except FieldDoesNotExist as e:
 
+            six.reraise(IncorrectLookupParameters, IncorrectLookupParameters(e), sys.exc_info()[2])
 
-# PKINIT with PKCS12: identity, with a password on the bundle, supplied by the
 
-# responder.
 
-# Supply the response in raw form.
+    def get_query_string(self, new_params=None, remove=None):
 
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % p12_enc_identity,
+        if new_params is None:
 
-           '-r', 'pkinit={"%s": "encrypted"}' % p12_enc_identity,
+            new_params = {}
 
-           '-X', 'X509_user_identity=%s' % p12_enc_identity, realm.user_princ])
+        if remove is None:
 
-# Supply the response through the convenience API.
+            remove = []
 
-realm.run(['./responder', '-X', 'X509_user_identity=%s' % p12_enc_identity,
+        p = self.params.copy()
 
-           '-p', '%s=%s' % (p12_enc_identity, 'encrypted'),
+        for r in remove:
 
-           realm.user_princ])
+            for k in list(p):
 
-realm.klist(realm.user_princ)
+                if k.startswith(r):
 
-realm.run([kvno, realm.host_princ])
+                    del p[k]
 
+        for k, v in new_params.items():
 
+            if v is None:
 
-if not have_soft_pkcs11:
+                if k in p:
 
-    skip_rest('PKINIT PKCS11 tests', 'soft-pkcs11.so not found')
+                    del p[k]
 
+            else:
 
+                p[k] = v
 
-softpkcs11rc = os.path.join(os.getcwd(), 'testdir', 'soft-pkcs11.rc')
+        return '?%s' % urlencode(sorted(p.items()))
 
-realm.env['SOFTPKCS11RC'] = softpkcs11rc
 
 
+    def get_results(self, request):
 
-# PKINIT with PKCS11: identity, with no need for a PIN.
+        paginator = self.model_admin.get_paginator(request, self.queryset, self.list_per_page)
 
-conf = open(softpkcs11rc, 'w')
+        # Get the number of objects, with admin filters applied.
 
-conf.write("%s\t%s\t%s\t%s\n" % ('user', 'user token', user_pem, privkey_pem))
+        result_count = paginator.count
 
-conf.close()
 
-# Expect to succeed without having to supply any more information.
 
-realm.run(['./responder', '-x', 'pkinit=',
+        # Get the total number of objects, with no admin filters applied.
 
-           '-X', 'X509_user_identity=%s' % p11_identity, realm.user_princ])
+        # Perform a slight optimization:
 
-realm.kinit(realm.user_princ,
+        # full_result_count is equal to paginator.count if no filters
 
-            flags=['-X', 'X509_user_identity=%s' % p11_identity])
+        # were applied
 
-realm.klist(realm.user_princ)
+        if self.get_filters_params() or self.params.get(SEARCH_VAR):
 
-realm.run([kvno, realm.host_princ])
+            full_result_count = self.root_queryset.count()
 
+        else:
 
+            full_result_count = result_count
 
-# PKINIT with PKCS11: identity, with a PIN supplied by the prompter.
+        can_show_all = result_count <= self.list_max_show_all
 
-os.remove(softpkcs11rc)
+        multi_page = result_count > self.list_per_page
 
-conf = open(softpkcs11rc, 'w')
 
-conf.write("%s\t%s\t%s\t%s\n" % ('user', 'user token', user_pem,
 
-                                 privkey_enc_pem))
+        # Get the list of objects to display on this page.
 
-conf.close()
+        if (self.show_all and can_show_all) or not multi_page:
 
-# Expect failure if the responder does nothing, and there's no prompter
+            result_list = self.queryset._clone()
 
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % p11_token_identity,
+        else:
 
-           '-X', 'X509_user_identity=%s' % p11_identity, realm.user_princ],
+            try:
 
-          expected_code=2)
+                result_list = paginator.page(self.page_num + 1).object_list
 
-realm.kinit(realm.user_princ,
+            except InvalidPage:
 
-            flags=['-X', 'X509_user_identity=%s' % p11_identity],
+                raise IncorrectLookupParameters
 
-            password='encrypted')
 
-realm.klist(realm.user_princ)
 
-realm.run([kvno, realm.host_princ])
+        self.result_count = result_count
 
+        self.full_result_count = full_result_count
 
+        self.result_list = result_list
 
-# PKINIT with PKCS11: identity, with a PIN supplied by the responder.
+        self.can_show_all = can_show_all
 
-# Supply the response in raw form.
+        self.multi_page = multi_page
 
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % p11_token_identity,
+        self.paginator = paginator
 
-           '-r', 'pkinit={"%s": "encrypted"}' % p11_token_identity,
 
-           '-X', 'X509_user_identity=%s' % p11_identity, realm.user_princ])
 
-# Supply the response through the convenience API.
+    def _get_default_ordering(self):
 
-realm.run(['./responder', '-X', 'X509_user_identity=%s' % p11_identity,
+        ordering = []
 
-           '-p', '%s=%s' % (p11_token_identity, 'encrypted'),
+        if self.model_admin.ordering:
 
-           realm.user_princ])
+            ordering = self.model_admin.ordering
 
-realm.klist(realm.user_princ)
+        elif self.lookup_opts.ordering:
 
-realm.run([kvno, realm.host_princ])
+            ordering = self.lookup_opts.ordering
 
+        return ordering
 
 
-success('PKINIT tests')
+
+    def get_ordering_field(self, field_name):
+
+        """
+
+        Returns the proper model field name corresponding to the given
+
+        field_name to use for ordering. field_name may either be the name of a
+
+        proper model field or the name of a method (on the admin or model) or a
+
+        callable with the 'admin_order_field' attribute. Returns None if no
+
+        proper model field name can be matched.
+
+        """
+
+        try:
+
+            field = self.lookup_opts.get_field(field_name)
+
+            return field.name
+
+        except models.FieldDoesNotExist:
+
+            # See whether field_name is a name of a non-field
+
+            # that allows sorting.
+
+            if callable(field_name):
+
+                attr = field_name
+
+            elif hasattr(self.model_admin, field_name):
+
+                attr = getattr(self.model_admin, field_name)
+
+            else:
+
+                attr = getattr(self.model, field_name)
+
+            return getattr(attr, 'admin_order_field', None)
+
+
+
+    def get_ordering(self, request, queryset):
+
+        """
+
+        Returns the list of ordering fields for the change list.
+
+        First we check the get_ordering() method in model admin, then we check
+
+        the object's default ordering. Then, any manually-specified ordering
+
+        from the query string overrides anything. Finally, a deterministic
+
+        order is guaranteed by ensuring the primary key is used as the last
+
+        ordering field.
+
+        """
+
+        params = self.params
+
+        ordering = list(self.model_admin.get_ordering(request)
+
+                        or self._get_default_ordering())
+
+        if ORDER_VAR in params:
+
+            # Clear ordering and used params
+
+            ordering = []
+
+            order_params = params[ORDER_VAR].split('.')
+
+            for p in order_params:
+
+                try:
+
+                    none, pfx, idx = p.rpartition('-')
+
+                    field_name = self.list_display[int(idx)]
+
+                    order_field = self.get_ordering_field(field_name)
+
+                    if not order_field:
+
+                        continue  # No 'admin_order_field', skip it
+
+                    # reverse order if order_field has already "-" as prefix
+
+                    if order_field.startswith('-') and pfx == "-":
+
+                        ordering.append(order_field[1:])
+
+                    else:
+
+                        ordering.append(pfx + order_field)
+
+                except (IndexError, ValueError):
+
+                    continue  # Invalid ordering specified, skip it.
+
+
+
+        # Add the given query's ordering fields, if any.
+
+        ordering.extend(queryset.query.order_by)
+
+
+
+        # Ensure that the primary key is systematically present in the list of
+
+        # ordering fields so we can guarantee a deterministic order across all
+
+        # database backends.
+
+        pk_name = self.lookup_opts.pk.name
+
+        if not (set(ordering) & set(['pk', '-pk', pk_name, '-' + pk_name])):
+
+            # The two sets do not intersect, meaning the pk isn't present. So
+
+            # we add it.
+
+            ordering.append('-pk')
+
+
+
+        return ordering
+
+
+
+    def get_ordering_field_columns(self):
+
+        """
+
+        Returns an OrderedDict of ordering field column numbers and asc/desc
+
+        """
+
+
+
+        # We must cope with more than one column having the same underlying sort
+
+        # field, so we base things on column numbers.
+
+        ordering = self._get_default_ordering()
+
+        ordering_fields = OrderedDict()
+
+        if ORDER_VAR not in self.params:
+
+            # for ordering specified on ModelAdmin or model Meta, we don't know
+
+            # the right column numbers absolutely, because there might be more
+
+            # than one column associated with that ordering, so we guess.
+
+            for field in ordering:
+
+                if field.startswith('-'):
+
+                    field = field[1:]
+
+                    order_type = 'desc'
+
+                else:
+
+                    order_type = 'asc'
+
+                for index, attr in enumerate(self.list_display):
+
+                    if self.get_ordering_field(attr) == field:
+
+                        ordering_fields[index] = order_type
+
+                        break
+
+        else:
+
+            for p in self.params[ORDER_VAR].split('.'):
+
+                none, pfx, idx = p.rpartition('-')
+
+                try:
+
+                    idx = int(idx)
+
+                except ValueError:
+
+                    continue  # skip it
+
+                ordering_fields[idx] = 'desc' if pfx == '-' else 'asc'
+
+        return ordering_fields
+
+
+
+    def get_queryset(self, request):
+
+        # First, we collect all the declared list filters.
+
+        (self.filter_specs, self.has_filters, remaining_lookup_params,
+
+         filters_use_distinct) = self.get_filters(request)
+
+
+
+        # Then, we let every list filter modify the queryset to its liking.
+
+        qs = self.root_queryset
+
+        for filter_spec in self.filter_specs:
+
+            new_qs = filter_spec.queryset(request, qs)
+
+            if new_qs is not None:
+
+                qs = new_qs
+
+
+
+        try:
+
+            # Finally, we apply the remaining lookup parameters from the query
+
+            # string (i.e. those that haven't already been processed by the
+
+            # filters).
+
+            qs = qs.filter(**remaining_lookup_params)
+
+        except (SuspiciousOperation, ImproperlyConfigured):
+
+            # Allow certain types of errors to be re-raised as-is so that the
+
+            # caller can treat them in a special way.
+
+            raise
+
+        except Exception as e:
+
+            # Every other error is caught with a naked except, because we don't
+
+            # have any other way of validating lookup parameters. They might be
+
+            # invalid if the keyword arguments are incorrect, or if the values
+
+            # are not in the correct type, so we might get FieldError,
+
+            # ValueError, ValidationError, or ?.
+
+            raise IncorrectLookupParameters(e)
+
+
+
+        if not qs.query.select_related:
+
+            qs = self.apply_select_related(qs)
+
+
+
+        # Set ordering.
+
+        ordering = self.get_ordering(request, qs)
+
+        qs = qs.order_by(*ordering)
+
+
+
+        # Apply search results
+
+        qs, search_use_distinct = self.model_admin.get_search_results(
+
+            request, qs, self.query)
+
+
+
+        # Remove duplicates from results, if necessary
+
+        if filters_use_distinct | search_use_distinct:
+
+            return qs.distinct()
+
+        else:
+
+            return qs
+
+
+
+    def apply_select_related(self, qs):
+
+        if self.list_select_related is True:
+
+            return qs.select_related()
+
+
+
+        if self.list_select_related is False:
+
+            if self.has_related_field_in_list_display():
+
+                return qs.select_related()
+
+
+
+        if self.list_select_related:
+
+            return qs.select_related(*self.list_select_related)
+
+        return qs
+
+
+
+    def has_related_field_in_list_display(self):
+
+        for field_name in self.list_display:
+
+            try:
+
+                field = self.lookup_opts.get_field(field_name)
+
+            except models.FieldDoesNotExist:
+
+                pass
+
+            else:
+
+                if isinstance(field.rel, models.ManyToOneRel):
+
+                    return True
+
+        return False
+
+
+
+    def url_for_result(self, result):
+
+        pk = getattr(result, self.pk_attname)
+
+        return reverse('admin:%s_%s_change' % (self.opts.app_label,
+
+                                               self.opts.model_name),
+
+                       args=(quote(pk),),
+
+                       current_app=self.model_admin.admin_site.name)

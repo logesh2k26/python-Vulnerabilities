@@ -2,21 +2,19 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-# -*- coding: utf-8 -*-
+# (c) 2013-2014, Michael DeHaan <michael.dehaan@gmail.com>
+
+#           Stephen Fromm <sfromm@gmail.com>
+
+#           Brian Coca  <briancoca+dev@gmail.com>
 
 #
 
-# This file is part of Radicale Server - Calendar Server
-
-# Copyright © 2008 Nicolas Kandel
-
-# Copyright © 2008 Pascal Halter
-
-# Copyright © 2008-2013 Guillaume Ayoub
+# This file is part of Ansible
 
 #
 
-# This library is free software: you can redistribute it and/or modify
+# Ansible is free software: you can redistribute it and/or modify
 
 # it under the terms of the GNU General Public License as published by
 
@@ -26,7 +24,7 @@
 
 #
 
-# This library is distributed in the hope that it will be useful,
+# Ansible is distributed in the hope that it will be useful,
 
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 
@@ -38,298 +36,238 @@
 
 # You should have received a copy of the GNU General Public License
 
-# along with Radicale.  If not, see <http://www.gnu.org/licenses/>.
 
-
-
-"""
-
-Implement htpasswd authentication.
-
-
-
-Apache's htpasswd command (httpd.apache.org/docs/programs/htpasswd.html) manages
-
-a file for storing user credentials. It can encrypt passwords using different
-
-methods, e.g. BCRYPT, MD5-APR1 (a version of MD5 modified for Apache), SHA1, or
-
-by using the system's CRYPT routine. The CRYPT and SHA1 encryption methods
-
-implemented by htpasswd are considered as insecure. MD5-APR1 provides medium
-
-security as of 2015. Only BCRYPT can be considered secure by current standards.
-
-
-
-MD5-APR1-encrypted credentials can be written by all versions of htpasswd (its
-
-the default, in fact), whereas BCRYPT requires htpasswd 2.4.x or newer.
-
-
-
-The `is_authenticated(user, password)` function provided by this module
-
-verifies the user-given credentials by parsing the htpasswd credential file
-
-pointed to by the ``htpasswd_filename`` configuration value while assuming
-
-the password encryption method specified via the ``htpasswd_encryption``
-
-configuration value.
-
-
-
-The following htpasswd password encrpytion methods are supported by Radicale
-
-out-of-the-box:
-
-
-
-    - plain-text (created by htpasswd -p...) -- INSECURE
-
-    - CRYPT      (created by htpasswd -d...) -- INSECURE
-
-    - SHA1       (created by htpasswd -s...) -- INSECURE
-
-
-
-When passlib (https://pypi.python.org/pypi/passlib) is importable, the
-
-following significantly more secure schemes are parsable by Radicale:
-
-
-
-    - MD5-APR1   (htpasswd -m...) -- htpasswd's default method
-
-    - BCRYPT     (htpasswd -B...) -- Requires htpasswd 2.4.x
-
-
-
-"""
-
-
-
-
-
-import base64
-
-import hashlib
 
 import os
 
+import os.path
 
+import pipes
 
+import shutil
 
+import tempfile
 
-from .. import config
+import base64
 
+from ansible import utils
 
+from ansible.runner.return_data import ReturnData
 
 
 
-FILENAME = os.path.expanduser(config.get("auth", "htpasswd_filename"))
+class ActionModule(object):
 
-ENCRYPTION = config.get("auth", "htpasswd_encryption")
 
 
+    TRANSFERS_FILES = True
 
 
 
-def _plain(hash_value, password):
+    def __init__(self, runner):
 
-    """Check if ``hash_value`` and ``password`` match, using plain method."""
+        self.runner = runner
 
-    return hash_value == password
 
 
+    def _assemble_from_fragments(self, src_path, delimiter=None, compiled_regexp=None):
 
+        ''' assemble a file from a directory of fragments '''
 
+        tmpfd, temp_path = tempfile.mkstemp()
 
-def _crypt(hash_value, password):
+        tmp = os.fdopen(tmpfd,'w')
 
-    """Check if ``hash_value`` and ``password`` match, using crypt method."""
+        delimit_me = False
 
-    return crypt.crypt(password, hash_value) == hash_value
+        add_newline = False
 
 
 
+        for f in sorted(os.listdir(src_path)):
 
+            if compiled_regexp and not compiled_regexp.search(f):
 
-def _sha1(hash_value, password):
+                continue
 
-    """Check if ``hash_value`` and ``password`` match, using sha1 method."""
+            fragment = "%s/%s" % (src_path, f)
 
-    hash_value = hash_value.replace("{SHA}", "").encode("ascii")
+            if not os.path.isfile(fragment):
 
-    password = password.encode(config.get("encoding", "stock"))
+                continue
 
-    sha1 = hashlib.sha1()  # pylint: disable=E1101
+            fragment_content = file(fragment).read()
 
-    sha1.update(password)
 
-    return sha1.digest() == base64.b64decode(hash_value)
 
+            # always put a newline between fragments if the previous fragment didn't end with a newline.
 
+            if add_newline:
 
+                tmp.write('\n')
 
 
-def _ssha(hash_salt_value, password):
 
-    """Check if ``hash_salt_value`` and ``password`` match, using salted sha1
+            # delimiters should only appear between fragments
 
-    method. This method is not directly supported by htpasswd, but it can be
+            if delimit_me:
 
-    written with e.g. openssl, and nginx can parse it."""
+                if delimiter:
 
-    hash_salt_value = base64.b64decode(hash_salt_value.replace("{SSHA}", ""))
+                    # un-escape anything like newlines
 
-    password = password.encode(config.get("encoding", "stock"))
+                    delimiter = delimiter.decode('unicode-escape')
 
-    hash_value = hash_salt_value[:20]
+                    tmp.write(delimiter)
 
-    salt_value = hash_salt_value[20:]
+                    # always make sure there's a newline after the
 
-    sha1 = hashlib.sha1()  # pylint: disable=E1101
+                    # delimiter, so lines don't run together
 
-    sha1.update(password)
+                    if delimiter[-1] != '\n':
 
-    sha1.update(salt_value)
+                        tmp.write('\n')
 
-    return sha1.digest() == hash_value
 
 
+            tmp.write(fragment_content)
 
+            delimit_me = True
 
+            if fragment_content.endswith('\n'):
 
-def _bcrypt(hash_value, password):
+                add_newline = False
 
-    return _passlib_bcrypt.verify(password, hash_value)
+            else:
 
+                add_newline = True
 
 
 
+        tmp.close()
 
-def _md5apr1(hash_value, password):
+        return temp_path
 
-    return _passlib_md5apr1.verify(password, hash_value)
 
 
+    def run(self, conn, tmp, module_name, module_args, inject, complex_args=None, **kwargs):
 
 
 
-# Prepare mapping between encryption names and verification functions.
+        # load up options
 
-# Pre-fill with methods that do not have external dependencies.
+        options  = {}
 
-_verifuncs = {
+        if complex_args:
 
-    "ssha": _ssha,
+            options.update(complex_args)
 
-    "sha1": _sha1,
 
-    "plain": _plain}
 
+        options.update(utils.parse_kv(module_args))
 
 
 
+        src = options.get('src', None)
 
-# Conditionally attempt to import external dependencies.
+        dest = options.get('dest', None)
 
-if ENCRYPTION == "md5":
+        delimiter = options.get('delimiter', None)
 
-    try:
+        remote_src = utils.boolean(options.get('remote_src', 'yes'))
 
-        from passlib.hash import apr_md5_crypt as _passlib_md5apr1
 
-    except ImportError:
 
-        raise RuntimeError(("The htpasswd_encryption method 'md5' requires "
 
-            "availability of the passlib module."))
 
-    _verifuncs["md5"] = _md5apr1
+        if src is None or dest is None:
 
-elif ENCRYPTION == "bcrypt":
+            result = dict(failed=True, msg="src and dest are required")
 
-    try:
+            return ReturnData(conn=conn, comm_ok=False, result=result)
 
-        from passlib.hash import bcrypt as _passlib_bcrypt
 
-    except ImportError:
 
-        raise RuntimeError(("The htpasswd_encryption method 'bcrypt' requires "
+        if remote_src:
 
-            "availability of the passlib module with bcrypt support."))
+            return self.runner._execute_module(conn, tmp, 'assemble', module_args, inject=inject, complex_args=complex_args)
 
-    # A call to `encrypt` raises passlib.exc.MissingBackendError with a good
+        elif '_original_file' in inject:
 
-    # error message if bcrypt backend is not available. Trigger this here.
+            src = utils.path_dwim_relative(inject['_original_file'], 'files', src, self.runner.basedir)
 
-    _passlib_bcrypt.encrypt("test-bcrypt-backend")
+        else:
 
-    _verifuncs["bcrypt"] = _bcrypt
+            # the source is local, so expand it here
 
-elif ENCRYPTION == "crypt":
+            src = os.path.expanduser(src)
 
-    try:
 
-        import crypt
 
-    except ImportError:
+        # Does all work assembling the file
 
-        raise RuntimeError(("The htpasswd_encryption method 'crypt' requires "
+        path = self._assemble_from_fragments(src, delimiter)
 
-            "crypt() system support."))
 
-    _verifuncs["crypt"] = _crypt
 
+        pathmd5 = utils.md5s(path)
 
+        remote_md5 = self.runner._remote_md5(conn, tmp, dest)
 
 
 
-# Validate initial configuration.
+        if pathmd5 != remote_md5:
 
-if ENCRYPTION not in _verifuncs:
+            resultant = file(path).read()
 
-    raise RuntimeError(("The htpasswd encryption method '%s' is not "
+            if self.runner.diff:
 
-        "supported." % ENCRYPTION))
+                dest_result = self.runner._execute_module(conn, tmp, 'slurp', "path=%s" % dest, inject=inject, persist_files=True)
 
- 
+                if 'content' in dest_result.result:
 
+                    dest_contents = dest_result.result['content']
 
+                    if dest_result.result['encoding'] == 'base64':
 
-def is_authenticated(user, password):
+                        dest_contents = base64.b64decode(dest_contents)
 
-    """Validate credentials.
+                    else:
 
+                        raise Exception("unknown encoding, failed: %s" % dest_result.result)
 
+            xfered = self.runner._transfer_str(conn, tmp, 'src', resultant)
 
-    Iterate through htpasswd credential file until user matches, extract hash
 
-    (encrypted password) and check hash against user-given password, using the
 
-    method specified in the Radicale config.
+            # fix file permissions when the copy is done as a different user
 
+            if self.runner.sudo and self.runner.sudo_user != 'root':
 
+                self.runner._low_level_exec_command(conn, "chmod a+r %s" % xfered, tmp)
 
-    """
 
-    with open(FILENAME) as f:
 
-        for line in f:
+            # run the copy module
 
-            strippedline = line.strip()
+            module_args = "%s src=%s dest=%s original_basename=%s" % (module_args, pipes.quote(xfered), pipes.quote(dest), pipes.quote(os.path.basename(src)))
 
-            if strippedline:
 
-                login, hash_value = strippedline.split(":")
 
-                if login == user:
+            if self.runner.noop_on_check(inject):
 
-                    # Allow encryption method to be overridden at runtime.
+                return ReturnData(conn=conn, comm_ok=True, result=dict(changed=True), diff=dict(before_header=dest, after_header=src, after=resultant))
 
-                    return _verifuncs[ENCRYPTION](hash_value, password)
+            else:
 
-    return False
+                res = self.runner._execute_module(conn, tmp, 'copy', module_args, inject=inject)
+
+                res.diff = dict(after=resultant)
+
+                return res
+
+        else:
+
+            module_args = "%s src=%s dest=%s original_basename=%s" % (module_args, pipes.quote(xfered), pipes.quote(dest), pipes.quote(os.path.basename(src)))
+
+            return self.runner._execute_module(conn, tmp, 'file', module_args, inject=inject)

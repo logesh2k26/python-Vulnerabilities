@@ -2,300 +2,256 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-"""
-
-Power management library.  For cobbler objects with power management configured
-
-encapsulate the logic to run power management commands so that the admin does not
-
-have to use seperate tools and remember how each of the power management tools are
-
-set up.  This makes power cycling a system for reinstallation much easier.
+import base64
 
 
 
-See https://github.com/cobbler/cobbler/wiki/Power-management
+from django.test import override_settings, SimpleTestCase
+
+from mock import create_autospec, ANY
 
 
 
-Copyright 2008-2009, Red Hat, Inc and Others
+from anymail.exceptions import AnymailInsecureWebhookWarning
 
-Michael DeHaan <michael.dehaan AT gmail>
-
-
-
-This program is free software; you can redistribute it and/or modify
-
-it under the terms of the GNU General Public License as published by
-
-the Free Software Foundation; either version 2 of the License, or
-
-(at your option) any later version.
+from anymail.signals import tracking, inbound
 
 
 
-This program is distributed in the hope that it will be useful,
-
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-
-GNU General Public License for more details.
-
-
-
-You should have received a copy of the GNU General Public License
-
-along with this program; if not, write to the Free Software
-
-Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
-
-02110-1301  USA
-
-"""
+from .utils import AnymailTestMixin, ClientWithCsrfChecks
 
 
 
 
 
-import os
+def event_handler(sender, event, esp_name, **kwargs):
 
-import os.path
+    """Prototypical webhook signal handler"""
 
-import traceback
-
-import time
-
-import re
+    pass
 
 
 
-import utils
 
-import func_utils
 
-from cexceptions import *
+@override_settings(ANYMAIL={'WEBHOOK_AUTHORIZATION': 'username:password'})
 
-import templar
+class WebhookTestCase(AnymailTestMixin, SimpleTestCase):
 
-import clogger
+    """Base for testing webhooks
 
 
 
-class PowerTool:
+    - connects webhook signal handlers
 
-    """
-
-    Handles conversion of internal state to the tftpboot tree layout
+    - sets up basic auth by default (since most ESP webhooks warn if it's not enabled)
 
     """
 
 
 
-    def __init__(self,config,system,api,force_user=None,force_pass=None,logger=None):
+    client_class = ClientWithCsrfChecks
+
+
+
+    def setUp(self):
+
+        super(WebhookTestCase, self).setUp()
+
+        # Use correct basic auth by default (individual tests can override):
+
+        self.set_basic_auth()
+
+
+
+        # Install mocked signal handlers
+
+        self.tracking_handler = create_autospec(event_handler)
+
+        tracking.connect(self.tracking_handler)
+
+        self.addCleanup(tracking.disconnect, self.tracking_handler)
+
+
+
+        self.inbound_handler = create_autospec(event_handler)
+
+        inbound.connect(self.inbound_handler)
+
+        self.addCleanup(inbound.disconnect, self.inbound_handler)
+
+
+
+    def set_basic_auth(self, username='username', password='password'):
+
+        """Set basic auth for all subsequent test client requests"""
+
+        credentials = base64.b64encode("{}:{}".format(username, password).encode('utf-8')).decode('utf-8')
+
+        self.client.defaults['HTTP_AUTHORIZATION'] = "Basic {}".format(credentials)
+
+
+
+    def clear_basic_auth(self):
+
+        self.client.defaults.pop('HTTP_AUTHORIZATION', None)
+
+
+
+    def assert_handler_called_once_with(self, mockfn, *expected_args, **expected_kwargs):
+
+        """Verifies mockfn was called with expected_args and at least expected_kwargs.
+
+
+
+        Ignores *additional* actual kwargs (which might be added by Django signal dispatch).
+
+        (This differs from mock.assert_called_once_with.)
+
+
+
+        Returns the actual kwargs.
 
         """
 
-        Power library constructor requires a cobbler system object.
+        self.assertEqual(mockfn.call_count, 1)
 
-        """
+        actual_args, actual_kwargs = mockfn.call_args
 
-        self.system      = system
+        self.assertEqual(actual_args, expected_args)
 
-        self.config      = config
+        for key, expected_value in expected_kwargs.items():
 
-        self.settings    = config.settings()
+            if expected_value is ANY:
 
-        self.api         = api
-
-        self.logger      = self.api.logger
-
-        self.force_user  = force_user
-
-        self.force_pass  = force_pass
-
-        if logger is None:
-
-            logger = clogger.Logger()
-
-        self.logger      = logger
-
-
-
-    def power(self, desired_state):
-
-        """
-
-        state is either "on" or "off".  Rebooting is implemented at the api.py
-
-        level.
-
-
-
-        The user and password need not be supplied.  If not supplied they
-
-        will be taken from the environment, COBBLER_POWER_USER and COBBLER_POWER_PASS.
-
-        If provided, these will override any other data and be used instead.  Users
-
-        interested in maximum security should take that route.
-
-        """
-
-
-
-        template = self.get_command_template()
-
-        template_file = open(template, "r")
-
-
-
-        meta = utils.blender(self.api, False, self.system)
-
-        meta["power_mode"] = desired_state
-
-
-
-        # allow command line overrides of the username/password 
-
-        if self.force_user is not None:
-
-           meta["power_user"] = self.force_user
-
-        if self.force_pass is not None:
-
-           meta["power_pass"] = self.force_pass
-
-
-
-        tmp = templar.Templar(self.api._config)
-
-        cmd = tmp.render(template_file, meta, None, self.system)
-
-        template_file.close()
-
-
-
-        cmd = cmd.strip()
-
-
-
-        self.logger.info("cobbler power configuration is:")
-
-
-
-        self.logger.info("      type   : %s" % self.system.power_type)
-
-        self.logger.info("      address: %s" % self.system.power_address)
-
-        self.logger.info("      user   : %s" % self.system.power_user)
-
-        self.logger.info("      id     : %s" % self.system.power_id)
-
-
-
-        # if no username/password data, check the environment
-
-
-
-        if meta.get("power_user","") == "":
-
-            meta["power_user"] = os.environ.get("COBBLER_POWER_USER","")
-
-        if meta.get("power_pass","") == "":
-
-            meta["power_pass"] = os.environ.get("COBBLER_POWER_PASS","")
-
-
-
-        self.logger.info("- %s" % cmd)
-
-
-
-        # use shell so we can have mutliple power commands chained together
-
-        cmd = ['/bin/sh','-c', cmd]
-
-
-
-        # Try the power command 5 times before giving up.
-
-        # Some power switches are flakey
-
-        for x in range(0,5):
-
-            output, rc = utils.subprocess_sp(self.logger, cmd, shell=False)
-
-            if rc == 0:
-
-                # If the desired state is actually a query for the status
-
-                # return different information than command return code
-
-                if desired_state == 'status':
-
-                    match = re.match('(^Status:\s)(ON|OFF)', output)
-
-                    if match:
-
-                        power_status = match.groups()[1]
-
-                        if power_status == 'ON':
-
-                            return True
-
-                        else:
-
-                            return False
-
-                    utils.die(self.logger,"command succeeded (rc=%s), but output ('%s') was not understood" % (rc, output))
-
-                    return None
-
-                break
+                self.assertIn(key, actual_kwargs)
 
             else:
 
-                time.sleep(2)
+                self.assertEqual(actual_kwargs[key], expected_value)
+
+        return actual_kwargs
 
 
 
-        if not rc == 0:
+    def get_kwargs(self, mockfn):
 
-           utils.die(self.logger,"command failed (rc=%s), please validate the physical setup and cobbler config" % rc)
+        """Return the kwargs passed to the most recent call to mockfn"""
 
+        self.assertIsNotNone(mockfn.call_args)  # mockfn hasn't been called yet
 
+        actual_args, actual_kwargs = mockfn.call_args
 
-        return rc
-
-
-
-    def get_command_template(self):
+        return actual_kwargs
 
 
 
-        """
 
-        In case the user wants to customize the power management commands, 
 
-        we source the code for each command from /etc/cobbler and run
+# noinspection PyUnresolvedReferences
 
-        them through Cheetah.
+class WebhookBasicAuthTestsMixin(object):
 
-        """
+    """Common test cases for webhook basic authentication.
 
 
 
-        if self.system.power_type in [ "", "none" ]:
+    Instantiate for each ESP's webhooks by:
 
-            utils.die(self.logger,"Power management is not enabled for this system")
+    - mixing into WebhookTestCase
+
+    - defining call_webhook to invoke the ESP's webhook
+
+    """
 
 
 
-        result = utils.get_power(self.system.power_type)
+    should_warn_if_no_auth = True  # subclass set False if other webhook verification used
 
-        if not result:
 
-            utils.die(self.logger, "Invalid power management type for this system (%s, %s)" % (self.system.power_type, self.system.name))
 
-        return result
+    def call_webhook(self):
+
+        # Concrete test cases should call a webhook via self.client.post,
+
+        # and return the response
+
+        raise NotImplementedError()
+
+
+
+    @override_settings(ANYMAIL={})  # Clear the WEBHOOK_AUTH settings from superclass
+
+    def test_warns_if_no_auth(self):
+
+        if self.should_warn_if_no_auth:
+
+            with self.assertWarns(AnymailInsecureWebhookWarning):
+
+                response = self.call_webhook()
+
+        else:
+
+            with self.assertDoesNotWarn(AnymailInsecureWebhookWarning):
+
+                response = self.call_webhook()
+
+        self.assertEqual(response.status_code, 200)
+
+
+
+    def test_verifies_basic_auth(self):
+
+        response = self.call_webhook()
+
+        self.assertEqual(response.status_code, 200)
+
+
+
+    def test_verifies_bad_auth(self):
+
+        self.set_basic_auth('baduser', 'wrongpassword')
+
+        response = self.call_webhook()
+
+        self.assertEqual(response.status_code, 400)
+
+
+
+    def test_verifies_missing_auth(self):
+
+        self.clear_basic_auth()
+
+        response = self.call_webhook()
+
+        self.assertEqual(response.status_code, 400)
+
+
+
+    @override_settings(ANYMAIL={'WEBHOOK_AUTHORIZATION': ['cred1:pass1', 'cred2:pass2']})
+
+    def test_supports_credential_rotation(self):
+
+        """You can supply a list of basic auth credentials, and any is allowed"""
+
+        self.set_basic_auth('cred1', 'pass1')
+
+        response = self.call_webhook()
+
+        self.assertEqual(response.status_code, 200)
+
+
+
+        self.set_basic_auth('cred2', 'pass2')
+
+        response = self.call_webhook()
+
+        self.assertEqual(response.status_code, 200)
+
+
+
+        self.set_basic_auth('baduser', 'wrongpassword')
+
+        response = self.call_webhook()
+
+        self.assertEqual(response.status_code, 400)

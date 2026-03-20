@@ -2,920 +2,934 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-from __future__ import with_statement
+# This file is dual licensed under the terms of the Apache License, Version
 
-import os
+# 2.0, and the BSD License. See the LICENSE file in the root of this repository
 
-import re
-
-import urllib
+# for complete details.
 
 
 
-from django.conf import settings
-
-from django.contrib.sites.models import Site, RequestSite
-
-from django.contrib.auth.models import User
-
-from django.core import mail
-
-from django.core.urlresolvers import reverse, NoReverseMatch
-
-from django.http import QueryDict
-
-from django.utils.encoding import force_unicode
-
-from django.utils.html import escape
-
-from django.test import TestCase
-
-from django.test.utils import override_settings
+from __future__ import absolute_import, division, print_function
 
 
 
-from django.contrib.auth import SESSION_KEY, REDIRECT_FIELD_NAME
+from cryptography import utils
 
-from django.contrib.auth.forms import (AuthenticationForm, PasswordChangeForm,
+from cryptography.exceptions import (
 
-                SetPasswordForm, PasswordResetForm)
+    InvalidSignature,
+
+    UnsupportedAlgorithm,
+
+    _Reasons,
+
+)
+
+from cryptography.hazmat.backends.openssl.utils import (
+
+    _calculate_digest_and_algorithm,
+
+    _check_not_prehashed,
+
+    _warn_sign_verify_deprecated,
+
+)
+
+from cryptography.hazmat.primitives import hashes
+
+from cryptography.hazmat.primitives.asymmetric import (
+
+    AsymmetricSignatureContext,
+
+    AsymmetricVerificationContext,
+
+    rsa,
+
+)
+
+from cryptography.hazmat.primitives.asymmetric.padding import (
+
+    AsymmetricPadding,
+
+    MGF1,
+
+    OAEP,
+
+    PKCS1v15,
+
+    PSS,
+
+    calculate_max_pss_salt_length,
+
+)
+
+from cryptography.hazmat.primitives.asymmetric.rsa import (
+
+    RSAPrivateKeyWithSerialization,
+
+    RSAPublicKeyWithSerialization,
+
+)
 
 
 
 
 
-class AuthViewsTestCase(TestCase):
+def _get_rsa_pss_salt_length(pss, key, hash_algorithm):
 
-    """
-
-    Helper base class for all the follow test cases.
-
-    """
-
-    fixtures = ['authtestdata.json']
-
-    urls = 'django.contrib.auth.tests.urls'
+    salt = pss._salt_length
 
 
 
-    def setUp(self):
+    if salt is MGF1.MAX_LENGTH or salt is PSS.MAX_LENGTH:
 
-        self.old_LANGUAGES = settings.LANGUAGES
+        return calculate_max_pss_salt_length(key, hash_algorithm)
 
-        self.old_LANGUAGE_CODE = settings.LANGUAGE_CODE
+    else:
 
-        settings.LANGUAGES = (('en', 'English'),)
+        return salt
 
-        settings.LANGUAGE_CODE = 'en'
 
-        self.old_TEMPLATE_DIRS = settings.TEMPLATE_DIRS
 
-        settings.TEMPLATE_DIRS = (
 
-            os.path.join(os.path.dirname(__file__), 'templates'),
+
+def _enc_dec_rsa(backend, key, data, padding):
+
+    if not isinstance(padding, AsymmetricPadding):
+
+        raise TypeError("Padding must be an instance of AsymmetricPadding.")
+
+
+
+    if isinstance(padding, PKCS1v15):
+
+        padding_enum = backend._lib.RSA_PKCS1_PADDING
+
+    elif isinstance(padding, OAEP):
+
+        padding_enum = backend._lib.RSA_PKCS1_OAEP_PADDING
+
+
+
+        if not isinstance(padding._mgf, MGF1):
+
+            raise UnsupportedAlgorithm(
+
+                "Only MGF1 is supported by this backend.",
+
+                _Reasons.UNSUPPORTED_MGF,
+
+            )
+
+
+
+        if not backend.rsa_padding_supported(padding):
+
+            raise UnsupportedAlgorithm(
+
+                "This combination of padding and hash algorithm is not "
+
+                "supported by this backend.",
+
+                _Reasons.UNSUPPORTED_PADDING,
+
+            )
+
+
+
+    else:
+
+        raise UnsupportedAlgorithm(
+
+            "{} is not supported by this backend.".format(padding.name),
+
+            _Reasons.UNSUPPORTED_PADDING,
 
         )
 
 
 
-    def tearDown(self):
+    return _enc_dec_rsa_pkey_ctx(backend, key, data, padding_enum, padding)
 
-        settings.LANGUAGES = self.old_LANGUAGES
 
-        settings.LANGUAGE_CODE = self.old_LANGUAGE_CODE
 
-        settings.TEMPLATE_DIRS = self.old_TEMPLATE_DIRS
 
 
+def _enc_dec_rsa_pkey_ctx(backend, key, data, padding_enum, padding):
 
-    def login(self, password='password'):
+    if isinstance(key, _RSAPublicKey):
 
-        response = self.client.post('/login/', {
+        init = backend._lib.EVP_PKEY_encrypt_init
 
-            'username': 'testclient',
+        crypt = backend._lib.EVP_PKEY_encrypt
 
-            'password': password,
+    else:
 
-            })
+        init = backend._lib.EVP_PKEY_decrypt_init
 
-        self.assertEqual(response.status_code, 302)
+        crypt = backend._lib.EVP_PKEY_decrypt
 
-        self.assertTrue(response['Location'].endswith(settings.LOGIN_REDIRECT_URL))
 
-        self.assertTrue(SESSION_KEY in self.client.session)
 
+    pkey_ctx = backend._lib.EVP_PKEY_CTX_new(key._evp_pkey, backend._ffi.NULL)
 
+    backend.openssl_assert(pkey_ctx != backend._ffi.NULL)
 
-    def assertContainsEscaped(self, response, text, **kwargs):
+    pkey_ctx = backend._ffi.gc(pkey_ctx, backend._lib.EVP_PKEY_CTX_free)
 
-        return self.assertContains(response, escape(force_unicode(text)), **kwargs)
+    res = init(pkey_ctx)
 
+    backend.openssl_assert(res == 1)
 
+    res = backend._lib.EVP_PKEY_CTX_set_rsa_padding(pkey_ctx, padding_enum)
 
-AuthViewsTestCase = override_settings(USE_TZ=False)(AuthViewsTestCase)
+    backend.openssl_assert(res > 0)
 
+    buf_size = backend._lib.EVP_PKEY_size(key._evp_pkey)
 
+    backend.openssl_assert(buf_size > 0)
 
+    if isinstance(padding, OAEP) and backend._lib.Cryptography_HAS_RSA_OAEP_MD:
 
+        mgf1_md = backend._evp_md_non_null_from_algorithm(
 
-class AuthViewNamedURLTests(AuthViewsTestCase):
+            padding._mgf._algorithm
 
-    urls = 'django.contrib.auth.urls'
+        )
 
+        res = backend._lib.EVP_PKEY_CTX_set_rsa_mgf1_md(pkey_ctx, mgf1_md)
 
+        backend.openssl_assert(res > 0)
 
-    def test_named_urls(self):
+        oaep_md = backend._evp_md_non_null_from_algorithm(padding._algorithm)
 
-        "Named URLs should be reversible"
+        res = backend._lib.EVP_PKEY_CTX_set_rsa_oaep_md(pkey_ctx, oaep_md)
 
-        expected_named_urls = [
+        backend.openssl_assert(res > 0)
 
-            ('login', [], {}),
 
-            ('logout', [], {}),
 
-            ('password_change', [], {}),
+    if (
 
-            ('password_change_done', [], {}),
+        isinstance(padding, OAEP)
 
-            ('password_reset', [], {}),
+        and padding._label is not None
 
-            ('password_reset_done', [], {}),
+        and len(padding._label) > 0
 
-            ('password_reset_confirm', [], {
+    ):
 
-                'uidb36': 'aaaaaaa',
+        # set0_rsa_oaep_label takes ownership of the char * so we need to
 
-                'token': '1111-aaaaa',
+        # copy it into some new memory
 
-            }),
+        labelptr = backend._lib.OPENSSL_malloc(len(padding._label))
 
-            ('password_reset_complete', [], {}),
+        backend.openssl_assert(labelptr != backend._ffi.NULL)
 
-        ]
+        backend._ffi.memmove(labelptr, padding._label, len(padding._label))
 
-        for name, args, kwargs in expected_named_urls:
+        res = backend._lib.EVP_PKEY_CTX_set0_rsa_oaep_label(
 
-            try:
+            pkey_ctx, labelptr, len(padding._label)
 
-                reverse(name, args=args, kwargs=kwargs)
+        )
 
-            except NoReverseMatch:
+        backend.openssl_assert(res == 1)
 
-                self.fail("Reversal of url named '%s' failed with NoReverseMatch" % name)
 
 
+    outlen = backend._ffi.new("size_t *", buf_size)
 
+    buf = backend._ffi.new("unsigned char[]", buf_size)
 
+    res = crypt(pkey_ctx, buf, outlen, data, len(data))
 
-class PasswordResetTest(AuthViewsTestCase):
+    if res <= 0:
 
+        _handle_rsa_enc_dec_error(backend, key)
 
 
-    def test_email_not_found(self):
 
-        "Error is raised if the provided email address isn't currently registered"
+    return backend._ffi.buffer(buf)[: outlen[0]]
 
-        response = self.client.get('/password_reset/')
 
-        self.assertEqual(response.status_code, 200)
 
-        response = self.client.post('/password_reset/', {'email': 'not_a_real_email@email.com'})
 
-        self.assertContainsEscaped(response, PasswordResetForm.error_messages['unknown'])
 
-        self.assertEqual(len(mail.outbox), 0)
+def _handle_rsa_enc_dec_error(backend, key):
 
+    errors = backend._consume_errors_with_text()
 
+    if isinstance(key, _RSAPublicKey):
 
-    def test_email_found(self):
+        raise ValueError(
 
-        "Email is sent if a valid email address is provided for password reset"
+            "Data too long for key size. Encrypt less data or use a "
 
-        response = self.client.post('/password_reset/', {'email': 'staffmember@example.com'})
+            "larger key size.",
 
-        self.assertEqual(response.status_code, 302)
+            errors,
 
-        self.assertEqual(len(mail.outbox), 1)
+        )
 
-        self.assertTrue("http://" in mail.outbox[0].body)
+    else:
 
-        self.assertEqual(settings.DEFAULT_FROM_EMAIL, mail.outbox[0].from_email)
+        raise ValueError("Decryption failed.", errors)
 
 
 
-    def test_email_found_custom_from(self):
 
-        "Email is sent if a valid email address is provided for password reset when a custom from_email is provided."
 
-        response = self.client.post('/password_reset_from_email/', {'email': 'staffmember@example.com'})
+def _rsa_sig_determine_padding(backend, key, padding, algorithm):
 
-        self.assertEqual(response.status_code, 302)
+    if not isinstance(padding, AsymmetricPadding):
 
-        self.assertEqual(len(mail.outbox), 1)
+        raise TypeError("Expected provider of AsymmetricPadding.")
 
-        self.assertEqual("staffmember@example.com", mail.outbox[0].from_email)
 
 
+    pkey_size = backend._lib.EVP_PKEY_size(key._evp_pkey)
 
-    def _test_confirm_start(self):
+    backend.openssl_assert(pkey_size > 0)
 
-        # Start by creating the email
 
-        response = self.client.post('/password_reset/', {'email': 'staffmember@example.com'})
 
-        self.assertEqual(response.status_code, 302)
+    if isinstance(padding, PKCS1v15):
 
-        self.assertEqual(len(mail.outbox), 1)
+        padding_enum = backend._lib.RSA_PKCS1_PADDING
 
-        return self._read_signup_email(mail.outbox[0])
+    elif isinstance(padding, PSS):
 
+        if not isinstance(padding._mgf, MGF1):
 
+            raise UnsupportedAlgorithm(
 
-    def _read_signup_email(self, email):
+                "Only MGF1 is supported by this backend.",
 
-        urlmatch = re.search(r"https?://[^/]*(/.*reset/\S*)", email.body)
+                _Reasons.UNSUPPORTED_MGF,
 
-        self.assertTrue(urlmatch is not None, "No URL found in sent email")
+            )
 
-        return urlmatch.group(), urlmatch.groups()[0]
 
 
+        # Size of key in bytes - 2 is the maximum
 
-    def test_confirm_valid(self):
+        # PSS signature length (salt length is checked later)
 
-        url, path = self._test_confirm_start()
+        if pkey_size - algorithm.digest_size - 2 < 0:
 
-        response = self.client.get(path)
+            raise ValueError(
 
-        # redirect to a 'complete' page:
+                "Digest too large for key size. Use a larger "
 
-        self.assertEqual(response.status_code, 200)
+                "key or different digest."
 
-        self.assertTrue("Please enter your new password" in response.content)
+            )
 
 
 
-    def test_confirm_invalid(self):
+        padding_enum = backend._lib.RSA_PKCS1_PSS_PADDING
 
-        url, path = self._test_confirm_start()
+    else:
 
-        # Let's munge the token in the path, but keep the same length,
+        raise UnsupportedAlgorithm(
 
-        # in case the URLconf will reject a different length.
+            "{} is not supported by this backend.".format(padding.name),
 
-        path = path[:-5] + ("0" * 4) + path[-1]
+            _Reasons.UNSUPPORTED_PADDING,
 
+        )
 
 
-        response = self.client.get(path)
 
-        self.assertEqual(response.status_code, 200)
+    return padding_enum
 
-        self.assertTrue("The password reset link was invalid" in response.content)
 
 
 
-    def test_confirm_invalid_user(self):
 
-        # Ensure that we get a 200 response for a non-existant user, not a 404
+def _rsa_sig_setup(backend, padding, algorithm, key, data, init_func):
 
-        response = self.client.get('/reset/123456-1-1/')
+    padding_enum = _rsa_sig_determine_padding(backend, key, padding, algorithm)
 
-        self.assertEqual(response.status_code, 200)
+    evp_md = backend._evp_md_non_null_from_algorithm(algorithm)
 
-        self.assertTrue("The password reset link was invalid" in response.content)
+    pkey_ctx = backend._lib.EVP_PKEY_CTX_new(key._evp_pkey, backend._ffi.NULL)
 
+    backend.openssl_assert(pkey_ctx != backend._ffi.NULL)
 
+    pkey_ctx = backend._ffi.gc(pkey_ctx, backend._lib.EVP_PKEY_CTX_free)
 
-    def test_confirm_overflow_user(self):
+    res = init_func(pkey_ctx)
 
-        # Ensure that we get a 200 response for a base36 user id that overflows int
+    backend.openssl_assert(res == 1)
 
-        response = self.client.get('/reset/zzzzzzzzzzzzz-1-1/')
+    res = backend._lib.EVP_PKEY_CTX_set_signature_md(pkey_ctx, evp_md)
 
-        self.assertEqual(response.status_code, 200)
+    if res == 0:
 
-        self.assertTrue("The password reset link was invalid" in response.content)
+        backend._consume_errors()
 
+        raise UnsupportedAlgorithm(
 
+            "{} is not supported by this backend for RSA signing.".format(
 
-    def test_confirm_invalid_post(self):
+                algorithm.name
 
-        # Same as test_confirm_invalid, but trying
+            ),
 
-        # to do a POST instead.
+            _Reasons.UNSUPPORTED_HASH,
 
-        url, path = self._test_confirm_start()
+        )
 
-        path = path[:-5] + ("0" * 4) + path[-1]
+    res = backend._lib.EVP_PKEY_CTX_set_rsa_padding(pkey_ctx, padding_enum)
 
+    backend.openssl_assert(res > 0)
 
+    if isinstance(padding, PSS):
 
-        self.client.post(path, {
+        res = backend._lib.EVP_PKEY_CTX_set_rsa_pss_saltlen(
 
-            'new_password1': 'anewpassword',
+            pkey_ctx, _get_rsa_pss_salt_length(padding, key, algorithm)
 
-            'new_password2': ' anewpassword',
+        )
 
-        })
+        backend.openssl_assert(res > 0)
 
-        # Check the password has not been changed
 
-        u = User.objects.get(email='staffmember@example.com')
 
-        self.assertTrue(not u.check_password("anewpassword"))
+        mgf1_md = backend._evp_md_non_null_from_algorithm(
 
+            padding._mgf._algorithm
 
+        )
 
-    def test_confirm_complete(self):
+        res = backend._lib.EVP_PKEY_CTX_set_rsa_mgf1_md(pkey_ctx, mgf1_md)
 
-        url, path = self._test_confirm_start()
+        backend.openssl_assert(res > 0)
 
-        response = self.client.post(path, {'new_password1': 'anewpassword',
 
-                                           'new_password2': 'anewpassword'})
 
-        # It redirects us to a 'complete' page:
+    return pkey_ctx
 
-        self.assertEqual(response.status_code, 302)
 
-        # Check the password has been changed
 
-        u = User.objects.get(email='staffmember@example.com')
 
-        self.assertTrue(u.check_password("anewpassword"))
 
+def _rsa_sig_sign(backend, padding, algorithm, private_key, data):
 
+    pkey_ctx = _rsa_sig_setup(
 
-        # Check we can't use the link again
+        backend,
 
-        response = self.client.get(path)
+        padding,
 
-        self.assertEqual(response.status_code, 200)
+        algorithm,
 
-        self.assertTrue("The password reset link was invalid" in response.content)
+        private_key,
 
+        data,
 
+        backend._lib.EVP_PKEY_sign_init,
 
-    def test_confirm_different_passwords(self):
+    )
 
-        url, path = self._test_confirm_start()
+    buflen = backend._ffi.new("size_t *")
 
-        response = self.client.post(path, {'new_password1': 'anewpassword',
+    res = backend._lib.EVP_PKEY_sign(
 
-                                           'new_password2': 'x'})
+        pkey_ctx, backend._ffi.NULL, buflen, data, len(data)
 
-        self.assertEqual(response.status_code, 200)
+    )
 
-        self.assertContainsEscaped(response, SetPasswordForm.error_messages['password_mismatch'])
+    backend.openssl_assert(res == 1)
 
+    buf = backend._ffi.new("unsigned char[]", buflen[0])
 
+    res = backend._lib.EVP_PKEY_sign(pkey_ctx, buf, buflen, data, len(data))
 
+    if res != 1:
 
+        errors = backend._consume_errors_with_text()
 
-class ChangePasswordTest(AuthViewsTestCase):
+        raise ValueError(
 
+            "Digest or salt length too long for key size. Use a larger key "
 
+            "or shorter salt length if you are specifying a PSS salt",
 
-    def fail_login(self, password='password'):
+            errors,
 
-        response = self.client.post('/login/', {
+        )
 
-            'username': 'testclient',
 
-            'password': password,
 
-        })
+    return backend._ffi.buffer(buf)[:]
 
-        self.assertEqual(response.status_code, 200)
 
-        self.assertContainsEscaped(response, AuthenticationForm.error_messages['invalid_login'])
 
 
 
-    def logout(self):
+def _rsa_sig_verify(backend, padding, algorithm, public_key, signature, data):
 
-        response = self.client.get('/logout/')
+    pkey_ctx = _rsa_sig_setup(
 
+        backend,
 
+        padding,
 
-    def test_password_change_fails_with_invalid_old_password(self):
+        algorithm,
 
-        self.login()
+        public_key,
 
-        response = self.client.post('/password_change/', {
+        data,
 
-            'old_password': 'donuts',
+        backend._lib.EVP_PKEY_verify_init,
 
-            'new_password1': 'password1',
+    )
 
-            'new_password2': 'password1',
+    res = backend._lib.EVP_PKEY_verify(
 
-        })
+        pkey_ctx, signature, len(signature), data, len(data)
 
-        self.assertEqual(response.status_code, 200)
+    )
 
-        self.assertContainsEscaped(response, PasswordChangeForm.error_messages['password_incorrect'])
+    # The previous call can return negative numbers in the event of an
 
+    # error. This is not a signature failure but we need to fail if it
 
+    # occurs.
 
-    def test_password_change_fails_with_mismatched_passwords(self):
+    backend.openssl_assert(res >= 0)
 
-        self.login()
+    if res == 0:
 
-        response = self.client.post('/password_change/', {
+        backend._consume_errors()
 
-            'old_password': 'password',
+        raise InvalidSignature
 
-            'new_password1': 'password1',
 
-            'new_password2': 'donuts',
 
-        })
 
-        self.assertEqual(response.status_code, 200)
 
-        self.assertContainsEscaped(response, SetPasswordForm.error_messages['password_mismatch'])
+@utils.register_interface(AsymmetricSignatureContext)
 
+class _RSASignatureContext(object):
 
+    def __init__(self, backend, private_key, padding, algorithm):
 
-    def test_password_change_succeeds(self):
+        self._backend = backend
 
-        self.login()
+        self._private_key = private_key
 
-        response = self.client.post('/password_change/', {
 
-            'old_password': 'password',
 
-            'new_password1': 'password1',
+        # We now call _rsa_sig_determine_padding in _rsa_sig_setup. However
 
-            'new_password2': 'password1',
+        # we need to make a pointless call to it here so we maintain the
 
-        })
+        # API of erroring on init with this context if the values are invalid.
 
-        self.assertEqual(response.status_code, 302)
+        _rsa_sig_determine_padding(backend, private_key, padding, algorithm)
 
-        self.assertTrue(response['Location'].endswith('/password_change/done/'))
+        self._padding = padding
 
-        self.fail_login()
+        self._algorithm = algorithm
 
-        self.login(password='password1')
+        self._hash_ctx = hashes.Hash(self._algorithm, self._backend)
 
 
 
-    def test_password_change_done_succeeds(self):
+    def update(self, data):
 
-        self.login()
+        self._hash_ctx.update(data)
 
-        response = self.client.post('/password_change/', {
 
-            'old_password': 'password',
 
-            'new_password1': 'password1',
+    def finalize(self):
 
-            'new_password2': 'password1',
+        return _rsa_sig_sign(
 
-        })
+            self._backend,
 
-        self.assertEqual(response.status_code, 302)
+            self._padding,
 
-        self.assertTrue(response['Location'].endswith('/password_change/done/'))
+            self._algorithm,
 
+            self._private_key,
 
+            self._hash_ctx.finalize(),
 
-    def test_password_change_done_fails(self):
+        )
 
-        with self.settings(LOGIN_URL='/login/'):
 
-            response = self.client.get('/password_change/done/')
 
-            self.assertEqual(response.status_code, 302)
 
-            self.assertTrue(response['Location'].endswith('/login/?next=/password_change/done/'))
 
+@utils.register_interface(AsymmetricVerificationContext)
 
+class _RSAVerificationContext(object):
 
+    def __init__(self, backend, public_key, signature, padding, algorithm):
 
+        self._backend = backend
 
-class LoginTest(AuthViewsTestCase):
+        self._public_key = public_key
 
+        self._signature = signature
 
+        self._padding = padding
 
-    def test_current_site_in_context_after_login(self):
+        # We now call _rsa_sig_determine_padding in _rsa_sig_setup. However
 
-        response = self.client.get(reverse('django.contrib.auth.views.login'))
+        # we need to make a pointless call to it here so we maintain the
 
-        self.assertEqual(response.status_code, 200)
+        # API of erroring on init with this context if the values are invalid.
 
-        if Site._meta.installed:
+        _rsa_sig_determine_padding(backend, public_key, padding, algorithm)
 
-            site = Site.objects.get_current()
 
-            self.assertEqual(response.context['site'], site)
 
-            self.assertEqual(response.context['site_name'], site.name)
+        padding = padding
 
-        else:
+        self._algorithm = algorithm
 
-            self.assertIsInstance(response.context['site'], RequestSite)
+        self._hash_ctx = hashes.Hash(self._algorithm, self._backend)
 
-        self.assertTrue(isinstance(response.context['form'], AuthenticationForm),
 
-                     'Login form is not an AuthenticationForm')
 
+    def update(self, data):
 
+        self._hash_ctx.update(data)
 
-    def test_security_check(self, password='password'):
 
-        login_url = reverse('django.contrib.auth.views.login')
 
+    def verify(self):
 
+        return _rsa_sig_verify(
 
-        # Those URLs should not pass the security check
+            self._backend,
 
-        for bad_url in ('http://example.com',
+            self._padding,
 
-                        'https://example.com',
+            self._algorithm,
 
-                        'ftp://exampel.com',
+            self._public_key,
 
-                        '//example.com'):
+            self._signature,
 
+            self._hash_ctx.finalize(),
 
+        )
 
-            nasty_url = '%(url)s?%(next)s=%(bad_url)s' % {
 
-                'url': login_url,
 
-                'next': REDIRECT_FIELD_NAME,
 
-                'bad_url': urllib.quote(bad_url),
 
-            }
+@utils.register_interface(RSAPrivateKeyWithSerialization)
 
-            response = self.client.post(nasty_url, {
+class _RSAPrivateKey(object):
 
-                'username': 'testclient',
+    def __init__(self, backend, rsa_cdata, evp_pkey):
 
-                'password': password,
+        res = backend._lib.RSA_check_key(rsa_cdata)
 
-            })
+        if res != 1:
 
-            self.assertEqual(response.status_code, 302)
+            errors = backend._consume_errors_with_text()
 
-            self.assertFalse(bad_url in response['Location'],
+            raise ValueError("Invalid private key", errors)
 
-                             "%s should be blocked" % bad_url)
 
 
+        self._backend = backend
 
-        # These URLs *should* still pass the security check
+        self._rsa_cdata = rsa_cdata
 
-        for good_url in ('/view/?param=http://example.com',
+        self._evp_pkey = evp_pkey
 
-                         '/view/?param=https://example.com',
 
-                         '/view?param=ftp://exampel.com',
 
-                         'view/?param=//example.com',
+        n = self._backend._ffi.new("BIGNUM **")
 
-                         'https:///',
+        self._backend._lib.RSA_get0_key(
 
-                         '//testserver/',
+            self._rsa_cdata,
 
-                         '/url%20with%20spaces/'):  # see ticket #12534
+            n,
 
-            safe_url = '%(url)s?%(next)s=%(good_url)s' % {
+            self._backend._ffi.NULL,
 
-                'url': login_url,
+            self._backend._ffi.NULL,
 
-                'next': REDIRECT_FIELD_NAME,
+        )
 
-                'good_url': urllib.quote(good_url),
+        self._backend.openssl_assert(n[0] != self._backend._ffi.NULL)
 
-            }
+        self._key_size = self._backend._lib.BN_num_bits(n[0])
 
-            response = self.client.post(safe_url, {
 
-                    'username': 'testclient',
 
-                    'password': password,
+    key_size = utils.read_only_property("_key_size")
 
-            })
 
-            self.assertEqual(response.status_code, 302)
 
-            self.assertTrue(good_url in response['Location'],
+    def signer(self, padding, algorithm):
 
-                            "%s should be allowed" % good_url)
+        _warn_sign_verify_deprecated()
 
+        _check_not_prehashed(algorithm)
 
+        return _RSASignatureContext(self._backend, self, padding, algorithm)
 
 
 
-class LoginURLSettings(AuthViewsTestCase):
+    def decrypt(self, ciphertext, padding):
 
+        key_size_bytes = (self.key_size + 7) // 8
 
+        if key_size_bytes != len(ciphertext):
 
-    def setUp(self):
+            raise ValueError("Ciphertext length must be equal to key size.")
 
-        super(LoginURLSettings, self).setUp()
 
-        self.old_LOGIN_URL = settings.LOGIN_URL
 
+        return _enc_dec_rsa(self._backend, self, ciphertext, padding)
 
 
-    def tearDown(self):
 
-        super(LoginURLSettings, self).tearDown()
+    def public_key(self):
 
-        settings.LOGIN_URL = self.old_LOGIN_URL
+        ctx = self._backend._lib.RSAPublicKey_dup(self._rsa_cdata)
 
+        self._backend.openssl_assert(ctx != self._backend._ffi.NULL)
 
+        ctx = self._backend._ffi.gc(ctx, self._backend._lib.RSA_free)
 
-    def get_login_required_url(self, login_url):
+        res = self._backend._lib.RSA_blinding_on(ctx, self._backend._ffi.NULL)
 
-        settings.LOGIN_URL = login_url
+        self._backend.openssl_assert(res == 1)
 
-        response = self.client.get('/login_required/')
+        evp_pkey = self._backend._rsa_cdata_to_evp_pkey(ctx)
 
-        self.assertEqual(response.status_code, 302)
+        return _RSAPublicKey(self._backend, ctx, evp_pkey)
 
-        return response['Location']
 
 
+    def private_numbers(self):
 
-    def test_standard_login_url(self):
+        n = self._backend._ffi.new("BIGNUM **")
 
-        login_url = '/login/'
+        e = self._backend._ffi.new("BIGNUM **")
 
-        login_required_url = self.get_login_required_url(login_url)
+        d = self._backend._ffi.new("BIGNUM **")
 
-        querystring = QueryDict('', mutable=True)
+        p = self._backend._ffi.new("BIGNUM **")
 
-        querystring['next'] = '/login_required/'
+        q = self._backend._ffi.new("BIGNUM **")
 
-        self.assertEqual(login_required_url, 'http://testserver%s?%s' %
+        dmp1 = self._backend._ffi.new("BIGNUM **")
 
-                         (login_url, querystring.urlencode('/')))
+        dmq1 = self._backend._ffi.new("BIGNUM **")
 
+        iqmp = self._backend._ffi.new("BIGNUM **")
 
+        self._backend._lib.RSA_get0_key(self._rsa_cdata, n, e, d)
 
-    def test_remote_login_url(self):
+        self._backend.openssl_assert(n[0] != self._backend._ffi.NULL)
 
-        login_url = 'http://remote.example.com/login'
+        self._backend.openssl_assert(e[0] != self._backend._ffi.NULL)
 
-        login_required_url = self.get_login_required_url(login_url)
+        self._backend.openssl_assert(d[0] != self._backend._ffi.NULL)
 
-        querystring = QueryDict('', mutable=True)
+        self._backend._lib.RSA_get0_factors(self._rsa_cdata, p, q)
 
-        querystring['next'] = 'http://testserver/login_required/'
+        self._backend.openssl_assert(p[0] != self._backend._ffi.NULL)
 
-        self.assertEqual(login_required_url,
+        self._backend.openssl_assert(q[0] != self._backend._ffi.NULL)
 
-                         '%s?%s' % (login_url, querystring.urlencode('/')))
+        self._backend._lib.RSA_get0_crt_params(
 
+            self._rsa_cdata, dmp1, dmq1, iqmp
 
+        )
 
-    def test_https_login_url(self):
+        self._backend.openssl_assert(dmp1[0] != self._backend._ffi.NULL)
 
-        login_url = 'https:///login/'
+        self._backend.openssl_assert(dmq1[0] != self._backend._ffi.NULL)
 
-        login_required_url = self.get_login_required_url(login_url)
+        self._backend.openssl_assert(iqmp[0] != self._backend._ffi.NULL)
 
-        querystring = QueryDict('', mutable=True)
+        return rsa.RSAPrivateNumbers(
 
-        querystring['next'] = 'http://testserver/login_required/'
+            p=self._backend._bn_to_int(p[0]),
 
-        self.assertEqual(login_required_url,
+            q=self._backend._bn_to_int(q[0]),
 
-                         '%s?%s' % (login_url, querystring.urlencode('/')))
+            d=self._backend._bn_to_int(d[0]),
 
+            dmp1=self._backend._bn_to_int(dmp1[0]),
 
+            dmq1=self._backend._bn_to_int(dmq1[0]),
 
-    def test_login_url_with_querystring(self):
+            iqmp=self._backend._bn_to_int(iqmp[0]),
 
-        login_url = '/login/?pretty=1'
+            public_numbers=rsa.RSAPublicNumbers(
 
-        login_required_url = self.get_login_required_url(login_url)
+                e=self._backend._bn_to_int(e[0]),
 
-        querystring = QueryDict('pretty=1', mutable=True)
+                n=self._backend._bn_to_int(n[0]),
 
-        querystring['next'] = '/login_required/'
+            ),
 
-        self.assertEqual(login_required_url, 'http://testserver/login/?%s' %
+        )
 
-                         querystring.urlencode('/'))
 
 
+    def private_bytes(self, encoding, format, encryption_algorithm):
 
-    def test_remote_login_url_with_next_querystring(self):
+        return self._backend._private_key_bytes(
 
-        login_url = 'http://remote.example.com/login/'
+            encoding,
 
-        login_required_url = self.get_login_required_url('%s?next=/default/' %
+            format,
 
-                                                         login_url)
+            encryption_algorithm,
 
-        querystring = QueryDict('', mutable=True)
+            self,
 
-        querystring['next'] = 'http://testserver/login_required/'
+            self._evp_pkey,
 
-        self.assertEqual(login_required_url, '%s?%s' % (login_url,
+            self._rsa_cdata,
 
-                                                    querystring.urlencode('/')))
+        )
 
 
 
+    def sign(self, data, padding, algorithm):
 
+        data, algorithm = _calculate_digest_and_algorithm(
 
-class LogoutTest(AuthViewsTestCase):
+            self._backend, data, algorithm
 
+        )
 
+        return _rsa_sig_sign(self._backend, padding, algorithm, self, data)
 
-    def confirm_logged_out(self):
 
-        self.assertTrue(SESSION_KEY not in self.client.session)
 
 
 
-    def test_logout_default(self):
+@utils.register_interface(RSAPublicKeyWithSerialization)
 
-        "Logout without next_page option renders the default template"
+class _RSAPublicKey(object):
 
-        self.login()
+    def __init__(self, backend, rsa_cdata, evp_pkey):
 
-        response = self.client.get('/logout/')
+        self._backend = backend
 
-        self.assertEqual(200, response.status_code)
+        self._rsa_cdata = rsa_cdata
 
-        self.assertTrue('Logged out' in response.content)
+        self._evp_pkey = evp_pkey
 
-        self.confirm_logged_out()
 
 
+        n = self._backend._ffi.new("BIGNUM **")
 
-    def test_14377(self):
+        self._backend._lib.RSA_get0_key(
 
-        # Bug 14377
+            self._rsa_cdata,
 
-        self.login()
+            n,
 
-        response = self.client.get('/logout/')
+            self._backend._ffi.NULL,
 
-        self.assertTrue('site' in response.context)
+            self._backend._ffi.NULL,
 
+        )
 
+        self._backend.openssl_assert(n[0] != self._backend._ffi.NULL)
 
-    def test_logout_with_overridden_redirect_url(self):
+        self._key_size = self._backend._lib.BN_num_bits(n[0])
 
-        # Bug 11223
 
-        self.login()
 
-        response = self.client.get('/logout/next_page/')
+    key_size = utils.read_only_property("_key_size")
 
-        self.assertEqual(response.status_code, 302)
 
-        self.assertTrue(response['Location'].endswith('/somewhere/'))
 
+    def verifier(self, signature, padding, algorithm):
 
+        _warn_sign_verify_deprecated()
 
-        response = self.client.get('/logout/next_page/?next=/login/')
+        utils._check_bytes("signature", signature)
 
-        self.assertEqual(response.status_code, 302)
 
-        self.assertTrue(response['Location'].endswith('/login/'))
 
+        _check_not_prehashed(algorithm)
 
+        return _RSAVerificationContext(
 
-        self.confirm_logged_out()
+            self._backend, self, signature, padding, algorithm
 
+        )
 
 
-    def test_logout_with_next_page_specified(self):
 
-        "Logout with next_page option given redirects to specified resource"
+    def encrypt(self, plaintext, padding):
 
-        self.login()
+        return _enc_dec_rsa(self._backend, self, plaintext, padding)
 
-        response = self.client.get('/logout/next_page/')
 
-        self.assertEqual(response.status_code, 302)
 
-        self.assertTrue(response['Location'].endswith('/somewhere/'))
+    def public_numbers(self):
 
-        self.confirm_logged_out()
+        n = self._backend._ffi.new("BIGNUM **")
 
+        e = self._backend._ffi.new("BIGNUM **")
 
+        self._backend._lib.RSA_get0_key(
 
-    def test_logout_with_redirect_argument(self):
+            self._rsa_cdata, n, e, self._backend._ffi.NULL
 
-        "Logout with query string redirects to specified resource"
+        )
 
-        self.login()
+        self._backend.openssl_assert(n[0] != self._backend._ffi.NULL)
 
-        response = self.client.get('/logout/?next=/login/')
+        self._backend.openssl_assert(e[0] != self._backend._ffi.NULL)
 
-        self.assertEqual(response.status_code, 302)
+        return rsa.RSAPublicNumbers(
 
-        self.assertTrue(response['Location'].endswith('/login/'))
+            e=self._backend._bn_to_int(e[0]),
 
-        self.confirm_logged_out()
+            n=self._backend._bn_to_int(n[0]),
 
+        )
 
 
-    def test_logout_with_custom_redirect_argument(self):
 
-        "Logout with custom query string redirects to specified resource"
+    def public_bytes(self, encoding, format):
 
-        self.login()
+        return self._backend._public_key_bytes(
 
-        response = self.client.get('/logout/custom_query/?follow=/somewhere/')
+            encoding, format, self, self._evp_pkey, self._rsa_cdata
 
-        self.assertEqual(response.status_code, 302)
+        )
 
-        self.assertTrue(response['Location'].endswith('/somewhere/'))
 
-        self.confirm_logged_out()
 
+    def verify(self, signature, data, padding, algorithm):
 
+        data, algorithm = _calculate_digest_and_algorithm(
 
-    def test_security_check(self, password='password'):
+            self._backend, data, algorithm
 
-        logout_url = reverse('django.contrib.auth.views.logout')
+        )
 
+        return _rsa_sig_verify(
 
+            self._backend, padding, algorithm, self, signature, data
 
-        # Those URLs should not pass the security check
-
-        for bad_url in ('http://example.com',
-
-                        'https://example.com',
-
-                        'ftp://exampel.com',
-
-                        '//example.com'):
-
-            nasty_url = '%(url)s?%(next)s=%(bad_url)s' % {
-
-                'url': logout_url,
-
-                'next': REDIRECT_FIELD_NAME,
-
-                'bad_url': urllib.quote(bad_url),
-
-            }
-
-            self.login()
-
-            response = self.client.get(nasty_url)
-
-            self.assertEqual(response.status_code, 302)
-
-            self.assertFalse(bad_url in response['Location'],
-
-                             "%s should be blocked" % bad_url)
-
-            self.confirm_logged_out()
-
-
-
-        # These URLs *should* still pass the security check
-
-        for good_url in ('/view/?param=http://example.com',
-
-                         '/view/?param=https://example.com',
-
-                         '/view?param=ftp://exampel.com',
-
-                         'view/?param=//example.com',
-
-                         'https:///',
-
-                         '//testserver/',
-
-                         '/url%20with%20spaces/'):  # see ticket #12534
-
-            safe_url = '%(url)s?%(next)s=%(good_url)s' % {
-
-                'url': logout_url,
-
-                'next': REDIRECT_FIELD_NAME,
-
-                'good_url': urllib.quote(good_url),
-
-            }
-
-            self.login()
-
-            response = self.client.get(safe_url)
-
-            self.assertEqual(response.status_code, 302)
-
-            self.assertTrue(good_url in response['Location'],
-
-                            "%s should be allowed" % good_url)
-
-            self.confirm_logged_out()
+        )

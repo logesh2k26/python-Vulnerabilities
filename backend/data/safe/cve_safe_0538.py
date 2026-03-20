@@ -2,1517 +2,5589 @@
 # Safety: safe
 # Category: safe
 
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
+import string
 
+import unittest
 
+from email import _header_value_parser as parser
 
-# Copyright 2012 OpenStack LLC
+from email import errors
 
-#
+from email import policy
 
-# Licensed under the Apache License, Version 2.0 (the "License"); you may
+from test.test_email import TestEmailBase, parameterize
 
-# not use this file except in compliance with the License. You may obtain
 
-# a copy of the License at
 
-#
+class TestTokens(TestEmailBase):
 
-#      http://www.apache.org/licenses/LICENSE-2.0
 
-#
 
-# Unless required by applicable law or agreed to in writing, software
+    # EWWhiteSpaceTerminal
 
-# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
-# License for the specific language governing permissions and limitations
+    def test_EWWhiteSpaceTerminal(self):
 
-# under the License.
+        x = parser.EWWhiteSpaceTerminal(' \t', 'fws')
 
+        self.assertEqual(x, ' \t')
 
+        self.assertEqual(str(x), '')
 
-import uuid
+        self.assertEqual(x.value, '')
 
-import routes
+        self.assertEqual(x.token_type, 'fws')
 
-import json
 
 
 
-from keystone import config
 
-from keystone import catalog
+class TestParserMixin:
 
-from keystone.common import cms
 
-from keystone.common import logging
 
-from keystone.common import utils
+    def _assert_results(self, tl, rest, string, value, defects, remainder,
 
-from keystone.common import wsgi
+                        comments=None):
 
-from keystone import exception
+        self.assertEqual(str(tl), string)
 
-from keystone import identity
+        self.assertEqual(tl.value, value)
 
-from keystone.openstack.common import timeutils
+        self.assertDefectsEqual(tl.all_defects, defects)
 
-from keystone import policy
+        self.assertEqual(rest, remainder)
 
-from keystone import token
+        if comments is not None:
 
+            self.assertEqual(tl.comments, comments)
 
 
 
+    def _test_get_x(self, method, source, string, value, defects,
 
-LOG = logging.getLogger(__name__)
+                          remainder, comments=None):
 
-MAX_PARAM_SIZE = config.CONF.max_param_size
+        tl, rest = method(source)
 
-MAX_TOKEN_SIZE = config.CONF.max_token_size
+        self._assert_results(tl, rest, string, value, defects, remainder,
 
+                             comments=None)
 
+        return tl
 
 
 
-class AdminRouter(wsgi.ComposingRouter):
+    def _test_parse_x(self, method, input, string, value, defects,
 
-    def __init__(self):
+                             comments=None):
 
-        mapper = routes.Mapper()
+        tl = method(input)
 
+        self._assert_results(tl, '', string, value, defects, '', comments)
 
+        return tl
 
-        version_controller = VersionController('admin')
 
-        mapper.connect('/',
 
-                       controller=version_controller,
 
-                       action='get_version')
 
+class TestParser(TestParserMixin, TestEmailBase):
 
 
-        # Token Operations
 
-        auth_controller = TokenController()
+    # _wsp_splitter
 
-        mapper.connect('/tokens',
 
-                       controller=auth_controller,
 
-                       action='authenticate',
+    rfc_printable_ascii = bytes(range(33, 127)).decode('ascii')
 
-                       conditions=dict(method=['POST']))
+    rfc_atext_chars = (string.ascii_letters + string.digits +
 
-        mapper.connect('/tokens/revoked',
+                        "!#$%&\'*+-/=?^_`{}|~")
 
-                       controller=auth_controller,
+    rfc_dtext_chars = rfc_printable_ascii.translate(str.maketrans('','',r'\[]'))
 
-                       action='revocation_list',
 
-                       conditions=dict(method=['GET']))
 
-        mapper.connect('/tokens/{token_id}',
+    def test__wsp_splitter_one_word(self):
 
-                       controller=auth_controller,
+        self.assertEqual(parser._wsp_splitter('foo', 1), ['foo'])
 
-                       action='validate_token',
 
-                       conditions=dict(method=['GET']))
 
-        mapper.connect('/tokens/{token_id}',
+    def test__wsp_splitter_two_words(self):
 
-                       controller=auth_controller,
+        self.assertEqual(parser._wsp_splitter('foo def', 1),
 
-                       action='validate_token_head',
+                                               ['foo', ' ', 'def'])
 
-                       conditions=dict(method=['HEAD']))
 
-        mapper.connect('/tokens/{token_id}',
 
-                       controller=auth_controller,
+    def test__wsp_splitter_ws_runs(self):
 
-                       action='delete_token',
+        self.assertEqual(parser._wsp_splitter('foo \t def jik', 1),
 
-                       conditions=dict(method=['DELETE']))
+                                              ['foo', ' \t ', 'def jik'])
 
-        mapper.connect('/tokens/{token_id}/endpoints',
 
-                       controller=auth_controller,
 
-                       action='endpoints',
 
-                       conditions=dict(method=['GET']))
 
+    # get_fws
 
 
-        # Certificates used to verify auth tokens
 
-        mapper.connect('/certificates/ca',
+    def test_get_fws_only(self):
 
-                       controller=auth_controller,
+        fws = self._test_get_x(parser.get_fws, ' \t  ', ' \t  ', ' ', [], '')
 
-                       action='ca_cert',
+        self.assertEqual(fws.token_type, 'fws')
 
-                       conditions=dict(method=['GET']))
 
 
+    def test_get_fws_space(self):
 
-        mapper.connect('/certificates/signing',
+        self._test_get_x(parser.get_fws, ' foo', ' ', ' ', [], 'foo')
 
-                       controller=auth_controller,
 
-                       action='signing_cert',
 
-                       conditions=dict(method=['GET']))
+    def test_get_fws_ws_run(self):
 
+        self._test_get_x(parser.get_fws, ' \t foo ', ' \t ', ' ', [], 'foo ')
 
 
-        # Miscellaneous Operations
 
-        extensions_controller = AdminExtensionsController()
+    # get_encoded_word
 
-        mapper.connect('/extensions',
 
-                       controller=extensions_controller,
 
-                       action='get_extensions_info',
+    def test_get_encoded_word_missing_start_raises(self):
 
-                       conditions=dict(method=['GET']))
+        with self.assertRaises(errors.HeaderParseError):
 
-        mapper.connect('/extensions/{extension_alias}',
+            parser.get_encoded_word('abc')
 
-                       controller=extensions_controller,
 
-                       action='get_extension_info',
 
-                       conditions=dict(method=['GET']))
+    def test_get_encoded_word_missing_end_raises(self):
 
-        identity_router = identity.AdminRouter()
+        with self.assertRaises(errors.HeaderParseError):
 
-        routers = [identity_router]
+            parser.get_encoded_word('=?abc')
 
-        super(AdminRouter, self).__init__(mapper, routers)
 
 
+    def test_get_encoded_word_missing_middle_raises(self):
 
+        with self.assertRaises(errors.HeaderParseError):
 
+            parser.get_encoded_word('=?abc?=')
 
-class PublicRouter(wsgi.ComposingRouter):
 
-    def __init__(self):
 
-        mapper = routes.Mapper()
+    def test_get_encoded_word_valid_ew(self):
 
+        self._test_get_x(parser.get_encoded_word,
 
+                         '=?us-ascii?q?this_is_a_test?=  bird',
 
-        version_controller = VersionController('public')
+                         'this is a test',
 
-        mapper.connect('/',
+                         'this is a test',
 
-                       controller=version_controller,
+                         [],
 
-                       action='get_version')
+                         '  bird')
 
 
 
-        # Token Operations
+    def test_get_encoded_word_internal_spaces(self):
 
-        auth_controller = TokenController()
+        self._test_get_x(parser.get_encoded_word,
 
-        mapper.connect('/tokens',
+                         '=?us-ascii?q?this is a test?=  bird',
 
-                       controller=auth_controller,
+                         'this is a test',
 
-                       action='authenticate',
+                         'this is a test',
 
-                       conditions=dict(method=['POST']))
+                         [errors.InvalidHeaderDefect],
 
+                         '  bird')
 
 
-        mapper.connect('/certificates/ca',
 
-                       controller=auth_controller,
+    def test_get_encoded_word_gets_first(self):
 
-                       action='ca_cert',
+        self._test_get_x(parser.get_encoded_word,
 
-                       conditions=dict(method=['GET']))
+                         '=?us-ascii?q?first?=  =?utf-8?q?second?=',
 
+                         'first',
 
+                         'first',
 
-        mapper.connect('/certificates/signing',
+                         [],
 
-                       controller=auth_controller,
+                         '  =?utf-8?q?second?=')
 
-                       action='signing_cert',
 
-                       conditions=dict(method=['GET']))
 
+    def test_get_encoded_word_gets_first_even_if_no_space(self):
 
+        self._test_get_x(parser.get_encoded_word,
 
-        # Miscellaneous
+                         '=?us-ascii?q?first?==?utf-8?q?second?=',
 
-        extensions_controller = PublicExtensionsController()
+                         'first',
 
-        mapper.connect('/extensions',
+                         'first',
 
-                       controller=extensions_controller,
+                         [errors.InvalidHeaderDefect],
 
-                       action='get_extensions_info',
+                         '=?utf-8?q?second?=')
 
-                       conditions=dict(method=['GET']))
 
-        mapper.connect('/extensions/{extension_alias}',
 
-                       controller=extensions_controller,
+    def test_get_encoded_word_sets_extra_attributes(self):
 
-                       action='get_extension_info',
+        ew = self._test_get_x(parser.get_encoded_word,
 
-                       conditions=dict(method=['GET']))
+                         '=?us-ascii*jive?q?first_second?=',
 
+                         'first second',
 
+                         'first second',
 
-        identity_router = identity.PublicRouter()
+                         [],
 
-        routers = [identity_router]
+                         '')
 
+        self.assertEqual(ew.charset, 'us-ascii')
 
+        self.assertEqual(ew.lang, 'jive')
 
-        super(PublicRouter, self).__init__(mapper, routers)
 
 
+    def test_get_encoded_word_lang_default_is_blank(self):
 
+        ew = self._test_get_x(parser.get_encoded_word,
 
+                         '=?us-ascii?q?first_second?=',
 
-class PublicVersionRouter(wsgi.ComposingRouter):
+                         'first second',
 
-    def __init__(self):
+                         'first second',
 
-        mapper = routes.Mapper()
+                         [],
 
-        version_controller = VersionController('public')
+                         '')
 
-        mapper.connect('/',
+        self.assertEqual(ew.charset, 'us-ascii')
 
-                       controller=version_controller,
+        self.assertEqual(ew.lang, '')
 
-                       action='get_versions')
 
-        routers = []
 
-        super(PublicVersionRouter, self).__init__(mapper, routers)
+    def test_get_encoded_word_non_printable_defect(self):
 
+        self._test_get_x(parser.get_encoded_word,
 
+                         '=?us-ascii?q?first\x02second?=',
 
+                         'first\x02second',
 
+                         'first\x02second',
 
-class AdminVersionRouter(wsgi.ComposingRouter):
+                         [errors.NonPrintableDefect],
 
-    def __init__(self):
+                         '')
 
-        mapper = routes.Mapper()
 
-        version_controller = VersionController('admin')
 
-        mapper.connect('/',
+    def test_get_encoded_word_leading_internal_space(self):
 
-                       controller=version_controller,
+        self._test_get_x(parser.get_encoded_word,
 
-                       action='get_versions')
+                        '=?us-ascii?q?=20foo?=',
 
-        routers = []
+                        ' foo',
 
-        super(AdminVersionRouter, self).__init__(mapper, routers)
+                        ' foo',
 
+                        [],
 
+                        '')
 
 
 
-class VersionController(wsgi.Application):
+    def test_get_encoded_word_quopri_utf_escape_follows_cte(self):
 
-    def __init__(self, version_type):
+        # Issue 18044
 
-        self.catalog_api = catalog.Manager()
+        self._test_get_x(parser.get_encoded_word,
 
-        self.url_key = '%sURL' % version_type
+                        '=?utf-8?q?=C3=89ric?=',
 
+                        'Éric',
 
+                        'Éric',
 
-        super(VersionController, self).__init__()
+                        [],
 
+                        '')
 
 
-    def _get_identity_url(self, context):
 
-        catalog_ref = self.catalog_api.get_catalog(context=context,
+    # get_unstructured
 
-                                                   user_id=None,
 
-                                                   tenant_id=None)
 
-        for region, region_ref in catalog_ref.iteritems():
+    def _get_unst(self, value):
 
-            for service, service_ref in region_ref.iteritems():
+        token = parser.get_unstructured(value)
 
-                if service == 'identity':
+        return token, ''
 
-                    return service_ref[self.url_key]
 
 
+    def test_get_unstructured_null(self):
 
-        raise exception.NotImplemented()
+        self._test_get_x(self._get_unst, '', '', '', [], '')
 
 
 
-    def _get_versions_list(self, context):
+    def test_get_unstructured_one_word(self):
 
-        """The list of versions is dependent on the context."""
+        self._test_get_x(self._get_unst, 'foo', 'foo', 'foo', [], '')
 
-        identity_url = self._get_identity_url(context)
 
-        if not identity_url.endswith('/'):
 
-            identity_url = identity_url + '/'
+    def test_get_unstructured_normal_phrase(self):
 
+        self._test_get_x(self._get_unst, 'foo bar bird',
 
+                                         'foo bar bird',
 
-        versions = {}
+                                         'foo bar bird',
 
-        versions['v2.0'] = {
+                                         [],
 
-            'id': 'v2.0',
+                                         '')
 
-            'status': 'beta',
 
-            'updated': '2011-11-19T00:00:00Z',
 
-            'links': [
+    def test_get_unstructured_normal_phrase_with_whitespace(self):
 
-                {
+        self._test_get_x(self._get_unst, 'foo \t bar      bird',
 
-                    'rel': 'self',
+                                         'foo \t bar      bird',
 
-                    'href': identity_url,
+                                         'foo bar bird',
 
-                }, {
+                                         [],
 
-                    'rel': 'describedby',
+                                         '')
 
-                    'type': 'text/html',
 
-                    'href': 'http://docs.openstack.org/api/openstack-'
 
-                            'identity-service/2.0/content/'
+    def test_get_unstructured_leading_whitespace(self):
 
-                }, {
+        self._test_get_x(self._get_unst, '  foo bar',
 
-                    'rel': 'describedby',
+                                         '  foo bar',
 
-                    'type': 'application/pdf',
+                                         ' foo bar',
 
-                    'href': 'http://docs.openstack.org/api/openstack-'
+                                         [],
 
-                            'identity-service/2.0/identity-dev-guide-'
+                                         '')
 
-                            '2.0.pdf'
 
-                }
+
+    def test_get_unstructured_trailing_whitespace(self):
+
+        self._test_get_x(self._get_unst, 'foo bar  ',
+
+                                         'foo bar  ',
+
+                                         'foo bar ',
+
+                                         [],
+
+                                         '')
+
+
+
+    def test_get_unstructured_leading_and_trailing_whitespace(self):
+
+        self._test_get_x(self._get_unst, '  foo bar  ',
+
+                                         '  foo bar  ',
+
+                                         ' foo bar ',
+
+                                         [],
+
+                                         '')
+
+
+
+    def test_get_unstructured_one_valid_ew_no_ws(self):
+
+        self._test_get_x(self._get_unst, '=?us-ascii?q?bar?=',
+
+                                         'bar',
+
+                                         'bar',
+
+                                         [],
+
+                                         '')
+
+
+
+    def test_get_unstructured_one_ew_trailing_ws(self):
+
+        self._test_get_x(self._get_unst, '=?us-ascii?q?bar?=  ',
+
+                                         'bar  ',
+
+                                         'bar ',
+
+                                         [],
+
+                                         '')
+
+
+
+    def test_get_unstructured_one_valid_ew_trailing_text(self):
+
+        self._test_get_x(self._get_unst, '=?us-ascii?q?bar?= bird',
+
+                                         'bar bird',
+
+                                         'bar bird',
+
+                                         [],
+
+                                         '')
+
+
+
+    def test_get_unstructured_phrase_with_ew_in_middle_of_text(self):
+
+        self._test_get_x(self._get_unst, 'foo =?us-ascii?q?bar?= bird',
+
+                                         'foo bar bird',
+
+                                         'foo bar bird',
+
+                                         [],
+
+                                         '')
+
+
+
+    def test_get_unstructured_phrase_with_two_ew(self):
+
+        self._test_get_x(self._get_unst,
+
+            'foo =?us-ascii?q?bar?= =?us-ascii?q?bird?=',
+
+            'foo barbird',
+
+            'foo barbird',
+
+            [],
+
+            '')
+
+
+
+    def test_get_unstructured_phrase_with_two_ew_trailing_ws(self):
+
+        self._test_get_x(self._get_unst,
+
+            'foo =?us-ascii?q?bar?= =?us-ascii?q?bird?=   ',
+
+            'foo barbird   ',
+
+            'foo barbird ',
+
+            [],
+
+            '')
+
+
+
+    def test_get_unstructured_phrase_with_ew_with_leading_ws(self):
+
+        self._test_get_x(self._get_unst,
+
+            '  =?us-ascii?q?bar?=',
+
+            '  bar',
+
+            ' bar',
+
+            [],
+
+            '')
+
+
+
+    def test_get_unstructured_phrase_with_two_ew_extra_ws(self):
+
+        self._test_get_x(self._get_unst,
+
+            'foo =?us-ascii?q?bar?= \t  =?us-ascii?q?bird?=',
+
+            'foo barbird',
+
+            'foo barbird',
+
+            [],
+
+            '')
+
+
+
+    def test_get_unstructured_two_ew_extra_ws_trailing_text(self):
+
+        self._test_get_x(self._get_unst,
+
+            '=?us-ascii?q?test?=   =?us-ascii?q?foo?=  val',
+
+            'testfoo  val',
+
+            'testfoo val',
+
+            [],
+
+            '')
+
+
+
+    def test_get_unstructured_ew_with_internal_ws(self):
+
+        self._test_get_x(self._get_unst,
+
+            '=?iso-8859-1?q?hello=20world?=',
+
+            'hello world',
+
+            'hello world',
+
+            [],
+
+            '')
+
+
+
+    def test_get_unstructured_ew_with_internal_leading_ws(self):
+
+        self._test_get_x(self._get_unst,
+
+            '   =?us-ascii?q?=20test?=   =?us-ascii?q?=20foo?=  val',
+
+            '    test foo  val',
+
+            '  test foo val',
+
+            [],
+
+            '')
+
+
+
+    def test_get_unstructured_invaild_ew(self):
+
+        self._test_get_x(self._get_unst,
+
+            '=?test val',
+
+            '=?test val',
+
+            '=?test val',
+
+            [],
+
+            '')
+
+
+
+    def test_get_unstructured_undecodable_bytes(self):
+
+        self._test_get_x(self._get_unst,
+
+            b'test \xACfoo  val'.decode('ascii', 'surrogateescape'),
+
+            'test \uDCACfoo  val',
+
+            'test \uDCACfoo val',
+
+            [errors.UndecodableBytesDefect],
+
+            '')
+
+
+
+    def test_get_unstructured_undecodable_bytes_in_EW(self):
+
+        self._test_get_x(self._get_unst,
+
+            (b'=?us-ascii?q?=20test?=   =?us-ascii?q?=20\xACfoo?='
+
+                b'  val').decode('ascii', 'surrogateescape'),
+
+            ' test \uDCACfoo  val',
+
+            ' test \uDCACfoo val',
+
+            [errors.UndecodableBytesDefect]*2,
+
+            '')
+
+
+
+    def test_get_unstructured_missing_base64_padding(self):
+
+        self._test_get_x(self._get_unst,
+
+            '=?utf-8?b?dmk?=',
+
+            'vi',
+
+            'vi',
+
+            [errors.InvalidBase64PaddingDefect],
+
+            '')
+
+
+
+    def test_get_unstructured_invalid_base64_character(self):
+
+        self._test_get_x(self._get_unst,
+
+            '=?utf-8?b?dm\x01k===?=',
+
+            'vi',
+
+            'vi',
+
+            [errors.InvalidBase64CharactersDefect],
+
+            '')
+
+
+
+    def test_get_unstructured_invalid_base64_character_and_bad_padding(self):
+
+        self._test_get_x(self._get_unst,
+
+            '=?utf-8?b?dm\x01k?=',
+
+            'vi',
+
+            'vi',
+
+            [errors.InvalidBase64CharactersDefect,
+
+             errors.InvalidBase64PaddingDefect],
+
+            '')
+
+
+
+    def test_get_unstructured_invalid_base64_length(self):
+
+        # bpo-27397: Return the encoded string since there's no way to decode.
+
+        self._test_get_x(self._get_unst,
+
+            '=?utf-8?b?abcde?=',
+
+            'abcde',
+
+            'abcde',
+
+            [errors.InvalidBase64LengthDefect],
+
+            '')
+
+
+
+    def test_get_unstructured_no_whitespace_between_ews(self):
+
+        self._test_get_x(self._get_unst,
+
+            '=?utf-8?q?foo?==?utf-8?q?bar?=',
+
+            'foobar',
+
+            'foobar',
+
+            [errors.InvalidHeaderDefect,
+
+            errors.InvalidHeaderDefect],
+
+            '')
+
+
+
+    def test_get_unstructured_ew_without_leading_whitespace(self):
+
+        self._test_get_x(
+
+            self._get_unst,
+
+            'nowhitespace=?utf-8?q?somevalue?=',
+
+            'nowhitespacesomevalue',
+
+            'nowhitespacesomevalue',
+
+            [errors.InvalidHeaderDefect],
+
+            '')
+
+
+
+    def test_get_unstructured_ew_without_trailing_whitespace(self):
+
+        self._test_get_x(
+
+            self._get_unst,
+
+            '=?utf-8?q?somevalue?=nowhitespace',
+
+            'somevaluenowhitespace',
+
+            'somevaluenowhitespace',
+
+            [errors.InvalidHeaderDefect],
+
+            '')
+
+
+
+    # get_qp_ctext
+
+
+
+    def test_get_qp_ctext_only(self):
+
+        ptext = self._test_get_x(parser.get_qp_ctext,
+
+                                'foobar', 'foobar', ' ', [], '')
+
+        self.assertEqual(ptext.token_type, 'ptext')
+
+
+
+    def test_get_qp_ctext_all_printables(self):
+
+        with_qp = self.rfc_printable_ascii.replace('\\', '\\\\')
+
+        with_qp = with_qp.  replace('(', r'\(')
+
+        with_qp = with_qp.replace(')', r'\)')
+
+        ptext = self._test_get_x(parser.get_qp_ctext,
+
+                                 with_qp, self.rfc_printable_ascii, ' ', [], '')
+
+
+
+    def test_get_qp_ctext_two_words_gets_first(self):
+
+        self._test_get_x(parser.get_qp_ctext,
+
+                        'foo de', 'foo', ' ', [], ' de')
+
+
+
+    def test_get_qp_ctext_following_wsp_preserved(self):
+
+        self._test_get_x(parser.get_qp_ctext,
+
+                        'foo \t\tde', 'foo', ' ', [], ' \t\tde')
+
+
+
+    def test_get_qp_ctext_up_to_close_paren_only(self):
+
+        self._test_get_x(parser.get_qp_ctext,
+
+                        'foo)', 'foo', ' ', [], ')')
+
+
+
+    def test_get_qp_ctext_wsp_before_close_paren_preserved(self):
+
+        self._test_get_x(parser.get_qp_ctext,
+
+                        'foo  )', 'foo', ' ', [], '  )')
+
+
+
+    def test_get_qp_ctext_close_paren_mid_word(self):
+
+        self._test_get_x(parser.get_qp_ctext,
+
+                        'foo)bar', 'foo', ' ', [], ')bar')
+
+
+
+    def test_get_qp_ctext_up_to_open_paren_only(self):
+
+        self._test_get_x(parser.get_qp_ctext,
+
+                        'foo(', 'foo', ' ', [], '(')
+
+
+
+    def test_get_qp_ctext_wsp_before_open_paren_preserved(self):
+
+        self._test_get_x(parser.get_qp_ctext,
+
+                        'foo  (', 'foo', ' ', [], '  (')
+
+
+
+    def test_get_qp_ctext_open_paren_mid_word(self):
+
+        self._test_get_x(parser.get_qp_ctext,
+
+                        'foo(bar', 'foo', ' ', [], '(bar')
+
+
+
+    def test_get_qp_ctext_non_printables(self):
+
+        ptext = self._test_get_x(parser.get_qp_ctext,
+
+                                'foo\x00bar)', 'foo\x00bar', ' ',
+
+                                [errors.NonPrintableDefect], ')')
+
+        self.assertEqual(ptext.defects[0].non_printables[0], '\x00')
+
+
+
+    # get_qcontent
+
+
+
+    def test_get_qcontent_only(self):
+
+        ptext = self._test_get_x(parser.get_qcontent,
+
+                                'foobar', 'foobar', 'foobar', [], '')
+
+        self.assertEqual(ptext.token_type, 'ptext')
+
+
+
+    def test_get_qcontent_all_printables(self):
+
+        with_qp = self.rfc_printable_ascii.replace('\\', '\\\\')
+
+        with_qp = with_qp.  replace('"', r'\"')
+
+        ptext = self._test_get_x(parser.get_qcontent, with_qp,
+
+                                 self.rfc_printable_ascii,
+
+                                 self.rfc_printable_ascii, [], '')
+
+
+
+    def test_get_qcontent_two_words_gets_first(self):
+
+        self._test_get_x(parser.get_qcontent,
+
+                        'foo de', 'foo', 'foo', [], ' de')
+
+
+
+    def test_get_qcontent_following_wsp_preserved(self):
+
+        self._test_get_x(parser.get_qcontent,
+
+                        'foo \t\tde', 'foo', 'foo', [], ' \t\tde')
+
+
+
+    def test_get_qcontent_up_to_dquote_only(self):
+
+        self._test_get_x(parser.get_qcontent,
+
+                        'foo"', 'foo', 'foo', [], '"')
+
+
+
+    def test_get_qcontent_wsp_before_close_paren_preserved(self):
+
+        self._test_get_x(parser.get_qcontent,
+
+                        'foo  "', 'foo', 'foo', [], '  "')
+
+
+
+    def test_get_qcontent_close_paren_mid_word(self):
+
+        self._test_get_x(parser.get_qcontent,
+
+                        'foo"bar', 'foo', 'foo', [], '"bar')
+
+
+
+    def test_get_qcontent_non_printables(self):
+
+        ptext = self._test_get_x(parser.get_qcontent,
+
+                                'foo\x00fg"', 'foo\x00fg', 'foo\x00fg',
+
+                                [errors.NonPrintableDefect], '"')
+
+        self.assertEqual(ptext.defects[0].non_printables[0], '\x00')
+
+
+
+    # get_atext
+
+
+
+    def test_get_atext_only(self):
+
+        atext = self._test_get_x(parser.get_atext,
+
+                                'foobar', 'foobar', 'foobar', [], '')
+
+        self.assertEqual(atext.token_type, 'atext')
+
+
+
+    def test_get_atext_all_atext(self):
+
+        atext = self._test_get_x(parser.get_atext, self.rfc_atext_chars,
+
+                                 self.rfc_atext_chars,
+
+                                 self.rfc_atext_chars, [], '')
+
+
+
+    def test_get_atext_two_words_gets_first(self):
+
+        self._test_get_x(parser.get_atext,
+
+                        'foo bar', 'foo', 'foo', [], ' bar')
+
+
+
+    def test_get_atext_following_wsp_preserved(self):
+
+        self._test_get_x(parser.get_atext,
+
+                        'foo \t\tbar', 'foo', 'foo', [], ' \t\tbar')
+
+
+
+    def test_get_atext_up_to_special(self):
+
+        self._test_get_x(parser.get_atext,
+
+                        'foo@bar', 'foo', 'foo', [], '@bar')
+
+
+
+    def test_get_atext_non_printables(self):
+
+        atext = self._test_get_x(parser.get_atext,
+
+                                'foo\x00bar(', 'foo\x00bar', 'foo\x00bar',
+
+                                [errors.NonPrintableDefect], '(')
+
+        self.assertEqual(atext.defects[0].non_printables[0], '\x00')
+
+
+
+    # get_bare_quoted_string
+
+
+
+    def test_get_bare_quoted_string_only(self):
+
+        bqs = self._test_get_x(parser.get_bare_quoted_string,
+
+                               '"foo"', '"foo"', 'foo', [], '')
+
+        self.assertEqual(bqs.token_type, 'bare-quoted-string')
+
+
+
+    def test_get_bare_quoted_string_must_start_with_dquote(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_bare_quoted_string('foo"')
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_bare_quoted_string('  "foo"')
+
+
+
+    def test_get_bare_quoted_string_only_quotes(self):
+
+        self._test_get_x(parser.get_bare_quoted_string,
+
+                         '""', '""', '', [], '')
+
+
+
+    def test_get_bare_quoted_string_missing_endquotes(self):
+
+        self._test_get_x(parser.get_bare_quoted_string,
+
+                         '"', '""', '', [errors.InvalidHeaderDefect], '')
+
+
+
+    def test_get_bare_quoted_string_following_wsp_preserved(self):
+
+        self._test_get_x(parser.get_bare_quoted_string,
+
+             '"foo"\t bar', '"foo"', 'foo', [], '\t bar')
+
+
+
+    def test_get_bare_quoted_string_multiple_words(self):
+
+        self._test_get_x(parser.get_bare_quoted_string,
+
+             '"foo bar moo"', '"foo bar moo"', 'foo bar moo', [], '')
+
+
+
+    def test_get_bare_quoted_string_multiple_words_wsp_preserved(self):
+
+        self._test_get_x(parser.get_bare_quoted_string,
+
+             '" foo  moo\t"', '" foo  moo\t"', ' foo  moo\t', [], '')
+
+
+
+    def test_get_bare_quoted_string_end_dquote_mid_word(self):
+
+        self._test_get_x(parser.get_bare_quoted_string,
+
+             '"foo"bar', '"foo"', 'foo', [], 'bar')
+
+
+
+    def test_get_bare_quoted_string_quoted_dquote(self):
+
+        self._test_get_x(parser.get_bare_quoted_string,
+
+             r'"foo\"in"a', r'"foo\"in"', 'foo"in', [], 'a')
+
+
+
+    def test_get_bare_quoted_string_non_printables(self):
+
+        self._test_get_x(parser.get_bare_quoted_string,
+
+             '"a\x01a"', '"a\x01a"', 'a\x01a',
+
+             [errors.NonPrintableDefect], '')
+
+
+
+    def test_get_bare_quoted_string_no_end_dquote(self):
+
+        self._test_get_x(parser.get_bare_quoted_string,
+
+             '"foo', '"foo"', 'foo',
+
+             [errors.InvalidHeaderDefect], '')
+
+        self._test_get_x(parser.get_bare_quoted_string,
+
+             '"foo ', '"foo "', 'foo ',
+
+             [errors.InvalidHeaderDefect], '')
+
+
+
+    def test_get_bare_quoted_string_empty_quotes(self):
+
+        self._test_get_x(parser.get_bare_quoted_string,
+
+            '""', '""', '', [], '')
+
+
+
+    # Issue 16983: apply postel's law to some bad encoding.
+
+    def test_encoded_word_inside_quotes(self):
+
+        self._test_get_x(parser.get_bare_quoted_string,
+
+            '"=?utf-8?Q?not_really_valid?="',
+
+            '"not really valid"',
+
+            'not really valid',
+
+            [errors.InvalidHeaderDefect,
+
+             errors.InvalidHeaderDefect],
+
+            '')
+
+
+
+    # get_comment
+
+
+
+    def test_get_comment_only(self):
+
+        comment = self._test_get_x(parser.get_comment,
+
+            '(comment)', '(comment)', ' ', [], '', ['comment'])
+
+        self.assertEqual(comment.token_type, 'comment')
+
+
+
+    def test_get_comment_must_start_with_paren(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_comment('foo"')
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_comment('  (foo"')
+
+
+
+    def test_get_comment_following_wsp_preserved(self):
+
+        self._test_get_x(parser.get_comment,
+
+            '(comment)  \t', '(comment)', ' ', [], '  \t', ['comment'])
+
+
+
+    def test_get_comment_multiple_words(self):
+
+        self._test_get_x(parser.get_comment,
+
+            '(foo bar)  \t', '(foo bar)', ' ', [], '  \t', ['foo bar'])
+
+
+
+    def test_get_comment_multiple_words_wsp_preserved(self):
+
+        self._test_get_x(parser.get_comment,
+
+            '( foo  bar\t )  \t', '( foo  bar\t )', ' ', [], '  \t',
+
+                [' foo  bar\t '])
+
+
+
+    def test_get_comment_end_paren_mid_word(self):
+
+        self._test_get_x(parser.get_comment,
+
+            '(foo)bar', '(foo)', ' ', [], 'bar', ['foo'])
+
+
+
+    def test_get_comment_quoted_parens(self):
+
+        self._test_get_x(parser.get_comment,
+
+            r'(foo\) \(\)bar)', r'(foo\) \(\)bar)', ' ', [], '', ['foo) ()bar'])
+
+
+
+    def test_get_comment_non_printable(self):
+
+        self._test_get_x(parser.get_comment,
+
+            '(foo\x7Fbar)', '(foo\x7Fbar)', ' ',
+
+            [errors.NonPrintableDefect], '', ['foo\x7Fbar'])
+
+
+
+    def test_get_comment_no_end_paren(self):
+
+        self._test_get_x(parser.get_comment,
+
+            '(foo bar', '(foo bar)', ' ',
+
+            [errors.InvalidHeaderDefect], '', ['foo bar'])
+
+        self._test_get_x(parser.get_comment,
+
+            '(foo bar  ', '(foo bar  )', ' ',
+
+            [errors.InvalidHeaderDefect], '', ['foo bar  '])
+
+
+
+    def test_get_comment_nested_comment(self):
+
+        comment = self._test_get_x(parser.get_comment,
+
+            '(foo(bar))', '(foo(bar))', ' ', [], '', ['foo(bar)'])
+
+        self.assertEqual(comment[1].content, 'bar')
+
+
+
+    def test_get_comment_nested_comment_wsp(self):
+
+        comment = self._test_get_x(parser.get_comment,
+
+            '(foo ( bar ) )', '(foo ( bar ) )', ' ', [], '', ['foo ( bar ) '])
+
+        self.assertEqual(comment[2].content, ' bar ')
+
+
+
+    def test_get_comment_empty_comment(self):
+
+        self._test_get_x(parser.get_comment,
+
+            '()', '()', ' ', [], '', [''])
+
+
+
+    def test_get_comment_multiple_nesting(self):
+
+        comment = self._test_get_x(parser.get_comment,
+
+            '(((((foo)))))', '(((((foo)))))', ' ', [], '', ['((((foo))))'])
+
+        for i in range(4, 0, -1):
+
+            self.assertEqual(comment[0].content, '('*(i-1)+'foo'+')'*(i-1))
+
+            comment = comment[0]
+
+        self.assertEqual(comment.content, 'foo')
+
+
+
+    def test_get_comment_missing_end_of_nesting(self):
+
+        self._test_get_x(parser.get_comment,
+
+            '(((((foo)))', '(((((foo)))))', ' ',
+
+            [errors.InvalidHeaderDefect]*2, '', ['((((foo))))'])
+
+
+
+    def test_get_comment_qs_in_nested_comment(self):
+
+        comment = self._test_get_x(parser.get_comment,
+
+            r'(foo (b\)))', r'(foo (b\)))', ' ', [], '', [r'foo (b\))'])
+
+        self.assertEqual(comment[2].content, 'b)')
+
+
+
+    # get_cfws
+
+
+
+    def test_get_cfws_only_ws(self):
+
+        cfws = self._test_get_x(parser.get_cfws,
+
+            '  \t \t', '  \t \t', ' ', [], '', [])
+
+        self.assertEqual(cfws.token_type, 'cfws')
+
+
+
+    def test_get_cfws_only_comment(self):
+
+        cfws = self._test_get_x(parser.get_cfws,
+
+            '(foo)', '(foo)', ' ', [], '', ['foo'])
+
+        self.assertEqual(cfws[0].content, 'foo')
+
+
+
+    def test_get_cfws_only_mixed(self):
+
+        cfws = self._test_get_x(parser.get_cfws,
+
+            ' (foo )  ( bar) ', ' (foo )  ( bar) ', ' ', [], '',
+
+                ['foo ', ' bar'])
+
+        self.assertEqual(cfws[1].content, 'foo ')
+
+        self.assertEqual(cfws[3].content, ' bar')
+
+
+
+    def test_get_cfws_ends_at_non_leader(self):
+
+        cfws = self._test_get_x(parser.get_cfws,
+
+            '(foo) bar', '(foo) ', ' ', [], 'bar', ['foo'])
+
+        self.assertEqual(cfws[0].content, 'foo')
+
+
+
+    def test_get_cfws_ends_at_non_printable(self):
+
+        cfws = self._test_get_x(parser.get_cfws,
+
+            '(foo) \x07', '(foo) ', ' ', [], '\x07', ['foo'])
+
+        self.assertEqual(cfws[0].content, 'foo')
+
+
+
+    def test_get_cfws_non_printable_in_comment(self):
+
+        cfws = self._test_get_x(parser.get_cfws,
+
+            '(foo \x07) "test"', '(foo \x07) ', ' ',
+
+            [errors.NonPrintableDefect], '"test"', ['foo \x07'])
+
+        self.assertEqual(cfws[0].content, 'foo \x07')
+
+
+
+    def test_get_cfws_header_ends_in_comment(self):
+
+        cfws = self._test_get_x(parser.get_cfws,
+
+            '  (foo ', '  (foo )', ' ',
+
+            [errors.InvalidHeaderDefect], '', ['foo '])
+
+        self.assertEqual(cfws[1].content, 'foo ')
+
+
+
+    def test_get_cfws_multiple_nested_comments(self):
+
+        cfws = self._test_get_x(parser.get_cfws,
+
+            '(foo (bar)) ((a)(a))', '(foo (bar)) ((a)(a))', ' ', [],
+
+                '', ['foo (bar)', '(a)(a)'])
+
+        self.assertEqual(cfws[0].comments, ['foo (bar)'])
+
+        self.assertEqual(cfws[2].comments, ['(a)(a)'])
+
+
+
+    # get_quoted_string
+
+
+
+    def test_get_quoted_string_only(self):
+
+        qs = self._test_get_x(parser.get_quoted_string,
+
+            '"bob"', '"bob"', 'bob', [], '')
+
+        self.assertEqual(qs.token_type, 'quoted-string')
+
+        self.assertEqual(qs.quoted_value, '"bob"')
+
+        self.assertEqual(qs.content, 'bob')
+
+
+
+    def test_get_quoted_string_with_wsp(self):
+
+        qs = self._test_get_x(parser.get_quoted_string,
+
+            '\t "bob"  ', '\t "bob"  ', ' bob ', [], '')
+
+        self.assertEqual(qs.quoted_value, ' "bob" ')
+
+        self.assertEqual(qs.content, 'bob')
+
+
+
+    def test_get_quoted_string_with_comments_and_wsp(self):
+
+        qs = self._test_get_x(parser.get_quoted_string,
+
+            ' (foo) "bob"(bar)', ' (foo) "bob"(bar)', ' bob ', [], '')
+
+        self.assertEqual(qs[0][1].content, 'foo')
+
+        self.assertEqual(qs[2][0].content, 'bar')
+
+        self.assertEqual(qs.content, 'bob')
+
+        self.assertEqual(qs.quoted_value, ' "bob" ')
+
+
+
+    def test_get_quoted_string_with_multiple_comments(self):
+
+        qs = self._test_get_x(parser.get_quoted_string,
+
+            ' (foo) (bar) "bob"(bird)', ' (foo) (bar) "bob"(bird)', ' bob ',
+
+                [], '')
+
+        self.assertEqual(qs[0].comments, ['foo', 'bar'])
+
+        self.assertEqual(qs[2].comments, ['bird'])
+
+        self.assertEqual(qs.content, 'bob')
+
+        self.assertEqual(qs.quoted_value, ' "bob" ')
+
+
+
+    def test_get_quoted_string_non_printable_in_comment(self):
+
+        qs = self._test_get_x(parser.get_quoted_string,
+
+            ' (\x0A) "bob"', ' (\x0A) "bob"', ' bob',
+
+                [errors.NonPrintableDefect], '')
+
+        self.assertEqual(qs[0].comments, ['\x0A'])
+
+        self.assertEqual(qs.content, 'bob')
+
+        self.assertEqual(qs.quoted_value, ' "bob"')
+
+
+
+    def test_get_quoted_string_non_printable_in_qcontent(self):
+
+        qs = self._test_get_x(parser.get_quoted_string,
+
+            ' (a) "a\x0B"', ' (a) "a\x0B"', ' a\x0B',
+
+                [errors.NonPrintableDefect], '')
+
+        self.assertEqual(qs[0].comments, ['a'])
+
+        self.assertEqual(qs.content, 'a\x0B')
+
+        self.assertEqual(qs.quoted_value, ' "a\x0B"')
+
+
+
+    def test_get_quoted_string_internal_ws(self):
+
+        qs = self._test_get_x(parser.get_quoted_string,
+
+            ' (a) "foo  bar "', ' (a) "foo  bar "', ' foo  bar ',
+
+                [], '')
+
+        self.assertEqual(qs[0].comments, ['a'])
+
+        self.assertEqual(qs.content, 'foo  bar ')
+
+        self.assertEqual(qs.quoted_value, ' "foo  bar "')
+
+
+
+    def test_get_quoted_string_header_ends_in_comment(self):
+
+        qs = self._test_get_x(parser.get_quoted_string,
+
+            ' (a) "bob" (a', ' (a) "bob" (a)', ' bob ',
+
+                [errors.InvalidHeaderDefect], '')
+
+        self.assertEqual(qs[0].comments, ['a'])
+
+        self.assertEqual(qs[2].comments, ['a'])
+
+        self.assertEqual(qs.content, 'bob')
+
+        self.assertEqual(qs.quoted_value, ' "bob" ')
+
+
+
+    def test_get_quoted_string_header_ends_in_qcontent(self):
+
+        qs = self._test_get_x(parser.get_quoted_string,
+
+            ' (a) "bob', ' (a) "bob"', ' bob',
+
+                [errors.InvalidHeaderDefect], '')
+
+        self.assertEqual(qs[0].comments, ['a'])
+
+        self.assertEqual(qs.content, 'bob')
+
+        self.assertEqual(qs.quoted_value, ' "bob"')
+
+
+
+    def test_get_quoted_string_no_quoted_string(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_quoted_string(' (ab) xyz')
+
+
+
+    def test_get_quoted_string_qs_ends_at_noncfws(self):
+
+        qs = self._test_get_x(parser.get_quoted_string,
+
+            '\t "bob" fee', '\t "bob" ', ' bob ', [], 'fee')
+
+        self.assertEqual(qs.content, 'bob')
+
+        self.assertEqual(qs.quoted_value, ' "bob" ')
+
+
+
+    # get_atom
+
+
+
+    def test_get_atom_only(self):
+
+        atom = self._test_get_x(parser.get_atom,
+
+            'bob', 'bob', 'bob', [], '')
+
+        self.assertEqual(atom.token_type, 'atom')
+
+
+
+    def test_get_atom_with_wsp(self):
+
+        self._test_get_x(parser.get_atom,
+
+            '\t bob  ', '\t bob  ', ' bob ', [], '')
+
+
+
+    def test_get_atom_with_comments_and_wsp(self):
+
+        atom = self._test_get_x(parser.get_atom,
+
+            ' (foo) bob(bar)', ' (foo) bob(bar)', ' bob ', [], '')
+
+        self.assertEqual(atom[0][1].content, 'foo')
+
+        self.assertEqual(atom[2][0].content, 'bar')
+
+
+
+    def test_get_atom_with_multiple_comments(self):
+
+        atom = self._test_get_x(parser.get_atom,
+
+            ' (foo) (bar) bob(bird)', ' (foo) (bar) bob(bird)', ' bob ',
+
+                [], '')
+
+        self.assertEqual(atom[0].comments, ['foo', 'bar'])
+
+        self.assertEqual(atom[2].comments, ['bird'])
+
+
+
+    def test_get_atom_non_printable_in_comment(self):
+
+        atom = self._test_get_x(parser.get_atom,
+
+            ' (\x0A) bob', ' (\x0A) bob', ' bob',
+
+                [errors.NonPrintableDefect], '')
+
+        self.assertEqual(atom[0].comments, ['\x0A'])
+
+
+
+    def test_get_atom_non_printable_in_atext(self):
+
+        atom = self._test_get_x(parser.get_atom,
+
+            ' (a) a\x0B', ' (a) a\x0B', ' a\x0B',
+
+                [errors.NonPrintableDefect], '')
+
+        self.assertEqual(atom[0].comments, ['a'])
+
+
+
+    def test_get_atom_header_ends_in_comment(self):
+
+        atom = self._test_get_x(parser.get_atom,
+
+            ' (a) bob (a', ' (a) bob (a)', ' bob ',
+
+                [errors.InvalidHeaderDefect], '')
+
+        self.assertEqual(atom[0].comments, ['a'])
+
+        self.assertEqual(atom[2].comments, ['a'])
+
+
+
+    def test_get_atom_no_atom(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_atom(' (ab) ')
+
+
+
+    def test_get_atom_no_atom_before_special(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_atom(' (ab) @')
+
+
+
+    def test_get_atom_atom_ends_at_special(self):
+
+        atom = self._test_get_x(parser.get_atom,
+
+            ' (foo) bob(bar)  @bang', ' (foo) bob(bar)  ', ' bob ', [], '@bang')
+
+        self.assertEqual(atom[0].comments, ['foo'])
+
+        self.assertEqual(atom[2].comments, ['bar'])
+
+
+
+    def test_get_atom_atom_ends_at_noncfws(self):
+
+        self._test_get_x(parser.get_atom,
+
+            'bob  fred', 'bob  ', 'bob ', [], 'fred')
+
+
+
+    def test_get_atom_rfc2047_atom(self):
+
+        self._test_get_x(parser.get_atom,
+
+            '=?utf-8?q?=20bob?=', ' bob', ' bob', [], '')
+
+
+
+    # get_dot_atom_text
+
+
+
+    def test_get_dot_atom_text(self):
+
+        dot_atom_text = self._test_get_x(parser.get_dot_atom_text,
+
+            'foo.bar.bang', 'foo.bar.bang', 'foo.bar.bang', [], '')
+
+        self.assertEqual(dot_atom_text.token_type, 'dot-atom-text')
+
+        self.assertEqual(len(dot_atom_text), 5)
+
+
+
+    def test_get_dot_atom_text_lone_atom_is_valid(self):
+
+        dot_atom_text = self._test_get_x(parser.get_dot_atom_text,
+
+            'foo', 'foo', 'foo', [], '')
+
+
+
+    def test_get_dot_atom_text_raises_on_leading_dot(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_dot_atom_text('.foo.bar')
+
+
+
+    def test_get_dot_atom_text_raises_on_trailing_dot(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_dot_atom_text('foo.bar.')
+
+
+
+    def test_get_dot_atom_text_raises_on_leading_non_atext(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_dot_atom_text(' foo.bar')
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_dot_atom_text('@foo.bar')
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_dot_atom_text('"foo.bar"')
+
+
+
+    def test_get_dot_atom_text_trailing_text_preserved(self):
+
+        dot_atom_text = self._test_get_x(parser.get_dot_atom_text,
+
+            'foo@bar', 'foo', 'foo', [], '@bar')
+
+
+
+    def test_get_dot_atom_text_trailing_ws_preserved(self):
+
+        dot_atom_text = self._test_get_x(parser.get_dot_atom_text,
+
+            'foo .bar', 'foo', 'foo', [], ' .bar')
+
+
+
+    # get_dot_atom
+
+
+
+    def test_get_dot_atom_only(self):
+
+        dot_atom = self._test_get_x(parser.get_dot_atom,
+
+            'foo.bar.bing', 'foo.bar.bing', 'foo.bar.bing', [], '')
+
+        self.assertEqual(dot_atom.token_type, 'dot-atom')
+
+        self.assertEqual(len(dot_atom), 1)
+
+
+
+    def test_get_dot_atom_with_wsp(self):
+
+        self._test_get_x(parser.get_dot_atom,
+
+            '\t  foo.bar.bing  ', '\t  foo.bar.bing  ', ' foo.bar.bing ', [], '')
+
+
+
+    def test_get_dot_atom_with_comments_and_wsp(self):
+
+        self._test_get_x(parser.get_dot_atom,
+
+            ' (sing)  foo.bar.bing (here) ', ' (sing)  foo.bar.bing (here) ',
+
+                ' foo.bar.bing ', [], '')
+
+
+
+    def test_get_dot_atom_space_ends_dot_atom(self):
+
+        self._test_get_x(parser.get_dot_atom,
+
+            ' (sing)  foo.bar .bing (here) ', ' (sing)  foo.bar ',
+
+                ' foo.bar ', [], '.bing (here) ')
+
+
+
+    def test_get_dot_atom_no_atom_raises(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_dot_atom(' (foo) ')
+
+
+
+    def test_get_dot_atom_leading_dot_raises(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_dot_atom(' (foo) .bar')
+
+
+
+    def test_get_dot_atom_two_dots_raises(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_dot_atom('bar..bang')
+
+
+
+    def test_get_dot_atom_trailing_dot_raises(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_dot_atom(' (foo) bar.bang. foo')
+
+
+
+    def test_get_dot_atom_rfc2047_atom(self):
+
+        self._test_get_x(parser.get_dot_atom,
+
+            '=?utf-8?q?=20bob?=', ' bob', ' bob', [], '')
+
+
+
+    # get_word (if this were black box we'd repeat all the qs/atom tests)
+
+
+
+    def test_get_word_atom_yields_atom(self):
+
+        word = self._test_get_x(parser.get_word,
+
+            ' (foo) bar (bang) :ah', ' (foo) bar (bang) ', ' bar ', [], ':ah')
+
+        self.assertEqual(word.token_type, 'atom')
+
+        self.assertEqual(word[0].token_type, 'cfws')
+
+
+
+    def test_get_word_all_CFWS(self):
+
+        # bpo-29412: Test that we don't raise IndexError when parsing CFWS only
+
+        # token.
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_word('(Recipients list suppressed')
+
+
+
+    def test_get_word_qs_yields_qs(self):
+
+        word = self._test_get_x(parser.get_word,
+
+            '"bar " (bang) ah', '"bar " (bang) ', 'bar  ', [], 'ah')
+
+        self.assertEqual(word.token_type, 'quoted-string')
+
+        self.assertEqual(word[0].token_type, 'bare-quoted-string')
+
+        self.assertEqual(word[0].value, 'bar ')
+
+        self.assertEqual(word.content, 'bar ')
+
+
+
+    def test_get_word_ends_at_dot(self):
+
+        self._test_get_x(parser.get_word,
+
+            'foo.', 'foo', 'foo', [], '.')
+
+
+
+    # get_phrase
+
+
+
+    def test_get_phrase_simple(self):
+
+        phrase = self._test_get_x(parser.get_phrase,
+
+            '"Fred A. Johnson" is his name, oh.',
+
+            '"Fred A. Johnson" is his name',
+
+            'Fred A. Johnson is his name',
+
+            [],
+
+            ', oh.')
+
+        self.assertEqual(phrase.token_type, 'phrase')
+
+
+
+    def test_get_phrase_complex(self):
+
+        phrase = self._test_get_x(parser.get_phrase,
+
+            ' (A) bird (in (my|your)) "hand  " is messy\t<>\t',
+
+            ' (A) bird (in (my|your)) "hand  " is messy\t',
+
+            ' bird hand   is messy ',
+
+            [],
+
+            '<>\t')
+
+        self.assertEqual(phrase[0][0].comments, ['A'])
+
+        self.assertEqual(phrase[0][2].comments, ['in (my|your)'])
+
+
+
+    def test_get_phrase_obsolete(self):
+
+        phrase = self._test_get_x(parser.get_phrase,
+
+            'Fred A.(weird).O Johnson',
+
+            'Fred A.(weird).O Johnson',
+
+            'Fred A. .O Johnson',
+
+            [errors.ObsoleteHeaderDefect]*3,
+
+            '')
+
+        self.assertEqual(len(phrase), 7)
+
+        self.assertEqual(phrase[3].comments, ['weird'])
+
+
+
+    def test_get_phrase_pharse_must_start_with_word(self):
+
+        phrase = self._test_get_x(parser.get_phrase,
+
+            '(even weirder).name',
+
+            '(even weirder).name',
+
+            ' .name',
+
+            [errors.InvalidHeaderDefect] + [errors.ObsoleteHeaderDefect]*2,
+
+            '')
+
+        self.assertEqual(len(phrase), 3)
+
+        self.assertEqual(phrase[0].comments, ['even weirder'])
+
+
+
+    def test_get_phrase_ending_with_obsolete(self):
+
+        phrase = self._test_get_x(parser.get_phrase,
+
+            'simple phrase.(with trailing comment):boo',
+
+            'simple phrase.(with trailing comment)',
+
+            'simple phrase. ',
+
+            [errors.ObsoleteHeaderDefect]*2,
+
+            ':boo')
+
+        self.assertEqual(len(phrase), 4)
+
+        self.assertEqual(phrase[3].comments, ['with trailing comment'])
+
+
+
+    def get_phrase_cfws_only_raises(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_phrase(' (foo) ')
+
+
+
+    # get_local_part
+
+
+
+    def test_get_local_part_simple(self):
+
+        local_part = self._test_get_x(parser.get_local_part,
+
+            'dinsdale@python.org', 'dinsdale', 'dinsdale', [], '@python.org')
+
+        self.assertEqual(local_part.token_type, 'local-part')
+
+        self.assertEqual(local_part.local_part, 'dinsdale')
+
+
+
+    def test_get_local_part_with_dot(self):
+
+        local_part = self._test_get_x(parser.get_local_part,
+
+            'Fred.A.Johnson@python.org',
+
+            'Fred.A.Johnson',
+
+            'Fred.A.Johnson',
+
+            [],
+
+            '@python.org')
+
+        self.assertEqual(local_part.local_part, 'Fred.A.Johnson')
+
+
+
+    def test_get_local_part_with_whitespace(self):
+
+        local_part = self._test_get_x(parser.get_local_part,
+
+            ' Fred.A.Johnson  @python.org',
+
+            ' Fred.A.Johnson  ',
+
+            ' Fred.A.Johnson ',
+
+            [],
+
+            '@python.org')
+
+        self.assertEqual(local_part.local_part, 'Fred.A.Johnson')
+
+
+
+    def test_get_local_part_with_cfws(self):
+
+        local_part = self._test_get_x(parser.get_local_part,
+
+            ' (foo) Fred.A.Johnson (bar (bird))  @python.org',
+
+            ' (foo) Fred.A.Johnson (bar (bird))  ',
+
+            ' Fred.A.Johnson ',
+
+            [],
+
+            '@python.org')
+
+        self.assertEqual(local_part.local_part, 'Fred.A.Johnson')
+
+        self.assertEqual(local_part[0][0].comments, ['foo'])
+
+        self.assertEqual(local_part[0][2].comments, ['bar (bird)'])
+
+
+
+    def test_get_local_part_simple_quoted(self):
+
+        local_part = self._test_get_x(parser.get_local_part,
+
+            '"dinsdale"@python.org', '"dinsdale"', '"dinsdale"', [], '@python.org')
+
+        self.assertEqual(local_part.token_type, 'local-part')
+
+        self.assertEqual(local_part.local_part, 'dinsdale')
+
+
+
+    def test_get_local_part_with_quoted_dot(self):
+
+        local_part = self._test_get_x(parser.get_local_part,
+
+            '"Fred.A.Johnson"@python.org',
+
+            '"Fred.A.Johnson"',
+
+            '"Fred.A.Johnson"',
+
+            [],
+
+            '@python.org')
+
+        self.assertEqual(local_part.local_part, 'Fred.A.Johnson')
+
+
+
+    def test_get_local_part_quoted_with_whitespace(self):
+
+        local_part = self._test_get_x(parser.get_local_part,
+
+            ' "Fred A. Johnson"  @python.org',
+
+            ' "Fred A. Johnson"  ',
+
+            ' "Fred A. Johnson" ',
+
+            [],
+
+            '@python.org')
+
+        self.assertEqual(local_part.local_part, 'Fred A. Johnson')
+
+
+
+    def test_get_local_part_quoted_with_cfws(self):
+
+        local_part = self._test_get_x(parser.get_local_part,
+
+            ' (foo) " Fred A. Johnson " (bar (bird))  @python.org',
+
+            ' (foo) " Fred A. Johnson " (bar (bird))  ',
+
+            ' " Fred A. Johnson " ',
+
+            [],
+
+            '@python.org')
+
+        self.assertEqual(local_part.local_part, ' Fred A. Johnson ')
+
+        self.assertEqual(local_part[0][0].comments, ['foo'])
+
+        self.assertEqual(local_part[0][2].comments, ['bar (bird)'])
+
+
+
+
+
+    def test_get_local_part_simple_obsolete(self):
+
+        local_part = self._test_get_x(parser.get_local_part,
+
+            'Fred. A.Johnson@python.org',
+
+            'Fred. A.Johnson',
+
+            'Fred. A.Johnson',
+
+            [errors.ObsoleteHeaderDefect],
+
+            '@python.org')
+
+        self.assertEqual(local_part.local_part, 'Fred.A.Johnson')
+
+
+
+    def test_get_local_part_complex_obsolete_1(self):
+
+        local_part = self._test_get_x(parser.get_local_part,
+
+            ' (foo )Fred (bar).(bird) A.(sheep)Johnson."and  dogs "@python.org',
+
+            ' (foo )Fred (bar).(bird) A.(sheep)Johnson."and  dogs "',
+
+            ' Fred . A. Johnson.and  dogs ',
+
+            [errors.ObsoleteHeaderDefect],
+
+            '@python.org')
+
+        self.assertEqual(local_part.local_part, 'Fred.A.Johnson.and  dogs ')
+
+
+
+    def test_get_local_part_complex_obsolete_invalid(self):
+
+        local_part = self._test_get_x(parser.get_local_part,
+
+            ' (foo )Fred (bar).(bird) A.(sheep)Johnson "and  dogs"@python.org',
+
+            ' (foo )Fred (bar).(bird) A.(sheep)Johnson "and  dogs"',
+
+            ' Fred . A. Johnson and  dogs',
+
+            [errors.InvalidHeaderDefect]*2,
+
+            '@python.org')
+
+        self.assertEqual(local_part.local_part, 'Fred.A.Johnson and  dogs')
+
+
+
+    def test_get_local_part_no_part_raises(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_local_part(' (foo) ')
+
+
+
+    def test_get_local_part_special_instead_raises(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_local_part(' (foo) @python.org')
+
+
+
+    def test_get_local_part_trailing_dot(self):
+
+        local_part = self._test_get_x(parser.get_local_part,
+
+            ' borris.@python.org',
+
+            ' borris.',
+
+            ' borris.',
+
+            [errors.InvalidHeaderDefect]*2,
+
+            '@python.org')
+
+        self.assertEqual(local_part.local_part, 'borris.')
+
+
+
+    def test_get_local_part_trailing_dot_with_ws(self):
+
+        local_part = self._test_get_x(parser.get_local_part,
+
+            ' borris. @python.org',
+
+            ' borris. ',
+
+            ' borris. ',
+
+            [errors.InvalidHeaderDefect]*2,
+
+            '@python.org')
+
+        self.assertEqual(local_part.local_part, 'borris.')
+
+
+
+    def test_get_local_part_leading_dot(self):
+
+        local_part = self._test_get_x(parser.get_local_part,
+
+            '.borris@python.org',
+
+            '.borris',
+
+            '.borris',
+
+            [errors.InvalidHeaderDefect]*2,
+
+            '@python.org')
+
+        self.assertEqual(local_part.local_part, '.borris')
+
+
+
+    def test_get_local_part_leading_dot_after_ws(self):
+
+        local_part = self._test_get_x(parser.get_local_part,
+
+            ' .borris@python.org',
+
+            ' .borris',
+
+            ' .borris',
+
+            [errors.InvalidHeaderDefect]*2,
+
+            '@python.org')
+
+        self.assertEqual(local_part.local_part, '.borris')
+
+
+
+    def test_get_local_part_double_dot_raises(self):
+
+        local_part = self._test_get_x(parser.get_local_part,
+
+            ' borris.(foo).natasha@python.org',
+
+            ' borris.(foo).natasha',
+
+            ' borris. .natasha',
+
+            [errors.InvalidHeaderDefect]*2,
+
+            '@python.org')
+
+        self.assertEqual(local_part.local_part, 'borris..natasha')
+
+
+
+    def test_get_local_part_quoted_strings_in_atom_list(self):
+
+        local_part = self._test_get_x(parser.get_local_part,
+
+            '""example" example"@example.com',
+
+            '""example" example"',
+
+            'example example',
+
+            [errors.InvalidHeaderDefect]*3,
+
+            '@example.com')
+
+        self.assertEqual(local_part.local_part, 'example example')
+
+
+
+    def test_get_local_part_valid_and_invalid_qp_in_atom_list(self):
+
+        local_part = self._test_get_x(parser.get_local_part,
+
+            r'"\\"example\\" example"@example.com',
+
+            r'"\\"example\\" example"',
+
+            r'\example\\ example',
+
+            [errors.InvalidHeaderDefect]*5,
+
+            '@example.com')
+
+        self.assertEqual(local_part.local_part, r'\example\\ example')
+
+
+
+    def test_get_local_part_unicode_defect(self):
+
+        # Currently this only happens when parsing unicode, not when parsing
+
+        # stuff that was originally binary.
+
+        local_part = self._test_get_x(parser.get_local_part,
+
+            'exámple@example.com',
+
+            'exámple',
+
+            'exámple',
+
+            [errors.NonASCIILocalPartDefect],
+
+            '@example.com')
+
+        self.assertEqual(local_part.local_part, 'exámple')
+
+
+
+    # get_dtext
+
+
+
+    def test_get_dtext_only(self):
+
+        dtext = self._test_get_x(parser.get_dtext,
+
+                                'foobar', 'foobar', 'foobar', [], '')
+
+        self.assertEqual(dtext.token_type, 'ptext')
+
+
+
+    def test_get_dtext_all_dtext(self):
+
+        dtext = self._test_get_x(parser.get_dtext, self.rfc_dtext_chars,
+
+                                 self.rfc_dtext_chars,
+
+                                 self.rfc_dtext_chars, [], '')
+
+
+
+    def test_get_dtext_two_words_gets_first(self):
+
+        self._test_get_x(parser.get_dtext,
+
+                        'foo bar', 'foo', 'foo', [], ' bar')
+
+
+
+    def test_get_dtext_following_wsp_preserved(self):
+
+        self._test_get_x(parser.get_dtext,
+
+                        'foo \t\tbar', 'foo', 'foo', [], ' \t\tbar')
+
+
+
+    def test_get_dtext_non_printables(self):
+
+        dtext = self._test_get_x(parser.get_dtext,
+
+                                'foo\x00bar]', 'foo\x00bar', 'foo\x00bar',
+
+                                [errors.NonPrintableDefect], ']')
+
+        self.assertEqual(dtext.defects[0].non_printables[0], '\x00')
+
+
+
+    def test_get_dtext_with_qp(self):
+
+        ptext = self._test_get_x(parser.get_dtext,
+
+                                 r'foo\]\[\\bar\b\e\l\l',
+
+                                 r'foo][\barbell',
+
+                                 r'foo][\barbell',
+
+                                 [errors.ObsoleteHeaderDefect],
+
+                                 '')
+
+
+
+    def test_get_dtext_up_to_close_bracket_only(self):
+
+        self._test_get_x(parser.get_dtext,
+
+                        'foo]', 'foo', 'foo', [], ']')
+
+
+
+    def test_get_dtext_wsp_before_close_bracket_preserved(self):
+
+        self._test_get_x(parser.get_dtext,
+
+                        'foo  ]', 'foo', 'foo', [], '  ]')
+
+
+
+    def test_get_dtext_close_bracket_mid_word(self):
+
+        self._test_get_x(parser.get_dtext,
+
+                        'foo]bar', 'foo', 'foo', [], ']bar')
+
+
+
+    def test_get_dtext_up_to_open_bracket_only(self):
+
+        self._test_get_x(parser.get_dtext,
+
+                        'foo[', 'foo', 'foo', [], '[')
+
+
+
+    def test_get_dtext_wsp_before_open_bracket_preserved(self):
+
+        self._test_get_x(parser.get_dtext,
+
+                        'foo  [', 'foo', 'foo', [], '  [')
+
+
+
+    def test_get_dtext_open_bracket_mid_word(self):
+
+        self._test_get_x(parser.get_dtext,
+
+                        'foo[bar', 'foo', 'foo', [], '[bar')
+
+
+
+    # get_domain_literal
+
+
+
+    def test_get_domain_literal_only(self):
+
+        domain_literal = domain_literal = self._test_get_x(parser.get_domain_literal,
+
+                                '[127.0.0.1]',
+
+                                '[127.0.0.1]',
+
+                                '[127.0.0.1]',
+
+                                [],
+
+                                '')
+
+        self.assertEqual(domain_literal.token_type, 'domain-literal')
+
+        self.assertEqual(domain_literal.domain, '[127.0.0.1]')
+
+        self.assertEqual(domain_literal.ip, '127.0.0.1')
+
+
+
+    def test_get_domain_literal_with_internal_ws(self):
+
+        domain_literal = self._test_get_x(parser.get_domain_literal,
+
+                                '[  127.0.0.1\t ]',
+
+                                '[  127.0.0.1\t ]',
+
+                                '[ 127.0.0.1 ]',
+
+                                [],
+
+                                '')
+
+        self.assertEqual(domain_literal.domain, '[127.0.0.1]')
+
+        self.assertEqual(domain_literal.ip, '127.0.0.1')
+
+
+
+    def test_get_domain_literal_with_surrounding_cfws(self):
+
+        domain_literal = self._test_get_x(parser.get_domain_literal,
+
+                                '(foo)[  127.0.0.1] (bar)',
+
+                                '(foo)[  127.0.0.1] (bar)',
+
+                                ' [ 127.0.0.1] ',
+
+                                [],
+
+                                '')
+
+        self.assertEqual(domain_literal.domain, '[127.0.0.1]')
+
+        self.assertEqual(domain_literal.ip, '127.0.0.1')
+
+
+
+    def test_get_domain_literal_no_start_char_raises(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_domain_literal('(foo) ')
+
+
+
+    def test_get_domain_literal_no_start_char_before_special_raises(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_domain_literal('(foo) @')
+
+
+
+    def test_get_domain_literal_bad_dtext_char_before_special_raises(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_domain_literal('(foo) [abc[@')
+
+
+
+    # get_domain
+
+
+
+    def test_get_domain_regular_domain_only(self):
+
+        domain = self._test_get_x(parser.get_domain,
+
+                                  'example.com',
+
+                                  'example.com',
+
+                                  'example.com',
+
+                                  [],
+
+                                  '')
+
+        self.assertEqual(domain.token_type, 'domain')
+
+        self.assertEqual(domain.domain, 'example.com')
+
+
+
+    def test_get_domain_domain_literal_only(self):
+
+        domain = self._test_get_x(parser.get_domain,
+
+                                  '[127.0.0.1]',
+
+                                  '[127.0.0.1]',
+
+                                  '[127.0.0.1]',
+
+                                  [],
+
+                                  '')
+
+        self.assertEqual(domain.token_type, 'domain')
+
+        self.assertEqual(domain.domain, '[127.0.0.1]')
+
+
+
+    def test_get_domain_with_cfws(self):
+
+        domain = self._test_get_x(parser.get_domain,
+
+                                  '(foo) example.com(bar)\t',
+
+                                  '(foo) example.com(bar)\t',
+
+                                  ' example.com ',
+
+                                  [],
+
+                                  '')
+
+        self.assertEqual(domain.domain, 'example.com')
+
+
+
+    def test_get_domain_domain_literal_with_cfws(self):
+
+        domain = self._test_get_x(parser.get_domain,
+
+                                  '(foo)[127.0.0.1]\t(bar)',
+
+                                  '(foo)[127.0.0.1]\t(bar)',
+
+                                  ' [127.0.0.1] ',
+
+                                  [],
+
+                                  '')
+
+        self.assertEqual(domain.domain, '[127.0.0.1]')
+
+
+
+    def test_get_domain_domain_with_cfws_ends_at_special(self):
+
+        domain = self._test_get_x(parser.get_domain,
+
+                                  '(foo)example.com\t(bar), next',
+
+                                  '(foo)example.com\t(bar)',
+
+                                  ' example.com ',
+
+                                  [],
+
+                                  ', next')
+
+        self.assertEqual(domain.domain, 'example.com')
+
+
+
+    def test_get_domain_domain_literal_with_cfws_ends_at_special(self):
+
+        domain = self._test_get_x(parser.get_domain,
+
+                                  '(foo)[127.0.0.1]\t(bar), next',
+
+                                  '(foo)[127.0.0.1]\t(bar)',
+
+                                  ' [127.0.0.1] ',
+
+                                  [],
+
+                                  ', next')
+
+        self.assertEqual(domain.domain, '[127.0.0.1]')
+
+
+
+    def test_get_domain_obsolete(self):
+
+        domain = self._test_get_x(parser.get_domain,
+
+                                  '(foo) example . (bird)com(bar)\t',
+
+                                  '(foo) example . (bird)com(bar)\t',
+
+                                  ' example . com ',
+
+                                  [errors.ObsoleteHeaderDefect],
+
+                                  '')
+
+        self.assertEqual(domain.domain, 'example.com')
+
+
+
+    def test_get_domain_no_non_cfws_raises(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_domain("  (foo)\t")
+
+
+
+    def test_get_domain_no_atom_raises(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_domain("  (foo)\t, broken")
+
+
+
+
+
+    # get_addr_spec
+
+
+
+    def test_get_addr_spec_normal(self):
+
+        addr_spec = self._test_get_x(parser.get_addr_spec,
+
+                                    'dinsdale@example.com',
+
+                                    'dinsdale@example.com',
+
+                                    'dinsdale@example.com',
+
+                                    [],
+
+                                    '')
+
+        self.assertEqual(addr_spec.token_type, 'addr-spec')
+
+        self.assertEqual(addr_spec.local_part, 'dinsdale')
+
+        self.assertEqual(addr_spec.domain, 'example.com')
+
+        self.assertEqual(addr_spec.addr_spec, 'dinsdale@example.com')
+
+
+
+    def test_get_addr_spec_with_doamin_literal(self):
+
+        addr_spec = self._test_get_x(parser.get_addr_spec,
+
+                                    'dinsdale@[127.0.0.1]',
+
+                                    'dinsdale@[127.0.0.1]',
+
+                                    'dinsdale@[127.0.0.1]',
+
+                                    [],
+
+                                    '')
+
+        self.assertEqual(addr_spec.local_part, 'dinsdale')
+
+        self.assertEqual(addr_spec.domain, '[127.0.0.1]')
+
+        self.assertEqual(addr_spec.addr_spec, 'dinsdale@[127.0.0.1]')
+
+
+
+    def test_get_addr_spec_with_cfws(self):
+
+        addr_spec = self._test_get_x(parser.get_addr_spec,
+
+                '(foo) dinsdale(bar)@ (bird) example.com (bog)',
+
+                '(foo) dinsdale(bar)@ (bird) example.com (bog)',
+
+                ' dinsdale@example.com ',
+
+                [],
+
+                '')
+
+        self.assertEqual(addr_spec.local_part, 'dinsdale')
+
+        self.assertEqual(addr_spec.domain, 'example.com')
+
+        self.assertEqual(addr_spec.addr_spec, 'dinsdale@example.com')
+
+
+
+    def test_get_addr_spec_with_qouoted_string_and_cfws(self):
+
+        addr_spec = self._test_get_x(parser.get_addr_spec,
+
+                '(foo) "roy a bug"(bar)@ (bird) example.com (bog)',
+
+                '(foo) "roy a bug"(bar)@ (bird) example.com (bog)',
+
+                ' "roy a bug"@example.com ',
+
+                [],
+
+                '')
+
+        self.assertEqual(addr_spec.local_part, 'roy a bug')
+
+        self.assertEqual(addr_spec.domain, 'example.com')
+
+        self.assertEqual(addr_spec.addr_spec, '"roy a bug"@example.com')
+
+
+
+    def test_get_addr_spec_ends_at_special(self):
+
+        addr_spec = self._test_get_x(parser.get_addr_spec,
+
+                '(foo) "roy a bug"(bar)@ (bird) example.com (bog) , next',
+
+                '(foo) "roy a bug"(bar)@ (bird) example.com (bog) ',
+
+                ' "roy a bug"@example.com ',
+
+                [],
+
+                ', next')
+
+        self.assertEqual(addr_spec.local_part, 'roy a bug')
+
+        self.assertEqual(addr_spec.domain, 'example.com')
+
+        self.assertEqual(addr_spec.addr_spec, '"roy a bug"@example.com')
+
+
+
+    def test_get_addr_spec_quoted_strings_in_atom_list(self):
+
+        addr_spec = self._test_get_x(parser.get_addr_spec,
+
+            '""example" example"@example.com',
+
+            '""example" example"@example.com',
+
+            'example example@example.com',
+
+            [errors.InvalidHeaderDefect]*3,
+
+            '')
+
+        self.assertEqual(addr_spec.local_part, 'example example')
+
+        self.assertEqual(addr_spec.domain, 'example.com')
+
+        self.assertEqual(addr_spec.addr_spec, '"example example"@example.com')
+
+
+
+    def test_get_addr_spec_dot_atom(self):
+
+        addr_spec = self._test_get_x(parser.get_addr_spec,
+
+            'star.a.star@example.com',
+
+            'star.a.star@example.com',
+
+            'star.a.star@example.com',
+
+            [],
+
+            '')
+
+        self.assertEqual(addr_spec.local_part, 'star.a.star')
+
+        self.assertEqual(addr_spec.domain, 'example.com')
+
+        self.assertEqual(addr_spec.addr_spec, 'star.a.star@example.com')
+
+
+
+    def test_get_addr_spec_multiple_domains(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_addr_spec('star@a.star@example.com')
+
+
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_addr_spec('star@a@example.com')
+
+
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_addr_spec('star@172.17.0.1@example.com')
+
+
+
+    # get_obs_route
+
+
+
+    def test_get_obs_route_simple(self):
+
+        obs_route = self._test_get_x(parser.get_obs_route,
+
+            '@example.com, @two.example.com:',
+
+            '@example.com, @two.example.com:',
+
+            '@example.com, @two.example.com:',
+
+            [],
+
+            '')
+
+        self.assertEqual(obs_route.token_type, 'obs-route')
+
+        self.assertEqual(obs_route.domains, ['example.com', 'two.example.com'])
+
+
+
+    def test_get_obs_route_complex(self):
+
+        obs_route = self._test_get_x(parser.get_obs_route,
+
+            '(foo),, (blue)@example.com (bar),@two.(foo) example.com (bird):',
+
+            '(foo),, (blue)@example.com (bar),@two.(foo) example.com (bird):',
+
+            ' ,, @example.com ,@two. example.com :',
+
+            [errors.ObsoleteHeaderDefect],  # This is the obs-domain
+
+            '')
+
+        self.assertEqual(obs_route.token_type, 'obs-route')
+
+        self.assertEqual(obs_route.domains, ['example.com', 'two.example.com'])
+
+
+
+    def test_get_obs_route_no_route_before_end_raises(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_obs_route('(foo) @example.com,')
+
+
+
+    def test_get_obs_route_no_route_before_special_raises(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_obs_route('(foo) [abc],')
+
+
+
+    def test_get_obs_route_no_route_before_special_raises2(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_obs_route('(foo) @example.com [abc],')
+
+
+
+    # get_angle_addr
+
+
+
+    def test_get_angle_addr_simple(self):
+
+        angle_addr = self._test_get_x(parser.get_angle_addr,
+
+            '<dinsdale@example.com>',
+
+            '<dinsdale@example.com>',
+
+            '<dinsdale@example.com>',
+
+            [],
+
+            '')
+
+        self.assertEqual(angle_addr.token_type, 'angle-addr')
+
+        self.assertEqual(angle_addr.local_part, 'dinsdale')
+
+        self.assertEqual(angle_addr.domain, 'example.com')
+
+        self.assertIsNone(angle_addr.route)
+
+        self.assertEqual(angle_addr.addr_spec, 'dinsdale@example.com')
+
+
+
+    def test_get_angle_addr_empty(self):
+
+        angle_addr = self._test_get_x(parser.get_angle_addr,
+
+            '<>',
+
+            '<>',
+
+            '<>',
+
+            [errors.InvalidHeaderDefect],
+
+            '')
+
+        self.assertEqual(angle_addr.token_type, 'angle-addr')
+
+        self.assertIsNone(angle_addr.local_part)
+
+        self.assertIsNone(angle_addr.domain)
+
+        self.assertIsNone(angle_addr.route)
+
+        self.assertEqual(angle_addr.addr_spec, '<>')
+
+
+
+    def test_get_angle_addr_qs_only_quotes(self):
+
+        angle_addr = self._test_get_x(parser.get_angle_addr,
+
+            '<""@example.com>',
+
+            '<""@example.com>',
+
+            '<""@example.com>',
+
+            [],
+
+            '')
+
+        self.assertEqual(angle_addr.token_type, 'angle-addr')
+
+        self.assertEqual(angle_addr.local_part, '')
+
+        self.assertEqual(angle_addr.domain, 'example.com')
+
+        self.assertIsNone(angle_addr.route)
+
+        self.assertEqual(angle_addr.addr_spec, '""@example.com')
+
+
+
+    def test_get_angle_addr_with_cfws(self):
+
+        angle_addr = self._test_get_x(parser.get_angle_addr,
+
+            ' (foo) <dinsdale@example.com>(bar)',
+
+            ' (foo) <dinsdale@example.com>(bar)',
+
+            ' <dinsdale@example.com> ',
+
+            [],
+
+            '')
+
+        self.assertEqual(angle_addr.token_type, 'angle-addr')
+
+        self.assertEqual(angle_addr.local_part, 'dinsdale')
+
+        self.assertEqual(angle_addr.domain, 'example.com')
+
+        self.assertIsNone(angle_addr.route)
+
+        self.assertEqual(angle_addr.addr_spec, 'dinsdale@example.com')
+
+
+
+    def test_get_angle_addr_qs_and_domain_literal(self):
+
+        angle_addr = self._test_get_x(parser.get_angle_addr,
+
+            '<"Fred Perfect"@[127.0.0.1]>',
+
+            '<"Fred Perfect"@[127.0.0.1]>',
+
+            '<"Fred Perfect"@[127.0.0.1]>',
+
+            [],
+
+            '')
+
+        self.assertEqual(angle_addr.local_part, 'Fred Perfect')
+
+        self.assertEqual(angle_addr.domain, '[127.0.0.1]')
+
+        self.assertIsNone(angle_addr.route)
+
+        self.assertEqual(angle_addr.addr_spec, '"Fred Perfect"@[127.0.0.1]')
+
+
+
+    def test_get_angle_addr_internal_cfws(self):
+
+        angle_addr = self._test_get_x(parser.get_angle_addr,
+
+            '<(foo) dinsdale@example.com(bar)>',
+
+            '<(foo) dinsdale@example.com(bar)>',
+
+            '< dinsdale@example.com >',
+
+            [],
+
+            '')
+
+        self.assertEqual(angle_addr.local_part, 'dinsdale')
+
+        self.assertEqual(angle_addr.domain, 'example.com')
+
+        self.assertIsNone(angle_addr.route)
+
+        self.assertEqual(angle_addr.addr_spec, 'dinsdale@example.com')
+
+
+
+    def test_get_angle_addr_obs_route(self):
+
+        angle_addr = self._test_get_x(parser.get_angle_addr,
+
+            '(foo)<@example.com, (bird) @two.example.com: dinsdale@example.com> (bar) ',
+
+            '(foo)<@example.com, (bird) @two.example.com: dinsdale@example.com> (bar) ',
+
+            ' <@example.com, @two.example.com: dinsdale@example.com> ',
+
+            [errors.ObsoleteHeaderDefect],
+
+            '')
+
+        self.assertEqual(angle_addr.local_part, 'dinsdale')
+
+        self.assertEqual(angle_addr.domain, 'example.com')
+
+        self.assertEqual(angle_addr.route, ['example.com', 'two.example.com'])
+
+        self.assertEqual(angle_addr.addr_spec, 'dinsdale@example.com')
+
+
+
+    def test_get_angle_addr_missing_closing_angle(self):
+
+        angle_addr = self._test_get_x(parser.get_angle_addr,
+
+            '<dinsdale@example.com',
+
+            '<dinsdale@example.com>',
+
+            '<dinsdale@example.com>',
+
+            [errors.InvalidHeaderDefect],
+
+            '')
+
+        self.assertEqual(angle_addr.local_part, 'dinsdale')
+
+        self.assertEqual(angle_addr.domain, 'example.com')
+
+        self.assertIsNone(angle_addr.route)
+
+        self.assertEqual(angle_addr.addr_spec, 'dinsdale@example.com')
+
+
+
+    def test_get_angle_addr_missing_closing_angle_with_cfws(self):
+
+        angle_addr = self._test_get_x(parser.get_angle_addr,
+
+            '<dinsdale@example.com (foo)',
+
+            '<dinsdale@example.com (foo)>',
+
+            '<dinsdale@example.com >',
+
+            [errors.InvalidHeaderDefect],
+
+            '')
+
+        self.assertEqual(angle_addr.local_part, 'dinsdale')
+
+        self.assertEqual(angle_addr.domain, 'example.com')
+
+        self.assertIsNone(angle_addr.route)
+
+        self.assertEqual(angle_addr.addr_spec, 'dinsdale@example.com')
+
+
+
+    def test_get_angle_addr_ends_at_special(self):
+
+        angle_addr = self._test_get_x(parser.get_angle_addr,
+
+            '<dinsdale@example.com> (foo), next',
+
+            '<dinsdale@example.com> (foo)',
+
+            '<dinsdale@example.com> ',
+
+            [],
+
+            ', next')
+
+        self.assertEqual(angle_addr.local_part, 'dinsdale')
+
+        self.assertEqual(angle_addr.domain, 'example.com')
+
+        self.assertIsNone(angle_addr.route)
+
+        self.assertEqual(angle_addr.addr_spec, 'dinsdale@example.com')
+
+
+
+    def test_get_angle_addr_no_angle_raise(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_angle_addr('(foo) ')
+
+
+
+    def test_get_angle_addr_no_angle_before_special_raises(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_angle_addr('(foo) , next')
+
+
+
+    def test_get_angle_addr_no_angle_raises(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_angle_addr('bar')
+
+
+
+    def test_get_angle_addr_special_after_angle_raises(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_angle_addr('(foo) <, bar')
+
+
+
+    # get_display_name  This is phrase but with a different value.
+
+
+
+    def test_get_display_name_simple(self):
+
+        display_name = self._test_get_x(parser.get_display_name,
+
+            'Fred A Johnson',
+
+            'Fred A Johnson',
+
+            'Fred A Johnson',
+
+            [],
+
+            '')
+
+        self.assertEqual(display_name.token_type, 'display-name')
+
+        self.assertEqual(display_name.display_name, 'Fred A Johnson')
+
+
+
+    def test_get_display_name_complex1(self):
+
+        display_name = self._test_get_x(parser.get_display_name,
+
+            '"Fred A. Johnson" is his name, oh.',
+
+            '"Fred A. Johnson" is his name',
+
+            '"Fred A. Johnson is his name"',
+
+            [],
+
+            ', oh.')
+
+        self.assertEqual(display_name.token_type, 'display-name')
+
+        self.assertEqual(display_name.display_name, 'Fred A. Johnson is his name')
+
+
+
+    def test_get_display_name_complex2(self):
+
+        display_name = self._test_get_x(parser.get_display_name,
+
+            ' (A) bird (in (my|your)) "hand  " is messy\t<>\t',
+
+            ' (A) bird (in (my|your)) "hand  " is messy\t',
+
+            ' "bird hand   is messy" ',
+
+            [],
+
+            '<>\t')
+
+        self.assertEqual(display_name[0][0].comments, ['A'])
+
+        self.assertEqual(display_name[0][2].comments, ['in (my|your)'])
+
+        self.assertEqual(display_name.display_name, 'bird hand   is messy')
+
+
+
+    def test_get_display_name_obsolete(self):
+
+        display_name = self._test_get_x(parser.get_display_name,
+
+            'Fred A.(weird).O Johnson',
+
+            'Fred A.(weird).O Johnson',
+
+            '"Fred A. .O Johnson"',
+
+            [errors.ObsoleteHeaderDefect]*3,
+
+            '')
+
+        self.assertEqual(len(display_name), 7)
+
+        self.assertEqual(display_name[3].comments, ['weird'])
+
+        self.assertEqual(display_name.display_name, 'Fred A. .O Johnson')
+
+
+
+    def test_get_display_name_pharse_must_start_with_word(self):
+
+        display_name = self._test_get_x(parser.get_display_name,
+
+            '(even weirder).name',
+
+            '(even weirder).name',
+
+            ' ".name"',
+
+            [errors.InvalidHeaderDefect] + [errors.ObsoleteHeaderDefect]*2,
+
+            '')
+
+        self.assertEqual(len(display_name), 3)
+
+        self.assertEqual(display_name[0].comments, ['even weirder'])
+
+        self.assertEqual(display_name.display_name, '.name')
+
+
+
+    def test_get_display_name_ending_with_obsolete(self):
+
+        display_name = self._test_get_x(parser.get_display_name,
+
+            'simple phrase.(with trailing comment):boo',
+
+            'simple phrase.(with trailing comment)',
+
+            '"simple phrase." ',
+
+            [errors.ObsoleteHeaderDefect]*2,
+
+            ':boo')
+
+        self.assertEqual(len(display_name), 4)
+
+        self.assertEqual(display_name[3].comments, ['with trailing comment'])
+
+        self.assertEqual(display_name.display_name, 'simple phrase.')
+
+
+
+    # get_name_addr
+
+
+
+    def test_get_name_addr_angle_addr_only(self):
+
+        name_addr = self._test_get_x(parser.get_name_addr,
+
+            '<dinsdale@example.com>',
+
+            '<dinsdale@example.com>',
+
+            '<dinsdale@example.com>',
+
+            [],
+
+            '')
+
+        self.assertEqual(name_addr.token_type, 'name-addr')
+
+        self.assertIsNone(name_addr.display_name)
+
+        self.assertEqual(name_addr.local_part, 'dinsdale')
+
+        self.assertEqual(name_addr.domain, 'example.com')
+
+        self.assertIsNone(name_addr.route)
+
+        self.assertEqual(name_addr.addr_spec, 'dinsdale@example.com')
+
+
+
+    def test_get_name_addr_atom_name(self):
+
+        name_addr = self._test_get_x(parser.get_name_addr,
+
+            'Dinsdale <dinsdale@example.com>',
+
+            'Dinsdale <dinsdale@example.com>',
+
+            'Dinsdale <dinsdale@example.com>',
+
+            [],
+
+            '')
+
+        self.assertEqual(name_addr.token_type, 'name-addr')
+
+        self.assertEqual(name_addr.display_name, 'Dinsdale')
+
+        self.assertEqual(name_addr.local_part, 'dinsdale')
+
+        self.assertEqual(name_addr.domain, 'example.com')
+
+        self.assertIsNone(name_addr.route)
+
+        self.assertEqual(name_addr.addr_spec, 'dinsdale@example.com')
+
+
+
+    def test_get_name_addr_atom_name_with_cfws(self):
+
+        name_addr = self._test_get_x(parser.get_name_addr,
+
+            '(foo) Dinsdale (bar) <dinsdale@example.com> (bird)',
+
+            '(foo) Dinsdale (bar) <dinsdale@example.com> (bird)',
+
+            ' Dinsdale <dinsdale@example.com> ',
+
+            [],
+
+            '')
+
+        self.assertEqual(name_addr.display_name, 'Dinsdale')
+
+        self.assertEqual(name_addr.local_part, 'dinsdale')
+
+        self.assertEqual(name_addr.domain, 'example.com')
+
+        self.assertIsNone(name_addr.route)
+
+        self.assertEqual(name_addr.addr_spec, 'dinsdale@example.com')
+
+
+
+    def test_get_name_addr_name_with_cfws_and_dots(self):
+
+        name_addr = self._test_get_x(parser.get_name_addr,
+
+            '(foo) Roy.A.Bear (bar) <dinsdale@example.com> (bird)',
+
+            '(foo) Roy.A.Bear (bar) <dinsdale@example.com> (bird)',
+
+            ' "Roy.A.Bear" <dinsdale@example.com> ',
+
+            [errors.ObsoleteHeaderDefect]*2,
+
+            '')
+
+        self.assertEqual(name_addr.display_name, 'Roy.A.Bear')
+
+        self.assertEqual(name_addr.local_part, 'dinsdale')
+
+        self.assertEqual(name_addr.domain, 'example.com')
+
+        self.assertIsNone(name_addr.route)
+
+        self.assertEqual(name_addr.addr_spec, 'dinsdale@example.com')
+
+
+
+    def test_get_name_addr_qs_name(self):
+
+        name_addr = self._test_get_x(parser.get_name_addr,
+
+            '"Roy.A.Bear" <dinsdale@example.com>',
+
+            '"Roy.A.Bear" <dinsdale@example.com>',
+
+            '"Roy.A.Bear" <dinsdale@example.com>',
+
+            [],
+
+            '')
+
+        self.assertEqual(name_addr.display_name, 'Roy.A.Bear')
+
+        self.assertEqual(name_addr.local_part, 'dinsdale')
+
+        self.assertEqual(name_addr.domain, 'example.com')
+
+        self.assertIsNone(name_addr.route)
+
+        self.assertEqual(name_addr.addr_spec, 'dinsdale@example.com')
+
+
+
+    def test_get_name_addr_with_route(self):
+
+        name_addr = self._test_get_x(parser.get_name_addr,
+
+            '"Roy.A.Bear" <@two.example.com: dinsdale@example.com>',
+
+            '"Roy.A.Bear" <@two.example.com: dinsdale@example.com>',
+
+            '"Roy.A.Bear" <@two.example.com: dinsdale@example.com>',
+
+            [errors.ObsoleteHeaderDefect],
+
+            '')
+
+        self.assertEqual(name_addr.display_name, 'Roy.A.Bear')
+
+        self.assertEqual(name_addr.local_part, 'dinsdale')
+
+        self.assertEqual(name_addr.domain, 'example.com')
+
+        self.assertEqual(name_addr.route, ['two.example.com'])
+
+        self.assertEqual(name_addr.addr_spec, 'dinsdale@example.com')
+
+
+
+    def test_get_name_addr_ends_at_special(self):
+
+        name_addr = self._test_get_x(parser.get_name_addr,
+
+            '"Roy.A.Bear" <dinsdale@example.com>, next',
+
+            '"Roy.A.Bear" <dinsdale@example.com>',
+
+            '"Roy.A.Bear" <dinsdale@example.com>',
+
+            [],
+
+            ', next')
+
+        self.assertEqual(name_addr.display_name, 'Roy.A.Bear')
+
+        self.assertEqual(name_addr.local_part, 'dinsdale')
+
+        self.assertEqual(name_addr.domain, 'example.com')
+
+        self.assertIsNone(name_addr.route)
+
+        self.assertEqual(name_addr.addr_spec, 'dinsdale@example.com')
+
+
+
+    def test_get_name_addr_no_content_raises(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_name_addr(' (foo) ')
+
+
+
+    def test_get_name_addr_no_content_before_special_raises(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_name_addr(' (foo) ,')
+
+
+
+    def test_get_name_addr_no_angle_after_display_name_raises(self):
+
+        with self.assertRaises(errors.HeaderParseError):
+
+            parser.get_name_addr('foo bar')
+
+
+
+    # get_mailbox
+
+
+
+    def test_get_mailbox_addr_spec_only(self):
+
+        mailbox = self._test_get_x(parser.get_mailbox,
+
+            'dinsdale@example.com',
+
+            'dinsdale@example.com',
+
+            'dinsdale@example.com',
+
+            [],
+
+            '')
+
+        self.assertEqual(mailbox.token_type, 'mailbox')
+
+        self.assertIsNone(mailbox.display_name)
+
+        self.assertEqual(mailbox.local_part, 'dinsdale')
+
+        self.assertEqual(mailbox.domain, 'example.com')
+
+        self.assertIsNone(mailbox.route)
+
+        self.assertEqual(mailbox.addr_spec, 'dinsdale@example.com')
+
+
+
+    def test_get_mailbox_angle_addr_only(self):
+
+        mailbox = self._test_get_x(parser.get_mailbox,
+
+            '<dinsdale@example.com>',
+
+            '<dinsdale@example.com>',
+
+            '<dinsdale@example.com>',
+
+            [],
+
+            '')
+
+        self.assertEqual(mailbox.token_type, 'mailbox')
+
+        self.assertIsNone(mailbox.display_name)
+
+        self.assertEqual(mailbox.local_part, 'dinsdale')
+
+        self.assertEqual(mailbox.domain, 'example.com')
+
+        self.assertIsNone(mailbox.route)
+
+        self.assertEqual(mailbox.addr_spec, 'dinsdale@example.com')
+
+
+
+    def test_get_mailbox_name_addr(self):
+
+        mailbox = self._test_get_x(parser.get_mailbox,
+
+            '"Roy A. Bear" <dinsdale@example.com>',
+
+            '"Roy A. Bear" <dinsdale@example.com>',
+
+            '"Roy A. Bear" <dinsdale@example.com>',
+
+            [],
+
+            '')
+
+        self.assertEqual(mailbox.token_type, 'mailbox')
+
+        self.assertEqual(mailbox.display_name, 'Roy A. Bear')
+
+        self.assertEqual(mailbox.local_part, 'dinsdale')
+
+        self.assertEqual(mailbox.domain, 'example.com')
+
+        self.assertIsNone(mailbox.route)
+
+        self.assertEqual(mailbox.addr_spec, 'dinsdale@example.com')
+
+
+
+    def test_get_mailbox_ends_at_special(self):
+
+        mailbox = self._test_get_x(parser.get_mailbox,
+
+            '"Roy A. Bear" <dinsdale@example.com>, rest',
+
+            '"Roy A. Bear" <dinsdale@example.com>',
+
+            '"Roy A. Bear" <dinsdale@example.com>',
+
+            [],
+
+            ', rest')
+
+        self.assertEqual(mailbox.token_type, 'mailbox')
+
+        self.assertEqual(mailbox.display_name, 'Roy A. Bear')
+
+        self.assertEqual(mailbox.local_part, 'dinsdale')
+
+        self.assertEqual(mailbox.domain, 'example.com')
+
+        self.assertIsNone(mailbox.route)
+
+        self.assertEqual(mailbox.addr_spec, 'dinsdale@example.com')
+
+
+
+    def test_get_mailbox_quoted_strings_in_atom_list(self):
+
+        mailbox = self._test_get_x(parser.get_mailbox,
+
+            '""example" example"@example.com',
+
+            '""example" example"@example.com',
+
+            'example example@example.com',
+
+            [errors.InvalidHeaderDefect]*3,
+
+            '')
+
+        self.assertEqual(mailbox.local_part, 'example example')
+
+        self.assertEqual(mailbox.domain, 'example.com')
+
+        self.assertEqual(mailbox.addr_spec, '"example example"@example.com')
+
+
+
+    # get_mailbox_list
+
+
+
+    def test_get_mailbox_list_single_addr(self):
+
+        mailbox_list = self._test_get_x(parser.get_mailbox_list,
+
+            'dinsdale@example.com',
+
+            'dinsdale@example.com',
+
+            'dinsdale@example.com',
+
+            [],
+
+            '')
+
+        self.assertEqual(mailbox_list.token_type, 'mailbox-list')
+
+        self.assertEqual(len(mailbox_list.mailboxes), 1)
+
+        mailbox = mailbox_list.mailboxes[0]
+
+        self.assertIsNone(mailbox.display_name)
+
+        self.assertEqual(mailbox.local_part, 'dinsdale')
+
+        self.assertEqual(mailbox.domain, 'example.com')
+
+        self.assertIsNone(mailbox.route)
+
+        self.assertEqual(mailbox.addr_spec, 'dinsdale@example.com')
+
+        self.assertEqual(mailbox_list.mailboxes,
+
+                         mailbox_list.all_mailboxes)
+
+
+
+    def test_get_mailbox_list_two_simple_addr(self):
+
+        mailbox_list = self._test_get_x(parser.get_mailbox_list,
+
+            'dinsdale@example.com, dinsdale@test.example.com',
+
+            'dinsdale@example.com, dinsdale@test.example.com',
+
+            'dinsdale@example.com, dinsdale@test.example.com',
+
+            [],
+
+            '')
+
+        self.assertEqual(mailbox_list.token_type, 'mailbox-list')
+
+        self.assertEqual(len(mailbox_list.mailboxes), 2)
+
+        self.assertEqual(mailbox_list.mailboxes[0].addr_spec,
+
+                        'dinsdale@example.com')
+
+        self.assertEqual(mailbox_list.mailboxes[1].addr_spec,
+
+                        'dinsdale@test.example.com')
+
+        self.assertEqual(mailbox_list.mailboxes,
+
+                         mailbox_list.all_mailboxes)
+
+
+
+    def test_get_mailbox_list_two_name_addr(self):
+
+        mailbox_list = self._test_get_x(parser.get_mailbox_list,
+
+            ('"Roy A. Bear" <dinsdale@example.com>,'
+
+                ' "Fred Flintstone" <dinsdale@test.example.com>'),
+
+            ('"Roy A. Bear" <dinsdale@example.com>,'
+
+                ' "Fred Flintstone" <dinsdale@test.example.com>'),
+
+            ('"Roy A. Bear" <dinsdale@example.com>,'
+
+                ' "Fred Flintstone" <dinsdale@test.example.com>'),
+
+            [],
+
+            '')
+
+        self.assertEqual(len(mailbox_list.mailboxes), 2)
+
+        self.assertEqual(mailbox_list.mailboxes[0].addr_spec,
+
+                        'dinsdale@example.com')
+
+        self.assertEqual(mailbox_list.mailboxes[0].display_name,
+
+                        'Roy A. Bear')
+
+        self.assertEqual(mailbox_list.mailboxes[1].addr_spec,
+
+                        'dinsdale@test.example.com')
+
+        self.assertEqual(mailbox_list.mailboxes[1].display_name,
+
+                        'Fred Flintstone')
+
+        self.assertEqual(mailbox_list.mailboxes,
+
+                         mailbox_list.all_mailboxes)
+
+
+
+    def test_get_mailbox_list_two_complex(self):
+
+        mailbox_list = self._test_get_x(parser.get_mailbox_list,
+
+            ('(foo) "Roy A. Bear" <dinsdale@example.com>(bar),'
+
+                ' "Fred Flintstone" <dinsdale@test.(bird)example.com>'),
+
+            ('(foo) "Roy A. Bear" <dinsdale@example.com>(bar),'
+
+                ' "Fred Flintstone" <dinsdale@test.(bird)example.com>'),
+
+            (' "Roy A. Bear" <dinsdale@example.com> ,'
+
+                ' "Fred Flintstone" <dinsdale@test. example.com>'),
+
+            [errors.ObsoleteHeaderDefect],
+
+            '')
+
+        self.assertEqual(len(mailbox_list.mailboxes), 2)
+
+        self.assertEqual(mailbox_list.mailboxes[0].addr_spec,
+
+                        'dinsdale@example.com')
+
+        self.assertEqual(mailbox_list.mailboxes[0].display_name,
+
+                        'Roy A. Bear')
+
+        self.assertEqual(mailbox_list.mailboxes[1].addr_spec,
+
+                        'dinsdale@test.example.com')
+
+        self.assertEqual(mailbox_list.mailboxes[1].display_name,
+
+                        'Fred Flintstone')
+
+        self.assertEqual(mailbox_list.mailboxes,
+
+                         mailbox_list.all_mailboxes)
+
+
+
+    def test_get_mailbox_list_unparseable_mailbox_null(self):
+
+        mailbox_list = self._test_get_x(parser.get_mailbox_list,
+
+            ('"Roy A. Bear"[] dinsdale@example.com,'
+
+                ' "Fred Flintstone" <dinsdale@test.(bird)example.com>'),
+
+            ('"Roy A. Bear"[] dinsdale@example.com,'
+
+                ' "Fred Flintstone" <dinsdale@test.(bird)example.com>'),
+
+            ('"Roy A. Bear"[] dinsdale@example.com,'
+
+                ' "Fred Flintstone" <dinsdale@test. example.com>'),
+
+            [errors.InvalidHeaderDefect,   # the 'extra' text after the local part
+
+             errors.InvalidHeaderDefect,   # the local part with no angle-addr
+
+             errors.ObsoleteHeaderDefect,  # period in extra text (example.com)
+
+             errors.ObsoleteHeaderDefect], # (bird) in valid address.
+
+            '')
+
+        self.assertEqual(len(mailbox_list.mailboxes), 1)
+
+        self.assertEqual(len(mailbox_list.all_mailboxes), 2)
+
+        self.assertEqual(mailbox_list.all_mailboxes[0].token_type,
+
+                        'invalid-mailbox')
+
+        self.assertIsNone(mailbox_list.all_mailboxes[0].display_name)
+
+        self.assertEqual(mailbox_list.all_mailboxes[0].local_part,
+
+                        'Roy A. Bear')
+
+        self.assertIsNone(mailbox_list.all_mailboxes[0].domain)
+
+        self.assertEqual(mailbox_list.all_mailboxes[0].addr_spec,
+
+                        '"Roy A. Bear"')
+
+        self.assertIs(mailbox_list.all_mailboxes[1],
+
+                        mailbox_list.mailboxes[0])
+
+        self.assertEqual(mailbox_list.mailboxes[0].addr_spec,
+
+                        'dinsdale@test.example.com')
+
+        self.assertEqual(mailbox_list.mailboxes[0].display_name,
+
+                        'Fred Flintstone')
+
+
+
+    def test_get_mailbox_list_junk_after_valid_address(self):
+
+        mailbox_list = self._test_get_x(parser.get_mailbox_list,
+
+            ('"Roy A. Bear" <dinsdale@example.com>@@,'
+
+                ' "Fred Flintstone" <dinsdale@test.example.com>'),
+
+            ('"Roy A. Bear" <dinsdale@example.com>@@,'
+
+                ' "Fred Flintstone" <dinsdale@test.example.com>'),
+
+            ('"Roy A. Bear" <dinsdale@example.com>@@,'
+
+                ' "Fred Flintstone" <dinsdale@test.example.com>'),
+
+            [errors.InvalidHeaderDefect],
+
+            '')
+
+        self.assertEqual(len(mailbox_list.mailboxes), 1)
+
+        self.assertEqual(len(mailbox_list.all_mailboxes), 2)
+
+        self.assertEqual(mailbox_list.all_mailboxes[0].addr_spec,
+
+                        'dinsdale@example.com')
+
+        self.assertEqual(mailbox_list.all_mailboxes[0].display_name,
+
+                        'Roy A. Bear')
+
+        self.assertEqual(mailbox_list.all_mailboxes[0].token_type,
+
+                        'invalid-mailbox')
+
+        self.assertIs(mailbox_list.all_mailboxes[1],
+
+                        mailbox_list.mailboxes[0])
+
+        self.assertEqual(mailbox_list.mailboxes[0].addr_spec,
+
+                        'dinsdale@test.example.com')
+
+        self.assertEqual(mailbox_list.mailboxes[0].display_name,
+
+                        'Fred Flintstone')
+
+
+
+    def test_get_mailbox_list_empty_list_element(self):
+
+        mailbox_list = self._test_get_x(parser.get_mailbox_list,
+
+            ('"Roy A. Bear" <dinsdale@example.com>, (bird),,'
+
+                ' "Fred Flintstone" <dinsdale@test.example.com>'),
+
+            ('"Roy A. Bear" <dinsdale@example.com>, (bird),,'
+
+                ' "Fred Flintstone" <dinsdale@test.example.com>'),
+
+            ('"Roy A. Bear" <dinsdale@example.com>, ,,'
+
+                ' "Fred Flintstone" <dinsdale@test.example.com>'),
+
+            [errors.ObsoleteHeaderDefect]*2,
+
+            '')
+
+        self.assertEqual(len(mailbox_list.mailboxes), 2)
+
+        self.assertEqual(mailbox_list.all_mailboxes,
+
+                         mailbox_list.mailboxes)
+
+        self.assertEqual(mailbox_list.all_mailboxes[0].addr_spec,
+
+                        'dinsdale@example.com')
+
+        self.assertEqual(mailbox_list.all_mailboxes[0].display_name,
+
+                        'Roy A. Bear')
+
+        self.assertEqual(mailbox_list.mailboxes[1].addr_spec,
+
+                        'dinsdale@test.example.com')
+
+        self.assertEqual(mailbox_list.mailboxes[1].display_name,
+
+                        'Fred Flintstone')
+
+
+
+    def test_get_mailbox_list_only_empty_elements(self):
+
+        mailbox_list = self._test_get_x(parser.get_mailbox_list,
+
+            '(foo),, (bar)',
+
+            '(foo),, (bar)',
+
+            ' ,, ',
+
+            [errors.ObsoleteHeaderDefect]*3,
+
+            '')
+
+        self.assertEqual(len(mailbox_list.mailboxes), 0)
+
+        self.assertEqual(mailbox_list.all_mailboxes,
+
+                         mailbox_list.mailboxes)
+
+
+
+    # get_group_list
+
+
+
+    def test_get_group_list_cfws_only(self):
+
+        group_list = self._test_get_x(parser.get_group_list,
+
+            '(hidden);',
+
+            '(hidden)',
+
+            ' ',
+
+            [],
+
+            ';')
+
+        self.assertEqual(group_list.token_type, 'group-list')
+
+        self.assertEqual(len(group_list.mailboxes), 0)
+
+        self.assertEqual(group_list.mailboxes,
+
+                         group_list.all_mailboxes)
+
+
+
+    def test_get_group_list_mailbox_list(self):
+
+        group_list = self._test_get_x(parser.get_group_list,
+
+            'dinsdale@example.org, "Fred A. Bear" <dinsdale@example.org>',
+
+            'dinsdale@example.org, "Fred A. Bear" <dinsdale@example.org>',
+
+            'dinsdale@example.org, "Fred A. Bear" <dinsdale@example.org>',
+
+            [],
+
+            '')
+
+        self.assertEqual(group_list.token_type, 'group-list')
+
+        self.assertEqual(len(group_list.mailboxes), 2)
+
+        self.assertEqual(group_list.mailboxes,
+
+                         group_list.all_mailboxes)
+
+        self.assertEqual(group_list.mailboxes[1].display_name,
+
+                         'Fred A. Bear')
+
+
+
+    def test_get_group_list_obs_group_list(self):
+
+        group_list = self._test_get_x(parser.get_group_list,
+
+            ', (foo),,(bar)',
+
+            ', (foo),,(bar)',
+
+            ', ,, ',
+
+            [errors.ObsoleteHeaderDefect],
+
+            '')
+
+        self.assertEqual(group_list.token_type, 'group-list')
+
+        self.assertEqual(len(group_list.mailboxes), 0)
+
+        self.assertEqual(group_list.mailboxes,
+
+                         group_list.all_mailboxes)
+
+
+
+    def test_get_group_list_comment_only_invalid(self):
+
+        group_list = self._test_get_x(parser.get_group_list,
+
+            '(bar)',
+
+            '(bar)',
+
+            ' ',
+
+            [errors.InvalidHeaderDefect],
+
+            '')
+
+        self.assertEqual(group_list.token_type, 'group-list')
+
+        self.assertEqual(len(group_list.mailboxes), 0)
+
+        self.assertEqual(group_list.mailboxes,
+
+                         group_list.all_mailboxes)
+
+
+
+    # get_group
+
+
+
+    def test_get_group_empty(self):
+
+        group = self._test_get_x(parser.get_group,
+
+            'Monty Python:;',
+
+            'Monty Python:;',
+
+            'Monty Python:;',
+
+            [],
+
+            '')
+
+        self.assertEqual(group.token_type, 'group')
+
+        self.assertEqual(group.display_name, 'Monty Python')
+
+        self.assertEqual(len(group.mailboxes), 0)
+
+        self.assertEqual(group.mailboxes,
+
+                         group.all_mailboxes)
+
+
+
+    def test_get_group_null_addr_spec(self):
+
+        group = self._test_get_x(parser.get_group,
+
+            'foo: <>;',
+
+            'foo: <>;',
+
+            'foo: <>;',
+
+            [errors.InvalidHeaderDefect],
+
+            '')
+
+        self.assertEqual(group.display_name, 'foo')
+
+        self.assertEqual(len(group.mailboxes), 0)
+
+        self.assertEqual(len(group.all_mailboxes), 1)
+
+        self.assertEqual(group.all_mailboxes[0].value, '<>')
+
+
+
+    def test_get_group_cfws_only(self):
+
+        group = self._test_get_x(parser.get_group,
+
+            'Monty Python: (hidden);',
+
+            'Monty Python: (hidden);',
+
+            'Monty Python: ;',
+
+            [],
+
+            '')
+
+        self.assertEqual(group.token_type, 'group')
+
+        self.assertEqual(group.display_name, 'Monty Python')
+
+        self.assertEqual(len(group.mailboxes), 0)
+
+        self.assertEqual(group.mailboxes,
+
+                         group.all_mailboxes)
+
+
+
+    def test_get_group_single_mailbox(self):
+
+        group = self._test_get_x(parser.get_group,
+
+            'Monty Python: "Fred A. Bear" <dinsdale@example.com>;',
+
+            'Monty Python: "Fred A. Bear" <dinsdale@example.com>;',
+
+            'Monty Python: "Fred A. Bear" <dinsdale@example.com>;',
+
+            [],
+
+            '')
+
+        self.assertEqual(group.token_type, 'group')
+
+        self.assertEqual(group.display_name, 'Monty Python')
+
+        self.assertEqual(len(group.mailboxes), 1)
+
+        self.assertEqual(group.mailboxes,
+
+                         group.all_mailboxes)
+
+        self.assertEqual(group.mailboxes[0].addr_spec,
+
+                         'dinsdale@example.com')
+
+
+
+    def test_get_group_mixed_list(self):
+
+        group = self._test_get_x(parser.get_group,
+
+            ('Monty Python: "Fred A. Bear" <dinsdale@example.com>,'
+
+                '(foo) Roger <ping@exampele.com>, x@test.example.com;'),
+
+            ('Monty Python: "Fred A. Bear" <dinsdale@example.com>,'
+
+                '(foo) Roger <ping@exampele.com>, x@test.example.com;'),
+
+            ('Monty Python: "Fred A. Bear" <dinsdale@example.com>,'
+
+                ' Roger <ping@exampele.com>, x@test.example.com;'),
+
+            [],
+
+            '')
+
+        self.assertEqual(group.token_type, 'group')
+
+        self.assertEqual(group.display_name, 'Monty Python')
+
+        self.assertEqual(len(group.mailboxes), 3)
+
+        self.assertEqual(group.mailboxes,
+
+                         group.all_mailboxes)
+
+        self.assertEqual(group.mailboxes[0].display_name,
+
+                         'Fred A. Bear')
+
+        self.assertEqual(group.mailboxes[1].display_name,
+
+                         'Roger')
+
+        self.assertEqual(group.mailboxes[2].local_part, 'x')
+
+
+
+    def test_get_group_one_invalid(self):
+
+        group = self._test_get_x(parser.get_group,
+
+            ('Monty Python: "Fred A. Bear" <dinsdale@example.com>,'
+
+                '(foo) Roger ping@exampele.com, x@test.example.com;'),
+
+            ('Monty Python: "Fred A. Bear" <dinsdale@example.com>,'
+
+                '(foo) Roger ping@exampele.com, x@test.example.com;'),
+
+            ('Monty Python: "Fred A. Bear" <dinsdale@example.com>,'
+
+                ' Roger ping@exampele.com, x@test.example.com;'),
+
+            [errors.InvalidHeaderDefect,   # non-angle addr makes local part invalid
+
+             errors.InvalidHeaderDefect],   # and its not obs-local either: no dots.
+
+            '')
+
+        self.assertEqual(group.token_type, 'group')
+
+        self.assertEqual(group.display_name, 'Monty Python')
+
+        self.assertEqual(len(group.mailboxes), 2)
+
+        self.assertEqual(len(group.all_mailboxes), 3)
+
+        self.assertEqual(group.mailboxes[0].display_name,
+
+                         'Fred A. Bear')
+
+        self.assertEqual(group.mailboxes[1].local_part, 'x')
+
+        self.assertIsNone(group.all_mailboxes[1].display_name)
+
+
+
+    def test_get_group_missing_final_semicol(self):
+
+        group = self._test_get_x(parser.get_group,
+
+            ('Monty Python:"Fred A. Bear" <dinsdale@example.com>,'
+
+             'eric@where.test,John <jdoe@test>'),
+
+            ('Monty Python:"Fred A. Bear" <dinsdale@example.com>,'
+
+             'eric@where.test,John <jdoe@test>;'),
+
+            ('Monty Python:"Fred A. Bear" <dinsdale@example.com>,'
+
+             'eric@where.test,John <jdoe@test>;'),
+
+            [errors.InvalidHeaderDefect],
+
+            '')
+
+        self.assertEqual(group.token_type, 'group')
+
+        self.assertEqual(group.display_name, 'Monty Python')
+
+        self.assertEqual(len(group.mailboxes), 3)
+
+        self.assertEqual(group.mailboxes,
+
+                         group.all_mailboxes)
+
+        self.assertEqual(group.mailboxes[0].addr_spec,
+
+                         'dinsdale@example.com')
+
+        self.assertEqual(group.mailboxes[0].display_name,
+
+                         'Fred A. Bear')
+
+        self.assertEqual(group.mailboxes[1].addr_spec,
+
+                         'eric@where.test')
+
+        self.assertEqual(group.mailboxes[2].display_name,
+
+                         'John')
+
+        self.assertEqual(group.mailboxes[2].addr_spec,
+
+                         'jdoe@test')
+
+    # get_address
+
+
+
+    def test_get_address_simple(self):
+
+        address = self._test_get_x(parser.get_address,
+
+            'dinsdale@example.com',
+
+            'dinsdale@example.com',
+
+            'dinsdale@example.com',
+
+            [],
+
+            '')
+
+        self.assertEqual(address.token_type, 'address')
+
+        self.assertEqual(len(address.mailboxes), 1)
+
+        self.assertEqual(address.mailboxes,
+
+                         address.all_mailboxes)
+
+        self.assertEqual(address.mailboxes[0].domain,
+
+                         'example.com')
+
+        self.assertEqual(address[0].token_type,
+
+                         'mailbox')
+
+
+
+    def test_get_address_complex(self):
+
+        address = self._test_get_x(parser.get_address,
+
+            '(foo) "Fred A. Bear" <(bird)dinsdale@example.com>',
+
+            '(foo) "Fred A. Bear" <(bird)dinsdale@example.com>',
+
+            ' "Fred A. Bear" < dinsdale@example.com>',
+
+            [],
+
+            '')
+
+        self.assertEqual(address.token_type, 'address')
+
+        self.assertEqual(len(address.mailboxes), 1)
+
+        self.assertEqual(address.mailboxes,
+
+                         address.all_mailboxes)
+
+        self.assertEqual(address.mailboxes[0].display_name,
+
+                         'Fred A. Bear')
+
+        self.assertEqual(address[0].token_type,
+
+                         'mailbox')
+
+
+
+    def test_get_address_rfc2047_display_name(self):
+
+        address = self._test_get_x(parser.get_address,
+
+            '=?utf-8?q?=C3=89ric?= <foo@example.com>',
+
+            'Éric <foo@example.com>',
+
+            'Éric <foo@example.com>',
+
+            [],
+
+            '')
+
+        self.assertEqual(address.token_type, 'address')
+
+        self.assertEqual(len(address.mailboxes), 1)
+
+        self.assertEqual(address.mailboxes,
+
+                         address.all_mailboxes)
+
+        self.assertEqual(address.mailboxes[0].display_name,
+
+                         'Éric')
+
+        self.assertEqual(address[0].token_type,
+
+                         'mailbox')
+
+
+
+    def test_get_address_empty_group(self):
+
+        address = self._test_get_x(parser.get_address,
+
+            'Monty Python:;',
+
+            'Monty Python:;',
+
+            'Monty Python:;',
+
+            [],
+
+            '')
+
+        self.assertEqual(address.token_type, 'address')
+
+        self.assertEqual(len(address.mailboxes), 0)
+
+        self.assertEqual(address.mailboxes,
+
+                         address.all_mailboxes)
+
+        self.assertEqual(address[0].token_type,
+
+                         'group')
+
+        self.assertEqual(address[0].display_name,
+
+                         'Monty Python')
+
+
+
+    def test_get_address_group(self):
+
+        address = self._test_get_x(parser.get_address,
+
+            'Monty Python: x@example.com, y@example.com;',
+
+            'Monty Python: x@example.com, y@example.com;',
+
+            'Monty Python: x@example.com, y@example.com;',
+
+            [],
+
+            '')
+
+        self.assertEqual(address.token_type, 'address')
+
+        self.assertEqual(len(address.mailboxes), 2)
+
+        self.assertEqual(address.mailboxes,
+
+                         address.all_mailboxes)
+
+        self.assertEqual(address[0].token_type,
+
+                         'group')
+
+        self.assertEqual(address[0].display_name,
+
+                         'Monty Python')
+
+        self.assertEqual(address.mailboxes[0].local_part, 'x')
+
+
+
+    def test_get_address_quoted_local_part(self):
+
+        address = self._test_get_x(parser.get_address,
+
+            '"foo bar"@example.com',
+
+            '"foo bar"@example.com',
+
+            '"foo bar"@example.com',
+
+            [],
+
+            '')
+
+        self.assertEqual(address.token_type, 'address')
+
+        self.assertEqual(len(address.mailboxes), 1)
+
+        self.assertEqual(address.mailboxes,
+
+                         address.all_mailboxes)
+
+        self.assertEqual(address.mailboxes[0].domain,
+
+                         'example.com')
+
+        self.assertEqual(address.mailboxes[0].local_part,
+
+                         'foo bar')
+
+        self.assertEqual(address[0].token_type, 'mailbox')
+
+
+
+    def test_get_address_ends_at_special(self):
+
+        address = self._test_get_x(parser.get_address,
+
+            'dinsdale@example.com, next',
+
+            'dinsdale@example.com',
+
+            'dinsdale@example.com',
+
+            [],
+
+            ', next')
+
+        self.assertEqual(address.token_type, 'address')
+
+        self.assertEqual(len(address.mailboxes), 1)
+
+        self.assertEqual(address.mailboxes,
+
+                         address.all_mailboxes)
+
+        self.assertEqual(address.mailboxes[0].domain,
+
+                         'example.com')
+
+        self.assertEqual(address[0].token_type, 'mailbox')
+
+
+
+    def test_get_address_invalid_mailbox_invalid(self):
+
+        address = self._test_get_x(parser.get_address,
+
+            'ping example.com, next',
+
+            'ping example.com',
+
+            'ping example.com',
+
+            [errors.InvalidHeaderDefect,    # addr-spec with no domain
+
+             errors.InvalidHeaderDefect,    # invalid local-part
+
+             errors.InvalidHeaderDefect,    # missing .s in local-part
 
             ],
 
-            'media-types': [
+            ', next')
 
-                {
+        self.assertEqual(address.token_type, 'address')
 
-                    'base': 'application/json',
+        self.assertEqual(len(address.mailboxes), 0)
 
-                    'type': 'application/vnd.openstack.identity-v2.0'
+        self.assertEqual(len(address.all_mailboxes), 1)
 
-                            '+json'
+        self.assertIsNone(address.all_mailboxes[0].domain)
 
-                }, {
+        self.assertEqual(address.all_mailboxes[0].local_part, 'ping example.com')
 
-                    'base': 'application/xml',
+        self.assertEqual(address[0].token_type, 'invalid-mailbox')
 
-                    'type': 'application/vnd.openstack.identity-v2.0'
 
-                            '+xml'
 
-                }
+    def test_get_address_quoted_strings_in_atom_list(self):
 
-            ]
+        address = self._test_get_x(parser.get_address,
 
-        }
+            '""example" example"@example.com',
 
+            '""example" example"@example.com',
 
+            'example example@example.com',
 
-        return versions
+            [errors.InvalidHeaderDefect]*3,
 
+            '')
 
+        self.assertEqual(address.all_mailboxes[0].local_part, 'example example')
 
-    def get_versions(self, context):
+        self.assertEqual(address.all_mailboxes[0].domain, 'example.com')
 
-        versions = self._get_versions_list(context)
+        self.assertEqual(address.all_mailboxes[0].addr_spec, '"example example"@example.com')
 
-        return wsgi.render_response(status=(300, 'Multiple Choices'), body={
 
-            'versions': {
 
-                'values': versions.values()
 
-            }
 
-        })
+    # get_address_list
 
 
 
-    def get_version(self, context):
+    def test_get_address_list_CFWS(self):
 
-        versions = self._get_versions_list(context)
+        address_list = self._test_get_x(parser.get_address_list,
 
-        return wsgi.render_response(body={
+                                        '(Recipient list suppressed)',
 
-            'version': versions['v2.0']
+                                        '(Recipient list suppressed)',
 
-        })
+                                        ' ',
 
+                                        [errors.ObsoleteHeaderDefect],  # no content in address list
 
+                                        '')
 
+        self.assertEqual(address_list.token_type, 'address-list')
 
+        self.assertEqual(len(address_list.mailboxes), 0)
 
-class NoopController(wsgi.Application):
+        self.assertEqual(address_list.mailboxes, address_list.all_mailboxes)
 
-    def __init__(self):
 
-        super(NoopController, self).__init__()
 
+    def test_get_address_list_mailboxes_simple(self):
 
+        address_list = self._test_get_x(parser.get_address_list,
 
-    def noop(self, context):
+            'dinsdale@example.com',
 
-        return {}
+            'dinsdale@example.com',
 
+            'dinsdale@example.com',
 
+            [],
 
+            '')
 
+        self.assertEqual(address_list.token_type, 'address-list')
 
-class TokenController(wsgi.Application):
+        self.assertEqual(len(address_list.mailboxes), 1)
 
-    def __init__(self):
+        self.assertEqual(address_list.mailboxes,
 
-        self.catalog_api = catalog.Manager()
+                         address_list.all_mailboxes)
 
-        self.identity_api = identity.Manager()
+        self.assertEqual([str(x) for x in address_list.mailboxes],
 
-        self.token_api = token.Manager()
+                         [str(x) for x in address_list.addresses])
 
-        self.policy_api = policy.Manager()
+        self.assertEqual(address_list.mailboxes[0].domain, 'example.com')
 
-        super(TokenController, self).__init__()
+        self.assertEqual(address_list[0].token_type, 'address')
 
+        self.assertIsNone(address_list[0].display_name)
 
 
-    def ca_cert(self, context, auth=None):
 
-        ca_file = open(config.CONF.signing.ca_certs, 'r')
+    def test_get_address_list_mailboxes_two_simple(self):
 
-        data = ca_file.read()
+        address_list = self._test_get_x(parser.get_address_list,
 
-        ca_file.close()
+            'foo@example.com, "Fred A. Bar" <bar@example.com>',
 
-        return data
+            'foo@example.com, "Fred A. Bar" <bar@example.com>',
 
+            'foo@example.com, "Fred A. Bar" <bar@example.com>',
 
+            [],
 
-    def signing_cert(self, context, auth=None):
+            '')
 
-        cert_file = open(config.CONF.signing.certfile, 'r')
+        self.assertEqual(address_list.token_type, 'address-list')
 
-        data = cert_file.read()
+        self.assertEqual(len(address_list.mailboxes), 2)
 
-        cert_file.close()
+        self.assertEqual(address_list.mailboxes,
 
-        return data
+                         address_list.all_mailboxes)
 
+        self.assertEqual([str(x) for x in address_list.mailboxes],
 
+                         [str(x) for x in address_list.addresses])
 
-    def authenticate(self, context, auth=None):
+        self.assertEqual(address_list.mailboxes[0].local_part, 'foo')
 
-        """Authenticate credentials and return a token.
+        self.assertEqual(address_list.mailboxes[1].display_name, "Fred A. Bar")
 
 
 
-        Accept auth as a dict that looks like::
+    def test_get_address_list_mailboxes_complex(self):
 
+        address_list = self._test_get_x(parser.get_address_list,
 
+            ('"Roy A. Bear" <dinsdale@example.com>, '
 
-            {
+                '(ping) Foo <x@example.com>,'
 
-                "auth":{
+                'Nobody Is. Special <y@(bird)example.(bad)com>'),
 
-                    "passwordCredentials":{
+            ('"Roy A. Bear" <dinsdale@example.com>, '
 
-                        "username":"test_user",
+                '(ping) Foo <x@example.com>,'
 
-                        "password":"mypass"
+                'Nobody Is. Special <y@(bird)example.(bad)com>'),
 
-                    },
+            ('"Roy A. Bear" <dinsdale@example.com>, '
 
-                    "tenantName":"customer-x"
+                'Foo <x@example.com>,'
 
-                }
+                '"Nobody Is. Special" <y@example. com>'),
 
-            }
+            [errors.ObsoleteHeaderDefect, # period in Is.
 
+            errors.ObsoleteHeaderDefect], # cfws in domain
 
+            '')
 
-        In this case, tenant is optional, if not provided the token will be
+        self.assertEqual(address_list.token_type, 'address-list')
 
-        considered "unscoped" and can later be used to get a scoped token.
+        self.assertEqual(len(address_list.mailboxes), 3)
 
+        self.assertEqual(address_list.mailboxes,
 
+                         address_list.all_mailboxes)
 
-        Alternatively, this call accepts auth with only a token and tenant
+        self.assertEqual([str(x) for x in address_list.mailboxes],
 
-        that will return a token that is scoped to that tenant.
+                         [str(x) for x in address_list.addresses])
 
-        """
+        self.assertEqual(address_list.mailboxes[0].domain, 'example.com')
 
+        self.assertEqual(address_list.mailboxes[0].token_type, 'mailbox')
 
+        self.assertEqual(address_list.addresses[0].token_type, 'address')
 
-        if 'passwordCredentials' in auth:
+        self.assertEqual(address_list.mailboxes[1].local_part, 'x')
 
-            user_id = auth['passwordCredentials'].get('userId', None)
+        self.assertEqual(address_list.mailboxes[2].display_name,
 
-            if user_id and len(user_id) > MAX_PARAM_SIZE:
+                         'Nobody Is. Special')
 
-                raise exception.ValidationSizeError(attribute='userId',
 
-                                                    size=MAX_PARAM_SIZE)
 
-            username = auth['passwordCredentials'].get('username', '')
+    def test_get_address_list_mailboxes_invalid_addresses(self):
 
-            if len(username) > MAX_PARAM_SIZE:
+        address_list = self._test_get_x(parser.get_address_list,
 
-                raise exception.ValidationSizeError(attribute='username',
+            ('"Roy A. Bear" <dinsdale@example.com>, '
 
-                                                    size=MAX_PARAM_SIZE)
+                '(ping) Foo x@example.com[],'
 
-            password = auth['passwordCredentials'].get('password', '')
+                'Nobody Is. Special <(bird)example.(bad)com>'),
 
-            max_pw_size = utils.MAX_PASSWORD_LENGTH
+            ('"Roy A. Bear" <dinsdale@example.com>, '
 
-            if len(password) > max_pw_size:
+                '(ping) Foo x@example.com[],'
 
-                raise exception.ValidationSizeError(attribute='password',
+                'Nobody Is. Special <(bird)example.(bad)com>'),
 
-                                                    size=max_pw_size)
+            ('"Roy A. Bear" <dinsdale@example.com>, '
 
+                'Foo x@example.com[],'
 
+                '"Nobody Is. Special" < example. com>'),
 
-            tenant_name = auth.get('tenantName', None)
+             [errors.InvalidHeaderDefect,   # invalid address in list
 
-            if tenant_name and len(tenant_name) > MAX_PARAM_SIZE:
+              errors.InvalidHeaderDefect,   # 'Foo x' local part invalid.
 
-                raise exception.ValidationSizeError(attribute='tenantName',
+              errors.InvalidHeaderDefect,   # Missing . in 'Foo x' local part
 
-                                                    size=MAX_PARAM_SIZE)
+              errors.ObsoleteHeaderDefect,  # period in 'Is.' disp-name phrase
 
+              errors.InvalidHeaderDefect,   # no domain part in addr-spec
 
+              errors.ObsoleteHeaderDefect], # addr-spec has comment in it
 
-            if username:
+            '')
 
-                try:
+        self.assertEqual(address_list.token_type, 'address-list')
 
-                    user_ref = self.identity_api.get_user_by_name(
+        self.assertEqual(len(address_list.mailboxes), 1)
 
-                        context=context, user_name=username)
+        self.assertEqual(len(address_list.all_mailboxes), 3)
 
-                    user_id = user_ref['id']
+        self.assertEqual([str(x) for x in address_list.all_mailboxes],
 
-                except exception.UserNotFound:
+                         [str(x) for x in address_list.addresses])
 
-                    raise exception.Unauthorized()
+        self.assertEqual(address_list.mailboxes[0].domain, 'example.com')
 
+        self.assertEqual(address_list.mailboxes[0].token_type, 'mailbox')
 
+        self.assertEqual(address_list.addresses[0].token_type, 'address')
 
-            # more compat
+        self.assertEqual(address_list.addresses[1].token_type, 'address')
 
-            tenant_id = auth.get('tenantId', None)
+        self.assertEqual(len(address_list.addresses[0].mailboxes), 1)
 
-            if tenant_id and len(tenant_id) > MAX_PARAM_SIZE:
+        self.assertEqual(len(address_list.addresses[1].mailboxes), 0)
 
-                raise exception.ValidationSizeError(attribute='tenantId',
+        self.assertEqual(len(address_list.addresses[1].mailboxes), 0)
 
-                                                    size=MAX_PARAM_SIZE)
+        self.assertEqual(
 
-            if tenant_name:
+            address_list.addresses[1].all_mailboxes[0].local_part, 'Foo x')
 
-                try:
+        self.assertEqual(
 
-                    tenant_ref = self.identity_api.get_tenant_by_name(
+            address_list.addresses[2].all_mailboxes[0].display_name,
 
-                        context=context, tenant_name=tenant_name)
+                "Nobody Is. Special")
 
-                    tenant_id = tenant_ref['id']
 
-                except exception.TenantNotFound:
 
-                    raise exception.Unauthorized()
+    def test_get_address_list_group_empty(self):
 
+        address_list = self._test_get_x(parser.get_address_list,
 
+            'Monty Python: ;',
 
-            try:
+            'Monty Python: ;',
 
-                auth_info = self.identity_api.authenticate(context=context,
+            'Monty Python: ;',
 
-                                                           user_id=user_id,
+            [],
 
-                                                           password=password,
+            '')
 
-                                                           tenant_id=tenant_id)
+        self.assertEqual(address_list.token_type, 'address-list')
 
-                (user_ref, tenant_ref, metadata_ref) = auth_info
+        self.assertEqual(len(address_list.mailboxes), 0)
 
+        self.assertEqual(address_list.mailboxes,
 
+                         address_list.all_mailboxes)
 
-                # If the user is disabled don't allow them to authenticate
+        self.assertEqual(len(address_list.addresses), 1)
 
-                if not user_ref.get('enabled', True):
+        self.assertEqual(address_list.addresses[0].token_type, 'address')
 
-                    LOG.warning('User %s is disabled' % user_id)
+        self.assertEqual(address_list.addresses[0].display_name, 'Monty Python')
 
-                    raise exception.Unauthorized()
+        self.assertEqual(len(address_list.addresses[0].mailboxes), 0)
 
 
 
-                # If the tenant is disabled don't allow them to authenticate
+    def test_get_address_list_group_simple(self):
 
-                if tenant_ref and not tenant_ref.get('enabled', True):
+        address_list = self._test_get_x(parser.get_address_list,
 
-                    LOG.warning('Tenant %s is disabled' % tenant_id)
+            'Monty Python: dinsdale@example.com;',
 
-                    raise exception.Unauthorized()
+            'Monty Python: dinsdale@example.com;',
 
-            except AssertionError as e:
+            'Monty Python: dinsdale@example.com;',
 
-                raise exception.Unauthorized(e.message)
+            [],
 
-            auth_token_data = dict(zip(['user', 'tenant', 'metadata'],
+            '')
 
-                                       auth_info))
+        self.assertEqual(address_list.token_type, 'address-list')
 
-            expiry = self.token_api._get_default_expire_time(context=context)
+        self.assertEqual(len(address_list.mailboxes), 1)
 
+        self.assertEqual(address_list.mailboxes,
 
+                         address_list.all_mailboxes)
 
-            if tenant_ref:
+        self.assertEqual(address_list.mailboxes[0].domain, 'example.com')
 
-                catalog_ref = self.catalog_api.get_catalog(
+        self.assertEqual(address_list.addresses[0].display_name,
 
-                    context=context,
+                         'Monty Python')
 
-                    user_id=user_ref['id'],
+        self.assertEqual(address_list.addresses[0].mailboxes[0].domain,
 
-                    tenant_id=tenant_ref['id'],
+                         'example.com')
 
-                    metadata=metadata_ref)
 
-            else:
 
-                catalog_ref = {}
+    def test_get_address_list_group_and_mailboxes(self):
 
-        elif 'token' in auth:
+        address_list = self._test_get_x(parser.get_address_list,
 
-            old_token = auth['token'].get('id', None)
+            ('Monty Python: dinsdale@example.com, "Fred" <flint@example.com>;, '
 
+                'Abe <x@example.com>, Bee <y@example.com>'),
 
+            ('Monty Python: dinsdale@example.com, "Fred" <flint@example.com>;, '
 
-            if len(old_token) > MAX_TOKEN_SIZE:
+                'Abe <x@example.com>, Bee <y@example.com>'),
 
-                raise exception.ValidationSizeError(attribute='token',
+            ('Monty Python: dinsdale@example.com, "Fred" <flint@example.com>;, '
 
-                                                    size=MAX_TOKEN_SIZE)
+                'Abe <x@example.com>, Bee <y@example.com>'),
 
-            tenant_name = auth.get('tenantName')
+            [],
 
-            if tenant_name and len(tenant_name) > MAX_PARAM_SIZE:
+            '')
 
-                raise exception.ValidationSizeError(attribute='tenantName',
+        self.assertEqual(address_list.token_type, 'address-list')
 
-                                                    size=MAX_PARAM_SIZE)
+        self.assertEqual(len(address_list.mailboxes), 4)
 
+        self.assertEqual(address_list.mailboxes,
 
+                         address_list.all_mailboxes)
 
-            try:
+        self.assertEqual(len(address_list.addresses), 3)
 
-                old_token_ref = self.token_api.get_token(context=context,
+        self.assertEqual(address_list.mailboxes[0].local_part, 'dinsdale')
 
-                                                         token_id=old_token)
+        self.assertEqual(address_list.addresses[0].display_name,
 
-            except exception.NotFound:
+                         'Monty Python')
 
-                LOG.warning("Token not found: " + str(old_token))
+        self.assertEqual(address_list.addresses[0].mailboxes[0].domain,
 
-                raise exception.Unauthorized()
+                         'example.com')
 
+        self.assertEqual(address_list.addresses[0].mailboxes[1].local_part,
 
+                         'flint')
 
-            user_ref = old_token_ref['user']
+        self.assertEqual(address_list.addresses[1].mailboxes[0].local_part,
 
-            user_id = user_ref['id']
+                         'x')
 
+        self.assertEqual(address_list.addresses[2].mailboxes[0].local_part,
 
+                         'y')
 
-            current_user_ref = self.identity_api.get_user(context=context,
+        self.assertEqual(str(address_list.addresses[1]),
 
-                                                          user_id=user_id)
+                         str(address_list.mailboxes[2]))
 
 
 
-            # If the user is disabled don't allow them to authenticate
+    def test_invalid_content_disposition(self):
 
-            if not current_user_ref.get('enabled', True):
+        content_disp = self._test_parse_x(
 
-                LOG.warning('User %s is disabled' % user_id)
+            parser.parse_content_disposition_header,
 
-                raise exception.Unauthorized()
+            ";attachment", "; attachment", ";attachment",
 
+            [errors.InvalidHeaderDefect]*2
 
+        )
 
-            if tenant_name:
 
-                tenant_ref = self.identity_api.get_tenant_by_name(
 
-                    context=context,
+    def test_invalid_content_transfer_encoding(self):
 
-                    tenant_name=tenant_name)
+        cte = self._test_parse_x(
 
-                tenant_id = tenant_ref['id']
+            parser.parse_content_transfer_encoding_header,
 
-            else:
+            ";foo", ";foo", ";foo", [errors.InvalidHeaderDefect]*3
 
-                tenant_id = auth.get('tenantId', None)
+        )
 
-            tenants = self.identity_api.get_tenants_for_user(context, user_id)
 
 
+    # get_msg_id
 
-            if tenant_id:
 
-                if not tenant_id in tenants:
 
-                    LOG.warning('User %s is authorized for tenant %s'
+    def test_get_msg_id_valid(self):
 
-                                % (user_id, tenant_id))
+        msg_id = self._test_get_x(
 
-                    raise exception.Unauthorized()
+            parser.get_msg_id,
 
+            "<simeple.local@example.something.com>",
 
+            "<simeple.local@example.something.com>",
 
-            expiry = old_token_ref['expires']
+            "<simeple.local@example.something.com>",
 
-            try:
+            [],
 
-                tenant_ref = self.identity_api.get_tenant(context=context,
+            '',
 
-                                                          tenant_id=tenant_id)
+            )
 
-            except exception.TenantNotFound:
+        self.assertEqual(msg_id.token_type, 'msg-id')
 
-                tenant_ref = None
 
-                metadata_ref = {}
 
-                catalog_ref = {}
+    def test_get_msg_id_obsolete_local(self):
 
-            except exception.MetadataNotFound:
+        msg_id = self._test_get_x(
 
-                metadata_ref = {}
+            parser.get_msg_id,
 
-                catalog_ref = {}
+            '<"simeple.local"@example.com>',
 
+            '<"simeple.local"@example.com>',
 
+            '<simeple.local@example.com>',
 
-            # If the tenant is disabled don't allow them to authenticate
+            [errors.ObsoleteHeaderDefect],
 
-            if tenant_ref and not tenant_ref.get('enabled', True):
+            '',
 
-                LOG.warning('Tenant %s is disabled' % tenant_id)
+            )
 
-                raise exception.Unauthorized()
+        self.assertEqual(msg_id.token_type, 'msg-id')
 
 
 
-            if tenant_ref:
+    def test_get_msg_id_non_folding_literal_domain(self):
 
-                metadata_ref = self.identity_api.get_metadata(
+        msg_id = self._test_get_x(
 
-                    context=context,
+            parser.get_msg_id,
 
-                    user_id=user_ref['id'],
+            "<simple.local@[someexamplecom.domain]>",
 
-                    tenant_id=tenant_ref['id'])
+            "<simple.local@[someexamplecom.domain]>",
 
-                catalog_ref = self.catalog_api.get_catalog(
+            "<simple.local@[someexamplecom.domain]>",
 
-                    context=context,
+            [],
 
-                    user_id=user_ref['id'],
+            "",
 
-                    tenant_id=tenant_ref['id'],
+            )
 
-                    metadata=metadata_ref)
+        self.assertEqual(msg_id.token_type, 'msg-id')
 
 
 
-            auth_token_data = dict(dict(user=current_user_ref,
 
-                                        tenant=tenant_ref,
 
-                                        metadata=metadata_ref))
+    def test_get_msg_id_obsolete_domain_part(self):
 
+        msg_id = self._test_get_x(
 
+            parser.get_msg_id,
 
-        auth_token_data['expires'] = expiry
+            "<simplelocal@(old)example.com>",
 
-        auth_token_data['id'] = 'placeholder'
+            "<simplelocal@(old)example.com>",
 
+            "<simplelocal@ example.com>",
 
+            [errors.ObsoleteHeaderDefect],
 
-        roles_ref = []
+            ""
 
-        for role_id in metadata_ref.get('roles', []):
+        )
 
-            role_ref = self.identity_api.get_role(context, role_id)
 
-            roles_ref.append(dict(name=role_ref['name']))
 
+    def test_get_msg_id_no_id_right_part(self):
 
+        msg_id = self._test_get_x(
 
-        token_data = self._format_token(auth_token_data, roles_ref)
+            parser.get_msg_id,
 
+            "<simplelocal>",
 
+            "<simplelocal>",
 
-        service_catalog = self._format_catalog(catalog_ref)
+            "<simplelocal>",
 
-        token_data['access']['serviceCatalog'] = service_catalog
+            [errors.InvalidHeaderDefect],
 
+            ""
 
+        )
 
-        if config.CONF.signing.token_format == 'UUID':
+        self.assertEqual(msg_id.token_type, 'msg-id')
 
-            token_id = uuid.uuid4().hex
 
-        elif config.CONF.signing.token_format == 'PKI':
 
+    def test_get_msg_id_no_angle_start(self):
 
+        with self.assertRaises(errors.HeaderParseError):
 
-            token_id = cms.cms_sign_token(json.dumps(token_data),
+            parser.get_msg_id("msgwithnoankle")
 
-                                          config.CONF.signing.certfile,
 
-                                          config.CONF.signing.keyfile)
 
-        else:
+    def test_get_msg_id_no_angle_end(self):
 
-            raise exception.UnexpectedError(
+        msg_id = self._test_get_x(
 
-                'Invalid value for token_format: %s.'
+            parser.get_msg_id,
 
-                '  Allowed values are PKI or UUID.' %
+            "<simplelocal@domain",
 
-                config.CONF.signing.token_format)
+            "<simplelocal@domain>",
 
-        try:
+            "<simplelocal@domain>",
 
-            self.token_api.create_token(
+            [errors.InvalidHeaderDefect],
 
-                context, token_id, dict(key=token_id,
+            ""
 
-                                        id=token_id,
+        )
 
-                                        expires=auth_token_data['expires'],
+        self.assertEqual(msg_id.token_type, 'msg-id')
 
-                                        user=user_ref,
 
-                                        tenant=tenant_ref,
 
-                                        metadata=metadata_ref))
 
-        except Exception as e:
 
-            # an identical token may have been created already.
+@parameterize
 
-            # if so, return the token_data as it is also identical
+class Test_parse_mime_parameters(TestParserMixin, TestEmailBase):
 
-            try:
 
-                self.token_api.get_token(context=context,
 
-                                         token_id=token_id)
+    def mime_parameters_as_value(self,
 
-            except exception.TokenNotFound:
+                                 value,
 
-                raise e
+                                 tl_str,
 
+                                 tl_value,
 
+                                 params,
 
-        token_data['access']['token']['id'] = token_id
+                                 defects):
 
+        mime_parameters = self._test_parse_x(parser.parse_mime_parameters,
 
+            value, tl_str, tl_value, defects)
 
-        return token_data
+        self.assertEqual(mime_parameters.token_type, 'mime-parameters')
 
+        self.assertEqual(list(mime_parameters.params), params)
 
 
-    def _get_token_ref(self, context, token_id, belongs_to=None):
 
-        """Returns a token if a valid one exists.
 
 
+    mime_parameters_params = {
 
-        Optionally, limited to a token owned by a specific tenant.
 
 
+        'simple': (
 
-        """
+            'filename="abc.py"',
 
-        # TODO(termie): this stuff should probably be moved to middleware
+            ' filename="abc.py"',
 
-        self.assert_admin(context)
+            'filename=abc.py',
 
+            [('filename', 'abc.py')],
 
+            []),
 
-        if cms.is_ans1_token(token_id):
 
-            data = json.loads(cms.cms_verify(cms.token_to_cms(token_id),
 
-                                             config.CONF.signing.certfile,
+        'multiple_keys': (
 
-                                             config.CONF.signing.ca_certs))
+            'filename="abc.py"; xyz=abc',
 
-            data['access']['token']['user'] = data['access']['user']
+            ' filename="abc.py"; xyz="abc"',
 
-            data['access']['token']['metadata'] = data['access']['metadata']
+            'filename=abc.py; xyz=abc',
 
-            if belongs_to:
+            [('filename', 'abc.py'), ('xyz', 'abc')],
 
-                assert data['access']['token']['tenant']['id'] == belongs_to
+            []),
 
-            token_ref = data['access']['token']
 
-        else:
 
-            token_ref = self.token_api.get_token(context=context,
+        'split_value': (
 
-                                                 token_id=token_id)
+            "filename*0*=iso-8859-1''%32%30%31%2E; filename*1*=%74%69%66",
 
-        return token_ref
+            ' filename="201.tif"',
 
+            "filename*0*=iso-8859-1''%32%30%31%2E; filename*1*=%74%69%66",
 
+            [('filename', '201.tif')],
 
-    # admin only
+            []),
 
-    def validate_token_head(self, context, token_id):
 
-        """Check that a token is valid.
 
+        # Note that it is undefined what we should do for error recovery when
 
+        # there are duplicate parameter names or duplicate parts in a split
 
-        Optionally, also ensure that it is owned by a specific tenant.
+        # part.  We choose to ignore all duplicate parameters after the first
 
+        # and to take duplicate or missing rfc 2231 parts in appearance order.
 
+        # This is backward compatible with get_param's behavior, but the
 
-        Identical to ``validate_token``, except does not return a response.
+        # decisions are arbitrary.
 
 
 
-        """
+        'duplicate_key': (
 
-        belongs_to = context['query_string'].get('belongsTo')
+            'filename=abc.gif; filename=def.tiff',
 
-        assert self._get_token_ref(context, token_id, belongs_to)
+            ' filename="abc.gif"',
 
+            "filename=abc.gif; filename=def.tiff",
 
+            [('filename', 'abc.gif')],
 
-    # admin only
+            [errors.InvalidHeaderDefect]),
 
-    def validate_token(self, context, token_id):
 
-        """Check that a token is valid.
 
+        'duplicate_key_with_split_value': (
 
+            "filename*0*=iso-8859-1''%32%30%31%2E; filename*1*=%74%69%66;"
 
-        Optionally, also ensure that it is owned by a specific tenant.
+                " filename=abc.gif",
 
+            ' filename="201.tif"',
 
+            "filename*0*=iso-8859-1''%32%30%31%2E; filename*1*=%74%69%66;"
 
-        Returns metadata about the token along any associated roles.
+                " filename=abc.gif",
 
+            [('filename', '201.tif')],
 
+            [errors.InvalidHeaderDefect]),
 
-        """
 
-        belongs_to = context['query_string'].get('belongsTo')
 
-        token_ref = self._get_token_ref(context, token_id, belongs_to)
+        'duplicate_key_with_split_value_other_order': (
 
+            "filename=abc.gif; "
 
+                " filename*0*=iso-8859-1''%32%30%31%2E; filename*1*=%74%69%66",
 
-        # TODO(termie): optimize this call at some point and put it into the
+            ' filename="abc.gif"',
 
-        #               the return for metadata
+            "filename=abc.gif;"
 
-        # fill out the roles in the metadata
+                " filename*0*=iso-8859-1''%32%30%31%2E; filename*1*=%74%69%66",
 
-        metadata_ref = token_ref['metadata']
+            [('filename', 'abc.gif')],
 
-        roles_ref = []
+            [errors.InvalidHeaderDefect]),
 
-        for role_id in metadata_ref.get('roles', []):
 
-            roles_ref.append(self.identity_api.get_role(context, role_id))
 
+        'duplicate_in_split_value': (
 
+            "filename*0*=iso-8859-1''%32%30%31%2E; filename*1*=%74%69%66;"
 
-        # Get a service catalog if possible
+                " filename*1*=abc.gif",
 
-        # This is needed for on-behalf-of requests
+            ' filename="201.tifabc.gif"',
 
-        catalog_ref = None
+            "filename*0*=iso-8859-1''%32%30%31%2E; filename*1*=%74%69%66;"
 
-        if token_ref.get('tenant'):
+                " filename*1*=abc.gif",
 
-            catalog_ref = self.catalog_api.get_catalog(
+            [('filename', '201.tifabc.gif')],
 
-                context=context,
+            [errors.InvalidHeaderDefect]),
 
-                user_id=token_ref['user']['id'],
 
-                tenant_id=token_ref['tenant']['id'],
 
-                metadata=metadata_ref)
+        'missing_split_value': (
 
-        return self._format_token(token_ref, roles_ref, catalog_ref)
+            "filename*0*=iso-8859-1''%32%30%31%2E; filename*3*=%74%69%66;",
 
+            ' filename="201.tif"',
 
+            "filename*0*=iso-8859-1''%32%30%31%2E; filename*3*=%74%69%66;",
 
-    def delete_token(self, context, token_id):
+            [('filename', '201.tif')],
 
-        """Delete a token, effectively invalidating it for authz."""
+            [errors.InvalidHeaderDefect]),
 
-        # TODO(termie): this stuff should probably be moved to middleware
 
-        self.assert_admin(context)
 
-        self.token_api.delete_token(context=context, token_id=token_id)
+        'duplicate_and_missing_split_value': (
 
+            "filename*0*=iso-8859-1''%32%30%31%2E; filename*3*=%74%69%66;"
 
+                " filename*3*=abc.gif",
 
-    def revocation_list(self, context, auth=None):
+            ' filename="201.tifabc.gif"',
 
-        self.assert_admin(context)
+            "filename*0*=iso-8859-1''%32%30%31%2E; filename*3*=%74%69%66;"
 
-        tokens = self.token_api.list_revoked_tokens(context)
+                " filename*3*=abc.gif",
 
+            [('filename', '201.tifabc.gif')],
 
+            [errors.InvalidHeaderDefect]*2),
 
-        for t in tokens:
 
-            expires = t['expires']
 
-            if not (expires and isinstance(expires, unicode)):
+        # Here we depart from get_param and assume the *0* was missing.
 
-                    t['expires'] = timeutils.isotime(expires)
+        'duplicate_with_broken_split_value': (
 
-        data = {'revoked': tokens}
+            "filename=abc.gif; "
 
-        json_data = json.dumps(data)
+                " filename*2*=iso-8859-1''%32%30%31%2E; filename*3*=%74%69%66",
 
-        signed_text = cms.cms_sign_text(json_data,
+            ' filename="abc.gif201.tif"',
 
-                                        config.CONF.signing.certfile,
+            "filename=abc.gif;"
 
-                                        config.CONF.signing.keyfile)
+                " filename*2*=iso-8859-1''%32%30%31%2E; filename*3*=%74%69%66",
 
+            [('filename', 'abc.gif201.tif')],
 
+            # Defects are apparent missing *0*, and two 'out of sequence'.
 
-        return {'signed': signed_text}
+            [errors.InvalidHeaderDefect]*3),
 
 
 
-    def endpoints(self, context, token_id):
+        # bpo-37461: Check that we don't go into an infinite loop.
 
-        """Return a list of endpoints available to the token."""
+        'extra_dquote': (
 
-        self.assert_admin(context)
+            'r*="\'a\'\\"',
 
+            ' r="\\""',
 
+            'r*=\'a\'"',
 
-        token_ref = self._get_token_ref(context, token_id)
+            [('r', '"')],
 
+            [errors.InvalidHeaderDefect]*2),
 
+    }
 
-        catalog_ref = None
 
-        if token_ref.get('tenant'):
 
-            catalog_ref = self.catalog_api.get_catalog(
+@parameterize
 
-                context=context,
+class Test_parse_mime_version(TestParserMixin, TestEmailBase):
 
-                user_id=token_ref['user']['id'],
 
-                tenant_id=token_ref['tenant']['id'],
 
-                metadata=token_ref['metadata'])
+    def mime_version_as_value(self,
 
+                              value,
 
+                              tl_str,
 
-        return self._format_endpoint_list(catalog_ref)
+                              tl_value,
 
+                              major,
 
+                              minor,
 
-    def _format_authenticate(self, token_ref, roles_ref, catalog_ref):
+                              defects):
 
-        o = self._format_token(token_ref, roles_ref)
+        mime_version = self._test_parse_x(parser.parse_mime_version,
 
-        o['access']['serviceCatalog'] = self._format_catalog(catalog_ref)
+            value, tl_str, tl_value, defects)
 
-        return o
+        self.assertEqual(mime_version.major, major)
 
+        self.assertEqual(mime_version.minor, minor)
 
 
-    def _format_token(self, token_ref, roles_ref, catalog_ref=None):
 
-        user_ref = token_ref['user']
+    mime_version_params = {
 
-        metadata_ref = token_ref['metadata']
 
-        expires = token_ref['expires']
 
-        if expires is not None:
+        'rfc_2045_1': (
 
-            if not isinstance(expires, unicode):
+            '1.0',
 
-                expires = timeutils.isotime(expires)
+            '1.0',
 
-        o = {'access': {'token': {'id': token_ref['id'],
+            '1.0',
 
-                                  'expires': expires,
+            1,
 
-                                  },
+            0,
 
-                        'user': {'id': user_ref['id'],
+            []),
 
-                                 'name': user_ref['name'],
 
-                                 'username': user_ref['name'],
 
-                                 'roles': roles_ref,
+        'RFC_2045_2': (
 
-                                 'roles_links': metadata_ref.get('roles_links',
+            '1.0 (produced by MetaSend Vx.x)',
 
-                                                                 [])
+            '1.0 (produced by MetaSend Vx.x)',
 
-                                 }
+            '1.0 ',
 
-                        }
+            1,
 
-             }
+            0,
 
-        if 'tenant' in token_ref and token_ref['tenant']:
+            []),
 
-            token_ref['tenant']['enabled'] = True
 
-            o['access']['token']['tenant'] = token_ref['tenant']
 
-        if catalog_ref is not None:
+        'RFC_2045_3': (
 
-            o['access']['serviceCatalog'] = self._format_catalog(catalog_ref)
+            '(produced by MetaSend Vx.x) 1.0',
 
-        if metadata_ref:
+            '(produced by MetaSend Vx.x) 1.0',
 
-            if 'is_admin' in metadata_ref:
+            ' 1.0',
 
-                o['access']['metadata'] = {'is_admin':
+            1,
 
-                                           metadata_ref['is_admin']}
+            0,
 
-            else:
+            []),
 
-                o['access']['metadata'] = {'is_admin': 0}
 
-        if 'roles' in metadata_ref:
 
-                o['access']['metadata']['roles'] = metadata_ref['roles']
+        'RFC_2045_4': (
 
-        return o
+            '1.(produced by MetaSend Vx.x)0',
 
+            '1.(produced by MetaSend Vx.x)0',
 
+            '1. 0',
 
-    def _format_catalog(self, catalog_ref):
+            1,
 
-        """Munge catalogs from internal to output format
+            0,
 
-        Internal catalogs look like:
+            []),
 
 
 
-        {$REGION: {
+        'empty': (
 
-            {$SERVICE: {
+            '',
 
-                $key1: $value1,
+            '',
 
-                ...
+            '',
 
-                }
+            None,
 
-            }
+            None,
 
-        }
+            [errors.HeaderMissingRequiredValue]),
 
 
-
-        The legacy api wants them to look like
-
-
-
-        [{'name': $SERVICE[name],
-
-          'type': $SERVICE,
-
-          'endpoints': [{
-
-              'tenantId': $tenant_id,
-
-              ...
-
-              'region': $REGION,
-
-              }],
-
-          'endpoints_links': [],
-
-         }]
-
-
-
-        """
-
-        if not catalog_ref:
-
-            return []
-
-
-
-        services = {}
-
-        for region, region_ref in catalog_ref.iteritems():
-
-            for service, service_ref in region_ref.iteritems():
-
-                new_service_ref = services.get(service, {})
-
-                new_service_ref['name'] = service_ref.pop('name')
-
-                new_service_ref['type'] = service
-
-                new_service_ref['endpoints_links'] = []
-
-                service_ref['region'] = region
-
-
-
-                endpoints_ref = new_service_ref.get('endpoints', [])
-
-                endpoints_ref.append(service_ref)
-
-
-
-                new_service_ref['endpoints'] = endpoints_ref
-
-                services[service] = new_service_ref
-
-
-
-        return services.values()
-
-
-
-    def _format_endpoint_list(self, catalog_ref):
-
-        """Formats a list of endpoints according to Identity API v2.
-
-
-
-        The v2.0 API wants an endpoint list to look like::
-
-
-
-            {
-
-                'endpoints': [
-
-                    {
-
-                        'id': $endpoint_id,
-
-                        'name': $SERVICE[name],
-
-                        'type': $SERVICE,
-
-                        'tenantId': $tenant_id,
-
-                        'region': $REGION,
-
-                    }
-
-                ],
-
-                'endpoints_links': [],
-
-            }
-
-
-
-        """
-
-        if not catalog_ref:
-
-            return {}
-
-
-
-        endpoints = []
-
-        for region_name, region_ref in catalog_ref.iteritems():
-
-            for service_type, service_ref in region_ref.iteritems():
-
-                endpoints.append({
-
-                    'id': service_ref.get('id'),
-
-                    'name': service_ref.get('name'),
-
-                    'type': service_type,
-
-                    'region': region_name,
-
-                    'publicURL': service_ref.get('publicURL'),
-
-                    'internalURL': service_ref.get('internalURL'),
-
-                    'adminURL': service_ref.get('adminURL'),
-
-                })
-
-
-
-        return {'endpoints': endpoints, 'endpoints_links': []}
-
-
-
-
-
-class ExtensionsController(wsgi.Application):
-
-    """Base extensions controller to be extended by public and admin API's."""
-
-
-
-    def __init__(self, extensions=None):
-
-        super(ExtensionsController, self).__init__()
-
-
-
-        self.extensions = extensions or {}
-
-
-
-    def get_extensions_info(self, context):
-
-        return {'extensions': {'values': self.extensions.values()}}
-
-
-
-    def get_extension_info(self, context, extension_alias):
-
-        try:
-
-            return {'extension': self.extensions[extension_alias]}
-
-        except KeyError:
-
-            raise exception.NotFound(target=extension_alias)
-
-
-
-
-
-class PublicExtensionsController(ExtensionsController):
-
-    pass
-
-
-
-
-
-class AdminExtensionsController(ExtensionsController):
-
-    def __init__(self, *args, **kwargs):
-
-        super(AdminExtensionsController, self).__init__(*args, **kwargs)
-
-
-
-        # TODO(dolph): Extensions should obviously provide this information
-
-        #               themselves, but hardcoding it here allows us to match
-
-        #               the API spec in the short term with minimal complexity.
-
-        self.extensions['OS-KSADM'] = {
-
-            'name': 'Openstack Keystone Admin',
-
-            'namespace': 'http://docs.openstack.org/identity/api/ext/'
-
-                         'OS-KSADM/v1.0',
-
-            'alias': 'OS-KSADM',
-
-            'updated': '2011-08-19T13:25:27-06:00',
-
-            'description': 'Openstack extensions to Keystone v2.0 API '
-
-                           'enabling Admin Operations.',
-
-            'links': [
-
-                {
-
-                    'rel': 'describedby',
-
-                    # TODO(dolph): link needs to be revised after
-
-                    #              bug 928059 merges
-
-                    'type': 'text/html',
-
-                    'href': 'https://github.com/openstack/identity-api',
-
-                }
-
-            ]
 
         }
 
@@ -1520,54 +5592,220 @@ class AdminExtensionsController(ExtensionsController):
 
 
 
-@logging.fail_gracefully
 
-def public_app_factory(global_conf, **local_conf):
 
-    conf = global_conf.copy()
-
-    conf.update(local_conf)
-
-    return PublicRouter()
+class TestFolding(TestEmailBase):
 
 
 
-
-
-@logging.fail_gracefully
-
-def admin_app_factory(global_conf, **local_conf):
-
-    conf = global_conf.copy()
-
-    conf.update(local_conf)
-
-    return AdminRouter()
+    policy = policy.default
 
 
 
+    def _test(self, tl, folded, policy=policy):
 
-
-@logging.fail_gracefully
-
-def public_version_app_factory(global_conf, **local_conf):
-
-    conf = global_conf.copy()
-
-    conf.update(local_conf)
-
-    return PublicVersionRouter()
+        self.assertEqual(tl.fold(policy=policy), folded, tl.ppstr())
 
 
 
+    def test_simple_unstructured_no_folds(self):
+
+        self._test(parser.get_unstructured("This is a test"),
+
+                   "This is a test\n")
 
 
-@logging.fail_gracefully
 
-def admin_version_app_factory(global_conf, **local_conf):
+    def test_simple_unstructured_folded(self):
 
-    conf = global_conf.copy()
+        self._test(parser.get_unstructured("This is also a test, but this "
 
-    conf.update(local_conf)
+                        "time there are enough words (and even some "
 
-    return AdminVersionRouter()
+                        "symbols) to make it wrap; at least in theory."),
+
+                   "This is also a test, but this time there are enough "
+
+                        "words (and even some\n"
+
+                   " symbols) to make it wrap; at least in theory.\n")
+
+
+
+    def test_unstructured_with_unicode_no_folds(self):
+
+        self._test(parser.get_unstructured("hübsch kleiner beißt"),
+
+                   "=?utf-8?q?h=C3=BCbsch_kleiner_bei=C3=9Ft?=\n")
+
+
+
+    def test_one_ew_on_each_of_two_wrapped_lines(self):
+
+        self._test(parser.get_unstructured("Mein kleiner Kaktus ist sehr "
+
+                                           "hübsch.  Es hat viele Stacheln "
+
+                                           "und oft beißt mich."),
+
+                   "Mein kleiner Kaktus ist sehr =?utf-8?q?h=C3=BCbsch=2E?=  "
+
+                        "Es hat viele Stacheln\n"
+
+                   " und oft =?utf-8?q?bei=C3=9Ft?= mich.\n")
+
+
+
+    def test_ews_combined_before_wrap(self):
+
+        self._test(parser.get_unstructured("Mein Kaktus ist hübsch.  "
+
+                                           "Es beißt mich.  "
+
+                                           "And that's all I'm sayin."),
+
+                   "Mein Kaktus ist =?utf-8?q?h=C3=BCbsch=2E__Es_bei=C3=9Ft?= "
+
+                        "mich.  And that's\n"
+
+                   " all I'm sayin.\n")
+
+
+
+    # XXX Need test of an encoded word so long that it needs to be wrapped
+
+
+
+    def test_simple_address(self):
+
+        self._test(parser.get_address_list("abc <xyz@example.com>")[0],
+
+                   "abc <xyz@example.com>\n")
+
+
+
+    def test_address_list_folding_at_commas(self):
+
+        self._test(parser.get_address_list('abc <xyz@example.com>, '
+
+                                            '"Fred Blunt" <sharp@example.com>, '
+
+                                            '"J.P.Cool" <hot@example.com>, '
+
+                                            '"K<>y" <key@example.com>, '
+
+                                            'Firesale <cheap@example.com>, '
+
+                                            '<end@example.com>')[0],
+
+                    'abc <xyz@example.com>, "Fred Blunt" <sharp@example.com>,\n'
+
+                    ' "J.P.Cool" <hot@example.com>, "K<>y" <key@example.com>,\n'
+
+                    ' Firesale <cheap@example.com>, <end@example.com>\n')
+
+
+
+    def test_address_list_with_unicode_names(self):
+
+        self._test(parser.get_address_list(
+
+            'Hübsch Kaktus <beautiful@example.com>, '
+
+                'beißt beißt <biter@example.com>')[0],
+
+            '=?utf-8?q?H=C3=BCbsch?= Kaktus <beautiful@example.com>,\n'
+
+                ' =?utf-8?q?bei=C3=9Ft_bei=C3=9Ft?= <biter@example.com>\n')
+
+
+
+    def test_address_list_with_unicode_names_in_quotes(self):
+
+        self._test(parser.get_address_list(
+
+            '"Hübsch Kaktus" <beautiful@example.com>, '
+
+                '"beißt" beißt <biter@example.com>')[0],
+
+            '=?utf-8?q?H=C3=BCbsch?= Kaktus <beautiful@example.com>,\n'
+
+                ' =?utf-8?q?bei=C3=9Ft_bei=C3=9Ft?= <biter@example.com>\n')
+
+
+
+    # XXX Need tests with comments on various sides of a unicode token,
+
+    # and with unicode tokens in the comments.  Spaces inside the quotes
+
+    # currently don't do the right thing.
+
+
+
+    def test_split_at_whitespace_after_header_before_long_token(self):
+
+        body = parser.get_unstructured('   ' + 'x'*77)
+
+        header = parser.Header([
+
+            parser.HeaderLabel([parser.ValueTerminal('test:', 'atext')]),
+
+            parser.CFWSList([parser.WhiteSpaceTerminal(' ', 'fws')]), body])
+
+        self._test(header, 'test:   \n ' + 'x'*77 + '\n')
+
+
+
+    def test_split_at_whitespace_before_long_token(self):
+
+        self._test(parser.get_unstructured('xxx   ' + 'y'*77),
+
+                   'xxx  \n ' + 'y'*77 + '\n')
+
+
+
+    def test_overlong_encodeable_is_wrapped(self):
+
+        first_token_with_whitespace = 'xxx   '
+
+        chrome_leader = '=?utf-8?q?'
+
+        len_chrome = len(chrome_leader) + 2
+
+        len_non_y = len_chrome + len(first_token_with_whitespace)
+
+        self._test(parser.get_unstructured(first_token_with_whitespace +
+
+                                           'y'*80),
+
+                   first_token_with_whitespace + chrome_leader +
+
+                       'y'*(78-len_non_y) + '?=\n' +
+
+                       ' ' + chrome_leader + 'y'*(80-(78-len_non_y)) + '?=\n')
+
+
+
+    def test_long_filename_attachment(self):
+
+        self._test(parser.parse_content_disposition_header(
+
+            'attachment; filename="TEST_TEST_TEST_TEST'
+
+                '_TEST_TEST_TEST_TEST_TEST_TEST_TEST_TEST_TES.txt"'),
+
+            "attachment;\n"
+
+            " filename*0*=us-ascii''TEST_TEST_TEST_TEST_TEST_TEST"
+
+                "_TEST_TEST_TEST_TEST_TEST;\n"
+
+            " filename*1*=_TEST_TES.txt\n",
+
+            )
+
+
+
+if __name__ == '__main__':
+
+    unittest.main()

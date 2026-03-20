@@ -2,290 +2,242 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-import warnings
+from typing import Any, List
 
 
 
-import six
+import bleach
 
-from django.http import HttpResponse
 
-from django.utils.crypto import constant_time_compare
 
-from django.utils.decorators import method_decorator
+from .rest_api import ValidationError
 
-from django.views.decorators.csrf import csrf_exempt
 
-from django.views.generic import View
 
 
 
-from ..exceptions import AnymailInsecureWebhookWarning, AnymailWebhookValidationFailure
+allowed_tags_strict = [
 
-from ..utils import get_anymail_setting, collect_all_methods, get_request_basic_auth
+    "a",
 
+    "img",  # links and images
 
+    "br",
 
+    "p",
 
+    "span",
 
-class AnymailBasicAuthMixin(object):
+    "blockquote",  # text layout
 
-    """Implements webhook basic auth as mixin to AnymailBaseWebhookView."""
+    "strike",
 
+    "del",
 
+    "ins",
 
-    # Whether to warn if basic auth is not configured.
+    "strong",
 
-    # For most ESPs, basic auth is the only webhook security,
+    "u",
 
-    # so the default is True. Subclasses can set False if
+    "em",
 
-    # they enforce other security (like signed webhooks).
+    "sup",
 
-    warn_if_no_basic_auth = True
+    "sub",
 
+    "pre",  # text formatting
 
+    "h1",
 
-    # List of allowable HTTP basic-auth 'user:pass' strings.
+    "h2",
 
-    basic_auth = None  # (Declaring class attr allows override by kwargs in View.as_view.)
+    "h3",
 
+    "h4",
 
+    "h5",
 
-    def __init__(self, **kwargs):
+    "h6",  # headings
 
-        self.basic_auth = get_anymail_setting('webhook_authorization', default=[],
+    "ol",
 
-                                              kwargs=kwargs)  # no esp_name -- auth is shared between ESPs
+    "ul",
 
-        # Allow a single string:
+    "li",  # lists
 
-        if isinstance(self.basic_auth, six.string_types):
+    "table",
 
-            self.basic_auth = [self.basic_auth]
+    "caption",
 
-        if self.warn_if_no_basic_auth and len(self.basic_auth) < 1:
+    "thead",
 
-            warnings.warn(
+    "tbody",
 
-                "Your Anymail webhooks are insecure and open to anyone on the web. "
+    "th",
 
-                "You should set WEBHOOK_AUTHORIZATION in your ANYMAIL settings. "
+    "tr",
 
-                "See 'Securing webhooks' in the Anymail docs.",
+    "td",  # tables
 
-                AnymailInsecureWebhookWarning)
+    "div",
 
-        # noinspection PyArgumentList
+]
 
-        super(AnymailBasicAuthMixin, self).__init__(**kwargs)
+allowed_tags_permissive = allowed_tags_strict + [
 
+    "video",
 
+]
 
-    def validate_request(self, request):
 
-        """If configured for webhook basic auth, validate request has correct auth."""
 
-        if self.basic_auth:
 
-            request_auth = get_request_basic_auth(request)
 
-            # Use constant_time_compare to avoid timing attack on basic auth. (It's OK that any()
+def allow_all(tag: str, name: str, value: str) -> bool:
 
-            # can terminate early: we're not trying to protect how many auth strings are allowed,
+    return True
 
-            # just the contents of each individual auth string.)
 
-            auth_ok = any(constant_time_compare(request_auth, allowed_auth)
 
-                          for allowed_auth in self.basic_auth)
 
-            if not auth_ok:
 
-                # noinspection PyUnresolvedReferences
+allowed_attributes = allow_all
 
-                raise AnymailWebhookValidationFailure(
+allowed_styles = [
 
-                    "Missing or invalid basic auth in Anymail %s webhook" % self.esp_name)
+    "color",
 
+    "background-color",
 
+    "height",
 
+    "width",
 
+    "text-align",
 
-# Mixin note: Django's View.__init__ doesn't cooperate with chaining,
+    "vertical-align",
 
-# so all mixins that need __init__ must appear before View in MRO.
+    "float",
 
-class AnymailBaseWebhookView(AnymailBasicAuthMixin, View):
+    "text-decoration",
 
-    """Base view for processing ESP event webhooks
+    "margin",
 
+    "padding",
 
+    "line-height",
 
-    ESP-specific implementations should subclass
+    "max-width",
 
-    and implement parse_events. They may also
+    "min-width",
 
-    want to implement validate_request
+    "max-height",
 
-    if additional security is available.
+    "min-height",
+
+    "overflow",
+
+    "word-break",
+
+    "word-wrap",
+
+]
+
+
+
+
+
+def validate_html_strict(html: str) -> str:
+
+    """
+
+    This method takes a string and escapes all non-whitelisted html entries.
+
+    Every field of a model that is loaded trusted in the DOM should be validated.
+
+    During copy and paste from Word maybe some tabs are spread over the html. Remove them.
+
+    """
+
+    return base_validate_html(html, allowed_tags_strict)
+
+
+
+
+
+def validate_html_permissive(html: str) -> str:
+
+    """
+
+    See validate_html_strict, but allows some more tags, like iframes and videos.
+
+    Do not use on validation for normal users, only for admins!
+
+    """
+
+    return base_validate_html(html, allowed_tags_permissive)
+
+
+
+
+
+def base_validate_html(html: str, allowed_tags: List[str]) -> str:
+
+    """
+
+    For internal use only.
+
+    """
+
+    html = html.replace("\t", "")
+
+    return bleach.clean(
+
+        html, tags=allowed_tags, attributes=allowed_attributes, styles=allowed_styles
+
+    )
+
+
+
+
+
+def validate_json(json: Any, max_depth: int) -> Any:
+
+    """
+
+    Traverses through the JSON structure (dicts and lists) and runs
+
+    validate_html_strict on every found string.
+
+
+
+    Give max-depth to protect against stack-overflows. This should be the
+
+    maximum nested depth of the object expected.
 
     """
 
 
 
-    def __init__(self, **kwargs):
+    if max_depth == 0:
 
-        super(AnymailBaseWebhookView, self).__init__(**kwargs)
+        raise ValidationError({"detail": "The JSON is too nested."})
 
-        self.validators = collect_all_methods(self.__class__, 'validate_request')
 
 
+    if isinstance(json, dict):
 
-    # Subclass implementation:
+        return {key: validate_json(value, max_depth - 1) for key, value in json.items()}
 
+    if isinstance(json, list):
 
+        return [validate_json(item, max_depth - 1) for item in json]
 
-    # Where to send events: either ..signals.inbound or ..signals.tracking
+    if isinstance(json, str):
 
-    signal = None
+        return validate_html_strict(json)
 
 
 
-    def validate_request(self, request):
-
-        """Check validity of webhook post, or raise AnymailWebhookValidationFailure.
-
-
-
-        AnymailBaseWebhookView includes basic auth validation.
-
-        Subclasses can implement (or provide via mixins) if the ESP supports
-
-        additional validation (such as signature checking).
-
-
-
-        *All* definitions of this method in the class chain (including mixins)
-
-        will be called. There is no need to chain to the superclass.
-
-        (See self.run_validators and collect_all_methods.)
-
-
-
-        Security note: use django.utils.crypto.constant_time_compare for string
-
-        comparisons, to avoid exposing your validation to a timing attack.
-
-        """
-
-        # if not constant_time_compare(request.POST['signature'], expected_signature):
-
-        #     raise AnymailWebhookValidationFailure("...message...")
-
-        # (else just do nothing)
-
-        pass
-
-
-
-    def parse_events(self, request):
-
-        """Return a list of normalized AnymailWebhookEvent extracted from ESP post data.
-
-
-
-        Subclasses must implement.
-
-        """
-
-        raise NotImplementedError()
-
-
-
-    # HTTP handlers (subclasses shouldn't need to override):
-
-
-
-    http_method_names = ["post", "head", "options"]
-
-
-
-    @method_decorator(csrf_exempt)
-
-    def dispatch(self, request, *args, **kwargs):
-
-        return super(AnymailBaseWebhookView, self).dispatch(request, *args, **kwargs)
-
-
-
-    def head(self, request, *args, **kwargs):
-
-        # Some ESPs verify the webhook with a HEAD request at configuration time
-
-        return HttpResponse()
-
-
-
-    def post(self, request, *args, **kwargs):
-
-        # Normal Django exception handling will do the right thing:
-
-        # - AnymailWebhookValidationFailure will turn into an HTTP 400 response
-
-        #   (via Django SuspiciousOperation handling)
-
-        # - Any other errors (e.g., in signal dispatch) will turn into HTTP 500
-
-        #   responses (via normal Django error handling). ESPs generally
-
-        #   treat that as "try again later".
-
-        self.run_validators(request)
-
-        events = self.parse_events(request)
-
-        esp_name = self.esp_name
-
-        for event in events:
-
-            self.signal.send(sender=self.__class__, event=event, esp_name=esp_name)
-
-        return HttpResponse()
-
-
-
-    # Request validation (subclasses shouldn't need to override):
-
-
-
-    def run_validators(self, request):
-
-        for validator in self.validators:
-
-            validator(self, request)
-
-
-
-    @property
-
-    def esp_name(self):
-
-        """
-
-        Read-only name of the ESP for this webhook view.
-
-
-
-        Subclasses must override with class attr. E.g.:
-
-            esp_name = "Postmark"
-
-            esp_name = "SendGrid"  # (use ESP's preferred capitalization)
-
-        """
-
-        raise NotImplementedError("%s.%s must declare esp_name class attr" %
-
-                                  (self.__class__.__module__, self.__class__.__name__))
+    return json

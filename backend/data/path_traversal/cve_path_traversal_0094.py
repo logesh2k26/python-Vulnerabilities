@@ -2,15 +2,19 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-# (c) 2012-2014, Michael DeHaan <michael.dehaan@gmail.com>
+# vim: ft=python fileencoding=utf-8 sts=4 sw=4 et:
+
+
+
+# Copyright 2016-2018 Florian Bruhin (The Compiler) <mail@qutebrowser.org>
 
 #
 
-# This file is part of Ansible
+# This file is part of qutebrowser.
 
 #
 
-# Ansible is free software: you can redistribute it and/or modify
+# qutebrowser is free software: you can redistribute it and/or modify
 
 # it under the terms of the GNU General Public License as published by
 
@@ -20,7 +24,7 @@
 
 #
 
-# Ansible is distributed in the hope that it will be useful,
+# qutebrowser is distributed in the hope that it will be useful,
 
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 
@@ -32,864 +36,2882 @@
 
 # You should have received a copy of the GNU General Public License
 
-# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
+# along with qutebrowser.  If not, see <http://www.gnu.org/licenses/>.
 
 
 
-# Make coding more python3-ish
+"""Wrapper over a QWebEngineView."""
 
-from __future__ import (absolute_import, division, print_function)
 
-__metaclass__ = type
 
+import math
 
+import functools
 
-import os
+import re
 
-import tempfile
+import html as html_utils
 
-from string import ascii_letters, digits
 
 
+from PyQt5.QtCore import (pyqtSignal, pyqtSlot, Qt, QEvent, QPoint, QPointF,
 
-from ansible.errors import AnsibleOptionsError
+                          QUrl, QTimer, QObject)
 
-from ansible.module_utils.six import string_types
+from PyQt5.QtGui import QKeyEvent, QIcon
 
-from ansible.module_utils.six.moves import configparser
+from PyQt5.QtNetwork import QAuthenticator
 
-from ansible.module_utils._text import to_text
+from PyQt5.QtWidgets import QApplication
 
-from ansible.parsing.quoting import unquote
+from PyQt5.QtWebEngineWidgets import QWebEnginePage, QWebEngineScript
 
-from ansible.utils.path import makedirs_safe
 
 
+from qutebrowser.config import configdata, config
 
-BOOL_TRUE = frozenset([ "true", "t", "y", "1", "yes", "on" ])
+from qutebrowser.browser import browsertab, mouse, shared, webelem
 
+from qutebrowser.browser.webengine import (webview, webengineelem, tabhistory,
 
+                                           interceptor, webenginequtescheme,
 
-def mk_boolean(value):
+                                           cookies, webenginedownloads,
 
-    ret = value
+                                           webenginesettings, certificateerror)
 
-    if not isinstance(value, bool):
+from qutebrowser.misc import miscwidgets
 
-        if value is None:
+from qutebrowser.utils import (usertypes, qtutils, log, javascript, utils,
 
-            ret = False
+                               message, objreg, jinja, debug)
 
-        ret = (str(value).lower() in BOOL_TRUE)
+from qutebrowser.qt import sip
 
-    return ret
 
 
 
-def shell_expand(path, expand_relative_paths=False):
 
-    '''
+_qute_scheme_handler = None
 
-    shell_expand is needed as os.path.expanduser does not work
 
-    when path is None, which is the default for ANSIBLE_PRIVATE_KEY_FILE
 
-    '''
 
-    if path:
 
-        path = os.path.expanduser(os.path.expandvars(path))
+def init():
 
-        if expand_relative_paths and not path.startswith('/'):
+    """Initialize QtWebEngine-specific modules."""
 
-            # paths are always 'relative' to the config?
+    # For some reason we need to keep a reference, otherwise the scheme handler
 
-            if 'CONFIG_FILE' in globals():
+    # won't work...
 
-                CFGDIR = os.path.dirname(CONFIG_FILE)
+    # https://www.riverbankcomputing.com/pipermail/pyqt/2016-September/038075.html
 
-                path = os.path.join(CFGDIR, path)
+    global _qute_scheme_handler
 
-            path = os.path.abspath(path)
 
-    return path
 
+    app = QApplication.instance()
 
+    log.init.debug("Initializing qute://* handler...")
 
-def get_config(p, section, key, env_var, default, value_type=None, expand_relative_paths=False):
+    _qute_scheme_handler = webenginequtescheme.QuteSchemeHandler(parent=app)
 
-    ''' return a configuration variable with casting
+    _qute_scheme_handler.install(webenginesettings.default_profile)
 
+    _qute_scheme_handler.install(webenginesettings.private_profile)
 
 
-    :arg p: A ConfigParser object to look for the configuration in
 
-    :arg section: A section of the ini config that should be examined for this section.
+    log.init.debug("Initializing request interceptor...")
 
-    :arg key: The config key to get this config from
+    host_blocker = objreg.get('host-blocker')
 
-    :arg env_var: An Environment variable to check for the config var.  If
+    args = objreg.get('args')
 
-        this is set to None then no environment variable will be used.
+    req_interceptor = interceptor.RequestInterceptor(
 
-    :arg default: A default value to assign to the config var if nothing else sets it.
+        host_blocker, args=args, parent=app)
 
-    :kwarg value_type: The type of the value.  This can be any of the following strings:
+    req_interceptor.install(webenginesettings.default_profile)
 
-        :boolean: sets the value to a True or False value
+    req_interceptor.install(webenginesettings.private_profile)
 
-        :integer: Sets the value to an integer or raises a ValueType error
 
-        :float: Sets the value to a float or raises a ValueType error
 
-        :list: Treats the value as a comma separated list.  Split the value
+    log.init.debug("Initializing QtWebEngine downloads...")
 
-            and return it as a python list.
+    download_manager = webenginedownloads.DownloadManager(parent=app)
 
-        :none: Sets the value to None
+    download_manager.install(webenginesettings.default_profile)
 
-        :path: Expands any environment variables and tilde's in the value.
+    download_manager.install(webenginesettings.private_profile)
 
-        :tmp_path: Create a unique temporary directory inside of the directory
+    objreg.register('webengine-download-manager', download_manager)
 
-            specified by value and return its path.
 
-        :pathlist: Treat the value as a typical PATH string.  (On POSIX, this
 
-            means colon separated strings.)  Split the value and then expand
+    log.init.debug("Initializing cookie filter...")
 
-            each part for environment variables and tildes.
+    cookies.install_filter(webenginesettings.default_profile)
 
-    :kwarg expand_relative_paths: for pathlist and path types, if this is set
+    cookies.install_filter(webenginesettings.private_profile)
 
-        to True then also change any relative paths into absolute paths.  The
 
-        default is False.
 
-    '''
+    # Clear visited links on web history clear
 
-    value = _get_config(p, section, key, env_var, default)
+    hist = objreg.get('web-history')
 
-    if value_type == 'boolean':
+    for p in [webenginesettings.default_profile,
 
-        value = mk_boolean(value)
+              webenginesettings.private_profile]:
 
+        hist.history_cleared.connect(p.clearAllVisitedLinks)
 
+        hist.url_cleared.connect(lambda url, profile=p:
 
-    elif value:
+                                 profile.clearVisitedLinks([url]))
 
-        if value_type == 'integer':
 
-            value = int(value)
 
 
 
-        elif value_type == 'float':
+# Mapping worlds from usertypes.JsWorld to QWebEngineScript world IDs.
 
-            value = float(value)
+_JS_WORLD_MAP = {
 
+    usertypes.JsWorld.main: QWebEngineScript.MainWorld,
 
+    usertypes.JsWorld.application: QWebEngineScript.ApplicationWorld,
 
-        elif value_type == 'list':
+    usertypes.JsWorld.user: QWebEngineScript.UserWorld,
 
-            if isinstance(value, string_types):
+    usertypes.JsWorld.jseval: QWebEngineScript.UserWorld + 1,
 
-                value = [x.strip() for x in value.split(',')]
+}
 
 
 
-        elif value_type == 'none':
 
-            if value == "None":
 
-                value = None
+class WebEngineAction(browsertab.AbstractAction):
 
 
 
-        elif value_type == 'path':
+    """QtWebEngine implementations related to web actions."""
 
-            value = shell_expand(value, expand_relative_paths=expand_relative_paths)
 
 
+    action_class = QWebEnginePage
 
-        elif value_type == 'tmppath':
+    action_base = QWebEnginePage.WebAction
 
-            value = shell_expand(value)
 
-            if not os.path.exists(value):
 
-                makedirs_safe(value, 0o700)
+    def exit_fullscreen(self):
 
-            prefix = 'ansible-local-%s' % os.getpid()
+        self._widget.triggerPageAction(QWebEnginePage.ExitFullScreen)
 
-            value = tempfile.mkdtemp(prefix=prefix, dir=value)
 
 
+    def save_page(self):
 
-        elif value_type == 'pathlist':
+        """Save the current page."""
 
-            if isinstance(value, string_types):
+        self._widget.triggerPageAction(QWebEnginePage.SavePage)
 
-                value = [shell_expand(x, expand_relative_paths=expand_relative_paths) \
 
-                         for x in value.split(os.pathsep)]
 
+    def show_source(self, pygments=False):
 
+        if pygments:
 
-        elif isinstance(value, string_types):
+            self._show_source_pygments()
 
-            value = unquote(value)
+            return
 
 
-
-    return to_text(value, errors='surrogate_or_strict', nonstring='passthru')
-
-
-
-
-
-def _get_config(p, section, key, env_var, default):
-
-    ''' helper function for get_config '''
-
-    value = default
-
-
-
-    if p is not None:
 
         try:
 
-            value = p.get(section, key, raw=True)
+            self._widget.triggerPageAction(QWebEnginePage.ViewSource)
 
-        except:
+        except AttributeError:
+
+            # Qt < 5.8
+
+            tb = objreg.get('tabbed-browser', scope='window',
+
+                            window=self._tab.win_id)
+
+            urlstr = self._tab.url().toString(QUrl.RemoveUserInfo)
+
+            # The original URL becomes the path of a view-source: URL
+
+            # (without a host), but query/fragment should stay.
+
+            url = QUrl('view-source:' + urlstr)
+
+            tb.tabopen(url, background=False, related=True)
+
+
+
+
+
+class WebEnginePrinting(browsertab.AbstractPrinting):
+
+
+
+    """QtWebEngine implementations related to printing."""
+
+
+
+    def check_pdf_support(self):
+
+        return True
+
+
+
+    def check_printer_support(self):
+
+        if not hasattr(self._widget.page(), 'print'):
+
+            raise browsertab.WebTabError(
+
+                "Printing is unsupported with QtWebEngine on Qt < 5.8")
+
+
+
+    def check_preview_support(self):
+
+        raise browsertab.WebTabError(
+
+            "Print previews are unsupported with QtWebEngine")
+
+
+
+    def to_pdf(self, filename):
+
+        self._widget.page().printToPdf(filename)
+
+
+
+    def to_printer(self, printer, callback=None):
+
+        if callback is None:
+
+            callback = lambda _ok: None
+
+        self._widget.page().print(printer, callback)
+
+
+
+
+
+class WebEngineSearch(browsertab.AbstractSearch):
+
+
+
+    """QtWebEngine implementations related to searching on the page.
+
+
+
+    Attributes:
+
+        _flags: The QWebEnginePage.FindFlags of the last search.
+
+        _pending_searches: How many searches have been started but not called
+
+                           back yet.
+
+    """
+
+
+
+    def __init__(self, tab, parent=None):
+
+        super().__init__(tab, parent)
+
+        self._flags = QWebEnginePage.FindFlags(0)
+
+        self._pending_searches = 0
+
+
+
+    def _find(self, text, flags, callback, caller):
+
+        """Call findText on the widget."""
+
+        self.search_displayed = True
+
+        self._pending_searches += 1
+
+
+
+        def wrapped_callback(found):
+
+            """Wrap the callback to do debug logging."""
+
+            self._pending_searches -= 1
+
+            if self._pending_searches > 0:
+
+                # See https://github.com/qutebrowser/qutebrowser/issues/2442
+
+                # and https://github.com/qt/qtwebengine/blob/5.10/src/core/web_contents_adapter.cpp#L924-L934
+
+                log.webview.debug("Ignoring cancelled search callback with "
+
+                                  "{} pending searches".format(
+
+                                      self._pending_searches))
+
+                return
+
+
+
+            if sip.isdeleted(self._widget):
+
+                # This happens when starting a search, and closing the tab
+
+                # before results arrive.
+
+                log.webview.debug("Ignoring finished search for deleted "
+
+                                  "widget")
+
+                return
+
+
+
+            found_text = 'found' if found else "didn't find"
+
+            if flags:
+
+                flag_text = 'with flags {}'.format(debug.qflags_key(
+
+                    QWebEnginePage, flags, klass=QWebEnginePage.FindFlag))
+
+            else:
+
+                flag_text = ''
+
+            log.webview.debug(' '.join([caller, found_text, text, flag_text])
+
+                              .strip())
+
+
+
+            if callback is not None:
+
+                callback(found)
+
+            self.finished.emit(found)
+
+
+
+        self._widget.findText(text, flags, wrapped_callback)
+
+
+
+    def search(self, text, *, ignore_case='never', reverse=False,
+
+               result_cb=None):
+
+        # Don't go to next entry on duplicate search
+
+        if self.text == text and self.search_displayed:
+
+            log.webview.debug("Ignoring duplicate search request"
+
+                              " for {}".format(text))
+
+            return
+
+
+
+        self.text = text
+
+        self._flags = QWebEnginePage.FindFlags(0)
+
+        if self._is_case_sensitive(ignore_case):
+
+            self._flags |= QWebEnginePage.FindCaseSensitively
+
+        if reverse:
+
+            self._flags |= QWebEnginePage.FindBackward
+
+
+
+        self._find(text, self._flags, result_cb, 'search')
+
+
+
+    def clear(self):
+
+        if self.search_displayed:
+
+            self.cleared.emit()
+
+        self.search_displayed = False
+
+        self._widget.findText('')
+
+
+
+    def prev_result(self, *, result_cb=None):
+
+        # The int() here makes sure we get a copy of the flags.
+
+        flags = QWebEnginePage.FindFlags(int(self._flags))
+
+        if flags & QWebEnginePage.FindBackward:
+
+            flags &= ~QWebEnginePage.FindBackward
+
+        else:
+
+            flags |= QWebEnginePage.FindBackward
+
+        self._find(self.text, flags, result_cb, 'prev_result')
+
+
+
+    def next_result(self, *, result_cb=None):
+
+        self._find(self.text, self._flags, result_cb, 'next_result')
+
+
+
+
+
+class WebEngineCaret(browsertab.AbstractCaret):
+
+
+
+    """QtWebEngine implementations related to moving the cursor/selection."""
+
+
+
+    def _flags(self):
+
+        """Get flags to pass to JS."""
+
+        flags = set()
+
+        if qtutils.version_check('5.7.1', compiled=False):
+
+            flags.add('filter-prefix')
+
+        if utils.is_windows:
+
+            flags.add('windows')
+
+        return list(flags)
+
+
+
+    @pyqtSlot(usertypes.KeyMode)
+
+    def _on_mode_entered(self, mode):
+
+        if mode != usertypes.KeyMode.caret:
+
+            return
+
+
+
+        if self._tab.search.search_displayed:
+
+            # We are currently in search mode.
+
+            # convert the search to a blue selection so we can operate on it
+
+            # https://bugreports.qt.io/browse/QTBUG-60673
+
+            self._tab.search.clear()
+
+
+
+        self._tab.run_js_async(
+
+            javascript.assemble('caret', 'setFlags', self._flags()))
+
+
+
+        self._js_call('setInitialCursor', callback=self._selection_cb)
+
+
+
+    def _selection_cb(self, enabled):
+
+        """Emit selection_toggled based on setInitialCursor."""
+
+        if enabled is None:
+
+            log.webview.debug("Ignoring selection status None")
+
+            return
+
+        self.selection_toggled.emit(enabled)
+
+
+
+    @pyqtSlot(usertypes.KeyMode)
+
+    def _on_mode_left(self, mode):
+
+        if mode != usertypes.KeyMode.caret:
+
+            return
+
+
+
+        self.drop_selection()
+
+        self._js_call('disableCaret')
+
+
+
+    def move_to_next_line(self, count=1):
+
+        self._js_call('moveDown', count)
+
+
+
+    def move_to_prev_line(self, count=1):
+
+        self._js_call('moveUp', count)
+
+
+
+    def move_to_next_char(self, count=1):
+
+        self._js_call('moveRight', count)
+
+
+
+    def move_to_prev_char(self, count=1):
+
+        self._js_call('moveLeft', count)
+
+
+
+    def move_to_end_of_word(self, count=1):
+
+        self._js_call('moveToEndOfWord', count)
+
+
+
+    def move_to_next_word(self, count=1):
+
+        self._js_call('moveToNextWord', count)
+
+
+
+    def move_to_prev_word(self, count=1):
+
+        self._js_call('moveToPreviousWord', count)
+
+
+
+    def move_to_start_of_line(self):
+
+        self._js_call('moveToStartOfLine')
+
+
+
+    def move_to_end_of_line(self):
+
+        self._js_call('moveToEndOfLine')
+
+
+
+    def move_to_start_of_next_block(self, count=1):
+
+        self._js_call('moveToStartOfNextBlock', count)
+
+
+
+    def move_to_start_of_prev_block(self, count=1):
+
+        self._js_call('moveToStartOfPrevBlock', count)
+
+
+
+    def move_to_end_of_next_block(self, count=1):
+
+        self._js_call('moveToEndOfNextBlock', count)
+
+
+
+    def move_to_end_of_prev_block(self, count=1):
+
+        self._js_call('moveToEndOfPrevBlock', count)
+
+
+
+    def move_to_start_of_document(self):
+
+        self._js_call('moveToStartOfDocument')
+
+
+
+    def move_to_end_of_document(self):
+
+        self._js_call('moveToEndOfDocument')
+
+
+
+    def toggle_selection(self):
+
+        self._js_call('toggleSelection', callback=self.selection_toggled.emit)
+
+
+
+    def drop_selection(self):
+
+        self._js_call('dropSelection')
+
+
+
+    def selection(self, callback):
+
+        # Not using selectedText() as WORKAROUND for
+
+        # https://bugreports.qt.io/browse/QTBUG-53134
+
+        # Even on Qt 5.10 selectedText() seems to work poorly, see
+
+        # https://github.com/qutebrowser/qutebrowser/issues/3523
+
+        self._tab.run_js_async(javascript.assemble('caret', 'getSelection'),
+
+                               callback)
+
+
+
+    def _follow_selected_cb_wrapped(self, js_elem, tab):
+
+        try:
+
+            self._follow_selected_cb(js_elem, tab)
+
+        finally:
+
+            self.follow_selected_done.emit()
+
+
+
+    def _follow_selected_cb(self, js_elem, tab):
+
+        """Callback for javascript which clicks the selected element.
+
+
+
+        Args:
+
+            js_elem: The element serialized from javascript.
+
+            tab: Open in a new tab.
+
+        """
+
+        if js_elem is None:
+
+            return
+
+
+
+        if js_elem == "focused":
+
+            # we had a focused element, not a selected one. Just send <enter>
+
+            self._follow_enter(tab)
+
+            return
+
+
+
+        assert isinstance(js_elem, dict), js_elem
+
+        elem = webengineelem.WebEngineElement(js_elem, tab=self._tab)
+
+        if tab:
+
+            click_type = usertypes.ClickTarget.tab
+
+        else:
+
+            click_type = usertypes.ClickTarget.normal
+
+
+
+        # Only click if we see a link
+
+        if elem.is_link():
+
+            log.webview.debug("Found link in selection, clicking. ClickTarget "
+
+                              "{}, elem {}".format(click_type, elem))
+
+            try:
+
+                elem.click(click_type)
+
+            except webelem.Error as e:
+
+                message.error(str(e))
+
+
+
+    def follow_selected(self, *, tab=False):
+
+        if self._tab.search.search_displayed:
+
+            # We are currently in search mode.
+
+            # let's click the link via a fake-click
+
+            # https://bugreports.qt.io/browse/QTBUG-60673
+
+            self._tab.search.clear()
+
+
+
+            log.webview.debug("Clicking a searched link via fake key press.")
+
+            # send a fake enter, clicking the orange selection box
+
+            self._follow_enter(tab)
+
+        else:
+
+            # click an existing blue selection
+
+            js_code = javascript.assemble('webelem',
+
+                                          'find_selected_focused_link')
+
+            self._tab.run_js_async(
+
+                js_code,
+
+                lambda jsret: self._follow_selected_cb_wrapped(jsret, tab))
+
+
+
+    def _js_call(self, command, *args, callback=None):
+
+        code = javascript.assemble('caret', command, *args)
+
+        self._tab.run_js_async(code, callback)
+
+
+
+
+
+class WebEngineScroller(browsertab.AbstractScroller):
+
+
+
+    """QtWebEngine implementations related to scrolling."""
+
+
+
+    def __init__(self, tab, parent=None):
+
+        super().__init__(tab, parent)
+
+        self._args = objreg.get('args')
+
+        self._pos_perc = (0, 0)
+
+        self._pos_px = QPoint()
+
+        self._at_bottom = False
+
+
+
+    def _init_widget(self, widget):
+
+        super()._init_widget(widget)
+
+        page = widget.page()
+
+        page.scrollPositionChanged.connect(self._update_pos)
+
+
+
+    def _repeated_key_press(self, key, count=1, modifier=Qt.NoModifier):
+
+        """Send count fake key presses to this scroller's WebEngineTab."""
+
+        for _ in range(min(count, 1000)):
+
+            self._tab.key_press(key, modifier)
+
+
+
+    @pyqtSlot(QPointF)
+
+    def _update_pos(self, pos):
+
+        """Update the scroll position attributes when it changed."""
+
+        self._pos_px = pos.toPoint()
+
+        contents_size = self._widget.page().contentsSize()
+
+
+
+        scrollable_x = contents_size.width() - self._widget.width()
+
+        if scrollable_x == 0:
+
+            perc_x = 0
+
+        else:
+
+            try:
+
+                perc_x = min(100, round(100 / scrollable_x * pos.x()))
+
+            except ValueError:
+
+                # https://github.com/qutebrowser/qutebrowser/issues/3219
+
+                log.misc.debug("Got ValueError!")
+
+                log.misc.debug("contents_size.width(): {}".format(
+
+                    contents_size.width()))
+
+                log.misc.debug("self._widget.width(): {}".format(
+
+                    self._widget.width()))
+
+                log.misc.debug("scrollable_x: {}".format(scrollable_x))
+
+                log.misc.debug("pos.x(): {}".format(pos.x()))
+
+                raise
+
+
+
+        scrollable_y = contents_size.height() - self._widget.height()
+
+        if scrollable_y == 0:
+
+            perc_y = 0
+
+        else:
+
+            perc_y = min(100, round(100 / scrollable_y * pos.y()))
+
+
+
+        self._at_bottom = math.ceil(pos.y()) >= scrollable_y
+
+
+
+        if (self._pos_perc != (perc_x, perc_y) or
+
+                'no-scroll-filtering' in self._args.debug_flags):
+
+            self._pos_perc = perc_x, perc_y
+
+            self.perc_changed.emit(*self._pos_perc)
+
+
+
+    def pos_px(self):
+
+        return self._pos_px
+
+
+
+    def pos_perc(self):
+
+        return self._pos_perc
+
+
+
+    def to_perc(self, x=None, y=None):
+
+        js_code = javascript.assemble('scroll', 'to_perc', x, y)
+
+        self._tab.run_js_async(js_code)
+
+
+
+    def to_point(self, point):
+
+        js_code = javascript.assemble('window', 'scroll', point.x(), point.y())
+
+        self._tab.run_js_async(js_code)
+
+
+
+    def to_anchor(self, name):
+
+        url = self._tab.url()
+
+        url.setFragment(name)
+
+        self._tab.openurl(url)
+
+
+
+    def delta(self, x=0, y=0):
+
+        self._tab.run_js_async(javascript.assemble('window', 'scrollBy', x, y))
+
+
+
+    def delta_page(self, x=0, y=0):
+
+        js_code = javascript.assemble('scroll', 'delta_page', x, y)
+
+        self._tab.run_js_async(js_code)
+
+
+
+    def up(self, count=1):
+
+        self._repeated_key_press(Qt.Key_Up, count)
+
+
+
+    def down(self, count=1):
+
+        self._repeated_key_press(Qt.Key_Down, count)
+
+
+
+    def left(self, count=1):
+
+        self._repeated_key_press(Qt.Key_Left, count)
+
+
+
+    def right(self, count=1):
+
+        self._repeated_key_press(Qt.Key_Right, count)
+
+
+
+    def top(self):
+
+        self._tab.key_press(Qt.Key_Home)
+
+
+
+    def bottom(self):
+
+        self._tab.key_press(Qt.Key_End)
+
+
+
+    def page_up(self, count=1):
+
+        self._repeated_key_press(Qt.Key_PageUp, count)
+
+
+
+    def page_down(self, count=1):
+
+        self._repeated_key_press(Qt.Key_PageDown, count)
+
+
+
+    def at_top(self):
+
+        return self.pos_px().y() == 0
+
+
+
+    def at_bottom(self):
+
+        return self._at_bottom
+
+
+
+
+
+class WebEngineHistory(browsertab.AbstractHistory):
+
+
+
+    """QtWebEngine implementations related to page history."""
+
+
+
+    def current_idx(self):
+
+        return self._history.currentItemIndex()
+
+
+
+    def can_go_back(self):
+
+        return self._history.canGoBack()
+
+
+
+    def can_go_forward(self):
+
+        return self._history.canGoForward()
+
+
+
+    def _item_at(self, i):
+
+        return self._history.itemAt(i)
+
+
+
+    def _go_to_item(self, item):
+
+        self._tab.predicted_navigation.emit(item.url())
+
+        self._history.goToItem(item)
+
+
+
+    def serialize(self):
+
+        if not qtutils.version_check('5.9', compiled=False):
+
+            # WORKAROUND for
+
+            # https://github.com/qutebrowser/qutebrowser/issues/2289
+
+            # Don't use the history's currentItem here, because of
+
+            # https://bugreports.qt.io/browse/QTBUG-59599 and because it doesn't
+
+            # contain view-source.
+
+            scheme = self._tab.url().scheme()
+
+            if scheme in ['view-source', 'chrome']:
+
+                raise browsertab.WebTabError("Can't serialize special URL!")
+
+        return qtutils.serialize(self._history)
+
+
+
+    def deserialize(self, data):
+
+        return qtutils.deserialize(data, self._history)
+
+
+
+    def load_items(self, items):
+
+        if items:
+
+            self._tab.predicted_navigation.emit(items[-1].url)
+
+
+
+        stream, _data, cur_data = tabhistory.serialize(items)
+
+        qtutils.deserialize_stream(stream, self._history)
+
+
+
+        @pyqtSlot()
+
+        def _on_load_finished():
+
+            self._tab.scroller.to_point(cur_data['scroll-pos'])
+
+            self._tab.load_finished.disconnect(_on_load_finished)
+
+
+
+        if cur_data is not None:
+
+            if 'zoom' in cur_data:
+
+                self._tab.zoom.set_factor(cur_data['zoom'])
+
+            if ('scroll-pos' in cur_data and
+
+                    self._tab.scroller.pos_px() == QPoint(0, 0)):
+
+                self._tab.load_finished.connect(_on_load_finished)
+
+
+
+
+
+class WebEngineZoom(browsertab.AbstractZoom):
+
+
+
+    """QtWebEngine implementations related to zooming."""
+
+
+
+    def _set_factor_internal(self, factor):
+
+        self._widget.setZoomFactor(factor)
+
+
+
+
+
+class WebEngineElements(browsertab.AbstractElements):
+
+
+
+    """QtWebEngine implemementations related to elements on the page."""
+
+
+
+    def _js_cb_multiple(self, callback, js_elems):
+
+        """Handle found elements coming from JS and call the real callback.
+
+
+
+        Args:
+
+            callback: The callback to call with the found elements.
+
+                      Called with None if there was an error.
+
+            js_elems: The elements serialized from javascript.
+
+        """
+
+        if js_elems is None:
+
+            callback(None)
+
+            return
+
+
+
+        elems = []
+
+        for js_elem in js_elems:
+
+            elem = webengineelem.WebEngineElement(js_elem, tab=self._tab)
+
+            elems.append(elem)
+
+        callback(elems)
+
+
+
+    def _js_cb_single(self, callback, js_elem):
+
+        """Handle a found focus elem coming from JS and call the real callback.
+
+
+
+        Args:
+
+            callback: The callback to call with the found element.
+
+                      Called with a WebEngineElement or None.
+
+            js_elem: The element serialized from javascript.
+
+        """
+
+        debug_str = ('None' if js_elem is None
+
+                     else utils.elide(repr(js_elem), 1000))
+
+        log.webview.debug("Got element from JS: {}".format(debug_str))
+
+
+
+        if js_elem is None:
+
+            callback(None)
+
+        else:
+
+            elem = webengineelem.WebEngineElement(js_elem, tab=self._tab)
+
+            callback(elem)
+
+
+
+    def find_css(self, selector, callback, *, only_visible=False):
+
+        js_code = javascript.assemble('webelem', 'find_css', selector,
+
+                                      only_visible)
+
+        js_cb = functools.partial(self._js_cb_multiple, callback)
+
+        self._tab.run_js_async(js_code, js_cb)
+
+
+
+    def find_id(self, elem_id, callback):
+
+        js_code = javascript.assemble('webelem', 'find_id', elem_id)
+
+        js_cb = functools.partial(self._js_cb_single, callback)
+
+        self._tab.run_js_async(js_code, js_cb)
+
+
+
+    def find_focused(self, callback):
+
+        js_code = javascript.assemble('webelem', 'find_focused')
+
+        js_cb = functools.partial(self._js_cb_single, callback)
+
+        self._tab.run_js_async(js_code, js_cb)
+
+
+
+    def find_at_pos(self, pos, callback):
+
+        assert pos.x() >= 0, pos
+
+        assert pos.y() >= 0, pos
+
+        pos /= self._tab.zoom.factor()
+
+        js_code = javascript.assemble('webelem', 'find_at_pos',
+
+                                      pos.x(), pos.y())
+
+        js_cb = functools.partial(self._js_cb_single, callback)
+
+        self._tab.run_js_async(js_code, js_cb)
+
+
+
+
+
+class WebEngineAudio(browsertab.AbstractAudio):
+
+
+
+    """QtWebEngine implemementations related to audio/muting.
+
+
+
+    Attributes:
+
+        _overridden: Whether the user toggled muting manually.
+
+                     If that's the case, we leave it alone.
+
+    """
+
+
+
+    def __init__(self, tab, parent=None):
+
+        super().__init__(tab, parent)
+
+        self._overridden = False
+
+
+
+    def _connect_signals(self):
+
+        page = self._widget.page()
+
+        page.audioMutedChanged.connect(self.muted_changed)
+
+        page.recentlyAudibleChanged.connect(self.recently_audible_changed)
+
+        self._tab.url_changed.connect(self._on_url_changed)
+
+        config.instance.changed.connect(self._on_config_changed)
+
+
+
+    def set_muted(self, muted: bool, override: bool = False):
+
+        self._overridden = override
+
+        page = self._widget.page()
+
+        page.setAudioMuted(muted)
+
+
+
+    def is_muted(self):
+
+        page = self._widget.page()
+
+        return page.isAudioMuted()
+
+
+
+    def is_recently_audible(self):
+
+        page = self._widget.page()
+
+        return page.recentlyAudible()
+
+
+
+    @pyqtSlot(QUrl)
+
+    def _on_url_changed(self, url):
+
+        if self._overridden:
+
+            return
+
+        mute = config.instance.get('content.mute', url=url)
+
+        self.set_muted(mute)
+
+
+
+    @config.change_filter('content.mute')
+
+    def _on_config_changed(self):
+
+        self._on_url_changed(self._tab.url())
+
+
+
+
+
+class _WebEnginePermissions(QObject):
+
+
+
+    """Handling of various permission-related signals."""
+
+
+
+    _abort_questions = pyqtSignal()
+
+
+
+    def __init__(self, tab, parent=None):
+
+        super().__init__(parent)
+
+        self._tab = tab
+
+        self._widget = None
+
+
+
+    def connect_signals(self):
+
+        """Connect related signals from the QWebEnginePage."""
+
+        page = self._widget.page()
+
+        page.fullScreenRequested.connect(
+
+            self._on_fullscreen_requested)
+
+        page.featurePermissionRequested.connect(
+
+            self._on_feature_permission_requested)
+
+
+
+        if qtutils.version_check('5.11'):
+
+            page.quotaRequested.connect(
+
+                self._on_quota_requested)
+
+            page.registerProtocolHandlerRequested.connect(
+
+                self._on_register_protocol_handler_requested)
+
+
+
+        self._tab.shutting_down.connect(self._abort_questions)
+
+        self._tab.load_started.connect(self._abort_questions)
+
+
+
+    @pyqtSlot('QWebEngineFullScreenRequest')
+
+    def _on_fullscreen_requested(self, request):
+
+        request.accept()
+
+        on = request.toggleOn()
+
+
+
+        self._tab.data.fullscreen = on
+
+        self._tab.fullscreen_requested.emit(on)
+
+        if on:
+
+            notification = miscwidgets.FullscreenNotification(self._widget)
+
+            notification.show()
+
+            notification.set_timeout(3000)
+
+
+
+    @pyqtSlot(QUrl, 'QWebEnginePage::Feature')
+
+    def _on_feature_permission_requested(self, url, feature):
+
+        """Ask the user for approval for geolocation/media/etc.."""
+
+        options = {
+
+            QWebEnginePage.Geolocation: 'content.geolocation',
+
+            QWebEnginePage.MediaAudioCapture: 'content.media_capture',
+
+            QWebEnginePage.MediaVideoCapture: 'content.media_capture',
+
+            QWebEnginePage.MediaAudioVideoCapture: 'content.media_capture',
+
+        }
+
+        messages = {
+
+            QWebEnginePage.Geolocation: 'access your location',
+
+            QWebEnginePage.MediaAudioCapture: 'record audio',
+
+            QWebEnginePage.MediaVideoCapture: 'record video',
+
+            QWebEnginePage.MediaAudioVideoCapture: 'record audio/video',
+
+        }
+
+        try:
+
+            options.update({
+
+                QWebEnginePage.MouseLock:
+
+                    'content.mouse_lock',
+
+            })
+
+            messages.update({
+
+                QWebEnginePage.MouseLock:
+
+                    'hide your mouse pointer',
+
+            })
+
+        except AttributeError:
+
+            # Added in Qt 5.8
+
+            pass
+
+        try:
+
+            options.update({
+
+                QWebEnginePage.DesktopVideoCapture:
+
+                    'content.desktop_capture',
+
+                QWebEnginePage.DesktopAudioVideoCapture:
+
+                    'content.desktop_capture',
+
+            })
+
+            messages.update({
+
+                QWebEnginePage.DesktopVideoCapture:
+
+                    'capture your desktop',
+
+                QWebEnginePage.DesktopAudioVideoCapture:
+
+                    'capture your desktop and audio',
+
+            })
+
+        except AttributeError:
+
+            # Added in Qt 5.10
 
             pass
 
 
 
-    if env_var is not None:
-
-        env_value = os.environ.get(env_var, None)
-
-        if env_value is not None:
-
-            value = env_value
+        assert options.keys() == messages.keys()
 
 
 
-    return to_text(value, errors='surrogate_or_strict', nonstring='passthru')
+        page = self._widget.page()
 
 
 
+        if feature not in options:
 
+            log.webview.error("Unhandled feature permission {}".format(
 
-def load_config_file():
+                debug.qenum_key(QWebEnginePage, feature)))
 
-    ''' Load Config File order(first found is used): ENV, CWD, HOME, /etc/ansible '''
+            page.setFeaturePermission(url, feature,
 
+                                      QWebEnginePage.PermissionDeniedByUser)
 
-
-    p = configparser.ConfigParser()
-
-
-
-    path0 = os.getenv("ANSIBLE_CONFIG", None)
-
-    if path0 is not None:
-
-        path0 = os.path.expanduser(path0)
-
-        if os.path.isdir(path0):
-
-            path0 += "/ansible.cfg"
-
-    try:
-
-        path1 = os.getcwd() + "/ansible.cfg"
-
-    except OSError:
-
-        path1 = None
-
-    path2 = os.path.expanduser("~/.ansible.cfg")
-
-    path3 = "/etc/ansible/ansible.cfg"
+            return
 
 
 
-    for path in [path0, path1, path2, path3]:
+        yes_action = functools.partial(
 
-        if path is not None and os.path.exists(path):
+            page.setFeaturePermission, url, feature,
+
+            QWebEnginePage.PermissionGrantedByUser)
+
+        no_action = functools.partial(
+
+            page.setFeaturePermission, url, feature,
+
+            QWebEnginePage.PermissionDeniedByUser)
+
+
+
+        question = shared.feature_permission(
+
+            url=url, option=options[feature], msg=messages[feature],
+
+            yes_action=yes_action, no_action=no_action,
+
+            abort_on=[self._abort_questions])
+
+
+
+        if question is not None:
+
+            page.featurePermissionRequestCanceled.connect(
+
+                functools.partial(self._on_feature_permission_cancelled,
+
+                                  question, url, feature))
+
+
+
+    def _on_feature_permission_cancelled(self, question, url, feature,
+
+                                         cancelled_url, cancelled_feature):
+
+        """Slot invoked when a feature permission request was cancelled.
+
+
+
+        To be used with functools.partial.
+
+        """
+
+        if url == cancelled_url and feature == cancelled_feature:
 
             try:
 
-                p.read(path)
+                question.abort()
 
-            except configparser.Error as e:
+            except RuntimeError:
 
-                raise AnsibleOptionsError("Error reading config file: \n{0}".format(e))
+                # The question could already be deleted, e.g. because it was
 
-            return p, path
+                # aborted after a loadStarted signal.
 
-    return None, ''
+                pass
 
 
 
+    def _on_quota_requested(self, request):
 
+        size = utils.format_size(request.requestedSize())
 
-p, CONFIG_FILE = load_config_file()
+        shared.feature_permission(
 
+            url=request.origin(),
 
+            option='content.persistent_storage',
 
-# check all of these extensions when looking for yaml files for things like
+            msg='use {} of persistent storage'.format(size),
 
-# group variables -- really anything we can load
+            yes_action=request.accept, no_action=request.reject,
 
-YAML_FILENAME_EXTENSIONS = [ "", ".yml", ".yaml", ".json" ]
+            abort_on=[self._abort_questions],
 
+            blocking=True)
 
 
-# the default whitelist for cow stencils
 
-DEFAULT_COW_WHITELIST = ['bud-frogs', 'bunny', 'cheese', 'daemon', 'default', 'dragon', 'elephant-in-snake', 'elephant',
+    def _on_register_protocol_handler_requested(self, request):
 
-                         'eyes', 'hellokitty', 'kitty', 'luke-koala', 'meow', 'milk', 'moofasa', 'moose', 'ren', 'sheep',
+        shared.feature_permission(
 
-                         'small', 'stegosaurus', 'stimpy', 'supermilker', 'three-eyes', 'turkey', 'turtle', 'tux', 'udder',
+            url=request.origin(),
 
-                         'vader-koala', 'vader', 'www',]
+            option='content.register_protocol_handler',
 
+            msg='open all {} links'.format(request.scheme()),
 
+            yes_action=request.accept, no_action=request.reject,
 
-# sections in config file
+            abort_on=[self._abort_questions],
 
-DEFAULTS='defaults'
+            blocking=True)
 
 
 
 
 
-# FIXME: add deprecation warning when these get set
+class _WebEngineScripts(QObject):
 
-#### DEPRECATED VARS ####
 
-#
 
+    def __init__(self, tab, parent=None):
 
+        super().__init__(parent)
 
-#### If --tags or --skip-tags is given multiple times on the CLI and this is
+        self._tab = tab
 
-# True, merge the lists of tags together.  If False, let the last argument
+        self._widget = None
 
-# overwrite any previous ones.  Behaviour is overwrite through 2.2.  2.3
+        self._greasemonkey = objreg.get('greasemonkey')
 
-# overwrites but prints deprecation.  2.4 the default is to merge.
 
-MERGE_MULTIPLE_CLI_TAGS = get_config(p, DEFAULTS, 'merge_multiple_cli_tags', 'ANSIBLE_MERGE_MULTIPLE_CLI_TAGS', True, value_type='boolean')
 
+    def connect_signals(self):
 
+        """Connect signals to our private slots."""
 
-#### GENERALLY CONFIGURABLE THINGS ####
+        config.instance.changed.connect(self._on_config_changed)
 
-DEFAULT_DEBUG             = get_config(p, DEFAULTS, 'debug',            'ANSIBLE_DEBUG',            False, value_type='boolean')
 
-DEFAULT_VERBOSITY         = get_config(p, DEFAULTS, 'verbosity',        'ANSIBLE_VERBOSITY',        0, value_type='integer')
 
-DEFAULT_HOST_LIST         = get_config(p, DEFAULTS,'inventory', 'ANSIBLE_INVENTORY', '/etc/ansible/hosts', value_type='path')
+        self._tab.search.cleared.connect(functools.partial(
 
-DEFAULT_ROLES_PATH        = get_config(p, DEFAULTS, 'roles_path',       'ANSIBLE_ROLES_PATH',
+            self._update_stylesheet, searching=False))
 
-                                       '~/.ansible/roles:/usr/share/ansible/roles:/etc/ansible/roles',
+        self._tab.search.finished.connect(self._update_stylesheet)
 
-                                       value_type='pathlist', expand_relative_paths=True)
 
-DEFAULT_REMOTE_TMP        = get_config(p, DEFAULTS, 'remote_tmp',       'ANSIBLE_REMOTE_TEMP',      '~/.ansible/tmp')
 
-DEFAULT_LOCAL_TMP         = get_config(p, DEFAULTS, 'local_tmp',        'ANSIBLE_LOCAL_TEMP',      '~/.ansible/tmp', value_type='tmppath')
+    @pyqtSlot(str)
 
-DEFAULT_MODULE_NAME       = get_config(p, DEFAULTS, 'module_name',      None,                       'command')
+    def _on_config_changed(self, option):
 
-DEFAULT_FACT_PATH         = get_config(p, DEFAULTS, 'fact_path',        'ANSIBLE_FACT_PATH', None, value_type='path')
+        if option in ['scrolling.bar', 'content.user_stylesheets']:
 
-DEFAULT_FORKS             = get_config(p, DEFAULTS, 'forks',            'ANSIBLE_FORKS',            5, value_type='integer')
+            self._init_stylesheet()
 
-DEFAULT_MODULE_ARGS       = get_config(p, DEFAULTS, 'module_args',      'ANSIBLE_MODULE_ARGS',      '')
+            self._update_stylesheet()
 
-DEFAULT_MODULE_LANG       = get_config(p, DEFAULTS, 'module_lang',      'ANSIBLE_MODULE_LANG',      os.getenv('LANG', 'en_US.UTF-8'))
 
-DEFAULT_MODULE_SET_LOCALE = get_config(p, DEFAULTS, 'module_set_locale','ANSIBLE_MODULE_SET_LOCALE',False, value_type='boolean')
 
-DEFAULT_MODULE_COMPRESSION= get_config(p, DEFAULTS, 'module_compression', None, 'ZIP_DEFLATED')
+    @pyqtSlot(bool)
 
-DEFAULT_TIMEOUT           = get_config(p, DEFAULTS, 'timeout',          'ANSIBLE_TIMEOUT',          10, value_type='integer')
+    def _update_stylesheet(self, searching=False):
 
-DEFAULT_POLL_INTERVAL     = get_config(p, DEFAULTS, 'poll_interval',    'ANSIBLE_POLL_INTERVAL',    15, value_type='integer')
+        """Update the custom stylesheet in existing tabs."""
 
-DEFAULT_REMOTE_USER       = get_config(p, DEFAULTS, 'remote_user',      'ANSIBLE_REMOTE_USER',      None)
+        css = shared.get_user_stylesheet(searching=searching)
 
-DEFAULT_ASK_PASS          = get_config(p, DEFAULTS, 'ask_pass',  'ANSIBLE_ASK_PASS',    False, value_type='boolean')
+        code = javascript.assemble('stylesheet', 'set_css', css)
 
-DEFAULT_PRIVATE_KEY_FILE  = get_config(p, DEFAULTS, 'private_key_file', 'ANSIBLE_PRIVATE_KEY_FILE', None, value_type='path')
+        self._tab.run_js_async(code)
 
-DEFAULT_REMOTE_PORT       = get_config(p, DEFAULTS, 'remote_port',      'ANSIBLE_REMOTE_PORT',      None, value_type='integer')
 
-DEFAULT_ASK_VAULT_PASS    = get_config(p, DEFAULTS, 'ask_vault_pass',    'ANSIBLE_ASK_VAULT_PASS',    False, value_type='boolean')
 
-DEFAULT_VAULT_PASSWORD_FILE = get_config(p, DEFAULTS, 'vault_password_file', 'ANSIBLE_VAULT_PASSWORD_FILE', None, value_type='path')
+    def _inject_early_js(self, name, js_code, *,
 
-DEFAULT_TRANSPORT         = get_config(p, DEFAULTS, 'transport',        'ANSIBLE_TRANSPORT',        'smart')
+                         world=QWebEngineScript.ApplicationWorld,
 
-DEFAULT_SCP_IF_SSH        = get_config(p, 'ssh_connection', 'scp_if_ssh',       'ANSIBLE_SCP_IF_SSH',       'smart')
+                         subframes=False):
 
-DEFAULT_SFTP_BATCH_MODE   = get_config(p, 'ssh_connection', 'sftp_batch_mode', 'ANSIBLE_SFTP_BATCH_MODE', True, value_type='boolean')
+        """Inject the given script to run early on a page load.
 
-DEFAULT_SSH_TRANSFER_METHOD = get_config(p, 'ssh_connection', 'transfer_method', 'ANSIBLE_SSH_TRANSFER_METHOD', None)
 
-DEFAULT_MANAGED_STR       = get_config(p, DEFAULTS, 'ansible_managed',  None,           'Ansible managed')
 
-DEFAULT_SYSLOG_FACILITY   = get_config(p, DEFAULTS, 'syslog_facility',  'ANSIBLE_SYSLOG_FACILITY', 'LOG_USER')
+        This runs the script both on DocumentCreation and DocumentReady as on
 
-DEFAULT_KEEP_REMOTE_FILES = get_config(p, DEFAULTS, 'keep_remote_files', 'ANSIBLE_KEEP_REMOTE_FILES', False, value_type='boolean')
+        some internal pages, DocumentCreation will not work.
 
-DEFAULT_HASH_BEHAVIOUR    = get_config(p, DEFAULTS, 'hash_behaviour', 'ANSIBLE_HASH_BEHAVIOUR', 'replace')
 
-DEFAULT_PRIVATE_ROLE_VARS = get_config(p, DEFAULTS, 'private_role_vars', 'ANSIBLE_PRIVATE_ROLE_VARS', False, value_type='boolean')
 
-DEFAULT_JINJA2_EXTENSIONS = get_config(p, DEFAULTS, 'jinja2_extensions', 'ANSIBLE_JINJA2_EXTENSIONS', None)
+        That is a WORKAROUND for https://bugreports.qt.io/browse/QTBUG-66011
 
-DEFAULT_EXECUTABLE        = get_config(p, DEFAULTS, 'executable', 'ANSIBLE_EXECUTABLE', '/bin/sh')
+        """
 
-DEFAULT_GATHERING         = get_config(p, DEFAULTS, 'gathering', 'ANSIBLE_GATHERING', 'implicit').lower()
+        scripts = self._widget.page().scripts()
 
-DEFAULT_GATHER_SUBSET     = get_config(p, DEFAULTS, 'gather_subset', 'ANSIBLE_GATHER_SUBSET', 'all').lower()
+        for injection in ['creation', 'ready']:
 
-DEFAULT_GATHER_TIMEOUT    = get_config(p, DEFAULTS, 'gather_timeout', 'ANSIBLE_GATHER_TIMEOUT', 10, value_type='integer')
+            injection_points = {
 
-DEFAULT_LOG_PATH          = get_config(p, DEFAULTS, 'log_path',           'ANSIBLE_LOG_PATH', '', value_type='path')
+                'creation': QWebEngineScript.DocumentCreation,
 
-DEFAULT_FORCE_HANDLERS    = get_config(p, DEFAULTS, 'force_handlers', 'ANSIBLE_FORCE_HANDLERS', False, value_type='boolean')
+                'ready': QWebEngineScript.DocumentReady,
 
-DEFAULT_INVENTORY_IGNORE  = get_config(p, DEFAULTS, 'inventory_ignore_extensions', 'ANSIBLE_INVENTORY_IGNORE',
+            }
 
-                                       ["~", ".orig", ".bak", ".ini", ".cfg", ".retry", ".pyc", ".pyo"], value_type='list')
+            script = QWebEngineScript()
 
-DEFAULT_VAR_COMPRESSION_LEVEL = get_config(p, DEFAULTS, 'var_compression_level', 'ANSIBLE_VAR_COMPRESSION_LEVEL', 0, value_type='integer')
+            script.setInjectionPoint(injection_points[injection])
 
-DEFAULT_INTERNAL_POLL_INTERVAL = get_config(p, DEFAULTS, 'internal_poll_interval', None, 0.001, value_type='float')
+            script.setSourceCode(js_code)
 
-ERROR_ON_MISSING_HANDLER  = get_config(p, DEFAULTS, 'error_on_missing_handler', 'ANSIBLE_ERROR_ON_MISSING_HANDLER', True, value_type='boolean')
+            script.setWorldId(world)
 
-SHOW_CUSTOM_STATS = get_config(p, DEFAULTS, 'show_custom_stats', 'ANSIBLE_SHOW_CUSTOM_STATS', False, value_type='boolean')
+            script.setRunsOnSubFrames(subframes)
 
-NAMESPACE_FACTS = get_config(p, DEFAULTS, 'restrict_facts_namespace', 'ANSIBLE_RESTRICT_FACTS', False, value_type='boolean')
+            script.setName('_qute_{}_{}'.format(name, injection))
 
+            scripts.insert(script)
 
 
-# static includes
 
-DEFAULT_TASK_INCLUDES_STATIC    = get_config(p, DEFAULTS, 'task_includes_static', 'ANSIBLE_TASK_INCLUDES_STATIC', False, value_type='boolean')
+    def _remove_early_js(self, name):
 
-DEFAULT_HANDLER_INCLUDES_STATIC = get_config(p, DEFAULTS, 'handler_includes_static', 'ANSIBLE_HANDLER_INCLUDES_STATIC', False, value_type='boolean')
+        """Remove an early QWebEngineScript."""
 
+        scripts = self._widget.page().scripts()
 
+        for injection in ['creation', 'ready']:
 
-# disclosure
+            full_name = '_qute_{}_{}'.format(name, injection)
 
-DEFAULT_NO_LOG           = get_config(p, DEFAULTS, 'no_log', 'ANSIBLE_NO_LOG', False, value_type='boolean')
+            script = scripts.findScript(full_name)
 
-DEFAULT_NO_TARGET_SYSLOG   = get_config(p, DEFAULTS, 'no_target_syslog', 'ANSIBLE_NO_TARGET_SYSLOG', False, value_type='boolean')
+            if not script.isNull():
 
-ALLOW_WORLD_READABLE_TMPFILES = get_config(p, DEFAULTS, 'allow_world_readable_tmpfiles', None, False, value_type='boolean')
+                scripts.remove(script)
 
 
 
-# selinux
+    def init(self):
 
-DEFAULT_SELINUX_SPECIAL_FS = get_config(p, 'selinux', 'special_context_filesystems', None, 'fuse, nfs, vboxsf, ramfs, 9p', value_type='list')
+        """Initialize global qutebrowser JavaScript."""
 
-DEFAULT_LIBVIRT_LXC_NOSECLABEL = get_config(p, 'selinux', 'libvirt_lxc_noseclabel', 'LIBVIRT_LXC_NOSECLABEL', False, value_type='boolean')
+        js_code = javascript.wrap_global(
 
+            'scripts',
 
+            utils.read_file('javascript/scroll.js'),
 
-### PRIVILEGE ESCALATION ###
+            utils.read_file('javascript/webelem.js'),
 
-# Backwards Compat
+            utils.read_file('javascript/caret.js'),
 
-DEFAULT_SU                = get_config(p, DEFAULTS, 'su', 'ANSIBLE_SU', False, value_type='boolean')
+        )
 
-DEFAULT_SU_USER           = get_config(p, DEFAULTS, 'su_user', 'ANSIBLE_SU_USER', 'root')
+        self._inject_early_js('js',
 
-DEFAULT_SU_EXE            = get_config(p, DEFAULTS, 'su_exe', 'ANSIBLE_SU_EXE', None)
+                              utils.read_file('javascript/print.js'),
 
-DEFAULT_SU_FLAGS          = get_config(p, DEFAULTS, 'su_flags', 'ANSIBLE_SU_FLAGS', None)
+                              subframes=True,
 
-DEFAULT_ASK_SU_PASS       = get_config(p, DEFAULTS, 'ask_su_pass', 'ANSIBLE_ASK_SU_PASS', False, value_type='boolean')
+                              world=QWebEngineScript.MainWorld)
 
-DEFAULT_SUDO              = get_config(p, DEFAULTS, 'sudo', 'ANSIBLE_SUDO', False, value_type='boolean')
+        # FIXME:qtwebengine what about subframes=True?
 
-DEFAULT_SUDO_USER         = get_config(p, DEFAULTS, 'sudo_user',        'ANSIBLE_SUDO_USER',        'root')
+        self._inject_early_js('js', js_code, subframes=True)
 
-DEFAULT_SUDO_EXE          = get_config(p, DEFAULTS, 'sudo_exe', 'ANSIBLE_SUDO_EXE', None)
+        self._init_stylesheet()
 
-DEFAULT_SUDO_FLAGS        = get_config(p, DEFAULTS, 'sudo_flags', 'ANSIBLE_SUDO_FLAGS', '-H -S -n')
 
-DEFAULT_ASK_SUDO_PASS     = get_config(p, DEFAULTS, 'ask_sudo_pass',    'ANSIBLE_ASK_SUDO_PASS',    False, value_type='boolean')
 
+        # The Greasemonkey metadata block support in QtWebEngine only starts at
 
+        # Qt 5.8. With 5.7.1, we need to inject the scripts ourselves in
 
-# Become
+        # response to urlChanged.
 
-BECOME_ERROR_STRINGS      = {
+        if not qtutils.version_check('5.8'):
 
-    'sudo': 'Sorry, try again.',
+            self._tab.url_changed.connect(
 
-    'su': 'Authentication failure',
+                self._inject_greasemonkey_scripts_for_url)
 
-    'pbrun': '',
+        else:
 
-    'pfexec': '',
+            self._greasemonkey.scripts_reloaded.connect(
 
-    'doas': 'Permission denied',
+                self._inject_all_greasemonkey_scripts)
 
-    'dzdo': '',
+            self._inject_all_greasemonkey_scripts()
 
-    'ksu': 'Password incorrect'
 
-}  # FIXME: deal with i18n
 
-BECOME_MISSING_STRINGS    = {
+    def _init_stylesheet(self):
 
-    'sudo': 'sorry, a password is required to run sudo',
+        """Initialize custom stylesheets.
 
-    'su': '',
 
-    'pbrun': '',
 
-    'pfexec': '',
+        Partially inspired by QupZilla:
 
-    'doas': 'Authorization required',
+        https://github.com/QupZilla/qupzilla/blob/v2.0/src/lib/app/mainapplication.cpp#L1063-L1101
 
-    'dzdo': '',
+        """
 
-    'ksu': 'No password given'
+        self._remove_early_js('stylesheet')
 
-}  # FIXME: deal with i18n
+        css = shared.get_user_stylesheet()
 
-BECOME_METHODS            = ['sudo','su','pbrun','pfexec','doas','dzdo','ksu','runas']
+        js_code = javascript.wrap_global(
 
-BECOME_ALLOW_SAME_USER    = get_config(p, 'privilege_escalation', 'become_allow_same_user', 'ANSIBLE_BECOME_ALLOW_SAME_USER', False, value_type='boolean')
+            'stylesheet',
 
-DEFAULT_BECOME_METHOD     = get_config(p, 'privilege_escalation', 'become_method', 'ANSIBLE_BECOME_METHOD',
+            utils.read_file('javascript/stylesheet.js'),
 
-                                       'sudo' if DEFAULT_SUDO else 'su' if DEFAULT_SU else 'sudo').lower()
+            javascript.assemble('stylesheet', 'set_css', css),
 
-DEFAULT_BECOME            = get_config(p, 'privilege_escalation', 'become', 'ANSIBLE_BECOME',False, value_type='boolean')
+        )
 
-DEFAULT_BECOME_USER       = get_config(p, 'privilege_escalation', 'become_user', 'ANSIBLE_BECOME_USER', 'root')
+        self._inject_early_js('stylesheet', js_code, subframes=True)
 
-DEFAULT_BECOME_EXE        = get_config(p, 'privilege_escalation', 'become_exe', 'ANSIBLE_BECOME_EXE', None)
 
-DEFAULT_BECOME_FLAGS      = get_config(p, 'privilege_escalation', 'become_flags', 'ANSIBLE_BECOME_FLAGS', None)
 
-DEFAULT_BECOME_ASK_PASS   = get_config(p, 'privilege_escalation', 'become_ask_pass', 'ANSIBLE_BECOME_ASK_PASS', False, value_type='boolean')
+    @pyqtSlot(QUrl)
 
+    def _inject_greasemonkey_scripts_for_url(self, url):
 
+        matching_scripts = self._greasemonkey.scripts_for(url)
 
+        self._inject_greasemonkey_scripts(
 
+            matching_scripts.start, QWebEngineScript.DocumentCreation, True)
 
-# PLUGINS
+        self._inject_greasemonkey_scripts(
 
+            matching_scripts.end, QWebEngineScript.DocumentReady, False)
 
+        self._inject_greasemonkey_scripts(
 
-# Modules that can optimize with_items loops into a single call.  Currently
+            matching_scripts.idle, QWebEngineScript.Deferred, False)
 
-# these modules must (1) take a "name" or "pkg" parameter that is a list.  If
 
-# the module takes both, bad things could happen.
 
-# In the future we should probably generalize this even further
+    @pyqtSlot()
 
-# (mapping of param: squash field)
+    def _inject_all_greasemonkey_scripts(self):
 
-DEFAULT_SQUASH_ACTIONS         = get_config(p, DEFAULTS, 'squash_actions', 'ANSIBLE_SQUASH_ACTIONS',
+        scripts = self._greasemonkey.all_scripts()
 
-                                            "apk, apt, dnf, homebrew, openbsd_pkg, pacman, pkgng, yum, zypper", value_type='list')
+        self._inject_greasemonkey_scripts(scripts)
 
-# paths
 
 
+    def _inject_greasemonkey_scripts(self, scripts=None, injection_point=None,
 
-DEFAULT_ACTION_PLUGIN_PATH     = get_config(p, DEFAULTS, 'action_plugins', 'ANSIBLE_ACTION_PLUGINS',
+                                     remove_first=True):
 
-                                            '~/.ansible/plugins/action:/usr/share/ansible/plugins/action', value_type='pathlist')
+        """Register user JavaScript files with the current tab.
 
-DEFAULT_CACHE_PLUGIN_PATH      = get_config(p, DEFAULTS, 'cache_plugins', 'ANSIBLE_CACHE_PLUGINS',
 
-                                            '~/.ansible/plugins/cache:/usr/share/ansible/plugins/cache', value_type='pathlist')
 
-DEFAULT_CALLBACK_PLUGIN_PATH   = get_config(p, DEFAULTS, 'callback_plugins', 'ANSIBLE_CALLBACK_PLUGINS',
+        Args:
 
-                                            '~/.ansible/plugins/callback:/usr/share/ansible/plugins/callback', value_type='pathlist')
+            scripts: A list of GreasemonkeyScripts, or None to add all
 
-DEFAULT_CONNECTION_PLUGIN_PATH = get_config(p, DEFAULTS, 'connection_plugins', 'ANSIBLE_CONNECTION_PLUGINS',
+                     known by the Greasemonkey subsystem.
 
-                                            '~/.ansible/plugins/connection:/usr/share/ansible/plugins/connection', value_type='pathlist')
+            injection_point: The QWebEngineScript::InjectionPoint stage
 
-DEFAULT_LOOKUP_PLUGIN_PATH     = get_config(p, DEFAULTS, 'lookup_plugins', 'ANSIBLE_LOOKUP_PLUGINS',
+                             to inject the script into, None to use
 
-                                            '~/.ansible/plugins/lookup:/usr/share/ansible/plugins/lookup', value_type='pathlist')
+                             auto-detection.
 
-DEFAULT_MODULE_PATH            = get_config(p, DEFAULTS, 'library',            'ANSIBLE_LIBRARY',
+            remove_first: Whether to remove all previously injected
 
-                                            '~/.ansible/plugins/modules:/usr/share/ansible/plugins/modules', value_type='pathlist')
+                          scripts before adding these ones.
 
-DEFAULT_MODULE_UTILS_PATH      = get_config(p, DEFAULTS, 'module_utils',       'ANSIBLE_MODULE_UTILS',
+        """
 
-                                            '~/.ansible/plugins/module_utils:/usr/share/ansible/plugins/module_utils', value_type='pathlist')
+        if sip.isdeleted(self._widget):
 
-DEFAULT_INVENTORY_PLUGIN_PATH  = get_config(p, DEFAULTS, 'inventory_plugins', 'ANSIBLE_INVENTORY_PLUGINS',
+            return
 
-                                            '~/.ansible/plugins/inventory:/usr/share/ansible/plugins/inventory', value_type='pathlist')
 
-DEFAULT_VARS_PLUGIN_PATH       = get_config(p, DEFAULTS, 'vars_plugins', 'ANSIBLE_VARS_PLUGINS',
 
-                                            '~/.ansible/plugins/vars:/usr/share/ansible/plugins/vars', value_type='pathlist')
+        # Since we are inserting scripts into a per-tab collection,
 
-DEFAULT_FILTER_PLUGIN_PATH     = get_config(p, DEFAULTS, 'filter_plugins', 'ANSIBLE_FILTER_PLUGINS',
+        # rather than just injecting scripts on page load, we need to
 
-                                            '~/.ansible/plugins/filter:/usr/share/ansible/plugins/filter', value_type='pathlist')
+        # make sure we replace existing scripts, not just add new ones.
 
-DEFAULT_TEST_PLUGIN_PATH       = get_config(p, DEFAULTS, 'test_plugins', 'ANSIBLE_TEST_PLUGINS',
+        # While, taking care not to remove any other scripts that might
 
-                                            '~/.ansible/plugins/test:/usr/share/ansible/plugins/test', value_type='pathlist')
+        # have been added elsewhere, like the one for stylesheets.
 
-DEFAULT_STRATEGY_PLUGIN_PATH   = get_config(p, DEFAULTS, 'strategy_plugins', 'ANSIBLE_STRATEGY_PLUGINS',
+        page_scripts = self._widget.page().scripts()
 
-                                            '~/.ansible/plugins/strategy:/usr/share/ansible/plugins/strategy', value_type='pathlist')
+        if remove_first:
 
+            for script in page_scripts.toList():
 
+                if script.name().startswith("GM-"):
 
-NETWORK_GROUP_MODULES          = get_config(p, DEFAULTS, 'network_group_modules','NETWORK_GROUP_MODULES', ['eos', 'nxos', 'ios', 'iosxr', 'junos',
+                    log.greasemonkey.debug('Removing script: {}'
 
-                                                                                                           'vyos', 'sros', 'dellos9', 'dellos10', 'dellos6'],
+                                           .format(script.name()))
 
-                                            value_type='list')
+                    removed = page_scripts.remove(script)
 
-DEFAULT_STRATEGY               = get_config(p, DEFAULTS, 'strategy',           'ANSIBLE_STRATEGY', 'linear')
+                    assert removed, script.name()
 
-DEFAULT_STDOUT_CALLBACK        = get_config(p, DEFAULTS, 'stdout_callback',    'ANSIBLE_STDOUT_CALLBACK', 'default')
 
-# cache
 
-CACHE_PLUGIN                   = get_config(p, DEFAULTS, 'fact_caching', 'ANSIBLE_CACHE_PLUGIN', 'memory')
+        if not scripts:
 
-CACHE_PLUGIN_CONNECTION        = get_config(p, DEFAULTS, 'fact_caching_connection', 'ANSIBLE_CACHE_PLUGIN_CONNECTION', None)
+            return
 
-CACHE_PLUGIN_PREFIX            = get_config(p, DEFAULTS, 'fact_caching_prefix', 'ANSIBLE_CACHE_PLUGIN_PREFIX', 'ansible_facts')
 
-CACHE_PLUGIN_TIMEOUT           = get_config(p, DEFAULTS, 'fact_caching_timeout', 'ANSIBLE_CACHE_PLUGIN_TIMEOUT', 24 * 60 * 60, value_type='integer')
 
+        for script in scripts:
 
+            new_script = QWebEngineScript()
 
-# Display
+            try:
 
-ANSIBLE_FORCE_COLOR            = get_config(p, DEFAULTS, 'force_color', 'ANSIBLE_FORCE_COLOR', None, value_type='boolean')
+                world = int(script.jsworld)
 
-ANSIBLE_NOCOLOR                = get_config(p, DEFAULTS, 'nocolor', 'ANSIBLE_NOCOLOR', None, value_type='boolean')
+            except ValueError:
 
-ANSIBLE_NOCOWS                 = get_config(p, DEFAULTS, 'nocows', 'ANSIBLE_NOCOWS', None, value_type='boolean')
+                try:
 
-ANSIBLE_COW_SELECTION          = get_config(p, DEFAULTS, 'cow_selection', 'ANSIBLE_COW_SELECTION', 'default')
+                    world = _JS_WORLD_MAP[usertypes.JsWorld[
 
-ANSIBLE_COW_WHITELIST          = get_config(p, DEFAULTS, 'cow_whitelist', 'ANSIBLE_COW_WHITELIST', DEFAULT_COW_WHITELIST, value_type='list')
+                        script.jsworld.lower()]]
 
-DISPLAY_SKIPPED_HOSTS          = get_config(p, DEFAULTS, 'display_skipped_hosts', 'DISPLAY_SKIPPED_HOSTS', True, value_type='boolean')
+                except KeyError:
 
-DEFAULT_UNDEFINED_VAR_BEHAVIOR = get_config(p, DEFAULTS, 'error_on_undefined_vars', 'ANSIBLE_ERROR_ON_UNDEFINED_VARS', True, value_type='boolean')
+                    log.greasemonkey.error(
 
-HOST_KEY_CHECKING              = get_config(p, DEFAULTS, 'host_key_checking',  'ANSIBLE_HOST_KEY_CHECKING',    True, value_type='boolean')
+                        "script {} has invalid value for '@qute-js-world'"
 
-SYSTEM_WARNINGS                = get_config(p, DEFAULTS, 'system_warnings', 'ANSIBLE_SYSTEM_WARNINGS', True, value_type='boolean')
+                        ": {}".format(script.name, script.jsworld))
 
-DEPRECATION_WARNINGS           = get_config(p, DEFAULTS, 'deprecation_warnings', 'ANSIBLE_DEPRECATION_WARNINGS', True, value_type='boolean')
+                    continue
 
-DEFAULT_CALLABLE_WHITELIST     = get_config(p, DEFAULTS, 'callable_whitelist', 'ANSIBLE_CALLABLE_WHITELIST', [], value_type='list')
+            new_script.setWorldId(world)
 
-COMMAND_WARNINGS               = get_config(p, DEFAULTS, 'command_warnings', 'ANSIBLE_COMMAND_WARNINGS', True, value_type='boolean')
+            new_script.setSourceCode(script.code())
 
-DEFAULT_LOAD_CALLBACK_PLUGINS  = get_config(p, DEFAULTS, 'bin_ansible_callbacks', 'ANSIBLE_LOAD_CALLBACK_PLUGINS', False, value_type='boolean')
+            new_script.setName("GM-{}".format(script.name))
 
-DEFAULT_CALLBACK_WHITELIST     = get_config(p, DEFAULTS, 'callback_whitelist', 'ANSIBLE_CALLBACK_WHITELIST', [], value_type='list')
+            new_script.setRunsOnSubFrames(script.runs_on_sub_frames)
 
-RETRY_FILES_ENABLED            = get_config(p, DEFAULTS, 'retry_files_enabled', 'ANSIBLE_RETRY_FILES_ENABLED', True, value_type='boolean')
+            # Override the @run-at value parsed by QWebEngineScript if desired.
 
-RETRY_FILES_SAVE_PATH          = get_config(p, DEFAULTS, 'retry_files_save_path', 'ANSIBLE_RETRY_FILES_SAVE_PATH', None, value_type='path')
+            if injection_point:
 
-DEFAULT_NULL_REPRESENTATION    = get_config(p, DEFAULTS, 'null_representation', 'ANSIBLE_NULL_REPRESENTATION', None, value_type='none')
+                new_script.setInjectionPoint(injection_point)
 
-DISPLAY_ARGS_TO_STDOUT         = get_config(p, DEFAULTS, 'display_args_to_stdout', 'ANSIBLE_DISPLAY_ARGS_TO_STDOUT', False, value_type='boolean')
+            log.greasemonkey.debug('adding script: {}'
 
-MAX_FILE_SIZE_FOR_DIFF         = get_config(p, DEFAULTS, 'max_diff_size', 'ANSIBLE_MAX_DIFF_SIZE', 1024*1024, value_type='integer')
+                                   .format(new_script.name()))
 
+            page_scripts.insert(new_script)
 
 
-# CONNECTION RELATED
 
-USE_PERSISTENT_CONNECTIONS     = get_config(p, DEFAULTS, 'use_persistent_connections', 'ANSIBLE_USE_PERSISTENT_CONNECTIONS', False, value_type='boolean')
 
-ANSIBLE_SSH_ARGS               = get_config(p, 'ssh_connection', 'ssh_args', 'ANSIBLE_SSH_ARGS', '-C -o ControlMaster=auto -o ControlPersist=60s')
 
-### WARNING: Someone might be tempted to switch this from percent-formatting
+class WebEngineTab(browsertab.AbstractTab):
 
-# to .format() in the future.  be sure to read this:
 
-# http://lucumr.pocoo.org/2016/12/29/careful-with-str-format/ and understand
 
-# that it may be a security risk to do so.
+    """A QtWebEngine tab in the browser.
 
-ANSIBLE_SSH_CONTROL_PATH       = get_config(p, 'ssh_connection', 'control_path', 'ANSIBLE_SSH_CONTROL_PATH', None)
 
-ANSIBLE_SSH_CONTROL_PATH_DIR   = get_config(p, 'ssh_connection', 'control_path_dir', 'ANSIBLE_SSH_CONTROL_PATH_DIR', u'~/.ansible/cp')
 
-ANSIBLE_SSH_PIPELINING         = get_config(p, 'ssh_connection', 'pipelining', 'ANSIBLE_SSH_PIPELINING', False, value_type='boolean')
+    Signals:
 
-ANSIBLE_SSH_RETRIES            = get_config(p, 'ssh_connection', 'retries', 'ANSIBLE_SSH_RETRIES', 0, value_type='integer')
+        _load_finished_fake:
 
-ANSIBLE_SSH_EXECUTABLE         = get_config(p, 'ssh_connection', 'ssh_executable', 'ANSIBLE_SSH_EXECUTABLE', 'ssh')
+            Used in place of unreliable loadFinished
 
-PARAMIKO_RECORD_HOST_KEYS      = get_config(p, 'paramiko_connection', 'record_host_keys', 'ANSIBLE_PARAMIKO_RECORD_HOST_KEYS', True, value_type='boolean')
+    """
 
-PARAMIKO_HOST_KEY_AUTO_ADD     = get_config(p, 'paramiko_connection', 'host_key_auto_add', 'ANSIBLE_PARAMIKO_HOST_KEY_AUTO_ADD', False, value_type='boolean')
 
-PARAMIKO_PROXY_COMMAND         = get_config(p, 'paramiko_connection', 'proxy_command', 'ANSIBLE_PARAMIKO_PROXY_COMMAND', None)
 
-PARAMIKO_LOOK_FOR_KEYS         = get_config(p, 'paramiko_connection', 'look_for_keys', 'ANSIBLE_PARAMIKO_LOOK_FOR_KEYS', True, value_type='boolean')
+    # WORKAROUND for https://bugreports.qt.io/browse/QTBUG-65223
 
-PERSISTENT_CONNECT_TIMEOUT     = get_config(p, 'persistent_connection', 'connect_timeout', 'ANSIBLE_PERSISTENT_CONNECT_TIMEOUT', 30, value_type='integer')
+    _load_finished_fake = pyqtSignal(bool)
 
-PERSISTENT_CONNECT_RETRIES     = get_config(p, 'persistent_connection', 'connect_retries', 'ANSIBLE_PERSISTENT_CONNECT_RETRIES', 30, value_type='integer')
 
-PERSISTENT_CONNECT_INTERVAL    = get_config(p, 'persistent_connection', 'connect_interval', 'ANSIBLE_PERSISTENT_CONNECT_INTERVAL', 1, value_type='integer')
 
+    def __init__(self, *, win_id, mode_manager, private, parent=None):
 
+        super().__init__(win_id=win_id, mode_manager=mode_manager,
 
-# obsolete -- will be formally removed
+                         private=private, parent=parent)
 
-ACCELERATE_PORT                = get_config(p, 'accelerate', 'accelerate_port', 'ACCELERATE_PORT', 5099, value_type='integer')
+        widget = webview.WebEngineView(tabdata=self.data, win_id=win_id,
 
-ACCELERATE_TIMEOUT             = get_config(p, 'accelerate', 'accelerate_timeout', 'ACCELERATE_TIMEOUT', 30, value_type='integer')
+                                       private=private)
 
-ACCELERATE_CONNECT_TIMEOUT     = get_config(p, 'accelerate', 'accelerate_connect_timeout', 'ACCELERATE_CONNECT_TIMEOUT', 1.0, value_type='float')
+        self.history = WebEngineHistory(tab=self)
 
-ACCELERATE_DAEMON_TIMEOUT      = get_config(p, 'accelerate', 'accelerate_daemon_timeout', 'ACCELERATE_DAEMON_TIMEOUT', 30, value_type='integer')
+        self.scroller = WebEngineScroller(tab=self, parent=self)
 
-ACCELERATE_KEYS_DIR            = get_config(p, 'accelerate', 'accelerate_keys_dir', 'ACCELERATE_KEYS_DIR', '~/.fireball.keys')
+        self.caret = WebEngineCaret(mode_manager=mode_manager,
 
-ACCELERATE_KEYS_DIR_PERMS      = get_config(p, 'accelerate', 'accelerate_keys_dir_perms', 'ACCELERATE_KEYS_DIR_PERMS', '700')
+                                    tab=self, parent=self)
 
-ACCELERATE_KEYS_FILE_PERMS     = get_config(p, 'accelerate', 'accelerate_keys_file_perms', 'ACCELERATE_KEYS_FILE_PERMS', '600')
+        self.zoom = WebEngineZoom(tab=self, parent=self)
 
-ACCELERATE_MULTI_KEY           = get_config(p, 'accelerate', 'accelerate_multi_key', 'ACCELERATE_MULTI_KEY', False, value_type='boolean')
+        self.search = WebEngineSearch(tab=self, parent=self)
 
-PARAMIKO_PTY                   = get_config(p, 'paramiko_connection', 'pty', 'ANSIBLE_PARAMIKO_PTY', True, value_type='boolean')
+        self.printing = WebEnginePrinting(tab=self)
 
+        self.elements = WebEngineElements(tab=self)
 
+        self.action = WebEngineAction(tab=self)
 
-# galaxy related
+        self.audio = WebEngineAudio(tab=self, parent=self)
 
-GALAXY_SERVER                  = get_config(p, 'galaxy', 'server', 'ANSIBLE_GALAXY_SERVER', 'https://galaxy.ansible.com')
+        self._permissions = _WebEnginePermissions(tab=self, parent=self)
 
-GALAXY_IGNORE_CERTS            = get_config(p, 'galaxy', 'ignore_certs', 'ANSIBLE_GALAXY_IGNORE', False, value_type='boolean')
+        self._scripts = _WebEngineScripts(tab=self, parent=self)
 
-# this can be configured to blacklist SCMS but cannot add new ones unless the code is also updated
+        # We're assigning settings in _set_widget
 
-GALAXY_SCMS                    = get_config(p, 'galaxy', 'scms', 'ANSIBLE_GALAXY_SCMS', 'git, hg', value_type='list')
+        self.settings = webenginesettings.WebEngineSettings(settings=None)
 
-GALAXY_ROLE_SKELETON = get_config(p, 'galaxy', 'role_skeleton', 'ANSIBLE_GALAXY_ROLE_SKELETON', None, value_type='path')
+        self._set_widget(widget)
 
-GALAXY_ROLE_SKELETON_IGNORE = get_config(p, 'galaxy', 'role_skeleton_ignore', 'ANSIBLE_GALAXY_ROLE_SKELETON_IGNORE', ['^.git$', '^.*/.git_keep$'],
+        self._connect_signals()
 
-                                         value_type='list')
+        self.backend = usertypes.Backend.QtWebEngine
 
+        self._child_event_filter = None
 
+        self._saved_zoom = None
 
-STRING_TYPE_FILTERS = get_config(p, 'jinja2', 'dont_type_filters', 'ANSIBLE_STRING_TYPE_FILTERS',
+        self._reload_url = None
 
-                                 ['string', 'to_json', 'to_nice_json', 'to_yaml', 'ppretty', 'json'], value_type='list' )
+        self._scripts.init()
 
 
 
-# colors
+    def _set_widget(self, widget):
 
-COLOR_HIGHLIGHT   = get_config(p, 'colors', 'highlight', 'ANSIBLE_COLOR_HIGHLIGHT', 'white')
+        # pylint: disable=protected-access
 
-COLOR_VERBOSE     = get_config(p, 'colors', 'verbose', 'ANSIBLE_COLOR_VERBOSE', 'blue')
+        super()._set_widget(widget)
 
-COLOR_WARN        = get_config(p, 'colors', 'warn', 'ANSIBLE_COLOR_WARN', 'bright purple')
+        self._permissions._widget = widget
 
-COLOR_ERROR       = get_config(p, 'colors', 'error', 'ANSIBLE_COLOR_ERROR', 'red')
+        self._scripts._widget = widget
 
-COLOR_DEBUG       = get_config(p, 'colors', 'debug', 'ANSIBLE_COLOR_DEBUG', 'dark gray')
 
-COLOR_DEPRECATE   = get_config(p, 'colors', 'deprecate', 'ANSIBLE_COLOR_DEPRECATE', 'purple')
 
-COLOR_SKIP        = get_config(p, 'colors', 'skip', 'ANSIBLE_COLOR_SKIP', 'cyan')
+    def _install_event_filter(self):
 
-COLOR_UNREACHABLE = get_config(p, 'colors', 'unreachable', 'ANSIBLE_COLOR_UNREACHABLE', 'bright red')
+        fp = self._widget.focusProxy()
 
-COLOR_OK          = get_config(p, 'colors', 'ok', 'ANSIBLE_COLOR_OK', 'green')
+        if fp is not None:
 
-COLOR_CHANGED     = get_config(p, 'colors', 'changed', 'ANSIBLE_COLOR_CHANGED', 'yellow')
+            fp.installEventFilter(self._mouse_event_filter)
 
-COLOR_DIFF_ADD    = get_config(p, 'colors', 'diff_add', 'ANSIBLE_COLOR_DIFF_ADD', 'green')
+        self._child_event_filter = mouse.ChildEventFilter(
 
-COLOR_DIFF_REMOVE = get_config(p, 'colors', 'diff_remove', 'ANSIBLE_COLOR_DIFF_REMOVE', 'red')
+            eventfilter=self._mouse_event_filter, widget=self._widget,
 
-COLOR_DIFF_LINES  = get_config(p, 'colors', 'diff_lines', 'ANSIBLE_COLOR_DIFF_LINES', 'cyan')
+            win_id=self.win_id, parent=self)
 
+        self._widget.installEventFilter(self._child_event_filter)
 
 
-# diff
 
-DIFF_CONTEXT = get_config(p, 'diff', 'context', 'ANSIBLE_DIFF_CONTEXT', 3, value_type='integer')
+    @pyqtSlot()
 
-DIFF_ALWAYS = get_config(p, 'diff', 'always', 'ANSIBLE_DIFF_ALWAYS', False, value_type='bool')
+    def _restore_zoom(self):
 
+        if sip.isdeleted(self._widget):
 
+            # https://github.com/qutebrowser/qutebrowser/issues/3498
 
-# non-configurable things
+            return
 
-MODULE_REQUIRE_ARGS       = ['command', 'win_command', 'shell', 'win_shell', 'raw', 'script']
+        if self._saved_zoom is None:
 
-MODULE_NO_JSON            = ['command', 'win_command', 'shell', 'win_shell', 'raw']
+            return
 
-DEFAULT_BECOME_PASS       = None
+        self.zoom.set_factor(self._saved_zoom)
 
-DEFAULT_PASSWORD_CHARS = to_text(ascii_letters + digits + ".,:-_", errors='strict')  # characters included in auto-generated passwords
+        self._saved_zoom = None
 
-DEFAULT_SUDO_PASS         = None
 
-DEFAULT_REMOTE_PASS       = None
 
-DEFAULT_SUBSET            = None
+    def openurl(self, url, *, predict=True):
 
-DEFAULT_SU_PASS           = None
+        """Open the given URL in this tab.
 
-VAULT_VERSION_MIN         = 1.0
 
-VAULT_VERSION_MAX         = 1.0
 
-TREE_DIR                  = None
+        Arguments:
 
-LOCALHOST                 = frozenset(['127.0.0.1', 'localhost', '::1'])
+            url: The QUrl to open.
 
-# module search
+            predict: If set to False, predicted_navigation is not emitted.
 
-BLACKLIST_EXTS = ('.pyc', '.swp', '.bak', '~', '.rpm', '.md', '.txt')
+        """
 
-IGNORE_FILES = ["COPYING", "CONTRIBUTING", "LICENSE", "README", "VERSION", "GUIDELINES"]
+        if sip.isdeleted(self._widget):
 
-INTERNAL_RESULT_KEYS      = ['add_host', 'add_group']
+            # https://github.com/qutebrowser/qutebrowser/issues/3896
 
-RESTRICTED_RESULT_KEYS    = ['ansible_rsync_path', 'ansible_playbook_python']
+            return
+
+        self._saved_zoom = self.zoom.factor()
+
+        self._openurl_prepare(url, predict=predict)
+
+        self._widget.load(url)
+
+
+
+    def url(self, requested=False):
+
+        page = self._widget.page()
+
+        if requested:
+
+            return page.requestedUrl()
+
+        else:
+
+            return page.url()
+
+
+
+    def dump_async(self, callback, *, plain=False):
+
+        if plain:
+
+            self._widget.page().toPlainText(callback)
+
+        else:
+
+            self._widget.page().toHtml(callback)
+
+
+
+    def run_js_async(self, code, callback=None, *, world=None):
+
+        if world is None:
+
+            world_id = QWebEngineScript.ApplicationWorld
+
+        elif isinstance(world, int):
+
+            world_id = world
+
+        else:
+
+            world_id = _JS_WORLD_MAP[world]
+
+
+
+        if callback is None:
+
+            self._widget.page().runJavaScript(code, world_id)
+
+        else:
+
+            self._widget.page().runJavaScript(code, world_id, callback)
+
+
+
+    def shutdown(self):
+
+        self.shutting_down.emit()
+
+        self.action.exit_fullscreen()
+
+        self._widget.shutdown()
+
+
+
+    def reload(self, *, force=False):
+
+        if force:
+
+            action = QWebEnginePage.ReloadAndBypassCache
+
+        else:
+
+            action = QWebEnginePage.Reload
+
+        self._widget.triggerPageAction(action)
+
+
+
+    def stop(self):
+
+        self._widget.stop()
+
+
+
+    def title(self):
+
+        return self._widget.title()
+
+
+
+    def icon(self):
+
+        return self._widget.icon()
+
+
+
+    def set_html(self, html, base_url=QUrl()):
+
+        # FIXME:qtwebengine
+
+        # check this and raise an exception if too big:
+
+        # Warning: The content will be percent encoded before being sent to the
+
+        # renderer via IPC. This may increase its size. The maximum size of the
+
+        # percent encoded content is 2 megabytes minus 30 bytes.
+
+        self._widget.setHtml(html, base_url)
+
+
+
+    def networkaccessmanager(self):
+
+        return None
+
+
+
+    def user_agent(self):
+
+        return None
+
+
+
+    def clear_ssl_errors(self):
+
+        raise browsertab.UnsupportedOperationError
+
+
+
+    def key_press(self, key, modifier=Qt.NoModifier):
+
+        press_evt = QKeyEvent(QEvent.KeyPress, key, modifier, 0, 0, 0)
+
+        release_evt = QKeyEvent(QEvent.KeyRelease, key, modifier,
+
+                                0, 0, 0)
+
+        self.send_event(press_evt)
+
+        self.send_event(release_evt)
+
+
+
+    def _show_error_page(self, url, error):
+
+        """Show an error page in the tab."""
+
+        log.misc.debug("Showing error page for {}".format(error))
+
+        url_string = url.toDisplayString()
+
+        error_page = jinja.render(
+
+            'error.html',
+
+            title="Error loading page: {}".format(url_string),
+
+            url=url_string, error=error)
+
+        self.set_html(error_page)
+
+
+
+    @pyqtSlot()
+
+    def _on_history_trigger(self):
+
+        try:
+
+            self._widget.page()
+
+        except RuntimeError:
+
+            # Looks like this slot can be triggered on destroyed tabs:
+
+            # https://crashes.qutebrowser.org/view/3abffbed (Qt 5.9.1)
+
+            # wrapped C/C++ object of type WebEngineView has been deleted
+
+            log.misc.debug("Ignoring history trigger for destroyed tab")
+
+            return
+
+
+
+        url = self.url()
+
+        requested_url = self.url(requested=True)
+
+
+
+        # Don't save the title if it's generated from the URL
+
+        title = self.title()
+
+        title_url = QUrl(url)
+
+        title_url.setScheme('')
+
+        if title == title_url.toDisplayString(QUrl.RemoveScheme).strip('/'):
+
+            title = ""
+
+
+
+        # Don't add history entry if the URL is invalid anyways
+
+        if not url.isValid():
+
+            log.misc.debug("Ignoring invalid URL being added to history")
+
+            return
+
+
+
+        self.add_history_item.emit(url, requested_url, title)
+
+
+
+    @pyqtSlot(QUrl, 'QAuthenticator*', 'QString')
+
+    def _on_proxy_authentication_required(self, url, authenticator,
+
+                                          proxy_host):
+
+        """Called when a proxy needs authentication."""
+
+        msg = "<b>{}</b> requires a username and password.".format(
+
+            html_utils.escape(proxy_host))
+
+        urlstr = url.toString(QUrl.RemovePassword | QUrl.FullyEncoded)
+
+        answer = message.ask(
+
+            title="Proxy authentication required", text=msg,
+
+            mode=usertypes.PromptMode.user_pwd,
+
+            abort_on=[self.shutting_down, self.load_started], url=urlstr)
+
+        if answer is not None:
+
+            authenticator.setUser(answer.user)
+
+            authenticator.setPassword(answer.password)
+
+        else:
+
+            try:
+
+                # pylint: disable=no-member, useless-suppression
+
+                sip.assign(authenticator, QAuthenticator())
+
+                # pylint: enable=no-member, useless-suppression
+
+            except AttributeError:
+
+                self._show_error_page(url, "Proxy authentication required")
+
+
+
+    @pyqtSlot(QUrl, 'QAuthenticator*')
+
+    def _on_authentication_required(self, url, authenticator):
+
+        netrc_success = False
+
+        if not self.data.netrc_used:
+
+            self.data.netrc_used = True
+
+            netrc_success = shared.netrc_authentication(url, authenticator)
+
+        if not netrc_success:
+
+            abort_on = [self.shutting_down, self.load_started]
+
+            answer = shared.authentication_required(url, authenticator,
+
+                                                    abort_on)
+
+        if not netrc_success and answer is None:
+
+            try:
+
+                # pylint: disable=no-member, useless-suppression
+
+                sip.assign(authenticator, QAuthenticator())
+
+                # pylint: enable=no-member, useless-suppression
+
+            except AttributeError:
+
+                # WORKAROUND for
+
+                # https://www.riverbankcomputing.com/pipermail/pyqt/2016-December/038400.html
+
+                self._show_error_page(url, "Authentication required")
+
+
+
+    @pyqtSlot()
+
+    def _on_load_started(self):
+
+        """Clear search when a new load is started if needed."""
+
+        # WORKAROUND for
+
+        # https://bugreports.qt.io/browse/QTBUG-61506
+
+        # (seems to be back in later Qt versions as well)
+
+        self.search.clear()
+
+        super()._on_load_started()
+
+        self.data.netrc_used = False
+
+
+
+    @pyqtSlot(QWebEnginePage.RenderProcessTerminationStatus, int)
+
+    def _on_render_process_terminated(self, status, exitcode):
+
+        """Show an error when the renderer process terminated."""
+
+        if (status == QWebEnginePage.AbnormalTerminationStatus and
+
+                exitcode == 256):
+
+            # WORKAROUND for https://bugreports.qt.io/browse/QTBUG-58697
+
+            status = QWebEnginePage.CrashedTerminationStatus
+
+
+
+        status_map = {
+
+            QWebEnginePage.NormalTerminationStatus:
+
+                browsertab.TerminationStatus.normal,
+
+            QWebEnginePage.AbnormalTerminationStatus:
+
+                browsertab.TerminationStatus.abnormal,
+
+            QWebEnginePage.CrashedTerminationStatus:
+
+                browsertab.TerminationStatus.crashed,
+
+            QWebEnginePage.KilledTerminationStatus:
+
+                browsertab.TerminationStatus.killed,
+
+            -1:
+
+                browsertab.TerminationStatus.unknown,
+
+        }
+
+        self.renderer_process_terminated.emit(status_map[status], exitcode)
+
+
+
+    @pyqtSlot(int)
+
+    def _on_load_progress_workaround(self, perc):
+
+        """Use loadProgress(100) to emit loadFinished(True).
+
+
+
+        See https://bugreports.qt.io/browse/QTBUG-65223
+
+        """
+
+        if perc == 100 and self.load_status() != usertypes.LoadStatus.error:
+
+            self._load_finished_fake.emit(True)
+
+
+
+    @pyqtSlot(bool)
+
+    def _on_load_finished_workaround(self, ok):
+
+        """Use only loadFinished(False).
+
+
+
+        See https://bugreports.qt.io/browse/QTBUG-65223
+
+        """
+
+        if not ok:
+
+            self._load_finished_fake.emit(False)
+
+
+
+    def _error_page_workaround(self, html):
+
+        """Check if we're displaying a Chromium error page.
+
+
+
+        This gets only called if we got loadFinished(False) without JavaScript,
+
+        so we can display at least some error page.
+
+
+
+        WORKAROUND for https://bugreports.qt.io/browse/QTBUG-66643
+
+        Needs to check the page content as a WORKAROUND for
+
+        https://bugreports.qt.io/browse/QTBUG-66661
+
+        """
+
+        match = re.search(r'"errorCode":"([^"]*)"', html)
+
+        if match is None:
+
+            return
+
+        self._show_error_page(self.url(), error=match.group(1))
+
+
+
+    @pyqtSlot(bool)
+
+    def _on_load_finished(self, ok):
+
+        """Display a static error page if JavaScript is disabled."""
+
+        super()._on_load_finished(ok)
+
+        js_enabled = self.settings.test_attribute('content.javascript.enabled')
+
+        if not ok and not js_enabled:
+
+            self.dump_async(self._error_page_workaround)
+
+
+
+        if ok and self._reload_url is not None:
+
+            # WORKAROUND for https://bugreports.qt.io/browse/QTBUG-66656
+
+            log.config.debug(
+
+                "Loading {} again because of config change".format(
+
+                    self._reload_url.toDisplayString()))
+
+            QTimer.singleShot(100, functools.partial(self.openurl,
+
+                                                     self._reload_url,
+
+                                                     predict=False))
+
+            self._reload_url = None
+
+
+
+        if not qtutils.version_check('5.10', compiled=False):
+
+            # We can't do this when we have the loadFinished workaround as that
+
+            # sometimes clears icons without loading a new page.
+
+            # In general, this is handled by Qt, but when loading takes long,
+
+            # the old icon is still displayed.
+
+            self.icon_changed.emit(QIcon())
+
+
+
+    @pyqtSlot(certificateerror.CertificateErrorWrapper)
+
+    def _on_ssl_errors(self, error):
+
+        self._has_ssl_errors = True
+
+
+
+        url = error.url()
+
+        log.webview.debug("Certificate error: {}".format(error))
+
+
+
+        if error.is_overridable():
+
+            error.ignore = shared.ignore_certificate_errors(
+
+                url, [error], abort_on=[self.shutting_down, self.load_started])
+
+        else:
+
+            log.webview.error("Non-overridable certificate error: "
+
+                              "{}".format(error))
+
+
+
+        log.webview.debug("ignore {}, URL {}, requested {}".format(
+
+            error.ignore, url, self.url(requested=True)))
+
+
+
+        # WORKAROUND for https://bugreports.qt.io/browse/QTBUG-56207
+
+        # We can't really know when to show an error page, as the error might
+
+        # have happened when loading some resource.
+
+        # However, self.url() is not available yet and the requested URL
+
+        # might not match the URL we get from the error - so we just apply a
+
+        # heuristic here.
+
+        if (not qtutils.version_check('5.9') and
+
+                not error.ignore and
+
+                url.matches(self.url(requested=True), QUrl.RemoveScheme)):
+
+            self._show_error_page(url, str(error))
+
+
+
+    @pyqtSlot(QUrl)
+
+    def _on_predicted_navigation(self, url):
+
+        """If we know we're going to visit an URL soon, change the settings.
+
+
+
+        This is a WORKAROUND for https://bugreports.qt.io/browse/QTBUG-66656
+
+        """
+
+        super()._on_predicted_navigation(url)
+
+        if not qtutils.version_check('5.11.1', compiled=False):
+
+            self.settings.update_for_url(url)
+
+
+
+    @pyqtSlot(usertypes.NavigationRequest)
+
+    def _on_navigation_request(self, navigation):
+
+        super()._on_navigation_request(navigation)
+
+
+
+        if navigation.url == QUrl('qute://print'):
+
+            try:
+
+                self.printing.show_dialog()
+
+            except browsertab.WebTabError as e:
+
+                message.error(str(e))
+
+            navigation.accepted = False
+
+
+
+        if not navigation.accepted or not navigation.is_main_frame:
+
+            return
+
+
+
+        settings_needing_reload = {
+
+            'content.plugins',
+
+            'content.javascript.enabled',
+
+            'content.javascript.can_access_clipboard',
+
+            'content.print_element_backgrounds',
+
+            'input.spatial_navigation',
+
+        }
+
+        assert settings_needing_reload.issubset(configdata.DATA)
+
+
+
+        changed = self.settings.update_for_url(navigation.url)
+
+        reload_needed = changed & settings_needing_reload
+
+
+
+        # On Qt < 5.11, we don't don't need a reload when type == link_clicked.
+
+        # On Qt 5.11.0, we always need a reload.
+
+        # On Qt > 5.11.0, we never need a reload:
+
+        # https://codereview.qt-project.org/#/c/229525/1
+
+        # WORKAROUND for https://bugreports.qt.io/browse/QTBUG-66656
+
+        if qtutils.version_check('5.11.1', compiled=False):
+
+            reload_needed = False
+
+        elif not qtutils.version_check('5.11.0', exact=True, compiled=False):
+
+            if navigation.navigation_type == navigation.Type.link_clicked:
+
+                reload_needed = False
+
+
+
+        if reload_needed:
+
+            self._reload_url = navigation.url
+
+
+
+    def _connect_signals(self):
+
+        view = self._widget
+
+        page = view.page()
+
+
+
+        page.windowCloseRequested.connect(self.window_close_requested)
+
+        page.linkHovered.connect(self.link_hovered)
+
+        page.loadProgress.connect(self._on_load_progress)
+
+        page.loadStarted.connect(self._on_load_started)
+
+        page.certificate_error.connect(self._on_ssl_errors)
+
+        page.authenticationRequired.connect(self._on_authentication_required)
+
+        page.proxyAuthenticationRequired.connect(
+
+            self._on_proxy_authentication_required)
+
+        page.contentsSizeChanged.connect(self.contents_size_changed)
+
+        page.navigation_request.connect(self._on_navigation_request)
+
+
+
+        view.titleChanged.connect(self.title_changed)
+
+        view.urlChanged.connect(self._on_url_changed)
+
+        view.renderProcessTerminated.connect(
+
+            self._on_render_process_terminated)
+
+        view.iconChanged.connect(self.icon_changed)
+
+        # WORKAROUND for https://bugreports.qt.io/browse/QTBUG-65223
+
+        if qtutils.version_check('5.10', compiled=False):
+
+            page.loadProgress.connect(self._on_load_progress_workaround)
+
+            self._load_finished_fake.connect(self._on_history_trigger)
+
+            self._load_finished_fake.connect(self._restore_zoom)
+
+            self._load_finished_fake.connect(self._on_load_finished)
+
+            page.loadFinished.connect(self._on_load_finished_workaround)
+
+        else:
+
+            # for older Qt versions which break with the above
+
+            page.loadProgress.connect(self._on_load_progress)
+
+            page.loadFinished.connect(self._on_history_trigger)
+
+            page.loadFinished.connect(self._restore_zoom)
+
+            page.loadFinished.connect(self._on_load_finished)
+
+
+
+        self.predicted_navigation.connect(self._on_predicted_navigation)
+
+
+
+        # pylint: disable=protected-access
+
+        self.audio._connect_signals()
+
+        self._permissions.connect_signals()
+
+        self._scripts.connect_signals()
+
+
+
+    def event_target(self):
+
+        return self._widget.render_widget()

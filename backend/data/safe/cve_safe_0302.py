@@ -2,1918 +2,1374 @@
 # Safety: safe
 # Category: safe
 
-# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2015, 2016 OpenMarket Ltd
 
-# Copyright 2018 New Vector Ltd
 
-# Copyright 2019 Matrix.org Federation C.I.C
+# Copyright 2012 OpenStack LLC
 
 #
 
-# Licensed under the Apache License, Version 2.0 (the "License");
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
 
-# you may not use this file except in compliance with the License.
+# not use this file except in compliance with the License. You may obtain
 
-# You may obtain a copy of the License at
+# a copy of the License at
 
 #
 
-#     http://www.apache.org/licenses/LICENSE-2.0
+#      http://www.apache.org/licenses/LICENSE-2.0
 
 #
 
 # Unless required by applicable law or agreed to in writing, software
 
-# distributed under the License is distributed on an "AS IS" BASIS,
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
-# See the License for the specific language governing permissions and
+# License for the specific language governing permissions and limitations
 
-# limitations under the License.
+# under the License.
 
-import logging
 
-from typing import (
 
-    TYPE_CHECKING,
+"""Main entry point into the Identity service."""
 
-    Any,
 
-    Awaitable,
 
-    Callable,
+import urllib
 
-    Dict,
+import urlparse
 
-    List,
+import uuid
 
-    Optional,
 
-    Tuple,
 
-    Union,
+from keystone.common import logging
 
-)
+from keystone.common import manager
 
+from keystone.common import wsgi
 
+from keystone import config
 
-from prometheus_client import Counter, Gauge, Histogram
+from keystone import exception
 
+from keystone import policy
 
+from keystone import token
 
-from twisted.internet import defer
 
-from twisted.internet.abstract import isIPAddress
 
-from twisted.python import failure
 
 
+CONF = config.CONF
 
-from synapse.api.constants import EventTypes, Membership
 
-from synapse.api.errors import (
 
-    AuthError,
+LOG = logging.getLogger(__name__)
 
-    Codes,
 
-    FederationError,
 
-    IncompatibleRoomVersionError,
 
-    NotFoundError,
 
-    SynapseError,
+class Manager(manager.Manager):
 
-    UnsupportedRoomVersionError,
+    """Default pivot point for the Identity backend.
 
-)
 
-from synapse.api.room_versions import KNOWN_ROOM_VERSIONS
 
-from synapse.events import EventBase
+    See :mod:`keystone.common.manager.Manager` for more details on how this
 
-from synapse.federation.federation_base import FederationBase, event_from_pdu_json
+    dynamically calls the backend.
 
-from synapse.federation.persistence import TransactionActions
 
-from synapse.federation.units import Edu, Transaction
 
-from synapse.http.endpoint import parse_server_name
+    """
 
-from synapse.http.servlet import assert_params_in_dict
 
-from synapse.logging.context import (
 
-    make_deferred_yieldable,
+    def __init__(self):
 
-    nested_logging_context,
+        super(Manager, self).__init__(CONF.identity.driver)
 
-    run_in_background,
 
-)
 
-from synapse.logging.opentracing import log_kv, start_active_span_from_edu, trace
 
-from synapse.logging.utils import log_function
 
-from synapse.replication.http.federation import (
+class Driver(object):
 
-    ReplicationFederationSendEduRestServlet,
+    """Interface description for an Identity driver."""
 
-    ReplicationGetQueryRestServlet,
 
-)
 
-from synapse.types import JsonDict, get_domain_from_id
+    def authenticate(self, user_id=None, tenant_id=None, password=None):
 
-from synapse.util import glob_to_regex, json_decoder, unwrapFirstError
+        """Authenticate a given user, tenant and password.
 
-from synapse.util.async_helpers import Linearizer, concurrently_execute
 
-from synapse.util.caches.response_cache import ResponseCache
 
+        :returns: (user_ref, tenant_ref, metadata_ref)
 
+        :raises: AssertionError
 
-if TYPE_CHECKING:
 
-    from synapse.server import HomeServer
-
-
-
-# when processing incoming transactions, we try to handle multiple rooms in
-
-# parallel, up to this limit.
-
-TRANSACTION_CONCURRENCY_LIMIT = 10
-
-
-
-logger = logging.getLogger(__name__)
-
-
-
-received_pdus_counter = Counter("synapse_federation_server_received_pdus", "")
-
-
-
-received_edus_counter = Counter("synapse_federation_server_received_edus", "")
-
-
-
-received_queries_counter = Counter(
-
-    "synapse_federation_server_received_queries", "", ["type"]
-
-)
-
-
-
-pdu_process_time = Histogram(
-
-    "synapse_federation_server_pdu_process_time", "Time taken to process an event",
-
-)
-
-
-
-
-
-last_pdu_age_metric = Gauge(
-
-    "synapse_federation_last_received_pdu_age",
-
-    "The age (in seconds) of the last PDU successfully received from the given domain",
-
-    labelnames=("server_name",),
-
-)
-
-
-
-
-
-class FederationServer(FederationBase):
-
-    def __init__(self, hs):
-
-        super().__init__(hs)
-
-
-
-        self.auth = hs.get_auth()
-
-        self.handler = hs.get_federation_handler()
-
-        self.state = hs.get_state_handler()
-
-
-
-        self.device_handler = hs.get_device_handler()
-
-
-
-        # Ensure the following handlers are loaded since they register callbacks
-
-        # with FederationHandlerRegistry.
-
-        hs.get_directory_handler()
-
-
-
-        self._federation_ratelimiter = hs.get_federation_ratelimiter()
-
-
-
-        self._server_linearizer = Linearizer("fed_server")
-
-        self._transaction_linearizer = Linearizer("fed_txn_handler")
-
-
-
-        # We cache results for transaction with the same ID
-
-        self._transaction_resp_cache = ResponseCache(
-
-            hs, "fed_txn_handler", timeout_ms=30000
-
-        )  # type: ResponseCache[Tuple[str, str]]
-
-
-
-        self.transaction_actions = TransactionActions(self.store)
-
-
-
-        self.registry = hs.get_federation_registry()
-
-
-
-        # We cache responses to state queries, as they take a while and often
-
-        # come in waves.
-
-        self._state_resp_cache = ResponseCache(
-
-            hs, "state_resp", timeout_ms=30000
-
-        )  # type: ResponseCache[Tuple[str, str]]
-
-        self._state_ids_resp_cache = ResponseCache(
-
-            hs, "state_ids_resp", timeout_ms=30000
-
-        )  # type: ResponseCache[Tuple[str, str]]
-
-
-
-        self._federation_metrics_domains = (
-
-            hs.get_config().federation.federation_metrics_domains
-
-        )
-
-
-
-    async def on_backfill_request(
-
-        self, origin: str, room_id: str, versions: List[str], limit: int
-
-    ) -> Tuple[int, Dict[str, Any]]:
-
-        with (await self._server_linearizer.queue((origin, room_id))):
-
-            origin_host, _ = parse_server_name(origin)
-
-            await self.check_server_matches_acl(origin_host, room_id)
-
-
-
-            pdus = await self.handler.on_backfill_request(
-
-                origin, room_id, versions, limit
-
-            )
-
-
-
-            res = self._transaction_from_pdus(pdus).get_dict()
-
-
-
-        return 200, res
-
-
-
-    async def on_incoming_transaction(
-
-        self, origin: str, transaction_data: JsonDict
-
-    ) -> Tuple[int, Dict[str, Any]]:
-
-        # keep this as early as possible to make the calculated origin ts as
-
-        # accurate as possible.
-
-        request_time = self._clock.time_msec()
-
-
-
-        transaction = Transaction(**transaction_data)
-
-        transaction_id = transaction.transaction_id  # type: ignore
-
-
-
-        if not transaction_id:
-
-            raise Exception("Transaction missing transaction_id")
-
-
-
-        logger.debug("[%s] Got transaction", transaction_id)
-
-
-
-        # We wrap in a ResponseCache so that we de-duplicate retried
-
-        # transactions.
-
-        return await self._transaction_resp_cache.wrap(
-
-            (origin, transaction_id),
-
-            self._on_incoming_transaction_inner,
-
-            origin,
-
-            transaction,
-
-            request_time,
-
-        )
-
-
-
-    async def _on_incoming_transaction_inner(
-
-        self, origin: str, transaction: Transaction, request_time: int
-
-    ) -> Tuple[int, Dict[str, Any]]:
-
-        # Use a linearizer to ensure that transactions from a remote are
-
-        # processed in order.
-
-        with await self._transaction_linearizer.queue(origin):
-
-            # We rate limit here *after* we've queued up the incoming requests,
-
-            # so that we don't fill up the ratelimiter with blocked requests.
-
-            #
-
-            # This is important as the ratelimiter allows N concurrent requests
-
-            # at a time, and only starts ratelimiting if there are more requests
-
-            # than that being processed at a time. If we queued up requests in
-
-            # the linearizer/response cache *after* the ratelimiting then those
-
-            # queued up requests would count as part of the allowed limit of N
-
-            # concurrent requests.
-
-            with self._federation_ratelimiter.ratelimit(origin) as d:
-
-                await d
-
-
-
-                result = await self._handle_incoming_transaction(
-
-                    origin, transaction, request_time
-
-                )
-
-
-
-        return result
-
-
-
-    async def _handle_incoming_transaction(
-
-        self, origin: str, transaction: Transaction, request_time: int
-
-    ) -> Tuple[int, Dict[str, Any]]:
-
-        """ Process an incoming transaction and return the HTTP response
-
-
-
-        Args:
-
-            origin: the server making the request
-
-            transaction: incoming transaction
-
-            request_time: timestamp that the HTTP request arrived at
-
-
-
-        Returns:
-
-            HTTP response code and body
 
         """
 
-        response = await self.transaction_actions.have_responded(origin, transaction)
+        raise exception.NotImplemented()
 
 
 
-        if response:
+    def get_tenant(self, tenant_id):
 
-            logger.debug(
+        """Get a tenant by id.
 
-                "[%s] We've already responded to this request",
 
-                transaction.transaction_id,  # type: ignore
 
-            )
+        :returns: tenant_ref
 
-            return response
+        :raises: keystone.exception.TenantNotFound
 
 
-
-        logger.debug("[%s] Transaction is new", transaction.transaction_id)  # type: ignore
-
-
-
-        # Reject if PDU count > 50 or EDU count > 100
-
-        if len(transaction.pdus) > 50 or (  # type: ignore
-
-            hasattr(transaction, "edus") and len(transaction.edus) > 100  # type: ignore
-
-        ):
-
-
-
-            logger.info("Transaction PDU or EDU count too large. Returning 400")
-
-
-
-            response = {}
-
-            await self.transaction_actions.set_response(
-
-                origin, transaction, 400, response
-
-            )
-
-            return 400, response
-
-
-
-        # We process PDUs and EDUs in parallel. This is important as we don't
-
-        # want to block things like to device messages from reaching clients
-
-        # behind the potentially expensive handling of PDUs.
-
-        pdu_results, _ = await make_deferred_yieldable(
-
-            defer.gatherResults(
-
-                [
-
-                    run_in_background(
-
-                        self._handle_pdus_in_txn, origin, transaction, request_time
-
-                    ),
-
-                    run_in_background(self._handle_edus_in_txn, origin, transaction),
-
-                ],
-
-                consumeErrors=True,
-
-            ).addErrback(unwrapFirstError)
-
-        )
-
-
-
-        response = {"pdus": pdu_results}
-
-
-
-        logger.debug("Returning: %s", str(response))
-
-
-
-        await self.transaction_actions.set_response(origin, transaction, 200, response)
-
-        return 200, response
-
-
-
-    async def _handle_pdus_in_txn(
-
-        self, origin: str, transaction: Transaction, request_time: int
-
-    ) -> Dict[str, dict]:
-
-        """Process the PDUs in a received transaction.
-
-
-
-        Args:
-
-            origin: the server making the request
-
-            transaction: incoming transaction
-
-            request_time: timestamp that the HTTP request arrived at
-
-
-
-        Returns:
-
-            A map from event ID of a processed PDU to any errors we should
-
-            report back to the sending server.
 
         """
 
+        raise exception.NotImplemented()
 
 
-        received_pdus_counter.inc(len(transaction.pdus))  # type: ignore
 
+    def get_tenant_by_name(self, tenant_name):
 
+        """Get a tenant by name.
 
-        origin_host, _ = parse_server_name(origin)
 
 
+        :returns: tenant_ref
 
-        pdus_by_room = {}  # type: Dict[str, List[EventBase]]
+        :raises: keystone.exception.TenantNotFound
 
 
-
-        newest_pdu_ts = 0
-
-
-
-        for p in transaction.pdus:  # type: ignore
-
-            # FIXME (richardv): I don't think this works:
-
-            #  https://github.com/matrix-org/synapse/issues/8429
-
-            if "unsigned" in p:
-
-                unsigned = p["unsigned"]
-
-                if "age" in unsigned:
-
-                    p["age"] = unsigned["age"]
-
-            if "age" in p:
-
-                p["age_ts"] = request_time - int(p["age"])
-
-                del p["age"]
-
-
-
-            # We try and pull out an event ID so that if later checks fail we
-
-            # can log something sensible. We don't mandate an event ID here in
-
-            # case future event formats get rid of the key.
-
-            possible_event_id = p.get("event_id", "<Unknown>")
-
-
-
-            # Now we get the room ID so that we can check that we know the
-
-            # version of the room.
-
-            room_id = p.get("room_id")
-
-            if not room_id:
-
-                logger.info(
-
-                    "Ignoring PDU as does not have a room_id. Event ID: %s",
-
-                    possible_event_id,
-
-                )
-
-                continue
-
-
-
-            try:
-
-                room_version = await self.store.get_room_version(room_id)
-
-            except NotFoundError:
-
-                logger.info("Ignoring PDU for unknown room_id: %s", room_id)
-
-                continue
-
-            except UnsupportedRoomVersionError as e:
-
-                # this can happen if support for a given room version is withdrawn,
-
-                # so that we still get events for said room.
-
-                logger.info("Ignoring PDU: %s", e)
-
-                continue
-
-
-
-            event = event_from_pdu_json(p, room_version)
-
-            pdus_by_room.setdefault(room_id, []).append(event)
-
-
-
-            if event.origin_server_ts > newest_pdu_ts:
-
-                newest_pdu_ts = event.origin_server_ts
-
-
-
-        pdu_results = {}
-
-
-
-        # we can process different rooms in parallel (which is useful if they
-
-        # require callouts to other servers to fetch missing events), but
-
-        # impose a limit to avoid going too crazy with ram/cpu.
-
-
-
-        async def process_pdus_for_room(room_id: str):
-
-            logger.debug("Processing PDUs for %s", room_id)
-
-            try:
-
-                await self.check_server_matches_acl(origin_host, room_id)
-
-            except AuthError as e:
-
-                logger.warning("Ignoring PDUs for room %s from banned server", room_id)
-
-                for pdu in pdus_by_room[room_id]:
-
-                    event_id = pdu.event_id
-
-                    pdu_results[event_id] = e.error_dict()
-
-                return
-
-
-
-            for pdu in pdus_by_room[room_id]:
-
-                event_id = pdu.event_id
-
-                with pdu_process_time.time():
-
-                    with nested_logging_context(event_id):
-
-                        try:
-
-                            await self._handle_received_pdu(origin, pdu)
-
-                            pdu_results[event_id] = {}
-
-                        except FederationError as e:
-
-                            logger.warning("Error handling PDU %s: %s", event_id, e)
-
-                            pdu_results[event_id] = {"error": str(e)}
-
-                        except Exception as e:
-
-                            f = failure.Failure()
-
-                            pdu_results[event_id] = {"error": str(e)}
-
-                            logger.error(
-
-                                "Failed to handle PDU %s",
-
-                                event_id,
-
-                                exc_info=(f.type, f.value, f.getTracebackObject()),
-
-                            )
-
-
-
-        await concurrently_execute(
-
-            process_pdus_for_room, pdus_by_room.keys(), TRANSACTION_CONCURRENCY_LIMIT
-
-        )
-
-
-
-        if newest_pdu_ts and origin in self._federation_metrics_domains:
-
-            newest_pdu_age = self._clock.time_msec() - newest_pdu_ts
-
-            last_pdu_age_metric.labels(server_name=origin).set(newest_pdu_age / 1000)
-
-
-
-        return pdu_results
-
-
-
-    async def _handle_edus_in_txn(self, origin: str, transaction: Transaction):
-
-        """Process the EDUs in a received transaction.
 
         """
 
+        raise exception.NotImplemented()
 
 
-        async def _process_edu(edu_dict):
 
-            received_edus_counter.inc()
+    def get_user(self, user_id):
 
+        """Get a user by id.
 
 
-            edu = Edu(
 
-                origin=origin,
+        :returns: user_ref
 
-                destination=self.server_name,
+        :raises: keystone.exception.UserNotFound
 
-                edu_type=edu_dict["edu_type"],
 
-                content=edu_dict["content"],
 
-            )
+        """
 
-            await self.registry.on_edu(edu.edu_type, origin, edu.content)
+        raise exception.NotImplemented()
 
 
 
-        await concurrently_execute(
+    def get_user_by_name(self, user_name):
 
-            _process_edu,
+        """Get a user by name.
 
-            getattr(transaction, "edus", []),
 
-            TRANSACTION_CONCURRENCY_LIMIT,
 
-        )
+        :returns: user_ref
 
+        :raises: keystone.exception.UserNotFound
 
 
-    async def on_room_state_request(
 
-        self, origin: str, room_id: str, event_id: str
+        """
 
-    ) -> Tuple[int, Dict[str, Any]]:
+        raise exception.NotImplemented()
 
-        origin_host, _ = parse_server_name(origin)
 
-        await self.check_server_matches_acl(origin_host, room_id)
 
+    def get_role(self, role_id):
 
+        """Get a role by id.
 
-        in_room = await self.auth.check_host_in_room(room_id, origin)
 
-        if not in_room:
 
-            raise AuthError(403, "Host not in room.")
+        :returns: role_ref
 
+        :raises: keystone.exception.RoleNotFound
 
 
-        # we grab the linearizer to protect ourselves from servers which hammer
 
-        # us. In theory we might already have the response to this query
+        """
 
-        # in the cache so we could return it without waiting for the linearizer
+        raise exception.NotImplemented()
 
-        # - but that's non-trivial to get right, and anyway somewhat defeats
 
-        # the point of the linearizer.
 
-        with (await self._server_linearizer.queue((origin, room_id))):
+    def list_users(self):
 
-            resp = dict(
+        """List all users in the system.
 
-                await self._state_resp_cache.wrap(
 
-                    (room_id, event_id),
 
-                    self._on_context_state_request_compute,
+        NOTE(termie): I'd prefer if this listed only the users for a given
 
-                    room_id,
+                      tenant.
 
-                    event_id,
 
-                )
 
-            )
+        :returns: a list of user_refs or an empty list
 
 
 
-        room_version = await self.store.get_room_version_id(room_id)
+        """
 
-        resp["room_version"] = room_version
+        raise exception.NotImplemented()
 
 
 
-        return 200, resp
+    def list_roles(self):
 
+        """List all roles in the system.
 
 
-    async def on_state_ids_request(
 
-        self, origin: str, room_id: str, event_id: str
+        :returns: a list of role_refs or an empty list.
 
-    ) -> Tuple[int, Dict[str, Any]]:
 
-        if not event_id:
 
-            raise NotImplementedError("Specify an event")
+        """
 
+        raise exception.NotImplemented()
 
 
-        origin_host, _ = parse_server_name(origin)
 
-        await self.check_server_matches_acl(origin_host, room_id)
+    # NOTE(termie): seven calls below should probably be exposed by the api
 
+    #               more clearly when the api redesign happens
 
+    def add_user_to_tenant(self, tenant_id, user_id):
 
-        in_room = await self.auth.check_host_in_room(room_id, origin)
+        """Add user to a tenant without an explicit role relationship.
 
-        if not in_room:
 
-            raise AuthError(403, "Host not in room.")
 
+        :raises: keystone.exception.TenantNotFound,
 
+                 keystone.exception.UserNotFound
 
-        resp = await self._state_ids_resp_cache.wrap(
 
-            (room_id, event_id), self._on_state_ids_request_compute, room_id, event_id,
 
-        )
+        """
 
+        raise exception.NotImplemented()
 
 
-        return 200, resp
 
+    def remove_user_from_tenant(self, tenant_id, user_id):
 
+        """Remove user from a tenant without an explicit role relationship.
 
-    async def _on_state_ids_request_compute(self, room_id, event_id):
 
-        state_ids = await self.handler.get_state_ids_for_pdu(room_id, event_id)
 
-        auth_chain_ids = await self.store.get_auth_chain_ids(state_ids)
+        :raises: keystone.exception.TenantNotFound,
 
-        return {"pdu_ids": state_ids, "auth_chain_ids": auth_chain_ids}
+                 keystone.exception.UserNotFound
 
 
 
-    async def _on_context_state_request_compute(
+        """
 
-        self, room_id: str, event_id: str
+        raise exception.NotImplemented()
 
-    ) -> Dict[str, list]:
 
-        if event_id:
 
-            pdus = await self.handler.get_state_for_pdu(room_id, event_id)
+    def get_all_tenants(self):
 
-        else:
+        """FIXME(dolph): Lists all tenants in the system? I'm not sure how this
 
-            pdus = (await self.state.get_current_state(room_id)).values()
+                         is different from get_tenants, why get_tenants isn't
 
+                         documented as part of the driver, or why it's called
 
+                         get_tenants instead of list_tenants (i.e. list_roles
 
-        auth_chain = await self.store.get_auth_chain([pdu.event_id for pdu in pdus])
+                         and list_users)...
 
 
 
-        return {
+        :returns: a list of ... FIXME(dolph): tenant_refs or tenant_id's?
 
-            "pdus": [pdu.get_pdu_json() for pdu in pdus],
 
-            "auth_chain": [pdu.get_pdu_json() for pdu in auth_chain],
+
+        """
+
+        raise exception.NotImplemented()
+
+
+
+    def get_tenant_users(self, tenant_id):
+
+        """FIXME(dolph): Lists all users with a relationship to the specified
+
+                         tenant?
+
+
+
+        :returns: a list of ... FIXME(dolph): user_refs or user_id's?
+
+        :raises: keystone.exception.UserNotFound
+
+
+
+        """
+
+        raise exception.NotImplemented()
+
+
+
+    def get_tenants_for_user(self, user_id):
+
+        """Get the tenants associated with a given user.
+
+
+
+        :returns: a list of tenant_id's.
+
+        :raises: keystone.exception.UserNotFound
+
+
+
+        """
+
+        raise exception.NotImplemented()
+
+
+
+    def get_roles_for_user_and_tenant(self, user_id, tenant_id):
+
+        """Get the roles associated with a user within given tenant.
+
+
+
+        :returns: a list of role ids.
+
+        :raises: keystone.exception.UserNotFound,
+
+                 keystone.exception.TenantNotFound
+
+
+
+        """
+
+        raise exception.NotImplemented()
+
+
+
+    def add_role_to_user_and_tenant(self, user_id, tenant_id, role_id):
+
+        """Add a role to a user within given tenant.
+
+
+
+        :raises: keystone.exception.UserNotFound,
+
+                 keystone.exception.TenantNotFound,
+
+                 keystone.exception.RoleNotFound
+
+        """
+
+        raise exception.NotImplemented()
+
+
+
+    def remove_role_from_user_and_tenant(self, user_id, tenant_id, role_id):
+
+        """Remove a role from a user within given tenant.
+
+
+
+        :raises: keystone.exception.UserNotFound,
+
+                 keystone.exception.TenantNotFound,
+
+                 keystone.exception.RoleNotFound
+
+
+
+        """
+
+        raise exception.NotImplemented()
+
+
+
+    # user crud
+
+    def create_user(self, user_id, user):
+
+        """Creates a new user.
+
+
+
+        :raises: keystone.exception.Conflict
+
+
+
+        """
+
+        raise exception.NotImplemented()
+
+
+
+    def update_user(self, user_id, user):
+
+        """Updates an existing user.
+
+
+
+        :raises: keystone.exception.UserNotFound, keystone.exception.Conflict
+
+
+
+        """
+
+        raise exception.NotImplemented()
+
+
+
+    def delete_user(self, user_id):
+
+        """Deletes an existing user.
+
+
+
+        :raises: keystone.exception.UserNotFound
+
+
+
+        """
+
+        raise exception.NotImplemented()
+
+
+
+    # tenant crud
+
+    def create_tenant(self, tenant_id, tenant):
+
+        """Creates a new tenant.
+
+
+
+        :raises: keystone.exception.Conflict
+
+
+
+        """
+
+        raise exception.NotImplemented()
+
+
+
+    def update_tenant(self, tenant_id, tenant):
+
+        """Updates an existing tenant.
+
+
+
+        :raises: keystone.exception.TenantNotFound, keystone.exception.Conflict
+
+
+
+        """
+
+        raise exception.NotImplemented()
+
+
+
+    def delete_tenant(self, tenant_id):
+
+        """Deletes an existing tenant.
+
+
+
+        :raises: keystone.exception.TenantNotFound
+
+
+
+        """
+
+        raise exception.NotImplemented()
+
+
+
+    # metadata crud
+
+    def get_metadata(self, user_id, tenant_id):
+
+        raise exception.NotImplemented()
+
+
+
+    def create_metadata(self, user_id, tenant_id, metadata):
+
+        raise exception.NotImplemented()
+
+
+
+    def update_metadata(self, user_id, tenant_id, metadata):
+
+        raise exception.NotImplemented()
+
+
+
+    def delete_metadata(self, user_id, tenant_id):
+
+        raise exception.NotImplemented()
+
+
+
+    # role crud
+
+    def create_role(self, role_id, role):
+
+        """Creates a new role.
+
+
+
+        :raises: keystone.exception.Conflict
+
+
+
+        """
+
+        raise exception.NotImplemented()
+
+
+
+    def update_role(self, role_id, role):
+
+        """Updates an existing role.
+
+
+
+        :raises: keystone.exception.RoleNotFound, keystone.exception.Conflict
+
+
+
+        """
+
+        raise exception.NotImplemented()
+
+
+
+    def delete_role(self, role_id):
+
+        """Deletes an existing role.
+
+
+
+        :raises: keystone.exception.RoleNotFound
+
+
+
+        """
+
+        raise exception.NotImplemented()
+
+
+
+
+
+class PublicRouter(wsgi.ComposableRouter):
+
+    def add_routes(self, mapper):
+
+        tenant_controller = TenantController()
+
+        mapper.connect('/tenants',
+
+                       controller=tenant_controller,
+
+                       action='get_tenants_for_token',
+
+                       conditions=dict(method=['GET']))
+
+
+
+
+
+class AdminRouter(wsgi.ComposableRouter):
+
+    def add_routes(self, mapper):
+
+        # Tenant Operations
+
+        tenant_controller = TenantController()
+
+        mapper.connect('/tenants',
+
+                       controller=tenant_controller,
+
+                       action='get_all_tenants',
+
+                       conditions=dict(method=['GET']))
+
+        mapper.connect('/tenants/{tenant_id}',
+
+                       controller=tenant_controller,
+
+                       action='get_tenant',
+
+                       conditions=dict(method=['GET']))
+
+
+
+        # User Operations
+
+        user_controller = UserController()
+
+        mapper.connect('/users/{user_id}',
+
+                       controller=user_controller,
+
+                       action='get_user',
+
+                       conditions=dict(method=['GET']))
+
+
+
+        # Role Operations
+
+        roles_controller = RoleController()
+
+        mapper.connect('/tenants/{tenant_id}/users/{user_id}/roles',
+
+                       controller=roles_controller,
+
+                       action='get_user_roles',
+
+                       conditions=dict(method=['GET']))
+
+        mapper.connect('/users/{user_id}/roles',
+
+                       controller=roles_controller,
+
+                       action='get_user_roles',
+
+                       conditions=dict(method=['GET']))
+
+
+
+
+
+class TenantController(wsgi.Application):
+
+    def __init__(self):
+
+        self.identity_api = Manager()
+
+        self.policy_api = policy.Manager()
+
+        self.token_api = token.Manager()
+
+        super(TenantController, self).__init__()
+
+
+
+    def get_all_tenants(self, context, **kw):
+
+        """Gets a list of all tenants for an admin user."""
+
+        self.assert_admin(context)
+
+        tenant_refs = self.identity_api.get_tenants(context)
+
+        params = {
+
+            'limit': context['query_string'].get('limit'),
+
+            'marker': context['query_string'].get('marker'),
 
         }
 
+        return self._format_tenant_list(tenant_refs, **params)
 
 
-    async def on_pdu_request(
 
-        self, origin: str, event_id: str
+    def get_tenants_for_token(self, context, **kw):
 
-    ) -> Tuple[int, Union[JsonDict, str]]:
+        """Get valid tenants for token based on token used to authenticate.
 
-        pdu = await self.handler.get_persisted_pdu(origin, event_id)
 
 
+        Pulls the token from the context, validates it and gets the valid
 
-        if pdu:
+        tenants for the user in the token.
 
-            return 200, self._transaction_from_pdus([pdu]).get_dict()
 
-        else:
 
-            return 404, ""
+        Doesn't care about token scopedness.
 
 
-
-    async def on_query_request(
-
-        self, query_type: str, args: Dict[str, str]
-
-    ) -> Tuple[int, Dict[str, Any]]:
-
-        received_queries_counter.labels(query_type).inc()
-
-        resp = await self.registry.on_query(query_type, args)
-
-        return 200, resp
-
-
-
-    async def on_make_join_request(
-
-        self, origin: str, room_id: str, user_id: str, supported_versions: List[str]
-
-    ) -> Dict[str, Any]:
-
-        origin_host, _ = parse_server_name(origin)
-
-        await self.check_server_matches_acl(origin_host, room_id)
-
-
-
-        room_version = await self.store.get_room_version_id(room_id)
-
-        if room_version not in supported_versions:
-
-            logger.warning(
-
-                "Room version %s not in %s", room_version, supported_versions
-
-            )
-
-            raise IncompatibleRoomVersionError(room_version=room_version)
-
-
-
-        pdu = await self.handler.on_make_join_request(origin, room_id, user_id)
-
-        time_now = self._clock.time_msec()
-
-        return {"event": pdu.get_pdu_json(time_now), "room_version": room_version}
-
-
-
-    async def on_invite_request(
-
-        self, origin: str, content: JsonDict, room_version_id: str
-
-    ) -> Dict[str, Any]:
-
-        room_version = KNOWN_ROOM_VERSIONS.get(room_version_id)
-
-        if not room_version:
-
-            raise SynapseError(
-
-                400,
-
-                "Homeserver does not support this room version",
-
-                Codes.UNSUPPORTED_ROOM_VERSION,
-
-            )
-
-
-
-        pdu = event_from_pdu_json(content, room_version)
-
-        origin_host, _ = parse_server_name(origin)
-
-        await self.check_server_matches_acl(origin_host, pdu.room_id)
-
-        pdu = await self._check_sigs_and_hash(room_version, pdu)
-
-        ret_pdu = await self.handler.on_invite_request(origin, pdu, room_version)
-
-        time_now = self._clock.time_msec()
-
-        return {"event": ret_pdu.get_pdu_json(time_now)}
-
-
-
-    async def on_send_join_request(
-
-        self, origin: str, content: JsonDict
-
-    ) -> Dict[str, Any]:
-
-        logger.debug("on_send_join_request: content: %s", content)
-
-
-
-        assert_params_in_dict(content, ["room_id"])
-
-        room_version = await self.store.get_room_version(content["room_id"])
-
-        pdu = event_from_pdu_json(content, room_version)
-
-
-
-        origin_host, _ = parse_server_name(origin)
-
-        await self.check_server_matches_acl(origin_host, pdu.room_id)
-
-
-
-        logger.debug("on_send_join_request: pdu sigs: %s", pdu.signatures)
-
-
-
-        pdu = await self._check_sigs_and_hash(room_version, pdu)
-
-
-
-        res_pdus = await self.handler.on_send_join_request(origin, pdu)
-
-        time_now = self._clock.time_msec()
-
-        return {
-
-            "state": [p.get_pdu_json(time_now) for p in res_pdus["state"]],
-
-            "auth_chain": [p.get_pdu_json(time_now) for p in res_pdus["auth_chain"]],
-
-        }
-
-
-
-    async def on_make_leave_request(
-
-        self, origin: str, room_id: str, user_id: str
-
-    ) -> Dict[str, Any]:
-
-        origin_host, _ = parse_server_name(origin)
-
-        await self.check_server_matches_acl(origin_host, room_id)
-
-        pdu = await self.handler.on_make_leave_request(origin, room_id, user_id)
-
-
-
-        room_version = await self.store.get_room_version_id(room_id)
-
-
-
-        time_now = self._clock.time_msec()
-
-        return {"event": pdu.get_pdu_json(time_now), "room_version": room_version}
-
-
-
-    async def on_send_leave_request(self, origin: str, content: JsonDict) -> dict:
-
-        logger.debug("on_send_leave_request: content: %s", content)
-
-
-
-        assert_params_in_dict(content, ["room_id"])
-
-        room_version = await self.store.get_room_version(content["room_id"])
-
-        pdu = event_from_pdu_json(content, room_version)
-
-
-
-        origin_host, _ = parse_server_name(origin)
-
-        await self.check_server_matches_acl(origin_host, pdu.room_id)
-
-
-
-        logger.debug("on_send_leave_request: pdu sigs: %s", pdu.signatures)
-
-
-
-        pdu = await self._check_sigs_and_hash(room_version, pdu)
-
-
-
-        await self.handler.on_send_leave_request(origin, pdu)
-
-        return {}
-
-
-
-    async def on_event_auth(
-
-        self, origin: str, room_id: str, event_id: str
-
-    ) -> Tuple[int, Dict[str, Any]]:
-
-        with (await self._server_linearizer.queue((origin, room_id))):
-
-            origin_host, _ = parse_server_name(origin)
-
-            await self.check_server_matches_acl(origin_host, room_id)
-
-
-
-            time_now = self._clock.time_msec()
-
-            auth_pdus = await self.handler.on_event_auth(event_id)
-
-            res = {"auth_chain": [a.get_pdu_json(time_now) for a in auth_pdus]}
-
-        return 200, res
-
-
-
-    @log_function
-
-    async def on_query_client_keys(
-
-        self, origin: str, content: Dict[str, str]
-
-    ) -> Tuple[int, Dict[str, Any]]:
-
-        return await self.on_query_request("client_keys", content)
-
-
-
-    async def on_query_user_devices(
-
-        self, origin: str, user_id: str
-
-    ) -> Tuple[int, Dict[str, Any]]:
-
-        keys = await self.device_handler.on_federation_query_user_devices(user_id)
-
-        return 200, keys
-
-
-
-    @trace
-
-    async def on_claim_client_keys(
-
-        self, origin: str, content: JsonDict
-
-    ) -> Dict[str, Any]:
-
-        query = []
-
-        for user_id, device_keys in content.get("one_time_keys", {}).items():
-
-            for device_id, algorithm in device_keys.items():
-
-                query.append((user_id, device_id, algorithm))
-
-
-
-        log_kv({"message": "Claiming one time keys.", "user, device pairs": query})
-
-        results = await self.store.claim_e2e_one_time_keys(query)
-
-
-
-        json_result = {}  # type: Dict[str, Dict[str, dict]]
-
-        for user_id, device_keys in results.items():
-
-            for device_id, keys in device_keys.items():
-
-                for key_id, json_str in keys.items():
-
-                    json_result.setdefault(user_id, {})[device_id] = {
-
-                        key_id: json_decoder.decode(json_str)
-
-                    }
-
-
-
-        logger.info(
-
-            "Claimed one-time-keys: %s",
-
-            ",".join(
-
-                (
-
-                    "%s for %s:%s" % (key_id, user_id, device_id)
-
-                    for user_id, user_keys in json_result.items()
-
-                    for device_id, device_keys in user_keys.items()
-
-                    for key_id, _ in device_keys.items()
-
-                )
-
-            ),
-
-        )
-
-
-
-        return {"one_time_keys": json_result}
-
-
-
-    async def on_get_missing_events(
-
-        self,
-
-        origin: str,
-
-        room_id: str,
-
-        earliest_events: List[str],
-
-        latest_events: List[str],
-
-        limit: int,
-
-    ) -> Dict[str, list]:
-
-        with (await self._server_linearizer.queue((origin, room_id))):
-
-            origin_host, _ = parse_server_name(origin)
-
-            await self.check_server_matches_acl(origin_host, room_id)
-
-
-
-            logger.debug(
-
-                "on_get_missing_events: earliest_events: %r, latest_events: %r,"
-
-                " limit: %d",
-
-                earliest_events,
-
-                latest_events,
-
-                limit,
-
-            )
-
-
-
-            missing_events = await self.handler.on_get_missing_events(
-
-                origin, room_id, earliest_events, latest_events, limit
-
-            )
-
-
-
-            if len(missing_events) < 5:
-
-                logger.debug(
-
-                    "Returning %d events: %r", len(missing_events), missing_events
-
-                )
-
-            else:
-
-                logger.debug("Returning %d events", len(missing_events))
-
-
-
-            time_now = self._clock.time_msec()
-
-
-
-        return {"events": [ev.get_pdu_json(time_now) for ev in missing_events]}
-
-
-
-    @log_function
-
-    async def on_openid_userinfo(self, token: str) -> Optional[str]:
-
-        ts_now_ms = self._clock.time_msec()
-
-        return await self.store.get_user_id_for_open_id_token(token, ts_now_ms)
-
-
-
-    def _transaction_from_pdus(self, pdu_list: List[EventBase]) -> Transaction:
-
-        """Returns a new Transaction containing the given PDUs suitable for
-
-        transmission.
 
         """
-
-        time_now = self._clock.time_msec()
-
-        pdus = [p.get_pdu_json(time_now) for p in pdu_list]
-
-        return Transaction(
-
-            origin=self.server_name,
-
-            pdus=pdus,
-
-            origin_server_ts=int(time_now),
-
-            destination=None,
-
-        )
-
-
-
-    async def _handle_received_pdu(self, origin: str, pdu: EventBase) -> None:
-
-        """ Process a PDU received in a federation /send/ transaction.
-
-
-
-        If the event is invalid, then this method throws a FederationError.
-
-        (The error will then be logged and sent back to the sender (which
-
-        probably won't do anything with it), and other events in the
-
-        transaction will be processed as normal).
-
-
-
-        It is likely that we'll then receive other events which refer to
-
-        this rejected_event in their prev_events, etc.  When that happens,
-
-        we'll attempt to fetch the rejected event again, which will presumably
-
-        fail, so those second-generation events will also get rejected.
-
-
-
-        Eventually, we get to the point where there are more than 10 events
-
-        between any new events and the original rejected event. Since we
-
-        only try to backfill 10 events deep on received pdu, we then accept the
-
-        new event, possibly introducing a discontinuity in the DAG, with new
-
-        forward extremities, so normal service is approximately returned,
-
-        until we try to backfill across the discontinuity.
-
-
-
-        Args:
-
-            origin: server which sent the pdu
-
-            pdu: received pdu
-
-
-
-        Raises: FederationError if the signatures / hash do not match, or
-
-            if the event was unacceptable for any other reason (eg, too large,
-
-            too many prev_events, couldn't find the prev_events)
-
-        """
-
-        # check that it's actually being sent from a valid destination to
-
-        # workaround bug #1753 in 0.18.5 and 0.18.6
-
-        if origin != get_domain_from_id(pdu.sender):
-
-            # We continue to accept join events from any server; this is
-
-            # necessary for the federation join dance to work correctly.
-
-            # (When we join over federation, the "helper" server is
-
-            # responsible for sending out the join event, rather than the
-
-            # origin. See bug #1893. This is also true for some third party
-
-            # invites).
-
-            if not (
-
-                pdu.type == "m.room.member"
-
-                and pdu.content
-
-                and pdu.content.get("membership", None)
-
-                in (Membership.JOIN, Membership.INVITE)
-
-            ):
-
-                logger.info(
-
-                    "Discarding PDU %s from invalid origin %s", pdu.event_id, origin
-
-                )
-
-                return
-
-            else:
-
-                logger.info("Accepting join PDU %s from %s", pdu.event_id, origin)
-
-
-
-        # We've already checked that we know the room version by this point
-
-        room_version = await self.store.get_room_version(pdu.room_id)
-
-
-
-        # Check signature.
 
         try:
 
-            pdu = await self._check_sigs_and_hash(room_version, pdu)
+            token_ref = self.token_api.get_token(context=context,
 
-        except SynapseError as e:
+                                                 token_id=context['token_id'])
 
-            raise FederationError("ERROR", e.code, e.msg, affected=pdu.event_id)
+        except exception.NotFound:
 
+            raise exception.Unauthorized()
 
 
-        await self.handler.on_receive_pdu(origin, pdu, sent_to_us_directly=True)
 
+        user_ref = token_ref['user']
 
+        tenant_ids = self.identity_api.get_tenants_for_user(
 
-    def __str__(self):
+            context, user_ref['id'])
 
-        return "<ReplicationLayer(%s)>" % self.server_name
+        tenant_refs = []
 
+        for tenant_id in tenant_ids:
 
+            tenant_refs.append(self.identity_api.get_tenant(
 
-    async def exchange_third_party_invite(
+                context=context,
 
-        self, sender_user_id: str, target_user_id: str, room_id: str, signed: Dict
+                tenant_id=tenant_id))
 
-    ):
+        params = {
 
-        ret = await self.handler.exchange_third_party_invite(
+            'limit': context['query_string'].get('limit'),
 
-            sender_user_id, target_user_id, room_id, signed
+            'marker': context['query_string'].get('marker'),
 
-        )
+        }
 
-        return ret
+        return self._format_tenant_list(tenant_refs, **params)
 
 
 
-    async def on_exchange_third_party_invite_request(self, event_dict: Dict):
+    def get_tenant(self, context, tenant_id):
 
-        ret = await self.handler.on_exchange_third_party_invite_request(event_dict)
+        # TODO(termie): this stuff should probably be moved to middleware
 
-        return ret
+        self.assert_admin(context)
 
+        return {'tenant': self.identity_api.get_tenant(context, tenant_id)}
 
 
-    async def check_server_matches_acl(self, server_name: str, room_id: str):
 
-        """Check if the given server is allowed by the server ACLs in the room
+    # CRUD Extension
 
+    def create_tenant(self, context, tenant):
 
+        tenant_ref = self._normalize_dict(tenant)
 
-        Args:
 
-            server_name: name of server, *without any port part*
 
-            room_id: ID of the room to check
+        if not 'name' in tenant_ref or not tenant_ref['name']:
 
+            msg = 'Name field is required and cannot be empty'
 
+            raise exception.ValidationError(message=msg)
 
-        Raises:
 
-            AuthError if the server does not match the ACL
 
-        """
+        self.assert_admin(context)
 
-        state_ids = await self.store.get_current_state_ids(room_id)
+        tenant_ref['id'] = tenant_ref.get('id', uuid.uuid4().hex)
 
-        acl_event_id = state_ids.get((EventTypes.ServerACL, ""))
+        tenant = self.identity_api.create_tenant(
 
+            context, tenant_ref['id'], tenant_ref)
 
+        return {'tenant': tenant}
 
-        if not acl_event_id:
 
-            return
 
+    def update_tenant(self, context, tenant_id, tenant):
 
+        self.assert_admin(context)
 
-        acl_event = await self.store.get_event(acl_event_id)
+        tenant_ref = self.identity_api.update_tenant(
 
-        if server_matches_acl_event(server_name, acl_event):
+            context, tenant_id, tenant)
 
-            return
+        return {'tenant': tenant_ref}
 
 
 
-        raise AuthError(code=403, msg="Server is banned from room")
+    def delete_tenant(self, context, tenant_id):
 
+        self.assert_admin(context)
 
+        self.identity_api.delete_tenant(context, tenant_id)
 
 
 
-def server_matches_acl_event(server_name: str, acl_event: EventBase) -> bool:
+    def get_tenant_users(self, context, tenant_id, **kw):
 
-    """Check if the given server is allowed by the ACL event
+        self.assert_admin(context)
 
+        user_refs = self.identity_api.get_tenant_users(context, tenant_id)
 
+        return {'users': user_refs}
 
-    Args:
 
-        server_name: name of server, without any port part
 
-        acl_event: m.room.server_acl event
+    def _format_tenant_list(self, tenant_refs, **kwargs):
 
+        marker = kwargs.get('marker')
 
+        first_index = 0
 
-    Returns:
+        if marker is not None:
 
-        True if this server is allowed by the ACLs
+            for (marker_index, tenant) in enumerate(tenant_refs):
 
-    """
+                if tenant['id'] == marker:
 
-    logger.debug("Checking %s against acl %s", server_name, acl_event.content)
+                    # we start pagination after the marker
 
+                    first_index = marker_index + 1
 
+                    break
 
-    # first of all, check if literal IPs are blocked, and if so, whether the
+            else:
 
-    # server name is a literal IP
+                msg = 'Marker could not be found'
 
-    allow_ip_literals = acl_event.content.get("allow_ip_literals", True)
+                raise exception.ValidationError(message=msg)
 
-    if not isinstance(allow_ip_literals, bool):
 
-        logger.warning("Ignoring non-bool allow_ip_literals flag")
 
-        allow_ip_literals = True
+        limit = kwargs.get('limit')
 
-    if not allow_ip_literals:
+        last_index = None
 
-        # check for ipv6 literals. These start with '['.
-
-        if server_name[0] == "[":
-
-            return False
-
-
-
-        # check for ipv4 literals. We can just lift the routine from twisted.
-
-        if isIPAddress(server_name):
-
-            return False
-
-
-
-    # next,  check the deny list
-
-    deny = acl_event.content.get("deny", [])
-
-    if not isinstance(deny, (list, tuple)):
-
-        logger.warning("Ignoring non-list deny ACL %s", deny)
-
-        deny = []
-
-    for e in deny:
-
-        if _acl_entry_matches(server_name, e):
-
-            # logger.info("%s matched deny rule %s", server_name, e)
-
-            return False
-
-
-
-    # then the allow list.
-
-    allow = acl_event.content.get("allow", [])
-
-    if not isinstance(allow, (list, tuple)):
-
-        logger.warning("Ignoring non-list allow ACL %s", allow)
-
-        allow = []
-
-    for e in allow:
-
-        if _acl_entry_matches(server_name, e):
-
-            # logger.info("%s matched allow rule %s", server_name, e)
-
-            return True
-
-
-
-    # everything else should be rejected.
-
-    # logger.info("%s fell through", server_name)
-
-    return False
-
-
-
-
-
-def _acl_entry_matches(server_name: str, acl_entry: Any) -> bool:
-
-    if not isinstance(acl_entry, str):
-
-        logger.warning(
-
-            "Ignoring non-str ACL entry '%s' (is %s)", acl_entry, type(acl_entry)
-
-        )
-
-        return False
-
-    regex = glob_to_regex(acl_entry)
-
-    return bool(regex.match(server_name))
-
-
-
-
-
-class FederationHandlerRegistry:
-
-    """Allows classes to register themselves as handlers for a given EDU or
-
-    query type for incoming federation traffic.
-
-    """
-
-
-
-    def __init__(self, hs: "HomeServer"):
-
-        self.config = hs.config
-
-        self.http_client = hs.get_simple_http_client()
-
-        self.clock = hs.get_clock()
-
-        self._instance_name = hs.get_instance_name()
-
-
-
-        # These are safe to load in monolith mode, but will explode if we try
-
-        # and use them. However we have guards before we use them to ensure that
-
-        # we don't route to ourselves, and in monolith mode that will always be
-
-        # the case.
-
-        self._get_query_client = ReplicationGetQueryRestServlet.make_client(hs)
-
-        self._send_edu = ReplicationFederationSendEduRestServlet.make_client(hs)
-
-
-
-        self.edu_handlers = (
-
-            {}
-
-        )  # type: Dict[str, Callable[[str, dict], Awaitable[None]]]
-
-        self.query_handlers = {}  # type: Dict[str, Callable[[dict], Awaitable[None]]]
-
-
-
-        # Map from type to instance name that we should route EDU handling to.
-
-        self._edu_type_to_instance = {}  # type: Dict[str, str]
-
-
-
-    def register_edu_handler(
-
-        self, edu_type: str, handler: Callable[[str, JsonDict], Awaitable[None]]
-
-    ):
-
-        """Sets the handler callable that will be used to handle an incoming
-
-        federation EDU of the given type.
-
-
-
-        Args:
-
-            edu_type: The type of the incoming EDU to register handler for
-
-            handler: A callable invoked on incoming EDU
-
-                of the given type. The arguments are the origin server name and
-
-                the EDU contents.
-
-        """
-
-        if edu_type in self.edu_handlers:
-
-            raise KeyError("Already have an EDU handler for %s" % (edu_type,))
-
-
-
-        logger.info("Registering federation EDU handler for %r", edu_type)
-
-
-
-        self.edu_handlers[edu_type] = handler
-
-
-
-    def register_query_handler(
-
-        self, query_type: str, handler: Callable[[dict], defer.Deferred]
-
-    ):
-
-        """Sets the handler callable that will be used to handle an incoming
-
-        federation query of the given type.
-
-
-
-        Args:
-
-            query_type: Category name of the query, which should match
-
-                the string used by make_query.
-
-            handler: Invoked to handle
-
-                incoming queries of this type. The return will be yielded
-
-                on and the result used as the response to the query request.
-
-        """
-
-        if query_type in self.query_handlers:
-
-            raise KeyError("Already have a Query handler for %s" % (query_type,))
-
-
-
-        logger.info("Registering federation query handler for %r", query_type)
-
-
-
-        self.query_handlers[query_type] = handler
-
-
-
-    def register_instance_for_edu(self, edu_type: str, instance_name: str):
-
-        """Register that the EDU handler is on a different instance than master.
-
-        """
-
-        self._edu_type_to_instance[edu_type] = instance_name
-
-
-
-    async def on_edu(self, edu_type: str, origin: str, content: dict):
-
-        if not self.config.use_presence and edu_type == "m.presence":
-
-            return
-
-
-
-        # Check if we have a handler on this instance
-
-        handler = self.edu_handlers.get(edu_type)
-
-        if handler:
-
-            with start_active_span_from_edu(content, "handle_edu"):
-
-                try:
-
-                    await handler(origin, content)
-
-                except SynapseError as e:
-
-                    logger.info("Failed to handle edu %r: %r", edu_type, e)
-
-                except Exception:
-
-                    logger.exception("Failed to handle edu %r", edu_type)
-
-            return
-
-
-
-        # Check if we can route it somewhere else that isn't us
-
-        route_to = self._edu_type_to_instance.get(edu_type, "master")
-
-        if route_to != self._instance_name:
+        if limit is not None:
 
             try:
 
-                await self._send_edu(
+                limit = int(limit)
 
-                    instance_name=route_to,
+                if limit < 0:
 
-                    edu_type=edu_type,
+                    raise AssertionError()
 
-                    origin=origin,
+            except (ValueError, AssertionError):
 
-                    content=content,
+                msg = 'Invalid limit value'
 
-                )
+                raise exception.ValidationError(message=msg)
 
-            except SynapseError as e:
-
-                logger.info("Failed to handle edu %r: %r", edu_type, e)
-
-            except Exception:
-
-                logger.exception("Failed to handle edu %r", edu_type)
-
-            return
+            last_index = first_index + limit
 
 
 
-        # Oh well, let's just log and move on.
-
-        logger.warning("No handler registered for EDU type %s", edu_type)
+        tenant_refs = tenant_refs[first_index:last_index]
 
 
 
-    async def on_query(self, query_type: str, args: dict):
+        for x in tenant_refs:
 
-        handler = self.query_handlers.get(query_type)
+            if 'enabled' not in x:
 
-        if handler:
+                x['enabled'] = True
 
-            return await handler(args)
+        o = {'tenants': tenant_refs,
 
+             'tenants_links': []}
 
-
-        # Check if we can route it somewhere else that isn't us
-
-        if self._instance_name == "master":
-
-            return await self._get_query_client(query_type=query_type, args=args)
+        return o
 
 
 
-        # Uh oh, no handler! Let's raise an exception so the request returns an
 
-        # error.
 
-        logger.warning("No handler registered for query type %s", query_type)
+class UserController(wsgi.Application):
 
-        raise NotFoundError("No handler for Query type '%s'" % (query_type,))
+    def __init__(self):
+
+        self.identity_api = Manager()
+
+        self.policy_api = policy.Manager()
+
+        self.token_api = token.Manager()
+
+        super(UserController, self).__init__()
+
+
+
+    def get_user(self, context, user_id):
+
+        self.assert_admin(context)
+
+        return {'user': self.identity_api.get_user(context, user_id)}
+
+
+
+    def get_users(self, context):
+
+        # NOTE(termie): i can't imagine that this really wants all the data
+
+        #               about every single user in the system...
+
+        self.assert_admin(context)
+
+        return {'users': self.identity_api.list_users(context)}
+
+
+
+    # CRUD extension
+
+    def create_user(self, context, user):
+
+        user = self._normalize_dict(user)
+
+        self.assert_admin(context)
+
+
+
+        if not 'name' in user or not user['name']:
+
+            msg = 'Name field is required and cannot be empty'
+
+            raise exception.ValidationError(message=msg)
+
+
+
+        tenant_id = user.get('tenantId', None)
+
+        if (tenant_id is not None
+
+                and self.identity_api.get_tenant(context, tenant_id) is None):
+
+            raise exception.TenantNotFound(tenant_id=tenant_id)
+
+        user_id = uuid.uuid4().hex
+
+        user_ref = user.copy()
+
+        user_ref['id'] = user_id
+
+        new_user_ref = self.identity_api.create_user(
+
+            context, user_id, user_ref)
+
+        if tenant_id:
+
+            self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
+
+        return {'user': new_user_ref}
+
+
+
+    def update_user(self, context, user_id, user):
+
+        # NOTE(termie): this is really more of a patch than a put
+
+        self.assert_admin(context)
+
+        user_ref = self.identity_api.update_user(context, user_id, user)
+
+
+
+        # If the password was changed or the user was disabled we clear tokens
+
+        if user.get('password') or not user.get('enabled', True):
+
+            try:
+
+                for token_id in self.token_api.list_tokens(context, user_id):
+
+                    self.token_api.delete_token(context, token_id)
+
+            except exception.NotImplemented:
+
+                # The users status has been changed but tokens remain valid for
+
+                # backends that can't list tokens for users
+
+                LOG.warning('User %s status has changed, but existing tokens '
+
+                            'remain valid' % user_id)
+
+        return {'user': user_ref}
+
+
+
+    def delete_user(self, context, user_id):
+
+        self.assert_admin(context)
+
+        self.identity_api.delete_user(context, user_id)
+
+
+
+    def set_user_enabled(self, context, user_id, user):
+
+        return self.update_user(context, user_id, user)
+
+
+
+    def set_user_password(self, context, user_id, user):
+
+        return self.update_user(context, user_id, user)
+
+
+
+    def update_user_tenant(self, context, user_id, user):
+
+        """Update the default tenant."""
+
+        self.assert_admin(context)
+
+        # ensure that we're a member of that tenant
+
+        tenant_id = user.get('tenantId')
+
+        self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
+
+        return self.update_user(context, user_id, user)
+
+
+
+
+
+class RoleController(wsgi.Application):
+
+    def __init__(self):
+
+        self.identity_api = Manager()
+
+        self.token_api = token.Manager()
+
+        self.policy_api = policy.Manager()
+
+        super(RoleController, self).__init__()
+
+
+
+    # COMPAT(essex-3)
+
+    def get_user_roles(self, context, user_id, tenant_id=None):
+
+        """Get the roles for a user and tenant pair.
+
+
+
+        Since we're trying to ignore the idea of user-only roles we're
+
+        not implementing them in hopes that the idea will die off.
+
+
+
+        """
+
+        self.assert_admin(context)
+
+        if tenant_id is None:
+
+            raise exception.NotImplemented(message='User roles not supported: '
+
+                                                   'tenant ID required')
+
+
+
+        roles = self.identity_api.get_roles_for_user_and_tenant(
+
+            context, user_id, tenant_id)
+
+        return {'roles': [self.identity_api.get_role(context, x)
+
+                          for x in roles]}
+
+
+
+    # CRUD extension
+
+    def get_role(self, context, role_id):
+
+        self.assert_admin(context)
+
+        return {'role': self.identity_api.get_role(context, role_id)}
+
+
+
+    def create_role(self, context, role):
+
+        role = self._normalize_dict(role)
+
+        self.assert_admin(context)
+
+
+
+        if not 'name' in role or not role['name']:
+
+            msg = 'Name field is required and cannot be empty'
+
+            raise exception.ValidationError(message=msg)
+
+
+
+        role_id = uuid.uuid4().hex
+
+        role['id'] = role_id
+
+        role_ref = self.identity_api.create_role(context, role_id, role)
+
+        return {'role': role_ref}
+
+
+
+    def delete_role(self, context, role_id):
+
+        self.assert_admin(context)
+
+        self.identity_api.delete_role(context, role_id)
+
+
+
+    def get_roles(self, context):
+
+        self.assert_admin(context)
+
+        return {'roles': self.identity_api.list_roles(context)}
+
+
+
+    def add_role_to_user(self, context, user_id, role_id, tenant_id=None):
+
+        """Add a role to a user and tenant pair.
+
+
+
+        Since we're trying to ignore the idea of user-only roles we're
+
+        not implementing them in hopes that the idea will die off.
+
+
+
+        """
+
+        self.assert_admin(context)
+
+        if tenant_id is None:
+
+            raise exception.NotImplemented(message='User roles not supported: '
+
+                                                   'tenant_id required')
+
+
+
+        # This still has the weird legacy semantics that adding a role to
+
+        # a user also adds them to a tenant
+
+        self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
+
+        self.identity_api.add_role_to_user_and_tenant(
+
+            context, user_id, tenant_id, role_id)
+
+        role_ref = self.identity_api.get_role(context, role_id)
+
+        return {'role': role_ref}
+
+
+
+    def remove_role_from_user(self, context, user_id, role_id, tenant_id=None):
+
+        """Remove a role from a user and tenant pair.
+
+
+
+        Since we're trying to ignore the idea of user-only roles we're
+
+        not implementing them in hopes that the idea will die off.
+
+
+
+        """
+
+        self.assert_admin(context)
+
+        if tenant_id is None:
+
+            raise exception.NotImplemented(message='User roles not supported: '
+
+                                                   'tenant_id required')
+
+
+
+        # This still has the weird legacy semantics that adding a role to
+
+        # a user also adds them to a tenant, so we must follow up on that
+
+        self.identity_api.remove_role_from_user_and_tenant(
+
+            context, user_id, tenant_id, role_id)
+
+        roles = self.identity_api.get_roles_for_user_and_tenant(
+
+            context, user_id, tenant_id)
+
+        if not roles:
+
+            self.identity_api.remove_user_from_tenant(
+
+                context, tenant_id, user_id)
+
+        return
+
+
+
+    # COMPAT(diablo): CRUD extension
+
+    def get_role_refs(self, context, user_id):
+
+        """Ultimate hack to get around having to make role_refs first-class.
+
+
+
+        This will basically iterate over the various roles the user has in
+
+        all tenants the user is a member of and create fake role_refs where
+
+        the id encodes the user-tenant-role information so we can look
+
+        up the appropriate data when we need to delete them.
+
+
+
+        """
+
+        self.assert_admin(context)
+
+        # Ensure user exists by getting it first.
+
+        self.identity_api.get_user(context, user_id)
+
+        tenant_ids = self.identity_api.get_tenants_for_user(context, user_id)
+
+        o = []
+
+        for tenant_id in tenant_ids:
+
+            role_ids = self.identity_api.get_roles_for_user_and_tenant(
+
+                context, user_id, tenant_id)
+
+            for role_id in role_ids:
+
+                ref = {'roleId': role_id,
+
+                       'tenantId': tenant_id,
+
+                       'userId': user_id}
+
+                ref['id'] = urllib.urlencode(ref)
+
+                o.append(ref)
+
+        return {'roles': o}
+
+
+
+    # COMPAT(diablo): CRUD extension
+
+    def create_role_ref(self, context, user_id, role):
+
+        """This is actually used for adding a user to a tenant.
+
+
+
+        In the legacy data model adding a user to a tenant required setting
+
+        a role.
+
+
+
+        """
+
+        self.assert_admin(context)
+
+        # TODO(termie): for now we're ignoring the actual role
+
+        tenant_id = role.get('tenantId')
+
+        role_id = role.get('roleId')
+
+        self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
+
+        self.identity_api.add_role_to_user_and_tenant(
+
+            context, user_id, tenant_id, role_id)
+
+        role_ref = self.identity_api.get_role(context, role_id)
+
+        return {'role': role_ref}
+
+
+
+    # COMPAT(diablo): CRUD extension
+
+    def delete_role_ref(self, context, user_id, role_ref_id):
+
+        """This is actually used for deleting a user from a tenant.
+
+
+
+        In the legacy data model removing a user from a tenant required
+
+        deleting a role.
+
+
+
+        To emulate this, we encode the tenant and role in the role_ref_id,
+
+        and if this happens to be the last role for the user-tenant pair,
+
+        we remove the user from the tenant.
+
+
+
+        """
+
+        self.assert_admin(context)
+
+        # TODO(termie): for now we're ignoring the actual role
+
+        role_ref_ref = urlparse.parse_qs(role_ref_id)
+
+        tenant_id = role_ref_ref.get('tenantId')[0]
+
+        role_id = role_ref_ref.get('roleId')[0]
+
+        self.identity_api.remove_role_from_user_and_tenant(
+
+            context, user_id, tenant_id, role_id)
+
+        roles = self.identity_api.get_roles_for_user_and_tenant(
+
+            context, user_id, tenant_id)
+
+        if not roles:
+
+            self.identity_api.remove_user_from_tenant(
+
+                context, tenant_id, user_id)

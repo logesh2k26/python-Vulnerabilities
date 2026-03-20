@@ -2,1570 +2,538 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-#!/usr/bin/python3
+import errno
 
-
-
-# This program is free software; you can redistribute it and/or modify it under
-
-# the terms of the GNU Lesser General Public License as published by the Free
-
-# Software Foundation; either version 3 of the License, or (at your option) any
-
-# later version.  See http://www.gnu.org/copyleft/lgpl.html for the full text
-
-# of the license.
-
-
-
-__author__ = 'Martin Pitt'
-
-__email__ = 'martin.pitt@ubuntu.com'
-
-__copyright__ = '(c) 2012 Canonical Ltd.'
-
-__license__ = 'LGPL 3+'
-
-
-
-import unittest
-
-import sys
+import logging
 
 import os
 
-import tempfile
+import uuid
 
-import subprocess
+import struct
 
 import time
 
+import base64
 
+import socket
 
-import dbus
 
-import dbus.mainloop.glib
 
+from ceph_deploy.cliutil import priority
 
+from ceph_deploy import conf, hosts, exc
 
-import dbusmock
+from ceph_deploy.util import arg_validators, ssh, net
 
+from ceph_deploy.misc import mon_hosts
 
+from ceph_deploy.lib import remoto
 
-from gi.repository import GLib
+from ceph_deploy.connection import get_local_connection
 
 
 
-dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
 
 
+LOG = logging.getLogger(__name__)
 
 
 
-class TestAPI(dbusmock.DBusTestCase):
 
-    '''Test dbus-mock API'''
 
+def generate_auth_key():
 
+    key = os.urandom(16)
 
-    @classmethod
+    header = struct.pack(
 
-    def setUpClass(klass):
+        '<hiih',
 
-        klass.start_session_bus()
+        1,                 # le16 type: CEPH_CRYPTO_AES
 
-        klass.dbus_con = klass.get_dbus()
+        int(time.time()),  # le32 created: seconds
 
+        0,                 # le32 created: nanoseconds,
 
+        len(key),          # le16: len(key)
 
-    def setUp(self):
+    )
 
-        self.mock_log = tempfile.NamedTemporaryFile()
+    return base64.b64encode(header + key)
 
-        self.p_mock = self.spawn_server('org.freedesktop.Test',
 
-                                        '/',
 
-                                        'org.freedesktop.Test.Main',
 
-                                        stdout=self.mock_log)
 
+def ssh_copy_keys(hostname, username=None):
 
+    LOG.info('making sure passwordless SSH succeeds')
 
-        self.obj_test = self.dbus_con.get_object('org.freedesktop.Test', '/')
+    if ssh.can_connect_passwordless(hostname):
 
-        self.dbus_test = dbus.Interface(self.obj_test, 'org.freedesktop.Test.Main')
+        return
 
-        self.dbus_mock = dbus.Interface(self.obj_test, dbusmock.MOCK_IFACE)
 
-        self.dbus_props = dbus.Interface(self.obj_test, dbus.PROPERTIES_IFACE)
 
+    LOG.warning('could not connect via SSH')
 
 
-    def tearDown(self):
 
-        self.p_mock.terminate()
+    # Create the key if it doesn't exist:
 
-        self.p_mock.wait()
+    id_rsa_pub_file = os.path.expanduser(u'~/.ssh/id_rsa.pub')
 
+    id_rsa_file = id_rsa_pub_file.split('.pub')[0]
 
+    if not os.path.exists(id_rsa_file):
 
-    def test_noarg_noret(self):
+        LOG.info('creating a passwordless id_rsa.pub key file')
 
-        '''no arguments, no return value'''
+        with get_local_connection(LOG) as conn:
 
+            remoto.process.run(
 
+                conn,
 
-        self.dbus_mock.AddMethod('', 'Do', '', '', '')
+                [
 
-        self.assertEqual(self.dbus_test.Do(), None)
+                    'ssh-keygen',
 
+                    '-t',
 
+                    'rsa',
 
-        # check that it's logged correctly
+                    '-N',
 
-        with open(self.mock_log.name) as f:
+                    "",
 
-            self.assertRegex(f.read(), '^[0-9.]+ Do$')
+                    '-f',
 
+                    id_rsa_file,
 
+                ]
 
-    def test_onearg_noret(self):
+            )
 
-        '''one argument, no return value'''
 
 
+    # Get the contents of id_rsa.pub and push it to the host
 
-        self.dbus_mock.AddMethod('', 'Do', 's', '', '')
+    LOG.info('will connect again with password prompt')
 
-        self.assertEqual(self.dbus_test.Do('Hello'), None)
+    distro = hosts.get(hostname, username, detect_sudo=False)
 
+    auth_keys_path = '.ssh/authorized_keys'
 
+    if not distro.conn.remote_module.path_exists(auth_keys_path):
 
-        # check that it's logged correctly
+        distro.conn.logger.warning(
 
-        with open(self.mock_log.name) as f:
+            '.ssh/authorized_keys does not exist, will skip adding keys'
 
-            self.assertRegex(f.read(), '^[0-9.]+ Do "Hello"$')
+        )
 
+    else:
 
+        LOG.info('adding public keys to authorized_keys')
 
-    def test_onearg_ret(self):
+        with open(os.path.expanduser('~/.ssh/id_rsa.pub'), 'r') as id_rsa:
 
-        '''one argument, code for return value'''
+            contents = id_rsa.read()
 
+        distro.conn.remote_module.append_to_file(
 
+            auth_keys_path,
 
-        self.dbus_mock.AddMethod('', 'Do', 's', 's', 'ret = args[0]')
+            contents
 
-        self.assertEqual(self.dbus_test.Do('Hello'), 'Hello')
+        )
 
+    distro.conn.exit()
 
 
-    def test_twoarg_ret(self):
 
-        '''two arguments, code for return value'''
 
 
+def validate_host_ip(ips, subnets):
 
-        self.dbus_mock.AddMethod('', 'Do', 'si', 's', 'ret = args[0] * args[1]')
+    """
 
-        self.assertEqual(self.dbus_test.Do('foo', 3), 'foofoofoo')
+    Make sure that a given host all subnets specified will have at least one IP
 
+    in that range.
 
+    """
 
-        # check that it's logged correctly
+    # Make sure we prune ``None`` arguments
 
-        with open(self.mock_log.name) as f:
+    subnets = [s for s in subnets if s is not None]
 
-            self.assertRegex(f.read(), '^[0-9.]+ Do "foo" 3$')
+    validate_one_subnet = len(subnets) == 1
 
 
 
-    def test_array_arg(self):
+    def ip_in_one_subnet(ips, subnet):
 
-        '''array argument'''
+        """ ensure an ip exists in at least one subnet """
 
+        for ip in ips:
 
+            if net.ip_in_subnet(ip, subnet):
 
-        self.dbus_mock.AddMethod('', 'Do', 'iaou', '',
+                return True
 
-                                 '''assert len(args) == 3
+        return False
 
-assert args[0] == -1;
 
-assert args[1] == ['/foo']
 
-assert type(args[1]) == dbus.Array
+    for subnet in subnets:
 
-assert type(args[1][0]) == dbus.ObjectPath
+        if ip_in_one_subnet(ips, subnet):
 
-assert args[2] == 5
+            if validate_one_subnet:
 
-''')
+                return
 
-        self.assertEqual(self.dbus_test.Do(-1, ['/foo'], 5), None)
+            else:  # keep going to make sure the other subnets are ok
 
+                continue
 
+        else:
 
-        # check that it's logged correctly
+            msg = "subnet (%s) is not valid for any of the ips found %s" % (subnet, str(ips))
 
-        with open(self.mock_log.name) as f:
+            raise RuntimeError(msg)
 
-            self.assertRegex(f.read(), '^[0-9.]+ Do -1 \["/foo"\] 5$')
 
 
 
-    def test_dict_arg(self):
 
-        '''dictionary argument'''
+def get_public_network_ip(ips, public_subnet):
 
+    """
 
+    Given a public subnet, chose the one IP from the remote host that exists
 
-        self.dbus_mock.AddMethod('', 'Do', 'ia{si}u', '',
+    within the subnet range.
 
-                                 '''assert len(args) == 3
+    """
 
-assert args[0] == -1;
+    for ip in ips:
 
-assert args[1] == {'foo': 42}
+        if net.ip_in_subnet(ip, public_subnet):
 
-assert type(args[1]) == dbus.Dictionary
+            return ip
 
-assert args[2] == 5
+    msg = "IPs (%s) are not valid for any of subnet specified %s" % (str(ips), str(public_subnet))
 
-''')
+    raise RuntimeError(msg)
 
-        self.assertEqual(self.dbus_test.Do(-1, {'foo': 42}, 5), None)
 
 
 
-        # check that it's logged correctly
 
-        with open(self.mock_log.name) as f:
+def new(args):
 
-            self.assertRegex(f.read(), '^[0-9.]+ Do -1 {"foo": 42} 5$')
+    if args.ceph_conf:
 
+        raise RuntimeError('will not create a ceph conf file if attemtping to re-use with `--ceph-conf` flag')
 
+    LOG.debug('Creating new cluster named %s', args.cluster)
 
-    def test_methods_on_other_interfaces(self):
+    cfg = conf.ceph.CephConf()
 
-        '''methods on other interfaces'''
+    cfg.add_section('global')
 
 
 
-        self.dbus_mock.AddMethod('org.freedesktop.Test.Other', 'OtherDo', '', '', '')
+    fsid = args.fsid or uuid.uuid4()
 
-        self.dbus_mock.AddMethods('org.freedesktop.Test.Other',
+    cfg.set('global', 'fsid', str(fsid))
 
-                                  [('OtherDo2', '', '', ''),
 
-                                   ('OtherDo3', 'i', 'i', 'ret = args[0]')])
 
+    # if networks were passed in, lets set them in the
 
+    # global section
 
-        # should not be on the main interface
+    if args.public_network:
 
-        self.assertRaises(dbus.exceptions.DBusException,
+        cfg.set('global', 'public network', str(args.public_network))
 
-                          self.dbus_test.OtherDo)
 
 
+    if args.cluster_network:
 
-        # should be on the other interface
+        cfg.set('global', 'cluster network', str(args.cluster_network))
 
-        self.assertEqual(self.obj_test.OtherDo(dbus_interface='org.freedesktop.Test.Other'), None)
 
-        self.assertEqual(self.obj_test.OtherDo2(dbus_interface='org.freedesktop.Test.Other'), None)
 
-        self.assertEqual(self.obj_test.OtherDo3(42, dbus_interface='org.freedesktop.Test.Other'), 42)
+    mon_initial_members = []
 
+    mon_host = []
 
 
-        # check that it's logged correctly
 
-        with open(self.mock_log.name) as f:
+    for (name, host) in mon_hosts(args.mon):
 
-            self.assertRegex(f.read(), '^[0-9.]+ OtherDo\n[0-9.]+ OtherDo2\n[0-9.]+ OtherDo3 42$')
+        # Try to ensure we can ssh in properly before anything else
 
+        if args.ssh_copykey:
 
+            ssh_copy_keys(host, args.username)
 
-    def test_methods_same_name(self):
 
-        '''methods with same name on different interfaces'''
 
+        # Now get the non-local IPs from the remote node
 
+        distro = hosts.get(host, username=args.username)
 
-        self.dbus_mock.AddMethod('org.iface1', 'Do', 'i', 'i', 'ret = args[0] + 2')
+        remote_ips = net.ip_addresses(distro.conn)
 
-        self.dbus_mock.AddMethod('org.iface2', 'Do', 'i', 'i', 'ret = args[0] + 3')
+        distro.conn.exit()
 
 
 
-        # should not be on the main interface
+        # Validate subnets if we received any
 
-        self.assertRaises(dbus.exceptions.DBusException,
+        if args.public_network or args.cluster_network:
 
-                          self.dbus_test.Do)
+            validate_host_ip(remote_ips, [args.public_network, args.cluster_network])
 
 
 
-        # should be on the other interface
+        # Pick the IP that matches the public cluster (if we were told to do
 
-        self.assertEqual(self.obj_test.Do(10, dbus_interface='org.iface1'), 12)
+        # so) otherwise pick the first, non-local IP
 
-        self.assertEqual(self.obj_test.Do(11, dbus_interface='org.iface2'), 14)
+        LOG.debug('Resolving host %s', host)
 
+        if args.public_network:
 
+            ip = get_public_network_ip(remote_ips, args.public_network)
 
-        # check that it's logged correctly
+        else:
 
-        with open(self.mock_log.name) as f:
+            ip = net.get_nonlocal_ip(host)
 
-            self.assertRegex(f.read(), '^[0-9.]+ Do 10\n[0-9.]+ Do 11$')
+        LOG.debug('Monitor %s at %s', name, ip)
 
+        mon_initial_members.append(name)
 
+        try:
 
-        # now add it to the primary interface, too
+            socket.inet_pton(socket.AF_INET6, ip)
 
-        self.dbus_mock.AddMethod('', 'Do', 'i', 'i', 'ret = args[0] + 1')
+            mon_host.append("[" + ip + "]")
 
-        self.assertEqual(self.obj_test.Do(9, dbus_interface='org.freedesktop.Test.Main'), 10)
+            LOG.info('Monitors are IPv6, binding Messenger traffic on IPv6')
 
-        self.assertEqual(self.obj_test.Do(10, dbus_interface='org.iface1'), 12)
+            cfg.set('global', 'ms bind ipv6', 'true')
 
-        self.assertEqual(self.obj_test.Do(11, dbus_interface='org.iface2'), 14)
+        except socket.error:
 
+            mon_host.append(ip)
 
 
-    def test_methods_type_mismatch(self):
 
-        '''calling methods with wrong arguments'''
 
 
 
-        def check(signature, args, err):
 
-            self.dbus_mock.AddMethod('', 'Do', signature, '', '')
+    LOG.debug('Monitor initial members are %s', mon_initial_members)
 
-            try:
+    LOG.debug('Monitor addrs are %s', mon_host)
 
-                self.dbus_test.Do(*args)
 
-                self.fail('method call did not raise an error for signature "%s" and arguments %s'
 
-                          % (signature, args))
+    cfg.set('global', 'mon initial members', ', '.join(mon_initial_members))
 
-            except dbus.exceptions.DBusException as e:
+    # no spaces here, see http://tracker.newdream.net/issues/3145
 
-                self.assertTrue(err in str(e), e)
+    cfg.set('global', 'mon host', ','.join(mon_host))
 
 
 
-        # not enough arguments
+    # override undesirable defaults, needed until bobtail
 
-        check('i', [], 'TypeError: More items found')
 
-        check('is', [1], 'TypeError: More items found')
 
+    # http://tracker.ceph.com/issues/6788
 
+    cfg.set('global', 'auth cluster required', 'cephx')
 
-        # too many arguments
+    cfg.set('global', 'auth service required', 'cephx')
 
-        check('', [1], 'TypeError: Fewer items found')
+    cfg.set('global', 'auth client required', 'cephx')
 
-        check('i', [1, 'hello'], 'TypeError: Fewer items found')
 
 
+    # http://tracker.newdream.net/issues/3138
 
-        # type mismatch
+    cfg.set('global', 'filestore xattr use omap', 'true')
 
-        check('u', [-1], 'convert negative value to unsigned')
 
-        check('i', ['hello'], 'TypeError: an integer is required')
 
-        check('s', [1], 'TypeError: Expected a string')
+    path = '{name}.conf'.format(
 
+        name=args.cluster,
 
+        )
 
-    def test_add_object(self):
 
-        '''add a new object'''
 
+    new_mon_keyring(args)
 
 
-        self.dbus_mock.AddObject('/obj1',
 
-                                 'org.freedesktop.Test.Sub',
+    LOG.debug('Writing initial config to %s...', path)
 
-                                 {
+    tmp = '%s.tmp' % path
 
-                                     'state': dbus.String('online', variant_level=1),
+    with file(tmp, 'w') as f:
 
-                                     'cute': dbus.Boolean(True, variant_level=1),
+        cfg.write(f)
 
-                                 },
+    try:
 
-                                 [])
+        os.rename(tmp, path)
 
+    except OSError as e:
 
+        if e.errno == errno.EEXIST:
 
-        obj1 = self.dbus_con.get_object('org.freedesktop.Test', '/obj1')
+            raise exc.ClusterExistsError(path)
 
-        dbus_sub = dbus.Interface(obj1, 'org.freedesktop.Test.Sub')
+        else:
 
-        dbus_props = dbus.Interface(obj1, dbus.PROPERTIES_IFACE)
+            raise
 
 
 
-        # check properties
 
-        self.assertEqual(dbus_props.Get('org.freedesktop.Test.Sub', 'state'), 'online')
 
-        self.assertEqual(dbus_props.Get('org.freedesktop.Test.Sub', 'cute'), True)
+def new_mon_keyring(args):
 
-        self.assertEqual(dbus_props.GetAll('org.freedesktop.Test.Sub'),
+    LOG.debug('Creating a random mon key...')
 
-                         {'state': 'online', 'cute': True})
+    mon_keyring = '[mon.]\nkey = %s\ncaps mon = allow *\n' % generate_auth_key()
 
 
 
-        # add new method
+    keypath = '{name}.mon.keyring'.format(
 
-        obj1.AddMethod('', 'Do', '', 's', 'ret = "hello"',
+        name=args.cluster,
 
-                       dbus_interface=dbusmock.MOCK_IFACE)
+        )
 
-        self.assertEqual(dbus_sub.Do(), 'hello')
 
 
+    LOG.debug('Writing monitor keyring to %s...', keypath)
 
-    def test_add_object_existing(self):
+    tmp = '%s.tmp' % keypath
 
-        '''try to add an existing object'''
+    with file(tmp, 'w') as f:
 
+        f.write(mon_keyring)
 
+    try:
 
-        self.dbus_mock.AddObject('/obj1', 'org.freedesktop.Test.Sub', {}, [])
+        os.rename(tmp, keypath)
 
+    except OSError as e:
 
+        if e.errno == errno.EEXIST:
 
-        self.assertRaises(dbus.exceptions.DBusException,
+            raise exc.ClusterExistsError(keypath)
 
-                          self.dbus_mock.AddObject,
+        else:
 
-                          '/obj1',
+            raise
 
-                          'org.freedesktop.Test.Sub',
 
-                          {},
 
-                          [])
 
 
+@priority(10)
 
-        # try to add the main object again
+def make(parser):
 
-        self.assertRaises(dbus.exceptions.DBusException,
+    """
 
-                          self.dbus_mock.AddObject,
+    Start deploying a new cluster, and write a CLUSTER.conf and keyring for it.
 
-                          '/',
+    """
 
-                          'org.freedesktop.Test.Other',
+    parser.add_argument(
 
-                          {},
+        'mon',
 
-                          [])
+        metavar='MON',
 
+        nargs='+',
 
+        help='initial monitor hostname, fqdn, or hostname:fqdn pair',
 
-    def test_add_object_with_methods(self):
+        type=arg_validators.Hostname(),
 
-        '''add a new object with methods'''
+        )
 
+    parser.add_argument(
 
+        '--no-ssh-copykey',
 
-        self.dbus_mock.AddObject('/obj1',
+        dest='ssh_copykey',
 
-                                 'org.freedesktop.Test.Sub',
+        action='store_false',
 
-                                 {
+        default=True,
 
-                                     'state': dbus.String('online', variant_level=1),
+        help='do not attempt to copy SSH keys',
 
-                                     'cute': dbus.Boolean(True, variant_level=1),
+    )
 
-                                 },
 
-                                 [
 
-                                     ('Do0', '', 'i', 'ret = 42'),
+    parser.add_argument(
 
-                                     ('Do1', 'i', 'i', 'ret = 31337'),
+        '--fsid',
 
-                                 ])
+        dest='fsid',
 
+        help='provide an alternate FSID for ceph.conf generation',
 
+    )
 
-        obj1 = self.dbus_con.get_object('org.freedesktop.Test', '/obj1')
 
 
+    parser.add_argument(
 
-        self.assertEqual(obj1.Do0(), 42)
+        '--cluster-network',
 
-        self.assertEqual(obj1.Do1(1), 31337)
+        help='specify the (internal) cluster network',
 
-        self.assertRaises(dbus.exceptions.DBusException,
+        type=arg_validators.Subnet(),
 
-                          obj1.Do2, 31337)
+    )
 
 
 
-    def test_properties(self):
+    parser.add_argument(
 
-        '''add and change properties'''
+        '--public-network',
 
+        help='specify the public network for a cluster',
 
+        type=arg_validators.Subnet(),
 
-        # no properties by default
+    )
 
-        self.assertEqual(self.dbus_props.GetAll('org.freedesktop.Test.Main'), {})
 
 
+    parser.set_defaults(
 
-        # no such property
+        func=new,
 
-        with self.assertRaises(dbus.exceptions.DBusException) as ctx:
-
-            self.dbus_props.Get('org.freedesktop.Test.Main', 'version')
-
-        self.assertEqual(ctx.exception.get_dbus_name(),
-
-                         'org.freedesktop.Test.Main.UnknownProperty')
-
-        self.assertEqual(ctx.exception.get_dbus_message(),
-
-                         'no such property version')
-
-
-
-        self.assertRaises(dbus.exceptions.DBusException,
-
-                          self.dbus_props.Set,
-
-                          'org.freedesktop.Test.Main',
-
-                          'version',
-
-                          dbus.Int32(2, variant_level=1))
-
-
-
-        self.dbus_mock.AddProperty('org.freedesktop.Test.Main',
-
-                                   'version',
-
-                                   dbus.Int32(2, variant_level=1))
-
-        # once again on default interface
-
-        self.dbus_mock.AddProperty('',
-
-                                   'connected',
-
-                                   dbus.Boolean(True, variant_level=1))
-
-
-
-        self.assertEqual(self.dbus_props.Get('org.freedesktop.Test.Main', 'version'), 2)
-
-        self.assertEqual(self.dbus_props.Get('org.freedesktop.Test.Main', 'connected'), True)
-
-
-
-        self.assertEqual(self.dbus_props.GetAll('org.freedesktop.Test.Main'),
-
-                         {'version': 2, 'connected': True})
-
-
-
-        with self.assertRaises(dbus.exceptions.DBusException) as ctx:
-
-            self.dbus_props.GetAll('org.freedesktop.Test.Bogus')
-
-        self.assertEqual(ctx.exception.get_dbus_name(),
-
-                         'org.freedesktop.Test.Main.UnknownInterface')
-
-        self.assertEqual(ctx.exception.get_dbus_message(),
-
-                         'no such interface org.freedesktop.Test.Bogus')
-
-
-
-        # change property
-
-        self.dbus_props.Set('org.freedesktop.Test.Main', 'version',
-
-                            dbus.Int32(4, variant_level=1))
-
-        self.assertEqual(self.dbus_props.Get('org.freedesktop.Test.Main', 'version'), 4)
-
-
-
-        # check that the Get/Set calls get logged
-
-        with open(self.mock_log.name) as f:
-
-            contents = f.read()
-
-            self.assertRegex(contents, '\n[0-9.]+ Get org.freedesktop.Test.Main.version\n')
-
-            self.assertRegex(contents, '\n[0-9.]+ Get org.freedesktop.Test.Main.connected\n')
-
-            self.assertRegex(contents, '\n[0-9.]+ GetAll org.freedesktop.Test.Main\n')
-
-            self.assertRegex(contents, '\n[0-9.]+ Set org.freedesktop.Test.Main.version 4\n')
-
-
-
-        # add property to different interface
-
-        self.dbus_mock.AddProperty('org.freedesktop.Test.Other',
-
-                                   'color',
-
-                                   dbus.String('yellow', variant_level=1))
-
-
-
-        self.assertEqual(self.dbus_props.GetAll('org.freedesktop.Test.Main'),
-
-                         {'version': 4, 'connected': True})
-
-        self.assertEqual(self.dbus_props.GetAll('org.freedesktop.Test.Other'),
-
-                         {'color': 'yellow'})
-
-        self.assertEqual(self.dbus_props.Get('org.freedesktop.Test.Other', 'color'),
-
-                         'yellow')
-
-
-
-    def test_introspection_methods(self):
-
-        '''dynamically added methods appear in introspection'''
-
-
-
-        dbus_introspect = dbus.Interface(self.obj_test, dbus.INTROSPECTABLE_IFACE)
-
-
-
-        xml_empty = dbus_introspect.Introspect()
-
-        self.assertTrue('<interface name="org.freedesktop.DBus.Mock">' in xml_empty, xml_empty)
-
-        self.assertTrue('<method name="AddMethod">' in xml_empty, xml_empty)
-
-
-
-        self.dbus_mock.AddMethod('', 'Do', 'saiv', 'i', 'ret = 42')
-
-
-
-        xml_method = dbus_introspect.Introspect()
-
-        self.assertFalse(xml_empty == xml_method, 'No change from empty XML')
-
-        self.assertTrue('<interface name="org.freedesktop.Test.Main">' in xml_method, xml_method)
-
-        self.assertTrue('''<method name="Do">
-
-      <arg direction="in" name="arg1" type="s" />
-
-      <arg direction="in" name="arg2" type="ai" />
-
-      <arg direction="in" name="arg3" type="v" />
-
-      <arg direction="out" type="i" />
-
-    </method>''' in xml_method, xml_method)
-
-
-
-    # properties in introspection are not supported by dbus-python right now
-
-    def test_introspection_properties(self):
-
-        '''dynamically added properties appear in introspection'''
-
-
-
-        self.dbus_mock.AddProperty('', 'Color', 'yellow')
-
-        self.dbus_mock.AddProperty('org.freedesktop.Test.Sub', 'Count', 5)
-
-
-
-        xml = self.obj_test.Introspect()
-
-
-
-        self.assertTrue('<interface name="org.freedesktop.Test.Main">' in xml, xml)
-
-        self.assertTrue('<interface name="org.freedesktop.Test.Sub">' in xml, xml)
-
-        self.assertTrue('<property access="readwrite" name="Color" type="s" />' in xml, xml)
-
-        self.assertTrue('<property access="readwrite" name="Count" type="i" />' in xml, xml)
-
-
-
-    def test_objects_map(self):
-
-        '''access global objects map'''
-
-
-
-        self.dbus_mock.AddMethod('', 'EnumObjs', '', 'ao', 'ret = objects.keys()')
-
-        self.assertEqual(self.dbus_test.EnumObjs(), ['/'])
-
-
-
-        self.dbus_mock.AddObject('/obj1', 'org.freedesktop.Test.Sub', {}, [])
-
-        self.assertEqual(set(self.dbus_test.EnumObjs()), {'/', '/obj1'})
-
-
-
-    def test_signals(self):
-
-        '''emitting signals'''
-
-
-
-        def do_emit():
-
-            self.dbus_mock.EmitSignal('', 'SigNoArgs', '', [])
-
-            self.dbus_mock.EmitSignal('org.freedesktop.Test.Sub',
-
-                                      'SigTwoArgs',
-
-                                      'su', ['hello', 42])
-
-            self.dbus_mock.EmitSignal('org.freedesktop.Test.Sub',
-
-                                      'SigTypeTest',
-
-                                      'iuvao',
-
-                                      [-42, 42, dbus.String('hello', variant_level=1), ['/a', '/b']])
-
-
-
-        caught = []
-
-        ml = GLib.MainLoop()
-
-
-
-        def catch(*args, **kwargs):
-
-            if kwargs['interface'].startswith('org.freedesktop.Test'):
-
-                caught.append((args, kwargs))
-
-            if len(caught) == 3:
-
-                # we caught everything there is to catch, don't wait for the
-
-                # timeout
-
-                ml.quit()
-
-
-
-        self.dbus_con.add_signal_receiver(catch,
-
-                                          interface_keyword='interface',
-
-                                          path_keyword='path',
-
-                                          member_keyword='member')
-
-
-
-        GLib.timeout_add(200, do_emit)
-
-        # ensure that the loop quits even when we catch fewer than 2 signals
-
-        GLib.timeout_add(3000, ml.quit)
-
-        ml.run()
-
-
-
-        # check SigNoArgs
-
-        self.assertEqual(caught[0][0], ())
-
-        self.assertEqual(caught[0][1]['member'], 'SigNoArgs')
-
-        self.assertEqual(caught[0][1]['path'], '/')
-
-        self.assertEqual(caught[0][1]['interface'], 'org.freedesktop.Test.Main')
-
-
-
-        # check SigTwoArgs
-
-        self.assertEqual(caught[1][0], ('hello', 42))
-
-        self.assertEqual(caught[1][1]['member'], 'SigTwoArgs')
-
-        self.assertEqual(caught[1][1]['path'], '/')
-
-        self.assertEqual(caught[1][1]['interface'], 'org.freedesktop.Test.Sub')
-
-
-
-        # check data types in SigTypeTest
-
-        self.assertEqual(caught[2][1]['member'], 'SigTypeTest')
-
-        self.assertEqual(caught[2][1]['path'], '/')
-
-        args = caught[2][0]
-
-        self.assertEqual(args[0], -42)
-
-        self.assertEqual(type(args[0]), dbus.Int32)
-
-        self.assertEqual(args[0].variant_level, 0)
-
-
-
-        self.assertEqual(args[1], 42)
-
-        self.assertEqual(type(args[1]), dbus.UInt32)
-
-        self.assertEqual(args[1].variant_level, 0)
-
-
-
-        self.assertEqual(args[2], 'hello')
-
-        self.assertEqual(type(args[2]), dbus.String)
-
-        self.assertEqual(args[2].variant_level, 1)
-
-
-
-        self.assertEqual(args[3], ['/a', '/b'])
-
-        self.assertEqual(type(args[3]), dbus.Array)
-
-        self.assertEqual(args[3].variant_level, 0)
-
-        self.assertEqual(type(args[3][0]), dbus.ObjectPath)
-
-        self.assertEqual(args[3][0].variant_level, 0)
-
-
-
-        # check correct logging
-
-        with open(self.mock_log.name) as f:
-
-            log = f.read()
-
-        self.assertRegex(log, '[0-9.]+ emit org.freedesktop.Test.Main.SigNoArgs\n')
-
-        self.assertRegex(log, '[0-9.]+ emit org.freedesktop.Test.Sub.SigTwoArgs "hello" 42\n')
-
-        self.assertRegex(log, '[0-9.]+ emit org.freedesktop.Test.Sub.SigTypeTest -42 42')
-
-        self.assertRegex(log, '[0-9.]+ emit org.freedesktop.Test.Sub.SigTypeTest -42 42 "hello" \["/a", "/b"\]\n')
-
-
-
-    def test_signals_type_mismatch(self):
-
-        '''emitting signals with wrong arguments'''
-
-
-
-        def check(signature, args, err):
-
-            try:
-
-                self.dbus_mock.EmitSignal('', 's', signature, args)
-
-                self.fail('EmitSignal did not raise an error for signature "%s" and arguments %s'
-
-                          % (signature, args))
-
-            except dbus.exceptions.DBusException as e:
-
-                self.assertTrue(err in str(e), e)
-
-
-
-        # not enough arguments
-
-        check('i', [], 'TypeError: More items found')
-
-        check('is', [1], 'TypeError: More items found')
-
-
-
-        # too many arguments
-
-        check('', [1], 'TypeError: Fewer items found')
-
-        check('i', [1, 'hello'], 'TypeError: Fewer items found')
-
-
-
-        # type mismatch
-
-        check('u', [-1], 'convert negative value to unsigned')
-
-        check('i', ['hello'], 'TypeError: an integer is required')
-
-        check('s', [1], 'TypeError: Expected a string')
-
-
-
-    def test_dbus_get_log(self):
-
-        '''query call logs over D-BUS'''
-
-
-
-        self.assertEqual(self.dbus_mock.ClearCalls(), None)
-
-        self.assertEqual(self.dbus_mock.GetCalls(), dbus.Array([]))
-
-
-
-        self.dbus_mock.AddMethod('', 'Do', '', '', '')
-
-        self.assertEqual(self.dbus_test.Do(), None)
-
-        mock_log = self.dbus_mock.GetCalls()
-
-        self.assertEqual(len(mock_log), 1)
-
-        self.assertGreater(mock_log[0][0], 10000)  # timestamp
-
-        self.assertEqual(mock_log[0][1], 'Do')
-
-        self.assertEqual(mock_log[0][2], [])
-
-
-
-        self.assertEqual(self.dbus_mock.ClearCalls(), None)
-
-        self.assertEqual(self.dbus_mock.GetCalls(), dbus.Array([]))
-
-
-
-        self.dbus_mock.AddMethod('', 'Wop', 's', 's', 'ret="hello"')
-
-        self.assertEqual(self.dbus_test.Wop('foo'), 'hello')
-
-        self.assertEqual(self.dbus_test.Wop('bar'), 'hello')
-
-        mock_log = self.dbus_mock.GetCalls()
-
-        self.assertEqual(len(mock_log), 2)
-
-        self.assertGreater(mock_log[0][0], 10000)  # timestamp
-
-        self.assertEqual(mock_log[0][1], 'Wop')
-
-        self.assertEqual(mock_log[0][2], ['foo'])
-
-        self.assertEqual(mock_log[1][1], 'Wop')
-
-        self.assertEqual(mock_log[1][2], ['bar'])
-
-
-
-        self.assertEqual(self.dbus_mock.ClearCalls(), None)
-
-        self.assertEqual(self.dbus_mock.GetCalls(), dbus.Array([]))
-
-
-
-    def test_dbus_get_method_calls(self):
-
-        '''query method call logs over D-BUS'''
-
-
-
-        self.dbus_mock.AddMethod('', 'Do', '', '', '')
-
-        self.assertEqual(self.dbus_test.Do(), None)
-
-        self.assertEqual(self.dbus_test.Do(), None)
-
-
-
-        self.dbus_mock.AddMethod('', 'Wop', 's', 's', 'ret="hello"')
-
-        self.assertEqual(self.dbus_test.Wop('foo'), 'hello')
-
-        self.assertEqual(self.dbus_test.Wop('bar'), 'hello')
-
-
-
-        mock_calls = self.dbus_mock.GetMethodCalls('Do')
-
-        self.assertEqual(len(mock_calls), 2)
-
-        self.assertEqual(mock_calls[0][1], [])
-
-        self.assertEqual(mock_calls[1][1], [])
-
-
-
-        mock_calls = self.dbus_mock.GetMethodCalls('Wop')
-
-        self.assertEqual(len(mock_calls), 2)
-
-        self.assertGreater(mock_calls[0][0], 10000)  # timestamp
-
-        self.assertEqual(mock_calls[0][1], ['foo'])
-
-        self.assertGreater(mock_calls[1][0], 10000)  # timestamp
-
-        self.assertEqual(mock_calls[1][1], ['bar'])
-
-
-
-    def test_dbus_method_called(self):
-
-        '''subscribe to MethodCalled signal'''
-
-
-
-        loop = GLib.MainLoop()
-
-        caught_signals = []
-
-
-
-        def method_called(method, args, **kwargs):
-
-            caught_signals.append((method, args))
-
-            loop.quit()
-
-
-
-        self.dbus_mock.AddMethod('', 'Do', 's', '', '')
-
-        self.dbus_mock.connect_to_signal('MethodCalled', method_called)
-
-        self.assertEqual(self.dbus_test.Do('foo'), None)
-
-
-
-        GLib.timeout_add(5000, loop.quit)
-
-        loop.run()
-
-
-
-        self.assertEqual(len(caught_signals), 1)
-
-        method, args = caught_signals[0]
-
-        self.assertEqual(method, 'Do')
-
-        self.assertEqual(len(args), 1)
-
-        self.assertEqual(args[0], 'foo')
-
-
-
-    def test_reset(self):
-
-        '''resetting to pristine state'''
-
-
-
-        self.dbus_mock.AddMethod('', 'Do', '', '', '')
-
-        self.dbus_mock.AddProperty('', 'propone', True)
-
-        self.dbus_mock.AddProperty('org.Test.Other', 'proptwo', 1)
-
-        self.dbus_mock.AddObject('/obj1', '', {}, [])
-
-
-
-        self.dbus_mock.Reset()
-
-
-
-        # resets properties and keeps the initial object
-
-        self.assertEqual(self.dbus_props.GetAll(''), {})
-
-        # resets methods
-
-        self.assertRaises(dbus.exceptions.DBusException, self.dbus_test.Do)
-
-        # resets other objects
-
-        obj1 = self.dbus_con.get_object('org.freedesktop.Test', '/obj1')
-
-        self.assertRaises(dbus.exceptions.DBusException, obj1.GetAll, '')
-
-
-
-
-
-class TestTemplates(dbusmock.DBusTestCase):
-
-    '''Test template API'''
-
-
-
-    @classmethod
-
-    def setUpClass(klass):
-
-        klass.start_session_bus()
-
-        klass.start_system_bus()
-
-
-
-    def test_local(self):
-
-        '''Load a local template *.py file'''
-
-
-
-        with tempfile.NamedTemporaryFile(prefix='answer_', suffix='.py') as my_template:
-
-            my_template.write(b'''import dbus
-
-BUS_NAME = 'universe.Ultimate'
-
-MAIN_OBJ = '/'
-
-MAIN_IFACE = 'universe.Ultimate'
-
-SYSTEM_BUS = False
-
-
-
-def load(mock, parameters):
-
-    mock.AddMethods(MAIN_IFACE, [('Answer', '', 'i', 'ret = 42')])
-
-''')
-
-            my_template.flush()
-
-            (p_mock, dbus_ultimate) = self.spawn_server_template(
-
-                my_template.name, stdout=subprocess.PIPE)
-
-            self.addCleanup(p_mock.wait)
-
-            self.addCleanup(p_mock.terminate)
-
-            self.addCleanup(p_mock.stdout.close)
-
-
-
-        self.assertEqual(dbus_ultimate.Answer(), 42)
-
-
-
-        # should appear in introspection
-
-        xml = dbus_ultimate.Introspect()
-
-        self.assertIn('<interface name="universe.Ultimate">', xml)
-
-        self.assertIn('<method name="Answer">', xml)
-
-
-
-        # should not have ObjectManager API by default
-
-        self.assertRaises(dbus.exceptions.DBusException,
-
-                          dbus_ultimate.GetManagedObjects)
-
-
-
-    def test_static_method(self):
-
-        '''Static method in a template'''
-
-
-
-        with tempfile.NamedTemporaryFile(prefix='answer_', suffix='.py') as my_template:
-
-            my_template.write(b'''import dbus
-
-BUS_NAME = 'universe.Ultimate'
-
-MAIN_OBJ = '/'
-
-MAIN_IFACE = 'universe.Ultimate'
-
-SYSTEM_BUS = False
-
-
-
-def load(mock, parameters):
-
-    pass
-
-
-
-@dbus.service.method(MAIN_IFACE,
-
-                     in_signature='',
-
-                     out_signature='i')
-
-def Answer(self):
-
-    return 42
-
-''')
-
-            my_template.flush()
-
-            (p_mock, dbus_ultimate) = self.spawn_server_template(
-
-                my_template.name, stdout=subprocess.PIPE)
-
-            self.addCleanup(p_mock.wait)
-
-            self.addCleanup(p_mock.terminate)
-
-            self.addCleanup(p_mock.stdout.close)
-
-
-
-        self.assertEqual(dbus_ultimate.Answer(), 42)
-
-
-
-        # should appear in introspection
-
-        xml = dbus_ultimate.Introspect()
-
-        self.assertIn('<interface name="universe.Ultimate">', xml)
-
-        self.assertIn('<method name="Answer">', xml)
-
-
-
-    def test_local_nonexisting(self):
-
-        self.assertRaises(ImportError, self.spawn_server_template, '/non/existing.py')
-
-
-
-    def test_object_manager(self):
-
-        '''Template with ObjectManager API'''
-
-
-
-        with tempfile.NamedTemporaryFile(prefix='objmgr_', suffix='.py') as my_template:
-
-            my_template.write(b'''import dbus
-
-BUS_NAME = 'org.test.Things'
-
-MAIN_OBJ = '/org/test/Things'
-
-IS_OBJECT_MANAGER = True
-
-SYSTEM_BUS = False
-
-
-
-def load(mock, parameters):
-
-    mock.AddObject('/org/test/Things/Thing1', 'org.test.Do', {'name': 'one'}, [])
-
-    mock.AddObject('/org/test/Things/Thing2', 'org.test.Do', {'name': 'two'}, [])
-
-    mock.AddObject('/org/test/Peer', 'org.test.Do', {'name': 'peer'}, [])
-
-''')
-
-            my_template.flush()
-
-            (p_mock, dbus_objmgr) = self.spawn_server_template(
-
-                my_template.name, stdout=subprocess.PIPE)
-
-            self.addCleanup(p_mock.wait)
-
-            self.addCleanup(p_mock.terminate)
-
-            self.addCleanup(p_mock.stdout.close)
-
-
-
-        # should have the two Things, but not the Peer
-
-        self.assertEqual(dbus_objmgr.GetManagedObjects(),
-
-                         {'/org/test/Things/Thing1': {'org.test.Do': {'name': 'one'}},
-
-                          '/org/test/Things/Thing2': {'org.test.Do': {'name': 'two'}}})
-
-
-
-        # should appear in introspection
-
-        xml = dbus_objmgr.Introspect()
-
-        self.assertIn('<interface name="org.freedesktop.DBus.ObjectManager">', xml)
-
-        self.assertIn('<method name="GetManagedObjects">', xml)
-
-        self.assertIn('<node name="Thing1" />', xml)
-
-        self.assertIn('<node name="Thing2" />', xml)
-
-
-
-    def test_reset(self):
-
-        '''Reset() puts the template back to pristine state'''
-
-
-
-        (p_mock, obj_logind) = self.spawn_server_template(
-
-            'logind', stdout=subprocess.PIPE)
-
-        self.addCleanup(p_mock.wait)
-
-        self.addCleanup(p_mock.terminate)
-
-        self.addCleanup(p_mock.stdout.close)
-
-
-
-        # do some property, method, and object changes
-
-        obj_logind.Set('org.freedesktop.login1.Manager', 'IdleAction', 'frob')
-
-        mock_logind = dbus.Interface(obj_logind, dbusmock.MOCK_IFACE)
-
-        mock_logind.AddProperty('org.Test.Other', 'walk', 'silly')
-
-        mock_logind.AddMethod('', 'DoWalk', '', '', '')
-
-        mock_logind.AddObject('/obj1', '', {}, [])
-
-
-
-        mock_logind.Reset()
-
-
-
-        # keeps the objects from the template
-
-        dbus_con = self.get_dbus(system_bus=True)
-
-        obj_logind = dbus_con.get_object('org.freedesktop.login1',
-
-                                         '/org/freedesktop/login1')
-
-        self.assertEqual(obj_logind.CanSuspend(), 'yes')
-
-
-
-        # resets properties
-
-        self.assertRaises(dbus.exceptions.DBusException,
-
-                          obj_logind.GetAll, 'org.Test.Other')
-
-        self.assertEqual(
-
-            obj_logind.Get('org.freedesktop.login1.Manager', 'IdleAction'),
-
-            'ignore')
-
-        # resets methods
-
-        self.assertRaises(dbus.exceptions.DBusException, obj_logind.DoWalk)
-
-        # resets other objects
-
-        obj1 = dbus_con.get_object('org.freedesktop.login1', '/obj1')
-
-        self.assertRaises(dbus.exceptions.DBusException, obj1.GetAll, '')
-
-
-
-
-
-class TestCleanup(dbusmock.DBusTestCase):
-
-    '''Test cleanup of resources'''
-
-
-
-    def test_mock_terminates_with_bus(self):
-
-        '''Spawned mock processes exit when bus goes down'''
-
-
-
-        self.start_session_bus()
-
-        p_mock = self.spawn_server('org.freedesktop.Test',
-
-                                   '/',
-
-                                   'org.freedesktop.Test.Main')
-
-        self.stop_dbus(self.session_bus_pid)
-
-
-
-        # give the mock 2 seconds to terminate
-
-        timeout = 20
-
-        while timeout > 0:
-
-            if p_mock.poll() is not None:
-
-                break
-
-            timeout -= 1
-
-            time.sleep(0.1)
-
-
-
-        if p_mock.poll() is None:
-
-            # clean up manually
-
-            p_mock.terminate()
-
-            p_mock.wait()
-
-            self.fail('mock process did not terminate after 2 seconds')
-
-
-
-        self.assertEqual(p_mock.wait(), 0)
-
-
-
-
-
-class TestSubclass(dbusmock.DBusTestCase):
-
-    '''Test subclassing DBusMockObject'''
-
-
-
-    @classmethod
-
-    def setUpClass(klass):
-
-        klass.start_session_bus()
-
-
-
-    def test_ctor(self):
-
-        '''Override DBusMockObject constructor'''
-
-
-
-        class MyMock(dbusmock.mockobject.DBusMockObject):
-
-            def __init__(self):
-
-                bus_name = dbus.service.BusName('org.test.MyMock',
-
-                                                dbusmock.testcase.DBusTestCase.get_dbus())
-
-                dbusmock.mockobject.DBusMockObject.__init__(
-
-                    self, bus_name, '/', 'org.test.A', {}, os.devnull)
-
-                self.AddMethod('', 'Ping', '', 'i', 'ret = 42')
-
-
-
-        m = MyMock()
-
-        self.assertEqual(m.Ping(), 42)
-
-
-
-    def test_none_props(self):
-
-        '''object with None properties argument'''
-
-
-
-        class MyMock(dbusmock.mockobject.DBusMockObject):
-
-            def __init__(self):
-
-                bus_name = dbus.service.BusName('org.test.MyMock',
-
-                                                dbusmock.testcase.DBusTestCase.get_dbus())
-
-                dbusmock.mockobject.DBusMockObject.__init__(
-
-                    self, bus_name, '/mymock', 'org.test.MyMockI', None, os.devnull)
-
-                self.AddMethod('', 'Ping', '', 'i', 'ret = 42')
-
-
-
-        m = MyMock()
-
-        self.assertEqual(m.Ping(), 42)
-
-        self.assertEqual(m.GetAll('org.test.MyMockI'), {})
-
-
-
-        m.AddProperty('org.test.MyMockI', 'blurb', 5)
-
-        self.assertEqual(m.GetAll('org.test.MyMockI'), {'blurb': 5})
-
-
-
-
-
-if __name__ == '__main__':
-
-    # avoid writing to stderr
-
-    unittest.main(testRunner=unittest.TextTestRunner(stream=sys.stdout, verbosity=2))
+        )

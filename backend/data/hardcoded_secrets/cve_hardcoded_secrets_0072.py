@@ -2,1754 +2,3554 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# vim: ft=python fileencoding=utf-8 sts=4 sw=4 et:
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
 
 
 
-# Copyright 2016-2019 Florian Bruhin (The Compiler) <mail@qutebrowser.org>
+# Copyright (c) 2011 X.commerce, a business unit of eBay Inc.
 
-#
+# Copyright 2010 United States Government as represented by the
 
-# This file is part of qutebrowser.
+# Administrator of the National Aeronautics and Space Administration.
 
-#
-
-# qutebrowser is free software: you can redistribute it and/or modify
-
-# it under the terms of the GNU General Public License as published by
-
-# the Free Software Foundation, either version 3 of the License, or
-
-# (at your option) any later version.
+# All Rights Reserved.
 
 #
 
-# qutebrowser is distributed in the hope that it will be useful,
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
 
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    not use this file except in compliance with the License. You may obtain
 
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-
-# GNU General Public License for more details.
+#    a copy of the License at
 
 #
 
-# You should have received a copy of the GNU General Public License
+#         http://www.apache.org/licenses/LICENSE-2.0
 
-# along with qutebrowser.  If not, see <http://www.gnu.org/licenses/>.
+#
 
+#    Unless required by applicable law or agreed to in writing, software
 
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-"""Wrapper over our (QtWebKit) WebView."""
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
+#    License for the specific language governing permissions and limitations
 
+#    under the License.
 
-import re
 
-import functools
 
-import xml.etree.ElementTree
+"""Defines interface for DB access.
 
 
 
-from PyQt5.QtCore import pyqtSlot, Qt, QUrl, QPoint, QTimer, QSizeF, QSize
+The underlying driver is loaded as a :class:`LazyPluggable`.
 
-from PyQt5.QtGui import QIcon
 
-from PyQt5.QtWebKitWidgets import QWebPage, QWebFrame
 
-from PyQt5.QtWebKit import QWebSettings
+Functions in this module are imported into the nova.db namespace. Call these
 
-from PyQt5.QtPrintSupport import QPrinter
+functions from nova.db namespace, not the nova.db.api namespace.
 
 
 
-from qutebrowser.browser import browsertab, shared
+All functions in this module return objects that implement a dictionary-like
 
-from qutebrowser.browser.webkit import (webview, tabhistory, webkitelem,
+interface. Currently, many of these objects are sqlalchemy objects that
 
-                                        webkitsettings)
+implement a dictionary interface. However, a future goal is to have all of
 
-from qutebrowser.utils import qtutils, usertypes, utils, log, debug
+these objects be simple dictionaries.
 
-from qutebrowser.qt import sip
 
 
 
 
+**Related Flags**
 
-class WebKitAction(browsertab.AbstractAction):
 
 
+:db_backend:  string to lookup in the list of LazyPluggable backends.
 
-    """QtWebKit implementations related to web actions."""
+              `sqlalchemy` is the only supported backend right now.
 
 
 
-    action_class = QWebPage
+:sql_connection:  string specifying the sqlalchemy connection to use, like:
 
-    action_base = QWebPage.WebAction
+                  `sqlite:///var/lib/nova/nova.sqlite`.
 
 
 
-    def exit_fullscreen(self):
+:enable_new_services:  when adding a new service to the database, is it in the
 
-        raise browsertab.UnsupportedOperationError
+                       pool of available hardware (Default: True)
 
 
 
-    def save_page(self):
+"""
 
-        """Save the current page."""
 
-        raise browsertab.UnsupportedOperationError
 
+from nova import exception
 
+from nova import flags
 
-    def show_source(self, pygments=False):
+from nova.openstack.common import cfg
 
-        self._show_source_pygments()
+from nova import utils
 
 
 
 
 
-class WebKitPrinting(browsertab.AbstractPrinting):
+db_opts = [
 
+    cfg.StrOpt('db_backend',
 
+               default='sqlalchemy',
 
-    """QtWebKit implementations related to printing."""
+               help='The backend to use for db'),
 
+    cfg.BoolOpt('enable_new_services',
 
+                default=True,
 
-    def check_pdf_support(self):
+                help='Services to be added to the available pool on create'),
 
-        pass
+    cfg.StrOpt('instance_name_template',
 
+               default='instance-%08x',
 
+               help='Template string to be used to generate instance names'),
 
-    def check_printer_support(self):
+    cfg.StrOpt('volume_name_template',
 
-        pass
+               default='volume-%08x',
 
+               help='Template string to be used to generate instance names'),
 
+    cfg.StrOpt('snapshot_name_template',
 
-    def check_preview_support(self):
+               default='snapshot-%08x',
 
-        pass
+               help='Template string to be used to generate snapshot names'),
 
+    ]
 
 
-    def to_pdf(self, filename):
 
-        printer = QPrinter()
+FLAGS = flags.FLAGS
 
-        printer.setOutputFileName(filename)
+FLAGS.register_opts(db_opts)
 
-        self.to_printer(printer)
 
 
+IMPL = utils.LazyPluggable('db_backend',
 
-    def to_printer(self, printer, callback=None):
+                           sqlalchemy='nova.db.sqlalchemy.api')
 
-        self._widget.print(printer)
 
-        # Can't find out whether there was an error...
 
-        if callback is not None:
 
-            callback(True)
 
+class NoMoreNetworks(exception.Error):
 
+    """No more available networks."""
 
+    pass
 
 
-class WebKitSearch(browsertab.AbstractSearch):
 
 
 
-    """QtWebKit implementations related to searching on the page."""
+class NoMoreTargets(exception.Error):
 
+    """No more available targets"""
 
+    pass
 
-    def __init__(self, tab, parent=None):
 
-        super().__init__(tab, parent)
 
-        self._flags = QWebPage.FindFlags(0)
 
 
+###################
 
-    def _call_cb(self, callback, found, text, flags, caller):
 
-        """Call the given callback if it's non-None.
 
 
 
-        Delays the call via a QTimer so the website is re-rendered in between.
+def service_destroy(context, instance_id):
 
+    """Destroy the service or raise if it does not exist."""
 
+    return IMPL.service_destroy(context, instance_id)
 
-        Args:
 
-            callback: What to call
 
-            found: If the text was found
 
-            text: The text searched for
 
-            flags: The flags searched with
+def service_get(context, service_id):
 
-            caller: Name of the caller.
+    """Get a service or raise if it does not exist."""
 
-        """
+    return IMPL.service_get(context, service_id)
 
-        found_text = 'found' if found else "didn't find"
 
-        # Removing FindWrapsAroundDocument to get the same logging as with
 
-        # QtWebEngine
 
-        debug_flags = debug.qflags_key(
 
-            QWebPage, flags & ~QWebPage.FindWrapsAroundDocument,
+def service_get_by_host_and_topic(context, host, topic):
 
-            klass=QWebPage.FindFlag)
+    """Get a service by host it's on and topic it listens to."""
 
-        if debug_flags != '0x0000':
+    return IMPL.service_get_by_host_and_topic(context, host, topic)
 
-            flag_text = 'with flags {}'.format(debug_flags)
 
-        else:
 
-            flag_text = ''
 
-        log.webview.debug(' '.join([caller, found_text, text, flag_text])
 
-                          .strip())
+def service_get_all(context, disabled=None):
 
-        if callback is not None:
+    """Get all services."""
 
-            QTimer.singleShot(0, functools.partial(callback, found))
+    return IMPL.service_get_all(context, disabled)
 
 
 
-        self.finished.emit(found)
 
 
+def service_get_all_by_topic(context, topic):
 
-    def clear(self):
+    """Get all services for a given topic."""
 
-        if self.search_displayed:
+    return IMPL.service_get_all_by_topic(context, topic)
 
-            self.cleared.emit()
 
-        self.search_displayed = False
 
-        # We first clear the marked text, then the highlights
 
-        self._widget.findText('')
 
-        self._widget.findText('', QWebPage.HighlightAllOccurrences)
+def service_get_all_by_host(context, host):
 
+    """Get all services for a given host."""
 
+    return IMPL.service_get_all_by_host(context, host)
 
-    def search(self, text, *, ignore_case=usertypes.IgnoreCase.never,
 
-               reverse=False, result_cb=None):
 
-        # Don't go to next entry on duplicate search
 
-        if self.text == text and self.search_displayed:
 
-            log.webview.debug("Ignoring duplicate search request"
+def service_get_all_compute_by_host(context, host):
 
-                              " for {}".format(text))
+    """Get all compute services for a given host."""
 
-            return
+    return IMPL.service_get_all_compute_by_host(context, host)
 
 
 
-        # Clear old search results, this is done automatically on QtWebEngine.
 
-        self.clear()
 
+def service_get_all_compute_sorted(context):
 
+    """Get all compute services sorted by instance count.
 
-        self.text = text
 
-        self.search_displayed = True
 
-        self._flags = QWebPage.FindWrapsAroundDocument
+    :returns: a list of (Service, instance_count) tuples.
 
-        if self._is_case_sensitive(ignore_case):
 
-            self._flags |= QWebPage.FindCaseSensitively
 
-        if reverse:
+    """
 
-            self._flags |= QWebPage.FindBackward
+    return IMPL.service_get_all_compute_sorted(context)
 
-        # We actually search *twice* - once to highlight everything, then again
 
-        # to get a mark so we can navigate.
 
-        found = self._widget.findText(text, self._flags)
 
-        self._widget.findText(text,
 
-                              self._flags | QWebPage.HighlightAllOccurrences)
+def service_get_all_volume_sorted(context):
 
-        self._call_cb(result_cb, found, text, self._flags, 'search')
+    """Get all volume services sorted by volume count.
 
 
 
-    def next_result(self, *, result_cb=None):
+    :returns: a list of (Service, volume_count) tuples.
 
-        self.search_displayed = True
 
-        found = self._widget.findText(self.text, self._flags)
 
-        self._call_cb(result_cb, found, self.text, self._flags, 'next_result')
+    """
 
+    return IMPL.service_get_all_volume_sorted(context)
 
 
-    def prev_result(self, *, result_cb=None):
 
-        self.search_displayed = True
 
-        # The int() here makes sure we get a copy of the flags.
 
-        flags = QWebPage.FindFlags(int(self._flags))
+def service_get_by_args(context, host, binary):
 
-        if flags & QWebPage.FindBackward:
+    """Get the state of an service by node name and binary."""
 
-            flags &= ~QWebPage.FindBackward
+    return IMPL.service_get_by_args(context, host, binary)
 
-        else:
 
-            flags |= QWebPage.FindBackward
 
-        found = self._widget.findText(self.text, flags)
 
-        self._call_cb(result_cb, found, self.text, flags, 'prev_result')
 
+def service_create(context, values):
 
+    """Create a service from the values dictionary."""
 
+    return IMPL.service_create(context, values)
 
 
-class WebKitCaret(browsertab.AbstractCaret):
 
 
 
-    """QtWebKit implementations related to moving the cursor/selection."""
+def service_update(context, service_id, values):
 
+    """Set the given properties on an service and update it.
 
 
-    @pyqtSlot(usertypes.KeyMode)
 
-    def _on_mode_entered(self, mode):
+    Raises NotFound if service does not exist.
 
-        if mode != usertypes.KeyMode.caret:
 
-            return
 
+    """
 
+    return IMPL.service_update(context, service_id, values)
 
-        self.selection_enabled = self._widget.hasSelection()
 
-        self.selection_toggled.emit(self.selection_enabled)
 
-        settings = self._widget.settings()
 
-        settings.setAttribute(QWebSettings.CaretBrowsingEnabled, True)
 
+###################
 
 
-        if self._widget.isVisible():
 
-            # Sometimes the caret isn't immediately visible, but unfocusing
 
-            # and refocusing it fixes that.
 
-            self._widget.clearFocus()
+def compute_node_get(context, compute_id):
 
-            self._widget.setFocus(Qt.OtherFocusReason)
+    """Get an computeNode or raise if it does not exist."""
 
+    return IMPL.compute_node_get(context, compute_id)
 
 
-            # Move the caret to the first element in the viewport if there
 
-            # isn't any text which is already selected.
 
-            #
 
-            # Note: We can't use hasSelection() here, as that's always
+def compute_node_get_all(context):
 
-            # true in caret mode.
+    """Get all computeNodes."""
 
-            if not self.selection_enabled:
+    return IMPL.compute_node_get_all(context)
 
-                self._widget.page().currentFrame().evaluateJavaScript(
 
-                    utils.read_file('javascript/position_caret.js'))
 
 
 
-    @pyqtSlot(usertypes.KeyMode)
+def compute_node_create(context, values):
 
-    def _on_mode_left(self, _mode):
+    """Create a computeNode from the values dictionary."""
 
-        settings = self._widget.settings()
+    return IMPL.compute_node_create(context, values)
 
-        if settings.testAttribute(QWebSettings.CaretBrowsingEnabled):
 
-            if self.selection_enabled and self._widget.hasSelection():
 
-                # Remove selection if it exists
 
-                self._widget.triggerPageAction(QWebPage.MoveToNextChar)
 
-            settings.setAttribute(QWebSettings.CaretBrowsingEnabled, False)
+def compute_node_update(context, compute_id, values, auto_adjust=True):
 
-            self.selection_enabled = False
+    """Set the given properties on an computeNode and update it.
 
 
 
-    def move_to_next_line(self, count=1):
+    Raises NotFound if computeNode does not exist.
 
-        if not self.selection_enabled:
+    """
 
-            act = QWebPage.MoveToNextLine
+    return IMPL.compute_node_update(context, compute_id, values, auto_adjust)
 
-        else:
 
-            act = QWebPage.SelectNextLine
 
-        for _ in range(count):
 
-            self._widget.triggerPageAction(act)
 
+def compute_node_get_by_host(context, host):
 
+    return IMPL.compute_node_get_by_host(context, host)
 
-    def move_to_prev_line(self, count=1):
 
-        if not self.selection_enabled:
 
-            act = QWebPage.MoveToPreviousLine
 
-        else:
 
-            act = QWebPage.SelectPreviousLine
+def compute_node_utilization_update(context, host, free_ram_mb_delta=0,
 
-        for _ in range(count):
+                          free_disk_gb_delta=0, work_delta=0, vm_delta=0):
 
-            self._widget.triggerPageAction(act)
+    return IMPL.compute_node_utilization_update(context, host,
 
+                          free_ram_mb_delta, free_disk_gb_delta, work_delta,
 
+                          vm_delta)
 
-    def move_to_next_char(self, count=1):
 
-        if not self.selection_enabled:
 
-            act = QWebPage.MoveToNextChar
 
-        else:
 
-            act = QWebPage.SelectNextChar
+def compute_node_utilization_set(context, host, free_ram_mb=None,
 
-        for _ in range(count):
+                                 free_disk_gb=None, work=None, vms=None):
 
-            self._widget.triggerPageAction(act)
+    return IMPL.compute_node_utilization_set(context, host, free_ram_mb,
 
+                                             free_disk_gb, work, vms)
 
 
-    def move_to_prev_char(self, count=1):
 
-        if not self.selection_enabled:
+###################
 
-            act = QWebPage.MoveToPreviousChar
 
-        else:
 
-            act = QWebPage.SelectPreviousChar
 
-        for _ in range(count):
 
-            self._widget.triggerPageAction(act)
+def certificate_create(context, values):
 
+    """Create a certificate from the values dictionary."""
 
+    return IMPL.certificate_create(context, values)
 
-    def move_to_end_of_word(self, count=1):
 
-        if not self.selection_enabled:
 
-            act = [QWebPage.MoveToNextWord]
 
-            if utils.is_windows:  # pragma: no cover
 
-                act.append(QWebPage.MoveToPreviousChar)
+def certificate_get_all_by_project(context, project_id):
 
-        else:
+    """Get all certificates for a project."""
 
-            act = [QWebPage.SelectNextWord]
+    return IMPL.certificate_get_all_by_project(context, project_id)
 
-            if utils.is_windows:  # pragma: no cover
 
-                act.append(QWebPage.SelectPreviousChar)
 
-        for _ in range(count):
 
-            for a in act:
 
-                self._widget.triggerPageAction(a)
+def certificate_get_all_by_user(context, user_id):
 
+    """Get all certificates for a user."""
 
+    return IMPL.certificate_get_all_by_user(context, user_id)
 
-    def move_to_next_word(self, count=1):
 
-        if not self.selection_enabled:
 
-            act = [QWebPage.MoveToNextWord]
 
-            if not utils.is_windows:  # pragma: no branch
 
-                act.append(QWebPage.MoveToNextChar)
+def certificate_get_all_by_user_and_project(context, user_id, project_id):
 
-        else:
+    """Get all certificates for a user and project."""
 
-            act = [QWebPage.SelectNextWord]
+    return IMPL.certificate_get_all_by_user_and_project(context,
 
-            if not utils.is_windows:  # pragma: no branch
+                                                        user_id,
 
-                act.append(QWebPage.SelectNextChar)
+                                                        project_id)
 
-        for _ in range(count):
 
-            for a in act:
 
-                self._widget.triggerPageAction(a)
 
 
+###################
 
-    def move_to_prev_word(self, count=1):
 
-        if not self.selection_enabled:
 
-            act = QWebPage.MoveToPreviousWord
+def floating_ip_get(context, id):
 
-        else:
+    return IMPL.floating_ip_get(context, id)
 
-            act = QWebPage.SelectPreviousWord
 
-        for _ in range(count):
 
-            self._widget.triggerPageAction(act)
 
 
+def floating_ip_get_pools(context):
 
-    def move_to_start_of_line(self):
+    """Returns a list of floating ip pools"""
 
-        if not self.selection_enabled:
+    return IMPL.floating_ip_get_pools(context)
 
-            act = QWebPage.MoveToStartOfLine
 
-        else:
 
-            act = QWebPage.SelectStartOfLine
 
-        self._widget.triggerPageAction(act)
 
+def floating_ip_allocate_address(context, project_id, pool):
 
+    """Allocate free floating ip from specified pool and return the address.
 
-    def move_to_end_of_line(self):
 
-        if not self.selection_enabled:
 
-            act = QWebPage.MoveToEndOfLine
+    Raises if one is not available.
 
-        else:
 
-            act = QWebPage.SelectEndOfLine
 
-        self._widget.triggerPageAction(act)
+    """
 
+    return IMPL.floating_ip_allocate_address(context, project_id, pool)
 
 
-    def move_to_start_of_next_block(self, count=1):
 
-        if not self.selection_enabled:
 
-            act = [QWebPage.MoveToNextLine,
 
-                   QWebPage.MoveToStartOfBlock]
+def floating_ip_create(context, values):
 
-        else:
+    """Create a floating ip from the values dictionary."""
 
-            act = [QWebPage.SelectNextLine,
+    return IMPL.floating_ip_create(context, values)
 
-                   QWebPage.SelectStartOfBlock]
 
-        for _ in range(count):
 
-            for a in act:
 
-                self._widget.triggerPageAction(a)
 
+def floating_ip_count_by_project(context, project_id):
 
+    """Count floating ips used by project."""
 
-    def move_to_start_of_prev_block(self, count=1):
+    return IMPL.floating_ip_count_by_project(context, project_id)
 
-        if not self.selection_enabled:
 
-            act = [QWebPage.MoveToPreviousLine,
 
-                   QWebPage.MoveToStartOfBlock]
 
-        else:
 
-            act = [QWebPage.SelectPreviousLine,
+def floating_ip_deallocate(context, address):
 
-                   QWebPage.SelectStartOfBlock]
+    """Deallocate an floating ip by address."""
 
-        for _ in range(count):
+    return IMPL.floating_ip_deallocate(context, address)
 
-            for a in act:
 
-                self._widget.triggerPageAction(a)
 
 
 
-    def move_to_end_of_next_block(self, count=1):
+def floating_ip_destroy(context, address):
 
-        if not self.selection_enabled:
+    """Destroy the floating_ip or raise if it does not exist."""
 
-            act = [QWebPage.MoveToNextLine,
+    return IMPL.floating_ip_destroy(context, address)
 
-                   QWebPage.MoveToEndOfBlock]
 
-        else:
 
-            act = [QWebPage.SelectNextLine,
 
-                   QWebPage.SelectEndOfBlock]
 
-        for _ in range(count):
+def floating_ip_disassociate(context, address):
 
-            for a in act:
+    """Disassociate an floating ip from a fixed ip by address.
 
-                self._widget.triggerPageAction(a)
 
 
+    :returns: the address of the existing fixed ip.
 
-    def move_to_end_of_prev_block(self, count=1):
 
-        if not self.selection_enabled:
 
-            act = [QWebPage.MoveToPreviousLine, QWebPage.MoveToEndOfBlock]
+    """
 
-        else:
+    return IMPL.floating_ip_disassociate(context, address)
 
-            act = [QWebPage.SelectPreviousLine, QWebPage.SelectEndOfBlock]
 
-        for _ in range(count):
 
-            for a in act:
 
-                self._widget.triggerPageAction(a)
 
+def floating_ip_fixed_ip_associate(context, floating_address,
 
+                                   fixed_address, host):
 
-    def move_to_start_of_document(self):
+    """Associate an floating ip to a fixed_ip by address."""
 
-        if not self.selection_enabled:
+    return IMPL.floating_ip_fixed_ip_associate(context,
 
-            act = QWebPage.MoveToStartOfDocument
+                                               floating_address,
 
-        else:
+                                               fixed_address,
 
-            act = QWebPage.SelectStartOfDocument
+                                               host)
 
-        self._widget.triggerPageAction(act)
 
 
 
-    def move_to_end_of_document(self):
 
-        if not self.selection_enabled:
+def floating_ip_get_all(context):
 
-            act = QWebPage.MoveToEndOfDocument
+    """Get all floating ips."""
 
-        else:
+    return IMPL.floating_ip_get_all(context)
 
-            act = QWebPage.SelectEndOfDocument
 
-        self._widget.triggerPageAction(act)
 
 
 
-    def toggle_selection(self):
+def floating_ip_get_all_by_host(context, host):
 
-        self.selection_enabled = not self.selection_enabled
+    """Get all floating ips by host."""
 
-        self.selection_toggled.emit(self.selection_enabled)
+    return IMPL.floating_ip_get_all_by_host(context, host)
 
 
 
-    def drop_selection(self):
 
-        self._widget.triggerPageAction(QWebPage.MoveToNextChar)
 
+def floating_ip_get_all_by_project(context, project_id):
 
+    """Get all floating ips by project."""
 
-    def selection(self, callback):
+    return IMPL.floating_ip_get_all_by_project(context, project_id)
 
-        callback(self._widget.selectedText())
 
 
 
-    def reverse_selection(self):
 
-        self._tab.run_js_async("""{
+def floating_ip_get_by_address(context, address):
 
-            const sel = window.getSelection();
+    """Get a floating ip by address or raise if it doesn't exist."""
 
-            sel.setBaseAndExtent(
+    return IMPL.floating_ip_get_by_address(context, address)
 
-                sel.extentNode, sel.extentOffset, sel.baseNode,
 
-                sel.baseOffset
 
-            );
 
-        }""")
 
+def floating_ip_get_by_fixed_address(context, fixed_address):
 
+    """Get a floating ips by fixed address"""
 
-    def _follow_selected(self, *, tab=False):
+    return IMPL.floating_ip_get_by_fixed_address(context, fixed_address)
 
-        if QWebSettings.globalSettings().testAttribute(
 
-                QWebSettings.JavascriptEnabled):
 
-            if tab:
 
-                self._tab.data.override_target = usertypes.ClickTarget.tab
 
-            self._tab.run_js_async("""
+def floating_ip_get_by_fixed_ip_id(context, fixed_ip_id):
 
-                const aElm = document.activeElement;
+    """Get a floating ips by fixed address"""
 
-                if (window.getSelection().anchorNode) {
+    return IMPL.floating_ip_get_by_fixed_ip_id(context, fixed_ip_id)
 
-                    window.getSelection().anchorNode.parentNode.click();
 
-                } else if (aElm && aElm !== document.body) {
 
-                    aElm.click();
 
-                }
 
-            """)
+def floating_ip_update(context, address, values):
 
-        else:
+    """Update a floating ip by address or raise if it doesn't exist."""
 
-            selection = self._widget.selectedHtml()
+    return IMPL.floating_ip_update(context, address, values)
 
-            if not selection:
 
-                # Getting here may mean we crashed, but we can't do anything
 
-                # about that until this commit is released:
 
-                # https://github.com/annulen/webkit/commit/0e75f3272d149bc64899c161f150eb341a2417af
 
-                # TODO find a way to check if something is focused
+def floating_ip_set_auto_assigned(context, address):
 
-                self._follow_enter(tab)
+    """Set auto_assigned flag to floating ip"""
 
-                return
+    return IMPL.floating_ip_set_auto_assigned(context, address)
 
-            try:
 
-                selected_element = xml.etree.ElementTree.fromstring(
 
-                    '<html>{}</html>'.format(selection)).find('a')
 
-            except xml.etree.ElementTree.ParseError:
 
-                raise browsertab.WebTabError('Could not parse selected '
+def dnsdomain_list(context):
 
-                                             'element!')
+    """Get a list of all zones in our database, public and private."""
 
+    return IMPL.dnsdomain_list(context)
 
 
-            if selected_element is not None:
 
-                try:
 
-                    url = selected_element.attrib['href']
 
-                except KeyError:
+def dnsdomain_register_for_zone(context, fqdomain, zone):
 
-                    raise browsertab.WebTabError('Anchor element without '
+    """Associated a DNS domain with an availability zone"""
 
-                                                 'href!')
+    return IMPL.dnsdomain_register_for_zone(context, fqdomain, zone)
 
-                url = self._tab.url().resolved(QUrl(url))
 
-                if tab:
 
-                    self._tab.new_tab_requested.emit(url)
 
-                else:
 
-                    self._tab.load_url(url)
+def dnsdomain_register_for_project(context, fqdomain, project):
 
+    """Associated a DNS domain with a project id"""
 
+    return IMPL.dnsdomain_register_for_project(context, fqdomain, project)
 
-    def follow_selected(self, *, tab=False):
 
-        try:
 
-            self._follow_selected(tab=tab)
 
-        finally:
 
-            self.follow_selected_done.emit()
+def dnsdomain_unregister(context, fqdomain):
 
+    """Purge associations for the specified DNS zone"""
 
+    return IMPL.dnsdomain_unregister(context, fqdomain)
 
 
 
-class WebKitZoom(browsertab.AbstractZoom):
 
 
+def dnsdomain_get(context, fqdomain):
 
-    """QtWebKit implementations related to zooming."""
+    """Get the db record for the specified domain."""
 
+    return IMPL.dnsdomain_get(context, fqdomain)
 
 
-    def _set_factor_internal(self, factor):
 
-        self._widget.setZoomFactor(factor)
 
 
+####################
 
 
 
-class WebKitScroller(browsertab.AbstractScroller):
 
 
+def migration_update(context, id, values):
 
-    """QtWebKit implementations related to scrolling."""
+    """Update a migration instance."""
 
+    return IMPL.migration_update(context, id, values)
 
 
-    # FIXME:qtwebengine When to use the main frame, when the current one?
 
 
 
-    def pos_px(self):
+def migration_create(context, values):
 
-        return self._widget.page().mainFrame().scrollPosition()
+    """Create a migration record."""
 
+    return IMPL.migration_create(context, values)
 
 
-    def pos_perc(self):
 
-        return self._widget.scroll_pos
 
 
+def migration_get(context, migration_id):
 
-    def to_point(self, point):
+    """Finds a migration by the id."""
 
-        self._widget.page().mainFrame().setScrollPosition(point)
+    return IMPL.migration_get(context, migration_id)
 
 
 
-    def to_anchor(self, name):
 
-        self._widget.page().mainFrame().scrollToAnchor(name)
 
+def migration_get_by_instance_and_status(context, instance_uuid, status):
 
+    """Finds a migration by the instance uuid its migrating."""
 
-    def delta(self, x=0, y=0):
+    return IMPL.migration_get_by_instance_and_status(context, instance_uuid,
 
-        qtutils.check_overflow(x, 'int')
+            status)
 
-        qtutils.check_overflow(y, 'int')
 
-        self._widget.page().mainFrame().scroll(x, y)
 
 
 
-    def delta_page(self, x=0.0, y=0.0):
+def migration_get_all_unconfirmed(context, confirm_window):
 
-        if y.is_integer():
+    """Finds all unconfirmed migrations within the confirmation window."""
 
-            y = int(y)
+    return IMPL.migration_get_all_unconfirmed(context, confirm_window)
 
-            if y == 0:
 
-                pass
 
-            elif y < 0:
 
-                self.page_up(count=-y)
 
-            elif y > 0:
+####################
 
-                self.page_down(count=y)
 
-            y = 0
 
-        if x == 0 and y == 0:
 
-            return
 
-        size = self._widget.page().mainFrame().geometry()
+def fixed_ip_associate(context, address, instance_id, network_id=None,
 
-        self.delta(x * size.width(), y * size.height())
+                       reserved=False):
 
+    """Associate fixed ip to instance.
 
 
-    def to_perc(self, x=None, y=None):
 
-        if x is None and y == 0:
+    Raises if fixed ip is not available.
 
-            self.top()
 
-        elif x is None and y == 100:
 
-            self.bottom()
+    """
 
-        else:
+    return IMPL.fixed_ip_associate(context, address, instance_id, network_id,
 
-            for val, orientation in [(x, Qt.Horizontal), (y, Qt.Vertical)]:
+                                   reserved)
 
-                if val is not None:
 
-                    frame = self._widget.page().mainFrame()
 
-                    maximum = frame.scrollBarMaximum(orientation)
 
-                    if maximum == 0:
 
-                        continue
+def fixed_ip_associate_pool(context, network_id, instance_id=None, host=None):
 
-                    pos = int(maximum * val / 100)
+    """Find free ip in network and associate it to instance or host.
 
-                    pos = qtutils.check_overflow(pos, 'int', fatal=False)
 
-                    frame.setScrollBarValue(orientation, pos)
 
+    Raises if one is not available.
 
 
-    def _key_press(self, key, count=1, getter_name=None, direction=None):
 
-        frame = self._widget.page().mainFrame()
+    """
 
-        getter = None if getter_name is None else getattr(frame, getter_name)
+    return IMPL.fixed_ip_associate_pool(context, network_id,
 
+                                        instance_id, host)
 
 
-        # FIXME:qtwebengine needed?
 
-        # self._widget.setFocus()
 
 
+def fixed_ip_create(context, values):
 
-        for _ in range(min(count, 5000)):
+    """Create a fixed ip from the values dictionary."""
 
-            # Abort scrolling if the minimum/maximum was reached.
+    return IMPL.fixed_ip_create(context, values)
 
-            if (getter is not None and
 
-                    frame.scrollBarValue(direction) == getter(direction)):
 
-                return
 
-            self._tab.fake_key_press(key)
 
+def fixed_ip_bulk_create(context, ips):
 
+    """Create a lot of fixed ips from the values dictionary."""
 
-    def up(self, count=1):
+    return IMPL.fixed_ip_bulk_create(context, ips)
 
-        self._key_press(Qt.Key_Up, count, 'scrollBarMinimum', Qt.Vertical)
 
 
 
-    def down(self, count=1):
 
-        self._key_press(Qt.Key_Down, count, 'scrollBarMaximum', Qt.Vertical)
+def fixed_ip_disassociate(context, address):
 
+    """Disassociate a fixed ip from an instance by address."""
 
+    return IMPL.fixed_ip_disassociate(context, address)
 
-    def left(self, count=1):
 
-        self._key_press(Qt.Key_Left, count, 'scrollBarMinimum', Qt.Horizontal)
 
 
 
-    def right(self, count=1):
+def fixed_ip_disassociate_all_by_timeout(context, host, time):
 
-        self._key_press(Qt.Key_Right, count, 'scrollBarMaximum', Qt.Horizontal)
+    """Disassociate old fixed ips from host."""
 
+    return IMPL.fixed_ip_disassociate_all_by_timeout(context, host, time)
 
 
-    def top(self):
 
-        self._key_press(Qt.Key_Home)
 
 
+def fixed_ip_get(context, id):
 
-    def bottom(self):
+    """Get fixed ip by id or raise if it does not exist."""
 
-        self._key_press(Qt.Key_End)
+    return IMPL.fixed_ip_get(context, id)
 
 
 
-    def page_up(self, count=1):
 
-        self._key_press(Qt.Key_PageUp, count, 'scrollBarMinimum', Qt.Vertical)
 
+def fixed_ip_get_all(context):
 
+    """Get all defined fixed ips."""
 
-    def page_down(self, count=1):
+    return IMPL.fixed_ip_get_all(context)
 
-        self._key_press(Qt.Key_PageDown, count, 'scrollBarMaximum',
 
-                        Qt.Vertical)
 
 
 
-    def at_top(self):
+def fixed_ip_get_by_address(context, address):
 
-        return self.pos_px().y() == 0
+    """Get a fixed ip by address or raise if it does not exist."""
 
+    return IMPL.fixed_ip_get_by_address(context, address)
 
 
-    def at_bottom(self):
 
-        frame = self._widget.page().currentFrame()
 
-        return self.pos_px().y() >= frame.scrollBarMaximum(Qt.Vertical)
 
+def fixed_ip_get_by_instance(context, instance_id):
 
+    """Get fixed ips by instance or raise if none exist."""
 
+    return IMPL.fixed_ip_get_by_instance(context, instance_id)
 
 
-class WebKitHistoryPrivate(browsertab.AbstractHistoryPrivate):
 
 
 
-    """History-related methods which are not part of the extension API."""
+def fixed_ip_get_by_network_host(context, network_id, host):
 
+    """Get fixed ip for a host in a network."""
 
+    return IMPL.fixed_ip_get_by_network_host(context, network_id, host)
 
-    def serialize(self):
 
-        return qtutils.serialize(self._history)
 
 
 
-    def deserialize(self, data):
+def fixed_ips_by_virtual_interface(context, vif_id):
 
-        qtutils.deserialize(data, self._history)
+    """Get fixed ips by virtual interface or raise if none exist."""
 
+    return IMPL.fixed_ips_by_virtual_interface(context, vif_id)
 
 
-    def load_items(self, items):
 
-        if items:
 
-            self._tab.before_load_started.emit(items[-1].url)
 
+def fixed_ip_get_network(context, address):
 
+    """Get a network for a fixed ip by address."""
 
-        stream, _data, user_data = tabhistory.serialize(items)
+    return IMPL.fixed_ip_get_network(context, address)
 
-        qtutils.deserialize_stream(stream, self._history)
 
-        for i, data in enumerate(user_data):
 
-            self._history.itemAt(i).setUserData(data)
 
-        cur_data = self._history.currentItem().userData()
 
-        if cur_data is not None:
+def fixed_ip_update(context, address, values):
 
-            if 'zoom' in cur_data:
+    """Create a fixed ip from the values dictionary."""
 
-                self._tab.zoom.set_factor(cur_data['zoom'])
+    return IMPL.fixed_ip_update(context, address, values)
 
-            if ('scroll-pos' in cur_data and
 
-                    self._tab.scroller.pos_px() == QPoint(0, 0)):
 
-                QTimer.singleShot(0, functools.partial(
+####################
 
-                    self._tab.scroller.to_point, cur_data['scroll-pos']))
 
 
 
 
+def virtual_interface_create(context, values):
 
-class WebKitHistory(browsertab.AbstractHistory):
+    """Create a virtual interface record in the database."""
 
+    return IMPL.virtual_interface_create(context, values)
 
 
-    """QtWebKit implementations related to page history."""
 
 
 
-    def __init__(self, tab):
+def virtual_interface_get(context, vif_id):
 
-        super().__init__(tab)
+    """Gets a virtual interface from the table,"""
 
-        self.private_api = WebKitHistoryPrivate(tab)
+    return IMPL.virtual_interface_get(context, vif_id)
 
 
 
-    def __len__(self):
 
-        return len(self._history)
 
+def virtual_interface_get_by_address(context, address):
 
+    """Gets a virtual interface from the table filtering on address."""
 
-    def __iter__(self):
+    return IMPL.virtual_interface_get_by_address(context, address)
 
-        return iter(self._history.items())
 
 
 
-    def current_idx(self):
 
-        return self._history.currentItemIndex()
+def virtual_interface_get_by_uuid(context, vif_uuid):
 
+    """Gets a virtual interface from the table filtering on vif uuid."""
 
+    return IMPL.virtual_interface_get_by_uuid(context, vif_uuid)
 
-    def can_go_back(self):
 
-        return self._history.canGoBack()
 
 
 
-    def can_go_forward(self):
+def virtual_interface_get_by_instance(context, instance_id):
 
-        return self._history.canGoForward()
+    """Gets all virtual_interfaces for instance."""
 
+    return IMPL.virtual_interface_get_by_instance(context, instance_id)
 
 
-    def _item_at(self, i):
 
-        return self._history.itemAt(i)
 
 
+def virtual_interface_get_by_instance_and_network(context, instance_id,
 
-    def _go_to_item(self, item):
+                                                           network_id):
 
-        self._tab.before_load_started.emit(item.url())
+    """Gets all virtual interfaces for instance."""
 
-        self._history.goToItem(item)
+    return IMPL.virtual_interface_get_by_instance_and_network(context,
 
+                                                              instance_id,
 
+                                                              network_id)
 
 
 
-class WebKitElements(browsertab.AbstractElements):
 
 
+def virtual_interface_delete(context, vif_id):
 
-    """QtWebKit implemementations related to elements on the page."""
+    """Delete virtual interface record from the database."""
 
+    return IMPL.virtual_interface_delete(context, vif_id)
 
 
-    def find_css(self, selector, callback, error_cb, *, only_visible=False):
 
-        utils.unused(error_cb)
 
-        mainframe = self._widget.page().mainFrame()
 
-        if mainframe is None:
+def virtual_interface_delete_by_instance(context, instance_id):
 
-            raise browsertab.WebTabError("No frame focused!")
+    """Delete virtual interface records associated with instance."""
 
+    return IMPL.virtual_interface_delete_by_instance(context, instance_id)
 
 
-        elems = []
 
-        frames = webkitelem.get_child_frames(mainframe)
 
-        for f in frames:
 
-            for elem in f.findAllElements(selector):
+def virtual_interface_get_all(context):
 
-                elems.append(webkitelem.WebKitElement(elem, tab=self._tab))
+    """Gets all virtual interfaces from the table"""
 
+    return IMPL.virtual_interface_get_all(context)
 
 
-        if only_visible:
 
-            # pylint: disable=protected-access
 
-            elems = [e for e in elems if e._is_visible(mainframe)]
 
-            # pylint: enable=protected-access
+####################
 
 
 
-        callback(elems)
 
 
+def instance_create(context, values):
 
-    def find_id(self, elem_id, callback):
+    """Create an instance from the values dictionary."""
 
-        def find_id_cb(elems):
+    return IMPL.instance_create(context, values)
 
-            """Call the real callback with the found elements."""
 
-            if not elems:
 
-                callback(None)
 
-            else:
 
-                callback(elems[0])
+def instance_data_get_for_project(context, project_id):
 
+    """Get (instance_count, total_cores, total_ram) for project."""
 
+    return IMPL.instance_data_get_for_project(context, project_id)
 
-        # Escape non-alphanumeric characters in the selector
 
-        # https://www.w3.org/TR/CSS2/syndata.html#value-def-identifier
 
-        elem_id = re.sub(r'[^a-zA-Z0-9_-]', r'\\\g<0>', elem_id)
 
-        self.find_css('#' + elem_id, find_id_cb, error_cb=lambda exc: None)
 
+def instance_destroy(context, instance_id):
 
+    """Destroy the instance or raise if it does not exist."""
 
-    def find_focused(self, callback):
+    return IMPL.instance_destroy(context, instance_id)
 
-        frame = self._widget.page().currentFrame()
 
-        if frame is None:
 
-            callback(None)
 
-            return
 
+def instance_get_by_uuid(context, uuid):
 
+    """Get an instance or raise if it does not exist."""
 
-        elem = frame.findFirstElement('*:focus')
+    return IMPL.instance_get_by_uuid(context, uuid)
 
-        if elem.isNull():
 
-            callback(None)
 
-        else:
 
-            callback(webkitelem.WebKitElement(elem, tab=self._tab))
 
+def instance_get(context, instance_id):
 
+    """Get an instance or raise if it does not exist."""
 
-    def find_at_pos(self, pos, callback):
+    return IMPL.instance_get(context, instance_id)
 
-        assert pos.x() >= 0
 
-        assert pos.y() >= 0
 
-        frame = self._widget.page().frameAt(pos)
 
-        if frame is None:
 
-            # This happens when we click inside the webview, but not actually
+def instance_get_all(context):
 
-            # on the QWebPage - for example when clicking the scrollbar
+    """Get all instances."""
 
-            # sometimes.
+    return IMPL.instance_get_all(context)
 
-            log.webview.debug("Hit test at {} but frame is None!".format(pos))
 
-            callback(None)
 
-            return
 
 
+def instance_get_all_by_filters(context, filters, sort_key='created_at',
 
-        # You'd think we have to subtract frame.geometry().topLeft() from the
+                                sort_dir='desc'):
 
-        # position, but it seems QWebFrame::hitTestContent wants a position
+    """Get all instances that match all filters."""
 
-        # relative to the QWebView, not to the frame. This makes no sense to
+    return IMPL.instance_get_all_by_filters(context, filters, sort_key,
 
-        # me, but it works this way.
+                                            sort_dir)
 
-        hitresult = frame.hitTestContent(pos)
 
-        if hitresult.isNull():
 
-            # For some reason, the whole hit result can be null sometimes (e.g.
 
-            # on doodle menu links).
 
-            log.webview.debug("Hit test result is null!")
+def instance_get_active_by_window(context, begin, end=None, project_id=None):
 
-            callback(None)
+    """Get instances active during a certain time window.
 
-            return
 
 
+    Specifying a project_id will filter for a certain project."""
 
-        try:
+    return IMPL.instance_get_active_by_window(context, begin, end, project_id)
 
-            elem = webkitelem.WebKitElement(hitresult.element(), tab=self._tab)
 
-        except webkitelem.IsNullError:
 
-            # For some reason, the hit result element can be a null element
 
-            # sometimes (e.g. when clicking the timetable fields on
 
-            # http://www.sbb.ch/ ).
+def instance_get_active_by_window_joined(context, begin, end=None,
 
-            log.webview.debug("Hit test result element is null!")
+                                         project_id=None):
 
-            callback(None)
+    """Get instances and joins active during a certain time window.
 
-            return
 
 
+    Specifying a project_id will filter for a certain project."""
 
-        callback(elem)
+    return IMPL.instance_get_active_by_window_joined(context, begin, end,
 
+                                              project_id)
 
 
 
 
-class WebKitAudio(browsertab.AbstractAudio):
 
+def instance_get_all_by_project(context, project_id):
 
+    """Get all instance belonging to a project."""
 
-    """Dummy handling of audio status for QtWebKit."""
+    return IMPL.instance_get_all_by_project(context, project_id)
 
 
 
-    def set_muted(self, muted: bool, override: bool = False) -> None:
 
-        raise browsertab.WebTabError('Muting is not supported on QtWebKit!')
 
+def instance_get_all_by_host(context, host):
 
+    """Get all instance belonging to a host."""
 
-    def is_muted(self):
+    return IMPL.instance_get_all_by_host(context, host)
 
-        return False
 
 
 
-    def is_recently_audible(self):
 
-        return False
+def instance_get_all_by_reservation(context, reservation_id):
 
+    """Get all instances belonging to a reservation."""
 
+    return IMPL.instance_get_all_by_reservation(context, reservation_id)
 
 
 
-class WebKitTabPrivate(browsertab.AbstractTabPrivate):
 
 
+def instance_get_floating_address(context, instance_id):
 
-    """QtWebKit-related methods which aren't part of the public API."""
+    """Get the first floating ip address of an instance."""
 
+    return IMPL.instance_get_floating_address(context, instance_id)
 
 
-    def networkaccessmanager(self):
 
-        return self._widget.page().networkAccessManager()
 
 
+def instance_get_all_hung_in_rebooting(context, reboot_window):
 
-    def user_agent(self):
+    """Get all instances stuck in a rebooting state."""
 
-        page = self._widget.page()
+    return IMPL.instance_get_all_hung_in_rebooting(context, reboot_window)
 
-        return page.userAgentForUrl(self._tab.url())
 
 
 
-    def clear_ssl_errors(self):
 
-        self.networkaccessmanager().clear_all_ssl_errors()
+def instance_test_and_set(context, instance_id, attr, ok_states,
 
+                          new_state):
 
+    """Atomically check if an instance is in a valid state, and if it is, set
 
-    def event_target(self):
+    the instance into a new state.
 
-        return self._widget
+    """
 
+    return IMPL.instance_test_and_set(
 
+            context, instance_id, attr, ok_states, new_state)
 
-    def shutdown(self):
 
-        self._widget.shutdown()
 
 
 
+def instance_update(context, instance_id, values):
 
+    """Set the given properties on an instance and update it.
 
-class WebKitTab(browsertab.AbstractTab):
 
 
+    Raises NotFound if instance does not exist.
 
-    """A QtWebKit tab in the browser."""
 
 
+    """
 
-    def __init__(self, *, win_id, mode_manager, private, parent=None):
+    return IMPL.instance_update(context, instance_id, values)
 
-        super().__init__(win_id=win_id, private=private, parent=parent)
 
-        widget = webview.WebView(win_id=win_id, tab_id=self.tab_id,
 
-                                 private=private, tab=self)
 
-        if private:
 
-            self._make_private(widget)
+def instance_add_security_group(context, instance_id, security_group_id):
 
-        self.history = WebKitHistory(tab=self)
+    """Associate the given security group with the given instance."""
 
-        self.scroller = WebKitScroller(tab=self, parent=self)
+    return IMPL.instance_add_security_group(context, instance_id,
 
-        self.caret = WebKitCaret(mode_manager=mode_manager,
+                                            security_group_id)
 
-                                 tab=self, parent=self)
 
-        self.zoom = WebKitZoom(tab=self, parent=self)
 
-        self.search = WebKitSearch(tab=self, parent=self)
 
-        self.printing = WebKitPrinting(tab=self)
 
-        self.elements = WebKitElements(tab=self)
+def instance_remove_security_group(context, instance_id, security_group_id):
 
-        self.action = WebKitAction(tab=self)
+    """Disassociate the given security group from the given instance."""
 
-        self.audio = WebKitAudio(tab=self, parent=self)
+    return IMPL.instance_remove_security_group(context, instance_id,
 
-        self.private_api = WebKitTabPrivate(mode_manager=mode_manager,
+                                            security_group_id)
 
-                                            tab=self)
 
-        # We're assigning settings in _set_widget
 
-        self.settings = webkitsettings.WebKitSettings(settings=None)
 
-        self._set_widget(widget)
 
-        self._connect_signals()
+def instance_action_create(context, values):
 
-        self.backend = usertypes.Backend.QtWebKit
+    """Create an instance action from the values dictionary."""
 
+    return IMPL.instance_action_create(context, values)
 
 
-    def _install_event_filter(self):
 
-        self._widget.installEventFilter(self._tab_event_filter)
 
 
+def instance_get_actions(context, instance_uuid):
 
-    def _make_private(self, widget):
+    """Get instance actions by instance uuid."""
 
-        settings = widget.settings()
+    return IMPL.instance_get_actions(context, instance_uuid)
 
-        settings.setAttribute(QWebSettings.PrivateBrowsingEnabled, True)
 
 
 
-    def load_url(self, url, *, emit_before_load_started=True):
 
-        self._load_url_prepare(
+def instance_get_id_to_uuid_mapping(context, ids):
 
-            url, emit_before_load_started=emit_before_load_started)
+    """Return a dictionary containing 'ID: UUID' given the ids"""
 
-        self._widget.load(url)
+    return IMPL.instance_get_id_to_uuid_mapping(context, ids)
 
 
 
-    def url(self, *, requested=False):
 
-        frame = self._widget.page().mainFrame()
 
-        if requested:
+###################
 
-            return frame.requestedUrl()
 
-        else:
 
-            return frame.url()
 
 
+def instance_info_cache_create(context, values):
 
-    def dump_async(self, callback, *, plain=False):
+    """Create a new instance cache record in the table.
 
-        frame = self._widget.page().mainFrame()
 
-        if plain:
 
-            callback(frame.toPlainText())
+    :param context: = request context object
 
-        else:
+    :param values: = dict containing column values
 
-            callback(frame.toHtml())
+    """
 
+    return IMPL.instance_info_cache_create(context, values)
 
 
-    def run_js_async(self, code, callback=None, *, world=None):
 
-        if world is not None and world != usertypes.JsWorld.jseval:
 
-            log.webview.warning("Ignoring world ID {}".format(world))
 
-        document_element = self._widget.page().mainFrame().documentElement()
+def instance_info_cache_get(context, instance_uuid):
 
-        result = document_element.evaluateJavaScript(code)
+    """Gets an instance info cache from the table.
 
-        if callback is not None:
 
-            callback(result)
 
+    :param instance_uuid: = uuid of the info cache's instance
 
+    """
 
-    def icon(self):
+    return IMPL.instance_info_cache_get(context, instance_uuid)
 
-        return self._widget.icon()
 
 
 
-    def reload(self, *, force=False):
 
-        if force:
+def instance_info_cache_update(context, instance_uuid, values):
 
-            action = QWebPage.ReloadAndBypassCache
+    """Update an instance info cache record in the table.
 
-        else:
 
-            action = QWebPage.Reload
 
-        self._widget.triggerPageAction(action)
+    :param instance_uuid: = uuid of info cache's instance
 
+    :param values: = dict containing column values to update
 
+    """
 
-    def stop(self):
+    return IMPL.instance_info_cache_update(context, instance_uuid, values)
 
-        self._widget.stop()
 
 
 
-    def title(self):
 
-        return self._widget.title()
+def instance_info_cache_delete(context, instance_uuid):
 
+    """Deletes an existing instance_info_cache record
 
 
-    @pyqtSlot()
 
-    def _on_history_trigger(self):
+    :param instance_uuid: = uuid of the instance tied to the cache record
 
-        url = self.url()
+    """
 
-        requested_url = self.url(requested=True)
+    return IMPL.instance_info_cache_delete(context, instance_uuid)
 
-        self.history_item_triggered.emit(url, requested_url, self.title())
 
 
 
-    def set_html(self, html, base_url=QUrl()):
 
-        self._widget.setHtml(html, base_url)
+###################
 
 
 
-    @pyqtSlot()
 
-    def _on_load_started(self):
 
-        super()._on_load_started()
+def key_pair_create(context, values):
 
-        nam = self._widget.page().networkAccessManager()
+    """Create a key_pair from the values dictionary."""
 
-        nam.netrc_used = False
+    return IMPL.key_pair_create(context, values)
 
-        # Make sure the icon is cleared when navigating to a page without one.
 
-        self.icon_changed.emit(QIcon())
 
 
 
-    @pyqtSlot(bool)
+def key_pair_destroy(context, user_id, name):
 
-    def _on_load_finished(self, ok: bool) -> None:
+    """Destroy the key_pair or raise if it does not exist."""
 
-        super()._on_load_finished(ok)
+    return IMPL.key_pair_destroy(context, user_id, name)
 
-        self._update_load_status(ok)
 
 
 
-    @pyqtSlot()
 
-    def _on_frame_load_finished(self):
+def key_pair_destroy_all_by_user(context, user_id):
 
-        """Make sure we emit an appropriate status when loading finished.
+    """Destroy all key_pairs by user."""
 
+    return IMPL.key_pair_destroy_all_by_user(context, user_id)
 
 
-        While Qt has a bool "ok" attribute for loadFinished, it always is True
 
-        when using error pages... See
 
-        https://github.com/qutebrowser/qutebrowser/issues/84
 
-        """
+def key_pair_get(context, user_id, name):
 
-        self._on_load_finished(not self._widget.page().error_occurred)
+    """Get a key_pair or raise if it does not exist."""
 
+    return IMPL.key_pair_get(context, user_id, name)
 
 
-    @pyqtSlot()
 
-    def _on_webkit_icon_changed(self):
 
-        """Emit iconChanged with a QIcon like QWebEngineView does."""
 
-        if sip.isdeleted(self._widget):
+def key_pair_get_all_by_user(context, user_id):
 
-            log.webview.debug("Got _on_webkit_icon_changed for deleted view!")
+    """Get all key_pairs by user."""
 
-            return
+    return IMPL.key_pair_get_all_by_user(context, user_id)
 
-        self.icon_changed.emit(self._widget.icon())
 
 
 
-    @pyqtSlot(QWebFrame)
 
-    def _on_frame_created(self, frame):
+####################
 
-        """Connect the contentsSizeChanged signal of each frame."""
 
-        # FIXME:qtwebengine those could theoretically regress:
 
-        # https://github.com/qutebrowser/qutebrowser/issues/152
 
-        # https://github.com/qutebrowser/qutebrowser/issues/263
 
-        frame.contentsSizeChanged.connect(self._on_contents_size_changed)
+def network_associate(context, project_id, force=False):
 
+    """Associate a free network to a project."""
 
+    return IMPL.network_associate(context, project_id, force)
 
-    @pyqtSlot(QSize)
 
-    def _on_contents_size_changed(self, size):
 
-        self.contents_size_changed.emit(QSizeF(size))
 
 
+def network_count(context):
 
-    @pyqtSlot(usertypes.NavigationRequest)
+    """Return the number of networks."""
 
-    def _on_navigation_request(self, navigation):
+    return IMPL.network_count(context)
 
-        super()._on_navigation_request(navigation)
 
-        if not navigation.accepted:
 
-            return
 
 
+def network_count_reserved_ips(context, network_id):
 
-        log.webview.debug("target {} override {}".format(
+    """Return the number of reserved ips in the network."""
 
-            self.data.open_target, self.data.override_target))
+    return IMPL.network_count_reserved_ips(context, network_id)
 
 
 
-        if self.data.override_target is not None:
 
-            target = self.data.override_target
 
-            self.data.override_target = None
+def network_create_safe(context, values):
 
-        else:
+    """Create a network from the values dict.
 
-            target = self.data.open_target
 
 
+    The network is only returned if the create succeeds. If the create violates
 
-        if (navigation.navigation_type == navigation.Type.link_clicked and
+    constraints because the network already exists, no exception is raised.
 
-                target != usertypes.ClickTarget.normal):
 
-            tab = shared.get_tab(self.win_id, target)
 
-            tab.load_url(navigation.url)
+    """
 
-            self.data.open_target = usertypes.ClickTarget.normal
+    return IMPL.network_create_safe(context, values)
 
-            navigation.accepted = False
 
 
 
-        if navigation.is_main_frame:
 
-            self.settings.update_for_url(navigation.url)
+def network_delete_safe(context, network_id):
 
+    """Delete network with key network_id.
 
 
-    @pyqtSlot()
 
-    def _on_ssl_errors(self):
+    This method assumes that the network is not associated with any project
 
-        self._has_ssl_errors = True
 
 
+    """
 
-    def _connect_signals(self):
+    return IMPL.network_delete_safe(context, network_id)
 
-        view = self._widget
 
-        page = view.page()
 
-        frame = page.mainFrame()
 
-        page.windowCloseRequested.connect(self.window_close_requested)
 
-        page.linkHovered.connect(self.link_hovered)
+def network_create_fixed_ips(context, network_id, num_vpn_clients):
 
-        page.loadProgress.connect(self._on_load_progress)
+    """Create the ips for the network, reserving sepecified ips."""
 
-        frame.loadStarted.connect(self._on_load_started)
+    return IMPL.network_create_fixed_ips(context, network_id, num_vpn_clients)
 
-        view.scroll_pos_changed.connect(self.scroller.perc_changed)
 
-        view.titleChanged.connect(self.title_changed)
 
-        view.urlChanged.connect(self._on_url_changed)
 
-        view.shutting_down.connect(self.shutting_down)
 
-        page.networkAccessManager().sslErrors.connect(self._on_ssl_errors)
+def network_disassociate(context, network_id):
 
-        frame.loadFinished.connect(self._on_frame_load_finished)
+    """Disassociate the network from project or raise if it does not exist."""
 
-        view.iconChanged.connect(self._on_webkit_icon_changed)
+    return IMPL.network_disassociate(context, network_id)
 
-        page.frameCreated.connect(self._on_frame_created)
 
-        frame.contentsSizeChanged.connect(self._on_contents_size_changed)
 
-        frame.initialLayoutCompleted.connect(self._on_history_trigger)
 
-        page.navigation_request.connect(self._on_navigation_request)
+
+def network_get(context, network_id):
+
+    """Get an network or raise if it does not exist."""
+
+    return IMPL.network_get(context, network_id)
+
+
+
+
+
+def network_get_all(context):
+
+    """Return all defined networks."""
+
+    return IMPL.network_get_all(context)
+
+
+
+
+
+def network_get_all_by_uuids(context, network_uuids, project_id=None):
+
+    """Return networks by ids."""
+
+    return IMPL.network_get_all_by_uuids(context, network_uuids, project_id)
+
+
+
+
+
+# pylint: disable=C0103
+
+
+
+
+
+def network_get_associated_fixed_ips(context, network_id, host=None):
+
+    """Get all network's ips that have been associated."""
+
+    return IMPL.network_get_associated_fixed_ips(context, network_id, host)
+
+
+
+
+
+def network_get_by_bridge(context, bridge):
+
+    """Get a network by bridge or raise if it does not exist."""
+
+    return IMPL.network_get_by_bridge(context, bridge)
+
+
+
+
+
+def network_get_by_uuid(context, uuid):
+
+    """Get a network by uuid or raise if it does not exist."""
+
+    return IMPL.network_get_by_uuid(context, uuid)
+
+
+
+
+
+def network_get_by_cidr(context, cidr):
+
+    """Get a network by cidr or raise if it does not exist"""
+
+    return IMPL.network_get_by_cidr(context, cidr)
+
+
+
+
+
+def network_get_by_instance(context, instance_id):
+
+    """Get a network by instance id or raise if it does not exist."""
+
+    return IMPL.network_get_by_instance(context, instance_id)
+
+
+
+
+
+def network_get_all_by_instance(context, instance_id):
+
+    """Get all networks by instance id or raise if none exist."""
+
+    return IMPL.network_get_all_by_instance(context, instance_id)
+
+
+
+
+
+def network_get_all_by_host(context, host):
+
+    """All networks for which the given host is the network host."""
+
+    return IMPL.network_get_all_by_host(context, host)
+
+
+
+
+
+def network_get_index(context, network_id):
+
+    """Get non-conflicting index for network."""
+
+    return IMPL.network_get_index(context, network_id)
+
+
+
+
+
+def network_set_cidr(context, network_id, cidr):
+
+    """Set the Classless Inner Domain Routing for the network."""
+
+    return IMPL.network_set_cidr(context, network_id, cidr)
+
+
+
+
+
+def network_set_host(context, network_id, host_id):
+
+    """Safely set the host for network."""
+
+    return IMPL.network_set_host(context, network_id, host_id)
+
+
+
+
+
+def network_update(context, network_id, values):
+
+    """Set the given properties on an network and update it.
+
+
+
+    Raises NotFound if network does not exist.
+
+
+
+    """
+
+    return IMPL.network_update(context, network_id, values)
+
+
+
+
+
+###################
+
+
+
+
+
+def queue_get_for(context, topic, physical_node_id):
+
+    """Return a channel to send a message to a node with a topic."""
+
+    return IMPL.queue_get_for(context, topic, physical_node_id)
+
+
+
+
+
+###################
+
+
+
+
+
+def iscsi_target_count_by_host(context, host):
+
+    """Return count of export devices."""
+
+    return IMPL.iscsi_target_count_by_host(context, host)
+
+
+
+
+
+def iscsi_target_create_safe(context, values):
+
+    """Create an iscsi_target from the values dictionary.
+
+
+
+    The device is not returned. If the create violates the unique
+
+    constraints because the iscsi_target and host already exist,
+
+    no exception is raised.
+
+
+
+    """
+
+    return IMPL.iscsi_target_create_safe(context, values)
+
+
+
+
+
+###############
+
+
+
+
+
+def auth_token_destroy(context, token_id):
+
+    """Destroy an auth token."""
+
+    return IMPL.auth_token_destroy(context, token_id)
+
+
+
+
+
+def auth_token_get(context, token_hash):
+
+    """Retrieves a token given the hash representing it."""
+
+    return IMPL.auth_token_get(context, token_hash)
+
+
+
+
+
+def auth_token_update(context, token_hash, values):
+
+    """Updates a token given the hash representing it."""
+
+    return IMPL.auth_token_update(context, token_hash, values)
+
+
+
+
+
+def auth_token_create(context, token):
+
+    """Creates a new token."""
+
+    return IMPL.auth_token_create(context, token)
+
+
+
+
+
+###################
+
+
+
+
+
+def quota_create(context, project_id, resource, limit):
+
+    """Create a quota for the given project and resource."""
+
+    return IMPL.quota_create(context, project_id, resource, limit)
+
+
+
+
+
+def quota_get(context, project_id, resource):
+
+    """Retrieve a quota or raise if it does not exist."""
+
+    return IMPL.quota_get(context, project_id, resource)
+
+
+
+
+
+def quota_get_all_by_project(context, project_id):
+
+    """Retrieve all quotas associated with a given project."""
+
+    return IMPL.quota_get_all_by_project(context, project_id)
+
+
+
+
+
+def quota_update(context, project_id, resource, limit):
+
+    """Update a quota or raise if it does not exist."""
+
+    return IMPL.quota_update(context, project_id, resource, limit)
+
+
+
+
+
+def quota_destroy(context, project_id, resource):
+
+    """Destroy the quota or raise if it does not exist."""
+
+    return IMPL.quota_destroy(context, project_id, resource)
+
+
+
+
+
+def quota_destroy_all_by_project(context, project_id):
+
+    """Destroy all quotas associated with a given project."""
+
+    return IMPL.quota_get_all_by_project(context, project_id)
+
+
+
+
+
+###################
+
+
+
+
+
+def quota_class_create(context, class_name, resource, limit):
+
+    """Create a quota class for the given name and resource."""
+
+    return IMPL.quota_class_create(context, class_name, resource, limit)
+
+
+
+
+
+def quota_class_get(context, class_name, resource):
+
+    """Retrieve a quota class or raise if it does not exist."""
+
+    return IMPL.quota_class_get(context, class_name, resource)
+
+
+
+
+
+def quota_class_get_all_by_name(context, class_name):
+
+    """Retrieve all quotas associated with a given quota class."""
+
+    return IMPL.quota_class_get_all_by_name(context, class_name)
+
+
+
+
+
+def quota_class_update(context, class_name, resource, limit):
+
+    """Update a quota class or raise if it does not exist."""
+
+    return IMPL.quota_class_update(context, class_name, resource, limit)
+
+
+
+
+
+def quota_class_destroy(context, class_name, resource):
+
+    """Destroy the quota class or raise if it does not exist."""
+
+    return IMPL.quota_class_destroy(context, class_name, resource)
+
+
+
+
+
+def quota_class_destroy_all_by_name(context, class_name):
+
+    """Destroy all quotas associated with a given quota class."""
+
+    return IMPL.quota_class_destroy_all_by_name(context, class_name)
+
+
+
+
+
+###################
+
+
+
+
+
+def volume_allocate_iscsi_target(context, volume_id, host):
+
+    """Atomically allocate a free iscsi_target from the pool."""
+
+    return IMPL.volume_allocate_iscsi_target(context, volume_id, host)
+
+
+
+
+
+def volume_attached(context, volume_id, instance_id, mountpoint):
+
+    """Ensure that a volume is set as attached."""
+
+    return IMPL.volume_attached(context, volume_id, instance_id, mountpoint)
+
+
+
+
+
+def volume_create(context, values):
+
+    """Create a volume from the values dictionary."""
+
+    return IMPL.volume_create(context, values)
+
+
+
+
+
+def volume_data_get_for_project(context, project_id):
+
+    """Get (volume_count, gigabytes) for project."""
+
+    return IMPL.volume_data_get_for_project(context, project_id)
+
+
+
+
+
+def volume_destroy(context, volume_id):
+
+    """Destroy the volume or raise if it does not exist."""
+
+    return IMPL.volume_destroy(context, volume_id)
+
+
+
+
+
+def volume_detached(context, volume_id):
+
+    """Ensure that a volume is set as detached."""
+
+    return IMPL.volume_detached(context, volume_id)
+
+
+
+
+
+def volume_get(context, volume_id):
+
+    """Get a volume or raise if it does not exist."""
+
+    return IMPL.volume_get(context, volume_id)
+
+
+
+
+
+def volume_get_all(context):
+
+    """Get all volumes."""
+
+    return IMPL.volume_get_all(context)
+
+
+
+
+
+def volume_get_all_by_host(context, host):
+
+    """Get all volumes belonging to a host."""
+
+    return IMPL.volume_get_all_by_host(context, host)
+
+
+
+
+
+def volume_get_all_by_instance(context, instance_id):
+
+    """Get all volumes belonging to a instance."""
+
+    return IMPL.volume_get_all_by_instance(context, instance_id)
+
+
+
+
+
+def volume_get_all_by_project(context, project_id):
+
+    """Get all volumes belonging to a project."""
+
+    return IMPL.volume_get_all_by_project(context, project_id)
+
+
+
+
+
+def volume_get_by_ec2_id(context, ec2_id):
+
+    """Get a volume by ec2 id."""
+
+    return IMPL.volume_get_by_ec2_id(context, ec2_id)
+
+
+
+
+
+def volume_get_instance(context, volume_id):
+
+    """Get the instance that a volume is attached to."""
+
+    return IMPL.volume_get_instance(context, volume_id)
+
+
+
+
+
+def volume_get_iscsi_target_num(context, volume_id):
+
+    """Get the target num (tid) allocated to the volume."""
+
+    return IMPL.volume_get_iscsi_target_num(context, volume_id)
+
+
+
+
+
+def volume_update(context, volume_id, values):
+
+    """Set the given properties on an volume and update it.
+
+
+
+    Raises NotFound if volume does not exist.
+
+
+
+    """
+
+    return IMPL.volume_update(context, volume_id, values)
+
+
+
+
+
+####################
+
+
+
+
+
+def snapshot_create(context, values):
+
+    """Create a snapshot from the values dictionary."""
+
+    return IMPL.snapshot_create(context, values)
+
+
+
+
+
+def snapshot_destroy(context, snapshot_id):
+
+    """Destroy the snapshot or raise if it does not exist."""
+
+    return IMPL.snapshot_destroy(context, snapshot_id)
+
+
+
+
+
+def snapshot_get(context, snapshot_id):
+
+    """Get a snapshot or raise if it does not exist."""
+
+    return IMPL.snapshot_get(context, snapshot_id)
+
+
+
+
+
+def snapshot_get_all(context):
+
+    """Get all snapshots."""
+
+    return IMPL.snapshot_get_all(context)
+
+
+
+
+
+def snapshot_get_all_by_project(context, project_id):
+
+    """Get all snapshots belonging to a project."""
+
+    return IMPL.snapshot_get_all_by_project(context, project_id)
+
+
+
+
+
+def snapshot_get_all_for_volume(context, volume_id):
+
+    """Get all snapshots for a volume."""
+
+    return IMPL.snapshot_get_all_for_volume(context, volume_id)
+
+
+
+
+
+def snapshot_update(context, snapshot_id, values):
+
+    """Set the given properties on an snapshot and update it.
+
+
+
+    Raises NotFound if snapshot does not exist.
+
+
+
+    """
+
+    return IMPL.snapshot_update(context, snapshot_id, values)
+
+
+
+
+
+####################
+
+
+
+
+
+def block_device_mapping_create(context, values):
+
+    """Create an entry of block device mapping"""
+
+    return IMPL.block_device_mapping_create(context, values)
+
+
+
+
+
+def block_device_mapping_update(context, bdm_id, values):
+
+    """Update an entry of block device mapping"""
+
+    return IMPL.block_device_mapping_update(context, bdm_id, values)
+
+
+
+
+
+def block_device_mapping_update_or_create(context, values):
+
+    """Update an entry of block device mapping.
+
+    If not existed, create a new entry"""
+
+    return IMPL.block_device_mapping_update_or_create(context, values)
+
+
+
+
+
+def block_device_mapping_get_all_by_instance(context, instance_id):
+
+    """Get all block device mapping belonging to a instance"""
+
+    return IMPL.block_device_mapping_get_all_by_instance(context, instance_id)
+
+
+
+
+
+def block_device_mapping_destroy(context, bdm_id):
+
+    """Destroy the block device mapping."""
+
+    return IMPL.block_device_mapping_destroy(context, bdm_id)
+
+
+
+
+
+def block_device_mapping_destroy_by_instance_and_volume(context, instance_id,
+
+                                                        volume_id):
+
+    """Destroy the block device mapping or raise if it does not exist."""
+
+    return IMPL.block_device_mapping_destroy_by_instance_and_volume(
+
+        context, instance_id, volume_id)
+
+
+
+
+
+####################
+
+
+
+
+
+def security_group_get_all(context):
+
+    """Get all security groups."""
+
+    return IMPL.security_group_get_all(context)
+
+
+
+
+
+def security_group_get(context, security_group_id):
+
+    """Get security group by its id."""
+
+    return IMPL.security_group_get(context, security_group_id)
+
+
+
+
+
+def security_group_get_by_name(context, project_id, group_name):
+
+    """Returns a security group with the specified name from a project."""
+
+    return IMPL.security_group_get_by_name(context, project_id, group_name)
+
+
+
+
+
+def security_group_get_by_project(context, project_id):
+
+    """Get all security groups belonging to a project."""
+
+    return IMPL.security_group_get_by_project(context, project_id)
+
+
+
+
+
+def security_group_get_by_instance(context, instance_id):
+
+    """Get security groups to which the instance is assigned."""
+
+    return IMPL.security_group_get_by_instance(context, instance_id)
+
+
+
+
+
+def security_group_exists(context, project_id, group_name):
+
+    """Indicates if a group name exists in a project."""
+
+    return IMPL.security_group_exists(context, project_id, group_name)
+
+
+
+
+
+def security_group_in_use(context, group_id):
+
+    """Indicates if a security group is currently in use."""
+
+    return IMPL.security_group_in_use(context, group_id)
+
+
+
+
+
+def security_group_create(context, values):
+
+    """Create a new security group."""
+
+    return IMPL.security_group_create(context, values)
+
+
+
+
+
+def security_group_destroy(context, security_group_id):
+
+    """Deletes a security group."""
+
+    return IMPL.security_group_destroy(context, security_group_id)
+
+
+
+
+
+####################
+
+
+
+
+
+def security_group_rule_create(context, values):
+
+    """Create a new security group."""
+
+    return IMPL.security_group_rule_create(context, values)
+
+
+
+
+
+def security_group_rule_get_by_security_group(context, security_group_id):
+
+    """Get all rules for a a given security group."""
+
+    return IMPL.security_group_rule_get_by_security_group(context,
+
+                                                          security_group_id)
+
+
+
+
+
+def security_group_rule_get_by_security_group_grantee(context,
+
+                                                      security_group_id):
+
+    """Get all rules that grant access to the given security group."""
+
+    return IMPL.security_group_rule_get_by_security_group_grantee(context,
+
+                                                             security_group_id)
+
+
+
+
+
+def security_group_rule_destroy(context, security_group_rule_id):
+
+    """Deletes a security group rule."""
+
+    return IMPL.security_group_rule_destroy(context, security_group_rule_id)
+
+
+
+
+
+def security_group_rule_get(context, security_group_rule_id):
+
+    """Gets a security group rule."""
+
+    return IMPL.security_group_rule_get(context, security_group_rule_id)
+
+
+
+
+
+###################
+
+
+
+
+
+def provider_fw_rule_create(context, rule):
+
+    """Add a firewall rule at the provider level (all hosts & instances)."""
+
+    return IMPL.provider_fw_rule_create(context, rule)
+
+
+
+
+
+def provider_fw_rule_get_all(context):
+
+    """Get all provider-level firewall rules."""
+
+    return IMPL.provider_fw_rule_get_all(context)
+
+
+
+
+
+def provider_fw_rule_destroy(context, rule_id):
+
+    """Delete a provider firewall rule from the database."""
+
+    return IMPL.provider_fw_rule_destroy(context, rule_id)
+
+
+
+
+
+###################
+
+
+
+
+
+def user_get(context, id):
+
+    """Get user by id."""
+
+    return IMPL.user_get(context, id)
+
+
+
+
+
+def user_get_by_uid(context, uid):
+
+    """Get user by uid."""
+
+    return IMPL.user_get_by_uid(context, uid)
+
+
+
+
+
+def user_get_by_access_key(context, access_key):
+
+    """Get user by access key."""
+
+    return IMPL.user_get_by_access_key(context, access_key)
+
+
+
+
+
+def user_create(context, values):
+
+    """Create a new user."""
+
+    return IMPL.user_create(context, values)
+
+
+
+
+
+def user_delete(context, id):
+
+    """Delete a user."""
+
+    return IMPL.user_delete(context, id)
+
+
+
+
+
+def user_get_all(context):
+
+    """Create a new user."""
+
+    return IMPL.user_get_all(context)
+
+
+
+
+
+def user_add_role(context, user_id, role):
+
+    """Add another global role for user."""
+
+    return IMPL.user_add_role(context, user_id, role)
+
+
+
+
+
+def user_remove_role(context, user_id, role):
+
+    """Remove global role from user."""
+
+    return IMPL.user_remove_role(context, user_id, role)
+
+
+
+
+
+def user_get_roles(context, user_id):
+
+    """Get global roles for user."""
+
+    return IMPL.user_get_roles(context, user_id)
+
+
+
+
+
+def user_add_project_role(context, user_id, project_id, role):
+
+    """Add project role for user."""
+
+    return IMPL.user_add_project_role(context, user_id, project_id, role)
+
+
+
+
+
+def user_remove_project_role(context, user_id, project_id, role):
+
+    """Remove project role from user."""
+
+    return IMPL.user_remove_project_role(context, user_id, project_id, role)
+
+
+
+
+
+def user_get_roles_for_project(context, user_id, project_id):
+
+    """Return list of roles a user holds on project."""
+
+    return IMPL.user_get_roles_for_project(context, user_id, project_id)
+
+
+
+
+
+def user_update(context, user_id, values):
+
+    """Update user."""
+
+    return IMPL.user_update(context, user_id, values)
+
+
+
+
+
+###################
+
+
+
+
+
+def project_get(context, id):
+
+    """Get project by id."""
+
+    return IMPL.project_get(context, id)
+
+
+
+
+
+def project_create(context, values):
+
+    """Create a new project."""
+
+    return IMPL.project_create(context, values)
+
+
+
+
+
+def project_add_member(context, project_id, user_id):
+
+    """Add user to project."""
+
+    return IMPL.project_add_member(context, project_id, user_id)
+
+
+
+
+
+def project_get_all(context):
+
+    """Get all projects."""
+
+    return IMPL.project_get_all(context)
+
+
+
+
+
+def project_get_by_user(context, user_id):
+
+    """Get all projects of which the given user is a member."""
+
+    return IMPL.project_get_by_user(context, user_id)
+
+
+
+
+
+def project_remove_member(context, project_id, user_id):
+
+    """Remove the given user from the given project."""
+
+    return IMPL.project_remove_member(context, project_id, user_id)
+
+
+
+
+
+def project_update(context, project_id, values):
+
+    """Update Remove the given user from the given project."""
+
+    return IMPL.project_update(context, project_id, values)
+
+
+
+
+
+def project_delete(context, project_id):
+
+    """Delete project."""
+
+    return IMPL.project_delete(context, project_id)
+
+
+
+
+
+def project_get_networks(context, project_id, associate=True):
+
+    """Return the network associated with the project.
+
+
+
+    If associate is true, it will attempt to associate a new
+
+    network if one is not found, otherwise it returns None.
+
+
+
+    """
+
+    return IMPL.project_get_networks(context, project_id, associate)
+
+
+
+
+
+###################
+
+
+
+
+
+def console_pool_create(context, values):
+
+    """Create console pool."""
+
+    return IMPL.console_pool_create(context, values)
+
+
+
+
+
+def console_pool_get(context, pool_id):
+
+    """Get a console pool."""
+
+    return IMPL.console_pool_get(context, pool_id)
+
+
+
+
+
+def console_pool_get_by_host_type(context, compute_host, proxy_host,
+
+                                  console_type):
+
+    """Fetch a console pool for a given proxy host, compute host, and type."""
+
+    return IMPL.console_pool_get_by_host_type(context,
+
+                                              compute_host,
+
+                                              proxy_host,
+
+                                              console_type)
+
+
+
+
+
+def console_pool_get_all_by_host_type(context, host, console_type):
+
+    """Fetch all pools for given proxy host and type."""
+
+    return IMPL.console_pool_get_all_by_host_type(context,
+
+                                                  host,
+
+                                                  console_type)
+
+
+
+
+
+def console_create(context, values):
+
+    """Create a console."""
+
+    return IMPL.console_create(context, values)
+
+
+
+
+
+def console_delete(context, console_id):
+
+    """Delete a console."""
+
+    return IMPL.console_delete(context, console_id)
+
+
+
+
+
+def console_get_by_pool_instance(context, pool_id, instance_id):
+
+    """Get console entry for a given instance and pool."""
+
+    return IMPL.console_get_by_pool_instance(context, pool_id, instance_id)
+
+
+
+
+
+def console_get_all_by_instance(context, instance_id):
+
+    """Get consoles for a given instance."""
+
+    return IMPL.console_get_all_by_instance(context, instance_id)
+
+
+
+
+
+def console_get(context, console_id, instance_id=None):
+
+    """Get a specific console (possibly on a given instance)."""
+
+    return IMPL.console_get(context, console_id, instance_id)
+
+
+
+
+
+    ##################
+
+
+
+
+
+def instance_type_create(context, values):
+
+    """Create a new instance type."""
+
+    return IMPL.instance_type_create(context, values)
+
+
+
+
+
+def instance_type_get_all(context, inactive=False, filters=None):
+
+    """Get all instance types."""
+
+    return IMPL.instance_type_get_all(
+
+        context, inactive=inactive, filters=filters)
+
+
+
+
+
+def instance_type_get(context, id):
+
+    """Get instance type by id."""
+
+    return IMPL.instance_type_get(context, id)
+
+
+
+
+
+def instance_type_get_by_name(context, name):
+
+    """Get instance type by name."""
+
+    return IMPL.instance_type_get_by_name(context, name)
+
+
+
+
+
+def instance_type_get_by_flavor_id(context, id):
+
+    """Get instance type by name."""
+
+    return IMPL.instance_type_get_by_flavor_id(context, id)
+
+
+
+
+
+def instance_type_destroy(context, name):
+
+    """Delete a instance type."""
+
+    return IMPL.instance_type_destroy(context, name)
+
+
+
+
+
+####################
+
+
+
+
+
+def cell_create(context, values):
+
+    """Create a new child Cell entry."""
+
+    return IMPL.cell_create(context, values)
+
+
+
+
+
+def cell_update(context, cell_id, values):
+
+    """Update a child Cell entry."""
+
+    return IMPL.cell_update(context, cell_id, values)
+
+
+
+
+
+def cell_delete(context, cell_id):
+
+    """Delete a child Cell."""
+
+    return IMPL.cell_delete(context, cell_id)
+
+
+
+
+
+def cell_get(context, cell_id):
+
+    """Get a specific child Cell."""
+
+    return IMPL.cell_get(context, cell_id)
+
+
+
+
+
+def cell_get_all(context):
+
+    """Get all child Cells."""
+
+    return IMPL.cell_get_all(context)
+
+
+
+
+
+####################
+
+
+
+
+
+def instance_metadata_get(context, instance_id):
+
+    """Get all metadata for an instance."""
+
+    return IMPL.instance_metadata_get(context, instance_id)
+
+
+
+
+
+def instance_metadata_delete(context, instance_id, key):
+
+    """Delete the given metadata item."""
+
+    IMPL.instance_metadata_delete(context, instance_id, key)
+
+
+
+
+
+def instance_metadata_update(context, instance_id, metadata, delete):
+
+    """Update metadata if it exists, otherwise create it."""
+
+    IMPL.instance_metadata_update(context, instance_id, metadata, delete)
+
+
+
+
+
+####################
+
+
+
+
+
+def agent_build_create(context, values):
+
+    """Create a new agent build entry."""
+
+    return IMPL.agent_build_create(context, values)
+
+
+
+
+
+def agent_build_get_by_triple(context, hypervisor, os, architecture):
+
+    """Get agent build by hypervisor/OS/architecture triple."""
+
+    return IMPL.agent_build_get_by_triple(context, hypervisor, os,
+
+            architecture)
+
+
+
+
+
+def agent_build_get_all(context):
+
+    """Get all agent builds."""
+
+    return IMPL.agent_build_get_all(context)
+
+
+
+
+
+def agent_build_destroy(context, agent_update_id):
+
+    """Destroy agent build entry."""
+
+    IMPL.agent_build_destroy(context, agent_update_id)
+
+
+
+
+
+def agent_build_update(context, agent_build_id, values):
+
+    """Update agent build entry."""
+
+    IMPL.agent_build_update(context, agent_build_id, values)
+
+
+
+
+
+####################
+
+
+
+
+
+def bw_usage_get_by_macs(context, macs, start_period):
+
+    """Return bw usages for an instance in a given audit period."""
+
+    return IMPL.bw_usage_get_by_macs(context, macs, start_period)
+
+
+
+
+
+def bw_usage_update(context,
+
+                    mac,
+
+                    start_period,
+
+                    bw_in, bw_out):
+
+    """Update cached bw usage for an instance and network
+
+       Creates new record if needed."""
+
+    return IMPL.bw_usage_update(context,
+
+                                mac,
+
+                                start_period,
+
+                                bw_in, bw_out)
+
+
+
+
+
+####################
+
+
+
+
+
+def instance_type_extra_specs_get(context, instance_type_id):
+
+    """Get all extra specs for an instance type."""
+
+    return IMPL.instance_type_extra_specs_get(context, instance_type_id)
+
+
+
+
+
+def instance_type_extra_specs_delete(context, instance_type_id, key):
+
+    """Delete the given extra specs item."""
+
+    IMPL.instance_type_extra_specs_delete(context, instance_type_id, key)
+
+
+
+
+
+def instance_type_extra_specs_update_or_create(context, instance_type_id,
+
+                                               extra_specs):
+
+    """Create or update instance type extra specs. This adds or modifies the
+
+    key/value pairs specified in the extra specs dict argument"""
+
+    IMPL.instance_type_extra_specs_update_or_create(context, instance_type_id,
+
+                                                    extra_specs)
+
+
+
+
+
+##################
+
+
+
+
+
+def volume_metadata_get(context, volume_id):
+
+    """Get all metadata for a volume."""
+
+    return IMPL.volume_metadata_get(context, volume_id)
+
+
+
+
+
+def volume_metadata_delete(context, volume_id, key):
+
+    """Delete the given metadata item."""
+
+    IMPL.volume_metadata_delete(context, volume_id, key)
+
+
+
+
+
+def volume_metadata_update(context, volume_id, metadata, delete):
+
+    """Update metadata if it exists, otherwise create it."""
+
+    IMPL.volume_metadata_update(context, volume_id, metadata, delete)
+
+
+
+
+
+##################
+
+
+
+
+
+def volume_type_create(context, values):
+
+    """Create a new volume type."""
+
+    return IMPL.volume_type_create(context, values)
+
+
+
+
+
+def volume_type_get_all(context, inactive=False):
+
+    """Get all volume types."""
+
+    return IMPL.volume_type_get_all(context, inactive)
+
+
+
+
+
+def volume_type_get(context, id):
+
+    """Get volume type by id."""
+
+    return IMPL.volume_type_get(context, id)
+
+
+
+
+
+def volume_type_get_by_name(context, name):
+
+    """Get volume type by name."""
+
+    return IMPL.volume_type_get_by_name(context, name)
+
+
+
+
+
+def volume_type_destroy(context, name):
+
+    """Delete a volume type."""
+
+    return IMPL.volume_type_destroy(context, name)
+
+
+
+
+
+####################
+
+
+
+
+
+def volume_type_extra_specs_get(context, volume_type_id):
+
+    """Get all extra specs for a volume type."""
+
+    return IMPL.volume_type_extra_specs_get(context, volume_type_id)
+
+
+
+
+
+def volume_type_extra_specs_delete(context, volume_type_id, key):
+
+    """Delete the given extra specs item."""
+
+    IMPL.volume_type_extra_specs_delete(context, volume_type_id, key)
+
+
+
+
+
+def volume_type_extra_specs_update_or_create(context, volume_type_id,
+
+                                               extra_specs):
+
+    """Create or update volume type extra specs. This adds or modifies the
+
+    key/value pairs specified in the extra specs dict argument"""
+
+    IMPL.volume_type_extra_specs_update_or_create(context, volume_type_id,
+
+                                                    extra_specs)
+
+
+
+
+
+###################
+
+
+
+
+
+def s3_image_get(context, image_id):
+
+    """Find local s3 image represented by the provided id"""
+
+    return IMPL.s3_image_get(context, image_id)
+
+
+
+
+
+def s3_image_get_by_uuid(context, image_uuid):
+
+    """Find local s3 image represented by the provided uuid"""
+
+    return IMPL.s3_image_get_by_uuid(context, image_uuid)
+
+
+
+
+
+def s3_image_create(context, image_uuid):
+
+    """Create local s3 image represented by provided uuid"""
+
+    return IMPL.s3_image_create(context, image_uuid)
+
+
+
+
+
+####################
+
+
+
+
+
+def sm_backend_conf_create(context, values):
+
+    """Create a new SM Backend Config entry."""
+
+    return IMPL.sm_backend_conf_create(context, values)
+
+
+
+
+
+def sm_backend_conf_update(context, sm_backend_conf_id, values):
+
+    """Update a SM Backend Config entry."""
+
+    return IMPL.sm_backend_conf_update(context, sm_backend_conf_id, values)
+
+
+
+
+
+def sm_backend_conf_delete(context, sm_backend_conf_id):
+
+    """Delete a SM Backend Config."""
+
+    return IMPL.sm_backend_conf_delete(context, sm_backend_conf_id)
+
+
+
+
+
+def sm_backend_conf_get(context, sm_backend_conf_id):
+
+    """Get a specific SM Backend Config."""
+
+    return IMPL.sm_backend_conf_get(context, sm_backend_conf_id)
+
+
+
+
+
+def sm_backend_conf_get_by_sr(context, sr_uuid):
+
+    """Get a specific SM Backend Config."""
+
+    return IMPL.sm_backend_conf_get_by_sr(context, sr_uuid)
+
+
+
+
+
+def sm_backend_conf_get_all(context):
+
+    """Get all SM Backend Configs."""
+
+    return IMPL.sm_backend_conf_get_all(context)
+
+
+
+
+
+####################
+
+
+
+
+
+def sm_flavor_create(context, values):
+
+    """Create a new SM Flavor entry."""
+
+    return IMPL.sm_flavor_create(context, values)
+
+
+
+
+
+def sm_flavor_update(context, sm_flavor_id, values):
+
+    """Update a SM Flavor entry."""
+
+    return IMPL.sm_flavor_update(context, values)
+
+
+
+
+
+def sm_flavor_delete(context, sm_flavor_id):
+
+    """Delete a SM Flavor."""
+
+    return IMPL.sm_flavor_delete(context, sm_flavor_id)
+
+
+
+
+
+def sm_flavor_get(context, sm_flavor):
+
+    """Get a specific SM Flavor."""
+
+    return IMPL.sm_flavor_get(context, sm_flavor)
+
+
+
+
+
+def sm_flavor_get_all(context):
+
+    """Get all SM Flavors."""
+
+    return IMPL.sm_flavor_get_all(context)
+
+
+
+
+
+####################
+
+
+
+
+
+def sm_volume_create(context, values):
+
+    """Create a new child Zone entry."""
+
+    return IMPL.sm_volume_create(context, values)
+
+
+
+
+
+def sm_volume_update(context, volume_id, values):
+
+    """Update a child Zone entry."""
+
+    return IMPL.sm_volume_update(context, values)
+
+
+
+
+
+def sm_volume_delete(context, volume_id):
+
+    """Delete a child Zone."""
+
+    return IMPL.sm_volume_delete(context, volume_id)
+
+
+
+
+
+def sm_volume_get(context, volume_id):
+
+    """Get a specific child Zone."""
+
+    return IMPL.sm_volume_get(context, volume_id)
+
+
+
+
+
+def sm_volume_get_all(context):
+
+    """Get all child Zones."""
+
+    return IMPL.sm_volume_get_all(context)
+
+
+
+
+
+####################
+
+
+
+
+
+def aggregate_create(context, values, metadata=None):
+
+    """Create a new aggregate with metadata."""
+
+    return IMPL.aggregate_create(context, values, metadata)
+
+
+
+
+
+def aggregate_get(context, aggregate_id):
+
+    """Get a specific aggregate by id."""
+
+    return IMPL.aggregate_get(context, aggregate_id)
+
+
+
+
+
+def aggregate_get_by_host(context, host):
+
+    """Get a specific aggregate by host"""
+
+    return IMPL.aggregate_get_by_host(context, host)
+
+
+
+
+
+def aggregate_update(context, aggregate_id, values):
+
+    """Update the attributes of an aggregates. If values contains a metadata
+
+    key, it updates the aggregate metadata too."""
+
+    return IMPL.aggregate_update(context, aggregate_id, values)
+
+
+
+
+
+def aggregate_delete(context, aggregate_id):
+
+    """Delete an aggregate."""
+
+    return IMPL.aggregate_delete(context, aggregate_id)
+
+
+
+
+
+def aggregate_get_all(context):
+
+    """Get all aggregates."""
+
+    return IMPL.aggregate_get_all(context)
+
+
+
+
+
+def aggregate_metadata_add(context, aggregate_id, metadata, set_delete=False):
+
+    """Add/update metadata. If set_delete=True, it adds only."""
+
+    IMPL.aggregate_metadata_add(context, aggregate_id, metadata, set_delete)
+
+
+
+
+
+def aggregate_metadata_get(context, aggregate_id):
+
+    """Get metadata for the specified aggregate."""
+
+    return IMPL.aggregate_metadata_get(context, aggregate_id)
+
+
+
+
+
+def aggregate_metadata_delete(context, aggregate_id, key):
+
+    """Delete the given metadata key."""
+
+    IMPL.aggregate_metadata_delete(context, aggregate_id, key)
+
+
+
+
+
+def aggregate_host_add(context, aggregate_id, host):
+
+    """Add host to the aggregate."""
+
+    IMPL.aggregate_host_add(context, aggregate_id, host)
+
+
+
+
+
+def aggregate_host_get_all(context, aggregate_id):
+
+    """Get hosts for the specified aggregate."""
+
+    return IMPL.aggregate_host_get_all(context, aggregate_id)
+
+
+
+
+
+def aggregate_host_delete(context, aggregate_id, host):
+
+    """Delete the given host from the aggregate."""
+
+    IMPL.aggregate_host_delete(context, aggregate_id, host)
+
+
+
+
+
+####################
+
+
+
+
+
+def instance_fault_create(context, values):
+
+    """Create a new Instance Fault."""
+
+    return IMPL.instance_fault_create(context, values)
+
+
+
+
+
+def instance_fault_get_by_instance_uuids(context, instance_uuids):
+
+    """Get all instance faults for the provided instance_uuids."""
+
+    return IMPL.instance_fault_get_by_instance_uuids(context, instance_uuids)

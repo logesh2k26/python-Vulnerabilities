@@ -2,2054 +2,2226 @@
 # Safety: safe
 # Category: safe
 
-# vim: ft=python fileencoding=utf-8 sts=4 sw=4 et:
+# Copyright (C) 2016 JWCrypto Project Contributors - see LICENSE file
 
 
 
-# Copyright 2016-2018 Florian Bruhin (The Compiler) <mail@qutebrowser.org>
+import abc
 
-#
+import os
 
-# This file is part of qutebrowser.
+import struct
 
-#
+from binascii import hexlify, unhexlify
 
-# qutebrowser is free software: you can redistribute it and/or modify
 
-# it under the terms of the GNU General Public License as published by
 
-# the Free Software Foundation, either version 3 of the License, or
+from cryptography.exceptions import InvalidSignature
 
-# (at your option) any later version.
+from cryptography.hazmat.backends import default_backend
 
-#
+from cryptography.hazmat.primitives import constant_time, hashes, hmac
 
-# qutebrowser is distributed in the hope that it will be useful,
+from cryptography.hazmat.primitives.asymmetric import ec
 
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
+from cryptography.hazmat.primitives.asymmetric import padding
 
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+from cryptography.hazmat.primitives.asymmetric import utils as ec_utils
 
-# GNU General Public License for more details.
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-#
+from cryptography.hazmat.primitives.kdf.concatkdf import ConcatKDFHash
 
-# You should have received a copy of the GNU General Public License
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-# along with qutebrowser.  If not, see <http://www.gnu.org/licenses/>.
+from cryptography.hazmat.primitives.padding import PKCS7
 
 
 
-"""Base class for a wrapper over QWebView/QWebEngineView."""
+import six
 
 
 
-import enum
+from jwcrypto.common import InvalidCEKeyLength
 
-import itertools
+from jwcrypto.common import InvalidJWAAlgorithm
 
+from jwcrypto.common import InvalidJWEKeyLength
 
+from jwcrypto.common import InvalidJWEKeyType
 
-import attr
+from jwcrypto.common import InvalidJWEOperation
 
-from PyQt5.QtCore import pyqtSignal, pyqtSlot, QUrl, QObject, QSizeF, Qt
+from jwcrypto.common import base64url_decode, base64url_encode
 
-from PyQt5.QtGui import QIcon
+from jwcrypto.common import json_decode
 
-from PyQt5.QtWidgets import QWidget, QApplication, QDialog
+from jwcrypto.jwk import JWK
 
-from PyQt5.QtPrintSupport import QPrintDialog
 
 
+# Implements RFC 7518 - JSON Web Algorithms (JWA)
 
-import pygments
 
-import pygments.lexers
 
-import pygments.formatters
 
 
+@six.add_metaclass(abc.ABCMeta)
 
-from qutebrowser.keyinput import modeman
+class JWAAlgorithm(object):
 
-from qutebrowser.config import config
 
-from qutebrowser.utils import (utils, objreg, usertypes, log, qtutils,
 
-                               urlutils, message)
+    @abc.abstractproperty
 
-from qutebrowser.misc import miscwidgets, objects
+    def name(self):
 
-from qutebrowser.browser import mouse, hints
+        """The algorithm Name"""
 
-from qutebrowser.qt import sip
+        pass
 
 
 
+    @abc.abstractproperty
 
+    def description(self):
 
-tab_id_gen = itertools.count(0)
+        """A short description"""
 
+        pass
 
 
 
+    @abc.abstractproperty
 
-def create(win_id, private, parent=None):
+    def keysize(self):
 
-    """Get a QtWebKit/QtWebEngine tab object.
+        """The actual/recommended/minimum key size"""
 
+        pass
 
 
-    Args:
 
-        win_id: The window ID where the tab will be shown.
+    @abc.abstractproperty
 
-        private: Whether the tab is a private/off the record tab.
+    def algorithm_usage_location(self):
 
-        parent: The Qt parent to set.
+        """One of 'alg', 'enc' or 'JWK'"""
 
-    """
+        pass
 
-    # Importing modules here so we don't depend on QtWebEngine without the
 
-    # argument and to avoid circular imports.
 
-    mode_manager = modeman.instance(win_id)
+    @abc.abstractproperty
 
-    if objects.backend == usertypes.Backend.QtWebEngine:
+    def algorithm_use(self):
 
-        from qutebrowser.browser.webengine import webenginetab
+        """One of 'sig', 'kex', 'enc'"""
 
-        tab_class = webenginetab.WebEngineTab
+        pass
 
-    else:
 
-        from qutebrowser.browser.webkit import webkittab
 
-        tab_class = webkittab.WebKitTab
 
-    return tab_class(win_id=win_id, mode_manager=mode_manager, private=private,
 
-                     parent=parent)
+def _bitsize(x):
 
+    return len(x) * 8
 
 
 
 
-def init():
 
-    """Initialize backend-specific modules."""
+def _inbytes(x):
 
-    if objects.backend == usertypes.Backend.QtWebEngine:
+    return x // 8
 
-        from qutebrowser.browser.webengine import webenginetab
 
-        webenginetab.init()
 
 
 
+def _randombits(x):
 
+    if x % 8 != 0:
 
-class WebTabError(Exception):
+        raise ValueError("lenght must be a multiple of 8")
 
+    return os.urandom(_inbytes(x))
 
 
-    """Base class for various errors."""
 
 
 
+# Note: the number of bits should be a multiple of 16
 
+def _encode_int(n, bits):
 
-class UnsupportedOperationError(WebTabError):
+    e = '{:x}'.format(n)
 
+    ilen = ((bits + 7) // 8) * 2  # number of bytes rounded up times 2 bytes
 
+    return unhexlify(e.rjust(ilen, '0')[:ilen])
 
-    """Raised when an operation is not supported with the given backend."""
 
 
 
 
+def _decode_int(n):
 
-TerminationStatus = enum.Enum('TerminationStatus', [
+    return int(hexlify(n), 16)
 
-    'normal',
 
-    'abnormal',  # non-zero exit status
 
-    'crashed',   # e.g. segfault
 
-    'killed',
 
-    'unknown',
+class _RawJWS(object):
 
-])
 
 
+    def sign(self, key, payload):
 
-
-
-@attr.s
-
-class TabData:
-
-
-
-    """A simple namespace with a fixed set of attributes.
-
-
-
-    Attributes:
-
-        keep_icon: Whether the (e.g. cloned) icon should not be cleared on page
-
-                   load.
-
-        inspector: The QWebInspector used for this webview.
-
-        viewing_source: Set if we're currently showing a source view.
-
-                        Only used when sources are shown via pygments.
-
-        open_target: Where to open the next link.
-
-                     Only used for QtWebKit.
-
-        override_target: Override for open_target for fake clicks (like hints).
-
-                         Only used for QtWebKit.
-
-        pinned: Flag to pin the tab.
-
-        fullscreen: Whether the tab has a video shown fullscreen currently.
-
-        netrc_used: Whether netrc authentication was performed.
-
-        input_mode: current input mode for the tab.
-
-    """
-
-
-
-    keep_icon = attr.ib(False)
-
-    viewing_source = attr.ib(False)
-
-    inspector = attr.ib(None)
-
-    open_target = attr.ib(usertypes.ClickTarget.normal)
-
-    override_target = attr.ib(None)
-
-    pinned = attr.ib(False)
-
-    fullscreen = attr.ib(False)
-
-    netrc_used = attr.ib(False)
-
-    input_mode = attr.ib(usertypes.KeyMode.normal)
-
-
-
-    def should_show_icon(self):
-
-        return (config.val.tabs.favicons.show == 'always' or
-
-                config.val.tabs.favicons.show == 'pinned' and self.pinned)
-
-
-
-
-
-class AbstractAction:
-
-
-
-    """Attribute of AbstractTab for Qt WebActions.
-
-
-
-    Class attributes (overridden by subclasses):
-
-        action_class: The class actions are defined on (QWeb{Engine,}Page)
-
-        action_base: The type of the actions (QWeb{Engine,}Page.WebAction)
-
-    """
-
-
-
-    action_class = None
-
-    action_base = None
-
-
-
-    def __init__(self, tab):
-
-        self._widget = None
-
-        self._tab = tab
-
-
-
-    def exit_fullscreen(self):
-
-        """Exit the fullscreen mode."""
-
-        raise NotImplementedError
-
-
-
-    def save_page(self):
-
-        """Save the current page."""
-
-        raise NotImplementedError
-
-
-
-    def run_string(self, name):
-
-        """Run a webaction based on its name."""
-
-        member = getattr(self.action_class, name, None)
-
-        if not isinstance(member, self.action_base):
-
-            raise WebTabError("{} is not a valid web action!".format(name))
-
-        self._widget.triggerPageAction(member)
-
-
-
-    def show_source(self,
-
-                    pygments=False):  # pylint: disable=redefined-outer-name
-
-        """Show the source of the current page in a new tab."""
-
-        raise NotImplementedError
-
-
-
-    def _show_source_pygments(self):
-
-
-
-        def show_source_cb(source):
-
-            """Show source as soon as it's ready."""
-
-            # WORKAROUND for https://github.com/PyCQA/pylint/issues/491
-
-            # pylint: disable=no-member
-
-            lexer = pygments.lexers.HtmlLexer()
-
-            formatter = pygments.formatters.HtmlFormatter(
-
-                full=True, linenos='table')
-
-            # pylint: enable=no-member
-
-            highlighted = pygments.highlight(source, lexer, formatter)
-
-
-
-            tb = objreg.get('tabbed-browser', scope='window',
-
-                            window=self._tab.win_id)
-
-            new_tab = tb.tabopen(background=False, related=True)
-
-            new_tab.set_html(highlighted, self._tab.url())
-
-            new_tab.data.viewing_source = True
-
-
-
-        self._tab.dump_async(show_source_cb)
-
-
-
-
-
-class AbstractPrinting:
-
-
-
-    """Attribute of AbstractTab for printing the page."""
-
-
-
-    def __init__(self, tab):
-
-        self._widget = None
-
-        self._tab = tab
-
-
-
-    def check_pdf_support(self):
-
-        raise NotImplementedError
-
-
-
-    def check_printer_support(self):
-
-        raise NotImplementedError
-
-
-
-    def check_preview_support(self):
-
-        raise NotImplementedError
-
-
-
-    def to_pdf(self, filename):
-
-        raise NotImplementedError
-
-
-
-    def to_printer(self, printer, callback=None):
-
-        """Print the tab.
-
-
-
-        Args:
-
-            printer: The QPrinter to print to.
-
-            callback: Called with a boolean
-
-                      (True if printing succeeded, False otherwise)
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def show_dialog(self):
-
-        """Print with a QPrintDialog."""
-
-        self.check_printer_support()
-
-
-
-        def print_callback(ok):
-
-            """Called when printing finished."""
-
-            if not ok:
-
-                message.error("Printing failed!")
-
-            diag.deleteLater()
-
-
-
-        def do_print():
-
-            """Called when the dialog was closed."""
-
-            self.to_printer(diag.printer(), print_callback)
-
-
-
-        diag = QPrintDialog(self._tab)
-
-        if utils.is_mac:
-
-            # For some reason we get a segfault when using open() on macOS
-
-            ret = diag.exec_()
-
-            if ret == QDialog.Accepted:
-
-                do_print()
-
-        else:
-
-            diag.open(do_print)
-
-
-
-
-
-class AbstractSearch(QObject):
-
-
-
-    """Attribute of AbstractTab for doing searches.
-
-
-
-    Attributes:
-
-        text: The last thing this view was searched for.
-
-        search_displayed: Whether we're currently displaying search results in
-
-                          this view.
-
-        _flags: The flags of the last search (needs to be set by subclasses).
-
-        _widget: The underlying WebView widget.
-
-    """
-
-
-
-    def __init__(self, parent=None):
-
-        super().__init__(parent)
-
-        self._widget = None
-
-        self.text = None
-
-        self.search_displayed = False
-
-
-
-    def _is_case_sensitive(self, ignore_case):
-
-        """Check if case-sensitivity should be used.
-
-
-
-        This assumes self.text is already set properly.
-
-
-
-        Arguments:
-
-            ignore_case: The ignore_case value from the config.
-
-        """
-
-        mapping = {
-
-            'smart': not self.text.islower(),
-
-            'never': True,
-
-            'always': False,
-
-        }
-
-        return mapping[ignore_case]
-
-
-
-    def search(self, text, *, ignore_case='never', reverse=False,
-
-               result_cb=None):
-
-        """Find the given text on the page.
-
-
-
-        Args:
-
-            text: The text to search for.
-
-            ignore_case: Search case-insensitively. ('always'/'never/'smart')
-
-            reverse: Reverse search direction.
-
-            result_cb: Called with a bool indicating whether a match was found.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def clear(self):
-
-        """Clear the current search."""
-
-        raise NotImplementedError
-
-
-
-    def prev_result(self, *, result_cb=None):
-
-        """Go to the previous result of the current search.
-
-
-
-        Args:
-
-            result_cb: Called with a bool indicating whether a match was found.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def next_result(self, *, result_cb=None):
-
-        """Go to the next result of the current search.
-
-
-
-        Args:
-
-            result_cb: Called with a bool indicating whether a match was found.
-
-        """
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractZoom(QObject):
-
-
-
-    """Attribute of AbstractTab for controlling zoom.
-
-
-
-    Attributes:
-
-        _neighborlist: A NeighborList with the zoom levels.
-
-        _default_zoom_changed: Whether the zoom was changed from the default.
-
-    """
-
-
-
-    def __init__(self, tab, parent=None):
-
-        super().__init__(parent)
-
-        self._tab = tab
-
-        self._widget = None
-
-        self._default_zoom_changed = False
-
-        self._init_neighborlist()
-
-        config.instance.changed.connect(self._on_config_changed)
-
-        self._zoom_factor = float(config.val.zoom.default) / 100
-
-
-
-        # # FIXME:qtwebengine is this needed?
-
-        # # For some reason, this signal doesn't get disconnected automatically
-
-        # # when the WebView is destroyed on older PyQt versions.
-
-        # # See https://github.com/qutebrowser/qutebrowser/issues/390
-
-        # self.destroyed.connect(functools.partial(
-
-        #     cfg.changed.disconnect, self.init_neighborlist))
-
-
-
-    @pyqtSlot(str)
-
-    def _on_config_changed(self, option):
-
-        if option in ['zoom.levels', 'zoom.default']:
-
-            if not self._default_zoom_changed:
-
-                factor = float(config.val.zoom.default) / 100
-
-                self.set_factor(factor)
-
-            self._init_neighborlist()
-
-
-
-    def _init_neighborlist(self):
-
-        """Initialize self._neighborlist."""
-
-        levels = config.val.zoom.levels
-
-        self._neighborlist = usertypes.NeighborList(
-
-            levels, mode=usertypes.NeighborList.Modes.edge)
-
-        self._neighborlist.fuzzyval = config.val.zoom.default
-
-
-
-    def offset(self, offset):
-
-        """Increase/Decrease the zoom level by the given offset.
-
-
-
-        Args:
-
-            offset: The offset in the zoom level list.
-
-
-
-        Return:
-
-            The new zoom percentage.
-
-        """
-
-        level = self._neighborlist.getitem(offset)
-
-        self.set_factor(float(level) / 100, fuzzyval=False)
-
-        return level
-
-
-
-    def _set_factor_internal(self, factor):
-
-        raise NotImplementedError
-
-
-
-    def set_factor(self, factor, *, fuzzyval=True):
-
-        """Zoom to a given zoom factor.
-
-
-
-        Args:
-
-            factor: The zoom factor as float.
-
-            fuzzyval: Whether to set the NeighborLists fuzzyval.
-
-        """
-
-        if fuzzyval:
-
-            self._neighborlist.fuzzyval = int(factor * 100)
-
-        if factor < 0:
-
-            raise ValueError("Can't zoom to factor {}!".format(factor))
-
-
-
-        default_zoom_factor = float(config.val.zoom.default) / 100
-
-        self._default_zoom_changed = (factor != default_zoom_factor)
-
-
-
-        self._zoom_factor = factor
-
-        self._set_factor_internal(factor)
-
-
-
-    def factor(self):
-
-        return self._zoom_factor
-
-
-
-    def set_default(self):
-
-        self._set_factor_internal(float(config.val.zoom.default) / 100)
-
-
-
-    def set_current(self):
-
-        self._set_factor_internal(self._zoom_factor)
-
-
-
-
-
-class AbstractCaret(QObject):
-
-
-
-    """Attribute of AbstractTab for caret browsing.
-
-
-
-    Signals:
-
-        selection_toggled: Emitted when the selection was toggled.
-
-                           arg: Whether the selection is now active.
-
-    """
-
-
-
-    selection_toggled = pyqtSignal(bool)
-
-
-
-    def __init__(self, tab, mode_manager, parent=None):
-
-        super().__init__(parent)
-
-        self._tab = tab
-
-        self._widget = None
-
-        self.selection_enabled = False
-
-        mode_manager.entered.connect(self._on_mode_entered)
-
-        mode_manager.left.connect(self._on_mode_left)
-
-
-
-    def _on_mode_entered(self, mode):
-
-        raise NotImplementedError
-
-
-
-    def _on_mode_left(self, mode):
-
-        raise NotImplementedError
-
-
-
-    def move_to_next_line(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def move_to_prev_line(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def move_to_next_char(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def move_to_prev_char(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def move_to_end_of_word(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def move_to_next_word(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def move_to_prev_word(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def move_to_start_of_line(self):
-
-        raise NotImplementedError
-
-
-
-    def move_to_end_of_line(self):
-
-        raise NotImplementedError
-
-
-
-    def move_to_start_of_next_block(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def move_to_start_of_prev_block(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def move_to_end_of_next_block(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def move_to_end_of_prev_block(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def move_to_start_of_document(self):
-
-        raise NotImplementedError
-
-
-
-    def move_to_end_of_document(self):
-
-        raise NotImplementedError
-
-
-
-    def toggle_selection(self):
-
-        raise NotImplementedError
-
-
-
-    def drop_selection(self):
-
-        raise NotImplementedError
-
-
-
-    def selection(self, callback):
-
-        raise NotImplementedError
-
-
-
-    def _follow_enter(self, tab):
-
-        """Follow a link by faking an enter press."""
-
-        if tab:
-
-            self._tab.key_press(Qt.Key_Enter, modifier=Qt.ControlModifier)
-
-        else:
-
-            self._tab.key_press(Qt.Key_Enter)
-
-
-
-    def follow_selected(self, *, tab=False):
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractScroller(QObject):
-
-
-
-    """Attribute of AbstractTab to manage scroll position."""
-
-
-
-    perc_changed = pyqtSignal(int, int)
-
-
-
-    def __init__(self, tab, parent=None):
-
-        super().__init__(parent)
-
-        self._tab = tab
-
-        self._widget = None
-
-        self.perc_changed.connect(self._log_scroll_pos_change)
-
-
-
-    @pyqtSlot()
-
-    def _log_scroll_pos_change(self):
-
-        log.webview.vdebug("Scroll position changed to {}".format(
-
-            self.pos_px()))
-
-
-
-    def _init_widget(self, widget):
-
-        self._widget = widget
-
-
-
-    def pos_px(self):
-
-        raise NotImplementedError
-
-
-
-    def pos_perc(self):
-
-        raise NotImplementedError
-
-
-
-    def to_perc(self, x=None, y=None):
-
-        raise NotImplementedError
-
-
-
-    def to_point(self, point):
-
-        raise NotImplementedError
-
-
-
-    def to_anchor(self, name):
-
-        raise NotImplementedError
-
-
-
-    def delta(self, x=0, y=0):
-
-        raise NotImplementedError
-
-
-
-    def delta_page(self, x=0, y=0):
-
-        raise NotImplementedError
-
-
-
-    def up(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def down(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def left(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def right(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def top(self):
-
-        raise NotImplementedError
-
-
-
-    def bottom(self):
-
-        raise NotImplementedError
-
-
-
-    def page_up(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def page_down(self, count=1):
-
-        raise NotImplementedError
-
-
-
-    def at_top(self):
-
-        raise NotImplementedError
-
-
-
-    def at_bottom(self):
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractHistory:
-
-
-
-    """The history attribute of a AbstractTab."""
-
-
-
-    def __init__(self, tab):
-
-        self._tab = tab
-
-        self._history = None
-
-
-
-    def __len__(self):
-
-        return len(self._history)
-
-
-
-    def __iter__(self):
-
-        return iter(self._history.items())
-
-
-
-    def current_idx(self):
-
-        raise NotImplementedError
-
-
-
-    def back(self, count=1):
-
-        """Go back in the tab's history."""
-
-        idx = self.current_idx() - count
-
-        if idx >= 0:
-
-            self._go_to_item(self._item_at(idx))
-
-        else:
-
-            self._go_to_item(self._item_at(0))
-
-            raise WebTabError("At beginning of history.")
-
-
-
-    def forward(self, count=1):
-
-        """Go forward in the tab's history."""
-
-        idx = self.current_idx() + count
-
-        if idx < len(self):
-
-            self._go_to_item(self._item_at(idx))
-
-        else:
-
-            self._go_to_item(self._item_at(len(self) - 1))
-
-            raise WebTabError("At end of history.")
-
-
-
-    def can_go_back(self):
-
-        raise NotImplementedError
-
-
-
-    def can_go_forward(self):
-
-        raise NotImplementedError
-
-
-
-    def _item_at(self, i):
-
-        raise NotImplementedError
-
-
-
-    def _go_to_item(self, item):
-
-        raise NotImplementedError
-
-
-
-    def serialize(self):
-
-        """Serialize into an opaque format understood by self.deserialize."""
-
-        raise NotImplementedError
-
-
-
-    def deserialize(self, data):
-
-        """Serialize from a format produced by self.serialize."""
-
-        raise NotImplementedError
-
-
-
-    def load_items(self, items):
-
-        """Deserialize from a list of WebHistoryItems."""
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractElements:
-
-
-
-    """Finding and handling of elements on the page."""
-
-
-
-    def __init__(self, tab):
-
-        self._widget = None
-
-        self._tab = tab
-
-
-
-    def find_css(self, selector, callback, *, only_visible=False):
-
-        """Find all HTML elements matching a given selector async.
-
-
-
-        Args:
-
-            callback: The callback to be called when the search finished.
-
-            selector: The CSS selector to search for.
-
-            only_visible: Only show elements which are visible on screen.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def find_id(self, elem_id, callback):
-
-        """Find the HTML element with the given ID async.
-
-
-
-        Args:
-
-            callback: The callback to be called when the search finished.
-
-            elem_id: The ID to search for.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def find_focused(self, callback):
-
-        """Find the focused element on the page async.
-
-
-
-        Args:
-
-            callback: The callback to be called when the search finished.
-
-                      Called with a WebEngineElement or None.
-
-        """
-
-        raise NotImplementedError
-
-
-
-    def find_at_pos(self, pos, callback):
-
-        """Find the element at the given position async.
-
-
-
-        This is also called "hit test" elsewhere.
-
-
-
-        Args:
-
-            pos: The QPoint to get the element for.
-
-            callback: The callback to be called when the search finished.
-
-                      Called with a WebEngineElement or None.
-
-        """
-
-        raise NotImplementedError
-
-
-
-
-
-class AbstractAudio(QObject):
-
-
-
-    """Handling of audio/muting for this tab."""
-
-
-
-    muted_changed = pyqtSignal(bool)
-
-    recently_audible_changed = pyqtSignal(bool)
-
-
-
-    def __init__(self, parent=None):
-
-        super().__init__(parent)
-
-        self._widget = None
-
-
-
-    def set_muted(self, muted: bool):
-
-        """Set this tab as muted or not."""
-
         raise NotImplementedError
-
-
-
-    def is_muted(self):
-
-        """Whether this tab is muted."""
-
-        raise NotImplementedError
-
-
 
-    def toggle_muted(self):
 
-        self.set_muted(not self.is_muted())
 
+    def verify(self, key, payload, signature):
 
-
-    def is_recently_audible(self):
-
-        """Whether this tab has had audio playing recently."""
-
         raise NotImplementedError
-
-
-
-
-
-class AbstractTab(QWidget):
 
 
 
-    """A wrapper over the given widget to hide its API and expose another one.
 
 
+class _RawHMAC(_RawJWS):
 
-    We use this to unify QWebView and QWebEngineView.
 
 
+    def __init__(self, hashfn):
 
-    Attributes:
+        self.backend = default_backend()
 
-        history: The AbstractHistory for the current tab.
+        self.hashfn = hashfn
 
-        registry: The ObjectRegistry associated with this tab.
 
-        private: Whether private browsing is turned on for this tab.
 
+    def _hmac_setup(self, key, payload):
 
+        h = hmac.HMAC(key, self.hashfn, backend=self.backend)
 
-        _load_status: loading status of this page
+        h.update(payload)
 
-                      Accessible via load_status() method.
+        return h
 
-        _has_ssl_errors: Whether SSL errors happened.
 
-                         Needs to be set by subclasses.
 
+    def sign(self, key, payload):
 
+        skey = base64url_decode(key.get_op_key('sign'))
 
-        for properties, see WebView/WebEngineView docs.
+        h = self._hmac_setup(skey, payload)
 
+        return h.finalize()
 
 
-    Signals:
 
-        See related Qt signals.
+    def verify(self, key, payload, signature):
 
+        vkey = base64url_decode(key.get_op_key('verify'))
 
+        h = self._hmac_setup(vkey, payload)
 
-        new_tab_requested: Emitted when a new tab should be opened with the
+        h.verify(signature)
 
-                           given URL.
 
-        load_status_changed: The loading status changed
 
-        fullscreen_requested: Fullscreen display was requested by the page.
 
-                              arg: True if fullscreen should be turned on,
 
-                                   False if it should be turned off.
+class _RawRSA(_RawJWS):
 
-        renderer_process_terminated: Emitted when the underlying renderer
+    def __init__(self, padfn, hashfn):
 
-                                     process terminated.
+        self.padfn = padfn
 
-                                     arg 0: A TerminationStatus member.
+        self.hashfn = hashfn
 
-                                     arg 1: The exit code.
 
-        predicted_navigation: Emitted before we tell Qt to open a URL.
 
-    """
+    def sign(self, key, payload):
 
+        skey = key.get_op_key('sign')
 
+        signer = skey.signer(self.padfn, self.hashfn)
 
-    window_close_requested = pyqtSignal()
+        signer.update(payload)
 
-    link_hovered = pyqtSignal(str)
+        return signer.finalize()
 
-    load_started = pyqtSignal()
 
-    load_progress = pyqtSignal(int)
 
-    load_finished = pyqtSignal(bool)
+    def verify(self, key, payload, signature):
 
-    icon_changed = pyqtSignal(QIcon)
+        pkey = key.get_op_key('verify')
 
-    title_changed = pyqtSignal(str)
+        verifier = pkey.verifier(signature, self.padfn, self.hashfn)
 
-    load_status_changed = pyqtSignal(str)
+        verifier.update(payload)
 
-    new_tab_requested = pyqtSignal(QUrl)
+        verifier.verify()
 
-    url_changed = pyqtSignal(QUrl)
 
-    shutting_down = pyqtSignal()
 
-    contents_size_changed = pyqtSignal(QSizeF)
 
-    add_history_item = pyqtSignal(QUrl, QUrl, str)  # url, requested url, title
 
-    fullscreen_requested = pyqtSignal(bool)
+class _RawEC(_RawJWS):
 
-    renderer_process_terminated = pyqtSignal(TerminationStatus, int)
+    def __init__(self, curve, hashfn):
 
-    predicted_navigation = pyqtSignal(QUrl)
+        self._curve = curve
 
+        self.hashfn = hashfn
 
 
-    # Hosts for which a certificate error happened. Shared between all tabs.
 
-    #
+    @property
 
-    # Note that we remember hosts here, without scheme/port:
+    def curve(self):
 
-    # QtWebEngine/Chromium also only remembers hostnames, and certificates are
+        return self._curve
 
-    # for a given hostname anyways.
 
-    _insecure_hosts = set()  # type: typing.Set[str]
 
+    def sign(self, key, payload):
 
+        skey = key.get_op_key('sign', self._curve)
 
-    def __init__(self, *, win_id, mode_manager, private, parent=None):
+        signer = skey.signer(ec.ECDSA(self.hashfn))
 
-        self.private = private
+        signer.update(payload)
 
-        self.win_id = win_id
+        signature = signer.finalize()
 
-        self.tab_id = next(tab_id_gen)
+        r, s = ec_utils.decode_rfc6979_signature(signature)
 
-        super().__init__(parent)
+        l = key.get_curve(self._curve).key_size
 
+        return _encode_int(r, l) + _encode_int(s, l)
 
 
-        self.registry = objreg.ObjectRegistry()
 
-        tab_registry = objreg.get('tab-registry', scope='window',
+    def verify(self, key, payload, signature):
 
-                                  window=win_id)
+        pkey = key.get_op_key('verify', self._curve)
 
-        tab_registry[self.tab_id] = self
+        r = signature[:len(signature) // 2]
 
-        objreg.register('tab', self, registry=self.registry)
+        s = signature[len(signature) // 2:]
 
+        enc_signature = ec_utils.encode_rfc6979_signature(
 
+            int(hexlify(r), 16), int(hexlify(s), 16))
 
-        self.data = TabData()
+        verifier = pkey.verifier(enc_signature, ec.ECDSA(self.hashfn))
 
-        self._layout = miscwidgets.WrapperLayout(self)
+        verifier.update(payload)
 
-        self._widget = None
+        verifier.verify()
 
-        self._progress = 0
 
-        self._mode_manager = mode_manager
 
-        self._load_status = usertypes.LoadStatus.none
 
-        self._mouse_event_filter = mouse.MouseEventFilter(
 
-            self, parent=self)
+class _RawNone(_RawJWS):
 
-        self.backend = None
 
 
+    def sign(self, key, payload):
 
-        # FIXME:qtwebengine  Should this be public api via self.hints?
+        return ''
 
-        #                    Also, should we get it out of objreg?
 
-        hintmanager = hints.HintManager(win_id, self.tab_id, parent=self)
 
-        objreg.register('hintmanager', hintmanager, scope='tab',
+    def verify(self, key, payload, signature):
 
-                        window=self.win_id, tab=self.tab_id)
+        raise InvalidSignature('The "none" signature cannot be verified')
 
 
 
-        self.predicted_navigation.connect(self._on_predicted_navigation)
 
 
+class _HS256(_RawHMAC, JWAAlgorithm):
 
-    def _set_widget(self, widget):
 
-        # pylint: disable=protected-access
 
-        self._widget = widget
+    name = "HS256"
 
-        self._layout.wrap(self, widget)
+    description = "HMAC using SHA-256"
 
-        self.history._history = widget.history()
+    keysize = 256
 
-        self.scroller._init_widget(widget)
+    algorithm_usage_location = 'alg'
 
-        self.caret._widget = widget
+    algorithm_use = 'sig'
 
-        self.zoom._widget = widget
 
-        self.search._widget = widget
 
-        self.printing._widget = widget
+    def __init__(self):
 
-        self.action._widget = widget
+        super(_HS256, self).__init__(hashes.SHA256())
 
-        self.elements._widget = widget
 
-        self.audio._widget = widget
 
-        self.settings._settings = widget.settings()
 
 
+class _HS384(_RawHMAC, JWAAlgorithm):
 
-        self._install_event_filter()
 
-        self.zoom.set_default()
 
+    name = "HS384"
 
+    description = "HMAC using SHA-384"
 
-    def _install_event_filter(self):
+    keysize = 384
 
-        raise NotImplementedError
-
-
-
-    def _set_load_status(self, val):
+    algorithm_usage_location = 'alg'
 
-        """Setter for load_status."""
+    algorithm_use = 'sig'
 
-        if not isinstance(val, usertypes.LoadStatus):
 
-            raise TypeError("Type {} is no LoadStatus member!".format(val))
 
-        log.webview.debug("load status for {}: {}".format(repr(self), val))
+    def __init__(self):
 
-        self._load_status = val
+        super(_HS384, self).__init__(hashes.SHA384())
 
-        self.load_status_changed.emit(val.name)
 
 
-
-    def event_target(self):
-
-        """Return the widget events should be sent to."""
-
-        raise NotImplementedError
 
 
+class _HS512(_RawHMAC, JWAAlgorithm):
 
-    def send_event(self, evt):
 
-        """Send the given event to the underlying widget.
 
+    name = "HS512"
 
+    description = "HMAC using SHA-512"
 
-        The event will be sent via QApplication.postEvent.
+    keysize = 512
 
-        Note that a posted event may not be re-used in any way!
+    algorithm_usage_location = 'alg'
 
-        """
+    algorithm_use = 'sig'
 
-        # This only gives us some mild protection against re-using events, but
 
-        # it's certainly better than a segfault.
 
-        if getattr(evt, 'posted', False):
+    def __init__(self):
 
-            raise utils.Unreachable("Can't re-use an event which was already "
+        super(_HS512, self).__init__(hashes.SHA512())
 
-                                    "posted!")
 
 
 
-        recipient = self.event_target()
 
-        if recipient is None:
+class _RS256(_RawRSA, JWAAlgorithm):
 
-            # https://github.com/qutebrowser/qutebrowser/issues/3888
 
-            log.webview.warning("Unable to find event target!")
 
-            return
+    name = "RS256"
 
+    description = "RSASSA-PKCS1-v1_5 using SHA-256"
 
+    keysize = 2048
 
-        evt.posted = True
+    algorithm_usage_location = 'alg'
 
-        QApplication.postEvent(recipient, evt)
+    algorithm_use = 'sig'
 
 
 
-    @pyqtSlot(QUrl)
+    def __init__(self):
 
-    def _on_predicted_navigation(self, url):
+        super(_RS256, self).__init__(padding.PKCS1v15(), hashes.SHA256())
 
-        """Adjust the title if we are going to visit an URL soon."""
 
-        qtutils.ensure_valid(url)
 
-        url_string = url.toDisplayString()
 
-        log.webview.debug("Predicted navigation: {}".format(url_string))
 
-        self.title_changed.emit(url_string)
+class _RS384(_RawRSA, JWAAlgorithm):
 
 
 
-    @pyqtSlot(QUrl)
+    name = "RS384"
 
-    def _on_url_changed(self, url):
+    description = "RSASSA-PKCS1-v1_5 using SHA-384"
 
-        """Update title when URL has changed and no title is available."""
+    keysize = 2048
 
-        if url.isValid() and not self.title():
+    algorithm_usage_location = 'alg'
 
-            self.title_changed.emit(url.toDisplayString())
+    algorithm_use = 'sig'
 
-        self.url_changed.emit(url)
 
 
+    def __init__(self):
 
-    @pyqtSlot()
+        super(_RS384, self).__init__(padding.PKCS1v15(), hashes.SHA384())
 
-    def _on_load_started(self):
 
-        self._progress = 0
 
-        self.data.viewing_source = False
 
-        self._set_load_status(usertypes.LoadStatus.loading)
 
-        self.load_started.emit()
+class _RS512(_RawRSA, JWAAlgorithm):
 
 
 
-    @pyqtSlot(usertypes.NavigationRequest)
+    name = "RS512"
 
-    def _on_navigation_request(self, navigation):
+    description = "RSASSA-PKCS1-v1_5 using SHA-512"
 
-        """Handle common acceptNavigationRequest code."""
+    keysize = 2048
 
-        url = utils.elide(navigation.url.toDisplayString(), 100)
+    algorithm_usage_location = 'alg'
 
-        log.webview.debug("navigation request: url {}, type {}, is_main_frame "
+    algorithm_use = 'sig'
 
-                          "{}".format(url,
 
-                                      navigation.navigation_type,
 
-                                      navigation.is_main_frame))
+    def __init__(self):
 
+        super(_RS512, self).__init__(padding.PKCS1v15(), hashes.SHA512())
 
 
-        if not navigation.url.isValid():
 
-            # Also a WORKAROUND for missing IDNA 2008 support in QUrl, see
 
-            # https://bugreports.qt.io/browse/QTBUG-60364
 
+class _ES256(_RawEC, JWAAlgorithm):
 
 
-            if navigation.navigation_type == navigation.Type.link_clicked:
 
-                msg = urlutils.get_errstring(navigation.url,
+    name = "ES256"
 
-                                             "Invalid link clicked")
+    description = "ECDSA using P-256 and SHA-256"
 
-                message.error(msg)
+    keysize = 256
 
-                self.data.open_target = usertypes.ClickTarget.normal
+    algorithm_usage_location = 'alg'
 
+    algorithm_use = 'sig'
 
 
-            log.webview.debug("Ignoring invalid URL {} in "
 
-                              "acceptNavigationRequest: {}".format(
+    def __init__(self):
 
-                                  navigation.url.toDisplayString(),
+        super(_ES256, self).__init__('P-256', hashes.SHA256())
 
-                                  navigation.url.errorString()))
 
-            navigation.accepted = False
 
 
 
-    def handle_auto_insert_mode(self, ok):
+class _ES384(_RawEC, JWAAlgorithm):
 
-        """Handle `input.insert_mode.auto_load` after loading finished."""
 
-        if not config.val.input.insert_mode.auto_load or not ok:
 
-            return
+    name = "ES384"
 
+    description = "ECDSA using P-384 and SHA-384"
 
+    keysize = 384
 
-        cur_mode = self._mode_manager.mode
+    algorithm_usage_location = 'alg'
 
-        if cur_mode == usertypes.KeyMode.insert:
+    algorithm_use = 'sig'
 
-            return
 
 
+    def __init__(self):
 
-        def _auto_insert_mode_cb(elem):
+        super(_ES384, self).__init__('P-384', hashes.SHA384())
 
-            """Called from JS after finding the focused element."""
 
-            if elem is None:
 
-                log.webview.debug("No focused element!")
 
-                return
 
-            if elem.is_editable():
+class _ES512(_RawEC, JWAAlgorithm):
 
-                modeman.enter(self.win_id, usertypes.KeyMode.insert,
 
-                              'load finished', only_if_normal=True)
 
+    name = "ES512"
 
+    description = "ECDSA using P-521 and SHA-512"
 
-        self.elements.find_focused(_auto_insert_mode_cb)
+    keysize = 512
 
+    algorithm_usage_location = 'alg'
 
+    algorithm_use = 'sig'
 
-    @pyqtSlot(bool)
 
-    def _on_load_finished(self, ok):
 
-        if sip.isdeleted(self._widget):
+    def __init__(self):
 
-            # https://github.com/qutebrowser/qutebrowser/issues/3498
+        super(_ES512, self).__init__('P-521', hashes.SHA512())
 
-            return
 
 
 
-        sess_manager = objreg.get('session-manager')
 
-        sess_manager.save_autosave()
+class _PS256(_RawRSA, JWAAlgorithm):
 
 
 
-        if ok:
+    name = "PS256"
 
-            if self.url().scheme() == 'https':
+    description = "RSASSA-PSS using SHA-256 and MGF1 with SHA-256"
 
-                if self.url().host() in self._insecure_hosts:
+    keysize = 2048
 
-                    self._set_load_status(usertypes.LoadStatus.warn)
+    algorithm_usage_location = 'alg'
 
-                else:
+    algorithm_use = 'sig'
 
-                    self._set_load_status(usertypes.LoadStatus.success_https)
 
-            else:
 
-                self._set_load_status(usertypes.LoadStatus.success)
+    def __init__(self):
 
-        elif ok:
+        padfn = padding.PSS(padding.MGF1(hashes.SHA256()),
 
-            self._set_load_status(usertypes.LoadStatus.warn)
+                            hashes.SHA256.digest_size)
 
-        else:
+        super(_PS256, self).__init__(padfn, hashes.SHA256())
 
-            self._set_load_status(usertypes.LoadStatus.error)
 
 
 
-        self.load_finished.emit(ok)
 
+class _PS384(_RawRSA, JWAAlgorithm):
 
 
-        if not self.title():
 
-            self.title_changed.emit(self.url().toDisplayString())
+    name = "PS384"
 
+    description = "RSASSA-PSS using SHA-384 and MGF1 with SHA-384"
 
+    keysize = 2048
 
-        self.zoom.set_current()
+    algorithm_usage_location = 'alg'
 
+    algorithm_use = 'sig'
 
 
-    @pyqtSlot()
 
-    def _on_history_trigger(self):
+    def __init__(self):
 
-        """Emit add_history_item when triggered by backend-specific signal."""
+        padfn = padding.PSS(padding.MGF1(hashes.SHA384()),
 
-        raise NotImplementedError
+                            hashes.SHA384.digest_size)
 
+        super(_PS384, self).__init__(padfn, hashes.SHA384())
 
 
-    @pyqtSlot(int)
 
-    def _on_load_progress(self, perc):
 
-        self._progress = perc
 
-        self.load_progress.emit(perc)
+class _PS512(_RawRSA, JWAAlgorithm):
 
 
 
-    def url(self, requested=False):
+    name = "PS512"
 
-        raise NotImplementedError
+    description = "RSASSA-PSS using SHA-512 and MGF1 with SHA-512"
 
+    keysize = 2048
 
+    algorithm_usage_location = 'alg'
 
-    def progress(self):
+    algorithm_use = 'sig'
 
-        return self._progress
 
 
+    def __init__(self):
 
-    def load_status(self):
+        padfn = padding.PSS(padding.MGF1(hashes.SHA512()),
 
-        return self._load_status
+                            hashes.SHA512.digest_size)
 
+        super(_PS512, self).__init__(padfn, hashes.SHA512())
 
 
-    def _openurl_prepare(self, url, *, predict=True):
 
-        qtutils.ensure_valid(url)
 
-        if predict:
 
-            self.predicted_navigation.emit(url)
+class _None(_RawNone, JWAAlgorithm):
 
 
 
-    def openurl(self, url, *, predict=True):
+    name = "none"
 
-        raise NotImplementedError
+    description = "No digital signature or MAC performed"
 
+    keysize = 0
 
+    algorithm_usage_location = 'alg'
 
-    def reload(self, *, force=False):
+    algorithm_use = 'sig'
 
-        raise NotImplementedError
 
 
 
-    def stop(self):
 
-        raise NotImplementedError
+class _RawKeyMgmt(object):
 
 
 
-    def clear_ssl_errors(self):
+    def wrap(self, key, bitsize, cek, headers):
 
         raise NotImplementedError
-
 
 
-    def key_press(self, key, modifier=Qt.NoModifier):
 
-        """Send a fake key event to this tab."""
+    def unwrap(self, key, bitsize, ek, headers):
 
         raise NotImplementedError
-
-
 
-    def dump_async(self, callback, *, plain=False):
 
-        """Dump the current page's html asynchronously.
 
 
 
-        The given callback will be called with the result when dumping is
+class _RSA(_RawKeyMgmt):
 
-        complete.
 
-        """
 
-        raise NotImplementedError
-
+    def __init__(self, padfn):
 
+        self.padfn = padfn
 
-    def run_js_async(self, code, callback=None, *, world=None):
 
-        """Run javascript async.
 
+    def _check_key(self, key):
 
+        if not isinstance(key, JWK):
 
-        The given callback will be called with the result when running JS is
+            raise ValueError('key is not a JWK object')
 
-        complete.
+        if key.key_type != 'RSA':
 
+            raise InvalidJWEKeyType('RSA', key.key_type)
 
 
-        Args:
 
-            code: The javascript code to run.
+    # FIXME: get key size and insure > 2048 bits
 
-            callback: The callback to call with the result, or None.
+    def wrap(self, key, bitsize, cek, headers):
 
-            world: A world ID (int or usertypes.JsWorld member) to run the JS
+        self._check_key(key)
 
-                   in the main world or in another isolated world.
+        if not cek:
 
-        """
+            cek = _randombits(bitsize)
 
-        raise NotImplementedError
+        rk = key.get_op_key('wrapKey')
 
+        ek = rk.encrypt(cek, self.padfn)
 
+        return {'cek': cek, 'ek': ek}
 
-    def shutdown(self):
 
-        raise NotImplementedError
 
+    def unwrap(self, key, bitsize, ek, headers):
 
+        self._check_key(key)
 
-    def title(self):
+        rk = key.get_op_key('decrypt')
 
-        raise NotImplementedError
+        cek = rk.decrypt(ek, self.padfn)
 
+        if _bitsize(cek) != bitsize:
 
+            raise InvalidJWEKeyLength(bitsize, _bitsize(cek))
 
-    def icon(self):
+        return cek
 
-        raise NotImplementedError
 
 
 
-    def set_html(self, html, base_url=QUrl()):
 
-        raise NotImplementedError
+class _Rsa15(_RSA, JWAAlgorithm):
 
 
 
-    def networkaccessmanager(self):
+    name = 'RSA1_5'
 
-        """Get the QNetworkAccessManager for this tab.
+    description = "RSAES-PKCS1-v1_5"
 
+    keysize = 2048
 
+    algorithm_usage_location = 'alg'
 
-        This is only implemented for QtWebKit.
+    algorithm_use = 'kex'
 
-        For QtWebEngine, always returns None.
 
-        """
 
-        raise NotImplementedError
+    def __init__(self):
 
+        super(_Rsa15, self).__init__(padding.PKCS1v15())
 
 
-    def user_agent(self):
 
-        """Get the user agent for this tab.
+    def unwrap(self, key, bitsize, ek, headers):
 
+        self._check_key(key)
 
+        # Address MMA attack by implementing RFC 3218 - 2.3.2. Random Filling
 
-        This is only implemented for QtWebKit.
+        # provides a random cek that will cause the decryption engine to
 
-        For QtWebEngine, always returns None.
+        # run to the end, but will fail decryption later.
 
-        """
 
-        raise NotImplementedError
 
+        # always generate a random cek so we spend roughly the
 
+        # same time as in the exception side of the branch
 
-    def __repr__(self):
+        cek = _randombits(bitsize)
 
         try:
 
-            url = utils.elide(self.url().toDisplayString(QUrl.EncodeUnicode),
+            cek = super(_Rsa15, self).unwrap(key, bitsize, ek, headers)
 
-                              100)
+            # always raise so we always run through the exception handling
 
-        except (AttributeError, RuntimeError) as exc:
+            # code in all cases
 
-            url = '<{}>'.format(exc.__class__.__name__)
+            raise Exception('Dummy')
 
-        return utils.get_repr(self, tab_id=self.tab_id, url=url)
+        except Exception:  # pylint: disable=broad-except
+
+            return cek
 
 
 
-    def is_deleted(self):
 
-        return sip.isdeleted(self._widget)
+
+class _RsaOaep(_RSA, JWAAlgorithm):
+
+
+
+    name = 'RSA-OAEP'
+
+    description = "RSAES OAEP using default parameters"
+
+    keysize = 2048
+
+    algorithm_usage_location = 'alg'
+
+    algorithm_use = 'kex'
+
+
+
+    def __init__(self):
+
+        super(_RsaOaep, self).__init__(
+
+            padding.OAEP(padding.MGF1(hashes.SHA1()),
+
+                         hashes.SHA1(), None))
+
+
+
+
+
+class _RsaOaep256(_RSA, JWAAlgorithm):  # noqa: ignore=N801
+
+
+
+    name = 'RSA-OAEP-256'
+
+    description = "RSAES OAEP using SHA-256 and MGF1 with SHA-256"
+
+    keysize = 2048
+
+    algorithm_usage_location = 'alg'
+
+    algorithm_use = 'kex'
+
+
+
+    def __init__(self):
+
+        super(_RsaOaep256, self).__init__(
+
+            padding.OAEP(padding.MGF1(hashes.SHA256()),
+
+                         hashes.SHA256(), None))
+
+
+
+
+
+class _AesKw(_RawKeyMgmt):
+
+
+
+    keysize = None
+
+
+
+    def __init__(self):
+
+        self.backend = default_backend()
+
+
+
+    def _get_key(self, key, op):
+
+        if not isinstance(key, JWK):
+
+            raise ValueError('key is not a JWK object')
+
+        if key.key_type != 'oct':
+
+            raise InvalidJWEKeyType('oct', key.key_type)
+
+        rk = base64url_decode(key.get_op_key(op))
+
+        if _bitsize(rk) != self.keysize:
+
+            raise InvalidJWEKeyLength(self.keysize, _bitsize(rk))
+
+        return rk
+
+
+
+    def wrap(self, key, bitsize, cek, headers):
+
+        rk = self._get_key(key, 'encrypt')
+
+        if not cek:
+
+            cek = _randombits(bitsize)
+
+
+
+        # Implement RFC 3394 Key Unwrap - 2.2.2
+
+        # TODO: Use cryptography once issue #1733 is resolved
+
+        iv = 'a6a6a6a6a6a6a6a6'
+
+        a = unhexlify(iv)
+
+        r = [cek[i:i + 8] for i in range(0, len(cek), 8)]
+
+        n = len(r)
+
+        for j in range(0, 6):
+
+            for i in range(0, n):
+
+                e = Cipher(algorithms.AES(rk), modes.ECB(),
+
+                           backend=self.backend).encryptor()
+
+                b = e.update(a + r[i]) + e.finalize()
+
+                a = _encode_int(_decode_int(b[:8]) ^ ((n * j) + i + 1), 64)
+
+                r[i] = b[-8:]
+
+        ek = a
+
+        for i in range(0, n):
+
+            ek += r[i]
+
+        return {'cek': cek, 'ek': ek}
+
+
+
+    def unwrap(self, key, bitsize, ek, headers):
+
+        rk = self._get_key(key, 'decrypt')
+
+
+
+        # Implement RFC 3394 Key Unwrap - 2.2.3
+
+        # TODO: Use cryptography once issue #1733 is resolved
+
+        iv = 'a6a6a6a6a6a6a6a6'
+
+        aiv = unhexlify(iv)
+
+
+
+        r = [ek[i:i + 8] for i in range(0, len(ek), 8)]
+
+        a = r.pop(0)
+
+        n = len(r)
+
+        for j in range(5, -1, -1):
+
+            for i in range(n - 1, -1, -1):
+
+                da = _decode_int(a)
+
+                atr = _encode_int((da ^ ((n * j) + i + 1)), 64) + r[i]
+
+                d = Cipher(algorithms.AES(rk), modes.ECB(),
+
+                           backend=self.backend).decryptor()
+
+                b = d.update(atr) + d.finalize()
+
+                a = b[:8]
+
+                r[i] = b[-8:]
+
+
+
+        if a != aiv:
+
+            raise RuntimeError('Decryption Failed')
+
+
+
+        cek = b''.join(r)
+
+        if _bitsize(cek) != bitsize:
+
+            raise InvalidJWEKeyLength(bitsize, _bitsize(cek))
+
+        return cek
+
+
+
+
+
+class _A128KW(_AesKw, JWAAlgorithm):
+
+
+
+    name = 'A128KW'
+
+    description = "AES Key Wrap using 128-bit key"
+
+    keysize = 128
+
+    algorithm_usage_location = 'alg'
+
+    algorithm_use = 'kex'
+
+
+
+
+
+class _A192KW(_AesKw, JWAAlgorithm):
+
+
+
+    name = 'A192KW'
+
+    description = "AES Key Wrap using 192-bit key"
+
+    keysize = 192
+
+    algorithm_usage_location = 'alg'
+
+    algorithm_use = 'kex'
+
+
+
+
+
+class _A256KW(_AesKw, JWAAlgorithm):
+
+
+
+    name = 'A256KW'
+
+    description = "AES Key Wrap using 256-bit key"
+
+    keysize = 256
+
+    algorithm_usage_location = 'alg'
+
+    algorithm_use = 'kex'
+
+
+
+
+
+class _AesGcmKw(_RawKeyMgmt):
+
+
+
+    keysize = None
+
+
+
+    def __init__(self):
+
+        self.backend = default_backend()
+
+
+
+    def _get_key(self, key, op):
+
+        if not isinstance(key, JWK):
+
+            raise ValueError('key is not a JWK object')
+
+        if key.key_type != 'oct':
+
+            raise InvalidJWEKeyType('oct', key.key_type)
+
+        rk = base64url_decode(key.get_op_key(op))
+
+        if _bitsize(rk) != self.keysize:
+
+            raise InvalidJWEKeyLength(self.keysize, _bitsize(rk))
+
+        return rk
+
+
+
+    def wrap(self, key, bitsize, cek, headers):
+
+        rk = self._get_key(key, 'encrypt')
+
+        if not cek:
+
+            cek = _randombits(bitsize)
+
+
+
+        iv = _randombits(96)
+
+        cipher = Cipher(algorithms.AES(rk), modes.GCM(iv),
+
+                        backend=self.backend)
+
+        encryptor = cipher.encryptor()
+
+        ek = encryptor.update(cek) + encryptor.finalize()
+
+
+
+        tag = encryptor.tag
+
+        return {'cek': cek, 'ek': ek,
+
+                'header': {'iv': base64url_encode(iv),
+
+                           'tag': base64url_encode(tag)}}
+
+
+
+    def unwrap(self, key, bitsize, ek, headers):
+
+        rk = self._get_key(key, 'decrypt')
+
+
+
+        if 'iv' not in headers:
+
+            raise ValueError('Invalid Header, missing "iv" parameter')
+
+        iv = base64url_decode(headers['iv'])
+
+        if 'tag' not in headers:
+
+            raise ValueError('Invalid Header, missing "tag" parameter')
+
+        tag = base64url_decode(headers['tag'])
+
+
+
+        cipher = Cipher(algorithms.AES(rk), modes.GCM(iv, tag),
+
+                        backend=self.backend)
+
+        decryptor = cipher.decryptor()
+
+        cek = decryptor.update(ek) + decryptor.finalize()
+
+        if _bitsize(cek) != bitsize:
+
+            raise InvalidJWEKeyLength(bitsize, _bitsize(cek))
+
+        return cek
+
+
+
+
+
+class _A128GcmKw(_AesGcmKw, JWAAlgorithm):
+
+
+
+    name = 'A128GCMKW'
+
+    description = "Key wrapping with AES GCM using 128-bit key"
+
+    keysize = 128
+
+    algorithm_usage_location = 'alg'
+
+    algorithm_use = 'kex'
+
+
+
+
+
+class _A192GcmKw(_AesGcmKw, JWAAlgorithm):
+
+
+
+    name = 'A192GCMKW'
+
+    description = "Key wrapping with AES GCM using 192-bit key"
+
+    keysize = 192
+
+    algorithm_usage_location = 'alg'
+
+    algorithm_use = 'kex'
+
+
+
+
+
+class _A256GcmKw(_AesGcmKw, JWAAlgorithm):
+
+
+
+    name = 'A256GCMKW'
+
+    description = "Key wrapping with AES GCM using 256-bit key"
+
+    keysize = 256
+
+    algorithm_usage_location = 'alg'
+
+    algorithm_use = 'kex'
+
+
+
+
+
+class _Pbes2HsAesKw(_RawKeyMgmt):
+
+
+
+    name = None
+
+    keysize = None
+
+    hashsize = None
+
+
+
+    def __init__(self):
+
+        self.backend = default_backend()
+
+        self.aeskwmap = {128: _A128KW, 192: _A192KW, 256: _A256KW}
+
+
+
+    def _get_key(self, alg, key, p2s, p2c):
+
+        if isinstance(key, bytes):
+
+            plain = key
+
+        else:
+
+            plain = key.encode('utf8')
+
+        salt = bytes(self.name.encode('utf8')) + b'\x00' + p2s
+
+
+
+        if self.hashsize == 256:
+
+            hashalg = hashes.SHA256()
+
+        elif self.hashsize == 384:
+
+            hashalg = hashes.SHA384()
+
+        elif self.hashsize == 512:
+
+            hashalg = hashes.SHA512()
+
+        else:
+
+            raise ValueError('Unknown Hash Size')
+
+
+
+        kdf = PBKDF2HMAC(algorithm=hashalg, length=_inbytes(self.keysize),
+
+                         salt=salt, iterations=p2c, backend=self.backend)
+
+        rk = kdf.derive(plain)
+
+        if _bitsize(rk) != self.keysize:
+
+            raise InvalidJWEKeyLength(self.keysize, len(rk))
+
+        return JWK(kty="oct", use="enc", k=base64url_encode(rk))
+
+
+
+    def wrap(self, key, bitsize, cek, headers):
+
+        p2s = _randombits(128)
+
+        p2c = 8192
+
+        kek = self._get_key(headers['alg'], key, p2s, p2c)
+
+
+
+        aeskw = self.aeskwmap[self.keysize]()
+
+        ret = aeskw.wrap(kek, bitsize, cek, headers)
+
+        ret['header'] = {'p2s': base64url_encode(p2s), 'p2c': p2c}
+
+        return ret
+
+
+
+    def unwrap(self, key, bitsize, ek, headers):
+
+        if 'p2s' not in headers:
+
+            raise ValueError('Invalid Header, missing "p2s" parameter')
+
+        if 'p2c' not in headers:
+
+            raise ValueError('Invalid Header, missing "p2c" parameter')
+
+        p2s = base64url_decode(headers['p2s'])
+
+        p2c = headers['p2c']
+
+        kek = self._get_key(headers['alg'], key, p2s, p2c)
+
+
+
+        aeskw = self.aeskwmap[self.keysize]()
+
+        return aeskw.unwrap(kek, bitsize, ek, headers)
+
+
+
+
+
+class _Pbes2Hs256A128Kw(_Pbes2HsAesKw, JWAAlgorithm):
+
+
+
+    name = 'PBES2-HS256+A128KW'
+
+    description = 'PBES2 with HMAC SHA-256 and "A128KW" wrapping'
+
+    keysize = 128
+
+    algorithm_usage_location = 'alg'
+
+    algorithm_use = 'kex'
+
+    hashsize = 256
+
+
+
+
+
+class _Pbes2Hs384A192Kw(_Pbes2HsAesKw, JWAAlgorithm):
+
+
+
+    name = 'PBES2-HS384+A192KW'
+
+    description = 'PBES2 with HMAC SHA-384 and "A192KW" wrapping'
+
+    keysize = 192
+
+    algorithm_usage_location = 'alg'
+
+    algorithm_use = 'kex'
+
+    hashsize = 384
+
+
+
+
+
+class _Pbes2Hs512A256Kw(_Pbes2HsAesKw, JWAAlgorithm):
+
+
+
+    name = 'PBES2-HS512+A256KW'
+
+    description = 'PBES2 with HMAC SHA-512 and "A256KW" wrapping'
+
+    keysize = 256
+
+    algorithm_usage_location = 'alg'
+
+    algorithm_use = 'kex'
+
+    hashsize = 512
+
+
+
+
+
+class _Direct(_RawKeyMgmt, JWAAlgorithm):
+
+
+
+    name = 'dir'
+
+    description = "Direct use of a shared symmetric key"
+
+    keysize = 128
+
+    algorithm_usage_location = 'alg'
+
+    algorithm_use = 'kex'
+
+
+
+    def _check_key(self, key):
+
+        if not isinstance(key, JWK):
+
+            raise ValueError('key is not a JWK object')
+
+        if key.key_type != 'oct':
+
+            raise InvalidJWEKeyType('oct', key.key_type)
+
+
+
+    def wrap(self, key, bitsize, cek, headers):
+
+        self._check_key(key)
+
+        if cek:
+
+            return (cek, None)
+
+        k = base64url_decode(key.get_op_key('encrypt'))
+
+        if _bitsize(k) != bitsize:
+
+            raise InvalidCEKeyLength(bitsize, _bitsize(k))
+
+        return {'cek': k}
+
+
+
+    def unwrap(self, key, bitsize, ek, headers):
+
+        self._check_key(key)
+
+        if ek != b'':
+
+            raise ValueError('Invalid Encryption Key.')
+
+        cek = base64url_decode(key.get_op_key('decrypt'))
+
+        if _bitsize(cek) != bitsize:
+
+            raise InvalidJWEKeyLength(bitsize, _bitsize(cek))
+
+        return cek
+
+
+
+
+
+class _EcdhEs(_RawKeyMgmt):
+
+
+
+    name = 'ECDH-ES'
+
+    description = "ECDH-ES using Concat KDF"
+
+    algorithm_usage_location = 'alg'
+
+    algorithm_use = 'kex'
+
+    keysize = None
+
+
+
+    def __init__(self):
+
+        self.backend = default_backend()
+
+        self.aeskwmap = {128: _A128KW, 192: _A192KW, 256: _A256KW}
+
+
+
+    def _check_key(self, key):
+
+        if not isinstance(key, JWK):
+
+            raise ValueError('key is not a JWK object')
+
+        if key.key_type != 'EC':
+
+            raise InvalidJWEKeyType('EC', key.key_type)
+
+
+
+    def _derive(self, privkey, pubkey, alg, bitsize, headers):
+
+        # OtherInfo is defined in NIST SP 56A 5.8.1.2.1
+
+
+
+        # AlgorithmID
+
+        otherinfo = struct.pack('>I', len(alg))
+
+        otherinfo += bytes(alg.encode('utf8'))
+
+
+
+        # PartyUInfo
+
+        apu = base64url_decode(headers['apu']) if 'apu' in headers else b''
+
+        otherinfo += struct.pack('>I', len(apu))
+
+        otherinfo += apu
+
+
+
+        # PartyVInfo
+
+        apv = base64url_decode(headers['apv']) if 'apv' in headers else b''
+
+        otherinfo += struct.pack('>I', len(apv))
+
+        otherinfo += apv
+
+
+
+        # SuppPubInfo
+
+        otherinfo += struct.pack('>I', bitsize)
+
+
+
+        # no SuppPrivInfo
+
+
+
+        shared_key = privkey.exchange(ec.ECDH(), pubkey)
+
+        ckdf = ConcatKDFHash(algorithm=hashes.SHA256(),
+
+                             length=_inbytes(bitsize),
+
+                             otherinfo=otherinfo,
+
+                             backend=self.backend)
+
+        return ckdf.derive(shared_key)
+
+
+
+    def wrap(self, key, bitsize, cek, headers):
+
+        self._check_key(key)
+
+        if self.keysize is None:
+
+            if cek is not None:
+
+                raise InvalidJWEOperation('ECDH-ES cannot use an existing CEK')
+
+            alg = headers['enc']
+
+        else:
+
+            bitsize = self.keysize
+
+            alg = headers['alg']
+
+
+
+        epk = JWK.generate(kty=key.key_type, crv=key.key_curve)
+
+        dk = self._derive(epk.get_op_key('unwrapKey'),
+
+                          key.get_op_key('wrapKey'),
+
+                          alg, bitsize, headers)
+
+
+
+        if self.keysize is None:
+
+            ret = {'cek': dk}
+
+        else:
+
+            aeskw = self.aeskwmap[bitsize]()
+
+            kek = JWK(kty="oct", use="enc", k=base64url_encode(dk))
+
+            ret = aeskw.wrap(kek, bitsize, cek, headers)
+
+
+
+        ret['header'] = {'epk': json_decode(epk.export_public())}
+
+        return ret
+
+
+
+    def unwrap(self, key, bitsize, ek, headers):
+
+        if 'epk' not in headers:
+
+            raise ValueError('Invalid Header, missing "epk" parameter')
+
+        self._check_key(key)
+
+        if self.keysize is None:
+
+            alg = headers['enc']
+
+        else:
+
+            bitsize = self.keysize
+
+            alg = headers['alg']
+
+
+
+        epk = JWK(**headers['epk'])
+
+        dk = self._derive(key.get_op_key('unwrapKey'),
+
+                          epk.get_op_key('wrapKey'),
+
+                          alg, bitsize, headers)
+
+        if self.keysize is None:
+
+            return dk
+
+        else:
+
+            aeskw = self.aeskwmap[bitsize]()
+
+            kek = JWK(kty="oct", use="enc", k=base64url_encode(dk))
+
+            cek = aeskw.unwrap(kek, bitsize, ek, headers)
+
+            return cek
+
+
+
+
+
+class _EcdhEsAes128Kw(_EcdhEs, JWAAlgorithm):
+
+
+
+    name = 'ECDH-ES+A128KW'
+
+    description = 'ECDH-ES using Concat KDF and "A128KW" wrapping'
+
+    keysize = 128
+
+    algorithm_usage_location = 'alg'
+
+    algorithm_use = 'kex'
+
+
+
+
+
+class _EcdhEsAes192Kw(_EcdhEs, JWAAlgorithm):
+
+
+
+    name = 'ECDH-ES+A192KW'
+
+    description = 'ECDH-ES using Concat KDF and "A192KW" wrapping'
+
+    keysize = 192
+
+    algorithm_usage_location = 'alg'
+
+    algorithm_use = 'kex'
+
+
+
+
+
+class _EcdhEsAes256Kw(_EcdhEs, JWAAlgorithm):
+
+
+
+    name = 'ECDH-ES+A256KW'
+
+    description = 'ECDH-ES using Concat KDF and "A128KW" wrapping'
+
+    keysize = 256
+
+    algorithm_usage_location = 'alg'
+
+    algorithm_use = 'kex'
+
+
+
+
+
+class _RawJWE(object):
+
+
+
+    def encrypt(self, k, a, m):
+
+        raise NotImplementedError
+
+
+
+    def decrypt(self, k, a, iv, e, t):
+
+        raise NotImplementedError
+
+
+
+
+
+class _AesCbcHmacSha2(_RawJWE):
+
+
+
+    keysize = None
+
+
+
+    def __init__(self, hashfn):
+
+        self.backend = default_backend()
+
+        self.hashfn = hashfn
+
+        self.blocksize = algorithms.AES.block_size
+
+        self.wrap_key_size = self.keysize * 2
+
+
+
+    def _mac(self, k, a, iv, e):
+
+        al = _encode_int(_bitsize(a), 64)
+
+        h = hmac.HMAC(k, self.hashfn, backend=self.backend)
+
+        h.update(a)
+
+        h.update(iv)
+
+        h.update(e)
+
+        h.update(al)
+
+        m = h.finalize()
+
+        return m[:_inbytes(self.keysize)]
+
+
+
+    # RFC 7518 - 5.2.2
+
+    def encrypt(self, k, a, m):
+
+        """ Encrypt according to the selected encryption and hashing
+
+        functions.
+
+
+
+        :param k: Encryption key (optional)
+
+        :param a: Additional Authentication Data
+
+        :param m: Plaintext
+
+
+
+        Returns a dictionary with the computed data.
+
+        """
+
+        hkey = k[:_inbytes(self.keysize)]
+
+        ekey = k[_inbytes(self.keysize):]
+
+
+
+        # encrypt
+
+        iv = _randombits(self.blocksize)
+
+        cipher = Cipher(algorithms.AES(ekey), modes.CBC(iv),
+
+                        backend=self.backend)
+
+        encryptor = cipher.encryptor()
+
+        padder = PKCS7(self.blocksize).padder()
+
+        padded_data = padder.update(m) + padder.finalize()
+
+        e = encryptor.update(padded_data) + encryptor.finalize()
+
+
+
+        # mac
+
+        t = self._mac(hkey, a, iv, e)
+
+
+
+        return (iv, e, t)
+
+
+
+    def decrypt(self, k, a, iv, e, t):
+
+        """ Decrypt according to the selected encryption and hashing
+
+        functions.
+
+        :param k: Encryption key (optional)
+
+        :param a: Additional Authenticated Data
+
+        :param iv: Initialization Vector
+
+        :param e: Ciphertext
+
+        :param t: Authentication Tag
+
+
+
+        Returns plaintext or raises an error
+
+        """
+
+        hkey = k[:_inbytes(self.keysize)]
+
+        dkey = k[_inbytes(self.keysize):]
+
+
+
+        # verify mac
+
+        if not constant_time.bytes_eq(t, self._mac(hkey, a, iv, e)):
+
+            raise InvalidSignature('Failed to verify MAC')
+
+
+
+        # decrypt
+
+        cipher = Cipher(algorithms.AES(dkey), modes.CBC(iv),
+
+                        backend=self.backend)
+
+        decryptor = cipher.decryptor()
+
+        d = decryptor.update(e) + decryptor.finalize()
+
+        unpadder = PKCS7(self.blocksize).unpadder()
+
+        return unpadder.update(d) + unpadder.finalize()
+
+
+
+
+
+class _A128CbcHs256(_AesCbcHmacSha2, JWAAlgorithm):
+
+
+
+    name = 'A128CBC-HS256'
+
+    description = "AES_128_CBC_HMAC_SHA_256 authenticated"
+
+    keysize = 128
+
+    algorithm_usage_location = 'enc'
+
+    algorithm_use = 'enc'
+
+
+
+    def __init__(self):
+
+        super(_A128CbcHs256, self).__init__(hashes.SHA256())
+
+
+
+
+
+class _A192CbcHs384(_AesCbcHmacSha2, JWAAlgorithm):
+
+
+
+    name = 'A192CBC-HS384'
+
+    description = "AES_192_CBC_HMAC_SHA_384 authenticated"
+
+    keysize = 192
+
+    algorithm_usage_location = 'enc'
+
+    algorithm_use = 'enc'
+
+
+
+    def __init__(self):
+
+        super(_A192CbcHs384, self).__init__(hashes.SHA384())
+
+
+
+
+
+class _A256CbcHs512(_AesCbcHmacSha2, JWAAlgorithm):
+
+
+
+    name = 'A256CBC-HS512'
+
+    description = "AES_256_CBC_HMAC_SHA_512 authenticated"
+
+    keysize = 256
+
+    algorithm_usage_location = 'enc'
+
+    algorithm_use = 'enc'
+
+
+
+    def __init__(self):
+
+        super(_A256CbcHs512, self).__init__(hashes.SHA512())
+
+
+
+
+
+class _AesGcm(_RawJWE):
+
+
+
+    keysize = None
+
+
+
+    def __init__(self):
+
+        self.backend = default_backend()
+
+        self.wrap_key_size = self.keysize
+
+
+
+    # RFC 7518 - 5.3
+
+    def encrypt(self, k, a, m):
+
+        """ Encrypt accoriding to the selected encryption and hashing
+
+        functions.
+
+
+
+        :param k: Encryption key (optional)
+
+        :param a: Additional Authentication Data
+
+        :param m: Plaintext
+
+
+
+        Returns a dictionary with the computed data.
+
+        """
+
+        iv = _randombits(96)
+
+        cipher = Cipher(algorithms.AES(k), modes.GCM(iv),
+
+                        backend=self.backend)
+
+        encryptor = cipher.encryptor()
+
+        encryptor.authenticate_additional_data(a)
+
+        e = encryptor.update(m) + encryptor.finalize()
+
+
+
+        return (iv, e, encryptor.tag)
+
+
+
+    def decrypt(self, k, a, iv, e, t):
+
+        """ Decrypt accoriding to the selected encryption and hashing
+
+        functions.
+
+        :param k: Encryption key (optional)
+
+        :param a: Additional Authenticated Data
+
+        :param iv: Initialization Vector
+
+        :param e: Ciphertext
+
+        :param t: Authentication Tag
+
+
+
+        Returns plaintext or raises an error
+
+        """
+
+        cipher = Cipher(algorithms.AES(k), modes.GCM(iv, t),
+
+                        backend=self.backend)
+
+        decryptor = cipher.decryptor()
+
+        decryptor.authenticate_additional_data(a)
+
+        return decryptor.update(e) + decryptor.finalize()
+
+
+
+
+
+class _A128Gcm(_AesGcm, JWAAlgorithm):
+
+
+
+    name = 'A128GCM'
+
+    description = "AES GCM using 128-bit key"
+
+    keysize = 128
+
+    algorithm_usage_location = 'enc'
+
+    algorithm_use = 'enc'
+
+
+
+
+
+class _A192Gcm(_AesGcm, JWAAlgorithm):
+
+
+
+    name = 'A192GCM'
+
+    description = "AES GCM using 192-bit key"
+
+    keysize = 192
+
+    algorithm_usage_location = 'enc'
+
+    algorithm_use = 'enc'
+
+
+
+
+
+class _A256Gcm(_AesGcm, JWAAlgorithm):
+
+
+
+    name = 'A256GCM'
+
+    description = "AES GCM using 256-bit key"
+
+    keysize = 256
+
+    algorithm_usage_location = 'enc'
+
+    algorithm_use = 'enc'
+
+
+
+
+
+class JWA(object):
+
+    """JWA Signing Algorithms.
+
+
+
+    This class provides access to all JWA algorithms.
+
+    """
+
+
+
+    algorithms_registry = {
+
+        'HS256': _HS256,
+
+        'HS384': _HS384,
+
+        'HS512': _HS512,
+
+        'RS256': _RS256,
+
+        'RS384': _RS384,
+
+        'RS512': _RS512,
+
+        'ES256': _ES256,
+
+        'ES384': _ES384,
+
+        'ES512': _ES512,
+
+        'PS256': _PS256,
+
+        'PS384': _PS384,
+
+        'PS512': _PS512,
+
+        'none': _None,
+
+        'RSA1_5': _Rsa15,
+
+        'RSA-OAEP': _RsaOaep,
+
+        'RSA-OAEP-256': _RsaOaep256,
+
+        'A128KW': _A128KW,
+
+        'A192KW': _A192KW,
+
+        'A256KW': _A256KW,
+
+        'dir': _Direct,
+
+        'ECDH-ES': _EcdhEs,
+
+        'ECDH-ES+A128KW': _EcdhEsAes128Kw,
+
+        'ECDH-ES+A192KW': _EcdhEsAes192Kw,
+
+        'ECDH-ES+A256KW': _EcdhEsAes256Kw,
+
+        'A128GCMKW': _A128GcmKw,
+
+        'A192GCMKW': _A192GcmKw,
+
+        'A256GCMKW': _A256GcmKw,
+
+        'PBES2-HS256+A128KW': _Pbes2Hs256A128Kw,
+
+        'PBES2-HS384+A192KW': _Pbes2Hs384A192Kw,
+
+        'PBES2-HS512+A256KW': _Pbes2Hs512A256Kw,
+
+        'A128CBC-HS256': _A128CbcHs256,
+
+        'A192CBC-HS384': _A192CbcHs384,
+
+        'A256CBC-HS512': _A256CbcHs512,
+
+        'A128GCM': _A128Gcm,
+
+        'A192GCM': _A192Gcm,
+
+        'A256GCM': _A256Gcm
+
+    }
+
+
+
+    @classmethod
+
+    def instantiate_alg(cls, name, use=None):
+
+        alg = cls.algorithms_registry[name]
+
+        if use is not None and alg.algorithm_use != use:
+
+            raise KeyError
+
+        return alg()
+
+
+
+    @classmethod
+
+    def signing_alg(cls, name):
+
+        try:
+
+            return cls.instantiate_alg(name, use='sig')
+
+        except KeyError:
+
+            raise InvalidJWAAlgorithm(
+
+                '%s is not a valid Signign algorithm name' % name)
+
+
+
+    @classmethod
+
+    def keymgmt_alg(cls, name):
+
+        try:
+
+            return cls.instantiate_alg(name, use='kex')
+
+        except KeyError:
+
+            raise InvalidJWAAlgorithm(
+
+                '%s is not a valid Key Management algorithm name' % name)
+
+
+
+    @classmethod
+
+    def encryption_alg(cls, name):
+
+        try:
+
+            return cls.instantiate_alg(name, use='enc')
+
+        except KeyError:
+
+            raise InvalidJWAAlgorithm(
+
+                '%s is not a valid Encryption algorithm name' % name)

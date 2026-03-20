@@ -2,576 +2,354 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-#
+from __future__ import absolute_import, division, print_function, with_statement
 
-# The Python Imaging Library.
 
-# $Id$
 
-#
+import traceback
 
-# IPTC/NAA file handling
 
-#
 
-# history:
+from tornado.concurrent import Future
 
-# 1995-10-01 fl   Created
+from tornado.httpclient import HTTPError, HTTPRequest
 
-# 1998-03-09 fl   Cleaned up and added to PIL
+from tornado.log import gen_log
 
-# 2002-06-18 fl   Added getiptcinfo helper
+from tornado.testing import AsyncHTTPTestCase, gen_test, bind_unused_port, ExpectLog
 
-#
+from tornado.test.util import unittest, skipOnTravis
 
-# Copyright (c) Secret Labs AB 1997-2002.
+from tornado.web import Application, RequestHandler
 
-# Copyright (c) Fredrik Lundh 1995.
 
-#
 
-# See the README file for information on usage and redistribution.
+try:
 
-#
+    import tornado.websocket
 
+except ImportError:
 
+    # The unittest module presents misleading errors on ImportError
 
-from __future__ import print_function
+    # (it acts as if websocket_test could not be found, hiding the underlying
 
+    # error).  If we get an ImportError here (which could happen due to
 
+    # TORNADO_EXTENSION=1), print some extra information before failing.
 
-__version__ = "0.3"
+    traceback.print_exc()
 
+    raise
 
 
 
+from tornado.websocket import WebSocketHandler, websocket_connect, WebSocketError, _websocket_mask_python
 
-from PIL import Image, ImageFile, _binary
 
-import os, tempfile
 
+try:
 
+    from tornado import speedups
 
-i8 = _binary.i8
+except ImportError:
 
-i16 = _binary.i16be
+    speedups = None
 
-i32 = _binary.i32be
 
-o8 = _binary.o8
 
 
 
-COMPRESSION = {
+class TestWebSocketHandler(WebSocketHandler):
 
-    1: "raw",
+    """Base class for testing handlers that exposes the on_close event.
 
-    5: "jpeg"
 
-}
 
+    This allows for deterministic cleanup of the associated socket.
 
+    """
 
-PAD = o8(0) * 4
+    def initialize(self, close_future):
 
+        self.close_future = close_future
 
 
-#
 
-# Helpers
+    def on_close(self):
 
+        self.close_future.set_result(None)
 
 
-def i(c):
 
-    return i32((PAD + c)[-4:])
 
 
+class EchoHandler(TestWebSocketHandler):
 
-def dump(c):
+    def on_message(self, message):
 
-    for i in c:
+        self.write_message(message, isinstance(message, bytes))
 
-        print("%02x" % i8(i), end=' ')
 
-    print()
 
 
 
-##
+class HeaderHandler(TestWebSocketHandler):
 
-# Image plugin for IPTC/NAA datastreams.  To read IPTC/NAA fields
+    def open(self):
 
-# from TIFF and JPEG files, use the <b>getiptcinfo</b> function.
+        self.write_message(self.request.headers.get('X-Test', ''))
 
 
 
-class IptcImageFile(ImageFile.ImageFile):
 
 
+class NonWebSocketHandler(RequestHandler):
 
-    format = "IPTC"
+    def get(self):
 
-    format_description = "IPTC/NAA"
+        self.write('ok')
 
 
 
-    def getint(self, key):
 
-        return i(self.info[key])
 
+class WebSocketTest(AsyncHTTPTestCase):
 
+    def get_app(self):
 
-    def field(self):
+        self.close_future = Future()
 
-        #
+        return Application([
 
-        # get a IPTC field header
+            ('/echo', EchoHandler, dict(close_future=self.close_future)),
 
-        s = self.fp.read(5)
+            ('/non_ws', NonWebSocketHandler),
 
-        if not len(s):
+            ('/header', HeaderHandler, dict(close_future=self.close_future)),
 
-            return None, 0
+        ])
 
 
 
-        tag = i8(s[1]), i8(s[2])
+    @gen_test
 
+    def test_websocket_gen(self):
 
+        ws = yield websocket_connect(
 
-        # syntax
+            'ws://localhost:%d/echo' % self.get_http_port(),
 
-        if i8(s[0]) != 0x1C or tag[0] < 1 or tag[0] > 9:
+            io_loop=self.io_loop)
 
-            raise SyntaxError("invalid IPTC/NAA file")
+        ws.write_message('hello')
 
+        response = yield ws.read_message()
 
+        self.assertEqual(response, 'hello')
 
-        # field size
+        ws.close()
 
-        size = i8(s[3])
+        yield self.close_future
 
-        if size > 132:
 
-            raise IOError("illegal field length in IPTC/NAA file")
 
-        elif size == 128:
+    def test_websocket_callbacks(self):
 
-            size = 0
+        websocket_connect(
 
-        elif size > 128:
+            'ws://localhost:%d/echo' % self.get_http_port(),
 
-            size = i(self.fp.read(size-128))
+            io_loop=self.io_loop, callback=self.stop)
 
-        else:
+        ws = self.wait().result()
 
-            size = i16(s[3:])
+        ws.write_message('hello')
 
+        ws.read_message(self.stop)
 
+        response = self.wait().result()
 
-        return tag, size
+        self.assertEqual(response, 'hello')
 
+        ws.close()
 
+        yield self.close_future
 
-    def _is_raw(self, offset, size):
 
-        #
 
-        # check if the file can be mapped
+    @gen_test
 
+    def test_websocket_http_fail(self):
 
+        with self.assertRaises(HTTPError) as cm:
 
-        # DISABLED: the following only slows things down...
+            yield websocket_connect(
 
-        return 0
+                'ws://localhost:%d/notfound' % self.get_http_port(),
 
+                io_loop=self.io_loop)
 
+        self.assertEqual(cm.exception.code, 404)
 
-        self.fp.seek(offset)
 
-        t, sz = self.field()
 
-        if sz != size[0]:
+    @gen_test
 
-            return 0
+    def test_websocket_http_success(self):
 
-        y = 1
+        with self.assertRaises(WebSocketError):
 
-        while True:
+            yield websocket_connect(
 
-            self.fp.seek(sz, 1)
+                'ws://localhost:%d/non_ws' % self.get_http_port(),
 
-            t, s = self.field()
+                io_loop=self.io_loop)
 
-            if t != (8, 10):
 
-                break
 
-            if s != sz:
+    @skipOnTravis
 
-                return 0
+    @gen_test
 
-            y = y + 1
+    def test_websocket_network_timeout(self):
 
-        return y == size[1]
+        sock, port = bind_unused_port()
 
+        sock.close()
 
+        with self.assertRaises(HTTPError) as cm:
 
-    def _open(self):
+            with ExpectLog(gen_log, ".*"):
 
+                yield websocket_connect(
 
+                    'ws://localhost:%d/' % port,
 
-        # load descriptive fields
+                    io_loop=self.io_loop,
 
-        while True:
+                    connect_timeout=0.01)
 
-            offset = self.fp.tell()
+        self.assertEqual(cm.exception.code, 599)
 
-            tag, size = self.field()
 
-            if not tag or tag == (8,10):
 
-                break
+    @gen_test
 
-            if size:
+    def test_websocket_network_fail(self):
 
-                tagdata = self.fp.read(size)
+        sock, port = bind_unused_port()
 
-            else:
+        sock.close()
 
-                tagdata = None
+        with self.assertRaises(HTTPError) as cm:
 
-            if tag in list(self.info.keys()):
+            with ExpectLog(gen_log, ".*"):
 
-                if isinstance(self.info[tag], list):
+                yield websocket_connect(
 
-                    self.info[tag].append(tagdata)
+                    'ws://localhost:%d/' % port,
 
-                else:
+                    io_loop=self.io_loop,
 
-                    self.info[tag] = [self.info[tag], tagdata]
+                    connect_timeout=3600)
 
-            else:
+        self.assertEqual(cm.exception.code, 599)
 
-                self.info[tag] = tagdata
 
 
+    @gen_test
 
-            # print tag, self.info[tag]
+    def test_websocket_close_buffered_data(self):
 
+        ws = yield websocket_connect(
 
+            'ws://localhost:%d/echo' % self.get_http_port())
 
-        # mode
+        ws.write_message('hello')
 
-        layers = i8(self.info[(3,60)][0])
+        ws.write_message('world')
 
-        component = i8(self.info[(3,60)][1])
+        ws.stream.close()
 
-        if (3,65) in self.info:
+        yield self.close_future
 
-            id = i8(self.info[(3,65)][0])-1
 
-        else:
 
-            id = 0
+    @gen_test
 
-        if layers == 1 and not component:
+    def test_websocket_headers(self):
 
-            self.mode = "L"
+        # Ensure that arbitrary headers can be passed through websocket_connect.
 
-        elif layers == 3 and component:
+        ws = yield websocket_connect(
 
-            self.mode = "RGB"[id]
+            HTTPRequest('ws://localhost:%d/header' % self.get_http_port(),
 
-        elif layers == 4 and component:
+                        headers={'X-Test': 'hello'}))
 
-            self.mode = "CMYK"[id]
+        response = yield ws.read_message()
 
+        self.assertEqual(response, 'hello')
 
+        ws.close()
 
-        # size
+        yield self.close_future
 
-        self.size = self.getint((3,20)), self.getint((3,30))
 
 
 
-        # compression
 
-        try:
+class MaskFunctionMixin(object):
 
-            compression = COMPRESSION[self.getint((3,120))]
+    # Subclasses should define self.mask(mask, data)
 
-        except KeyError:
+    def test_mask(self):
 
-            raise IOError("Unknown IPTC image compression")
+        self.assertEqual(self.mask(b'abcd', b''), b'')
 
+        self.assertEqual(self.mask(b'abcd', b'b'), b'\x03')
 
+        self.assertEqual(self.mask(b'abcd', b'54321'), b'TVPVP')
 
-        # tile
+        self.assertEqual(self.mask(b'ZXCV', b'98765432'), b'c`t`olpd')
 
-        if tag == (8,10):
+        # Include test cases with \x00 bytes (to ensure that the C
 
-            if compression == "raw" and self._is_raw(offset, self.size):
+        # extension isn't depending on null-terminated strings) and
 
-                self.tile = [(compression, (offset, size + 5, -1),
+        # bytes with the high bit set (to smoke out signedness issues).
 
-                             (0, 0, self.size[0], self.size[1]))]
+        self.assertEqual(self.mask(b'\x00\x01\x02\x03',
 
-            else:
+                                   b'\xff\xfb\xfd\xfc\xfe\xfa'),
 
-                self.tile = [("iptc", (compression, offset),
+                         b'\xff\xfa\xff\xff\xfe\xfb')
 
-                             (0, 0, self.size[0], self.size[1]))]
+        self.assertEqual(self.mask(b'\xff\xfb\xfd\xfc',
 
+                                   b'\x00\x01\x02\x03\x04\x05'),
 
+                         b'\xff\xfa\xff\xff\xfb\xfe')
 
-    def load(self):
 
 
 
-        if len(self.tile) != 1 or self.tile[0][0] != "iptc":
 
-            return ImageFile.ImageFile.load(self)
+class PythonMaskFunctionTest(MaskFunctionMixin, unittest.TestCase):
 
+    def mask(self, mask, data):
 
+        return _websocket_mask_python(mask, data)
 
-        type, tile, box = self.tile[0]
 
 
 
-        encoding, offset = tile
 
+@unittest.skipIf(speedups is None, "tornado.speedups module not present")
 
+class CythonMaskFunctionTest(MaskFunctionMixin, unittest.TestCase):
 
-        self.fp.seek(offset)
+    def mask(self, mask, data):
 
-
-
-        # Copy image data to temporary file
-
-        outfile = tempfile.mktemp()
-
-        o = open(outfile, "wb")
-
-        if encoding == "raw":
-
-            # To simplify access to the extracted file,
-
-            # prepend a PPM header
-
-            o.write("P5\n%d %d\n255\n" % self.size)
-
-        while True:
-
-            type, size = self.field()
-
-            if type != (8, 10):
-
-                break
-
-            while size > 0:
-
-                s = self.fp.read(min(size, 8192))
-
-                if not s:
-
-                    break
-
-                o.write(s)
-
-                size = size - len(s)
-
-        o.close()
-
-
-
-        try:
-
-            try:
-
-                # fast
-
-                self.im = Image.core.open_ppm(outfile)
-
-            except:
-
-                # slightly slower
-
-                im = Image.open(outfile)
-
-                im.load()
-
-                self.im = im.im
-
-        finally:
-
-            try: os.unlink(outfile)
-
-            except: pass
-
-
-
-
-
-Image.register_open("IPTC", IptcImageFile)
-
-
-
-Image.register_extension("IPTC", ".iim")
-
-
-
-##
-
-# Get IPTC information from TIFF, JPEG, or IPTC file.
-
-#
-
-# @param im An image containing IPTC data.
-
-# @return A dictionary containing IPTC information, or None if
-
-#     no IPTC information block was found.
-
-
-
-def getiptcinfo(im):
-
-
-
-    from PIL import TiffImagePlugin, JpegImagePlugin
-
-    import io
-
-
-
-    data = None
-
-
-
-    if isinstance(im, IptcImageFile):
-
-        # return info dictionary right away
-
-        return im.info
-
-
-
-    elif isinstance(im, JpegImagePlugin.JpegImageFile):
-
-        # extract the IPTC/NAA resource
-
-        try:
-
-            app = im.app["APP13"]
-
-            if app[:14] == "Photoshop 3.0\x00":
-
-                app = app[14:]
-
-                # parse the image resource block
-
-                offset = 0
-
-                while app[offset:offset+4] == "8BIM":
-
-                    offset = offset + 4
-
-                    # resource code
-
-                    code = JpegImagePlugin.i16(app, offset)
-
-                    offset = offset + 2
-
-                    # resource name (usually empty)
-
-                    name_len = i8(app[offset])
-
-                    name = app[offset+1:offset+1+name_len]
-
-                    offset = 1 + offset + name_len
-
-                    if offset & 1:
-
-                        offset = offset + 1
-
-                    # resource data block
-
-                    size = JpegImagePlugin.i32(app, offset)
-
-                    offset = offset + 4
-
-                    if code == 0x0404:
-
-                        # 0x0404 contains IPTC/NAA data
-
-                        data = app[offset:offset+size]
-
-                        break
-
-                    offset = offset + size
-
-                    if offset & 1:
-
-                        offset = offset + 1
-
-        except (AttributeError, KeyError):
-
-            pass
-
-
-
-    elif isinstance(im, TiffImagePlugin.TiffImageFile):
-
-        # get raw data from the IPTC/NAA tag (PhotoShop tags the data
-
-        # as 4-byte integers, so we cannot use the get method...)
-
-        try:
-
-            data = im.tag.tagdata[TiffImagePlugin.IPTC_NAA_CHUNK]
-
-        except (AttributeError, KeyError):
-
-            pass
-
-
-
-    if data is None:
-
-        return None # no properties
-
-
-
-    # create an IptcImagePlugin object without initializing it
-
-    class FakeImage:
-
-        pass
-
-    im = FakeImage()
-
-    im.__class__ = IptcImageFile
-
-
-
-    # parse the IPTC information chunk
-
-    im.info = {}
-
-    im.fp = io.BytesIO(data)
-
-
-
-    try:
-
-        im._open()
-
-    except (IndexError, KeyError):
-
-        pass # expected failure
-
-
-
-    return im.info
+        return speedups.websocket_mask(mask, data)

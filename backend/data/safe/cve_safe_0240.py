@@ -2,342 +2,82 @@
 # Safety: safe
 # Category: safe
 
-# Based on local.py (c) 2012, Michael DeHaan <michael.dehaan@gmail.com>
+# tests.test_safety
 
-# and chroot.py     (c) 2013, Maykel Moya <mmoya@speedyrails.com>
-
-# (c) 2013, Michael Scherer <misc@zarb.org>
-
-# (c) 2015, Toshio Kuratomi <tkuratomi@ansible.com>
+# Test that we're using safe methods
 
 #
 
-# This file is part of Ansible
+# Author:   Benjamin Bengfort <benjamin@bengfort.com>
+
+# Created:  Fri Nov 10 12:22:35 2017 -0500
 
 #
 
-# Ansible is free software: you can redistribute it and/or modify
+# Copyright (C) 2014 Bengfort.com
 
-# it under the terms of the GNU General Public License as published by
-
-# the Free Software Foundation, either version 3 of the License, or
-
-# (at your option) any later version.
+# For license information, see LICENSE.txt
 
 #
 
-# Ansible is distributed in the hope that it will be useful,
-
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-
-# GNU General Public License for more details.
-
-#
-
-# You should have received a copy of the GNU General Public License
-
-# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
-
-from __future__ import (absolute_import, division, print_function)
-
-__metaclass__ = type
+# ID: test_safety.py [] benjamin@bengfort.com $
 
 
 
-import distutils.spawn
+"""
 
-import traceback
+Testing the paths descriptor
+
+"""
+
+
+
+##########################################################################
+
+## Imports
+
+##########################################################################
+
+
 
 import os
 
-import subprocess
 
-from ansible import errors
 
-from ansible.callbacks import vvv
+from unittest import mock
 
-import ansible.constants as C
 
 
 
-BUFSIZE = 4096
 
+# Cannot import from test_conf.py to ensure correct mock
 
+TESTDATA = os.path.join(os.path.dirname(__file__), "testdata")
 
-class Connection(object):
+TESTCONF = os.path.join(TESTDATA, "testconf.yaml")
 
-    ''' Local BSD Jail based connections '''
 
 
 
-    def _search_executable(self, executable):
 
-        cmd = distutils.spawn.find_executable(executable)
+@mock.patch('confire.config.yaml')
 
-        if not cmd:
+def test_use_yaml_safe_load(mock_yaml):
 
-            raise errors.AnsibleError("%s command not found in PATH") % executable
+    """
 
-        return cmd
+    Ensure we're using yaml.safe_load not yaml.load
 
+    """
 
+    from confire.config import Configuration
 
-    def list_jails(self):
+    Configuration.CONF_PATHS = [TESTCONF]
 
-        p = subprocess.Popen([self.jls_cmd, '-q', 'name'],
+    Configuration.load()
 
-                             cwd=self.runner.basedir,
 
-                             stdin=subprocess.PIPE,
 
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    mock_yaml.safe_load.assert_called_once()
 
-
-
-        stdout, stderr = p.communicate()
-
-
-
-        return stdout.split()
-
-
-
-    def get_jail_path(self):
-
-        p = subprocess.Popen([self.jls_cmd, '-j', self.jail, '-q', 'path'],
-
-                             cwd=self.runner.basedir,
-
-                             stdin=subprocess.PIPE,
-
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-
-
-        stdout, stderr = p.communicate()
-
-        # remove \n
-
-        return stdout[:-1]
-
-
-
- 
-
-        
-
-    def __init__(self, runner, host, port, *args, **kwargs):
-
-        self.jail = host
-
-        self.runner = runner
-
-        self.host = host
-
-        self.has_pipelining = False
-
-        self.become_methods_supported=C.BECOME_METHODS
-
-
-
-        if os.geteuid() != 0:
-
-            raise errors.AnsibleError("jail connection requires running as root")
-
-
-
-        self.jls_cmd = self._search_executable('jls')
-
-        self.jexec_cmd = self._search_executable('jexec')
-
-        
-
-        if not self.jail in self.list_jails():
-
-            raise errors.AnsibleError("incorrect jail name %s" % self.jail)
-
-
-
-
-
-        self.host = host
-
-        # port is unused, since this is local
-
-        self.port = port
-
-
-
-    def connect(self, port=None):
-
-        ''' connect to the jail; nothing to do here '''
-
-
-
-        vvv("THIS IS A LOCAL JAIL DIR", host=self.jail)
-
-
-
-        return self
-
-
-
-    # a modifier
-
-    def _generate_cmd(self, executable, cmd):
-
-        if executable:
-
-            local_cmd = [self.jexec_cmd, self.jail, executable, '-c', cmd]
-
-        else:
-
-            local_cmd = '%s "%s" %s' % (self.jexec_cmd, self.jail, cmd)
-
-        return local_cmd
-
-
-
-    def _buffered_exec_command(self, cmd, tmp_path, become_user=None, sudoable=False, executable='/bin/sh', in_data=None, stdin=subprocess.PIPE):
-
-        ''' run a command on the jail.  This is only needed for implementing
-
-        put_file() get_file() so that we don't have to read the whole file
-
-        into memory.
-
-
-
-        compared to exec_command() it looses some niceties like being able to
-
-        return the process's exit code immediately.
-
-        '''
-
-
-
-        if sudoable and self.runner.become and self.runner.become_method not in self.become_methods_supported:
-
-            raise errors.AnsibleError("Internal Error: this module does not support running commands via %s" % self.runner.become_method)
-
-
-
-        if in_data:
-
-            raise errors.AnsibleError("Internal Error: this module does not support optimized module pipelining")
-
-
-
-        # Ignores privilege escalation
-
-        local_cmd = self._generate_cmd(executable, cmd)
-
-
-
-        vvv("EXEC %s" % (local_cmd), host=self.jail)
-
-        p = subprocess.Popen(local_cmd, shell=isinstance(local_cmd, basestring),
-
-                             cwd=self.runner.basedir,
-
-                             stdin=stdin,
-
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-
-
-        return p
-
-
-
-    def exec_command(self, cmd, tmp_path, become_user=None, sudoable=False, executable='/bin/sh', in_data=None):
-
-        ''' run a command on the jail '''
-
-
-
-        p = self._buffered_exec_command(cmd, tmp_path, become_user, sudoable, executable, in_data)
-
-
-
-        stdout, stderr = p.communicate()
-
-        return (p.returncode, '', stdout, stderr)
-
-
-
-    def put_file(self, in_path, out_path):
-
-        ''' transfer a file from local to jail '''
-
-
-
-        vvv("PUT %s TO %s" % (in_path, out_path), host=self.jail)
-
-
-
-        with open(in_path, 'rb') as in_file:
-
-            p = self._buffered_exec_command('dd of=%s' % out_path, None, stdin=in_file)
-
-            try:
-
-                stdout, stderr = p.communicate()
-
-            except:
-
-                traceback.print_exc()
-
-                raise errors.AnsibleError("failed to transfer file to %s" % out_path)
-
-            if p.returncode != 0:
-
-                raise errors.AnsibleError("failed to transfer file to %s:\n%s\n%s" % (out_path, stdout, stderr))
-
-
-
-    def fetch_file(self, in_path, out_path):
-
-        ''' fetch a file from jail to local '''
-
-
-
-        vvv("FETCH %s TO %s" % (in_path, out_path), host=self.jail)
-
-
-
-
-
-        p = self._buffered_exec_command('dd if=%s bs=%s' % (in_path, BUFSIZE), None)
-
-
-
-        with open(out_path, 'wb+') as out_file:
-
-            try:
-
-                for chunk in p.stdout.read(BUFSIZE):
-
-                    out_file.write(chunk)
-
-            except:
-
-                traceback.print_exc()
-
-                raise errors.AnsibleError("failed to transfer file to %s" % out_path)
-
-            stdout, stderr = p.communicate()
-
-            if p.returncode != 0:
-
-                raise errors.AnsibleError("failed to transfer file to %s:\n%s\n%s" % (out_path, stdout, stderr))
-
-
-
-    def close(self):
-
-        ''' terminate the connection; nothing to do here '''
-
-        pass
+    mock_yaml.load.assert_not_called()

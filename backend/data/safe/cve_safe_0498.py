@@ -2,906 +2,690 @@
 # Safety: safe
 # Category: safe
 
-import os
+##############################################################################
+
+#
+
+# Copyright (c) 2001, 2002 Zope Foundation and Contributors.
+
+# All Rights Reserved.
+
+#
+
+# This software is subject to the provisions of the Zope Public License,
+
+# Version 2.1 (ZPL).  A copy of the ZPL should accompany this distribution.
+
+# THIS SOFTWARE IS PROVIDED "AS IS" AND ANY AND ALL EXPRESS OR IMPLIED
+
+# WARRANTIES ARE DISCLAIMED, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+
+# WARRANTIES OF TITLE, MERCHANTABILITY, AGAINST INFRINGEMENT, AND FITNESS
+
+# FOR A PARTICULAR PURPOSE.
+
+#
+
+##############################################################################
+
+"""HTTP Request Parser
+
+
+
+This server uses asyncore to accept connections and do initial
+
+processing but threads to do work.
+
+"""
 
 import re
 
-import urllib
+from io import BytesIO
 
 
 
-from django.conf import settings
+from waitress.buffers import OverflowableBuffer
 
-from django.contrib.auth import SESSION_KEY, REDIRECT_FIELD_NAME
+from waitress.compat import tostr, unquote_bytes_to_wsgi, urlparse
 
-from django.contrib.auth.forms import AuthenticationForm
+from waitress.receiver import ChunkedReceiver, FixedStreamReceiver
 
-from django.contrib.sites.models import Site, RequestSite
+from waitress.utilities import (
 
-from django.contrib.auth.models import User
+    BadRequest,
 
-from django.test import TestCase
+    RequestEntityTooLarge,
 
-from django.core import mail
+    RequestHeaderFieldsTooLarge,
 
-from django.core.exceptions import SuspiciousOperation
+    find_double_newline,
 
-from django.core.urlresolvers import reverse
-
-from django.http import QueryDict
+)
 
 
 
-class AuthViewsTestCase(TestCase):
+
+
+class ParsingError(Exception):
+
+    pass
+
+
+
+
+
+class HTTPRequestParser(object):
+
+    """A structure that collects the HTTP request.
+
+
+
+    Once the stream is completed, the instance is passed to
+
+    a server task constructor.
 
     """
 
-    Helper base class for all the follow test cases.
 
-    """
 
-    fixtures = ['authtestdata.json']
+    completed = False  # Set once request is completed.
 
-    urls = 'django.contrib.auth.tests.urls'
+    empty = False  # Set if no request was made.
 
+    expect_continue = False  # client sent "Expect: 100-continue" header
 
+    headers_finished = False  # True when headers have been read
 
-    def setUp(self):
+    header_plus = b""
 
-        self.old_LANGUAGES = settings.LANGUAGES
+    chunked = False
 
-        self.old_LANGUAGE_CODE = settings.LANGUAGE_CODE
+    content_length = 0
 
-        settings.LANGUAGES = (('en', 'English'),)
+    header_bytes_received = 0
 
-        settings.LANGUAGE_CODE = 'en'
+    body_bytes_received = 0
 
-        self.old_TEMPLATE_DIRS = settings.TEMPLATE_DIRS
+    body_rcv = None
 
-        settings.TEMPLATE_DIRS = (
+    version = "1.0"
 
-            os.path.join(os.path.dirname(__file__), 'templates'),
+    error = None
 
-        )
+    connection_close = False
 
 
 
-    def tearDown(self):
+    # Other attributes: first_line, header, headers, command, uri, version,
 
-        settings.LANGUAGES = self.old_LANGUAGES
+    # path, query, fragment
 
-        settings.LANGUAGE_CODE = self.old_LANGUAGE_CODE
 
-        settings.TEMPLATE_DIRS = self.old_TEMPLATE_DIRS
 
+    def __init__(self, adj):
 
+        """
 
-    def login(self, password='password'):
+        adj is an Adjustments object.
 
-        response = self.client.post('/login/', {
+        """
 
-            'username': 'testclient',
+        # headers is a mapping containing keys translated to uppercase
 
-            'password': password
+        # with dashes turned into underscores.
 
-            }
+        self.headers = {}
 
-        )
+        self.adj = adj
 
-        self.assertEqual(response.status_code, 302)
 
-        self.assertTrue(response['Location'].endswith(settings.LOGIN_REDIRECT_URL))
 
-        self.assertTrue(SESSION_KEY in self.client.session)
+    def received(self, data):
 
+        """
 
+        Receives the HTTP stream for one request.  Returns the number of
 
-class PasswordResetTest(AuthViewsTestCase):
+        bytes consumed.  Sets the completed flag once both the header and the
 
+        body have been received.
 
+        """
 
-    def test_email_not_found(self):
+        if self.completed:
 
-        "Error is raised if the provided email address isn't currently registered"
+            return 0  # Can't consume any more.
 
-        response = self.client.get('/password_reset/')
+        datalen = len(data)
 
-        self.assertEqual(response.status_code, 200)
+        br = self.body_rcv
 
-        response = self.client.post('/password_reset/', {'email': 'not_a_real_email@email.com'})
+        if br is None:
 
-        self.assertContains(response, "That e-mail address doesn&#39;t have an associated user account")
+            # In header.
 
-        self.assertEqual(len(mail.outbox), 0)
+            s = self.header_plus + data
 
+            index = find_double_newline(s)
 
+            if index >= 0:
 
-    def test_email_found(self):
+                # Header finished.
 
-        "Email is sent if a valid email address is provided for password reset"
+                header_plus = s[:index]
 
-        response = self.client.post('/password_reset/', {'email': 'staffmember@example.com'})
+                consumed = len(data) - (len(s) - index)
 
-        self.assertEqual(response.status_code, 302)
 
-        self.assertEqual(len(mail.outbox), 1)
 
-        self.assertTrue("http://" in mail.outbox[0].body)
+                # Remove preceeding blank lines. This is suggested by
 
-        self.assertEqual(settings.DEFAULT_FROM_EMAIL, mail.outbox[0].from_email)
+                # https://tools.ietf.org/html/rfc7230#section-3.5 to support
 
+                # clients sending an extra CR LF after another request when
 
+                # using HTTP pipelining
 
-    def test_email_found_custom_from(self):
+                header_plus = header_plus.lstrip()
 
-        "Email is sent if a valid email address is provided for password reset when a custom from_email is provided."
 
-        response = self.client.post('/password_reset_from_email/', {'email': 'staffmember@example.com'})
 
-        self.assertEqual(response.status_code, 302)
+                if not header_plus:
 
-        self.assertEqual(len(mail.outbox), 1)
+                    self.empty = True
 
-        self.assertEqual("staffmember@example.com", mail.outbox[0].from_email)
+                    self.completed = True
 
+                else:
 
+                    try:
 
-    def test_admin_reset(self):
+                        self.parse_header(header_plus)
 
-        "If the reset view is marked as being for admin, the HTTP_HOST header is used for a domain override."
+                    except ParsingError as e:
 
-        response = self.client.post('/admin_password_reset/',
+                        self.error = BadRequest(e.args[0])
 
-            {'email': 'staffmember@example.com'},
+                        self.completed = True
 
-            HTTP_HOST='adminsite.com'
+                    else:
 
-        )
+                        if self.body_rcv is None:
 
-        self.assertEqual(response.status_code, 302)
+                            # no content-length header and not a t-e: chunked
 
-        self.assertEqual(len(mail.outbox), 1)
+                            # request
 
-        self.assertTrue("http://adminsite.com" in mail.outbox[0].body)
+                            self.completed = True
 
-        self.assertEqual(settings.DEFAULT_FROM_EMAIL, mail.outbox[0].from_email)
+                        if self.content_length > 0:
 
+                            max_body = self.adj.max_request_body_size
 
+                            # we won't accept this request if the content-length
 
-    def test_poisoned_http_host(self):
+                            # is too large
 
-        "Poisoned HTTP_HOST headers can't be used for reset emails"
+                            if self.content_length >= max_body:
 
-        # This attack is based on the way browsers handle URLs. The colon
+                                self.error = RequestEntityTooLarge(
 
-        # should be used to separate the port, but if the URL contains an @,
+                                    "exceeds max_body of %s" % max_body
 
-        # the colon is interpreted as part of a username for login purposes,
+                                )
 
-        # making 'evil.com' the request domain. Since HTTP_HOST is used to
+                                self.completed = True
 
-        # produce a meaningful reset URL, we need to be certain that the
+                self.headers_finished = True
 
-        # HTTP_HOST header isn't poisoned. This is done as a check when get_host()
+                return consumed
 
-        # is invoked, but we check here as a practical consequence.
+            else:
 
-        def test_host_poisoning():
+                # Header not finished yet.
 
-            self.client.post('/password_reset/',
+                self.header_bytes_received += datalen
 
-                {'email': 'staffmember@example.com'},
+                max_header = self.adj.max_request_header_size
 
-                HTTP_HOST='www.example:dr.frankenstein@evil.tld'
+                if self.header_bytes_received >= max_header:
 
-            )
+                    # malformed header, we need to construct some request
 
-        self.assertRaises(SuspiciousOperation, test_host_poisoning)
+                    # on our own. we disregard the incoming(?) requests HTTP
 
-        self.assertEqual(len(mail.outbox), 0)
+                    # version and just use 1.0. IOW someone just sent garbage
 
+                    # over the wire
 
+                    self.parse_header(b"GET / HTTP/1.0\n")
 
-    def test_poisoned_http_host_admin_site(self):
+                    self.error = RequestHeaderFieldsTooLarge(
 
-        "Poisoned HTTP_HOST headers can't be used for reset emails on admin views"
+                        "exceeds max_header of %s" % max_header
 
-        def test_host_poisoning():
+                    )
 
-            self.client.post('/admin_password_reset/',
+                    self.completed = True
 
-                {'email': 'staffmember@example.com'},
+                self.header_plus = s
 
-                HTTP_HOST='www.example:dr.frankenstein@evil.tld'
-
-            )
-
-        self.assertRaises(SuspiciousOperation, test_host_poisoning)
-
-        self.assertEqual(len(mail.outbox), 0)
-
-
-
-    def _test_confirm_start(self):
-
-        # Start by creating the email
-
-        response = self.client.post('/password_reset/', {'email': 'staffmember@example.com'})
-
-        self.assertEqual(response.status_code, 302)
-
-        self.assertEqual(len(mail.outbox), 1)
-
-        return self._read_signup_email(mail.outbox[0])
-
-
-
-    def _read_signup_email(self, email):
-
-        urlmatch = re.search(r"https?://[^/]*(/.*reset/\S*)", email.body)
-
-        self.assertTrue(urlmatch is not None, "No URL found in sent email")
-
-        return urlmatch.group(), urlmatch.groups()[0]
-
-
-
-    def test_confirm_valid(self):
-
-        url, path = self._test_confirm_start()
-
-        response = self.client.get(path)
-
-        # redirect to a 'complete' page:
-
-        self.assertEqual(response.status_code, 200)
-
-        self.assertTrue("Please enter your new password" in response.content)
-
-
-
-    def test_confirm_invalid(self):
-
-        url, path = self._test_confirm_start()
-
-        # Let's munge the token in the path, but keep the same length,
-
-        # in case the URLconf will reject a different length.
-
-        path = path[:-5] + ("0"*4) + path[-1]
-
-
-
-        response = self.client.get(path)
-
-        self.assertEqual(response.status_code, 200)
-
-        self.assertTrue("The password reset link was invalid" in response.content)
-
-
-
-    def test_confirm_invalid_user(self):
-
-        # Ensure that we get a 200 response for a non-existant user, not a 404
-
-        response = self.client.get('/reset/123456-1-1/')
-
-        self.assertEqual(response.status_code, 200)
-
-        self.assertTrue("The password reset link was invalid" in response.content)
-
-
-
-    def test_confirm_overflow_user(self):
-
-        # Ensure that we get a 200 response for a base36 user id that overflows int
-
-        response = self.client.get('/reset/zzzzzzzzzzzzz-1-1/')
-
-        self.assertEqual(response.status_code, 200)
-
-        self.assertTrue("The password reset link was invalid" in response.content)
-
-
-
-    def test_confirm_invalid_post(self):
-
-        # Same as test_confirm_invalid, but trying
-
-        # to do a POST instead.
-
-        url, path = self._test_confirm_start()
-
-        path = path[:-5] + ("0"*4) + path[-1]
-
-
-
-        response = self.client.post(path, {'new_password1': 'anewpassword',
-
-                                           'new_password2':' anewpassword'})
-
-        # Check the password has not been changed
-
-        u = User.objects.get(email='staffmember@example.com')
-
-        self.assertTrue(not u.check_password("anewpassword"))
-
-
-
-    def test_confirm_complete(self):
-
-        url, path = self._test_confirm_start()
-
-        response = self.client.post(path, {'new_password1': 'anewpassword',
-
-                                           'new_password2': 'anewpassword'})
-
-        # It redirects us to a 'complete' page:
-
-        self.assertEqual(response.status_code, 302)
-
-        # Check the password has been changed
-
-        u = User.objects.get(email='staffmember@example.com')
-
-        self.assertTrue(u.check_password("anewpassword"))
-
-
-
-        # Check we can't use the link again
-
-        response = self.client.get(path)
-
-        self.assertEqual(response.status_code, 200)
-
-        self.assertTrue("The password reset link was invalid" in response.content)
-
-
-
-    def test_confirm_different_passwords(self):
-
-        url, path = self._test_confirm_start()
-
-        response = self.client.post(path, {'new_password1': 'anewpassword',
-
-                                           'new_password2':' x'})
-
-        self.assertEqual(response.status_code, 200)
-
-        self.assertTrue("The two password fields didn&#39;t match" in response.content)
-
-
-
-class ChangePasswordTest(AuthViewsTestCase):
-
-
-
-    def fail_login(self, password='password'):
-
-        response = self.client.post('/login/', {
-
-            'username': 'testclient',
-
-            'password': password
-
-            }
-
-        )
-
-        self.assertEqual(response.status_code, 200)
-
-        self.assertTrue("Please enter a correct username and password. Note that both fields are case-sensitive." in response.content)
-
-
-
-    def logout(self):
-
-        response = self.client.get('/logout/')
-
-
-
-    def test_password_change_fails_with_invalid_old_password(self):
-
-        self.login()
-
-        response = self.client.post('/password_change/', {
-
-            'old_password': 'donuts',
-
-            'new_password1': 'password1',
-
-            'new_password2': 'password1',
-
-            }
-
-        )
-
-        self.assertEqual(response.status_code, 200)
-
-        self.assertTrue("Your old password was entered incorrectly. Please enter it again." in response.content)
-
-
-
-    def test_password_change_fails_with_mismatched_passwords(self):
-
-        self.login()
-
-        response = self.client.post('/password_change/', {
-
-            'old_password': 'password',
-
-            'new_password1': 'password1',
-
-            'new_password2': 'donuts',
-
-            }
-
-        )
-
-        self.assertEqual(response.status_code, 200)
-
-        self.assertTrue("The two password fields didn&#39;t match." in response.content)
-
-
-
-    def test_password_change_succeeds(self):
-
-        self.login()
-
-        response = self.client.post('/password_change/', {
-
-            'old_password': 'password',
-
-            'new_password1': 'password1',
-
-            'new_password2': 'password1',
-
-            }
-
-        )
-
-        self.assertEqual(response.status_code, 302)
-
-        self.assertTrue(response['Location'].endswith('/password_change/done/'))
-
-        self.fail_login()
-
-        self.login(password='password1')
-
-
-
-class LoginTest(AuthViewsTestCase):
-
-
-
-    def test_current_site_in_context_after_login(self):
-
-        response = self.client.get(reverse('django.contrib.auth.views.login'))
-
-        self.assertEqual(response.status_code, 200)
-
-        if Site._meta.installed:
-
-            site = Site.objects.get_current()
-
-            self.assertEqual(response.context['site'], site)
-
-            self.assertEqual(response.context['site_name'], site.name)
+                return datalen
 
         else:
 
-            self.assertIsInstance(response.context['site'], RequestSite)
+            # In body.
 
-        self.assertTrue(isinstance(response.context['form'], AuthenticationForm),
+            consumed = br.received(data)
 
-                     'Login form is not an AuthenticationForm')
+            self.body_bytes_received += consumed
 
+            max_body = self.adj.max_request_body_size
 
+            if self.body_bytes_received >= max_body:
 
-    def test_security_check(self, password='password'):
+                # this will only be raised during t-e: chunked requests
 
-        login_url = reverse('django.contrib.auth.views.login')
+                self.error = RequestEntityTooLarge("exceeds max_body of %s" % max_body)
 
+                self.completed = True
 
+            elif br.error:
 
-        # Those URLs should not pass the security check
+                # garbage in chunked encoding input probably
 
-        for bad_url in ('http://example.com',
+                self.error = br.error
 
-                        'https://example.com',
+                self.completed = True
 
-                        'ftp://exampel.com',
+            elif br.completed:
 
-                        '//example.com'):
+                # The request (with the body) is ready to use.
 
+                self.completed = True
 
+                if self.chunked:
 
-            nasty_url = '%(url)s?%(next)s=%(bad_url)s' % {
+                    # We've converted the chunked transfer encoding request
 
-                'url': login_url,
+                    # body into a normal request body, so we know its content
 
-                'next': REDIRECT_FIELD_NAME,
+                    # length; set the header here.  We already popped the
 
-                'bad_url': urllib.quote(bad_url)
+                    # TRANSFER_ENCODING header in parse_header, so this will
 
-            }
+                    # appear to the client to be an entirely non-chunked HTTP
 
-            response = self.client.post(nasty_url, {
+                    # request with a valid content-length.
 
-                'username': 'testclient',
+                    self.headers["CONTENT_LENGTH"] = str(br.__len__())
 
-                'password': password,
+            return consumed
 
-                }
 
-            )
 
-            self.assertEqual(response.status_code, 302)
+    def parse_header(self, header_plus):
 
-            self.assertFalse(bad_url in response['Location'],
+        """
 
-                             "%s should be blocked" % bad_url)
+        Parses the header_plus block of text (the headers plus the
 
+        first line of the request).
 
+        """
 
-        # These URLs *should* still pass the security check
+        index = header_plus.find(b"\r\n")
 
-        for good_url in ('/view/?param=http://example.com',
+        if index >= 0:
 
-                         '/view/?param=https://example.com',
+            first_line = header_plus[:index].rstrip()
 
-                         '/view?param=ftp://exampel.com',
+            header = header_plus[index + 2 :]
 
-                         'view/?param=//example.com',
+        else:
 
-                         'https:///',
+            raise ParsingError("HTTP message header invalid")
 
-                         '//testserver/',
 
-                         '/url%20with%20spaces/', # see ticket #12534
 
-                         ):
+        if b"\r" in first_line or b"\n" in first_line:
 
-            safe_url = '%(url)s?%(next)s=%(good_url)s' % {
+            raise ParsingError("Bare CR or LF found in HTTP message")
 
-                'url': login_url,
 
-                'next': REDIRECT_FIELD_NAME,
 
-                'good_url': urllib.quote(good_url)
+        self.first_line = first_line  # for testing
 
-            }
 
-            response = self.client.post(safe_url, {
 
-                    'username': 'testclient',
+        lines = get_header_lines(header)
 
-                    'password': password,
 
-                }
 
-            )
+        headers = self.headers
 
-            self.assertEqual(response.status_code, 302)
+        for line in lines:
 
-            self.assertTrue(good_url in response['Location'],
+            index = line.find(b":")
 
-                            "%s should be allowed" % good_url)
+            if index > 0:
 
+                key = line[:index]
 
+                if b"_" in key:
 
+                    continue
 
+                value = line[index + 1 :].strip()
 
-class LoginURLSettings(AuthViewsTestCase):
+                key1 = tostr(key.upper().replace(b"-", b"_"))
 
-    urls = 'django.contrib.auth.tests.urls'
+                # If a header already exists, we append subsequent values
 
+                # seperated by a comma. Applications already need to handle
 
+                # the comma seperated values, as HTTP front ends might do
 
-    def setUp(self):
+                # the concatenation for you (behavior specified in RFC2616).
 
-        super(LoginURLSettings, self).setUp()
+                try:
 
-        self.old_LOGIN_URL = settings.LOGIN_URL
+                    headers[key1] += tostr(b", " + value)
 
+                except KeyError:
 
+                    headers[key1] = tostr(value)
 
-    def tearDown(self):
+            # else there's garbage in the headers?
 
-        super(LoginURLSettings, self).tearDown()
 
-        settings.LOGIN_URL = self.old_LOGIN_URL
 
+        # command, uri, version will be bytes
 
+        command, uri, version = crack_first_line(first_line)
 
-    def get_login_required_url(self, login_url):
+        version = tostr(version)
 
-        settings.LOGIN_URL = login_url
+        command = tostr(command)
 
-        response = self.client.get('/login_required/')
+        self.command = command
 
-        self.assertEqual(response.status_code, 302)
+        self.version = version
 
-        return response['Location']
+        (
 
+            self.proxy_scheme,
 
+            self.proxy_netloc,
 
-    def test_standard_login_url(self):
+            self.path,
 
-        login_url = '/login/'
+            self.query,
 
-        login_required_url = self.get_login_required_url(login_url)
+            self.fragment,
 
-        querystring = QueryDict('', mutable=True)
+        ) = split_uri(uri)
 
-        querystring['next'] = '/login_required/'
+        self.url_scheme = self.adj.url_scheme
 
-        self.assertEqual(login_required_url,
+        connection = headers.get("CONNECTION", "")
 
-             'http://testserver%s?%s' % (login_url, querystring.urlencode('/')))
 
 
+        if version == "1.0":
 
-    def test_remote_login_url(self):
+            if connection.lower() != "keep-alive":
 
-        login_url = 'http://remote.example.com/login'
+                self.connection_close = True
 
-        login_required_url = self.get_login_required_url(login_url)
 
-        querystring = QueryDict('', mutable=True)
 
-        querystring['next'] = 'http://testserver/login_required/'
+        if version == "1.1":
 
-        self.assertEqual(login_required_url,
+            # since the server buffers data from chunked transfers and clients
 
-                         '%s?%s' % (login_url, querystring.urlencode('/')))
+            # never need to deal with chunked requests, downstream clients
 
+            # should not see the HTTP_TRANSFER_ENCODING header; we pop it
 
+            # here
 
-    def test_https_login_url(self):
+            te = headers.pop("TRANSFER_ENCODING", "")
 
-        login_url = 'https:///login/'
+            if te.lower() == "chunked":
 
-        login_required_url = self.get_login_required_url(login_url)
+                self.chunked = True
 
-        querystring = QueryDict('', mutable=True)
+                buf = OverflowableBuffer(self.adj.inbuf_overflow)
 
-        querystring['next'] = 'http://testserver/login_required/'
+                self.body_rcv = ChunkedReceiver(buf)
 
-        self.assertEqual(login_required_url,
+            expect = headers.get("EXPECT", "").lower()
 
-                         '%s?%s' % (login_url, querystring.urlencode('/')))
+            self.expect_continue = expect == "100-continue"
 
+            if connection.lower() == "close":
 
+                self.connection_close = True
 
-    def test_login_url_with_querystring(self):
 
-        login_url = '/login/?pretty=1'
 
-        login_required_url = self.get_login_required_url(login_url)
+        if not self.chunked:
 
-        querystring = QueryDict('pretty=1', mutable=True)
+            try:
 
-        querystring['next'] = '/login_required/'
+                cl = int(headers.get("CONTENT_LENGTH", 0))
 
-        self.assertEqual(login_required_url, 'http://testserver/login/?%s' %
+            except ValueError:
 
-                         querystring.urlencode('/'))
+                cl = 0
 
+            self.content_length = cl
 
+            if cl > 0:
 
-    def test_remote_login_url_with_next_querystring(self):
+                buf = OverflowableBuffer(self.adj.inbuf_overflow)
 
-        login_url = 'http://remote.example.com/login/'
+                self.body_rcv = FixedStreamReceiver(cl, buf)
 
-        login_required_url = self.get_login_required_url('%s?next=/default/' %
 
-                                                         login_url)
 
-        querystring = QueryDict('', mutable=True)
+    def get_body_stream(self):
 
-        querystring['next'] = 'http://testserver/login_required/'
+        body_rcv = self.body_rcv
 
-        self.assertEqual(login_required_url, '%s?%s' % (login_url,
+        if body_rcv is not None:
 
-                                                    querystring.urlencode('/')))
+            return body_rcv.getfile()
 
+        else:
 
+            return BytesIO()
 
 
 
-class LogoutTest(AuthViewsTestCase):
+    def close(self):
 
-    urls = 'django.contrib.auth.tests.urls'
+        body_rcv = self.body_rcv
 
+        if body_rcv is not None:
 
+            body_rcv.getbuf().close()
 
-    def confirm_logged_out(self):
 
-        self.assertTrue(SESSION_KEY not in self.client.session)
 
 
 
-    def test_logout_default(self):
+def split_uri(uri):
 
-        "Logout without next_page option renders the default template"
+    # urlsplit handles byte input by returning bytes on py3, so
 
-        self.login()
+    # scheme, netloc, path, query, and fragment are bytes
 
-        response = self.client.get('/logout/')
 
-        self.assertEqual(200, response.status_code)
 
-        self.assertTrue('Logged out' in response.content)
+    scheme = netloc = path = query = fragment = b""
 
-        self.confirm_logged_out()
 
 
+    # urlsplit below will treat this as a scheme-less netloc, thereby losing
 
-    def test_14377(self):
+    # the original intent of the request. Here we shamelessly stole 4 lines of
 
-        # Bug 14377
+    # code from the CPython stdlib to parse out the fragment and query but
 
-        self.login()
+    # leave the path alone. See
 
-        response = self.client.get('/logout/')
+    # https://github.com/python/cpython/blob/8c9e9b0cd5b24dfbf1424d1f253d02de80e8f5ef/Lib/urllib/parse.py#L465-L468
 
-        self.assertTrue('site' in response.context)
+    # and https://github.com/Pylons/waitress/issues/260
 
 
 
-    def test_logout_with_overridden_redirect_url(self):
+    if uri[:2] == b"//":
 
-        # Bug 11223
+        path = uri
 
-        self.login()
 
-        response = self.client.get('/logout/next_page/')
 
-        self.assertEqual(response.status_code, 302)
+        if b"#" in path:
 
-        self.assertTrue(response['Location'].endswith('/somewhere/'))
+            path, fragment = path.split(b"#", 1)
 
 
 
-        response = self.client.get('/logout/next_page/?next=/login/')
+        if b"?" in path:
 
-        self.assertEqual(response.status_code, 302)
+            path, query = path.split(b"?", 1)
 
-        self.assertTrue(response['Location'].endswith('/login/'))
+    else:
 
+        try:
 
+            scheme, netloc, path, query, fragment = urlparse.urlsplit(uri)
 
-        self.confirm_logged_out()
+        except UnicodeError:
 
+            raise ParsingError("Bad URI")
 
 
-    def test_logout_with_next_page_specified(self):
 
-        "Logout with next_page option given redirects to specified resource"
+    return (
 
-        self.login()
+        tostr(scheme),
 
-        response = self.client.get('/logout/next_page/')
+        tostr(netloc),
 
-        self.assertEqual(response.status_code, 302)
+        unquote_bytes_to_wsgi(path),
 
-        self.assertTrue(response['Location'].endswith('/somewhere/'))
+        tostr(query),
 
-        self.confirm_logged_out()
+        tostr(fragment),
 
+    )
 
 
-    def test_logout_with_redirect_argument(self):
 
-        "Logout with query string redirects to specified resource"
 
-        self.login()
 
-        response = self.client.get('/logout/?next=/login/')
+def get_header_lines(header):
 
-        self.assertEqual(response.status_code, 302)
+    """
 
-        self.assertTrue(response['Location'].endswith('/login/'))
+    Splits the header into lines, putting multi-line headers together.
 
-        self.confirm_logged_out()
+    """
 
+    r = []
 
+    lines = header.split(b"\r\n")
 
-    def test_logout_with_custom_redirect_argument(self):
+    for line in lines:
 
-        "Logout with custom query string redirects to specified resource"
+        if b"\r" in line or b"\n" in line:
 
-        self.login()
+            raise ParsingError('Bare CR or LF found in header line "%s"' % tostr(line))
 
-        response = self.client.get('/logout/custom_query/?follow=/somewhere/')
 
-        self.assertEqual(response.status_code, 302)
 
-        self.assertTrue(response['Location'].endswith('/somewhere/'))
+        if line.startswith((b" ", b"\t")):
 
-        self.confirm_logged_out()
+            if not r:
 
+                # https://corte.si/posts/code/pathod/pythonservers/index.html
 
+                raise ParsingError('Malformed header line "%s"' % tostr(line))
 
-    def test_security_check(self, password='password'):
+            r[-1] += line
 
-        logout_url = reverse('django.contrib.auth.views.logout')
+        else:
 
+            r.append(line)
 
+    return r
 
-        # Those URLs should not pass the security check
 
-        for bad_url in ('http://example.com',
 
-                        'https://example.com',
 
-                        'ftp://exampel.com',
 
-                        '//example.com'
+first_line_re = re.compile(
 
-                        ):
+    b"([^ ]+) "
 
-            nasty_url = '%(url)s?%(next)s=%(bad_url)s' % {
+    b"((?:[^ :?#]+://[^ ?#/]*(?:[0-9]{1,5})?)?[^ ]+)"
 
-                'url': logout_url,
+    b"(( HTTP/([0-9.]+))$|$)"
 
-                'next': REDIRECT_FIELD_NAME,
+)
 
-                'bad_url': urllib.quote(bad_url)
 
-            }
 
-            self.login()
 
-            response = self.client.get(nasty_url)
 
-            self.assertEqual(response.status_code, 302)
+def crack_first_line(line):
 
-            self.assertFalse(bad_url in response['Location'],
+    m = first_line_re.match(line)
 
-                             "%s should be blocked" % bad_url)
+    if m is not None and m.end() == len(line):
 
-            self.confirm_logged_out()
+        if m.group(3):
 
+            version = m.group(5)
 
+        else:
 
-        # These URLs *should* still pass the security check
+            version = b""
 
-        for good_url in ('/view/?param=http://example.com',
+        method = m.group(1)
 
-                         '/view/?param=https://example.com',
 
-                         '/view?param=ftp://exampel.com',
 
-                         'view/?param=//example.com',
+        # the request methods that are currently defined are all uppercase:
 
-                         'https:///',
+        # https://www.iana.org/assignments/http-methods/http-methods.xhtml and
 
-                         '//testserver/',
+        # the request method is case sensitive according to
 
-                         '/url%20with%20spaces/', # see ticket #12534
+        # https://tools.ietf.org/html/rfc7231#section-4.1
 
-                         ):
 
-            safe_url = '%(url)s?%(next)s=%(good_url)s' % {
 
-                'url': logout_url,
+        # By disallowing anything but uppercase methods we save poor
 
-                'next': REDIRECT_FIELD_NAME,
+        # unsuspecting souls from sending lowercase HTTP methods to waitress
 
-                'good_url': urllib.quote(good_url)
+        # and having the request complete, while servers like nginx drop the
 
-            }
+        # request onto the floor.
 
-            self.login()
+        if method != method.upper():
 
-            response = self.client.get(safe_url)
+            raise ParsingError('Malformed HTTP method "%s"' % tostr(method))
 
-            self.assertEqual(response.status_code, 302)
+        uri = m.group(2)
 
-            self.assertTrue(good_url in response['Location'],
+        return method, uri, version
 
-                            "%s should be allowed" % good_url)
+    else:
 
-            self.confirm_logged_out()
+        return b"", b"", b""

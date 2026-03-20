@@ -2,280 +2,818 @@
 # Safety: safe
 # Category: safe
 
-"""
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-Custom Authenticator to use Bitbucket OAuth with JupyterHub
 
-"""
 
+# Copyright 2010 United States Government as represented by the
 
+# Administrator of the National Aeronautics and Space Administration.
 
-import json
+# All Rights Reserved.
 
-import urllib
+#
 
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
 
+#    not use this file except in compliance with the License. You may obtain
 
-from tornado.auth import OAuth2Mixin
+#    a copy of the License at
 
-from tornado import web
+#
 
+#         http://www.apache.org/licenses/LICENSE-2.0
 
+#
 
-from tornado.httputil import url_concat
+#    Unless required by applicable law or agreed to in writing, software
 
-from tornado.httpclient import HTTPRequest, AsyncHTTPClient
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
+#    License for the specific language governing permissions and limitations
 
-from jupyterhub.auth import LocalAuthenticator
+#    under the License.
 
 
 
-from traitlets import Set, default, observe
+from nova import compute
 
+from nova import context
 
+from nova import db
 
-from .oauth2 import OAuthLoginHandler, OAuthenticator
+from nova import flags
 
+from nova import quota
 
+from nova import test
 
+from nova import volume
 
+from nova.compute import instance_types
 
-def _api_headers(access_token):
 
-    return {
 
-        "Accept": "application/json",
 
-        "User-Agent": "JupyterHub",
 
-        "Authorization": "Bearer {}".format(access_token),
+FLAGS = flags.FLAGS
 
-    }
 
 
 
 
+class QuotaTestCase(test.TestCase):
 
-class BitbucketOAuthenticator(OAuthenticator):
 
 
+    class StubImageService(object):
 
-    _deprecated_oauth_aliases = {
 
-        "team_whitelist": ("allowed_teams", "0.12.0"),
 
-        **OAuthenticator._deprecated_oauth_aliases,
+        def show(self, *args, **kwargs):
 
-    }
+            return {"properties": {}}
 
 
 
-    login_service = "Bitbucket"
+    def setUp(self):
 
-    client_id_env = 'BITBUCKET_CLIENT_ID'
+        super(QuotaTestCase, self).setUp()
 
-    client_secret_env = 'BITBUCKET_CLIENT_SECRET'
+        self.flags(connection_type='fake',
 
+                   quota_instances=2,
 
+                   quota_cores=4,
 
-    @default("authorize_url")
+                   quota_volumes=2,
 
-    def _authorize_url_default(self):
+                   quota_gigabytes=20,
 
-        return "https://bitbucket.org/site/oauth2/authorize"
+                   quota_floating_ips=1,
 
+                   quota_security_groups=10,
 
+                   quota_security_group_rules=20)
 
-    @default("token_url")
 
-    def _token_url_default(self):
 
-        return "https://bitbucket.org/site/oauth2/access_token"
+        self.network = self.network = self.start_service('network')
 
+        self.user_id = 'admin'
 
+        self.project_id = 'admin'
 
-    team_whitelist = Set(help="Deprecated, use `BitbucketOAuthenticator.allowed_teams`", config=True,)
+        self.context = context.RequestContext(self.user_id,
 
+                                              self.project_id,
 
+                                              True)
 
-    allowed_teams = Set(
 
-        config=True, help="Automatically allow members of selected teams"
 
-    )
+    def _create_instance(self, cores=2):
 
+        """Create a test instance"""
 
+        inst = {}
 
+        inst['image_id'] = 1
 
+        inst['reservation_id'] = 'r-fakeres'
 
-    headers = {
+        inst['user_id'] = self.user_id
 
-        "Accept": "application/json",
+        inst['project_id'] = self.project_id
 
-        "User-Agent": "JupyterHub",
+        inst['instance_type_id'] = '3'  # m1.large
 
-        "Authorization": "Bearer {}",
+        inst['vcpus'] = cores
 
-    }
+        return db.instance_create(self.context, inst)['id']
 
 
 
-    async def authenticate(self, handler, data=None):
+    def _create_volume(self, size=10):
 
-        code = handler.get_argument("code")
+        """Create a test volume"""
 
-        # TODO: Configure the curl_httpclient for tornado
+        vol = {}
 
-        http_client = AsyncHTTPClient()
+        vol['user_id'] = self.user_id
 
+        vol['project_id'] = self.project_id
 
+        vol['size'] = size
 
-        params = dict(
+        return db.volume_create(self.context, vol)['id']
 
-            client_id=self.client_id,
 
-            client_secret=self.client_secret,
 
-            grant_type="authorization_code",
+    def _get_instance_type(self, name):
 
-            code=code,
+        instance_types = {
 
-            redirect_uri=self.get_callback_url(handler),
+            'm1.tiny': dict(memory_mb=512, vcpus=1, local_gb=0, flavorid=1),
 
-        )
+            'm1.small': dict(memory_mb=2048, vcpus=1, local_gb=20, flavorid=2),
 
+            'm1.medium':
 
+                dict(memory_mb=4096, vcpus=2, local_gb=40, flavorid=3),
 
-        url = url_concat("https://bitbucket.org/site/oauth2/access_token", params)
+            'm1.large': dict(memory_mb=8192, vcpus=4, local_gb=80, flavorid=4),
 
+            'm1.xlarge':
 
+                dict(memory_mb=16384, vcpus=8, local_gb=160, flavorid=5)}
 
-        bb_header = {"Content-Type": "application/x-www-form-urlencoded;charset=utf-8"}
+        return instance_types[name]
 
-        req = HTTPRequest(
 
-            url,
 
-            method="POST",
+    def test_quota_overrides(self):
 
-            auth_username=self.client_id,
+        """Make sure overriding a projects quotas works"""
 
-            auth_password=self.client_secret,
+        num_instances = quota.allowed_instances(self.context, 100,
 
-            body=urllib.parse.urlencode(params).encode('utf-8'),
+            self._get_instance_type('m1.small'))
 
-            headers=bb_header,
+        self.assertEqual(num_instances, 2)
 
-        )
+        db.quota_create(self.context, self.project_id, 'instances', 10)
 
+        num_instances = quota.allowed_instances(self.context, 100,
 
+            self._get_instance_type('m1.small'))
 
-        resp = await http_client.fetch(req)
+        self.assertEqual(num_instances, 4)
 
-        resp_json = json.loads(resp.body.decode('utf8', 'replace'))
+        db.quota_create(self.context, self.project_id, 'cores', 100)
 
+        num_instances = quota.allowed_instances(self.context, 100,
 
+            self._get_instance_type('m1.small'))
 
-        access_token = resp_json['access_token']
+        self.assertEqual(num_instances, 10)
 
+        db.quota_create(self.context, self.project_id, 'ram', 3 * 2048)
 
+        num_instances = quota.allowed_instances(self.context, 100,
 
-        # Determine who the logged in user is
+            self._get_instance_type('m1.small'))
 
-        req = HTTPRequest(
+        self.assertEqual(num_instances, 3)
 
-            "https://api.bitbucket.org/2.0/user",
 
-            method="GET",
 
-            headers=_api_headers(access_token),
+        # metadata_items
 
-        )
+        too_many_items = FLAGS.quota_metadata_items + 1000
 
-        resp = await http_client.fetch(req)
+        num_metadata_items = quota.allowed_metadata_items(self.context,
 
-        resp_json = json.loads(resp.body.decode('utf8', 'replace'))
+                                                          too_many_items)
 
+        self.assertEqual(num_metadata_items, FLAGS.quota_metadata_items)
 
+        db.quota_create(self.context, self.project_id, 'metadata_items', 5)
 
-        username = resp_json["username"]
+        num_metadata_items = quota.allowed_metadata_items(self.context,
 
+                                                          too_many_items)
 
+        self.assertEqual(num_metadata_items, 5)
 
-        # Check if user is a member of any allowed teams.
 
-        # This check is performed here, as the check requires `access_token`.
 
-        if self.allowed_teams:
+        # Cleanup
 
-            user_in_team = await self._check_membership_allowed_teams(username, access_token)
+        db.quota_destroy_all_by_project(self.context, self.project_id)
 
-            if not user_in_team:
 
-                self.log.warning("%s not in team allowed list of users", username)
 
-                return None
+    def test_unlimited_instances(self):
 
+        self.flags(quota_instances=2, quota_ram=-1, quota_cores=-1)
 
+        instance_type = self._get_instance_type('m1.small')
 
-        return {
+        num_instances = quota.allowed_instances(self.context, 100,
 
-            'name': username,
+                                                instance_type)
 
-            'auth_state': {'access_token': access_token, 'bitbucket_user': resp_json},
+        self.assertEqual(num_instances, 2)
 
-        }
+        db.quota_create(self.context, self.project_id, 'instances', None)
 
+        num_instances = quota.allowed_instances(self.context, 100,
 
+                                                instance_type)
 
-    async def _check_membership_allowed_teams(self, username, access_token):
+        self.assertEqual(num_instances, 100)
 
-        http_client = AsyncHTTPClient()
+        num_instances = quota.allowed_instances(self.context, 101,
 
+                                                instance_type)
 
+        self.assertEqual(num_instances, 101)
 
-        headers = _api_headers(access_token)
 
-        # We verify the team membership by calling teams endpoint.
 
-        next_page = url_concat(
+    def test_unlimited_ram(self):
 
-            "https://api.bitbucket.org/2.0/teams", {'role': 'member'}
+        self.flags(quota_instances=-1, quota_ram=2 * 2048, quota_cores=-1)
 
-        )
+        instance_type = self._get_instance_type('m1.small')
 
-        while next_page:
+        num_instances = quota.allowed_instances(self.context, 100,
 
-            req = HTTPRequest(next_page, method="GET", headers=headers)
+                                                instance_type)
 
-            resp = await http_client.fetch(req)
+        self.assertEqual(num_instances, 2)
 
-            resp_json = json.loads(resp.body.decode('utf8', 'replace'))
+        db.quota_create(self.context, self.project_id, 'ram', None)
 
-            next_page = resp_json.get('next', None)
+        num_instances = quota.allowed_instances(self.context, 100,
 
+                                                instance_type)
 
+        self.assertEqual(num_instances, 100)
 
-            user_teams = set([entry["username"] for entry in resp_json["values"]])
+        num_instances = quota.allowed_instances(self.context, 101,
 
-            # check if any of the organizations seen thus far are in the allowed list
+                                                instance_type)
 
-            if len(self.allowed_teams & user_teams) > 0:
+        self.assertEqual(num_instances, 101)
 
-                return True
 
-        return False
 
+    def test_unlimited_cores(self):
 
+        self.flags(quota_instances=-1, quota_ram=-1, quota_cores=2)
 
+        instance_type = self._get_instance_type('m1.small')
 
+        num_instances = quota.allowed_instances(self.context, 100,
 
-class LocalBitbucketOAuthenticator(LocalAuthenticator, BitbucketOAuthenticator):
+                                                instance_type)
 
-    """A version that mixes in local system user creation"""
+        self.assertEqual(num_instances, 2)
 
+        db.quota_create(self.context, self.project_id, 'cores', None)
 
+        num_instances = quota.allowed_instances(self.context, 100,
 
-    pass
+                                                instance_type)
+
+        self.assertEqual(num_instances, 100)
+
+        num_instances = quota.allowed_instances(self.context, 101,
+
+                                                instance_type)
+
+        self.assertEqual(num_instances, 101)
+
+
+
+    def test_unlimited_volumes(self):
+
+        self.flags(quota_volumes=10, quota_gigabytes=-1)
+
+        volumes = quota.allowed_volumes(self.context, 100, 1)
+
+        self.assertEqual(volumes, 10)
+
+        db.quota_create(self.context, self.project_id, 'volumes', None)
+
+        volumes = quota.allowed_volumes(self.context, 100, 1)
+
+        self.assertEqual(volumes, 100)
+
+        volumes = quota.allowed_volumes(self.context, 101, 1)
+
+        self.assertEqual(volumes, 101)
+
+
+
+    def test_unlimited_gigabytes(self):
+
+        self.flags(quota_volumes=-1, quota_gigabytes=10)
+
+        volumes = quota.allowed_volumes(self.context, 100, 1)
+
+        self.assertEqual(volumes, 10)
+
+        db.quota_create(self.context, self.project_id, 'gigabytes', None)
+
+        volumes = quota.allowed_volumes(self.context, 100, 1)
+
+        self.assertEqual(volumes, 100)
+
+        volumes = quota.allowed_volumes(self.context, 101, 1)
+
+        self.assertEqual(volumes, 101)
+
+
+
+    def test_unlimited_floating_ips(self):
+
+        self.flags(quota_floating_ips=10)
+
+        floating_ips = quota.allowed_floating_ips(self.context, 100)
+
+        self.assertEqual(floating_ips, 10)
+
+        db.quota_create(self.context, self.project_id, 'floating_ips', None)
+
+        floating_ips = quota.allowed_floating_ips(self.context, 100)
+
+        self.assertEqual(floating_ips, 100)
+
+        floating_ips = quota.allowed_floating_ips(self.context, 101)
+
+        self.assertEqual(floating_ips, 101)
+
+
+
+    def test_unlimited_security_groups(self):
+
+        self.flags(quota_security_groups=10)
+
+        security_groups = quota.allowed_security_groups(self.context, 100)
+
+        self.assertEqual(security_groups, 10)
+
+        db.quota_create(self.context, self.project_id, 'security_groups', None)
+
+        security_groups = quota.allowed_security_groups(self.context, 100)
+
+        self.assertEqual(security_groups, 100)
+
+        security_groups = quota.allowed_security_groups(self.context, 101)
+
+        self.assertEqual(security_groups, 101)
+
+
+
+    def test_unlimited_security_group_rules(self):
+
+
+
+        def fake_security_group_rule_count_by_group(context, sec_group_id):
+
+            return 0
+
+
+
+        self.stubs.Set(db, 'security_group_rule_count_by_group',
+
+                       fake_security_group_rule_count_by_group)
+
+
+
+        self.flags(quota_security_group_rules=20)
+
+        rules = quota.allowed_security_group_rules(self.context, 1234, 100)
+
+        self.assertEqual(rules, 20)
+
+        db.quota_create(self.context, self.project_id, 'security_group_rules',
+
+                        None)
+
+        rules = quota.allowed_security_group_rules(self.context, 1234, 100)
+
+        self.assertEqual(rules, 100)
+
+        rules = quota.allowed_security_group_rules(self.context, 1234, 101)
+
+        self.assertEqual(rules, 101)
+
+
+
+    def test_unlimited_metadata_items(self):
+
+        self.flags(quota_metadata_items=10)
+
+        items = quota.allowed_metadata_items(self.context, 100)
+
+        self.assertEqual(items, 10)
+
+        db.quota_create(self.context, self.project_id, 'metadata_items', None)
+
+        items = quota.allowed_metadata_items(self.context, 100)
+
+        self.assertEqual(items, 100)
+
+        items = quota.allowed_metadata_items(self.context, 101)
+
+        self.assertEqual(items, 101)
+
+
+
+    def test_too_many_instances(self):
+
+        instance_ids = []
+
+        for i in range(FLAGS.quota_instances):
+
+            instance_id = self._create_instance()
+
+            instance_ids.append(instance_id)
+
+        inst_type = instance_types.get_instance_type_by_name('m1.small')
+
+        self.assertRaises(quota.QuotaError, compute.API().create,
+
+                                            self.context,
+
+                                            min_count=1,
+
+                                            max_count=1,
+
+                                            instance_type=inst_type,
+
+                                            image_href=1)
+
+        for instance_id in instance_ids:
+
+            db.instance_destroy(self.context, instance_id)
+
+
+
+    def test_too_many_cores(self):
+
+        instance_ids = []
+
+        instance_id = self._create_instance(cores=4)
+
+        instance_ids.append(instance_id)
+
+        inst_type = instance_types.get_instance_type_by_name('m1.small')
+
+        self.assertRaises(quota.QuotaError, compute.API().create,
+
+                                            self.context,
+
+                                            min_count=1,
+
+                                            max_count=1,
+
+                                            instance_type=inst_type,
+
+                                            image_href=1)
+
+        for instance_id in instance_ids:
+
+            db.instance_destroy(self.context, instance_id)
+
+
+
+    def test_too_many_volumes(self):
+
+        volume_ids = []
+
+        for i in range(FLAGS.quota_volumes):
+
+            volume_id = self._create_volume()
+
+            volume_ids.append(volume_id)
+
+        self.assertRaises(quota.QuotaError,
+
+                          volume.API().create,
+
+                          self.context,
+
+                          size=10,
+
+                          snapshot_id=None,
+
+                          name='',
+
+                          description='')
+
+        for volume_id in volume_ids:
+
+            db.volume_destroy(self.context, volume_id)
+
+
+
+    def test_too_many_gigabytes(self):
+
+        volume_ids = []
+
+        volume_id = self._create_volume(size=20)
+
+        volume_ids.append(volume_id)
+
+        self.assertRaises(quota.QuotaError,
+
+                          volume.API().create,
+
+                          self.context,
+
+                          size=10,
+
+                          snapshot_id=None,
+
+                          name='',
+
+                          description='')
+
+        for volume_id in volume_ids:
+
+            db.volume_destroy(self.context, volume_id)
+
+
+
+    def test_too_many_addresses(self):
+
+        address = '192.168.0.100'
+
+        db.floating_ip_create(context.get_admin_context(),
+
+                              {'address': address,
+
+                               'project_id': self.project_id})
+
+        self.assertRaises(quota.QuotaError,
+
+                          self.network.allocate_floating_ip,
+
+                          self.context,
+
+                          self.project_id)
+
+        db.floating_ip_destroy(context.get_admin_context(), address)
+
+
+
+    def test_too_many_metadata_items(self):
+
+        metadata = {}
+
+        for i in range(FLAGS.quota_metadata_items + 1):
+
+            metadata['key%s' % i] = 'value%s' % i
+
+        inst_type = instance_types.get_instance_type_by_name('m1.small')
+
+        self.assertRaises(quota.QuotaError, compute.API().create,
+
+                                            self.context,
+
+                                            min_count=1,
+
+                                            max_count=1,
+
+                                            instance_type=inst_type,
+
+                                            image_href='fake',
+
+                                            metadata=metadata)
+
+
+
+    def test_default_allowed_injected_files(self):
+
+        self.flags(quota_max_injected_files=55)
+
+        self.assertEqual(quota.allowed_injected_files(self.context, 100), 55)
+
+
+
+    def test_overridden_allowed_injected_files(self):
+
+        self.flags(quota_max_injected_files=5)
+
+        db.quota_create(self.context, self.project_id, 'injected_files', 77)
+
+        self.assertEqual(quota.allowed_injected_files(self.context, 100), 77)
+
+
+
+    def test_unlimited_default_allowed_injected_files(self):
+
+        self.flags(quota_max_injected_files=-1)
+
+        self.assertEqual(quota.allowed_injected_files(self.context, 100), 100)
+
+
+
+    def test_unlimited_db_allowed_injected_files(self):
+
+        self.flags(quota_max_injected_files=5)
+
+        db.quota_create(self.context, self.project_id, 'injected_files', None)
+
+        self.assertEqual(quota.allowed_injected_files(self.context, 100), 100)
+
+
+
+    def test_default_allowed_injected_file_content_bytes(self):
+
+        self.flags(quota_max_injected_file_content_bytes=12345)
+
+        limit = quota.allowed_injected_file_content_bytes(self.context, 23456)
+
+        self.assertEqual(limit, 12345)
+
+
+
+    def test_overridden_allowed_injected_file_content_bytes(self):
+
+        self.flags(quota_max_injected_file_content_bytes=12345)
+
+        db.quota_create(self.context, self.project_id,
+
+                        'injected_file_content_bytes', 5678)
+
+        limit = quota.allowed_injected_file_content_bytes(self.context, 23456)
+
+        self.assertEqual(limit, 5678)
+
+
+
+    def test_unlimited_default_allowed_injected_file_content_bytes(self):
+
+        self.flags(quota_max_injected_file_content_bytes=-1)
+
+        limit = quota.allowed_injected_file_content_bytes(self.context, 23456)
+
+        self.assertEqual(limit, 23456)
+
+
+
+    def test_unlimited_db_allowed_injected_file_content_bytes(self):
+
+        self.flags(quota_max_injected_file_content_bytes=12345)
+
+        db.quota_create(self.context, self.project_id,
+
+                        'injected_file_content_bytes', None)
+
+        limit = quota.allowed_injected_file_content_bytes(self.context, 23456)
+
+        self.assertEqual(limit, 23456)
+
+
+
+    def _create_with_injected_files(self, files):
+
+        self.flags(image_service='nova.image.fake.FakeImageService')
+
+        api = compute.API(image_service=self.StubImageService())
+
+        inst_type = instance_types.get_instance_type_by_name('m1.small')
+
+        api.create(self.context, min_count=1, max_count=1,
+
+                instance_type=inst_type, image_href='3',
+
+                injected_files=files)
+
+
+
+    def test_no_injected_files(self):
+
+        self.flags(image_service='nova.image.fake.FakeImageService')
+
+        api = compute.API(image_service=self.StubImageService())
+
+        inst_type = instance_types.get_instance_type_by_name('m1.small')
+
+        api.create(self.context, instance_type=inst_type, image_href='3')
+
+
+
+    def test_max_injected_files(self):
+
+        files = []
+
+        for i in xrange(FLAGS.quota_max_injected_files):
+
+            files.append(('/my/path%d' % i, 'config = test\n'))
+
+        self._create_with_injected_files(files)  # no QuotaError
+
+
+
+    def test_too_many_injected_files(self):
+
+        files = []
+
+        for i in xrange(FLAGS.quota_max_injected_files + 1):
+
+            files.append(('/my/path%d' % i, 'my\ncontent%d\n' % i))
+
+        self.assertRaises(quota.QuotaError,
+
+                          self._create_with_injected_files, files)
+
+
+
+    def test_max_injected_file_content_bytes(self):
+
+        max = FLAGS.quota_max_injected_file_content_bytes
+
+        content = ''.join(['a' for i in xrange(max)])
+
+        files = [('/test/path', content)]
+
+        self._create_with_injected_files(files)  # no QuotaError
+
+
+
+    def test_too_many_injected_file_content_bytes(self):
+
+        max = FLAGS.quota_max_injected_file_content_bytes
+
+        content = ''.join(['a' for i in xrange(max + 1)])
+
+        files = [('/test/path', content)]
+
+        self.assertRaises(quota.QuotaError,
+
+                          self._create_with_injected_files, files)
+
+
+
+    def test_allowed_injected_file_path_bytes(self):
+
+        self.assertEqual(
+
+                quota.allowed_injected_file_path_bytes(self.context),
+
+                FLAGS.quota_max_injected_file_path_bytes)
+
+
+
+    def test_max_injected_file_path_bytes(self):
+
+        max = FLAGS.quota_max_injected_file_path_bytes
+
+        path = ''.join(['a' for i in xrange(max)])
+
+        files = [(path, 'config = quotatest')]
+
+        self._create_with_injected_files(files)  # no QuotaError
+
+
+
+    def test_too_many_injected_file_path_bytes(self):
+
+        max = FLAGS.quota_max_injected_file_path_bytes
+
+        path = ''.join(['a' for i in xrange(max + 1)])
+
+        files = [(path, 'config = quotatest')]
+
+        self.assertRaises(quota.QuotaError,
+
+                          self._create_with_injected_files, files)

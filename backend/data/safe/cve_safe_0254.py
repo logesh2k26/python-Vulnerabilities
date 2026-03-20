@@ -2,918 +2,1472 @@
 # Safety: safe
 # Category: safe
 
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
+from __future__ import absolute_import
 
+from __future__ import division
 
+from __future__ import print_function
 
-# Copyright 2011 United States Government as represented by the
 
-# Administrator of the National Aeronautics and Space Administration.
 
-# All Rights Reserved.
+import email.utils
 
-# Copyright (c) 2011 Citrix Systems, Inc.
+import errno
 
-#
+import httplib2
 
-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+import mock
 
-#    not use this file except in compliance with the License. You may obtain
+import os
 
-#    a copy of the License at
+import pytest
 
-#
+from six.moves import http_client, urllib
 
-#         http://www.apache.org/licenses/LICENSE-2.0
+import socket
 
-#
+import tests
 
-#    Unless required by applicable law or agreed to in writing, software
 
-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
-#    License for the specific language governing permissions and limitations
 
-#    under the License.
+def _raise_connection_refused_exception(*args, **kwargs):
 
+    raise socket.error(errno.ECONNREFUSED, "Connection refused.")
 
 
-from nova import context
 
-from nova import db
 
-from nova import flags
 
-from nova import log as logging
+def test_connection_type():
 
-from nova.openstack.common import cfg
+    http = httplib2.Http()
 
-from nova import utils
+    http.force_exception_to_status_code = False
 
-from nova.virt import netutils
+    response, content = http.request(
 
+        tests.DUMMY_URL, connection_type=tests.MockHTTPConnection
 
+    )
 
+    assert response["content-location"] == tests.DUMMY_URL
 
+    assert content == b"the body"
 
-LOG = logging.getLogger(__name__)
 
 
 
-allow_same_net_traffic_opt = cfg.BoolOpt('allow_same_net_traffic',
 
-        default=True,
+def test_bad_status_line_retry():
 
-        help='Whether to allow network traffic from same network')
+    http = httplib2.Http()
 
+    old_retries = httplib2.RETRIES
 
+    httplib2.RETRIES = 1
 
-FLAGS = flags.FLAGS
+    http.force_exception_to_status_code = False
 
-FLAGS.register_opt(allow_same_net_traffic_opt)
+    try:
 
+        response, content = http.request(
 
+            tests.DUMMY_URL, connection_type=tests.MockHTTPBadStatusConnection
 
+        )
 
+    except http_client.BadStatusLine:
 
-class FirewallDriver(object):
+        assert tests.MockHTTPBadStatusConnection.num_calls == 2
 
-    """ Firewall Driver base class.
+    httplib2.RETRIES = old_retries
 
 
 
-        Defines methods that any driver providing security groups
 
-        and provider fireall functionality should implement.
 
-    """
+def test_unknown_server():
 
-    def prepare_instance_filter(self, instance, network_info):
+    http = httplib2.Http()
 
-        """Prepare filters for the instance.
+    http.force_exception_to_status_code = False
 
-        At this point, the instance isn't running yet."""
+    with tests.assert_raises(httplib2.ServerNotFoundError):
 
-        raise NotImplementedError()
+        with mock.patch("socket.socket.connect", side_effect=socket.gaierror):
 
+            http.request("http://no-such-hostname./")
 
 
-    def unfilter_instance(self, instance, network_info):
 
-        """Stop filtering instance"""
+    # Now test with exceptions turned off
 
-        raise NotImplementedError()
+    http.force_exception_to_status_code = True
 
+    response, content = http.request("http://no-such-hostname./")
 
+    assert response["content-type"] == "text/plain"
 
-    def apply_instance_filter(self, instance, network_info):
+    assert content.startswith(b"Unable to find")
 
-        """Apply instance filter.
+    assert response.status == 400
 
 
 
-        Once this method returns, the instance should be firewalled
 
-        appropriately. This method should as far as possible be a
 
-        no-op. It's vastly preferred to get everything set up in
+@pytest.mark.skipif(
 
-        prepare_instance_filter.
+    os.environ.get("TRAVIS_PYTHON_VERSION") in ("2.7", "pypy"),
 
-        """
+    reason="Fails on Travis py27/pypy, works elsewhere. "
 
-        raise NotImplementedError()
+    "See https://travis-ci.org/httplib2/httplib2/jobs/408769880.",
 
+)
 
+@mock.patch("socket.socket.connect", spec=True)
 
-    def refresh_security_group_rules(self, security_group_id):
+def test_connection_refused_raises_exception(mock_socket_connect):
 
-        """Refresh security group rules from data store
+    mock_socket_connect.side_effect = _raise_connection_refused_exception
 
+    http = httplib2.Http()
 
+    http.force_exception_to_status_code = False
 
-        Gets called when a rule has been added to or removed from
+    with tests.assert_raises(socket.error):
 
-        the security group."""
+        http.request(tests.DUMMY_URL)
 
-        raise NotImplementedError()
 
 
 
-    def refresh_security_group_members(self, security_group_id):
 
-        """Refresh security group members from data store
+@pytest.mark.skipif(
 
+    os.environ.get("TRAVIS_PYTHON_VERSION") in ("2.7", "pypy"),
 
+    reason="Fails on Travis py27/pypy, works elsewhere. "
 
-        Gets called when an instance gets added to or removed from
+    "See https://travis-ci.org/httplib2/httplib2/jobs/408769880.",
 
-        the security group."""
+)
 
-        raise NotImplementedError()
+@mock.patch("socket.socket.connect", spec=True)
 
+def test_connection_refused_returns_response(mock_socket_connect):
 
+    mock_socket_connect.side_effect = _raise_connection_refused_exception
 
-    def refresh_provider_fw_rules(self):
+    http = httplib2.Http()
 
-        """Refresh common rules for all hosts/instances from data store.
+    http.force_exception_to_status_code = True
 
+    response, content = http.request(tests.DUMMY_URL)
 
+    content = content.lower()
 
-        Gets called when a rule has been added to or removed from
+    assert response["content-type"] == "text/plain"
 
-        the list of rules (via admin api).
+    assert (
 
+        b"connection refused" in content
 
+        or b"actively refused" in content
 
-        """
+        or b"socket is not connected" in content
 
-        raise NotImplementedError()
+    )
 
+    assert response.status == 400
 
 
-    def setup_basic_filtering(self, instance, network_info):
 
-        """Create rules to block spoofing and allow dhcp.
 
 
+def test_get_iri():
 
-        This gets called when spawning an instance, before
+    http = httplib2.Http()
 
-        :py:meth:`prepare_instance_filter`.
+    query = u"?a=\N{CYRILLIC CAPITAL LETTER DJE}"
 
+    with tests.server_reflect() as uri:
 
+        response, content = http.request(uri + query, "GET")
 
-        """
+        assert response.status == 200
 
-        raise NotImplementedError()
+        reflected = tests.HttpRequest.from_bytes(content)
 
+        assert reflected.uri == "/?a=%D0%82"
 
 
-    def instance_filter_exists(self, instance, network_info):
 
-        """Check nova-instance-instance-xxx exists"""
 
-        raise NotImplementedError()
 
+def test_get_is_default_method():
 
+    # Test that GET is the default method
 
+    http = httplib2.Http()
 
+    with tests.server_reflect() as uri:
 
-class IptablesFirewallDriver(FirewallDriver):
+        response, content = http.request(uri)
 
-    """Driver which enforces security groups through iptables rules."""
+        assert response.status == 200
 
+        reflected = tests.HttpRequest.from_bytes(content)
 
+        assert reflected.method == "GET"
 
-    def __init__(self, **kwargs):
 
-        from nova.network import linux_net
 
-        self.iptables = linux_net.iptables_manager
 
-        self.instances = {}
 
-        self.network_infos = {}
+def test_different_methods():
 
-        self.basicly_filtered = False
+    # Test that all methods can be used
 
+    http = httplib2.Http()
 
+    methods = ["GET", "PUT", "DELETE", "POST", "unknown"]
 
-        self.iptables.ipv4['filter'].add_chain('sg-fallback')
+    with tests.server_reflect(request_count=len(methods)) as uri:
 
-        self.iptables.ipv4['filter'].add_rule('sg-fallback', '-j DROP')
+        for method in methods:
 
-        self.iptables.ipv6['filter'].add_chain('sg-fallback')
+            response, content = http.request(uri, method, body=b" ")
 
-        self.iptables.ipv6['filter'].add_rule('sg-fallback', '-j DROP')
+            assert response.status == 200
 
+            reflected = tests.HttpRequest.from_bytes(content)
 
+            assert reflected.method == method
 
-    def setup_basic_filtering(self, instance, network_info):
 
-        pass
 
 
 
-    def apply_instance_filter(self, instance, network_info):
+def test_head_read():
 
-        """No-op. Everything is done in prepare_instance_filter."""
+    # Test that we don't try to read the response of a HEAD request
 
-        pass
+    # since httplib blocks response.read() for HEAD requests.
 
+    http = httplib2.Http()
 
+    respond_with = b"HTTP/1.0 200 OK\r\ncontent-length: " b"14\r\n\r\nnon-empty-body"
 
-    def unfilter_instance(self, instance, network_info):
+    with tests.server_const_bytes(respond_with) as uri:
 
-        if self.instances.pop(instance['id'], None):
+        response, content = http.request(uri, "HEAD")
 
-            # NOTE(vish): use the passed info instead of the stored info
+    assert response.status == 200
 
-            self.network_infos.pop(instance['id'])
+    assert content == b""
 
-            self.remove_filters_for_instance(instance)
 
-            self.iptables.apply()
 
-        else:
 
-            LOG.info(_('Attempted to unfilter instance %s which is not '
 
-                     'filtered'), instance['id'])
+def test_get_no_cache():
 
+    # Test that can do a GET w/o the cache turned on.
 
+    http = httplib2.Http()
 
-    def prepare_instance_filter(self, instance, network_info):
+    with tests.server_const_http() as uri:
 
-        self.instances[instance['id']] = instance
+        response, content = http.request(uri, "GET")
 
-        self.network_infos[instance['id']] = network_info
+    assert response.status == 200
 
-        self.add_filters_for_instance(instance)
+    assert response.previous is None
 
-        LOG.debug(_('Filters added to instance %s'), instance['uuid'])
 
-        self.refresh_provider_fw_rules()
 
-        LOG.debug(_('Provider Firewall Rules refreshed'))
 
-        self.iptables.apply()
 
+def test_user_agent():
 
+    # Test that we provide a default user-agent
 
-    def _create_filter(self, ips, chain_name):
+    http = httplib2.Http()
 
-        return ['-d %s -j $%s' % (ip, chain_name) for ip in ips]
+    with tests.server_reflect() as uri:
 
+        response, content = http.request(uri, "GET")
 
+        assert response.status == 200
 
-    def _filters_for_instance(self, chain_name, network_info):
+        reflected = tests.HttpRequest.from_bytes(content)
 
-        """Creates a rule corresponding to each ip that defines a
+        assert reflected.headers.get("user-agent", "").startswith("Python-httplib2/")
 
-             jump to the corresponding instance - chain for all the traffic
 
-             destined to that ip."""
 
-        ips_v4 = [ip['ip'] for (_n, mapping) in network_info
 
-                 for ip in mapping['ips']]
 
-        ipv4_rules = self._create_filter(ips_v4, chain_name)
+def test_user_agent_non_default():
 
+    # Test that the default user-agent can be over-ridden
 
+    http = httplib2.Http()
 
-        ipv6_rules = []
+    with tests.server_reflect() as uri:
 
-        if FLAGS.use_ipv6:
+        response, content = http.request(uri, "GET", headers={"User-Agent": "fred/1.0"})
 
-            ips_v6 = [ip['ip'] for (_n, mapping) in network_info
+        assert response.status == 200
 
-                     for ip in mapping['ip6s']]
+        reflected = tests.HttpRequest.from_bytes(content)
 
-            ipv6_rules = self._create_filter(ips_v6, chain_name)
+        assert reflected.headers.get("user-agent") == "fred/1.0"
 
 
 
-        return ipv4_rules, ipv6_rules
 
 
+def test_get_300_with_location():
 
-    def _add_filters(self, chain_name, ipv4_rules, ipv6_rules):
+    # Test the we automatically follow 300 redirects if a Location: header is provided
 
-        for rule in ipv4_rules:
+    http = httplib2.Http()
 
-            self.iptables.ipv4['filter'].add_rule(chain_name, rule)
+    final_content = b"This is the final destination.\n"
 
+    routes = {
 
+        "/final": tests.http_response_bytes(body=final_content),
 
-        if FLAGS.use_ipv6:
+        "": tests.http_response_bytes(
 
-            for rule in ipv6_rules:
+            status="300 Multiple Choices", headers={"location": "/final"}
 
-                self.iptables.ipv6['filter'].add_rule(chain_name, rule)
+        ),
 
+    }
 
+    with tests.server_route(routes, request_count=2) as uri:
 
-    def add_filters_for_instance(self, instance):
+        response, content = http.request(uri, "GET")
 
-        network_info = self.network_infos[instance['id']]
+    assert response.status == 200
 
-        chain_name = self._instance_chain_name(instance)
+    assert content == final_content
 
-        if FLAGS.use_ipv6:
+    assert response.previous.status == 300
 
-            self.iptables.ipv6['filter'].add_chain(chain_name)
+    assert not response.previous.fromcache
 
-        self.iptables.ipv4['filter'].add_chain(chain_name)
 
-        ipv4_rules, ipv6_rules = self._filters_for_instance(chain_name,
 
-                                                            network_info)
+    # Confirm that the intermediate 300 is not cached
 
-        self._add_filters('local', ipv4_rules, ipv6_rules)
+    with tests.server_route(routes, request_count=2) as uri:
 
-        ipv4_rules, ipv6_rules = self.instance_rules(instance, network_info)
+        response, content = http.request(uri, "GET")
 
-        self._add_filters(chain_name, ipv4_rules, ipv6_rules)
+    assert response.status == 200
 
+    assert content == final_content
 
+    assert response.previous.status == 300
 
-    def remove_filters_for_instance(self, instance):
+    assert not response.previous.fromcache
 
-        chain_name = self._instance_chain_name(instance)
 
 
 
-        self.iptables.ipv4['filter'].remove_chain(chain_name)
 
-        if FLAGS.use_ipv6:
+def test_get_300_with_location_noredirect():
 
-            self.iptables.ipv6['filter'].remove_chain(chain_name)
+    # Test the we automatically follow 300 redirects if a Location: header is provided
 
+    http = httplib2.Http()
 
+    http.follow_redirects = False
 
-    @staticmethod
+    response = tests.http_response_bytes(
 
-    def _security_group_chain_name(security_group_id):
+        status="300 Multiple Choices",
 
-        return 'nova-sg-%s' % (security_group_id,)
+        headers={"location": "/final"},
 
+        body=b"redirect body",
 
+    )
 
-    def _instance_chain_name(self, instance):
+    with tests.server_const_bytes(response) as uri:
 
-        return 'inst-%s' % (instance['id'],)
+        response, content = http.request(uri, "GET")
 
+    assert response.status == 300
 
 
-    def _do_basic_rules(self, ipv4_rules, ipv6_rules, network_info):
 
-        # Always drop invalid packets
 
-        ipv4_rules += ['-m state --state ' 'INVALID -j DROP']
 
-        ipv6_rules += ['-m state --state ' 'INVALID -j DROP']
+def test_get_300_without_location():
 
+    # Not giving a Location: header in a 300 response is acceptable
 
+    # In which case we just return the 300 response
 
-        # Allow established connections
+    http = httplib2.Http()
 
-        ipv4_rules += ['-m state --state ESTABLISHED,RELATED -j ACCEPT']
+    with tests.server_const_http(
 
-        ipv6_rules += ['-m state --state ESTABLISHED,RELATED -j ACCEPT']
+        status="300 Multiple Choices", body=b"redirect body"
 
+    ) as uri:
 
+        response, content = http.request(uri, "GET")
 
-        # Pass through provider-wide drops
+    assert response.status == 300
 
-        ipv4_rules += ['-j $provider']
+    assert response.previous is None
 
-        ipv6_rules += ['-j $provider']
+    assert content == b"redirect body"
 
 
 
-    def _do_dhcp_rules(self, ipv4_rules, network_info):
 
-        dhcp_servers = [info['dhcp_server'] for (_n, info) in network_info]
 
+def test_get_301():
 
+    # Test that we automatically follow 301 redirects
 
-        for dhcp_server in dhcp_servers:
+    # and that we cache the 301 response
 
-            ipv4_rules.append('-s %s -p udp --sport 67 --dport 68 '
+    http = httplib2.Http(cache=tests.get_cache_path())
 
-                              '-j ACCEPT' % (dhcp_server,))
+    destination = ""
 
+    routes = {
 
+        "/final": tests.http_response_bytes(body=b"This is the final destination.\n"),
 
-    def _do_project_network_rules(self, ipv4_rules, ipv6_rules, network_info):
+        "": tests.http_response_bytes(
 
-        cidrs = [network['cidr'] for (network, _i) in network_info]
+            status="301 Now where did I leave that URL",
 
-        for cidr in cidrs:
+            headers={"location": "/final"},
 
-            ipv4_rules.append('-s %s -j ACCEPT' % (cidr,))
+            body=b"redirect body",
 
-        if FLAGS.use_ipv6:
+        ),
 
-            cidrv6s = [network['cidr_v6'] for (network, _i) in
+    }
 
-                       network_info]
+    with tests.server_route(routes, request_count=3) as uri:
 
+        destination = urllib.parse.urljoin(uri, "/final")
 
+        response1, content1 = http.request(uri, "GET")
 
-            for cidrv6 in cidrv6s:
+        response2, content2 = http.request(uri, "GET")
 
-                ipv6_rules.append('-s %s -j ACCEPT' % (cidrv6,))
+    assert response1.status == 200
 
+    assert "content-location" in response2
 
+    assert response1["content-location"] == destination
 
-    def _do_ra_rules(self, ipv6_rules, network_info):
+    assert content1 == b"This is the final destination.\n"
 
-        gateways_v6 = [mapping['gateway_v6'] for (_n, mapping) in
+    assert response1.previous.status == 301
 
-                       network_info]
+    assert not response1.previous.fromcache
 
-        for gateway_v6 in gateways_v6:
 
-            ipv6_rules.append(
 
-                    '-s %s/128 -p icmpv6 -j ACCEPT' % (gateway_v6,))
+    assert response2.status == 200
 
+    assert response2["content-location"] == destination
 
+    assert content2 == b"This is the final destination.\n"
 
-    def _build_icmp_rule(self, rule, version):
+    assert response2.previous.status == 301
 
-        icmp_type = rule.from_port
+    assert response2.previous.fromcache
 
-        icmp_code = rule.to_port
 
 
 
-        if icmp_type == -1:
 
-            icmp_type_arg = None
+@pytest.mark.skip(
 
-        else:
+    not os.environ.get("httplib2_test_still_run_skipped")
 
-            icmp_type_arg = '%s' % icmp_type
+    and os.environ.get("TRAVIS_PYTHON_VERSION") in ("2.7", "pypy"),
 
-            if not icmp_code == -1:
+    reason="FIXME: timeout on Travis py27 and pypy, works elsewhere",
 
-                icmp_type_arg += '/%s' % icmp_code
+)
 
+def test_head_301():
 
+    # Test that we automatically follow 301 redirects
 
-        if icmp_type_arg:
+    http = httplib2.Http()
 
-            if version == 4:
+    destination = ""
 
-                return ['-m', 'icmp', '--icmp-type', icmp_type_arg]
+    routes = {
 
-            elif version == 6:
+        "/final": tests.http_response_bytes(body=b"This is the final destination.\n"),
 
-                return ['-m', 'icmp6', '--icmpv6-type', icmp_type_arg]
+        "": tests.http_response_bytes(
 
-        # return empty list if icmp_type == -1
+            status="301 Now where did I leave that URL",
 
-        return []
+            headers={"location": "/final"},
 
+            body=b"redirect body",
 
+        ),
 
-    def _build_tcp_udp_rule(self, rule, version):
+    }
 
-        if rule.from_port == rule.to_port:
+    with tests.server_route(routes, request_count=2) as uri:
 
-            return ['--dport', '%s' % (rule.from_port,)]
+        destination = urllib.parse.urljoin(uri, "/final")
 
-        else:
+        response, content = http.request(uri, "HEAD")
 
-            return ['-m', 'multiport',
+    assert response.status == 200
 
-                    '--dports', '%s:%s' % (rule.from_port,
+    assert response["content-location"] == destination
 
-                                           rule.to_port)]
+    assert response.previous.status == 301
 
+    assert not response.previous.fromcache
 
 
-    def instance_rules(self, instance, network_info):
 
-        ctxt = context.get_admin_context()
 
 
+@pytest.mark.xfail(
 
-        ipv4_rules = []
+    reason=(
 
-        ipv6_rules = []
+        "FIXME: 301 cache works only with follow_redirects, should work " "regardless"
 
+    )
 
+)
 
-        # Initialize with basic rules
+def test_get_301_no_redirect():
 
-        self._do_basic_rules(ipv4_rules, ipv6_rules, network_info)
+    # Test that we cache the 301 response
 
-        # Set up rules to allow traffic to/from DHCP server
+    http = httplib2.Http(cache=tests.get_cache_path(), timeout=0.5)
 
-        self._do_dhcp_rules(ipv4_rules, network_info)
+    http.follow_redirects = False
 
+    response = tests.http_response_bytes(
 
+        status="301 Now where did I leave that URL",
 
-        #Allow project network traffic
+        headers={"location": "/final", "cache-control": "max-age=300"},
 
-        if FLAGS.allow_same_net_traffic:
+        body=b"redirect body",
 
-            self._do_project_network_rules(ipv4_rules, ipv6_rules,
+        add_date=True,
 
-                                           network_info)
+    )
 
-        # We wrap these in FLAGS.use_ipv6 because they might cause
+    with tests.server_const_bytes(response) as uri:
 
-        # a DB lookup. The other ones are just list operations, so
+        response, _ = http.request(uri, "GET")
 
-        # they're not worth the clutter.
+        assert response.status == 301
 
-        if FLAGS.use_ipv6:
+        assert not response.fromcache
 
-            # Allow RA responses
+        response, _ = http.request(uri, "GET")
 
-            self._do_ra_rules(ipv6_rules, network_info)
+        assert response.status == 301
 
+        assert response.fromcache
 
 
-        security_groups = db.security_group_get_by_instance(ctxt,
 
-                                                            instance['id'])
 
 
+def test_get_302():
 
-        # then, security group chains and rules
+    # Test that we automatically follow 302 redirects
 
-        for security_group in security_groups:
+    # and that we DO NOT cache the 302 response
 
-            rules = db.security_group_rule_get_by_security_group(ctxt,
+    http = httplib2.Http(cache=tests.get_cache_path())
 
-                                                          security_group['id'])
+    second_url, final_url = "", ""
 
+    routes = {
 
+        "/final": tests.http_response_bytes(body=b"This is the final destination.\n"),
 
-            for rule in rules:
+        "/second": tests.http_response_bytes(
 
-                LOG.debug(_('Adding security group rule: %r'), rule)
+            status="302 Found", headers={"location": "/final"}, body=b"second redirect"
 
+        ),
 
+        "": tests.http_response_bytes(
 
-                if not rule.cidr:
+            status="302 Found", headers={"location": "/second"}, body=b"redirect body"
 
-                    version = 4
+        ),
 
-                else:
+    }
 
-                    version = netutils.get_ip_version(rule.cidr)
+    with tests.server_route(routes, request_count=7) as uri:
 
+        second_url = urllib.parse.urljoin(uri, "/second")
 
+        final_url = urllib.parse.urljoin(uri, "/final")
 
-                if version == 4:
+        response1, content1 = http.request(second_url, "GET")
 
-                    fw_rules = ipv4_rules
+        response2, content2 = http.request(second_url, "GET")
 
-                else:
+        response3, content3 = http.request(uri, "GET")
 
-                    fw_rules = ipv6_rules
+    assert response1.status == 200
 
+    assert response1["content-location"] == final_url
 
+    assert content1 == b"This is the final destination.\n"
 
-                protocol = rule.protocol.lower()
+    assert response1.previous.status == 302
 
-                if version == 6 and protocol == 'icmp':
+    assert not response1.previous.fromcache
 
-                    protocol = 'icmpv6'
 
 
+    assert response2.status == 200
 
-                args = ['-j ACCEPT']
+    # FIXME:
 
-                if protocol:
+    # assert response2.fromcache
 
-                    args += ['-p', protocol]
+    assert response2["content-location"] == final_url
 
+    assert content2 == b"This is the final destination.\n"
 
+    assert response2.previous.status == 302
 
-                if protocol in ['udp', 'tcp']:
+    assert not response2.previous.fromcache
 
-                    args += self._build_tcp_udp_rule(rule, version)
+    assert response2.previous["content-location"] == second_url
 
-                elif protocol == 'icmp':
 
-                    args += self._build_icmp_rule(rule, version)
 
-                if rule.cidr:
+    assert response3.status == 200
 
-                    LOG.info('Using cidr %r', rule.cidr)
+    # FIXME:
 
-                    args += ['-s', rule.cidr]
+    # assert response3.fromcache
 
-                    fw_rules += [' '.join(args)]
+    assert content3 == b"This is the final destination.\n"
 
-                else:
+    assert response3.previous.status == 302
 
-                    if rule['grantee_group']:
+    assert not response3.previous.fromcache
 
-                        # FIXME(jkoelker) This needs to be ported up into
 
-                        #                 the compute manager which already
 
-                        #                 has access to a nw_api handle,
 
-                        #                 and should be the only one making
 
-                        #                 making rpc calls.
+def test_get_302_redirection_limit():
 
-                        import nova.network
+    # Test that we can set a lower redirection limit
 
-                        nw_api = nova.network.API()
+    # and that we raise an exception when we exceed
 
-                        for instance in rule['grantee_group']['instances']:
+    # that limit.
 
-                            LOG.info('instance: %r', instance)
+    http = httplib2.Http()
 
-                            nw_info = nw_api.get_instance_nw_info(ctxt,
+    http.force_exception_to_status_code = False
 
-                                                                  instance)
+    routes = {
 
+        "/second": tests.http_response_bytes(
 
+            status="302 Found", headers={"location": "/final"}, body=b"second redirect"
 
-                            ips = [ip['address']
+        ),
 
-                                for ip in nw_info.fixed_ips()
+        "": tests.http_response_bytes(
 
-                                    if ip['version'] == version]
+            status="302 Found", headers={"location": "/second"}, body=b"redirect body"
 
+        ),
 
+    }
 
-                            LOG.info('ips: %r', ips)
+    with tests.server_route(routes, request_count=4) as uri:
 
-                            for ip in ips:
+        try:
 
-                                subrule = args + ['-s %s' % ip]
+            http.request(uri, "GET", redirections=1)
 
-                                fw_rules += [' '.join(subrule)]
+            assert False, "This should not happen"
 
+        except httplib2.RedirectLimit:
 
+            pass
 
-                LOG.info('Using fw_rules: %r', fw_rules)
+        except Exception:
 
-        ipv4_rules += ['-j $sg-fallback']
+            assert False, "Threw wrong kind of exception "
 
-        ipv6_rules += ['-j $sg-fallback']
 
 
+        # Re-run the test with out the exceptions
 
-        return ipv4_rules, ipv6_rules
+        http.force_exception_to_status_code = True
 
+        response, content = http.request(uri, "GET", redirections=1)
 
 
-    def instance_filter_exists(self, instance, network_info):
 
-        pass
+    assert response.status == 500
 
+    assert response.reason.startswith("Redirected more")
 
+    assert response["status"] == "302"
 
-    def refresh_security_group_members(self, security_group):
+    assert content == b"second redirect"
 
-        self.do_refresh_security_group_rules(security_group)
+    assert response.previous is not None
 
-        self.iptables.apply()
 
 
 
-    def refresh_security_group_rules(self, security_group):
 
-        self.do_refresh_security_group_rules(security_group)
+def test_get_302_no_location():
 
-        self.iptables.apply()
+    # Test that we throw an exception when we get
 
+    # a 302 with no Location: header.
 
+    http = httplib2.Http()
 
-    @utils.synchronized('iptables', external=True)
+    http.force_exception_to_status_code = False
 
-    def do_refresh_security_group_rules(self, security_group):
+    with tests.server_const_http(status="302 Found", request_count=2) as uri:
 
-        for instance in self.instances.values():
+        try:
 
-            self.remove_filters_for_instance(instance)
+            http.request(uri, "GET")
 
-            self.add_filters_for_instance(instance)
+            assert False, "Should never reach here"
 
+        except httplib2.RedirectMissingLocation:
 
+            pass
 
-    def refresh_provider_fw_rules(self):
+        except Exception:
 
-        """See :class:`FirewallDriver` docs."""
+            assert False, "Threw wrong kind of exception "
 
-        self._do_refresh_provider_fw_rules()
 
-        self.iptables.apply()
 
+        # Re-run the test with out the exceptions
 
+        http.force_exception_to_status_code = True
 
-    @utils.synchronized('iptables', external=True)
+        response, content = http.request(uri, "GET")
 
-    def _do_refresh_provider_fw_rules(self):
 
-        """Internal, synchronized version of refresh_provider_fw_rules."""
 
-        self._purge_provider_fw_rules()
+    assert response.status == 500
 
-        self._build_provider_fw_rules()
+    assert response.reason.startswith("Redirected but")
 
+    assert "302" == response["status"]
 
+    assert content == b""
 
-    def _purge_provider_fw_rules(self):
 
-        """Remove all rules from the provider chains."""
 
-        self.iptables.ipv4['filter'].empty_chain('provider')
 
-        if FLAGS.use_ipv6:
 
-            self.iptables.ipv6['filter'].empty_chain('provider')
+@pytest.mark.skip(
 
+    not os.environ.get("httplib2_test_still_run_skipped")
 
+    and os.environ.get("TRAVIS_PYTHON_VERSION") in ("2.7", "pypy"),
 
-    def _build_provider_fw_rules(self):
+    reason="FIXME: timeout on Travis py27 and pypy, works elsewhere",
 
-        """Create all rules for the provider IP DROPs."""
+)
 
-        self.iptables.ipv4['filter'].add_chain('provider')
+def test_303():
 
-        if FLAGS.use_ipv6:
+    # Do a follow-up GET on a Location: header
 
-            self.iptables.ipv6['filter'].add_chain('provider')
+    # returned from a POST that gave a 303.
 
-        ipv4_rules, ipv6_rules = self._provider_rules()
+    http = httplib2.Http()
 
-        for rule in ipv4_rules:
+    routes = {
 
-            self.iptables.ipv4['filter'].add_rule('provider', rule)
+        "/final": tests.make_http_reflect(),
 
+        "": tests.make_http_reflect(
 
+            status="303 See Other", headers={"location": "/final"}
 
-        if FLAGS.use_ipv6:
+        ),
 
-            for rule in ipv6_rules:
+    }
 
-                self.iptables.ipv6['filter'].add_rule('provider', rule)
+    with tests.server_route(routes, request_count=2) as uri:
 
+        response, content = http.request(uri, "POST", " ")
 
+    assert response.status == 200
 
-    @staticmethod
+    reflected = tests.HttpRequest.from_bytes(content)
 
-    def _provider_rules():
+    assert reflected.uri == "/final"
 
-        """Generate a list of rules from provider for IP4 & IP6."""
+    assert response.previous.status == 303
 
-        ctxt = context.get_admin_context()
 
-        ipv4_rules = []
 
-        ipv6_rules = []
+    # Skip follow-up GET
 
-        rules = db.provider_fw_rule_get_all(ctxt)
+    http = httplib2.Http()
 
-        for rule in rules:
+    http.follow_redirects = False
 
-            LOG.debug(_('Adding provider rule: %s'), rule['cidr'])
+    with tests.server_route(routes, request_count=1) as uri:
 
-            version = netutils.get_ip_version(rule['cidr'])
+        response, content = http.request(uri, "POST", " ")
 
-            if version == 4:
+    assert response.status == 303
 
-                fw_rules = ipv4_rules
 
-            else:
 
-                fw_rules = ipv6_rules
+    # All methods can be used
 
+    http = httplib2.Http()
 
+    cases = "DELETE GET HEAD POST PUT EVEN_NEW_ONES".split(" ")
 
-            protocol = rule['protocol']
+    with tests.server_route(routes, request_count=len(cases) * 2) as uri:
 
-            if version == 6 and protocol == 'icmp':
+        for method in cases:
 
-                protocol = 'icmpv6'
+            response, content = http.request(uri, method, body=b"q q")
 
+            assert response.status == 200
 
+            reflected = tests.HttpRequest.from_bytes(content)
 
-            args = ['-p', protocol, '-s', rule['cidr']]
+            assert reflected.method == "GET"
 
 
 
-            if protocol in ['udp', 'tcp']:
 
-                if rule['from_port'] == rule['to_port']:
 
-                    args += ['--dport', '%s' % (rule['from_port'],)]
+def test_etag_used():
 
-                else:
+    # Test that we use ETags properly to validate our cache
 
-                    args += ['-m', 'multiport',
+    cache_path = tests.get_cache_path()
 
-                             '--dports', '%s:%s' % (rule['from_port'],
+    http = httplib2.Http(cache=cache_path)
 
-                                                    rule['to_port'])]
+    response_kwargs = dict(
 
-            elif protocol == 'icmp':
+        add_date=True,
 
-                icmp_type = rule['from_port']
+        add_etag=True,
 
-                icmp_code = rule['to_port']
+        body=b"something",
 
+        headers={"cache-control": "public,max-age=300"},
 
+    )
 
-                if icmp_type == -1:
 
-                    icmp_type_arg = None
 
-                else:
+    def handler(request):
 
-                    icmp_type_arg = '%s' % icmp_type
+        if request.headers.get("range"):
 
-                    if not icmp_code == -1:
+            return tests.http_response_bytes(status=206, **response_kwargs)
 
-                        icmp_type_arg += '/%s' % icmp_code
+        return tests.http_response_bytes(**response_kwargs)
 
 
 
-                if icmp_type_arg:
+    with tests.server_request(handler, request_count=2) as uri:
 
-                    if version == 4:
+        response, _ = http.request(uri, "GET", headers={"accept-encoding": "identity"})
 
-                        args += ['-m', 'icmp', '--icmp-type',
+        assert response["etag"] == '"437b930db84b8079c2dd804a71936b5f"'
 
-                                 icmp_type_arg]
 
-                    elif version == 6:
 
-                        args += ['-m', 'icmp6', '--icmpv6-type',
+        http.request(uri, "GET", headers={"accept-encoding": "identity"})
 
-                                 icmp_type_arg]
+        response, _ = http.request(
 
-            args += ['-j DROP']
+            uri,
 
-            fw_rules += [' '.join(args)]
+            "GET",
 
-        return ipv4_rules, ipv6_rules
+            headers={"accept-encoding": "identity", "cache-control": "must-revalidate"},
 
+        )
 
+        assert response.status == 200
 
+        assert response.fromcache
 
 
-class NoopFirewallDriver(object):
 
-    """Firewall driver which just provides No-op methods."""
+        # TODO: API to read cache item, at least internal to tests
 
-    def __init__(*args, **kwargs):
+        cache_file_name = os.path.join(
 
-        pass
+            cache_path, httplib2.safename(httplib2.urlnorm(uri)[-1])
 
+        )
 
+        with open(cache_file_name, "r") as f:
 
-    def _noop(*args, **kwargs):
+            status_line = f.readline()
 
-        pass
+        assert status_line.startswith("status:")
 
 
 
-    def __getattr__(self, key):
+        response, content = http.request(
 
-        return self._noop
+            uri, "HEAD", headers={"accept-encoding": "identity"}
 
+        )
 
+        assert response.status == 200
 
-    def instance_filter_exists(self, instance, network_info):
+        assert response.fromcache
 
-        return True
+
+
+        response, content = http.request(
+
+            uri, "GET", headers={"accept-encoding": "identity", "range": "bytes=0-0"}
+
+        )
+
+        assert response.status == 206
+
+        assert not response.fromcache
+
+
+
+
+
+def test_etag_ignore():
+
+    # Test that we can forcibly ignore ETags
+
+    http = httplib2.Http(cache=tests.get_cache_path())
+
+    response_kwargs = dict(add_date=True, add_etag=True)
+
+    with tests.server_reflect(request_count=3, **response_kwargs) as uri:
+
+        response, content = http.request(
+
+            uri, "GET", headers={"accept-encoding": "identity"}
+
+        )
+
+        assert response.status == 200
+
+        assert response["etag"] != ""
+
+
+
+        response, content = http.request(
+
+            uri,
+
+            "GET",
+
+            headers={"accept-encoding": "identity", "cache-control": "max-age=0"},
+
+        )
+
+        reflected = tests.HttpRequest.from_bytes(content)
+
+        assert reflected.headers.get("if-none-match")
+
+
+
+        http.ignore_etag = True
+
+        response, content = http.request(
+
+            uri,
+
+            "GET",
+
+            headers={"accept-encoding": "identity", "cache-control": "max-age=0"},
+
+        )
+
+        assert not response.fromcache
+
+        reflected = tests.HttpRequest.from_bytes(content)
+
+        assert not reflected.headers.get("if-none-match")
+
+
+
+
+
+def test_etag_override():
+
+    # Test that we can forcibly ignore ETags
+
+    http = httplib2.Http(cache=tests.get_cache_path())
+
+    response_kwargs = dict(add_date=True, add_etag=True)
+
+    with tests.server_reflect(request_count=3, **response_kwargs) as uri:
+
+        response, _ = http.request(uri, "GET", headers={"accept-encoding": "identity"})
+
+        assert response.status == 200
+
+        assert response["etag"] != ""
+
+
+
+        response, content = http.request(
+
+            uri,
+
+            "GET",
+
+            headers={"accept-encoding": "identity", "cache-control": "max-age=0"},
+
+        )
+
+        assert response.status == 200
+
+        reflected = tests.HttpRequest.from_bytes(content)
+
+        assert reflected.headers.get("if-none-match")
+
+        assert reflected.headers.get("if-none-match") != "fred"
+
+
+
+        response, content = http.request(
+
+            uri,
+
+            "GET",
+
+            headers={
+
+                "accept-encoding": "identity",
+
+                "cache-control": "max-age=0",
+
+                "if-none-match": "fred",
+
+            },
+
+        )
+
+        assert response.status == 200
+
+        reflected = tests.HttpRequest.from_bytes(content)
+
+        assert reflected.headers.get("if-none-match") == "fred"
+
+
+
+
+
+@pytest.mark.skip(reason="was commented in legacy code")
+
+def test_get_304_end_to_end():
+
+    pass
+
+    # Test that end to end headers get overwritten in the cache
+
+    # uri = urllib.parse.urljoin(base, "304/end2end.cgi")
+
+    # response, content = http.request(uri, 'GET')
+
+    # assertNotEqual(response['etag'], "")
+
+    # old_date = response['date']
+
+    # time.sleep(2)
+
+
+
+    # response, content = http.request(uri, 'GET', headers = {'Cache-Control': 'max-age=0'})
+
+    # # The response should be from the cache, but the Date: header should be updated.
+
+    # new_date = response['date']
+
+    # assert new_date != old_date
+
+    # assert response.status == 200
+
+    # assert response.fromcache == True
+
+
+
+
+
+def test_get_304_last_modified():
+
+    # Test that we can still handle a 304
+
+    # by only using the last-modified cache validator.
+
+    http = httplib2.Http(cache=tests.get_cache_path())
+
+    date = email.utils.formatdate()
+
+
+
+    def handler(read):
+
+        read()
+
+        yield tests.http_response_bytes(
+
+            status=200, body=b"something", headers={"date": date, "last-modified": date}
+
+        )
+
+
+
+        request2 = read()
+
+        assert request2.headers["if-modified-since"] == date
+
+        yield tests.http_response_bytes(status=304)
+
+
+
+    with tests.server_yield(handler, request_count=2) as uri:
+
+        response, content = http.request(uri, "GET")
+
+        assert response.get("last-modified") == date
+
+
+
+        response, content = http.request(uri, "GET")
+
+        assert response.status == 200
+
+        assert response.fromcache
+
+
+
+
+
+def test_get_307():
+
+    # Test that we do follow 307 redirects but
+
+    # do not cache the 307
+
+    http = httplib2.Http(cache=tests.get_cache_path(), timeout=1)
+
+    r307 = tests.http_response_bytes(status=307, headers={"location": "/final"})
+
+    r200 = tests.http_response_bytes(
+
+        status=200,
+
+        add_date=True,
+
+        body=b"final content\n",
+
+        headers={"cache-control": "max-age=300"},
+
+    )
+
+
+
+    with tests.server_list_http([r307, r200, r307]) as uri:
+
+        response, content = http.request(uri, "GET")
+
+        assert response.previous.status == 307
+
+        assert not response.previous.fromcache
+
+        assert response.status == 200
+
+        assert not response.fromcache
+
+        assert content == b"final content\n"
+
+
+
+        response, content = http.request(uri, "GET")
+
+        assert response.previous.status == 307
+
+        assert not response.previous.fromcache
+
+        assert response.status == 200
+
+        assert response.fromcache
+
+        assert content == b"final content\n"
+
+
+
+
+
+def test_post_307():
+
+    # 307: follow with same method
+
+    http = httplib2.Http(cache=tests.get_cache_path(), timeout=1)
+
+    http.follow_all_redirects = True
+
+    r307 = tests.http_response_bytes(status=307, headers={"location": "/final"})
+
+    r200 = tests.http_response_bytes(status=200, body=b"final content\n")
+
+
+
+    with tests.server_list_http([r307, r200, r307, r200]) as uri:
+
+        response, content = http.request(uri, "POST")
+
+        assert response.previous.status == 307
+
+        assert not response.previous.fromcache
+
+        assert response.status == 200
+
+        assert not response.fromcache
+
+        assert content == b"final content\n"
+
+
+
+        response, content = http.request(uri, "POST")
+
+        assert response.previous.status == 307
+
+        assert not response.previous.fromcache
+
+        assert response.status == 200
+
+        assert not response.fromcache
+
+        assert content == b"final content\n"
+
+
+
+
+
+def test_change_308():
+
+    # 308: follow with same method, cache redirect
+
+    http = httplib2.Http(cache=tests.get_cache_path(), timeout=1)
+
+    routes = {
+
+        "/final": tests.make_http_reflect(),
+
+        "": tests.http_response_bytes(
+
+            status="308 Permanent Redirect",
+
+            add_date=True,
+
+            headers={"cache-control": "max-age=300", "location": "/final"},
+
+        ),
+
+    }
+
+
+
+    with tests.server_route(routes, request_count=3) as uri:
+
+        response, content = http.request(uri, "CHANGE", body=b"hello308")
+
+        assert response.previous.status == 308
+
+        assert not response.previous.fromcache
+
+        assert response.status == 200
+
+        assert not response.fromcache
+
+        assert content.startswith(b"CHANGE /final HTTP")
+
+
+
+        response, content = http.request(uri, "CHANGE")
+
+        assert response.previous.status == 308
+
+        assert response.previous.fromcache
+
+        assert response.status == 200
+
+        assert not response.fromcache
+
+        assert content.startswith(b"CHANGE /final HTTP")
+
+
+
+
+
+def test_get_410():
+
+    # Test that we pass 410's through
+
+    http = httplib2.Http()
+
+    with tests.server_const_http(status=410) as uri:
+
+        response, content = http.request(uri, "GET")
+
+        assert response.status == 410
+
+
+
+
+
+def test_get_duplicate_headers():
+
+    # Test that duplicate headers get concatenated via ','
+
+    http = httplib2.Http()
+
+    response = b"""HTTP/1.0 200 OK\r\n\
+
+Link: link1\r\n\
+
+Content-Length: 7\r\n\
+
+Link: link2\r\n\r\n\
+
+content"""
+
+    with tests.server_const_bytes(response) as uri:
+
+        response, content = http.request(uri, "GET")
+
+        assert response.status == 200
+
+        assert content == b"content"
+
+        assert response["link"], "link1, link2"
+
+
+
+
+
+def test_custom_redirect_codes():
+
+    http = httplib2.Http()
+
+    http.redirect_codes = set([300])
+
+    with tests.server_const_http(status=301, request_count=1) as uri:
+
+        response, content = http.request(uri, "GET")
+
+        assert response.status == 301
+
+        assert response.previous is None
+
+
+
+
+
+def test_cwe93_inject_crlf():
+
+    # https://cwe.mitre.org/data/definitions/93.html
+
+    # GET /?q= HTTP/1.1      <- injected "HTTP/1.1" from attacker
+
+    # injected: attack
+
+    # ignore-http: HTTP/1.1  <- nominal "HTTP/1.1" from library
+
+    # Host: localhost:57285
+
+    http = httplib2.Http()
+
+    with tests.server_reflect() as uri:
+
+        danger_url = urllib.parse.urljoin(
+
+            uri, "?q= HTTP/1.1\r\ninjected: attack\r\nignore-http:"
+
+        )
+
+        response, content = http.request(danger_url, "GET")
+
+        assert response.status == 200
+
+        req = tests.HttpRequest.from_bytes(content)
+
+        assert req.headers.get("injected") is None
+
+
+
+
+
+def test_inject_space():
+
+    # Injecting space into request line is precursor to CWE-93 and possibly other injections
+
+    http = httplib2.Http()
+
+    with tests.server_reflect() as uri:
+
+        # "\r\nignore-http:" suffix is nuance for current server implementation
+
+        # please only pay attention to space after "?q="
+
+        danger_url = urllib.parse.urljoin(uri, "?q= HTTP/1.1\r\nignore-http:")
+
+        response, content = http.request(danger_url, "GET")
+
+        assert response.status == 200
+
+        req = tests.HttpRequest.from_bytes(content)
+
+        assert req.uri == "/?q=%20HTTP/1.1%0D%0Aignore-http:"

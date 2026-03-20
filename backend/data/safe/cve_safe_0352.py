@@ -2,382 +2,506 @@
 # Safety: safe
 # Category: safe
 
+"""Tornado handlers for logging into the Jupyter Server."""
+
+
+
+# Copyright (c) Jupyter Development Team.
+
+# Distributed under the terms of the Modified BSD License.
+
+
+
 import re
 
-import random
+import os
 
-import datetime
-
-from django.utils.translation import ugettext as _
-
-from django.utils.translation import ungettext
-
-from django.utils.html import escape
+import uuid
 
 
 
-def get_from_dict_or_object(source, key):
+from urllib.parse import urlparse
 
-    try:
 
-        return source[key]
 
-    except:
+from tornado.escape import url_escape
 
-        return getattr(source, key)
+
+
+from .security import passwd_check, set_password
+
+
+
+from ..base.handlers import JupyterHandler
 
 
 
 
 
-def enumerate_string_list(strings):
+class LoginHandler(JupyterHandler):
 
-    """for a list or a tuple ('one', 'two',) return
-
-    a list formatted as ['1) one', '2) two',]
-
-    """
-
-    numbered_strings = enumerate(strings, start = 1)
-
-    return [ '%d) %s' % item for item in numbered_strings ]
+    """The basic tornado login handler
 
 
 
-def pad_string(text):
-
-    """Inserts one space between words,
-
-    including one space before the first word
-
-    and after the last word.
-
-    String without words is collapsed to ''
+    authenticates with a hashed password from the configuration.
 
     """
 
-    words = text.strip().split()
+    def _render(self, message=None):
 
-    if len(words) > 0:
+        self.write(self.render_template('login.html',
 
-        return ' ' + ' '.join(words) + ' '
+                next=url_escape(self.get_argument('next', default=self.base_url)),
 
-    else:
+                message=message,
 
-        return ''
+        ))
 
 
 
-def split_list(text):
+    def _redirect_safe(self, url, default=None):
 
-    """Takes text, representing a loosely formatted
+        """Redirect if url is on our PATH
 
-    list (comma, semicolon, empty space separated
 
-    words) and returns a list() of words.
 
-    """
+        Full-domain redirects are allowed if they pass our CORS origin checks.
 
-    text = text.replace(',', ' ').replace(';', ' ')
 
-    return text.strip().split()
 
+        Otherwise use default (self.base_url if unspecified).
 
+        """
 
-def is_iterable(thing):
+        if default is None:
 
-    if hasattr(thing, '__iter__'):
+            default = self.base_url
 
-        return True
+        # protect chrome users from mishandling unescaped backslashes.
 
-    else:
+        # \ is not valid in urls, but some browsers treat it as /
 
-        return isinstance(thing, basestring)
+        # instead of %5C, causing `\\` to behave as `//`
 
+        url = url.replace("\\", "%5C")
 
+        parsed = urlparse(url)
 
-BOT_REGEX = re.compile(
+        if parsed.netloc or not (parsed.path + "/").startswith(self.base_url):
 
-    r'bot|http|\.com|crawl|spider|python|curl|yandex'
+            # require that next_url be absolute path within our path
 
-)
+            allow = False
 
-BROWSER_REGEX = re.compile(
+            # OR pass our cross-origin check
 
-    r'^(Mozilla.*(Gecko|KHTML|MSIE|Presto|Trident)|Opera).*$'
+            if parsed.netloc:
 
-)
+                # if full URL, run our cross-origin check:
 
-MOBILE_REGEX = re.compile(
+                origin = '%s://%s' % (parsed.scheme, parsed.netloc)
 
-    r'(BlackBerry|HTC|LG|MOT|Nokia|NOKIAN|PLAYSTATION|PSP|SAMSUNG|SonyEricsson)'
+                origin = origin.lower()
 
-)
+                if self.allow_origin:
 
+                    allow = self.allow_origin == origin
 
+                elif self.allow_origin_pat:
 
+                    allow = bool(self.allow_origin_pat.match(origin))
 
+            if not allow:
 
-def strip_plus(text):
+                # not allowed, use default
 
-    """returns text with redundant spaces replaced with just one,
+                self.log.warning("Not allowing login redirect to %r" % url)
 
-    and stripped leading and the trailing spaces"""
+                url = default
 
-    return re.sub('\s+', ' ', text).strip()
+        self.redirect(url)
 
 
 
+    def get(self):
 
+        if self.current_user:
 
-def not_a_robot_request(request):
+            next_url = self.get_argument('next', default=self.base_url)
 
-
-
-    if 'HTTP_ACCEPT_LANGUAGE' not in request.META:
-
-        return False
-
-
-
-    user_agent = request.META.get('HTTP_USER_AGENT', None)
-
-    if user_agent is None:
-
-        return False
-
-
-
-    if BOT_REGEX.match(user_agent, re.IGNORECASE):
-
-        return False
-
-
-
-    if MOBILE_REGEX.match(user_agent):
-
-        return True
-
-
-
-    if BROWSER_REGEX.search(user_agent):
-
-        return True
-
-
-
-    return False
-
-
-
-def diff_date(date, use_on_prefix = False):
-
-    now = datetime.datetime.now()#datetime(*time.localtime()[0:6])#???
-
-    diff = now - date
-
-    days = diff.days
-
-    hours = int(diff.seconds/3600)
-
-    minutes = int(diff.seconds/60)
-
-
-
-    if days > 2:
-
-        if date.year == now.year:
-
-            date_token = date.strftime("%b %d")
+            self._redirect_safe(next_url)
 
         else:
 
-            date_token = date.strftime("%b %d '%y")
+            self._render()
 
-        if use_on_prefix:
 
-            return _('on %(date)s') % { 'date': date_token }
+
+    @property
+
+    def hashed_password(self):
+
+        return self.password_from_settings(self.settings)
+
+
+
+    def passwd_check(self, a, b):
+
+        return passwd_check(a, b)
+
+
+
+    def post(self):
+
+        typed_password = self.get_argument('password', default=u'')
+
+        new_password = self.get_argument('new_password', default=u'')
+
+
+
+        if self.get_login_available(self.settings):
+
+            if self.passwd_check(self.hashed_password, typed_password) and not new_password:
+
+                self.set_login_cookie(self, uuid.uuid4().hex)
+
+            elif self.token and self.token == typed_password:
+
+                self.set_login_cookie(self, uuid.uuid4().hex)
+
+                if new_password and self.settings.get("allow_password_change"):
+
+                    config_dir = self.settings.get("config_dir")
+
+                    config_file = os.path.join(
+
+                        config_dir, "jupyter_notebook_config.json"
+
+                    )
+
+                    set_password(new_password, config_file=config_file)
+
+                    self.log.info("Wrote hashed password to %s" % config_file)
+
+            else:
+
+                self.set_status(401)
+
+                self._render(message={'error': 'Invalid credentials'})
+
+                return
+
+
+
+
+
+        next_url = self.get_argument('next', default=self.base_url)
+
+        self._redirect_safe(next_url)
+
+
+
+    @classmethod
+
+    def set_login_cookie(cls, handler, user_id=None):
+
+        """Call this on handlers to set the login cookie for success"""
+
+        cookie_options = handler.settings.get('cookie_options', {})
+
+        cookie_options.setdefault('httponly', True)
+
+        # tornado <4.2 has a bug that considers secure==True as soon as
+
+        # 'secure' kwarg is passed to set_secure_cookie
+
+        if handler.settings.get('secure_cookie', handler.request.protocol == 'https'):
+
+            cookie_options.setdefault('secure', True)
+
+        cookie_options.setdefault('path', handler.base_url)
+
+        handler.set_secure_cookie(handler.cookie_name, user_id, **cookie_options)
+
+        return user_id
+
+
+
+    auth_header_pat = re.compile('token\s+(.+)', re.IGNORECASE)
+
+
+
+    @classmethod
+
+    def get_token(cls, handler):
+
+        """Get the user token from a request
+
+
+
+        Default:
+
+
+
+        - in URL parameters: ?token=<token>
+
+        - in header: Authorization: token <token>
+
+        """
+
+
+
+        user_token = handler.get_argument('token', '')
+
+        if not user_token:
+
+            # get it from Authorization header
+
+            m = cls.auth_header_pat.match(handler.request.headers.get('Authorization', ''))
+
+            if m:
+
+                user_token = m.group(1)
+
+        return user_token
+
+
+
+    @classmethod
+
+    def should_check_origin(cls, handler):
+
+        """Should the Handler check for CORS origin validation?
+
+
+
+        Origin check should be skipped for token-authenticated requests.
+
+
+
+        Returns:
+
+        - True, if Handler must check for valid CORS origin.
+
+        - False, if Handler should skip origin check since requests are token-authenticated.
+
+        """
+
+        return not cls.is_token_authenticated(handler)
+
+
+
+    @classmethod
+
+    def is_token_authenticated(cls, handler):
+
+        """Returns True if handler has been token authenticated. Otherwise, False.
+
+
+
+        Login with a token is used to signal certain things, such as:
+
+
+
+        - permit access to REST API
+
+        - xsrf protection
+
+        - skip origin-checks for scripts
+
+        """
+
+        if getattr(handler, '_user_id', None) is None:
+
+            # ensure get_user has been called, so we know if we're token-authenticated
+
+            handler.get_current_user()
+
+        return getattr(handler, '_token_authenticated', False)
+
+
+
+    @classmethod
+
+    def get_user(cls, handler):
+
+        """Called by handlers.get_current_user for identifying the current user.
+
+
+
+        See tornado.web.RequestHandler.get_current_user for details.
+
+        """
+
+        # Can't call this get_current_user because it will collide when
+
+        # called on LoginHandler itself.
+
+        if getattr(handler, '_user_id', None):
+
+            return handler._user_id
+
+        user_id = cls.get_user_token(handler)
+
+        if user_id is None:
+
+            get_secure_cookie_kwargs  = handler.settings.get('get_secure_cookie_kwargs', {})
+
+            user_id = handler.get_secure_cookie(handler.cookie_name, **get_secure_cookie_kwargs )
 
         else:
 
-            return date_token
+            cls.set_login_cookie(handler, user_id)
 
-    elif days == 2:
+            # Record that the current request has been authenticated with a token.
 
-        return _('2 days ago')
+            # Used in is_token_authenticated above.
 
-    elif days == 1:
+            handler._token_authenticated = True
 
-        return _('yesterday')
+        if user_id is None:
 
-    elif minutes >= 60:
+            # If an invalid cookie was sent, clear it to prevent unnecessary
 
-        return ungettext(
+            # extra warnings. But don't do this on a request with *no* cookie,
 
-            '%(hr)d hour ago',
+            # because that can erroneously log you out (see gh-3365)
 
-            '%(hr)d hours ago',
+            if handler.get_cookie(handler.cookie_name) is not None:
 
-            hours
+                handler.log.warning("Clearing invalid/expired login cookie %s", handler.cookie_name)
 
-        ) % {'hr':hours}
+                handler.clear_login_cookie()
 
-    else:
+            if not handler.login_available:
 
-        return ungettext(
+                # Completely insecure! No authentication at all.
 
-            '%(min)d min ago',
+                # No need to warn here, though; validate_security will have already done that.
 
-            '%(min)d mins ago',
-
-            minutes
-
-        ) % {'min':minutes}
+                user_id = 'anonymous'
 
 
 
-#todo: this function may need to be removed to simplify the paginator functionality
+        # cache value for future retrievals on the same request
 
-LEADING_PAGE_RANGE_DISPLAYED = TRAILING_PAGE_RANGE_DISPLAYED = 5
+        handler._user_id = user_id
 
-LEADING_PAGE_RANGE = TRAILING_PAGE_RANGE = 4
-
-NUM_PAGES_OUTSIDE_RANGE = 1
-
-ADJACENT_PAGES = 2
-
-def setup_paginator(context):
-
-    """
-
-    custom paginator tag
-
-    Inspired from http://blog.localkinegrinds.com/2007/09/06/digg-style-pagination-in-django/
-
-    """
-
-    if (context["is_paginated"]):
-
-        " Initialize variables "
-
-        in_leading_range = in_trailing_range = False
-
-        pages_outside_leading_range = pages_outside_trailing_range = range(0)
+        return user_id
 
 
 
-        if (context["pages"] <= LEADING_PAGE_RANGE_DISPLAYED):
+    @classmethod
 
-            in_leading_range = in_trailing_range = True
+    def get_user_token(cls, handler):
 
-            page_numbers = [n for n in range(1, context["pages"] + 1) if n > 0 and n <= context["pages"]]
+        """Identify the user based on a token in the URL or Authorization header
 
-        elif (context["current_page_number"] <= LEADING_PAGE_RANGE):
+        
 
-            in_leading_range = True
+        Returns:
 
-            page_numbers = [n for n in range(1, LEADING_PAGE_RANGE_DISPLAYED + 1) if n > 0 and n <= context["pages"]]
+        - uuid if authenticated
 
-            pages_outside_leading_range = [n + context["pages"] for n in range(0, -NUM_PAGES_OUTSIDE_RANGE, -1)]
+        - None if not
 
-        elif (context["current_page_number"] > context["pages"] - TRAILING_PAGE_RANGE):
+        """
 
-            in_trailing_range = True
+        token = handler.token
 
-            page_numbers = [n for n in range(context["pages"] - TRAILING_PAGE_RANGE_DISPLAYED + 1, context["pages"] + 1) if n > 0 and n <= context["pages"]]
+        if not token:
 
-            pages_outside_trailing_range = [n + 1 for n in range(0, NUM_PAGES_OUTSIDE_RANGE)]
+            return
+
+        # check login token from URL argument or Authorization header
+
+        user_token = cls.get_token(handler)
+
+        authenticated = False
+
+        if user_token == token:
+
+            # token-authenticated, set the login cookie
+
+            handler.log.debug("Accepting token-authenticated connection from %s", handler.request.remote_ip)
+
+            authenticated = True
+
+
+
+        if authenticated:
+
+            return uuid.uuid4().hex
 
         else:
 
-            page_numbers = [n for n in range(context["current_page_number"] - ADJACENT_PAGES, context["current_page_number"] + ADJACENT_PAGES + 1) if n > 0 and n <= context["pages"]]
-
-            pages_outside_leading_range = [n + context["pages"] for n in range(0, -NUM_PAGES_OUTSIDE_RANGE, -1)]
-
-            pages_outside_trailing_range = [n + 1 for n in range(0, NUM_PAGES_OUTSIDE_RANGE)]
+            return None
 
 
 
-        page_object = context['page_object']
 
-        #patch for change in django 1.5
 
-        if page_object.has_previous():
+    @classmethod
 
-            previous_page_number = page_object.previous_page_number()
+    def validate_security(cls, app, ssl_options=None):
+
+        """Check the application's security.
+
+
+
+        Show messages, or abort if necessary, based on the security configuration.
+
+        """
+
+        if not app.ip:
+
+            warning = "WARNING: The Jupyter server is listening on all IP addresses"
+
+            if ssl_options is None:
+
+                app.log.warning(warning + " and not using encryption. This "
+
+                    "is not recommended.")
+
+            if not app.password and not app.token:
+
+                app.log.warning(warning + " and not using authentication. "
+
+                    "This is highly insecure and not recommended.")
 
         else:
 
-            previous_page_number = None
+            if not app.password and not app.token:
+
+                app.log.warning(
+
+                    "All authentication is disabled."
+
+                    "  Anyone who can connect to this server will be able to run code.")
 
 
 
-        if page_object.has_next():
+    @classmethod
 
-            next_page_number = page_object.next_page_number()
+    def password_from_settings(cls, settings):
 
-        else:
-
-            next_page_number = None
+        """Return the hashed password from the tornado settings.
 
 
 
-        return {
+        If there is no configured password, an empty string will be returned.
 
-            "base_url": escape(context["base_url"]),
+        """
 
-            "is_paginated": context["is_paginated"],
-
-            "previous": previous_page_number,
-
-            "has_previous": page_object.has_previous(),
-
-            "next": next_page_number,
-
-            "has_next": page_object.has_next(),
-
-            "page": context["current_page_number"],
-
-            "pages": context["pages"],
-
-            "page_numbers": page_numbers,
-
-            "in_leading_range" : in_leading_range,
-
-            "in_trailing_range" : in_trailing_range,
-
-            "pages_outside_leading_range": pages_outside_leading_range,
-
-            "pages_outside_trailing_range": pages_outside_trailing_range,
-
-        }
+        return settings.get('password', u'')
 
 
 
-def get_admin():
+    @classmethod
 
-    """Returns an admin users, usefull for raising flags"""
+    def get_login_available(cls, settings):
 
-    try:
+        """Whether this LoginHandler is needed - and therefore whether the login page should be displayed."""
 
-        from django.contrib.auth.models import User
-
-        return User.objects.filter(is_superuser=True)[0]
-
-    except:
-
-        raise Exception('there is no admin users')
-
-
-
-def generate_random_key(length=16):
-
-    """return random string, length is number of characters"""
-
-    random.seed()
-
-    assert(isinstance(length, int))
-
-    format_string = '%0' + str(2*length) + 'x'
-
-    return format_string % random.getrandbits(length*8)
+        return bool(cls.password_from_settings(settings) or settings.get('token'))

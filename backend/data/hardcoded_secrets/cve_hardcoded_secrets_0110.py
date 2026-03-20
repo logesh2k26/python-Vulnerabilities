@@ -2,818 +2,1852 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# -*- coding: utf-8 -*-
+# encoding: utf-8
 
-'''
+from __future__ import unicode_literals
 
-    feedgen.ext.dc
 
-    ~~~~~~~~~~~~~~~~~~~
 
+from datetime import datetime, timedelta
 
+from unittest import TestCase
 
-    Extends the FeedGenerator to add Dubline Core Elements to the feeds.
 
 
+from django import forms
 
-    Descriptions partly taken from
+from django.conf import settings
 
-    http://dublincore.org/documents/dcmi-terms/#elements-coverage
+from django.contrib import admin
 
+from django.contrib.admin import widgets
 
+from django.contrib.admin.tests import AdminSeleniumWebDriverTestCase
 
-    :copyright: 2013-2017, Lars Kiesow <lkiesow@uos.de>
+from django.core.files.storage import default_storage
 
+from django.core.files.uploadedfile import SimpleUploadedFile
 
+from django.db.models import CharField, DateField
 
-    :license: FreeBSD and LGPL, see license.* for more details.
+from django.test import TestCase as DjangoTestCase
 
-'''
+from django.test.utils import override_settings
 
+from django.utils import six
 
+from django.utils import translation
 
-from lxml import etree
+from django.utils.html import conditional_escape
 
 
 
-from feedgen.ext.base import BaseExtension
+from . import models
 
+from .widgetadmin import site as widget_admin_site
 
 
 
 
-class DcBaseExtension(BaseExtension):
 
-    '''Dublin Core Elements extension for podcasts.
+admin_static_prefix = lambda: {
 
-    '''
+    'ADMIN_STATIC_PREFIX': "%sadmin/" % settings.STATIC_URL,
 
+}
 
 
-    def __init__(self):
 
-        # http://dublincore.org/documents/usageguide/elements.shtml
+class AdminFormfieldForDBFieldTests(TestCase):
 
-        # http://dublincore.org/documents/dces/
+    """
 
-        # http://dublincore.org/documents/dcmi-terms/
+    Tests for correct behavior of ModelAdmin.formfield_for_dbfield
 
-        self._dcelem_contributor = None
+    """
 
-        self._dcelem_coverage = None
 
-        self._dcelem_creator = None
 
-        self._dcelem_date = None
+    def assertFormfield(self, model, fieldname, widgetclass, **admin_overrides):
 
-        self._dcelem_description = None
+        """
 
-        self._dcelem_format = None
+        Helper to call formfield_for_dbfield for a given model and field name
 
-        self._dcelem_identifier = None
+        and verify that the returned formfield is appropriate.
 
-        self._dcelem_language = None
+        """
 
-        self._dcelem_publisher = None
+        # Override any settings on the model admin
 
-        self._dcelem_relation = None
+        class MyModelAdmin(admin.ModelAdmin):
 
-        self._dcelem_rights = None
+            pass
 
-        self._dcelem_source = None
+        for k in admin_overrides:
 
-        self._dcelem_subject = None
+            setattr(MyModelAdmin, k, admin_overrides[k])
 
-        self._dcelem_title = None
 
-        self._dcelem_type = None
 
+        # Construct the admin, and ask it for a formfield
 
+        ma = MyModelAdmin(model, admin.site)
 
-    def extend_ns(self):
+        ff = ma.formfield_for_dbfield(model._meta.get_field(fieldname), request=None)
 
-        return {'dc': 'http://purl.org/dc/elements/1.1/'}
 
 
+        # "unwrap" the widget wrapper, if needed
 
-    def _extend_xml(self, xml_elem):
+        if isinstance(ff.widget, widgets.RelatedFieldWidgetWrapper):
 
-        '''Extend xml_elem with set DC fields.
+            widget = ff.widget.widget
 
+        else:
 
+            widget = ff.widget
 
-        :param xml_elem: etree element
 
-        '''
 
-        DCELEMENTS_NS = 'http://purl.org/dc/elements/1.1/'
+        # Check that we got a field of the right type
 
+        self.assertTrue(
 
+            isinstance(widget, widgetclass),
 
-        for elem in ['contributor', 'coverage', 'creator', 'date',
+            "Wrong widget for %s.%s: expected %s, got %s" % \
 
-                     'description', 'language', 'publisher', 'relation',
+                (model.__class__.__name__, fieldname, widgetclass, type(widget))
 
-                     'rights', 'source', 'subject', 'title', 'type', 'format',
+        )
 
-                     'identifier']:
 
-            if hasattr(self, '_dcelem_%s' % elem):
 
-                for val in getattr(self, '_dcelem_%s' % elem) or []:
+        # Return the formfield so that other tests can continue
 
-                    node = etree.SubElement(xml_elem,
+        return ff
 
-                                            '{%s}%s' % (DCELEMENTS_NS, elem))
 
-                    node.text = val
 
+    def testDateField(self):
 
+        self.assertFormfield(models.Event, 'start_date', widgets.AdminDateWidget)
 
-    def extend_atom(self, atom_feed):
 
-        '''Extend an Atom feed with the set DC fields.
 
+    def testDateTimeField(self):
 
+        self.assertFormfield(models.Member, 'birthdate', widgets.AdminSplitDateTime)
 
-        :param atom_feed: The feed root element
 
-        :returns: The feed root element
 
-        '''
+    def testTimeField(self):
 
+        self.assertFormfield(models.Event, 'start_time', widgets.AdminTimeWidget)
 
 
-        self._extend_xml(atom_feed)
 
+    def testTextField(self):
 
+        self.assertFormfield(models.Event, 'description', widgets.AdminTextareaWidget)
 
-        return atom_feed
 
 
+    def testURLField(self):
 
-    def extend_rss(self, rss_feed):
+        self.assertFormfield(models.Event, 'link', widgets.AdminURLFieldWidget)
 
-        '''Extend a RSS feed with the set DC fields.
 
 
+    def testIntegerField(self):
 
-        :param rss_feed: The feed root element
+        self.assertFormfield(models.Event, 'min_age', widgets.AdminIntegerFieldWidget)
 
-        :returns: The feed root element.
 
-        '''
 
-        channel = rss_feed[0]
+    def testCharField(self):
 
-        self._extend_xml(channel)
+        self.assertFormfield(models.Member, 'name', widgets.AdminTextInputWidget)
 
 
 
-        return rss_feed
+    def testEmailField(self):
 
+        self.assertFormfield(models.Member, 'email', widgets.AdminEmailInputWidget)
 
 
-    def dc_contributor(self, contributor=None, replace=False):
 
-        '''Get or set the dc:contributor which is an entity responsible for
+    def testFileField(self):
 
-        making contributions to the resource.
+        self.assertFormfield(models.Album, 'cover_art', widgets.AdminFileWidget)
 
 
 
-        For more information see:
+    def testForeignKey(self):
 
-        http://dublincore.org/documents/dcmi-terms/#elements-contributor
+        self.assertFormfield(models.Event, 'main_band', forms.Select)
 
 
 
-        :param contributor: Contributor or list of contributors.
+    def testRawIDForeignKey(self):
 
-        :param replace: Replace alredy set contributors (deault: False).
+        self.assertFormfield(models.Event, 'main_band', widgets.ForeignKeyRawIdWidget,
 
-        :returns: List of contributors.
+                             raw_id_fields=['main_band'])
 
-        '''
 
-        if contributor is not None:
 
-            if not isinstance(contributor, list):
+    def testRadioFieldsForeignKey(self):
 
-                contributor = [contributor]
+        ff = self.assertFormfield(models.Event, 'main_band', widgets.AdminRadioSelect,
 
-            if replace or not self._dcelem_contributor:
+                                  radio_fields={'main_band':admin.VERTICAL})
 
-                self._dcelem_contributor = []
+        self.assertEqual(ff.empty_label, None)
 
-            self._dcelem_contributor += contributor
 
-        return self._dcelem_contributor
 
+    def testManyToMany(self):
 
+        self.assertFormfield(models.Band, 'members', forms.SelectMultiple)
 
-    def dc_coverage(self, coverage=None, replace=True):
 
-        '''Get or set the dc:coverage which indicated the spatial or temporal
 
-        topic of the resource, the spatial applicability of the resource, or
+    def testRawIDManyTOMany(self):
 
-        the jurisdiction under which the resource is relevant.
+        self.assertFormfield(models.Band, 'members', widgets.ManyToManyRawIdWidget,
 
+                             raw_id_fields=['members'])
 
 
-        Spatial topic and spatial applicability may be a named place or a
 
-        location specified by its geographic coordinates. Temporal topic may be
+    def testFilteredManyToMany(self):
 
-        a named period, date, or date range. A jurisdiction may be a named
+        self.assertFormfield(models.Band, 'members', widgets.FilteredSelectMultiple,
 
-        administrative entity or a geographic place to which the resource
+                             filter_vertical=['members'])
 
-        applies. Recommended best practice is to use a controlled vocabulary
 
-        such as the Thesaurus of Geographic Names [TGN]. Where appropriate,
 
-        named places or time periods can be used in preference to numeric
+    def testFormfieldOverrides(self):
 
-        identifiers such as sets of coordinates or date ranges.
+        self.assertFormfield(models.Event, 'start_date', forms.TextInput,
 
+                             formfield_overrides={DateField: {'widget': forms.TextInput}})
 
 
-        References:
 
-        [TGN] http://www.getty.edu/research/tools/vocabulary/tgn/index.html
+    def testFormfieldOverridesWidgetInstances(self):
 
+        """
 
+        Test that widget instances in formfield_overrides are not shared between
 
-        :param coverage: Coverage of the feed.
+        different fields. (#19423)
 
-        :param replace: Replace already set coverage (default: True).
+        """
 
-        :returns: Coverage of the feed.
+        class BandAdmin(admin.ModelAdmin):
 
-        '''
+            formfield_overrides = {
 
-        if coverage is not None:
+                CharField: {'widget': forms.TextInput(attrs={'size':'10'})}
 
-            if not isinstance(coverage, list):
+            }
 
-                coverage = [coverage]
+        ma = BandAdmin(models.Band, admin.site)
 
-            if replace or not self._dcelem_coverage:
+        f1 = ma.formfield_for_dbfield(models.Band._meta.get_field('name'), request=None)
 
-                self._dcelem_coverage = []
+        f2 = ma.formfield_for_dbfield(models.Band._meta.get_field('style'), request=None)
 
-            self._dcelem_coverage = coverage
+        self.assertNotEqual(f1.widget, f2.widget)
 
-        return self._dcelem_coverage
+        self.assertEqual(f1.widget.attrs['maxlength'], '100')
 
+        self.assertEqual(f2.widget.attrs['maxlength'], '20')
 
+        self.assertEqual(f2.widget.attrs['size'], '10')
 
-    def dc_creator(self, creator=None, replace=False):
 
-        '''Get or set the dc:creator which is an entity primarily responsible
 
-        for making the resource.
+    def testFieldWithChoices(self):
 
+        self.assertFormfield(models.Member, 'gender', forms.Select)
 
 
-        For more information see:
 
-        http://dublincore.org/documents/dcmi-terms/#elements-creator
+    def testChoicesWithRadioFields(self):
 
+        self.assertFormfield(models.Member, 'gender', widgets.AdminRadioSelect,
 
+                             radio_fields={'gender':admin.VERTICAL})
 
-        :param creator: Creator or list of creators.
 
-        :param replace: Replace alredy set creators (deault: False).
 
-        :returns: List of creators.
+    def testInheritance(self):
 
-        '''
+        self.assertFormfield(models.Album, 'backside_art', widgets.AdminFileWidget)
 
-        if creator is not None:
 
-            if not isinstance(creator, list):
 
-                creator = [creator]
+    def test_m2m_widgets(self):
 
-            if replace or not self._dcelem_creator:
+        """m2m fields help text as it applies to admin app (#9321)."""
 
-                self._dcelem_creator = []
+        class AdvisorAdmin(admin.ModelAdmin):
 
-            self._dcelem_creator += creator
+            filter_vertical=['companies']
 
-        return self._dcelem_creator
 
 
+        self.assertFormfield(models.Advisor, 'companies', widgets.FilteredSelectMultiple,
 
-    def dc_date(self, date=None, replace=True):
+                             filter_vertical=['companies'])
 
-        '''Get or set the dc:date which describes a point or period of time
+        ma = AdvisorAdmin(models.Advisor, admin.site)
 
-        associated with an event in the lifecycle of the resource.
+        f = ma.formfield_for_dbfield(models.Advisor._meta.get_field('companies'), request=None)
 
+        self.assertEqual(six.text_type(f.help_text), ' Hold down "Control", or "Command" on a Mac, to select more than one.')
 
 
-        For more information see:
 
-        http://dublincore.org/documents/dcmi-terms/#elements-date
 
 
+@override_settings(PASSWORD_HASHERS=('django.contrib.auth.hashers.SHA1PasswordHasher',))
 
-        :param date: Date or list of dates.
+class AdminFormfieldForDBFieldWithRequestTests(DjangoTestCase):
 
-        :param replace: Replace alredy set dates (deault: True).
+    fixtures = ["admin-widgets-users.xml"]
 
-        :returns: List of dates.
 
-        '''
 
-        if date is not None:
+    def testFilterChoicesByRequestUser(self):
 
-            if not isinstance(date, list):
+        """
 
-                date = [date]
+        Ensure the user can only see their own cars in the foreign key dropdown.
 
-            if replace or not self._dcelem_date:
+        """
 
-                self._dcelem_date = []
+        self.client.login(username="super", password="secret")
 
-            self._dcelem_date += date
+        response = self.client.get("/widget_admin/admin_widgets/cartire/add/")
 
-        return self._dcelem_date
+        self.assertNotContains(response, "BMW M3")
 
+        self.assertContains(response, "Volkswagon Passat")
 
 
-    def dc_description(self, description=None, replace=True):
 
-        '''Get or set the dc:description which is an account of the resource.
 
 
+@override_settings(PASSWORD_HASHERS=('django.contrib.auth.hashers.SHA1PasswordHasher',))
 
-        For more information see:
+class AdminForeignKeyWidgetChangeList(DjangoTestCase):
 
-        http://dublincore.org/documents/dcmi-terms/#elements-description
+    fixtures = ["admin-widgets-users.xml"]
 
+    admin_root = '/widget_admin'
 
 
-        :param description: Description or list of descriptions.
 
-        :param replace: Replace alredy set descriptions (deault: True).
+    def setUp(self):
 
-        :returns: List of descriptions.
+        self.client.login(username="super", password="secret")
 
-        '''
 
-        if description is not None:
 
-            if not isinstance(description, list):
+    def tearDown(self):
 
-                description = [description]
+        self.client.logout()
 
-            if replace or not self._dcelem_description:
 
-                self._dcelem_description = []
 
-            self._dcelem_description += description
+    def test_changelist_foreignkey(self):
 
-        return self._dcelem_description
+        response = self.client.get('%s/admin_widgets/car/' % self.admin_root)
 
+        self.assertContains(response, '%s/auth/user/add/' % self.admin_root)
 
 
-    def dc_format(self, format=None, replace=True):
 
-        '''Get or set the dc:format which describes the file format, physical
 
-        medium, or dimensions of the resource.
 
+@override_settings(PASSWORD_HASHERS=('django.contrib.auth.hashers.SHA1PasswordHasher',))
 
+class AdminForeignKeyRawIdWidget(DjangoTestCase):
 
-        For more information see:
+    fixtures = ["admin-widgets-users.xml"]
 
-        http://dublincore.org/documents/dcmi-terms/#elements-format
+    admin_root = '/widget_admin'
 
 
 
-        :param format: Format of the resource or list of formats.
+    def setUp(self):
 
-        :param replace: Replace alredy set format (deault: True).
+        self.client.login(username="super", password="secret")
 
-        :returns: Format of the resource.
 
-        '''
 
-        if format is not None:
+    def tearDown(self):
 
-            if not isinstance(format, list):
+        self.client.logout()
 
-                format = [format]
 
-            if replace or not self._dcelem_format:
 
-                self._dcelem_format = []
+    def test_nonexistent_target_id(self):
 
-            self._dcelem_format += format
+        band = models.Band.objects.create(name='Bogey Blues')
 
-        return self._dcelem_format
+        pk = band.pk
 
+        band.delete()
 
+        post_data = {
 
-    def dc_identifier(self, identifier=None, replace=True):
+            "main_band": '%s' % pk,
 
-        '''Get or set the dc:identifier which should be an unambiguous
+        }
 
-        reference to the resource within a given context.
+        # Try posting with a non-existent pk in a raw id field: this
 
+        # should result in an error message, not a server exception.
 
+        response = self.client.post('%s/admin_widgets/event/add/' % self.admin_root,
 
-        For more inidentifierion see:
+            post_data)
 
-        http://dublincore.org/documents/dcmi-terms/#elements-identifier
+        self.assertContains(response,
 
+            'Select a valid choice. That choice is not one of the available choices.')
 
 
-        :param identifier: Identifier of the resource or list of identifiers.
 
-        :param replace: Replace alredy set identifier (deault: True).
+    def test_invalid_target_id(self):
 
-        :returns: Identifiers of the resource.
 
-        '''
 
-        if identifier is not None:
+        for test_str in ('Iñtërnâtiônàlizætiøn', "1234'", -1234):
 
-            if not isinstance(identifier, list):
+            # This should result in an error message, not a server exception.
 
-                identifier = [identifier]
+            response = self.client.post('%s/admin_widgets/event/add/' % self.admin_root,
 
-            if replace or not self._dcelem_identifier:
+                {"main_band": test_str})
 
-                self._dcelem_identifier = []
 
-            self._dcelem_identifier += identifier
 
-        return self._dcelem_identifier
+            self.assertContains(response,
 
+                'Select a valid choice. That choice is not one of the available choices.')
 
 
-    def dc_language(self, language=None, replace=True):
 
-        '''Get or set the dc:language which describes a language of the
+    def test_url_params_from_lookup_dict_any_iterable(self):
 
-        resource.
+        lookup1 = widgets.url_params_from_lookup_dict({'color__in': ('red', 'blue')})
 
+        lookup2 = widgets.url_params_from_lookup_dict({'color__in': ['red', 'blue']})
 
+        self.assertEqual(lookup1, {'color__in': 'red,blue'})
 
-        For more information see:
+        self.assertEqual(lookup1, lookup2)
 
-        http://dublincore.org/documents/dcmi-terms/#elements-language
 
 
+    def test_url_params_from_lookup_dict_callable(self):
 
-        :param language: Language or list of languages.
+        def my_callable():
 
-        :param replace: Replace alredy set languages (deault: True).
+            return 'works'
 
-        :returns: List of languages.
+        lookup1 = widgets.url_params_from_lookup_dict({'myfield': my_callable})
 
-        '''
+        lookup2 = widgets.url_params_from_lookup_dict({'myfield': my_callable()})
 
-        if language is not None:
+        self.assertEqual(lookup1, lookup2)
 
-            if not isinstance(language, list):
 
-                language = [language]
 
-            if replace or not self._dcelem_language:
 
-                self._dcelem_language = []
 
-            self._dcelem_language += language
+class FilteredSelectMultipleWidgetTest(DjangoTestCase):
 
-        return self._dcelem_language
+    def test_render(self):
 
+        w = widgets.FilteredSelectMultiple('test', False)
 
+        self.assertHTMLEqual(
 
-    def dc_publisher(self, publisher=None, replace=False):
+            conditional_escape(w.render('test', 'test')),
 
-        '''Get or set the dc:publisher which is an entity responsible for
+            '<select multiple="multiple" name="test" class="selectfilter">\n</select><script type="text/javascript">addEvent(window, "load", function(e) {SelectFilter.init("id_test", "test", 0, "%(ADMIN_STATIC_PREFIX)s"); });</script>\n' % admin_static_prefix()
 
-        making the resource available.
+        )
 
 
 
-        For more information see:
+    def test_stacked_render(self):
 
-        http://dublincore.org/documents/dcmi-terms/#elements-publisher
+        w = widgets.FilteredSelectMultiple('test', True)
 
+        self.assertHTMLEqual(
 
+            conditional_escape(w.render('test', 'test')),
 
-        :param publisher: Publisher or list of publishers.
+            '<select multiple="multiple" name="test" class="selectfilterstacked">\n</select><script type="text/javascript">addEvent(window, "load", function(e) {SelectFilter.init("id_test", "test", 1, "%(ADMIN_STATIC_PREFIX)s"); });</script>\n' % admin_static_prefix()
 
-        :param replace: Replace alredy set publishers (deault: False).
+        )
 
-        :returns: List of publishers.
 
-        '''
 
-        if publisher is not None:
+class AdminDateWidgetTest(DjangoTestCase):
 
-            if not isinstance(publisher, list):
+    def test_attrs(self):
 
-                publisher = [publisher]
+        """
 
-            if replace or not self._dcelem_publisher:
+        Ensure that user-supplied attrs are used.
 
-                self._dcelem_publisher = []
+        Refs #12073.
 
-            self._dcelem_publisher += publisher
+        """
 
-        return self._dcelem_publisher
+        w = widgets.AdminDateWidget()
 
+        self.assertHTMLEqual(
 
+            conditional_escape(w.render('test', datetime(2007, 12, 1, 9, 30))),
 
-    def dc_relation(self, relation=None, replace=False):
+            '<input value="2007-12-01" type="text" class="vDateField" name="test" size="10" />',
 
-        '''Get or set the dc:relation which describes a related resource.
+        )
 
+        # pass attrs to widget
 
+        w = widgets.AdminDateWidget(attrs={'size': 20, 'class': 'myDateField'})
 
-        For more information see:
+        self.assertHTMLEqual(
 
-        http://dublincore.org/documents/dcmi-terms/#elements-relation
+            conditional_escape(w.render('test', datetime(2007, 12, 1, 9, 30))),
 
+            '<input value="2007-12-01" type="text" class="myDateField" name="test" size="20" />',
 
+        )
 
-        :param relation: Relation or list of relations.
 
-        :param replace: Replace alredy set relations (deault: False).
 
-        :returns: List of relations.
+class AdminTimeWidgetTest(DjangoTestCase):
 
-        '''
+    def test_attrs(self):
 
-        if relation is not None:
+        """
 
-            if not isinstance(relation, list):
+        Ensure that user-supplied attrs are used.
 
-                relation = [relation]
+        Refs #12073.
 
-            if replace or not self._dcelem_relation:
+        """
 
-                self._dcelem_relation = []
+        w = widgets.AdminTimeWidget()
 
-            self._dcelem_relation += relation
+        self.assertHTMLEqual(
 
-        return self._dcelem_relation
+            conditional_escape(w.render('test', datetime(2007, 12, 1, 9, 30))),
 
+            '<input value="09:30:00" type="text" class="vTimeField" name="test" size="8" />',
 
+        )
 
-    def dc_rights(self, rights=None, replace=False):
+        # pass attrs to widget
 
-        '''Get or set the dc:rights which may contain information about rights
+        w = widgets.AdminTimeWidget(attrs={'size': 20, 'class': 'myTimeField'})
 
-        held in and over the resource.
+        self.assertHTMLEqual(
 
+            conditional_escape(w.render('test', datetime(2007, 12, 1, 9, 30))),
 
+            '<input value="09:30:00" type="text" class="myTimeField" name="test" size="20" />',
 
-        For more information see:
+        )
 
-        http://dublincore.org/documents/dcmi-terms/#elements-rights
 
 
+class AdminSplitDateTimeWidgetTest(DjangoTestCase):
 
-        :param rights: Rights information or list of rights information.
+    def test_render(self):
 
-        :param replace: Replace alredy set rightss (deault: False).
+        w = widgets.AdminSplitDateTime()
 
-        :returns: List of rights information.
+        self.assertHTMLEqual(
 
-        '''
+            conditional_escape(w.render('test', datetime(2007, 12, 1, 9, 30))),
 
-        if rights is not None:
+            '<p class="datetime">Date: <input value="2007-12-01" type="text" class="vDateField" name="test_0" size="10" /><br />Time: <input value="09:30:00" type="text" class="vTimeField" name="test_1" size="8" /></p>',
 
-            if not isinstance(rights, list):
+        )
 
-                rights = [rights]
 
-            if replace or not self._dcelem_rights:
 
-                self._dcelem_rights = []
+    def test_localization(self):
 
-            self._dcelem_rights += rights
+        w = widgets.AdminSplitDateTime()
 
-        return self._dcelem_rights
 
 
+        with self.settings(USE_L10N=True):
 
-    def dc_source(self, source=None, replace=False):
+            with translation.override('de-at'):
 
-        '''Get or set the dc:source which is a related resource from which the
+                w.is_localized = True
 
-        described resource is derived.
+                self.assertHTMLEqual(
 
+                    conditional_escape(w.render('test', datetime(2007, 12, 1, 9, 30))),
 
+                    '<p class="datetime">Datum: <input value="01.12.2007" type="text" class="vDateField" name="test_0" size="10" /><br />Zeit: <input value="09:30:00" type="text" class="vTimeField" name="test_1" size="8" /></p>',
 
-        The described resource may be derived from the related resource in
+                )
 
-        whole or in part. Recommended best practice is to identify the related
 
-        resource by means of a string conforming to a formal identification
 
-        system.
 
 
+class AdminURLWidgetTest(DjangoTestCase):
 
-        For more information see:
+    def test_render(self):
 
-        http://dublincore.org/documents/dcmi-terms/#elements-source
+        w = widgets.AdminURLFieldWidget()
 
+        self.assertHTMLEqual(
 
+            conditional_escape(w.render('test', '')),
 
-        :param source: Source or list of sources.
+            '<input class="vURLField" name="test" type="url" />'
 
-        :param replace: Replace alredy set sources (deault: False).
+        )
 
-        :returns: List of sources.
+        self.assertHTMLEqual(
 
-        '''
+            conditional_escape(w.render('test', 'http://example.com')),
 
-        if source is not None:
+            '<p class="url">Currently:<a href="http://example.com">http://example.com</a><br />Change:<input class="vURLField" name="test" type="url" value="http://example.com" /></p>'
 
-            if not isinstance(source, list):
+        )
 
-                source = [source]
 
-            if replace or not self._dcelem_source:
 
-                self._dcelem_source = []
+    def test_render_idn(self):
 
-            self._dcelem_source += source
+        w = widgets.AdminURLFieldWidget()
 
-        return self._dcelem_source
+        self.assertHTMLEqual(
 
+            conditional_escape(w.render('test', 'http://example-äüö.com')),
 
+            '<p class="url">Currently:<a href="http://xn--example--7za4pnc.com">http://example-äüö.com</a><br />Change:<input class="vURLField" name="test" type="url" value="http://example-äüö.com" /></p>'
 
-    def dc_subject(self, subject=None, replace=False):
+        )
 
-        '''Get or set the dc:subject which describes the topic of the resource.
 
 
+    def test_render_quoting(self):
 
-        For more information see:
+        w = widgets.AdminURLFieldWidget()
 
-        http://dublincore.org/documents/dcmi-terms/#elements-subject
+        self.assertHTMLEqual(
 
+            conditional_escape(w.render('test', 'http://example.com/<sometag>some text</sometag>')),
 
+            '<p class="url">Currently:<a href="http://example.com/%3Csometag%3Esome%20text%3C/sometag%3E">http://example.com/&lt;sometag&gt;some text&lt;/sometag&gt;</a><br />Change:<input class="vURLField" name="test" type="url" value="http://example.com/<sometag>some text</sometag>" /></p>'
 
-        :param subject: Subject or list of subjects.
+        )
 
-        :param replace: Replace alredy set subjects (deault: False).
+        self.assertHTMLEqual(
 
-        :returns: List of subjects.
+            conditional_escape(w.render('test', 'http://example-äüö.com/<sometag>some text</sometag>')),
 
-        '''
+            '<p class="url">Currently:<a href="http://xn--example--7za4pnc.com/%3Csometag%3Esome%20text%3C/sometag%3E">http://example-äüö.com/&lt;sometag&gt;some text&lt;/sometag&gt;</a><br />Change:<input class="vURLField" name="test" type="url" value="http://example-äüö.com/<sometag>some text</sometag>" /></p>'
 
-        if subject is not None:
+        )
 
-            if not isinstance(subject, list):
 
-                subject = [subject]
 
-            if replace or not self._dcelem_subject:
 
-                self._dcelem_subject = []
 
-            self._dcelem_subject += subject
+class AdminFileWidgetTest(DjangoTestCase):
 
-        return self._dcelem_subject
+    def test_render(self):
 
+        band = models.Band.objects.create(name='Linkin Park')
 
+        album = band.album_set.create(
 
-    def dc_title(self, title=None, replace=True):
+            name='Hybrid Theory', cover_art=r'albums\hybrid_theory.jpg'
 
-        '''Get or set the dc:title which is a name given to the resource.
+        )
 
 
 
-        For more information see:
+        w = widgets.AdminFileWidget()
 
-        http://dublincore.org/documents/dcmi-terms/#elements-title
+        self.assertHTMLEqual(
 
+            conditional_escape(w.render('test', album.cover_art)),
 
+            '<p class="file-upload">Currently: <a href="%(STORAGE_URL)salbums/hybrid_theory.jpg">albums\hybrid_theory.jpg</a> <span class="clearable-file-input"><input type="checkbox" name="test-clear" id="test-clear_id" /> <label for="test-clear_id">Clear</label></span><br />Change: <input type="file" name="test" /></p>' % { 'STORAGE_URL': default_storage.url('') },
 
-        :param title: Title or list of titles.
+        )
 
-        :param replace: Replace alredy set titles (deault: False).
 
-        :returns: List of titles.
 
-        '''
+        self.assertHTMLEqual(
 
-        if title is not None:
+            conditional_escape(w.render('test', SimpleUploadedFile('test', b'content'))),
 
-            if not isinstance(title, list):
+            '<input type="file" name="test" />',
 
-                title = [title]
+        )
 
-            if replace or not self._dcelem_title:
 
-                self._dcelem_title = []
 
-            self._dcelem_title += title
 
-        return self._dcelem_title
 
+class ForeignKeyRawIdWidgetTest(DjangoTestCase):
 
+    def test_render(self):
 
-    def dc_type(self, type=None, replace=False):
+        band = models.Band.objects.create(name='Linkin Park')
 
-        '''Get or set the dc:type which describes the nature or genre of the
+        band.album_set.create(
 
-        resource.
+            name='Hybrid Theory', cover_art=r'albums\hybrid_theory.jpg'
 
+        )
 
+        rel = models.Album._meta.get_field('band').rel
 
-        For more information see:
 
-        http://dublincore.org/documents/dcmi-terms/#elements-type
 
+        w = widgets.ForeignKeyRawIdWidget(rel, widget_admin_site)
 
+        self.assertHTMLEqual(
 
-        :param type: Type or list of types.
+            conditional_escape(w.render('test', band.pk, attrs={})),
 
-        :param replace: Replace alredy set types (deault: False).
+            '<input type="text" name="test" value="%(bandpk)s" class="vForeignKeyRawIdAdminField" /><a href="/widget_admin/admin_widgets/band/?t=id" class="related-lookup" id="lookup_id_test" onclick="return showRelatedObjectLookupPopup(this);"> <img src="%(ADMIN_STATIC_PREFIX)simg/selector-search.gif" width="16" height="16" alt="Lookup" /></a>&nbsp;<strong>Linkin Park</strong>' % dict(admin_static_prefix(), bandpk=band.pk)
 
-        :returns: List of types.
+        )
 
-        '''
 
-        if type is not None:
 
-            if not isinstance(type, list):
+    def test_relations_to_non_primary_key(self):
 
-                type = [type]
+        # Check that ForeignKeyRawIdWidget works with fields which aren't
 
-            if replace or not self._dcelem_type:
+        # related to the model's primary key.
 
-                self._dcelem_type = []
+        apple = models.Inventory.objects.create(barcode=86, name='Apple')
 
-            self._dcelem_type += type
+        models.Inventory.objects.create(barcode=22, name='Pear')
 
-        return self._dcelem_type
+        core = models.Inventory.objects.create(
 
+            barcode=87, name='Core', parent=apple
 
+        )
 
+        rel = models.Inventory._meta.get_field('parent').rel
 
+        w = widgets.ForeignKeyRawIdWidget(rel, widget_admin_site)
 
-class DcExtension(DcBaseExtension):
+        self.assertHTMLEqual(
 
-    '''Dublin Core Elements extension for podcasts.
+            w.render('test', core.parent_id, attrs={}),
 
-    '''
+            '<input type="text" name="test" value="86" class="vForeignKeyRawIdAdminField" /><a href="/widget_admin/admin_widgets/inventory/?t=barcode" class="related-lookup" id="lookup_id_test" onclick="return showRelatedObjectLookupPopup(this);"> <img src="%(ADMIN_STATIC_PREFIX)simg/selector-search.gif" width="16" height="16" alt="Lookup" /></a>&nbsp;<strong>Apple</strong>' % admin_static_prefix()
 
+        )
 
 
 
+    def test_fk_related_model_not_in_admin(self):
 
-class DcEntryExtension(DcBaseExtension):
+        # FK to a model not registered with admin site. Raw ID widget should
 
-    '''Dublin Core Elements extension for podcasts.
+        # have no magnifying glass link. See #16542
 
-    '''
+        big_honeycomb = models.Honeycomb.objects.create(location='Old tree')
 
-    def extend_atom(self, entry):
+        big_honeycomb.bee_set.create()
 
-        '''Add dc elements to an atom item. Alters the item itself.
+        rel = models.Bee._meta.get_field('honeycomb').rel
 
 
 
-        :param entry: An atom entry element.
+        w = widgets.ForeignKeyRawIdWidget(rel, widget_admin_site)
 
-        :returns: The entry element.
+        self.assertHTMLEqual(
 
-        '''
+            conditional_escape(w.render('honeycomb_widget', big_honeycomb.pk, attrs={})),
 
-        self._extend_xml(entry)
+            '<input type="text" name="honeycomb_widget" value="%(hcombpk)s" />&nbsp;<strong>Honeycomb object</strong>' % {'hcombpk': big_honeycomb.pk}
 
-        return entry
+        )
 
 
 
-    def extend_rss(self, item):
+    def test_fk_to_self_model_not_in_admin(self):
 
-        '''Add dc elements to a RSS item. Alters the item itself.
+        # FK to self, not registered with admin site. Raw ID widget should have
 
+        # no magnifying glass link. See #16542
 
+        subject1 = models.Individual.objects.create(name='Subject #1')
 
-        :param item: A RSS item element.
+        models.Individual.objects.create(name='Child', parent=subject1)
 
-        :returns: The item element.
+        rel = models.Individual._meta.get_field('parent').rel
 
-        '''
 
-        self._extend_xml(item)
 
-        return item
+        w = widgets.ForeignKeyRawIdWidget(rel, widget_admin_site)
+
+        self.assertHTMLEqual(
+
+            conditional_escape(w.render('individual_widget', subject1.pk, attrs={})),
+
+            '<input type="text" name="individual_widget" value="%(subj1pk)s" />&nbsp;<strong>Individual object</strong>' % {'subj1pk': subject1.pk}
+
+        )
+
+
+
+    def test_proper_manager_for_label_lookup(self):
+
+        # see #9258
+
+        rel = models.Inventory._meta.get_field('parent').rel
+
+        w = widgets.ForeignKeyRawIdWidget(rel, widget_admin_site)
+
+
+
+        hidden = models.Inventory.objects.create(
+
+            barcode=93, name='Hidden', hidden=True
+
+        )
+
+        child_of_hidden = models.Inventory.objects.create(
+
+            barcode=94, name='Child of hidden', parent=hidden
+
+        )
+
+        self.assertHTMLEqual(
+
+            w.render('test', child_of_hidden.parent_id, attrs={}),
+
+            '<input type="text" name="test" value="93" class="vForeignKeyRawIdAdminField" /><a href="/widget_admin/admin_widgets/inventory/?t=barcode" class="related-lookup" id="lookup_id_test" onclick="return showRelatedObjectLookupPopup(this);"> <img src="%(ADMIN_STATIC_PREFIX)simg/selector-search.gif" width="16" height="16" alt="Lookup" /></a>&nbsp;<strong>Hidden</strong>' % admin_static_prefix()
+
+        )
+
+
+
+
+
+class ManyToManyRawIdWidgetTest(DjangoTestCase):
+
+    def test_render(self):
+
+        band = models.Band.objects.create(name='Linkin Park')
+
+
+
+        m1 = models.Member.objects.create(name='Chester')
+
+        m2 = models.Member.objects.create(name='Mike')
+
+        band.members.add(m1, m2)
+
+        rel = models.Band._meta.get_field('members').rel
+
+
+
+        w = widgets.ManyToManyRawIdWidget(rel, widget_admin_site)
+
+        self.assertHTMLEqual(
+
+            conditional_escape(w.render('test', [m1.pk, m2.pk], attrs={})),
+
+            '<input type="text" name="test" value="%(m1pk)s,%(m2pk)s" class="vManyToManyRawIdAdminField" /><a href="/widget_admin/admin_widgets/member/" class="related-lookup" id="lookup_id_test" onclick="return showRelatedObjectLookupPopup(this);"> <img src="/static/admin/img/selector-search.gif" width="16" height="16" alt="Lookup" /></a>' % dict(admin_static_prefix(), m1pk=m1.pk, m2pk=m2.pk)
+
+        )
+
+
+
+        self.assertHTMLEqual(
+
+            conditional_escape(w.render('test', [m1.pk])),
+
+            '<input type="text" name="test" value="%(m1pk)s" class="vManyToManyRawIdAdminField" /><a href="/widget_admin/admin_widgets/member/" class="related-lookup" id="lookup_id_test" onclick="return showRelatedObjectLookupPopup(this);"> <img src="%(ADMIN_STATIC_PREFIX)simg/selector-search.gif" width="16" height="16" alt="Lookup" /></a>' % dict(admin_static_prefix(), m1pk=m1.pk)
+
+        )
+
+
+
+    def test_m2m_related_model_not_in_admin(self):
+
+        # M2M relationship with model not registered with admin site. Raw ID
+
+        # widget should have no magnifying glass link. See #16542
+
+        consultor1 = models.Advisor.objects.create(name='Rockstar Techie')
+
+
+
+        c1 = models.Company.objects.create(name='Doodle')
+
+        c2 = models.Company.objects.create(name='Pear')
+
+        consultor1.companies.add(c1, c2)
+
+        rel = models.Advisor._meta.get_field('companies').rel
+
+
+
+        w = widgets.ManyToManyRawIdWidget(rel, widget_admin_site)
+
+        self.assertHTMLEqual(
+
+            conditional_escape(w.render('company_widget1', [c1.pk, c2.pk], attrs={})),
+
+            '<input type="text" name="company_widget1" value="%(c1pk)s,%(c2pk)s" />' % {'c1pk': c1.pk, 'c2pk': c2.pk}
+
+        )
+
+
+
+        self.assertHTMLEqual(
+
+            conditional_escape(w.render('company_widget2', [c1.pk])),
+
+            '<input type="text" name="company_widget2" value="%(c1pk)s" />' % {'c1pk': c1.pk}
+
+        )
+
+
+
+class RelatedFieldWidgetWrapperTests(DjangoTestCase):
+
+    def test_no_can_add_related(self):
+
+        rel = models.Individual._meta.get_field('parent').rel
+
+        w = widgets.AdminRadioSelect()
+
+        # Used to fail with a name error.
+
+        w = widgets.RelatedFieldWidgetWrapper(w, rel, widget_admin_site)
+
+        self.assertFalse(w.can_add_related)
+
+
+
+
+
+
+
+@override_settings(PASSWORD_HASHERS=('django.contrib.auth.hashers.SHA1PasswordHasher',))
+
+class DateTimePickerSeleniumFirefoxTests(AdminSeleniumWebDriverTestCase):
+
+
+
+    available_apps = ['admin_widgets'] + AdminSeleniumWebDriverTestCase.available_apps
+
+    fixtures = ['admin-widgets-users.xml']
+
+    urls = "admin_widgets.urls"
+
+    webdriver_class = 'selenium.webdriver.firefox.webdriver.WebDriver'
+
+
+
+    def test_show_hide_date_time_picker_widgets(self):
+
+        """
+
+        Ensure that pressing the ESC key closes the date and time picker
+
+        widgets.
+
+        Refs #17064.
+
+        """
+
+        from selenium.webdriver.common.keys import Keys
+
+
+
+        self.admin_login(username='super', password='secret', login_url='/')
+
+        # Open a page that has a date and time picker widgets
+
+        self.selenium.get('%s%s' % (self.live_server_url,
+
+            '/admin_widgets/member/add/'))
+
+
+
+        # First, with the date picker widget ---------------------------------
+
+        # Check that the date picker is hidden
+
+        self.assertEqual(
+
+            self.get_css_value('#calendarbox0', 'display'), 'none')
+
+        # Click the calendar icon
+
+        self.selenium.find_element_by_id('calendarlink0').click()
+
+        # Check that the date picker is visible
+
+        self.assertEqual(
+
+            self.get_css_value('#calendarbox0', 'display'), 'block')
+
+        # Press the ESC key
+
+        self.selenium.find_element_by_tag_name('body').send_keys([Keys.ESCAPE])
+
+        # Check that the date picker is hidden again
+
+        self.assertEqual(
+
+            self.get_css_value('#calendarbox0', 'display'), 'none')
+
+
+
+        # Then, with the time picker widget ----------------------------------
+
+        # Check that the time picker is hidden
+
+        self.assertEqual(
+
+            self.get_css_value('#clockbox0', 'display'), 'none')
+
+        # Click the time icon
+
+        self.selenium.find_element_by_id('clocklink0').click()
+
+        # Check that the time picker is visible
+
+        self.assertEqual(
+
+            self.get_css_value('#clockbox0', 'display'), 'block')
+
+        # Press the ESC key
+
+        self.selenium.find_element_by_tag_name('body').send_keys([Keys.ESCAPE])
+
+        # Check that the time picker is hidden again
+
+        self.assertEqual(
+
+            self.get_css_value('#clockbox0', 'display'), 'none')
+
+
+
+class DateTimePickerSeleniumChromeTests(DateTimePickerSeleniumFirefoxTests):
+
+    webdriver_class = 'selenium.webdriver.chrome.webdriver.WebDriver'
+
+
+
+class DateTimePickerSeleniumIETests(DateTimePickerSeleniumFirefoxTests):
+
+    webdriver_class = 'selenium.webdriver.ie.webdriver.WebDriver'
+
+
+
+
+
+@override_settings(TIME_ZONE='Asia/Singapore')
+
+@override_settings(PASSWORD_HASHERS=('django.contrib.auth.hashers.SHA1PasswordHasher',))
+
+class DateTimePickerShortcutsSeleniumFirefoxTests(AdminSeleniumWebDriverTestCase):
+
+    available_apps = ['admin_widgets'] + AdminSeleniumWebDriverTestCase.available_apps
+
+    fixtures = ['admin-widgets-users.xml']
+
+    urls = "admin_widgets.urls"
+
+    webdriver_class = 'selenium.webdriver.firefox.webdriver.WebDriver'
+
+
+
+    def test_date_time_picker_shortcuts(self):
+
+        """
+
+        Ensure that date/time/datetime picker shortcuts work in the current time zone.
+
+        Refs #20663.
+
+
+
+        This test case is fairly tricky, it relies on selenium still running the browser
+
+        in the default time zone "America/Chicago" despite `override_settings` changing
+
+        the time zone to "Asia/Singapore".
+
+        """
+
+        self.admin_login(username='super', password='secret', login_url='/')
+
+
+
+        now = datetime.now()
+
+        error_margin = timedelta(seconds=10)
+
+
+
+        self.selenium.get('%s%s' % (self.live_server_url,
+
+            '/admin_widgets/member/add/'))
+
+
+
+        self.selenium.find_element_by_id('id_name').send_keys('test')
+
+
+
+        # Click on the "today" and "now" shortcuts.
+
+        shortcuts = self.selenium.find_elements_by_css_selector(
+
+            '.field-birthdate .datetimeshortcuts')
+
+
+
+        for shortcut in shortcuts:
+
+            shortcut.find_element_by_tag_name('a').click()
+
+
+
+        # Check that there is a time zone mismatch warning.
+
+        # Warning: This would effectively fail if the TIME_ZONE defined in the
+
+        # settings has the same UTC offset as "Asia/Singapore" because the
+
+        # mismatch warning would be rightfully missing from the page.
+
+        self.selenium.find_elements_by_css_selector(
+
+            '.field-birthdate .timezonewarning')
+
+
+
+        # Submit the form.
+
+        self.selenium.find_element_by_tag_name('form').submit()
+
+        self.wait_page_loaded()
+
+
+
+        # Make sure that "now" in javascript is within 10 seconds
+
+        # from "now" on the server side.
+
+        member = models.Member.objects.get(name='test')
+
+        self.assertGreater(member.birthdate, now - error_margin)
+
+        self.assertLess(member.birthdate, now + error_margin)
+
+
+
+class DateTimePickerShortcutsSeleniumChromeTests(DateTimePickerShortcutsSeleniumFirefoxTests):
+
+    webdriver_class = 'selenium.webdriver.chrome.webdriver.WebDriver'
+
+
+
+class DateTimePickerShortcutsSeleniumIETests(DateTimePickerShortcutsSeleniumFirefoxTests):
+
+    webdriver_class = 'selenium.webdriver.ie.webdriver.WebDriver'
+
+
+
+
+
+@override_settings(PASSWORD_HASHERS=('django.contrib.auth.hashers.SHA1PasswordHasher',))
+
+class HorizontalVerticalFilterSeleniumFirefoxTests(AdminSeleniumWebDriverTestCase):
+
+
+
+    available_apps = ['admin_widgets'] + AdminSeleniumWebDriverTestCase.available_apps
+
+    fixtures = ['admin-widgets-users.xml']
+
+    urls = "admin_widgets.urls"
+
+    webdriver_class = 'selenium.webdriver.firefox.webdriver.WebDriver'
+
+
+
+    def setUp(self):
+
+        self.lisa = models.Student.objects.create(name='Lisa')
+
+        self.john = models.Student.objects.create(name='John')
+
+        self.bob = models.Student.objects.create(name='Bob')
+
+        self.peter = models.Student.objects.create(name='Peter')
+
+        self.jenny = models.Student.objects.create(name='Jenny')
+
+        self.jason = models.Student.objects.create(name='Jason')
+
+        self.cliff = models.Student.objects.create(name='Cliff')
+
+        self.arthur = models.Student.objects.create(name='Arthur')
+
+        self.school = models.School.objects.create(name='School of Awesome')
+
+        super(HorizontalVerticalFilterSeleniumFirefoxTests, self).setUp()
+
+
+
+    def assertActiveButtons(self, mode, field_name, choose, remove,
+
+                             choose_all=None, remove_all=None):
+
+        choose_link = '#id_%s_add_link' % field_name
+
+        choose_all_link = '#id_%s_add_all_link' % field_name
+
+        remove_link = '#id_%s_remove_link' % field_name
+
+        remove_all_link = '#id_%s_remove_all_link' % field_name
+
+        self.assertEqual(self.has_css_class(choose_link, 'active'), choose)
+
+        self.assertEqual(self.has_css_class(remove_link, 'active'), remove)
+
+        if mode == 'horizontal':
+
+            self.assertEqual(self.has_css_class(choose_all_link, 'active'), choose_all)
+
+            self.assertEqual(self.has_css_class(remove_all_link, 'active'), remove_all)
+
+
+
+    def execute_basic_operations(self, mode, field_name):
+
+        from_box = '#id_%s_from' % field_name
+
+        to_box = '#id_%s_to' % field_name
+
+        choose_link = 'id_%s_add_link' % field_name
+
+        choose_all_link = 'id_%s_add_all_link' % field_name
+
+        remove_link = 'id_%s_remove_link' % field_name
+
+        remove_all_link = 'id_%s_remove_all_link' % field_name
+
+
+
+        # Initial positions ---------------------------------------------------
+
+        self.assertSelectOptions(from_box,
+
+                        [str(self.arthur.id), str(self.bob.id),
+
+                         str(self.cliff.id), str(self.jason.id),
+
+                         str(self.jenny.id), str(self.john.id)])
+
+        self.assertSelectOptions(to_box,
+
+                        [str(self.lisa.id), str(self.peter.id)])
+
+        self.assertActiveButtons(mode, field_name, False, False, True, True)
+
+
+
+        # Click 'Choose all' --------------------------------------------------
+
+        if mode == 'horizontal':
+
+            self.selenium.find_element_by_id(choose_all_link).click()
+
+        elif mode == 'vertical':
+
+            # There 's no 'Choose all' button in vertical mode, so individually
+
+            # select all options and click 'Choose'.
+
+            for option in self.selenium.find_elements_by_css_selector(from_box + ' > option'):
+
+                option.click()
+
+            self.selenium.find_element_by_id(choose_link).click()
+
+        self.assertSelectOptions(from_box, [])
+
+        self.assertSelectOptions(to_box,
+
+                        [str(self.lisa.id), str(self.peter.id),
+
+                         str(self.arthur.id), str(self.bob.id),
+
+                         str(self.cliff.id), str(self.jason.id),
+
+                         str(self.jenny.id), str(self.john.id)])
+
+        self.assertActiveButtons(mode, field_name, False, False, False, True)
+
+
+
+        # Click 'Remove all' --------------------------------------------------
+
+        if mode == 'horizontal':
+
+            self.selenium.find_element_by_id(remove_all_link).click()
+
+        elif mode == 'vertical':
+
+            # There 's no 'Remove all' button in vertical mode, so individually
+
+            # select all options and click 'Remove'.
+
+            for option in self.selenium.find_elements_by_css_selector(to_box + ' > option'):
+
+                option.click()
+
+            self.selenium.find_element_by_id(remove_link).click()
+
+        self.assertSelectOptions(from_box,
+
+                        [str(self.lisa.id), str(self.peter.id),
+
+                         str(self.arthur.id), str(self.bob.id),
+
+                         str(self.cliff.id), str(self.jason.id),
+
+                         str(self.jenny.id), str(self.john.id)])
+
+        self.assertSelectOptions(to_box, [])
+
+        self.assertActiveButtons(mode, field_name, False, False, True, False)
+
+
+
+        # Choose some options ------------------------------------------------
+
+        self.get_select_option(from_box, str(self.lisa.id)).click()
+
+        self.get_select_option(from_box, str(self.jason.id)).click()
+
+        self.get_select_option(from_box, str(self.bob.id)).click()
+
+        self.get_select_option(from_box, str(self.john.id)).click()
+
+        self.assertActiveButtons(mode, field_name, True, False, True, False)
+
+        self.selenium.find_element_by_id(choose_link).click()
+
+        self.assertActiveButtons(mode, field_name, False, False, True, True)
+
+
+
+        self.assertSelectOptions(from_box,
+
+                        [str(self.peter.id), str(self.arthur.id),
+
+                         str(self.cliff.id), str(self.jenny.id)])
+
+        self.assertSelectOptions(to_box,
+
+                        [str(self.lisa.id), str(self.bob.id),
+
+                         str(self.jason.id), str(self.john.id)])
+
+
+
+        # Remove some options -------------------------------------------------
+
+        self.get_select_option(to_box, str(self.lisa.id)).click()
+
+        self.get_select_option(to_box, str(self.bob.id)).click()
+
+        self.assertActiveButtons(mode, field_name, False, True, True, True)
+
+        self.selenium.find_element_by_id(remove_link).click()
+
+        self.assertActiveButtons(mode, field_name, False, False, True, True)
+
+
+
+        self.assertSelectOptions(from_box,
+
+                        [str(self.peter.id), str(self.arthur.id),
+
+                         str(self.cliff.id), str(self.jenny.id),
+
+                         str(self.lisa.id), str(self.bob.id)])
+
+        self.assertSelectOptions(to_box,
+
+                        [str(self.jason.id), str(self.john.id)])
+
+
+
+        # Choose some more options --------------------------------------------
+
+        self.get_select_option(from_box, str(self.arthur.id)).click()
+
+        self.get_select_option(from_box, str(self.cliff.id)).click()
+
+        self.selenium.find_element_by_id(choose_link).click()
+
+
+
+        self.assertSelectOptions(from_box,
+
+                        [str(self.peter.id), str(self.jenny.id),
+
+                         str(self.lisa.id), str(self.bob.id)])
+
+        self.assertSelectOptions(to_box,
+
+                        [str(self.jason.id), str(self.john.id),
+
+                         str(self.arthur.id), str(self.cliff.id)])
+
+
+
+    def test_basic(self):
+
+        self.school.students = [self.lisa, self.peter]
+
+        self.school.alumni = [self.lisa, self.peter]
+
+        self.school.save()
+
+
+
+        self.admin_login(username='super', password='secret', login_url='/')
+
+        self.selenium.get(
+
+            '%s%s' % (self.live_server_url, '/admin_widgets/school/%s/' % self.school.id))
+
+
+
+        self.wait_page_loaded()
+
+        self.execute_basic_operations('vertical', 'students')
+
+        self.execute_basic_operations('horizontal', 'alumni')
+
+
+
+        # Save and check that everything is properly stored in the database ---
+
+        self.selenium.find_element_by_xpath('//input[@value="Save"]').click()
+
+        self.wait_page_loaded()
+
+        self.school = models.School.objects.get(id=self.school.id)  # Reload from database
+
+        self.assertEqual(list(self.school.students.all()),
+
+                         [self.arthur, self.cliff, self.jason, self.john])
+
+        self.assertEqual(list(self.school.alumni.all()),
+
+                         [self.arthur, self.cliff, self.jason, self.john])
+
+
+
+    def test_filter(self):
+
+        """
+
+        Ensure that typing in the search box filters out options displayed in
+
+        the 'from' box.
+
+        """
+
+        from selenium.webdriver.common.keys import Keys
+
+
+
+        self.school.students = [self.lisa, self.peter]
+
+        self.school.alumni = [self.lisa, self.peter]
+
+        self.school.save()
+
+
+
+        self.admin_login(username='super', password='secret', login_url='/')
+
+        self.selenium.get(
+
+            '%s%s' % (self.live_server_url, '/admin_widgets/school/%s/' % self.school.id))
+
+
+
+
+
+        for field_name in ['students', 'alumni']:
+
+            from_box = '#id_%s_from' % field_name
+
+            to_box = '#id_%s_to' % field_name
+
+            choose_link = '#id_%s_add_link' % field_name
+
+            remove_link = '#id_%s_remove_link' % field_name
+
+            input = self.selenium.find_element_by_css_selector('#id_%s_input' % field_name)
+
+
+
+            # Initial values
+
+            self.assertSelectOptions(from_box,
+
+                        [str(self.arthur.id), str(self.bob.id),
+
+                         str(self.cliff.id), str(self.jason.id),
+
+                         str(self.jenny.id), str(self.john.id)])
+
+
+
+            # Typing in some characters filters out non-matching options
+
+            input.send_keys('a')
+
+            self.assertSelectOptions(from_box, [str(self.arthur.id), str(self.jason.id)])
+
+            input.send_keys('R')
+
+            self.assertSelectOptions(from_box, [str(self.arthur.id)])
+
+
+
+            # Clearing the text box makes the other options reappear
+
+            input.send_keys([Keys.BACK_SPACE])
+
+            self.assertSelectOptions(from_box, [str(self.arthur.id), str(self.jason.id)])
+
+            input.send_keys([Keys.BACK_SPACE])
+
+            self.assertSelectOptions(from_box,
+
+                        [str(self.arthur.id), str(self.bob.id),
+
+                         str(self.cliff.id), str(self.jason.id),
+
+                         str(self.jenny.id), str(self.john.id)])
+
+
+
+            # -----------------------------------------------------------------
+
+            # Check that chosing a filtered option sends it properly to the
+
+            # 'to' box.
+
+            input.send_keys('a')
+
+            self.assertSelectOptions(from_box, [str(self.arthur.id), str(self.jason.id)])
+
+            self.get_select_option(from_box, str(self.jason.id)).click()
+
+            self.selenium.find_element_by_css_selector(choose_link).click()
+
+            self.assertSelectOptions(from_box, [str(self.arthur.id)])
+
+            self.assertSelectOptions(to_box,
+
+                        [str(self.lisa.id), str(self.peter.id),
+
+                         str(self.jason.id)])
+
+
+
+            self.get_select_option(to_box, str(self.lisa.id)).click()
+
+            self.selenium.find_element_by_css_selector(remove_link).click()
+
+            self.assertSelectOptions(from_box,
+
+                        [str(self.arthur.id), str(self.lisa.id)])
+
+            self.assertSelectOptions(to_box,
+
+                        [str(self.peter.id), str(self.jason.id)])
+
+
+
+            input.send_keys([Keys.BACK_SPACE]) # Clear text box
+
+            self.assertSelectOptions(from_box,
+
+                        [str(self.arthur.id), str(self.bob.id),
+
+                         str(self.cliff.id), str(self.jenny.id),
+
+                         str(self.john.id), str(self.lisa.id)])
+
+            self.assertSelectOptions(to_box,
+
+                        [str(self.peter.id), str(self.jason.id)])
+
+
+
+        # Save and check that everything is properly stored in the database ---
+
+        self.selenium.find_element_by_xpath('//input[@value="Save"]').click()
+
+        self.wait_page_loaded()
+
+        self.school = models.School.objects.get(id=self.school.id) # Reload from database
+
+        self.assertEqual(list(self.school.students.all()),
+
+                         [self.jason, self.peter])
+
+        self.assertEqual(list(self.school.alumni.all()),
+
+                         [self.jason, self.peter])
+
+
+
+class HorizontalVerticalFilterSeleniumChromeTests(HorizontalVerticalFilterSeleniumFirefoxTests):
+
+    webdriver_class = 'selenium.webdriver.chrome.webdriver.WebDriver'
+
+
+
+class HorizontalVerticalFilterSeleniumIETests(HorizontalVerticalFilterSeleniumFirefoxTests):
+
+    webdriver_class = 'selenium.webdriver.ie.webdriver.WebDriver'
+
+
+
+
+
+@override_settings(PASSWORD_HASHERS=('django.contrib.auth.hashers.SHA1PasswordHasher',))
+
+class AdminRawIdWidgetSeleniumFirefoxTests(AdminSeleniumWebDriverTestCase):
+
+    available_apps = ['admin_widgets'] + AdminSeleniumWebDriverTestCase.available_apps
+
+    fixtures = ['admin-widgets-users.xml']
+
+    urls = "admin_widgets.urls"
+
+    webdriver_class = 'selenium.webdriver.firefox.webdriver.WebDriver'
+
+
+
+    def setUp(self):
+
+        models.Band.objects.create(id=42, name='Bogey Blues')
+
+        models.Band.objects.create(id=98, name='Green Potatoes')
+
+        super(AdminRawIdWidgetSeleniumFirefoxTests, self).setUp()
+
+
+
+    def test_foreignkey(self):
+
+        self.admin_login(username='super', password='secret', login_url='/')
+
+        self.selenium.get(
+
+            '%s%s' % (self.live_server_url, '/admin_widgets/event/add/'))
+
+        main_window = self.selenium.current_window_handle
+
+
+
+        # No value has been selected yet
+
+        self.assertEqual(
+
+            self.selenium.find_element_by_id('id_main_band').get_attribute('value'),
+
+            '')
+
+
+
+        # Open the popup window and click on a band
+
+        self.selenium.find_element_by_id('lookup_id_main_band').click()
+
+        self.selenium.switch_to_window('id_main_band')
+
+        self.wait_page_loaded()
+
+        link = self.selenium.find_element_by_link_text('Bogey Blues')
+
+        self.assertTrue('/band/42/' in link.get_attribute('href'))
+
+        link.click()
+
+
+
+        # The field now contains the selected band's id
+
+        self.selenium.switch_to_window(main_window)
+
+        self.assertEqual(
+
+            self.selenium.find_element_by_id('id_main_band').get_attribute('value'),
+
+            '42')
+
+
+
+        # Reopen the popup window and click on another band
+
+        self.selenium.find_element_by_id('lookup_id_main_band').click()
+
+        self.selenium.switch_to_window('id_main_band')
+
+        self.wait_page_loaded()
+
+        link = self.selenium.find_element_by_link_text('Green Potatoes')
+
+        self.assertTrue('/band/98/' in link.get_attribute('href'))
+
+        link.click()
+
+
+
+        # The field now contains the other selected band's id
+
+        self.selenium.switch_to_window(main_window)
+
+        self.assertEqual(
+
+            self.selenium.find_element_by_id('id_main_band').get_attribute('value'),
+
+            '98')
+
+
+
+    def test_many_to_many(self):
+
+        self.admin_login(username='super', password='secret', login_url='/')
+
+        self.selenium.get(
+
+            '%s%s' % (self.live_server_url, '/admin_widgets/event/add/'))
+
+        main_window = self.selenium.current_window_handle
+
+
+
+        # No value has been selected yet
+
+        self.assertEqual(
+
+            self.selenium.find_element_by_id('id_supporting_bands').get_attribute('value'),
+
+            '')
+
+
+
+        # Open the popup window and click on a band
+
+        self.selenium.find_element_by_id('lookup_id_supporting_bands').click()
+
+        self.selenium.switch_to_window('id_supporting_bands')
+
+        self.wait_page_loaded()
+
+        link = self.selenium.find_element_by_link_text('Bogey Blues')
+
+        self.assertTrue('/band/42/' in link.get_attribute('href'))
+
+        link.click()
+
+
+
+        # The field now contains the selected band's id
+
+        self.selenium.switch_to_window(main_window)
+
+        self.assertEqual(
+
+            self.selenium.find_element_by_id('id_supporting_bands').get_attribute('value'),
+
+            '42')
+
+
+
+        # Reopen the popup window and click on another band
+
+        self.selenium.find_element_by_id('lookup_id_supporting_bands').click()
+
+        self.selenium.switch_to_window('id_supporting_bands')
+
+        self.wait_page_loaded()
+
+        link = self.selenium.find_element_by_link_text('Green Potatoes')
+
+        self.assertTrue('/band/98/' in link.get_attribute('href'))
+
+        link.click()
+
+
+
+        # The field now contains the two selected bands' ids
+
+        self.selenium.switch_to_window(main_window)
+
+        self.assertEqual(
+
+            self.selenium.find_element_by_id('id_supporting_bands').get_attribute('value'),
+
+            '42,98')
+
+
+
+class AdminRawIdWidgetSeleniumChromeTests(AdminRawIdWidgetSeleniumFirefoxTests):
+
+    webdriver_class = 'selenium.webdriver.chrome.webdriver.WebDriver'
+
+
+
+class AdminRawIdWidgetSeleniumIETests(AdminRawIdWidgetSeleniumFirefoxTests):
+
+    webdriver_class = 'selenium.webdriver.ie.webdriver.WebDriver'

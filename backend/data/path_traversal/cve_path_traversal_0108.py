@@ -2,1058 +2,2066 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-import os
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-import hashlib
+
+
+# Copyright 2012 OpenStack LLC
+
+#
+
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
+
+# not use this file except in compliance with the License. You may obtain
+
+# a copy of the License at
+
+#
+
+#      http://www.apache.org/licenses/LICENSE-2.0
+
+#
+
+# Unless required by applicable law or agreed to in writing, software
+
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+
+# License for the specific language governing permissions and limitations
+
+# under the License.
+
+
+
+import uuid
+
+import routes
 
 import json
 
-import random
 
-import string
 
-import sys
+from keystone import config
 
-import tempfile
+from keystone import catalog
 
-import warnings
+from keystone.common import cms
 
+from keystone.common import logging
 
+from keystone.common import wsgi
 
-from rply.errors import ParserGeneratorError, ParserGeneratorWarning
+from keystone import exception
 
-from rply.grammar import Grammar
+from keystone import identity
 
-from rply.parser import LRParser
+from keystone.openstack.common import timeutils
 
-from rply.utils import IdentityDict, Counter, iteritems, itervalues
+from keystone import policy
 
+from keystone import token
 
 
 
 
-LARGE_VALUE = sys.maxsize
 
+LOG = logging.getLogger(__name__)
 
 
 
 
-class ParserGenerator(object):
 
-    VERSION = 1
+class V3Router(wsgi.ComposingRouter):
 
+    def crud_routes(self, mapper, controller, collection_key, key):
 
+        collection_path = '/%(collection_key)s' % {
 
-    def __init__(self, tokens, precedence=[], cache_id=None):
+            'collection_key': collection_key}
 
-        self.tokens = tokens
+        entity_path = '/%(collection_key)s/{%(key)s_id}' % {
 
-        self.productions = []
+            'collection_key': collection_key,
 
-        self.precedence = precedence
+            'key': key}
 
-        if cache_id is None:
 
-            # This ensures that we always go through the caching code.
 
-            cache_id = "".join(random.choice(string.ascii_letters) for _ in range(6))
+        mapper.connect(
 
-        self.cache_id = cache_id
+            collection_path,
 
-        self.error_handler = None
+            controller=controller,
 
+            action='create_%s' % key,
 
+            conditions=dict(method=['POST']))
 
-    def production(self, rule, precedence=None):
+        mapper.connect(
 
-        parts = rule.split()
+            collection_path,
 
-        production_name = parts[0]
+            controller=controller,
 
-        if parts[1] != ":":
+            action='list_%s' % collection_key,
 
-            raise ParserGeneratorError("Expecting :")
+            conditions=dict(method=['GET']))
 
-        syms = parts[2:]
+        mapper.connect(
 
+            entity_path,
 
+            controller=controller,
 
-        def inner(func):
+            action='get_%s' % key,
 
-            self.productions.append((production_name, syms, func, precedence))
+            conditions=dict(method=['GET']))
 
-            return func
+        mapper.connect(
 
-        return inner
+            entity_path,
 
+            controller=controller,
 
+            action='update_%s' % key,
 
-    def error(self, func):
+            conditions=dict(method=['PATCH']))
 
-        self.error_handler = func
+        mapper.connect(
 
-        return func
+            entity_path,
 
+            controller=controller,
 
+            action='delete_%s' % key,
 
-    def compute_grammar_hash(self, g):
+            conditions=dict(method=['DELETE']))
 
-        hasher = hashlib.sha1()
 
-        hasher.update(g.start.encode())
 
-        hasher.update(json.dumps(sorted(g.terminals)).encode())
+    def __init__(self):
 
-        for term, (assoc, level) in sorted(iteritems(g.precedence)):
+        mapper = routes.Mapper()
 
-            hasher.update(term.encode())
 
-            hasher.update(assoc.encode())
 
-            hasher.update(bytes(level))
+        apis = dict(
 
-        for p in g.productions:
+            catalog_api=catalog.Manager(),
 
-            hasher.update(p.name.encode())
+            identity_api=identity.Manager(),
 
-            hasher.update(json.dumps(p.prec).encode())
+            policy_api=policy.Manager(),
 
-            hasher.update(json.dumps(p.prod).encode())
+            token_api=token.Manager())
 
-        return hasher.hexdigest()
 
 
+        # Catalog
 
-    def serialize_table(self, table):
 
-        return {
 
-            "lr_action": table.lr_action,
+        self.crud_routes(
 
-            "lr_goto": table.lr_goto,
+            mapper,
 
-            "sr_conflicts": table.sr_conflicts,
+            catalog.ServiceControllerV3(**apis),
 
-            "rr_conflicts": table.rr_conflicts,
+            'services',
 
-            "default_reductions": table.default_reductions,
+            'service')
 
-            "start": table.grammar.start,
 
-            "terminals": sorted(table.grammar.terminals),
 
-            "precedence": table.grammar.precedence,
+        self.crud_routes(
 
-            "productions": [(p.name, p.prod, p.prec) for p in table.grammar.productions],
+            mapper,
+
+            catalog.EndpointControllerV3(**apis),
+
+            'endpoints',
+
+            'endpoint')
+
+
+
+        # Identity
+
+
+
+        self.crud_routes(
+
+            mapper,
+
+            identity.DomainControllerV3(**apis),
+
+            'domains',
+
+            'domain')
+
+
+
+        project_controller = identity.ProjectControllerV3(**apis)
+
+        self.crud_routes(
+
+            mapper,
+
+            project_controller,
+
+            'projects',
+
+            'project')
+
+        mapper.connect(
+
+            '/users/{user_id}/projects',
+
+            controller=project_controller,
+
+            action='list_user_projects',
+
+            conditions=dict(method=['GET']))
+
+
+
+        self.crud_routes(
+
+            mapper,
+
+            identity.UserControllerV3(**apis),
+
+            'users',
+
+            'user')
+
+
+
+        self.crud_routes(
+
+            mapper,
+
+            identity.CredentialControllerV3(**apis),
+
+            'credentials',
+
+            'credential')
+
+
+
+        role_controller = identity.RoleControllerV3(**apis)
+
+        self.crud_routes(
+
+            mapper,
+
+            role_controller,
+
+            'roles',
+
+            'role')
+
+        mapper.connect(
+
+            '/projects/{project_id}/users/{user_id}/roles/{role_id}',
+
+            controller=role_controller,
+
+            action='create_grant',
+
+            conditions=dict(method=['PUT']))
+
+        mapper.connect(
+
+            '/projects/{project_id}/users/{user_id}/roles/{role_id}',
+
+            controller=role_controller,
+
+            action='check_grant',
+
+            conditions=dict(method=['HEAD']))
+
+        mapper.connect(
+
+            '/projects/{project_id}/users/{user_id}/roles',
+
+            controller=role_controller,
+
+            action='list_grants',
+
+            conditions=dict(method=['GET']))
+
+        mapper.connect(
+
+            '/projects/{project_id}/users/{user_id}/roles/{role_id}',
+
+            controller=role_controller,
+
+            action='revoke_grant',
+
+            conditions=dict(method=['DELETE']))
+
+        mapper.connect(
+
+            '/domains/{domain_id}/users/{user_id}/roles/{role_id}',
+
+            controller=role_controller,
+
+            action='create_grant',
+
+            conditions=dict(method=['PUT']))
+
+        mapper.connect(
+
+            '/domains/{domain_id}/users/{user_id}/roles/{role_id}',
+
+            controller=role_controller,
+
+            action='check_grant',
+
+            conditions=dict(method=['HEAD']))
+
+        mapper.connect(
+
+            '/domains/{domain_id}/users/{user_id}/roles',
+
+            controller=role_controller,
+
+            action='list_grants',
+
+            conditions=dict(method=['GET']))
+
+        mapper.connect(
+
+            '/domains/{domain_id}/users/{user_id}/roles/{role_id}',
+
+            controller=role_controller,
+
+            action='revoke_grant',
+
+            conditions=dict(method=['DELETE']))
+
+
+
+        # Policy
+
+
+
+        policy_controller = policy.PolicyControllerV3(**apis)
+
+        self.crud_routes(
+
+            mapper,
+
+            policy_controller,
+
+            'policies',
+
+            'policy')
+
+
+
+        # Token
+
+
+
+        """
+
+        # v2.0 LEGACY
+
+        mapper.connect('/tokens/{token_id}',
+
+                       controller=auth_controller,
+
+                       action='validate_token',
+
+                       conditions=dict(method=['GET']))
+
+        mapper.connect('/tokens/{token_id}',
+
+                       controller=auth_controller,
+
+                       action='validate_token_head',
+
+                       conditions=dict(method=['HEAD']))
+
+        mapper.connect('/tokens/{token_id}',
+
+                       controller=auth_controller,
+
+                       action='delete_token',
+
+                       conditions=dict(method=['DELETE']))
+
+        mapper.connect('/tokens/{token_id}/endpoints',
+
+                       controller=auth_controller,
+
+                       action='endpoints',
+
+                       conditions=dict(method=['GET']))
+
+        """
+
+
+
+        super(V3Router, self).__init__(mapper, [])
+
+
+
+
+
+class AdminRouter(wsgi.ComposingRouter):
+
+    def __init__(self):
+
+        mapper = routes.Mapper()
+
+
+
+        version_controller = VersionController('admin')
+
+        mapper.connect('/',
+
+                       controller=version_controller,
+
+                       action='get_version')
+
+
+
+        # Token Operations
+
+        auth_controller = TokenController()
+
+        mapper.connect('/tokens',
+
+                       controller=auth_controller,
+
+                       action='authenticate',
+
+                       conditions=dict(method=['POST']))
+
+        mapper.connect('/tokens/revoked',
+
+                       controller=auth_controller,
+
+                       action='revocation_list',
+
+                       conditions=dict(method=['GET']))
+
+        mapper.connect('/tokens/{token_id}',
+
+                       controller=auth_controller,
+
+                       action='validate_token',
+
+                       conditions=dict(method=['GET']))
+
+        mapper.connect('/tokens/{token_id}',
+
+                       controller=auth_controller,
+
+                       action='validate_token_head',
+
+                       conditions=dict(method=['HEAD']))
+
+        mapper.connect('/tokens/{token_id}',
+
+                       controller=auth_controller,
+
+                       action='delete_token',
+
+                       conditions=dict(method=['DELETE']))
+
+        mapper.connect('/tokens/{token_id}/endpoints',
+
+                       controller=auth_controller,
+
+                       action='endpoints',
+
+                       conditions=dict(method=['GET']))
+
+
+
+        # Certificates used to verify auth tokens
+
+        mapper.connect('/certificates/ca',
+
+                       controller=auth_controller,
+
+                       action='ca_cert',
+
+                       conditions=dict(method=['GET']))
+
+
+
+        mapper.connect('/certificates/signing',
+
+                       controller=auth_controller,
+
+                       action='signing_cert',
+
+                       conditions=dict(method=['GET']))
+
+
+
+        # Miscellaneous Operations
+
+        extensions_controller = AdminExtensionsController()
+
+        mapper.connect('/extensions',
+
+                       controller=extensions_controller,
+
+                       action='get_extensions_info',
+
+                       conditions=dict(method=['GET']))
+
+        mapper.connect('/extensions/{extension_alias}',
+
+                       controller=extensions_controller,
+
+                       action='get_extension_info',
+
+                       conditions=dict(method=['GET']))
+
+        identity_router = identity.AdminRouter()
+
+        routers = [identity_router]
+
+        super(AdminRouter, self).__init__(mapper, routers)
+
+
+
+
+
+class PublicRouter(wsgi.ComposingRouter):
+
+    def __init__(self):
+
+        mapper = routes.Mapper()
+
+
+
+        version_controller = VersionController('public')
+
+        mapper.connect('/',
+
+                       controller=version_controller,
+
+                       action='get_version')
+
+
+
+        # Token Operations
+
+        auth_controller = TokenController()
+
+        mapper.connect('/tokens',
+
+                       controller=auth_controller,
+
+                       action='authenticate',
+
+                       conditions=dict(method=['POST']))
+
+
+
+        mapper.connect('/certificates/ca',
+
+                       controller=auth_controller,
+
+                       action='ca_cert',
+
+                       conditions=dict(method=['GET']))
+
+
+
+        mapper.connect('/certificates/signing',
+
+                       controller=auth_controller,
+
+                       action='signing_cert',
+
+                       conditions=dict(method=['GET']))
+
+
+
+        # Miscellaneous
+
+        extensions_controller = PublicExtensionsController()
+
+        mapper.connect('/extensions',
+
+                       controller=extensions_controller,
+
+                       action='get_extensions_info',
+
+                       conditions=dict(method=['GET']))
+
+        mapper.connect('/extensions/{extension_alias}',
+
+                       controller=extensions_controller,
+
+                       action='get_extension_info',
+
+                       conditions=dict(method=['GET']))
+
+
+
+        identity_router = identity.PublicRouter()
+
+        routers = [identity_router]
+
+
+
+        super(PublicRouter, self).__init__(mapper, routers)
+
+
+
+
+
+class PublicVersionRouter(wsgi.ComposingRouter):
+
+    def __init__(self):
+
+        mapper = routes.Mapper()
+
+        version_controller = VersionController('public')
+
+        mapper.connect('/',
+
+                       controller=version_controller,
+
+                       action='get_versions')
+
+        routers = []
+
+        super(PublicVersionRouter, self).__init__(mapper, routers)
+
+
+
+
+
+class AdminVersionRouter(wsgi.ComposingRouter):
+
+    def __init__(self):
+
+        mapper = routes.Mapper()
+
+        version_controller = VersionController('admin')
+
+        mapper.connect('/',
+
+                       controller=version_controller,
+
+                       action='get_versions')
+
+        routers = []
+
+        super(AdminVersionRouter, self).__init__(mapper, routers)
+
+
+
+
+
+class VersionController(wsgi.Application):
+
+    def __init__(self, version_type):
+
+        self.catalog_api = catalog.Manager()
+
+        self.url_key = '%sURL' % version_type
+
+
+
+        super(VersionController, self).__init__()
+
+
+
+    def _get_identity_url(self, context):
+
+        catalog_ref = self.catalog_api.get_catalog(context=context,
+
+                                                   user_id=None,
+
+                                                   tenant_id=None)
+
+        for region, region_ref in catalog_ref.iteritems():
+
+            for service, service_ref in region_ref.iteritems():
+
+                if service == 'identity':
+
+                    return service_ref[self.url_key]
+
+
+
+        raise exception.NotImplemented()
+
+
+
+    def _get_versions_list(self, context):
+
+        """The list of versions is dependent on the context."""
+
+        identity_url = self._get_identity_url(context)
+
+        if not identity_url.endswith('/'):
+
+            identity_url = identity_url + '/'
+
+
+
+        versions = {}
+
+        versions['v2.0'] = {
+
+            'id': 'v2.0',
+
+            'status': 'beta',
+
+            'updated': '2011-11-19T00:00:00Z',
+
+            'links': [
+
+                {
+
+                    'rel': 'self',
+
+                    'href': identity_url,
+
+                }, {
+
+                    'rel': 'describedby',
+
+                    'type': 'text/html',
+
+                    'href': 'http://docs.openstack.org/api/openstack-'
+
+                            'identity-service/2.0/content/'
+
+                }, {
+
+                    'rel': 'describedby',
+
+                    'type': 'application/pdf',
+
+                    'href': 'http://docs.openstack.org/api/openstack-'
+
+                            'identity-service/2.0/identity-dev-guide-'
+
+                            '2.0.pdf'
+
+                }
+
+            ],
+
+            'media-types': [
+
+                {
+
+                    'base': 'application/json',
+
+                    'type': 'application/vnd.openstack.identity-v2.0'
+
+                            '+json'
+
+                }, {
+
+                    'base': 'application/xml',
+
+                    'type': 'application/vnd.openstack.identity-v2.0'
+
+                            '+xml'
+
+                }
+
+            ]
 
         }
 
 
 
-    def data_is_valid(self, g, data):
+        return versions
 
-        if g.start != data["start"]:
 
-            return False
 
-        if sorted(g.terminals) != data["terminals"]:
+    def get_versions(self, context):
 
-            return False
+        versions = self._get_versions_list(context)
 
-        if sorted(g.precedence) != sorted(data["precedence"]):
+        return wsgi.render_response(status=(300, 'Multiple Choices'), body={
 
-            return False
+            'versions': {
 
-        for key, (assoc, level) in iteritems(g.precedence):
+                'values': versions.values()
 
-            if data["precedence"][key] != [assoc, level]:
+            }
 
-                return False
+        })
 
-        if len(g.productions) != len(data["productions"]):
 
-            return False
 
-        for p, (name, prod, (assoc, level)) in zip(g.productions, data["productions"]):
+    def get_version(self, context):
 
-            if p.name != name:
+        versions = self._get_versions_list(context)
 
-                return False
+        return wsgi.render_response(body={
 
-            if p.prod != prod:
+            'version': versions['v2.0']
 
-                return False
+        })
 
-            if p.prec != (assoc, level):
 
-                return False
 
-        return True
 
 
+class NoopController(wsgi.Application):
 
-    def build(self):
+    def __init__(self):
 
-        g = Grammar(self.tokens)
+        super(NoopController, self).__init__()
 
 
 
-        for level, (assoc, terms) in enumerate(self.precedence, 1):
+    def noop(self, context):
 
-            for term in terms:
+        return {}
 
-                g.set_precedence(term, assoc, level)
 
 
 
-        for prod_name, syms, func, precedence in self.productions:
 
-            g.add_production(prod_name, syms, func, precedence)
+class ExternalAuthNotApplicable(Exception):
 
+    """External authentication is not applicable"""
 
 
-        g.set_start()
 
 
 
-        for unused_term in g.unused_terminals():
+class TokenController(wsgi.Application):
 
-            warnings.warn(
+    def __init__(self):
 
-                "Token %r is unused" % unused_term,
+        self.catalog_api = catalog.Manager()
 
-                ParserGeneratorWarning,
+        self.identity_api = identity.Manager()
 
-                stacklevel=2
+        self.token_api = token.Manager()
 
-            )
+        self.policy_api = policy.Manager()
 
-        for unused_prod in g.unused_productions():
+        super(TokenController, self).__init__()
 
-            warnings.warn(
 
-                "Production %r is not reachable" % unused_prod,
 
-                ParserGeneratorWarning,
+    def ca_cert(self, context, auth=None):
 
-                stacklevel=2
+        ca_file = open(config.CONF.signing.ca_certs, 'r')
 
-            )
+        data = ca_file.read()
 
+        ca_file.close()
 
+        return data
 
-        g.build_lritems()
 
-        g.compute_first()
 
-        g.compute_follow()
+    def signing_cert(self, context, auth=None):
 
+        cert_file = open(config.CONF.signing.certfile, 'r')
 
+        data = cert_file.read()
 
-        cache_file = os.path.join(
+        cert_file.close()
 
-            tempfile.gettempdir(),
+        return data
 
-            "rply-%s-%s-%s.json" % (self.VERSION, self.cache_id, self.compute_grammar_hash(g))
 
-        )
 
-        table = None
+    def authenticate(self, context, auth=None):
 
-        if os.path.exists(cache_file):
+        """Authenticate credentials and return a token.
 
-            with open(cache_file) as f:
 
-                data = json.load(f)
 
-            if self.data_is_valid(g, data):
+        Accept auth as a dict that looks like::
 
-                table = LRTable.from_cache(g, data)
 
-        if table is None:
 
-            table = LRTable.from_grammar(g)
+            {
 
-            with open(cache_file, "w") as f:
+                "auth":{
 
-                json.dump(self.serialize_table(table), f)
+                    "passwordCredentials":{
 
-        if table.sr_conflicts:
+                        "username":"test_user",
 
-            warnings.warn(
+                        "password":"mypass"
 
-                "%d shift/reduce conflict%s" % (len(table.sr_conflicts), "s" if len(table.sr_conflicts) > 1 else ""),
+                    },
 
-                ParserGeneratorWarning,
+                    "tenantName":"customer-x"
 
-                stacklevel=2,
+                }
 
-            )
+            }
 
-        if table.rr_conflicts:
 
-            warnings.warn(
 
-                "%d reduce/reduce conflict%s" % (len(table.rr_conflicts), "s" if len(table.rr_conflicts) > 1 else ""),
+        In this case, tenant is optional, if not provided the token will be
 
-                ParserGeneratorWarning,
+        considered "unscoped" and can later be used to get a scoped token.
 
-                stacklevel=2,
 
-            )
 
-        return LRParser(table, self.error_handler)
+        Alternatively, this call accepts auth with only a token and tenant
 
+        that will return a token that is scoped to that tenant.
 
+        """
 
 
 
-def digraph(X, R, FP):
+        if auth is None:
 
-    N = dict.fromkeys(X, 0)
+            raise exception.ValidationError(attribute='auth',
 
-    stack = []
+                                            target='request body')
 
-    F = {}
 
-    for x in X:
 
-        if N[x] == 0:
+        auth_token_data = None
 
-            traverse(x, N, stack, F, X, R, FP)
 
-    return F
 
+        if "token" in auth:
 
+            # Try to authenticate using a token
 
+            auth_token_data, auth_info = self._authenticate_token(
 
+                context, auth)
 
-def traverse(x, N, stack, F, X, R, FP):
+        else:
 
-    stack.append(x)
+            # Try external authentication
 
-    d = len(stack)
+            try:
 
-    N[x] = d
+                auth_token_data, auth_info = self._authenticate_external(
 
-    F[x] = FP(x)
+                    context, auth)
 
+            except ExternalAuthNotApplicable:
 
+                # Try local authentication
 
-    rel = R(x)
+                auth_token_data, auth_info = self._authenticate_local(
 
-    for y in rel:
+                    context, auth)
 
-        if N[y] == 0:
 
-            traverse(y, N, stack, F, X, R, FP)
 
-        N[x] = min(N[x], N[y])
+        user_ref, tenant_ref, metadata_ref = auth_info
 
-        for a in F.get(y, []):
 
-            if a not in F[x]:
 
-                F[x].append(a)
+        # If the user is disabled don't allow them to authenticate
 
-    if N[x] == d:
+        if not user_ref.get('enabled', True):
 
-        N[stack[-1]] = LARGE_VALUE
+            msg = 'User is disabled: %s' % user_ref['id']
 
-        F[stack[-1]] = F[x]
+            LOG.warning(msg)
 
-        element = stack.pop()
+            raise exception.Unauthorized(msg)
 
-        while element != x:
 
-            N[stack[-1]] = LARGE_VALUE
 
-            F[stack[-1]] = F[x]
+        # If the tenant is disabled don't allow them to authenticate
 
-            element = stack.pop()
+        if tenant_ref and not tenant_ref.get('enabled', True):
 
+            msg = 'Tenant is disabled: %s' % tenant_ref['id']
 
+            LOG.warning(msg)
 
+            raise exception.Unauthorized(msg)
 
 
-class LRTable(object):
 
-    def __init__(self, grammar, lr_action, lr_goto, default_reductions, sr_conflicts, rr_conflicts):
+        if tenant_ref:
 
-        self.grammar = grammar
+            catalog_ref = self.catalog_api.get_catalog(
 
-        self.lr_action = lr_action
+                context=context,
 
-        self.lr_goto = lr_goto
+                user_id=user_ref['id'],
 
-        self.default_reductions = default_reductions
+                tenant_id=tenant_ref['id'],
 
-        self.sr_conflicts = sr_conflicts
+                metadata=metadata_ref)
 
-        self.rr_conflicts = rr_conflicts
+        else:
 
+            catalog_ref = {}
 
 
-    @classmethod
 
-    def from_cache(cls, grammar, data):
+        auth_token_data['id'] = 'placeholder'
 
-        lr_action = [
 
-            dict([(str(k), v) for k, v in iteritems(action)])
 
-            for action in data["lr_action"]
+        roles_ref = []
 
-        ]
+        for role_id in metadata_ref.get('roles', []):
 
-        lr_goto = [
+            role_ref = self.identity_api.get_role(context, role_id)
 
-            dict([(str(k), v) for k, v in iteritems(goto)])
+            roles_ref.append(dict(name=role_ref['name']))
 
-            for goto in data["lr_goto"]
 
-        ]
 
-        return LRTable(
+        token_data = self._format_token(auth_token_data, roles_ref)
 
-            grammar,
 
-            lr_action,
 
-            lr_goto,
+        service_catalog = self._format_catalog(catalog_ref)
 
-            data["default_reductions"],
+        token_data['access']['serviceCatalog'] = service_catalog
 
-            data["sr_conflicts"],
 
-            data["rr_conflicts"]
 
-        )
+        if config.CONF.signing.token_format == 'UUID':
 
+            token_id = uuid.uuid4().hex
 
+        elif config.CONF.signing.token_format == 'PKI':
 
-    @classmethod
+            token_id = cms.cms_sign_token(json.dumps(token_data),
 
-    def from_grammar(cls, grammar):
+                                          config.CONF.signing.certfile,
 
-        cidhash = IdentityDict()
+                                          config.CONF.signing.keyfile)
 
-        goto_cache = {}
+        else:
 
-        add_count = Counter()
+            raise exception.UnexpectedError(
 
-        C = cls.lr0_items(grammar, add_count, cidhash, goto_cache)
+                'Invalid value for token_format: %s.'
 
+                '  Allowed values are PKI or UUID.' %
 
+                config.CONF.signing.token_format)
 
-        cls.add_lalr_lookaheads(grammar, C, add_count, cidhash, goto_cache)
+        try:
 
+            self.token_api.create_token(
 
+                context, token_id, dict(key=token_id,
 
-        lr_action = [None] * len(C)
+                                        id=token_id,
 
-        lr_goto = [None] * len(C)
+                                        user=user_ref,
 
-        sr_conflicts = []
+                                        tenant=tenant_ref,
 
-        rr_conflicts = []
+                                        metadata=metadata_ref))
 
-        for st, I in enumerate(C):
+        except Exception as e:
 
-            st_action = {}
+            # an identical token may have been created already.
 
-            st_actionp = {}
+            # if so, return the token_data as it is also identical
 
-            st_goto = {}
+            try:
 
-            for p in I:
+                self.token_api.get_token(context=context,
 
-                if p.getlength() == p.lr_index + 1:
+                                         token_id=token_id)
 
-                    if p.name == "S'":
+            except exception.TokenNotFound:
 
-                        # Start symbol. Accept!
+                raise e
 
-                        st_action["$end"] = 0
 
-                        st_actionp["$end"] = p
 
-                    else:
+        token_data['access']['token']['id'] = token_id
 
-                        laheads = p.lookaheads[st]
 
-                        for a in laheads:
 
-                            if a in st_action:
+        return token_data
 
-                                r = st_action[a]
 
-                                if r > 0:
 
-                                    sprec, slevel = grammar.productions[st_actionp[a].number].prec
+    def _authenticate_token(self, context, auth):
 
-                                    rprec, rlevel = grammar.precedence.get(a, ("right", 0))
+        """Try to authenticate using an already existing token.
 
-                                    if (slevel < rlevel) or (slevel == rlevel and rprec == "left"):
 
-                                        st_action[a] = -p.number
 
-                                        st_actionp[a] = p
+        Returns auth_token_data, (user_ref, tenant_ref, metadata_ref)
 
-                                        if not slevel and not rlevel:
+        """
 
-                                            sr_conflicts.append((st, repr(a), "reduce"))
+        if 'token' not in auth:
 
-                                        grammar.productions[p.number].reduced += 1
+            raise exception.ValidationError(
 
-                                    elif not (slevel == rlevel and rprec == "nonassoc"):
+                attribute='token', target='auth')
 
-                                        if not rlevel:
 
-                                            sr_conflicts.append((st, repr(a), "shift"))
 
-                                elif r < 0:
+        if "id" not in auth['token']:
 
-                                    oldp = grammar.productions[-r]
+            raise exception.ValidationError(
 
-                                    pp = grammar.productions[p.number]
+                attribute="id", target="token")
 
-                                    if oldp.number > pp.number:
 
-                                        st_action[a] = -p.number
 
-                                        st_actionp[a] = p
+        old_token = auth['token']['id']
 
-                                        chosenp, rejectp = pp, oldp
 
-                                        grammar.productions[p.number].reduced += 1
 
-                                        grammar.productions[oldp.number].reduced -= 1
+        try:
 
-                                    else:
+            old_token_ref = self.token_api.get_token(context=context,
 
-                                        chosenp, rejectp = oldp, pp
+                                                     token_id=old_token)
 
-                                    rr_conflicts.append((st, repr(chosenp), repr(rejectp)))
+        except exception.NotFound as e:
 
-                                else:
+            raise exception.Unauthorized(e)
 
-                                    raise LALRError("Unknown conflict in state %d" % st)
 
-                            else:
 
-                                st_action[a] = -p.number
+        user_ref = old_token_ref['user']
 
-                                st_actionp[a] = p
+        user_id = user_ref['id']
 
-                                grammar.productions[p.number].reduced += 1
 
-                else:
 
-                    i = p.lr_index
+        current_user_ref = self.identity_api.get_user(context=context,
 
-                    a = p.prod[i + 1]
+                                                      user_id=user_id)
 
-                    if a in grammar.terminals:
 
-                        g = cls.lr0_goto(I, a, add_count, goto_cache)
 
-                        j = cidhash.get(g, -1)
+        tenant_id = self._get_tenant_id_from_auth(context, auth)
 
-                        if j >= 0:
 
-                            if a in st_action:
 
-                                r = st_action[a]
+        tenant_ref = self._get_tenant_ref(context, user_id, tenant_id)
 
-                                if r > 0:
+        metadata_ref = self._get_metadata_ref(context, user_id, tenant_id)
 
-                                    if r != j:
 
-                                        raise LALRError("Shift/shift conflict in state %d" % st)
 
-                                elif r < 0:
+        expiry = old_token_ref['expires']
 
-                                    rprec, rlevel = grammar.productions[st_actionp[a].number].prec
+        auth_token_data = self._get_auth_token_data(current_user_ref,
 
-                                    sprec, slevel = grammar.precedence.get(a, ("right", 0))
+                                                    tenant_ref,
 
-                                    if (slevel > rlevel) or (slevel == rlevel and rprec == "right"):
+                                                    metadata_ref,
 
-                                        grammar.productions[st_actionp[a].number].reduced -= 1
+                                                    expiry)
 
-                                        st_action[a] = j
 
-                                        st_actionp[a] = p
 
-                                        if not rlevel:
+        return auth_token_data, (current_user_ref, tenant_ref, metadata_ref)
 
-                                            sr_conflicts.append((st, repr(a), "shift"))
 
-                                    elif not (slevel == rlevel and rprec == "nonassoc"):
 
-                                        if not slevel and not rlevel:
+    def _authenticate_local(self, context, auth):
 
-                                            sr_conflicts.append((st, repr(a), "reduce"))
+        """Try to authenticate against the identity backend.
 
-                                else:
 
-                                    raise LALRError("Unknown conflict in state %d" % st)
 
-                            else:
+        Returns auth_token_data, (user_ref, tenant_ref, metadata_ref)
 
-                                st_action[a] = j
+        """
 
-                                st_actionp[a] = p
+        if 'passwordCredentials' not in auth:
 
-            nkeys = set()
+            raise exception.ValidationError(
 
-            for ii in I:
+                attribute='passwordCredentials', target='auth')
 
-                for s in ii.unique_syms:
 
-                    if s in grammar.nonterminals:
 
-                        nkeys.add(s)
+        if "password" not in auth['passwordCredentials']:
 
-            for n in nkeys:
+            raise exception.ValidationError(
 
-                g = cls.lr0_goto(I, n, add_count, goto_cache)
+                attribute='password', target='passwordCredentials')
 
-                j = cidhash.get(g, -1)
 
-                if j >= 0:
 
-                    st_goto[n] = j
+        password = auth['passwordCredentials']['password']
 
 
 
-            lr_action[st] = st_action
+        if ("userId" not in auth['passwordCredentials'] and
 
-            lr_goto[st] = st_goto
+                "username" not in auth['passwordCredentials']):
 
+            raise exception.ValidationError(
 
+                attribute='username or userId',
 
-        default_reductions = [0] * len(lr_action)
+                target='passwordCredentials')
 
-        for state, actions in enumerate(lr_action):
 
-            actions = set(itervalues(actions))
 
-            if len(actions) == 1 and next(iter(actions)) < 0:
+        user_id = auth['passwordCredentials'].get('userId', None)
 
-                default_reductions[state] = next(iter(actions))
+        username = auth['passwordCredentials'].get('username', '')
 
-        return LRTable(grammar, lr_action, lr_goto, default_reductions, sr_conflicts, rr_conflicts)
 
 
+        if username:
 
-    @classmethod
+            try:
 
-    def lr0_items(cls, grammar, add_count, cidhash, goto_cache):
+                user_ref = self.identity_api.get_user_by_name(
 
-        C = [cls.lr0_closure([grammar.productions[0].lr_next], add_count)]
+                    context=context, user_name=username)
 
-        for i, I in enumerate(C):
+                user_id = user_ref['id']
 
-            cidhash[I] = i
+            except exception.UserNotFound as e:
 
+                raise exception.Unauthorized(e)
 
 
-        i = 0
 
-        while i < len(C):
+        tenant_id = self._get_tenant_id_from_auth(context, auth)
 
-            I = C[i]
 
-            i += 1
 
+        try:
 
+            auth_info = self.identity_api.authenticate(
 
-            asyms = set()
+                context=context,
 
-            for ii in I:
+                user_id=user_id,
 
-                asyms.update(ii.unique_syms)
+                password=password,
 
-            for x in asyms:
+                tenant_id=tenant_id)
 
-                g = cls.lr0_goto(I, x, add_count, goto_cache)
+        except AssertionError as e:
 
-                if not g:
+            raise exception.Unauthorized(e)
 
-                    continue
+        (user_ref, tenant_ref, metadata_ref) = auth_info
 
-                if g in cidhash:
 
-                    continue
 
-                cidhash[g] = len(C)
+        expiry = self.token_api._get_default_expire_time(context=context)
 
-                C.append(g)
+        auth_token_data = self._get_auth_token_data(user_ref,
 
-        return C
+                                                    tenant_ref,
 
+                                                    metadata_ref,
 
+                                                    expiry)
 
-    @classmethod
 
-    def lr0_closure(cls, I, add_count):
 
-        add_count.incr()
+        return auth_token_data, (user_ref, tenant_ref, metadata_ref)
 
 
 
-        J = I[:]
+    def _authenticate_external(self, context, auth):
 
-        added = True
+        """Try to authenticate an external user via REMOTE_USER variable.
 
-        while added:
 
-            added = False
 
-            for j in J:
+        Returns auth_token_data, (user_ref, tenant_ref, metadata_ref)
 
-                for x in j.lr_after:
+        """
 
-                    if x.lr0_added == add_count.value:
+        if 'REMOTE_USER' not in context:
 
-                        continue
+            raise ExternalAuthNotApplicable()
 
-                    J.append(x.lr_next)
 
-                    x.lr0_added = add_count.value
 
-                    added = True
+        username = context['REMOTE_USER']
 
-        return J
+        try:
 
+            user_ref = self.identity_api.get_user_by_name(
 
+                context=context, user_name=username)
 
-    @classmethod
+            user_id = user_ref['id']
 
-    def lr0_goto(cls, I, x, add_count, goto_cache):
+        except exception.UserNotFound as e:
 
-        s = goto_cache.setdefault(x, IdentityDict())
+            raise exception.Unauthorized(e)
 
 
 
-        gs = []
+        tenant_id = self._get_tenant_id_from_auth(context, auth)
 
-        for p in I:
 
-            n = p.lr_next
 
-            if n and n.lr_before == x:
+        tenant_ref = self._get_tenant_ref(context, user_id, tenant_id)
 
-                s1 = s.get(n)
+        metadata_ref = self._get_metadata_ref(context, user_id, tenant_id)
 
-                if not s1:
 
-                    s1 = {}
 
-                    s[n] = s1
+        expiry = self.token_api._get_default_expire_time(context=context)
 
-                gs.append(n)
+        auth_token_data = self._get_auth_token_data(user_ref,
 
-                s = s1
+                                                    tenant_ref,
 
-        g = s.get("$end")
+                                                    metadata_ref,
 
-        if not g:
+                                                    expiry)
 
-            if gs:
 
-                g = cls.lr0_closure(gs, add_count)
 
-                s["$end"] = g
+        return auth_token_data, (user_ref, tenant_ref, metadata_ref)
+
+
+
+    def _get_auth_token_data(self, user, tenant, metadata, expiry):
+
+        return dict(dict(user=user,
+
+                         tenant=tenant,
+
+                         metadata=metadata,
+
+                         expires=expiry))
+
+
+
+    def _get_tenant_id_from_auth(self, context, auth):
+
+        """Extract tenant information from auth dict.
+
+
+
+        Returns a valid tenant_id if it exists, or None if not specified.
+
+        """
+
+        tenant_id = auth.get('tenantId', None)
+
+        tenant_name = auth.get('tenantName', None)
+
+        if tenant_name:
+
+            try:
+
+                tenant_ref = self.identity_api.get_tenant_by_name(
+
+                    context=context, tenant_name=tenant_name)
+
+                tenant_id = tenant_ref['id']
+
+            except exception.TenantNotFound as e:
+
+                raise exception.Unauthorized(e)
+
+        return tenant_id
+
+
+
+    def _get_tenant_ref(self, context, user_id, tenant_id):
+
+        """Returns the tenant_ref for the user's tenant"""
+
+        tenant_ref = None
+
+        if tenant_id:
+
+            tenants = self.identity_api.get_tenants_for_user(context, user_id)
+
+            if tenant_id not in tenants:
+
+                msg = 'User %s is unauthorized for tenant %s' % (
+
+                    user_id, tenant_id)
+
+                LOG.warning(msg)
+
+                raise exception.Unauthorized(msg)
+
+
+
+            try:
+
+                tenant_ref = self.identity_api.get_tenant(context=context,
+
+                                                          tenant_id=tenant_id)
+
+            except exception.TenantNotFound as e:
+
+                exception.Unauthorized(e)
+
+        return tenant_ref
+
+
+
+    def _get_metadata_ref(self, context, user_id, tenant_id):
+
+        """Returns the metadata_ref for a user in a tenant"""
+
+        metadata_ref = {}
+
+        if tenant_id:
+
+            try:
+
+                metadata_ref = self.identity_api.get_metadata(
+
+                    context=context,
+
+                    user_id=user_id,
+
+                    tenant_id=tenant_id)
+
+            except exception.MetadataNotFound:
+
+                metadata_ref = {}
+
+
+
+        return metadata_ref
+
+
+
+    def _get_token_ref(self, context, token_id, belongs_to=None):
+
+        """Returns a token if a valid one exists.
+
+
+
+        Optionally, limited to a token owned by a specific tenant.
+
+
+
+        """
+
+        # TODO(termie): this stuff should probably be moved to middleware
+
+        self.assert_admin(context)
+
+
+
+        if cms.is_ans1_token(token_id):
+
+            data = json.loads(cms.cms_verify(cms.token_to_cms(token_id),
+
+                                             config.CONF.signing.certfile,
+
+                                             config.CONF.signing.ca_certs))
+
+            data['access']['token']['user'] = data['access']['user']
+
+            data['access']['token']['metadata'] = data['access']['metadata']
+
+            if belongs_to:
+
+                assert data['access']['token']['tenant']['id'] == belongs_to
+
+            token_ref = data['access']['token']
+
+        else:
+
+            token_ref = self.token_api.get_token(context=context,
+
+                                                 token_id=token_id)
+
+        return token_ref
+
+
+
+    # admin only
+
+    def validate_token_head(self, context, token_id):
+
+        """Check that a token is valid.
+
+
+
+        Optionally, also ensure that it is owned by a specific tenant.
+
+
+
+        Identical to ``validate_token``, except does not return a response.
+
+
+
+        """
+
+        belongs_to = context['query_string'].get('belongsTo')
+
+        assert self._get_token_ref(context, token_id, belongs_to)
+
+
+
+    # admin only
+
+    def validate_token(self, context, token_id):
+
+        """Check that a token is valid.
+
+
+
+        Optionally, also ensure that it is owned by a specific tenant.
+
+
+
+        Returns metadata about the token along any associated roles.
+
+
+
+        """
+
+        belongs_to = context['query_string'].get('belongsTo')
+
+        token_ref = self._get_token_ref(context, token_id, belongs_to)
+
+
+
+        # TODO(termie): optimize this call at some point and put it into the
+
+        #               the return for metadata
+
+        # fill out the roles in the metadata
+
+        metadata_ref = token_ref['metadata']
+
+        roles_ref = []
+
+        for role_id in metadata_ref.get('roles', []):
+
+            roles_ref.append(self.identity_api.get_role(context, role_id))
+
+
+
+        # Get a service catalog if possible
+
+        # This is needed for on-behalf-of requests
+
+        catalog_ref = None
+
+        if token_ref.get('tenant'):
+
+            catalog_ref = self.catalog_api.get_catalog(
+
+                context=context,
+
+                user_id=token_ref['user']['id'],
+
+                tenant_id=token_ref['tenant']['id'],
+
+                metadata=metadata_ref)
+
+        return self._format_token(token_ref, roles_ref, catalog_ref)
+
+
+
+    def delete_token(self, context, token_id):
+
+        """Delete a token, effectively invalidating it for authz."""
+
+        # TODO(termie): this stuff should probably be moved to middleware
+
+        self.assert_admin(context)
+
+        self.token_api.delete_token(context=context, token_id=token_id)
+
+
+
+    def revocation_list(self, context, auth=None):
+
+        self.assert_admin(context)
+
+        tokens = self.token_api.list_revoked_tokens(context)
+
+
+
+        for t in tokens:
+
+            expires = t['expires']
+
+            if not (expires and isinstance(expires, unicode)):
+
+                    t['expires'] = timeutils.isotime(expires)
+
+        data = {'revoked': tokens}
+
+        json_data = json.dumps(data)
+
+        signed_text = cms.cms_sign_text(json_data,
+
+                                        config.CONF.signing.certfile,
+
+                                        config.CONF.signing.keyfile)
+
+
+
+        return {'signed': signed_text}
+
+
+
+    def endpoints(self, context, token_id):
+
+        """Return a list of endpoints available to the token."""
+
+        self.assert_admin(context)
+
+
+
+        token_ref = self._get_token_ref(context, token_id)
+
+
+
+        catalog_ref = None
+
+        if token_ref.get('tenant'):
+
+            catalog_ref = self.catalog_api.get_catalog(
+
+                context=context,
+
+                user_id=token_ref['user']['id'],
+
+                tenant_id=token_ref['tenant']['id'],
+
+                metadata=token_ref['metadata'])
+
+
+
+        return self._format_endpoint_list(catalog_ref)
+
+
+
+    def _format_authenticate(self, token_ref, roles_ref, catalog_ref):
+
+        o = self._format_token(token_ref, roles_ref)
+
+        o['access']['serviceCatalog'] = self._format_catalog(catalog_ref)
+
+        return o
+
+
+
+    def _format_token(self, token_ref, roles_ref, catalog_ref=None):
+
+        user_ref = token_ref['user']
+
+        metadata_ref = token_ref['metadata']
+
+        expires = token_ref['expires']
+
+        if expires is not None:
+
+            if not isinstance(expires, unicode):
+
+                expires = timeutils.isotime(expires)
+
+        o = {'access': {'token': {'id': token_ref['id'],
+
+                                  'expires': expires,
+
+                                  'issued_at': timeutils.strtime()
+
+                                  },
+
+                        'user': {'id': user_ref['id'],
+
+                                 'name': user_ref['name'],
+
+                                 'username': user_ref['name'],
+
+                                 'roles': roles_ref,
+
+                                 'roles_links': metadata_ref.get('roles_links',
+
+                                                                 [])
+
+                                 }
+
+                        }
+
+             }
+
+        if 'tenant' in token_ref and token_ref['tenant']:
+
+            token_ref['tenant']['enabled'] = True
+
+            o['access']['token']['tenant'] = token_ref['tenant']
+
+        if catalog_ref is not None:
+
+            o['access']['serviceCatalog'] = self._format_catalog(catalog_ref)
+
+        if metadata_ref:
+
+            if 'is_admin' in metadata_ref:
+
+                o['access']['metadata'] = {'is_admin':
+
+                                           metadata_ref['is_admin']}
 
             else:
 
-                s["$end"] = gs
+                o['access']['metadata'] = {'is_admin': 0}
 
-        return g
+        if 'roles' in metadata_ref:
 
+                o['access']['metadata']['roles'] = metadata_ref['roles']
 
+        return o
 
-    @classmethod
 
-    def add_lalr_lookaheads(cls, grammar, C, add_count, cidhash, goto_cache):
 
-        nullable = cls.compute_nullable_nonterminals(grammar)
+    def _format_catalog(self, catalog_ref):
 
-        trans = cls.find_nonterminal_transitions(grammar, C)
+        """Munge catalogs from internal to output format
 
-        readsets = cls.compute_read_sets(grammar, C, trans, nullable, add_count, cidhash, goto_cache)
+        Internal catalogs look like:
 
-        lookd, included = cls.compute_lookback_includes(grammar, C, trans, nullable, add_count, cidhash, goto_cache)
 
-        followsets = cls.compute_follow_sets(trans, readsets, included)
 
-        cls.add_lookaheads(lookd, followsets)
+        {$REGION: {
 
+            {$SERVICE: {
 
+                $key1: $value1,
 
-    @classmethod
+                ...
 
-    def compute_nullable_nonterminals(cls, grammar):
+                }
 
-        nullable = set()
+            }
 
-        num_nullable = 0
+        }
 
-        while True:
 
-            for p in grammar.productions[1:]:
 
-                if p.getlength() == 0:
+        The legacy api wants them to look like
 
-                    nullable.add(p.name)
 
-                    continue
 
-                for t in p.prod:
+        [{'name': $SERVICE[name],
 
-                    if t not in nullable:
+          'type': $SERVICE,
 
-                        break
+          'endpoints': [{
 
-                else:
+              'tenantId': $tenant_id,
 
-                    nullable.add(p.name)
+              ...
 
-            if len(nullable) == num_nullable:
+              'region': $REGION,
 
-                break
+              }],
 
-            num_nullable = len(nullable)
+          'endpoints_links': [],
 
-        return nullable
+         }]
 
 
 
-    @classmethod
+        """
 
-    def find_nonterminal_transitions(cls, grammar, C):
+        if not catalog_ref:
 
-        trans = []
+            return {}
 
-        for idx, state in enumerate(C):
 
-            for p in state:
 
-                if p.lr_index < p.getlength() - 1:
+        services = {}
 
-                    t = (idx, p.prod[p.lr_index + 1])
+        for region, region_ref in catalog_ref.iteritems():
 
-                    if t[1] in grammar.nonterminals and t not in trans:
+            for service, service_ref in region_ref.iteritems():
 
-                        trans.append(t)
+                new_service_ref = services.get(service, {})
 
-        return trans
+                new_service_ref['name'] = service_ref.pop('name')
 
+                new_service_ref['type'] = service
 
+                new_service_ref['endpoints_links'] = []
 
-    @classmethod
+                service_ref['region'] = region
 
-    def compute_read_sets(cls, grammar, C, ntrans, nullable, add_count, cidhash, goto_cache):
 
-        FP = lambda x: cls.dr_relation(grammar, C, x, nullable, add_count, goto_cache)
 
-        R = lambda x: cls.reads_relation(C, x, nullable, add_count, cidhash, goto_cache)
+                endpoints_ref = new_service_ref.get('endpoints', [])
 
-        return digraph(ntrans, R, FP)
+                endpoints_ref.append(service_ref)
 
 
 
-    @classmethod
+                new_service_ref['endpoints'] = endpoints_ref
 
-    def compute_follow_sets(cls, ntrans, readsets, includesets):
+                services[service] = new_service_ref
 
-        FP = lambda x: readsets[x]
 
-        R = lambda x: includesets.get(x, [])
 
-        return digraph(ntrans, R, FP)
+        return services.values()
 
 
 
-    @classmethod
+    def _format_endpoint_list(self, catalog_ref):
 
-    def dr_relation(cls, grammar, C, trans, nullable, add_count, goto_cache):
+        """Formats a list of endpoints according to Identity API v2.
 
-        state, N = trans
 
-        terms = []
 
+        The v2.0 API wants an endpoint list to look like::
 
 
-        g = cls.lr0_goto(C[state], N, add_count, goto_cache)
 
-        for p in g:
+            {
 
-            if p.lr_index < p.getlength() - 1:
+                'endpoints': [
 
-                a = p.prod[p.lr_index + 1]
+                    {
 
-                if a in grammar.terminals and a not in terms:
+                        'id': $endpoint_id,
 
-                    terms.append(a)
+                        'name': $SERVICE[name],
 
-        if state == 0 and N == grammar.productions[0].prod[0]:
+                        'type': $SERVICE,
 
-            terms.append("$end")
+                        'tenantId': $tenant_id,
 
-        return terms
+                        'region': $REGION,
 
+                    }
 
+                ],
 
-    @classmethod
+                'endpoints_links': [],
 
-    def reads_relation(cls, C, trans, empty, add_count, cidhash, goto_cache):
+            }
 
-        rel = []
 
-        state, N = trans
 
+        """
 
+        if not catalog_ref:
 
-        g = cls.lr0_goto(C[state], N, add_count, goto_cache)
+            return {}
 
-        j = cidhash.get(g, -1)
 
-        for p in g:
 
-            if p.lr_index < p.getlength() - 1:
+        endpoints = []
 
-                a = p.prod[p.lr_index + 1]
+        for region_name, region_ref in catalog_ref.iteritems():
 
-                if a in empty:
+            for service_type, service_ref in region_ref.iteritems():
 
-                    rel.append((j, a))
+                endpoints.append({
 
-        return rel
+                    'id': service_ref.get('id'),
 
+                    'name': service_ref.get('name'),
 
+                    'type': service_type,
 
-    @classmethod
+                    'region': region_name,
 
-    def compute_lookback_includes(cls, grammar, C, trans, nullable, add_count, cidhash, goto_cache):
+                    'publicURL': service_ref.get('publicURL'),
 
-        lookdict = {}
+                    'internalURL': service_ref.get('internalURL'),
 
-        includedict = {}
+                    'adminURL': service_ref.get('adminURL'),
 
+                })
 
 
-        dtrans = dict.fromkeys(trans, 1)
 
+        return {'endpoints': endpoints, 'endpoints_links': []}
 
 
-        for state, N in trans:
 
-            lookb = []
 
-            includes = []
 
-            for p in C[state]:
+class ExtensionsController(wsgi.Application):
 
-                if p.name != N:
+    """Base extensions controller to be extended by public and admin API's."""
 
-                    continue
 
 
+    def __init__(self, extensions=None):
 
-                lr_index = p.lr_index
+        super(ExtensionsController, self).__init__()
 
-                j = state
 
-                while lr_index < p.getlength() - 1:
 
-                    lr_index += 1
+        self.extensions = extensions or {}
 
-                    t = p.prod[lr_index]
 
 
+    def get_extensions_info(self, context):
 
-                    if (j, t) in dtrans:
+        return {'extensions': {'values': self.extensions.values()}}
 
-                        li = lr_index + 1
 
-                        while li < p.getlength():
 
-                            if p.prod[li] in grammar.terminals:
+    def get_extension_info(self, context, extension_alias):
 
-                                break
+        try:
 
-                            if p.prod[li] not in nullable:
+            return {'extension': self.extensions[extension_alias]}
 
-                                break
+        except KeyError:
 
-                            li += 1
+            raise exception.NotFound(target=extension_alias)
 
-                        else:
 
-                            includes.append((j, t))
 
 
 
-                    g = cls.lr0_goto(C[j], t, add_count, goto_cache)
+class PublicExtensionsController(ExtensionsController):
 
-                    j = cidhash.get(g, -1)
+    pass
 
 
 
-                for r in C[j]:
 
-                    if r.name != p.name:
 
-                        continue
+class AdminExtensionsController(ExtensionsController):
 
-                    if r.getlength() != p.getlength():
+    def __init__(self, *args, **kwargs):
 
-                        continue
+        super(AdminExtensionsController, self).__init__(*args, **kwargs)
 
-                    i = 0
 
-                    while i < r.lr_index:
 
-                        if r.prod[i] != p.prod[i + 1]:
+        # TODO(dolph): Extensions should obviously provide this information
 
-                            break
+        #               themselves, but hardcoding it here allows us to match
 
-                        i += 1
+        #               the API spec in the short term with minimal complexity.
 
-                    else:
+        self.extensions['OS-KSADM'] = {
 
-                        lookb.append((j, r))
+            'name': 'Openstack Keystone Admin',
 
+            'namespace': 'http://docs.openstack.org/identity/api/ext/'
 
+                         'OS-KSADM/v1.0',
 
-            for i in includes:
+            'alias': 'OS-KSADM',
 
-                includedict.setdefault(i, []).append((state, N))
+            'updated': '2011-08-19T13:25:27-06:00',
 
-            lookdict[state, N] = lookb
+            'description': 'Openstack extensions to Keystone v2.0 API '
 
-        return lookdict, includedict
+                           'enabling Admin Operations.',
 
+            'links': [
 
+                {
 
-    @classmethod
+                    'rel': 'describedby',
 
-    def add_lookaheads(cls, lookbacks, followset):
+                    # TODO(dolph): link needs to be revised after
 
-        for trans, lb in iteritems(lookbacks):
+                    #              bug 928059 merges
 
-            for state, p in lb:
+                    'type': 'text/html',
 
-                f = followset.get(trans, [])
+                    'href': 'https://github.com/openstack/identity-api',
 
-                laheads = p.lookaheads.setdefault(state, [])
+                }
 
-                for a in f:
+            ]
 
-                    if a not in laheads:
+        }
 
-                        laheads.append(a)
+
+
+
+
+@logging.fail_gracefully
+
+def public_app_factory(global_conf, **local_conf):
+
+    conf = global_conf.copy()
+
+    conf.update(local_conf)
+
+    return PublicRouter()
+
+
+
+
+
+@logging.fail_gracefully
+
+def admin_app_factory(global_conf, **local_conf):
+
+    conf = global_conf.copy()
+
+    conf.update(local_conf)
+
+    return AdminRouter()
+
+
+
+
+
+@logging.fail_gracefully
+
+def public_version_app_factory(global_conf, **local_conf):
+
+    conf = global_conf.copy()
+
+    conf.update(local_conf)
+
+    return PublicVersionRouter()
+
+
+
+
+
+@logging.fail_gracefully
+
+def admin_version_app_factory(global_conf, **local_conf):
+
+    conf = global_conf.copy()
+
+    conf.update(local_conf)
+
+    return AdminVersionRouter()
+
+
+
+
+
+@logging.fail_gracefully
+
+def v3_app_factory(global_conf, **local_conf):
+
+    conf = global_conf.copy()
+
+    conf.update(local_conf)
+
+    return V3Router()

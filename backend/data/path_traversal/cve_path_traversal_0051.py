@@ -68,7 +68,7 @@ from PyQt5.QtWebEngineWidgets import QWebEnginePage, QWebEngineScript
 
 from qutebrowser.config import configdata, config
 
-from qutebrowser.browser import browsertab, mouse, shared, webelem
+from qutebrowser.browser import browsertab, eventfilter, shared, webelem
 
 from qutebrowser.browser.webengine import (webview, webengineelem, tabhistory,
 
@@ -78,7 +78,7 @@ from qutebrowser.browser.webengine import (webview, webengineelem, tabhistory,
 
                                            webenginesettings, certificateerror)
 
-from qutebrowser.misc import miscwidgets
+from qutebrowser.misc import miscwidgets, objects
 
 from qutebrowser.utils import (usertypes, qtutils, log, javascript, utils,
 
@@ -126,9 +126,7 @@ def init():
 
     log.init.debug("Initializing request interceptor...")
 
-    args = objreg.get('args')
-
-    req_interceptor = interceptor.RequestInterceptor(args=args, parent=app)
+    req_interceptor = interceptor.RequestInterceptor(parent=app)
 
     req_interceptor.install(webenginesettings.default_profile)
 
@@ -844,8 +842,6 @@ class WebEngineScroller(browsertab.AbstractScroller):
 
         super().__init__(tab, parent)
 
-        self._args = objreg.get('args')
-
         self._pos_perc = (0, 0)
 
         self._pos_px = QPoint()
@@ -902,7 +898,7 @@ class WebEngineScroller(browsertab.AbstractScroller):
 
                 # https://github.com/qutebrowser/qutebrowser/issues/3219
 
-                log.misc.debug("Got ValueError!")
+                log.misc.debug("Got ValueError for perc_x!")
 
                 log.misc.debug("contents_size.width(): {}".format(
 
@@ -928,7 +924,29 @@ class WebEngineScroller(browsertab.AbstractScroller):
 
         else:
 
-            perc_y = min(100, round(100 / scrollable_y * pos.y()))
+            try:
+
+                perc_y = min(100, round(100 / scrollable_y * pos.y()))
+
+            except ValueError:
+
+                # https://github.com/qutebrowser/qutebrowser/issues/3219
+
+                log.misc.debug("Got ValueError for perc_y!")
+
+                log.misc.debug("contents_size.height(): {}".format(
+
+                    contents_size.height()))
+
+                log.misc.debug("self._widget.height(): {}".format(
+
+                    self._widget.height()))
+
+                log.misc.debug("scrollable_y: {}".format(scrollable_y))
+
+                log.misc.debug("pos.y(): {}".format(pos.y()))
+
+                raise
 
 
 
@@ -938,7 +956,7 @@ class WebEngineScroller(browsertab.AbstractScroller):
 
         if (self._pos_perc != (perc_x, perc_y) or
 
-                'no-scroll-filtering' in self._args.debug_flags):
+                'no-scroll-filtering' in objects.debug_flags):
 
             self._pos_perc = perc_x, perc_y
 
@@ -1628,6 +1646,18 @@ class _WebEnginePermissions(QObject):
 
         page = self._widget.page()
 
+        grant_permission = functools.partial(
+
+            page.setFeaturePermission, url, feature,
+
+            QWebEnginePage.PermissionGrantedByUser)
+
+        deny_permission = functools.partial(
+
+            page.setFeaturePermission, url, feature,
+
+            QWebEnginePage.PermissionDeniedByUser)
+
 
 
         if feature not in self._options:
@@ -1636,25 +1666,35 @@ class _WebEnginePermissions(QObject):
 
                 debug.qenum_key(QWebEnginePage, feature)))
 
-            page.setFeaturePermission(url, feature,
-
-                                      QWebEnginePage.PermissionDeniedByUser)
+            deny_permission()
 
             return
 
 
 
-        yes_action = functools.partial(
+        if (
 
-            page.setFeaturePermission, url, feature,
+                hasattr(QWebEnginePage, 'DesktopVideoCapture') and
 
-            QWebEnginePage.PermissionGrantedByUser)
+                feature in [QWebEnginePage.DesktopVideoCapture,
 
-        no_action = functools.partial(
+                            QWebEnginePage.DesktopAudioVideoCapture] and
 
-            page.setFeaturePermission, url, feature,
+                qtutils.version_check('5.13', compiled=False) and
 
-            QWebEnginePage.PermissionDeniedByUser)
+                not qtutils.version_check('5.13.2', compiled=False)
+
+        ):
+
+            # WORKAROUND for https://bugreports.qt.io/browse/QTBUG-78016
+
+            log.webview.warning("Ignoring desktop sharing request due to "
+
+                                "crashes in Qt < 5.13.2")
+
+            deny_permission()
+
+            return
 
 
 
@@ -1664,7 +1704,7 @@ class _WebEnginePermissions(QObject):
 
             option=self._options[feature], msg=self._messages[feature],
 
-            yes_action=yes_action, no_action=no_action,
+            yes_action=grant_permission, no_action=deny_permission,
 
             abort_on=[self._tab.abort_questions])
 
@@ -2288,11 +2328,11 @@ class WebEngineTab(browsertab.AbstractTab):
 
         if fp is not None:
 
-            fp.installEventFilter(self._mouse_event_filter)
+            fp.installEventFilter(self._tab_event_filter)
 
-        self._child_event_filter = mouse.ChildEventFilter(
+        self._child_event_filter = eventfilter.ChildEventFilter(
 
-            eventfilter=self._mouse_event_filter, widget=self._widget,
+            eventfilter=self._tab_event_filter, widget=self._widget,
 
             win_id=self.win_id, parent=self)
 
@@ -2686,25 +2726,39 @@ class WebEngineTab(browsertab.AbstractTab):
 
 
 
-    def _error_page_workaround(self, html):
+    def _error_page_workaround(self, js_enabled, html):
 
         """Check if we're displaying a Chromium error page.
 
 
 
-        This gets only called if we got loadFinished(False) without JavaScript,
+        This gets called if we got a loadFinished(False), so we can display at
 
-        so we can display at least some error page.
+        least some error page in situations where Chromium's can't be
+
+        displayed.
 
 
 
         WORKAROUND for https://bugreports.qt.io/browse/QTBUG-66643
+
+        WORKAROUND for https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=882805
+
+
 
         Needs to check the page content as a WORKAROUND for
 
         https://bugreports.qt.io/browse/QTBUG-66661
 
         """
+
+        missing_jst = 'jstProcess(' in html and 'jstProcess=' not in html
+
+        if js_enabled and not missing_jst:
+
+            return
+
+
 
         match = re.search(r'"errorCode":"([^"]*)"', html)
 
@@ -2764,11 +2818,13 @@ class WebEngineTab(browsertab.AbstractTab):
 
 
 
-        js_enabled = self.settings.test_attribute('content.javascript.enabled')
+        if not ok:
 
-        if not ok and not js_enabled:
+            self.dump_async(functools.partial(
 
-            self.dump_async(self._error_page_workaround)
+                self._error_page_workaround,
+
+                self.settings.test_attribute('content.javascript.enabled')))
 
 
 

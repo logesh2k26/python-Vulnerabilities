@@ -2,192 +2,484 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
+# -*- coding: utf-8 -*-
 
+from __future__ import absolute_import, print_function, division
 
 
-# Copyright 2012 United States Government as represented by the
 
-# Administrator of the National Aeronautics and Space Administration.
 
-# All Rights Reserved.
 
-#
+# standard library dependencies
 
-# Copyright 2012 Nebula, Inc.
+try:
 
-#
+    # prefer lxml as it supports XPath
 
-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+    from lxml import etree
 
-#    not use this file except in compliance with the License. You may obtain
+except ImportError:
 
-#    a copy of the License at
+    import xml.etree.ElementTree as etree
 
-#
 
-#         http://www.apache.org/licenses/LICENSE-2.0
 
-#
+from operator import attrgetter
 
-#    Unless required by applicable law or agreed to in writing, software
+import itertools
 
-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+from petl.compat import string_types, text_type
 
-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
-#    License for the specific language governing permissions and limitations
 
-#    under the License.
 
-"""
 
-Middleware provided and used by Horizon.
+# internal dependencies
 
-"""
+from petl.util.base import Table
 
+from petl.io.sources import read_source_from_arg
 
 
-import logging
 
 
 
-from django import http
+def fromxml(source, *args, **kwargs):
 
-from django import shortcuts
+    """
 
+    Extract data from an XML file. E.g.::
 
 
-from django.core.urlresolvers import reverse
 
-from django.contrib import messages
+        >>> import petl as etl
 
-from django.contrib.auth import REDIRECT_FIELD_NAME
+        >>> # setup a file to demonstrate with
 
-from django.utils.encoding import iri_to_uri
+        ... d = '''<table>
 
+        ...     <tr>
 
+        ...         <td>foo</td><td>bar</td>
 
-from horizon import exceptions
+        ...     </tr>
 
-from horizon import users
+        ...     <tr>
 
+        ...         <td>a</td><td>1</td>
 
+        ...     </tr>
 
+        ...     <tr>
 
+        ...         <td>b</td><td>2</td>
 
-LOG = logging.getLogger(__name__)
+        ...     </tr>
 
+        ...     <tr>
 
+        ...         <td>c</td><td>2</td>
 
+        ...     </tr>
 
+        ... </table>'''
 
-class HorizonMiddleware(object):
+        >>> with open('example1.xml', 'w') as f:
 
-    """ The main Horizon middleware class. Required for use of Horizon. """
+        ...     f.write(d)
 
+        ...
 
+        212
 
-    def process_request(self, request):
+        >>> table1 = etl.fromxml('example1.xml', 'tr', 'td')
 
-        """ Adds data necessary for Horizon to function to the request.
+        >>> table1
 
+        +-----+-----+
 
+        | foo | bar |
 
-        Adds the current "active" :class:`~horizon.Dashboard` and
+        +=====+=====+
 
-        :class:`~horizon.Panel` to ``request.horizon``.
+        | 'a' | '1' |
 
+        +-----+-----+
 
+        | 'b' | '2' |
 
-        Adds a :class:`~horizon.users.User` object to ``request.user``.
+        +-----+-----+
 
-        """
+        | 'c' | '2' |
 
-        request.__class__.user = users.LazyUser()
+        +-----+-----+
 
-        request.horizon = {'dashboard': None, 'panel': None}
 
 
 
-    def process_exception(self, request, exception):
 
-        """
+    If the data values are stored in an attribute, provide the attribute
 
-        Catches internal Horizon exception classes such as NotAuthorized,
+    name as an extra positional argument::
 
-        NotFound and Http302 and handles them gracefully.
 
-        """
 
-        if isinstance(exception,
+        >>> d = '''<table>
 
-                (exceptions.NotAuthorized, exceptions.NotAuthenticated)):
+        ...     <tr>
 
-            auth_url = reverse("horizon:auth_login")
+        ...         <td v='foo'/><td v='bar'/>
 
-            next_url = iri_to_uri(request.get_full_path())
+        ...     </tr>
 
-            if next_url != auth_url:
+        ...     <tr>
 
-                param = "?%s=%s" % (REDIRECT_FIELD_NAME, next_url)
+        ...         <td v='a'/><td v='1'/>
 
-                redirect_to = "".join((auth_url, param))
+        ...     </tr>
+
+        ...     <tr>
+
+        ...         <td v='b'/><td v='2'/>
+
+        ...     </tr>
+
+        ...     <tr>
+
+        ...         <td v='c'/><td v='2'/>
+
+        ...     </tr>
+
+        ... </table>'''
+
+        >>> with open('example2.xml', 'w') as f:
+
+        ...     f.write(d)
+
+        ...
+
+        220
+
+        >>> table2 = etl.fromxml('example2.xml', 'tr', 'td', 'v')
+
+        >>> table2
+
+        +-----+-----+
+
+        | foo | bar |
+
+        +=====+=====+
+
+        | 'a' | '1' |
+
+        +-----+-----+
+
+        | 'b' | '2' |
+
+        +-----+-----+
+
+        | 'c' | '2' |
+
+        +-----+-----+
+
+
+
+    Data values can also be extracted by providing a mapping of field
+
+    names to element paths::
+
+
+
+        >>> d = '''<table>
+
+        ...     <row>
+
+        ...         <foo>a</foo><baz><bar v='1'/><bar v='3'/></baz>
+
+        ...     </row>
+
+        ...     <row>
+
+        ...         <foo>b</foo><baz><bar v='2'/></baz>
+
+        ...     </row>
+
+        ...     <row>
+
+        ...         <foo>c</foo><baz><bar v='2'/></baz>
+
+        ...     </row>
+
+        ... </table>'''
+
+        >>> with open('example3.xml', 'w') as f:
+
+        ...     f.write(d)
+
+        ...
+
+        223
+
+        >>> table3 = etl.fromxml('example3.xml', 'row',
+
+        ...                      {'foo': 'foo', 'bar': ('baz/bar', 'v')})
+
+        >>> table3
+
+        +------------+-----+
+
+        | bar        | foo |
+
+        +============+=====+
+
+        | ('1', '3') | 'a' |
+
+        +------------+-----+
+
+        | '2'        | 'b' |
+
+        +------------+-----+
+
+        | '2'        | 'c' |
+
+        +------------+-----+
+
+
+
+    If `lxml <http://lxml.de/>`_ is installed, full XPath expressions can be
+
+    used.
+
+
+
+    Note that the implementation is currently **not** streaming, i.e.,
+
+    the whole document is loaded into memory.
+
+
+
+    If multiple elements match a given field, all values are reported as a
+
+    tuple.
+
+
+
+    If there is more than one element name used for row values, a tuple
+
+    or list of paths can be provided, e.g.,
+
+    ``fromxml('example.html', './/tr', ('th', 'td'))``.
+
+
+
+    """
+
+
+
+    source = read_source_from_arg(source)
+
+    return XmlView(source, *args, **kwargs)
+
+
+
+
+
+class XmlView(Table):
+
+
+
+    def __init__(self, source, *args, **kwargs):
+
+        self.source = source
+
+        self.args = args
+
+        if len(args) == 2 and isinstance(args[1], (string_types, tuple, list)):
+
+            self.rmatch = args[0]
+
+            self.vmatch = args[1]
+
+            self.vdict = None
+
+            self.attr = None
+
+        elif len(args) == 2 and isinstance(args[1], dict):
+
+            self.rmatch = args[0]
+
+            self.vmatch = None
+
+            self.vdict = args[1]
+
+            self.attr = None
+
+        elif len(args) == 3:
+
+            self.rmatch = args[0]
+
+            self.vmatch = args[1]
+
+            self.vdict = None
+
+            self.attr = args[2]
+
+        else:
+
+            assert False, 'bad parameters'
+
+        self.missing = kwargs.get('missing', None)
+
+
+
+    def __iter__(self):
+
+        vmatch = self.vmatch
+
+        vdict = self.vdict
+
+
+
+        with self.source.open('rb') as xmlf:
+
+
+
+            tree = etree.parse(xmlf)
+
+            if not hasattr(tree, 'iterfind'):
+
+                # Python 2.6 compatibility
+
+                tree.iterfind = tree.findall
+
+
+
+            if vmatch is not None:
+
+                # simple case, all value paths are the same
+
+                for rowelm in tree.iterfind(self.rmatch):
+
+                    if self.attr is None:
+
+                        getv = attrgetter('text')
+
+                    else:
+
+                        getv = lambda e: e.get(self.attr)
+
+                    if isinstance(vmatch, string_types):
+
+                        # match only one path
+
+                        velms = rowelm.findall(vmatch)
+
+                    else:
+
+                        # match multiple paths
+
+                        velms = itertools.chain(*[rowelm.findall(enm)
+
+                                                  for enm in vmatch])
+
+                    yield tuple(getv(velm)
+
+                                for velm in velms)
+
+
 
             else:
 
-                redirect_to = auth_url
-
-            messages.error(request, unicode(exception))
-
-            if request.is_ajax():
-
-                response_401 = http.HttpResponse(status=401)
-
-                response_401['X-Horizon-Location'] = redirect_to
-
-                return response_401
-
-            return shortcuts.redirect(redirect_to)
+                # difficult case, deal with different paths for each field
 
 
 
-        # If an internal "NotFound" error gets this far, return a real 404.
+                # determine output header
 
-        if isinstance(exception, exceptions.NotFound):
+                flds = tuple(sorted(map(text_type, vdict.keys())))
 
-            raise http.Http404(exception)
-
-
-
-        if isinstance(exception, exceptions.Http302):
-
-            if exception.message:
-
-                messages.error(request, exception.message)
-
-            return shortcuts.redirect(exception.location)
+                yield flds
 
 
 
-    def process_response(self, request, response):
+                # setup value getters
 
-        """
+                vmatches = dict()
 
-        Convert HttpResponseRedirect to HttpResponse if request is via ajax
+                vgetters = dict()
 
-        to allow ajax request to redirect url
+                for f in flds:
 
-        """
+                    vmatch = self.vdict[f]
 
-        if request.is_ajax():
+                    if isinstance(vmatch, string_types):
 
-            if type(response) == http.HttpResponseRedirect:
+                        # match element path
 
-                redirect_response = http.HttpResponse()
+                        vmatches[f] = vmatch
 
-                redirect_response['X-Horizon-Location'] = response['location']
+                        vgetters[f] = element_text_getter(self.missing)
 
-                return redirect_response
+                    else:
 
-        return response
+                        # match element path and attribute name
+
+                        vmatches[f] = vmatch[0]
+
+                        attr = vmatch[1]
+
+                        vgetters[f] = attribute_text_getter(attr, self.missing)
+
+
+
+                # determine data rows
+
+                for rowelm in tree.iterfind(self.rmatch):
+
+                    yield tuple(vgetters[f](rowelm.findall(vmatches[f]))
+
+                                for f in flds)
+
+
+
+
+
+def element_text_getter(missing):
+
+    def _get(v):
+
+        if len(v) > 1:
+
+            return tuple(e.text for e in v)
+
+        elif len(v) == 1:
+
+            return v[0].text
+
+        else:
+
+            return missing
+
+    return _get
+
+
+
+
+
+def attribute_text_getter(attr, missing):
+
+    def _get(v):
+
+        if len(v) > 1:
+
+            return tuple(e.get(attr) for e in v)
+
+        elif len(v) == 1:
+
+            return v[0].get(attr)
+
+        else:
+
+            return missing
+
+    return _get

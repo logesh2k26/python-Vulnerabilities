@@ -2,1004 +2,3158 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-from __future__ import with_statement
-
-import os
-
-import re
-
-import urllib
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
 
 
 
-from django.conf import settings
+# Copyright 2010 United States Government as represented by the
 
-from django.contrib.sites.models import Site, RequestSite
+# Administrator of the National Aeronautics and Space Administration.
 
-from django.contrib.auth.models import User
+# All Rights Reserved.
 
-from django.core import mail
+#
 
-from django.core.exceptions import SuspiciousOperation
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
 
-from django.core.urlresolvers import reverse, NoReverseMatch
+#    not use this file except in compliance with the License. You may obtain
 
-from django.http import QueryDict
+#    a copy of the License at
 
-from django.utils.encoding import force_unicode
+#
 
-from django.utils.html import escape
+#         http://www.apache.org/licenses/LICENSE-2.0
 
-from django.test import TestCase
+#
 
-from django.test.utils import override_settings
+#    Unless required by applicable law or agreed to in writing, software
 
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
-from django.contrib.auth import SESSION_KEY, REDIRECT_FIELD_NAME
+#    License for the specific language governing permissions and limitations
 
-from django.contrib.auth.forms import (AuthenticationForm, PasswordChangeForm,
-
-                SetPasswordForm, PasswordResetForm)
-
-
+#    under the License.
 
 
 
-class AuthViewsTestCase(TestCase):
+"""Defines interface for DB access.
+
+
+
+The underlying driver is loaded as a :class:`LazyPluggable`.
+
+
+
+**Related Flags**
+
+
+
+:db_backend:  string to lookup in the list of LazyPluggable backends.
+
+              `sqlalchemy` is the only supported backend right now.
+
+
+
+:sql_connection:  string specifying the sqlalchemy connection to use, like:
+
+                  `sqlite:///var/lib/nova/nova.sqlite`.
+
+
+
+:enable_new_services:  when adding a new service to the database, is it in the
+
+                       pool of available hardware (Default: True)
+
+
+
+"""
+
+
+
+from nova import exception
+
+from nova import flags
+
+from nova import utils
+
+
+
+
+
+FLAGS = flags.FLAGS
+
+flags.DEFINE_string('db_backend', 'sqlalchemy',
+
+                    'The backend to use for db')
+
+flags.DEFINE_boolean('enable_new_services', True,
+
+                     'Services to be added to the available pool on create')
+
+flags.DEFINE_string('instance_name_template', 'instance-%08x',
+
+                    'Template string to be used to generate instance names')
+
+flags.DEFINE_string('volume_name_template', 'volume-%08x',
+
+                    'Template string to be used to generate instance names')
+
+flags.DEFINE_string('snapshot_name_template', 'snapshot-%08x',
+
+                    'Template string to be used to generate snapshot names')
+
+flags.DEFINE_string('vsa_name_template', 'vsa-%08x',
+
+                    'Template string to be used to generate VSA names')
+
+
+
+IMPL = utils.LazyPluggable(FLAGS['db_backend'],
+
+                           sqlalchemy='nova.db.sqlalchemy.api')
+
+
+
+
+
+class NoMoreBlades(exception.Error):
+
+    """No more available blades."""
+
+    pass
+
+
+
+
+
+class NoMoreNetworks(exception.Error):
+
+    """No more available networks."""
+
+    pass
+
+
+
+
+
+class NoMoreTargets(exception.Error):
+
+    """No more available blades"""
+
+    pass
+
+
+
+
+
+###################
+
+
+
+
+
+def service_destroy(context, instance_id):
+
+    """Destroy the service or raise if it does not exist."""
+
+    return IMPL.service_destroy(context, instance_id)
+
+
+
+
+
+def service_get(context, service_id):
+
+    """Get a service or raise if it does not exist."""
+
+    return IMPL.service_get(context, service_id)
+
+
+
+
+
+def service_get_by_host_and_topic(context, host, topic):
+
+    """Get a service by host it's on and topic it listens to."""
+
+    return IMPL.service_get_by_host_and_topic(context, host, topic)
+
+
+
+
+
+def service_get_all(context, disabled=None):
+
+    """Get all services."""
+
+    return IMPL.service_get_all(context, disabled)
+
+
+
+
+
+def service_get_all_by_topic(context, topic):
+
+    """Get all services for a given topic."""
+
+    return IMPL.service_get_all_by_topic(context, topic)
+
+
+
+
+
+def service_get_all_by_host(context, host):
+
+    """Get all services for a given host."""
+
+    return IMPL.service_get_all_by_host(context, host)
+
+
+
+
+
+def service_get_all_compute_by_host(context, host):
+
+    """Get all compute services for a given host."""
+
+    return IMPL.service_get_all_compute_by_host(context, host)
+
+
+
+
+
+def service_get_all_compute_sorted(context):
+
+    """Get all compute services sorted by instance count.
+
+
+
+    :returns: a list of (Service, instance_count) tuples.
+
+
 
     """
 
-    Helper base class for all the follow test cases.
+    return IMPL.service_get_all_compute_sorted(context)
+
+
+
+
+
+def service_get_all_network_sorted(context):
+
+    """Get all network services sorted by network count.
+
+
+
+    :returns: a list of (Service, network_count) tuples.
+
+
 
     """
 
-    fixtures = ['authtestdata.json']
+    return IMPL.service_get_all_network_sorted(context)
 
-    urls = 'django.contrib.auth.tests.urls'
 
 
 
-    def setUp(self):
 
-        self.old_LANGUAGES = settings.LANGUAGES
+def service_get_all_volume_sorted(context):
 
-        self.old_LANGUAGE_CODE = settings.LANGUAGE_CODE
+    """Get all volume services sorted by volume count.
 
-        settings.LANGUAGES = (('en', 'English'),)
 
-        settings.LANGUAGE_CODE = 'en'
 
-        self.old_TEMPLATE_DIRS = settings.TEMPLATE_DIRS
+    :returns: a list of (Service, volume_count) tuples.
 
-        settings.TEMPLATE_DIRS = (
 
-            os.path.join(os.path.dirname(__file__), 'templates'),
 
-        )
+    """
 
+    return IMPL.service_get_all_volume_sorted(context)
 
 
-    def tearDown(self):
 
-        settings.LANGUAGES = self.old_LANGUAGES
 
-        settings.LANGUAGE_CODE = self.old_LANGUAGE_CODE
 
-        settings.TEMPLATE_DIRS = self.old_TEMPLATE_DIRS
+def service_get_by_args(context, host, binary):
 
+    """Get the state of an service by node name and binary."""
 
+    return IMPL.service_get_by_args(context, host, binary)
 
-    def login(self, password='password'):
 
-        response = self.client.post('/login/', {
 
-            'username': 'testclient',
 
-            'password': password,
 
-            })
+def service_create(context, values):
 
-        self.assertEqual(response.status_code, 302)
+    """Create a service from the values dictionary."""
 
-        self.assertTrue(response['Location'].endswith(settings.LOGIN_REDIRECT_URL))
+    return IMPL.service_create(context, values)
 
-        self.assertTrue(SESSION_KEY in self.client.session)
 
 
 
-    def assertContainsEscaped(self, response, text, **kwargs):
 
-        return self.assertContains(response, escape(force_unicode(text)), **kwargs)
+def service_update(context, service_id, values):
 
+    """Set the given properties on an service and update it.
 
 
-AuthViewsTestCase = override_settings(USE_TZ=False)(AuthViewsTestCase)
 
+    Raises NotFound if service does not exist.
 
 
 
+    """
 
-class AuthViewNamedURLTests(AuthViewsTestCase):
+    return IMPL.service_update(context, service_id, values)
 
-    urls = 'django.contrib.auth.urls'
 
 
 
-    def test_named_urls(self):
 
-        "Named URLs should be reversible"
+###################
 
-        expected_named_urls = [
 
-            ('login', [], {}),
 
-            ('logout', [], {}),
 
-            ('password_change', [], {}),
 
-            ('password_change_done', [], {}),
+def compute_node_get(context, compute_id, session=None):
 
-            ('password_reset', [], {}),
+    """Get an computeNode or raise if it does not exist."""
 
-            ('password_reset_done', [], {}),
+    return IMPL.compute_node_get(context, compute_id)
 
-            ('password_reset_confirm', [], {
 
-                'uidb36': 'aaaaaaa',
 
-                'token': '1111-aaaaa',
 
-            }),
 
-            ('password_reset_complete', [], {}),
+def compute_node_create(context, values):
 
-        ]
+    """Create a computeNode from the values dictionary."""
 
-        for name, args, kwargs in expected_named_urls:
+    return IMPL.compute_node_create(context, values)
 
-            try:
 
-                reverse(name, args=args, kwargs=kwargs)
 
-            except NoReverseMatch:
 
-                self.fail("Reversal of url named '%s' failed with NoReverseMatch" % name)
 
+def compute_node_update(context, compute_id, values):
 
+    """Set the given properties on an computeNode and update it.
 
 
 
-class PasswordResetTest(AuthViewsTestCase):
+    Raises NotFound if computeNode does not exist.
 
 
 
-    def test_email_not_found(self):
+    """
 
-        "Error is raised if the provided email address isn't currently registered"
 
-        response = self.client.get('/password_reset/')
 
-        self.assertEqual(response.status_code, 200)
+    return IMPL.compute_node_update(context, compute_id, values)
 
-        response = self.client.post('/password_reset/', {'email': 'not_a_real_email@email.com'})
 
-        self.assertContainsEscaped(response, PasswordResetForm.error_messages['unknown'])
 
-        self.assertEqual(len(mail.outbox), 0)
 
 
+###################
 
-    def test_email_found(self):
 
-        "Email is sent if a valid email address is provided for password reset"
 
-        response = self.client.post('/password_reset/', {'email': 'staffmember@example.com'})
 
-        self.assertEqual(response.status_code, 302)
 
-        self.assertEqual(len(mail.outbox), 1)
+def certificate_create(context, values):
 
-        self.assertTrue("http://" in mail.outbox[0].body)
+    """Create a certificate from the values dictionary."""
 
-        self.assertEqual(settings.DEFAULT_FROM_EMAIL, mail.outbox[0].from_email)
+    return IMPL.certificate_create(context, values)
 
 
 
-    def test_email_found_custom_from(self):
 
-        "Email is sent if a valid email address is provided for password reset when a custom from_email is provided."
 
-        response = self.client.post('/password_reset_from_email/', {'email': 'staffmember@example.com'})
+def certificate_destroy(context, certificate_id):
 
-        self.assertEqual(response.status_code, 302)
+    """Destroy the certificate or raise if it does not exist."""
 
-        self.assertEqual(len(mail.outbox), 1)
+    return IMPL.certificate_destroy(context, certificate_id)
 
-        self.assertEqual("staffmember@example.com", mail.outbox[0].from_email)
 
 
 
-    @override_settings(ALLOWED_HOSTS=['adminsite.com'])
 
-    def test_admin_reset(self):
+def certificate_get_all_by_project(context, project_id):
 
-        "If the reset view is marked as being for admin, the HTTP_HOST header is used for a domain override."
+    """Get all certificates for a project."""
 
-        response = self.client.post('/admin_password_reset/',
+    return IMPL.certificate_get_all_by_project(context, project_id)
 
-            {'email': 'staffmember@example.com'},
 
-            HTTP_HOST='adminsite.com'
 
-        )
 
-        self.assertEqual(response.status_code, 302)
 
-        self.assertEqual(len(mail.outbox), 1)
+def certificate_get_all_by_user(context, user_id):
 
-        self.assertTrue("http://adminsite.com" in mail.outbox[0].body)
+    """Get all certificates for a user."""
 
-        self.assertEqual(settings.DEFAULT_FROM_EMAIL, mail.outbox[0].from_email)
+    return IMPL.certificate_get_all_by_user(context, user_id)
 
 
 
-    # Skip any 500 handler action (like sending more mail...)
 
-    @override_settings(DEBUG_PROPAGATE_EXCEPTIONS=True)
 
-    def test_poisoned_http_host(self):
+def certificate_get_all_by_user_and_project(context, user_id, project_id):
 
-        "Poisoned HTTP_HOST headers can't be used for reset emails"
+    """Get all certificates for a user and project."""
 
-        # This attack is based on the way browsers handle URLs. The colon
+    return IMPL.certificate_get_all_by_user_and_project(context,
 
-        # should be used to separate the port, but if the URL contains an @,
+                                                        user_id,
 
-        # the colon is interpreted as part of a username for login purposes,
+                                                        project_id)
 
-        # making 'evil.com' the request domain. Since HTTP_HOST is used to
 
-        # produce a meaningful reset URL, we need to be certain that the
 
-        # HTTP_HOST header isn't poisoned. This is done as a check when get_host()
 
-        # is invoked, but we check here as a practical consequence.
 
-        with self.assertRaises(SuspiciousOperation):
+def certificate_update(context, certificate_id, values):
 
-            self.client.post('/password_reset/',
+    """Set the given properties on an certificate and update it.
 
-                {'email': 'staffmember@example.com'},
 
-                HTTP_HOST='www.example:dr.frankenstein@evil.tld'
 
-            )
+    Raises NotFound if service does not exist.
 
-        self.assertEqual(len(mail.outbox), 0)
 
 
+    """
 
-    # Skip any 500 handler action (like sending more mail...)
+    return IMPL.certificate_update(context, certificate_id, values)
 
-    @override_settings(DEBUG_PROPAGATE_EXCEPTIONS=True)
 
-    def test_poisoned_http_host_admin_site(self):
 
-        "Poisoned HTTP_HOST headers can't be used for reset emails on admin views"
 
-        with self.assertRaises(SuspiciousOperation):
 
-            self.client.post('/admin_password_reset/',
+###################
 
-                {'email': 'staffmember@example.com'},
 
-                HTTP_HOST='www.example:dr.frankenstein@evil.tld'
 
-            )
+def floating_ip_get(context, id):
 
-        self.assertEqual(len(mail.outbox), 0)
+    return IMPL.floating_ip_get(context, id)
 
 
 
-    def _test_confirm_start(self):
 
-        # Start by creating the email
 
-        response = self.client.post('/password_reset/', {'email': 'staffmember@example.com'})
+def floating_ip_allocate_address(context, project_id):
 
-        self.assertEqual(response.status_code, 302)
+    """Allocate free floating ip and return the address.
 
-        self.assertEqual(len(mail.outbox), 1)
 
-        return self._read_signup_email(mail.outbox[0])
 
+    Raises if one is not available.
 
 
-    def _read_signup_email(self, email):
 
-        urlmatch = re.search(r"https?://[^/]*(/.*reset/\S*)", email.body)
+    """
 
-        self.assertTrue(urlmatch is not None, "No URL found in sent email")
+    return IMPL.floating_ip_allocate_address(context, project_id)
 
-        return urlmatch.group(), urlmatch.groups()[0]
 
 
 
-    def test_confirm_valid(self):
 
-        url, path = self._test_confirm_start()
+def floating_ip_create(context, values):
 
-        response = self.client.get(path)
+    """Create a floating ip from the values dictionary."""
 
-        # redirect to a 'complete' page:
+    return IMPL.floating_ip_create(context, values)
 
-        self.assertEqual(response.status_code, 200)
 
-        self.assertTrue("Please enter your new password" in response.content)
 
 
 
-    def test_confirm_invalid(self):
+def floating_ip_count_by_project(context, project_id):
 
-        url, path = self._test_confirm_start()
+    """Count floating ips used by project."""
 
-        # Let's munge the token in the path, but keep the same length,
+    return IMPL.floating_ip_count_by_project(context, project_id)
 
-        # in case the URLconf will reject a different length.
 
-        path = path[:-5] + ("0" * 4) + path[-1]
 
 
 
-        response = self.client.get(path)
+def floating_ip_deallocate(context, address):
 
-        self.assertEqual(response.status_code, 200)
+    """Deallocate an floating ip by address."""
 
-        self.assertTrue("The password reset link was invalid" in response.content)
+    return IMPL.floating_ip_deallocate(context, address)
 
 
 
-    def test_confirm_invalid_user(self):
 
-        # Ensure that we get a 200 response for a non-existant user, not a 404
 
-        response = self.client.get('/reset/123456-1-1/')
+def floating_ip_destroy(context, address):
 
-        self.assertEqual(response.status_code, 200)
+    """Destroy the floating_ip or raise if it does not exist."""
 
-        self.assertTrue("The password reset link was invalid" in response.content)
+    return IMPL.floating_ip_destroy(context, address)
 
 
 
-    def test_confirm_overflow_user(self):
 
-        # Ensure that we get a 200 response for a base36 user id that overflows int
 
-        response = self.client.get('/reset/zzzzzzzzzzzzz-1-1/')
+def floating_ip_disassociate(context, address):
 
-        self.assertEqual(response.status_code, 200)
+    """Disassociate an floating ip from a fixed ip by address.
 
-        self.assertTrue("The password reset link was invalid" in response.content)
 
 
+    :returns: the address of the existing fixed ip.
 
-    def test_confirm_invalid_post(self):
 
-        # Same as test_confirm_invalid, but trying
 
-        # to do a POST instead.
+    """
 
-        url, path = self._test_confirm_start()
+    return IMPL.floating_ip_disassociate(context, address)
 
-        path = path[:-5] + ("0" * 4) + path[-1]
 
 
 
-        self.client.post(path, {
 
-            'new_password1': 'anewpassword',
+def floating_ip_fixed_ip_associate(context, floating_address,
 
-            'new_password2': ' anewpassword',
+                                   fixed_address, host):
 
-        })
+    """Associate an floating ip to a fixed_ip by address."""
 
-        # Check the password has not been changed
+    return IMPL.floating_ip_fixed_ip_associate(context,
 
-        u = User.objects.get(email='staffmember@example.com')
+                                               floating_address,
 
-        self.assertTrue(not u.check_password("anewpassword"))
+                                               fixed_address,
 
+                                               host)
 
 
-    def test_confirm_complete(self):
 
-        url, path = self._test_confirm_start()
 
-        response = self.client.post(path, {'new_password1': 'anewpassword',
 
-                                           'new_password2': 'anewpassword'})
+def floating_ip_get_all(context):
 
-        # It redirects us to a 'complete' page:
+    """Get all floating ips."""
 
-        self.assertEqual(response.status_code, 302)
+    return IMPL.floating_ip_get_all(context)
 
-        # Check the password has been changed
 
-        u = User.objects.get(email='staffmember@example.com')
 
-        self.assertTrue(u.check_password("anewpassword"))
 
 
+def floating_ip_get_all_by_host(context, host):
 
-        # Check we can't use the link again
+    """Get all floating ips by host."""
 
-        response = self.client.get(path)
+    return IMPL.floating_ip_get_all_by_host(context, host)
 
-        self.assertEqual(response.status_code, 200)
 
-        self.assertTrue("The password reset link was invalid" in response.content)
 
 
 
-    def test_confirm_different_passwords(self):
+def floating_ip_get_all_by_project(context, project_id):
 
-        url, path = self._test_confirm_start()
+    """Get all floating ips by project."""
 
-        response = self.client.post(path, {'new_password1': 'anewpassword',
+    return IMPL.floating_ip_get_all_by_project(context, project_id)
 
-                                           'new_password2': 'x'})
 
-        self.assertEqual(response.status_code, 200)
 
-        self.assertContainsEscaped(response, SetPasswordForm.error_messages['password_mismatch'])
 
 
+def floating_ip_get_by_address(context, address):
 
+    """Get a floating ip by address or raise if it doesn't exist."""
 
+    return IMPL.floating_ip_get_by_address(context, address)
 
-class ChangePasswordTest(AuthViewsTestCase):
 
 
 
-    def fail_login(self, password='password'):
 
-        response = self.client.post('/login/', {
+def floating_ip_update(context, address, values):
 
-            'username': 'testclient',
+    """Update a floating ip by address or raise if it doesn't exist."""
 
-            'password': password,
+    return IMPL.floating_ip_update(context, address, values)
 
-        })
 
-        self.assertEqual(response.status_code, 200)
 
-        self.assertContainsEscaped(response, AuthenticationForm.error_messages['invalid_login'])
 
 
+def floating_ip_set_auto_assigned(context, address):
 
-    def logout(self):
+    """Set auto_assigned flag to floating ip"""
 
-        response = self.client.get('/logout/')
+    return IMPL.floating_ip_set_auto_assigned(context, address)
 
 
 
-    def test_password_change_fails_with_invalid_old_password(self):
+####################
 
-        self.login()
 
-        response = self.client.post('/password_change/', {
 
-            'old_password': 'donuts',
 
-            'new_password1': 'password1',
 
-            'new_password2': 'password1',
+def migration_update(context, id, values):
 
-        })
+    """Update a migration instance."""
 
-        self.assertEqual(response.status_code, 200)
+    return IMPL.migration_update(context, id, values)
 
-        self.assertContainsEscaped(response, PasswordChangeForm.error_messages['password_incorrect'])
 
 
 
-    def test_password_change_fails_with_mismatched_passwords(self):
 
-        self.login()
+def migration_create(context, values):
 
-        response = self.client.post('/password_change/', {
+    """Create a migration record."""
 
-            'old_password': 'password',
+    return IMPL.migration_create(context, values)
 
-            'new_password1': 'password1',
 
-            'new_password2': 'donuts',
 
-        })
 
-        self.assertEqual(response.status_code, 200)
 
-        self.assertContainsEscaped(response, SetPasswordForm.error_messages['password_mismatch'])
+def migration_get(context, migration_id):
 
+    """Finds a migration by the id."""
 
+    return IMPL.migration_get(context, migration_id)
 
-    def test_password_change_succeeds(self):
 
-        self.login()
 
-        response = self.client.post('/password_change/', {
 
-            'old_password': 'password',
 
-            'new_password1': 'password1',
+def migration_get_by_instance_and_status(context, instance_uuid, status):
 
-            'new_password2': 'password1',
+    """Finds a migration by the instance uuid its migrating."""
 
-        })
+    return IMPL.migration_get_by_instance_and_status(context, instance_uuid,
 
-        self.assertEqual(response.status_code, 302)
+            status)
 
-        self.assertTrue(response['Location'].endswith('/password_change/done/'))
 
-        self.fail_login()
 
-        self.login(password='password1')
 
 
+####################
 
-    def test_password_change_done_succeeds(self):
 
-        self.login()
 
-        response = self.client.post('/password_change/', {
 
-            'old_password': 'password',
 
-            'new_password1': 'password1',
+def fixed_ip_associate(context, address, instance_id, network_id=None,
 
-            'new_password2': 'password1',
+                       reserved=False):
 
-        })
+    """Associate fixed ip to instance.
 
-        self.assertEqual(response.status_code, 302)
 
-        self.assertTrue(response['Location'].endswith('/password_change/done/'))
 
+    Raises if fixed ip is not available.
 
 
-    def test_password_change_done_fails(self):
 
-        with self.settings(LOGIN_URL='/login/'):
+    """
 
-            response = self.client.get('/password_change/done/')
+    return IMPL.fixed_ip_associate(context, address, instance_id, network_id,
 
-            self.assertEqual(response.status_code, 302)
+                                   reserved)
 
-            self.assertTrue(response['Location'].endswith('/login/?next=/password_change/done/'))
 
 
 
 
+def fixed_ip_associate_pool(context, network_id, instance_id=None, host=None):
 
-class LoginTest(AuthViewsTestCase):
+    """Find free ip in network and associate it to instance or host.
 
 
 
-    def test_current_site_in_context_after_login(self):
+    Raises if one is not available.
 
-        response = self.client.get(reverse('django.contrib.auth.views.login'))
 
-        self.assertEqual(response.status_code, 200)
 
-        if Site._meta.installed:
+    """
 
-            site = Site.objects.get_current()
+    return IMPL.fixed_ip_associate_pool(context, network_id,
 
-            self.assertEqual(response.context['site'], site)
+                                        instance_id, host)
 
-            self.assertEqual(response.context['site_name'], site.name)
 
-        else:
 
-            self.assertIsInstance(response.context['site'], RequestSite)
 
-        self.assertTrue(isinstance(response.context['form'], AuthenticationForm),
 
-                     'Login form is not an AuthenticationForm')
+def fixed_ip_create(context, values):
 
+    """Create a fixed ip from the values dictionary."""
 
+    return IMPL.fixed_ip_create(context, values)
 
-    def test_security_check(self, password='password'):
 
-        login_url = reverse('django.contrib.auth.views.login')
 
 
 
-        # Those URLs should not pass the security check
+def fixed_ip_bulk_create(context, ips):
 
-        for bad_url in ('http://example.com',
+    """Create a lot of fixed ips from the values dictionary."""
 
-                        'https://example.com',
+    return IMPL.fixed_ip_bulk_create(context, ips)
 
-                        'ftp://exampel.com',
 
-                        '//example.com'):
 
 
 
-            nasty_url = '%(url)s?%(next)s=%(bad_url)s' % {
+def fixed_ip_disassociate(context, address):
 
-                'url': login_url,
+    """Disassociate a fixed ip from an instance by address."""
 
-                'next': REDIRECT_FIELD_NAME,
+    return IMPL.fixed_ip_disassociate(context, address)
 
-                'bad_url': urllib.quote(bad_url),
 
-            }
 
-            response = self.client.post(nasty_url, {
 
-                'username': 'testclient',
 
-                'password': password,
+def fixed_ip_disassociate_all_by_timeout(context, host, time):
 
-            })
+    """Disassociate old fixed ips from host."""
 
-            self.assertEqual(response.status_code, 302)
+    return IMPL.fixed_ip_disassociate_all_by_timeout(context, host, time)
 
-            self.assertFalse(bad_url in response['Location'],
 
-                             "%s should be blocked" % bad_url)
 
 
 
-        # These URLs *should* still pass the security check
+def fixed_ip_get_all(context):
 
-        for good_url in ('/view/?param=http://example.com',
+    """Get all defined fixed ips."""
 
-                         '/view/?param=https://example.com',
+    return IMPL.fixed_ip_get_all(context)
 
-                         '/view?param=ftp://exampel.com',
 
-                         'view/?param=//example.com',
 
-                         'https:///',
 
-                         '//testserver/',
 
-                         '/url%20with%20spaces/'):  # see ticket #12534
+def fixed_ip_get_all_by_instance_host(context, host):
 
-            safe_url = '%(url)s?%(next)s=%(good_url)s' % {
+    """Get all allocated fixed ips filtered by instance host."""
 
-                'url': login_url,
+    return IMPL.fixed_ip_get_all_by_instance_host(context, host)
 
-                'next': REDIRECT_FIELD_NAME,
 
-                'good_url': urllib.quote(good_url),
 
-            }
 
-            response = self.client.post(safe_url, {
 
-                    'username': 'testclient',
+def fixed_ip_get_by_address(context, address):
 
-                    'password': password,
+    """Get a fixed ip by address or raise if it does not exist."""
 
-            })
+    return IMPL.fixed_ip_get_by_address(context, address)
 
-            self.assertEqual(response.status_code, 302)
 
-            self.assertTrue(good_url in response['Location'],
 
-                            "%s should be allowed" % good_url)
 
 
+def fixed_ip_get_by_instance(context, instance_id):
 
+    """Get fixed ips by instance or raise if none exist."""
 
+    return IMPL.fixed_ip_get_by_instance(context, instance_id)
 
-class LoginURLSettings(AuthViewsTestCase):
 
 
 
-    def setUp(self):
 
-        super(LoginURLSettings, self).setUp()
+def fixed_ip_get_by_network_host(context, network_id, host):
 
-        self.old_LOGIN_URL = settings.LOGIN_URL
+    """Get fixed ip for a host in a network."""
 
+    return IMPL.fixed_ip_get_by_network_host(context, network_id, host)
 
 
-    def tearDown(self):
 
-        super(LoginURLSettings, self).tearDown()
 
-        settings.LOGIN_URL = self.old_LOGIN_URL
 
+def fixed_ip_get_by_virtual_interface(context, vif_id):
 
+    """Get fixed ips by virtual interface or raise if none exist."""
 
-    def get_login_required_url(self, login_url):
+    return IMPL.fixed_ip_get_by_virtual_interface(context, vif_id)
 
-        settings.LOGIN_URL = login_url
 
-        response = self.client.get('/login_required/')
 
-        self.assertEqual(response.status_code, 302)
 
-        return response['Location']
 
+def fixed_ip_get_network(context, address):
 
+    """Get a network for a fixed ip by address."""
 
-    def test_standard_login_url(self):
+    return IMPL.fixed_ip_get_network(context, address)
 
-        login_url = '/login/'
 
-        login_required_url = self.get_login_required_url(login_url)
 
-        querystring = QueryDict('', mutable=True)
 
-        querystring['next'] = '/login_required/'
 
-        self.assertEqual(login_required_url, 'http://testserver%s?%s' %
+def fixed_ip_update(context, address, values):
 
-                         (login_url, querystring.urlencode('/')))
+    """Create a fixed ip from the values dictionary."""
 
+    return IMPL.fixed_ip_update(context, address, values)
 
 
-    def test_remote_login_url(self):
 
-        login_url = 'http://remote.example.com/login'
+####################
 
-        login_required_url = self.get_login_required_url(login_url)
 
-        querystring = QueryDict('', mutable=True)
 
-        querystring['next'] = 'http://testserver/login_required/'
 
-        self.assertEqual(login_required_url,
 
-                         '%s?%s' % (login_url, querystring.urlencode('/')))
+def virtual_interface_create(context, values):
 
+    """Create a virtual interface record in the database."""
 
+    return IMPL.virtual_interface_create(context, values)
 
-    def test_https_login_url(self):
 
-        login_url = 'https:///login/'
 
-        login_required_url = self.get_login_required_url(login_url)
 
-        querystring = QueryDict('', mutable=True)
 
-        querystring['next'] = 'http://testserver/login_required/'
+def virtual_interface_update(context, vif_id, values):
 
-        self.assertEqual(login_required_url,
+    """Update a virtual interface record in the database."""
 
-                         '%s?%s' % (login_url, querystring.urlencode('/')))
+    return IMPL.virtual_interface_update(context, vif_id, values)
 
 
 
-    def test_login_url_with_querystring(self):
 
-        login_url = '/login/?pretty=1'
 
-        login_required_url = self.get_login_required_url(login_url)
+def virtual_interface_get(context, vif_id):
 
-        querystring = QueryDict('pretty=1', mutable=True)
+    """Gets a virtual interface from the table,"""
 
-        querystring['next'] = '/login_required/'
+    return IMPL.virtual_interface_get(context, vif_id)
 
-        self.assertEqual(login_required_url, 'http://testserver/login/?%s' %
 
-                         querystring.urlencode('/'))
 
 
 
-    def test_remote_login_url_with_next_querystring(self):
+def virtual_interface_get_by_address(context, address):
 
-        login_url = 'http://remote.example.com/login/'
+    """Gets a virtual interface from the table filtering on address."""
 
-        login_required_url = self.get_login_required_url('%s?next=/default/' %
+    return IMPL.virtual_interface_get_by_address(context, address)
 
-                                                         login_url)
 
-        querystring = QueryDict('', mutable=True)
 
-        querystring['next'] = 'http://testserver/login_required/'
 
-        self.assertEqual(login_required_url, '%s?%s' % (login_url,
 
-                                                    querystring.urlencode('/')))
+def virtual_interface_get_by_uuid(context, vif_uuid):
 
+    """Gets a virtual interface from the table filtering on vif uuid."""
 
+    return IMPL.virtual_interface_get_by_uuid(context, vif_uuid)
 
 
 
-class LogoutTest(AuthViewsTestCase):
 
 
+def virtual_interface_get_by_fixed_ip(context, fixed_ip_id):
 
-    def confirm_logged_out(self):
+    """Gets the virtual interface fixed_ip is associated with."""
 
-        self.assertTrue(SESSION_KEY not in self.client.session)
+    return IMPL.virtual_interface_get_by_fixed_ip(context, fixed_ip_id)
 
 
 
-    def test_logout_default(self):
 
-        "Logout without next_page option renders the default template"
 
-        self.login()
+def virtual_interface_get_by_instance(context, instance_id):
 
-        response = self.client.get('/logout/')
+    """Gets all virtual_interfaces for instance."""
 
-        self.assertEqual(200, response.status_code)
+    return IMPL.virtual_interface_get_by_instance(context, instance_id)
 
-        self.assertTrue('Logged out' in response.content)
 
-        self.confirm_logged_out()
 
 
 
-    def test_14377(self):
+def virtual_interface_get_by_instance_and_network(context, instance_id,
 
-        # Bug 14377
+                                                           network_id):
 
-        self.login()
+    """Gets all virtual interfaces for instance."""
 
-        response = self.client.get('/logout/')
+    return IMPL.virtual_interface_get_by_instance_and_network(context,
 
-        self.assertTrue('site' in response.context)
+                                                              instance_id,
 
+                                                              network_id)
 
 
-    def test_logout_with_overridden_redirect_url(self):
 
-        # Bug 11223
 
-        self.login()
 
-        response = self.client.get('/logout/next_page/')
+def virtual_interface_get_by_network(context, network_id):
 
-        self.assertEqual(response.status_code, 302)
+    """Gets all virtual interfaces on network."""
 
-        self.assertTrue(response['Location'].endswith('/somewhere/'))
+    return IMPL.virtual_interface_get_by_network(context, network_id)
 
 
 
-        response = self.client.get('/logout/next_page/?next=/login/')
 
-        self.assertEqual(response.status_code, 302)
 
-        self.assertTrue(response['Location'].endswith('/login/'))
+def virtual_interface_delete(context, vif_id):
 
+    """Delete virtual interface record from the database."""
 
+    return IMPL.virtual_interface_delete(context, vif_id)
 
-        self.confirm_logged_out()
 
 
 
-    def test_logout_with_next_page_specified(self):
 
-        "Logout with next_page option given redirects to specified resource"
+def virtual_interface_delete_by_instance(context, instance_id):
 
-        self.login()
+    """Delete virtual interface records associated with instance."""
 
-        response = self.client.get('/logout/next_page/')
+    return IMPL.virtual_interface_delete_by_instance(context, instance_id)
 
-        self.assertEqual(response.status_code, 302)
 
-        self.assertTrue(response['Location'].endswith('/somewhere/'))
 
-        self.confirm_logged_out()
 
 
+####################
 
-    def test_logout_with_redirect_argument(self):
 
-        "Logout with query string redirects to specified resource"
 
-        self.login()
 
-        response = self.client.get('/logout/?next=/login/')
 
-        self.assertEqual(response.status_code, 302)
+def instance_create(context, values):
 
-        self.assertTrue(response['Location'].endswith('/login/'))
+    """Create an instance from the values dictionary."""
 
-        self.confirm_logged_out()
+    return IMPL.instance_create(context, values)
 
 
 
-    def test_logout_with_custom_redirect_argument(self):
 
-        "Logout with custom query string redirects to specified resource"
 
-        self.login()
+def instance_data_get_for_project(context, project_id):
 
-        response = self.client.get('/logout/custom_query/?follow=/somewhere/')
+    """Get (instance_count, total_cores, total_ram) for project."""
 
-        self.assertEqual(response.status_code, 302)
+    return IMPL.instance_data_get_for_project(context, project_id)
 
-        self.assertTrue(response['Location'].endswith('/somewhere/'))
 
-        self.confirm_logged_out()
 
 
 
-    def test_security_check(self, password='password'):
+def instance_destroy(context, instance_id):
 
-        logout_url = reverse('django.contrib.auth.views.logout')
+    """Destroy the instance or raise if it does not exist."""
 
+    return IMPL.instance_destroy(context, instance_id)
 
 
-        # Those URLs should not pass the security check
 
-        for bad_url in ('http://example.com',
 
-                        'https://example.com',
 
-                        'ftp://exampel.com',
+def instance_stop(context, instance_id):
 
-                        '//example.com'):
+    """Stop the instance or raise if it does not exist."""
 
-            nasty_url = '%(url)s?%(next)s=%(bad_url)s' % {
+    return IMPL.instance_stop(context, instance_id)
 
-                'url': logout_url,
 
-                'next': REDIRECT_FIELD_NAME,
 
-                'bad_url': urllib.quote(bad_url),
 
-            }
 
-            self.login()
+def instance_get_by_uuid(context, uuid):
 
-            response = self.client.get(nasty_url)
+    """Get an instance or raise if it does not exist."""
 
-            self.assertEqual(response.status_code, 302)
+    return IMPL.instance_get_by_uuid(context, uuid)
 
-            self.assertFalse(bad_url in response['Location'],
 
-                             "%s should be blocked" % bad_url)
 
-            self.confirm_logged_out()
 
 
+def instance_get(context, instance_id):
 
-        # These URLs *should* still pass the security check
+    """Get an instance or raise if it does not exist."""
 
-        for good_url in ('/view/?param=http://example.com',
+    return IMPL.instance_get(context, instance_id)
 
-                         '/view/?param=https://example.com',
 
-                         '/view?param=ftp://exampel.com',
 
-                         'view/?param=//example.com',
 
-                         'https:///',
 
-                         '//testserver/',
+def instance_get_all(context):
 
-                         '/url%20with%20spaces/'):  # see ticket #12534
+    """Get all instances."""
 
-            safe_url = '%(url)s?%(next)s=%(good_url)s' % {
+    return IMPL.instance_get_all(context)
 
-                'url': logout_url,
 
-                'next': REDIRECT_FIELD_NAME,
 
-                'good_url': urllib.quote(good_url),
 
-            }
 
-            self.login()
+def instance_get_all_by_filters(context, filters):
 
-            response = self.client.get(safe_url)
+    """Get all instances that match all filters."""
 
-            self.assertEqual(response.status_code, 302)
+    return IMPL.instance_get_all_by_filters(context, filters)
 
-            self.assertTrue(good_url in response['Location'],
 
-                            "%s should be allowed" % good_url)
 
-            self.confirm_logged_out()
+
+
+def instance_get_active_by_window(context, begin, end=None, project_id=None):
+
+    """Get instances active during a certain time window.
+
+
+
+    Specifying a project_id will filter for a certain project."""
+
+    return IMPL.instance_get_active_by_window(context, begin, end, project_id)
+
+
+
+
+
+def instance_get_active_by_window_joined(context, begin, end=None,
+
+                                         project_id=None):
+
+    """Get instances and joins active during a certain time window.
+
+
+
+    Specifying a project_id will filter for a certain project."""
+
+    return IMPL.instance_get_active_by_window_joined(context, begin, end,
+
+                                              project_id)
+
+
+
+
+
+def instance_get_all_by_user(context, user_id):
+
+    """Get all instances."""
+
+    return IMPL.instance_get_all_by_user(context, user_id)
+
+
+
+
+
+def instance_get_all_by_project(context, project_id):
+
+    """Get all instance belonging to a project."""
+
+    return IMPL.instance_get_all_by_project(context, project_id)
+
+
+
+
+
+def instance_get_all_by_host(context, host):
+
+    """Get all instance belonging to a host."""
+
+    return IMPL.instance_get_all_by_host(context, host)
+
+
+
+
+
+def instance_get_all_by_reservation(context, reservation_id):
+
+    """Get all instances belonging to a reservation."""
+
+    return IMPL.instance_get_all_by_reservation(context, reservation_id)
+
+
+
+
+
+def instance_get_by_fixed_ip(context, address):
+
+    """Get an instance for a fixed ip by address."""
+
+    return IMPL.instance_get_by_fixed_ip(context, address)
+
+
+
+
+
+def instance_get_by_fixed_ipv6(context, address):
+
+    """Get an instance for a fixed ip by IPv6 address."""
+
+    return IMPL.instance_get_by_fixed_ipv6(context, address)
+
+
+
+
+
+def instance_get_fixed_addresses(context, instance_id):
+
+    """Get the fixed ip address of an instance."""
+
+    return IMPL.instance_get_fixed_addresses(context, instance_id)
+
+
+
+
+
+def instance_get_fixed_addresses_v6(context, instance_id):
+
+    return IMPL.instance_get_fixed_addresses_v6(context, instance_id)
+
+
+
+
+
+def instance_get_floating_address(context, instance_id):
+
+    """Get the first floating ip address of an instance."""
+
+    return IMPL.instance_get_floating_address(context, instance_id)
+
+
+
+
+
+def instance_get_project_vpn(context, project_id):
+
+    """Get a vpn instance by project or return None."""
+
+    return IMPL.instance_get_project_vpn(context, project_id)
+
+
+
+
+
+def instance_set_state(context, instance_id, state, description=None):
+
+    """Set the state of an instance."""
+
+    return IMPL.instance_set_state(context, instance_id, state, description)
+
+
+
+
+
+def instance_update(context, instance_id, values):
+
+    """Set the given properties on an instance and update it.
+
+
+
+    Raises NotFound if instance does not exist.
+
+
+
+    """
+
+    return IMPL.instance_update(context, instance_id, values)
+
+
+
+
+
+def instance_add_security_group(context, instance_id, security_group_id):
+
+    """Associate the given security group with the given instance."""
+
+    return IMPL.instance_add_security_group(context, instance_id,
+
+                                            security_group_id)
+
+
+
+
+
+def instance_remove_security_group(context, instance_id, security_group_id):
+
+    """Disassociate the given security group from the given instance."""
+
+    return IMPL.instance_remove_security_group(context, instance_id,
+
+                                            security_group_id)
+
+
+
+
+
+def instance_action_create(context, values):
+
+    """Create an instance action from the values dictionary."""
+
+    return IMPL.instance_action_create(context, values)
+
+
+
+
+
+def instance_get_actions(context, instance_id):
+
+    """Get instance actions by instance id."""
+
+    return IMPL.instance_get_actions(context, instance_id)
+
+
+
+
+
+###################
+
+
+
+
+
+def key_pair_create(context, values):
+
+    """Create a key_pair from the values dictionary."""
+
+    return IMPL.key_pair_create(context, values)
+
+
+
+
+
+def key_pair_destroy(context, user_id, name):
+
+    """Destroy the key_pair or raise if it does not exist."""
+
+    return IMPL.key_pair_destroy(context, user_id, name)
+
+
+
+
+
+def key_pair_destroy_all_by_user(context, user_id):
+
+    """Destroy all key_pairs by user."""
+
+    return IMPL.key_pair_destroy_all_by_user(context, user_id)
+
+
+
+
+
+def key_pair_get(context, user_id, name):
+
+    """Get a key_pair or raise if it does not exist."""
+
+    return IMPL.key_pair_get(context, user_id, name)
+
+
+
+
+
+def key_pair_get_all_by_user(context, user_id):
+
+    """Get all key_pairs by user."""
+
+    return IMPL.key_pair_get_all_by_user(context, user_id)
+
+
+
+
+
+####################
+
+
+
+
+
+def network_associate(context, project_id, force=False):
+
+    """Associate a free network to a project."""
+
+    return IMPL.network_associate(context, project_id, force)
+
+
+
+
+
+def network_count(context):
+
+    """Return the number of networks."""
+
+    return IMPL.network_count(context)
+
+
+
+
+
+def network_count_allocated_ips(context, network_id):
+
+    """Return the number of allocated non-reserved ips in the network."""
+
+    return IMPL.network_count_allocated_ips(context, network_id)
+
+
+
+
+
+def network_count_available_ips(context, network_id):
+
+    """Return the number of available ips in the network."""
+
+    return IMPL.network_count_available_ips(context, network_id)
+
+
+
+
+
+def network_count_reserved_ips(context, network_id):
+
+    """Return the number of reserved ips in the network."""
+
+    return IMPL.network_count_reserved_ips(context, network_id)
+
+
+
+
+
+def network_create_safe(context, values):
+
+    """Create a network from the values dict.
+
+
+
+    The network is only returned if the create succeeds. If the create violates
+
+    constraints because the network already exists, no exception is raised.
+
+
+
+    """
+
+    return IMPL.network_create_safe(context, values)
+
+
+
+
+
+def network_delete_safe(context, network_id):
+
+    """Delete network with key network_id.
+
+
+
+    This method assumes that the network is not associated with any project
+
+
+
+    """
+
+    return IMPL.network_delete_safe(context, network_id)
+
+
+
+
+
+def network_create_fixed_ips(context, network_id, num_vpn_clients):
+
+    """Create the ips for the network, reserving sepecified ips."""
+
+    return IMPL.network_create_fixed_ips(context, network_id, num_vpn_clients)
+
+
+
+
+
+def network_disassociate(context, network_id):
+
+    """Disassociate the network from project or raise if it does not exist."""
+
+    return IMPL.network_disassociate(context, network_id)
+
+
+
+
+
+def network_disassociate_all(context):
+
+    """Disassociate all networks from projects."""
+
+    return IMPL.network_disassociate_all(context)
+
+
+
+
+
+def network_get(context, network_id):
+
+    """Get an network or raise if it does not exist."""
+
+    return IMPL.network_get(context, network_id)
+
+
+
+
+
+def network_get_all(context):
+
+    """Return all defined networks."""
+
+    return IMPL.network_get_all(context)
+
+
+
+
+
+def network_get_all_by_uuids(context, network_uuids, project_id=None):
+
+    """Return networks by ids."""
+
+    return IMPL.network_get_all_by_uuids(context, network_uuids, project_id)
+
+
+
+
+
+# pylint: disable=C0103
+
+
+
+
+
+def network_get_associated_fixed_ips(context, network_id):
+
+    """Get all network's ips that have been associated."""
+
+    return IMPL.network_get_associated_fixed_ips(context, network_id)
+
+
+
+
+
+def network_get_by_bridge(context, bridge):
+
+    """Get a network by bridge or raise if it does not exist."""
+
+    return IMPL.network_get_by_bridge(context, bridge)
+
+
+
+
+
+def network_get_by_uuid(context, uuid):
+
+    """Get a network by uuid or raise if it does not exist."""
+
+    return IMPL.network_get_by_uuid(context, uuid)
+
+
+
+
+
+def network_get_by_cidr(context, cidr):
+
+    """Get a network by cidr or raise if it does not exist"""
+
+    return IMPL.network_get_by_cidr(context, cidr)
+
+
+
+
+
+def network_get_by_instance(context, instance_id):
+
+    """Get a network by instance id or raise if it does not exist."""
+
+    return IMPL.network_get_by_instance(context, instance_id)
+
+
+
+
+
+def network_get_all_by_instance(context, instance_id):
+
+    """Get all networks by instance id or raise if none exist."""
+
+    return IMPL.network_get_all_by_instance(context, instance_id)
+
+
+
+
+
+def network_get_all_by_host(context, host):
+
+    """All networks for which the given host is the network host."""
+
+    return IMPL.network_get_all_by_host(context, host)
+
+
+
+
+
+def network_get_index(context, network_id):
+
+    """Get non-conflicting index for network."""
+
+    return IMPL.network_get_index(context, network_id)
+
+
+
+
+
+def network_get_vpn_ip(context, network_id):
+
+    """Get non-conflicting index for network."""
+
+    return IMPL.network_get_vpn_ip(context, network_id)
+
+
+
+
+
+def network_set_cidr(context, network_id, cidr):
+
+    """Set the Classless Inner Domain Routing for the network."""
+
+    return IMPL.network_set_cidr(context, network_id, cidr)
+
+
+
+
+
+def network_set_host(context, network_id, host_id):
+
+    """Safely set the host for network."""
+
+    return IMPL.network_set_host(context, network_id, host_id)
+
+
+
+
+
+def network_update(context, network_id, values):
+
+    """Set the given properties on an network and update it.
+
+
+
+    Raises NotFound if network does not exist.
+
+
+
+    """
+
+    return IMPL.network_update(context, network_id, values)
+
+
+
+
+
+###################
+
+
+
+
+
+def queue_get_for(context, topic, physical_node_id):
+
+    """Return a channel to send a message to a node with a topic."""
+
+    return IMPL.queue_get_for(context, topic, physical_node_id)
+
+
+
+
+
+###################
+
+
+
+
+
+def export_device_count(context):
+
+    """Return count of export devices."""
+
+    return IMPL.export_device_count(context)
+
+
+
+
+
+def export_device_create_safe(context, values):
+
+    """Create an export_device from the values dictionary.
+
+
+
+    The device is not returned. If the create violates the unique
+
+    constraints because the shelf_id and blade_id already exist,
+
+    no exception is raised.
+
+
+
+    """
+
+    return IMPL.export_device_create_safe(context, values)
+
+
+
+
+
+###################
+
+
+
+
+
+def iscsi_target_count_by_host(context, host):
+
+    """Return count of export devices."""
+
+    return IMPL.iscsi_target_count_by_host(context, host)
+
+
+
+
+
+def iscsi_target_create_safe(context, values):
+
+    """Create an iscsi_target from the values dictionary.
+
+
+
+    The device is not returned. If the create violates the unique
+
+    constraints because the iscsi_target and host already exist,
+
+    no exception is raised.
+
+
+
+    """
+
+    return IMPL.iscsi_target_create_safe(context, values)
+
+
+
+
+
+###############
+
+
+
+
+
+def auth_token_destroy(context, token_id):
+
+    """Destroy an auth token."""
+
+    return IMPL.auth_token_destroy(context, token_id)
+
+
+
+
+
+def auth_token_get(context, token_hash):
+
+    """Retrieves a token given the hash representing it."""
+
+    return IMPL.auth_token_get(context, token_hash)
+
+
+
+
+
+def auth_token_update(context, token_hash, values):
+
+    """Updates a token given the hash representing it."""
+
+    return IMPL.auth_token_update(context, token_hash, values)
+
+
+
+
+
+def auth_token_create(context, token):
+
+    """Creates a new token."""
+
+    return IMPL.auth_token_create(context, token)
+
+
+
+
+
+###################
+
+
+
+
+
+def quota_create(context, project_id, resource, limit):
+
+    """Create a quota for the given project and resource."""
+
+    return IMPL.quota_create(context, project_id, resource, limit)
+
+
+
+
+
+def quota_get(context, project_id, resource):
+
+    """Retrieve a quota or raise if it does not exist."""
+
+    return IMPL.quota_get(context, project_id, resource)
+
+
+
+
+
+def quota_get_all_by_project(context, project_id):
+
+    """Retrieve all quotas associated with a given project."""
+
+    return IMPL.quota_get_all_by_project(context, project_id)
+
+
+
+
+
+def quota_update(context, project_id, resource, limit):
+
+    """Update a quota or raise if it does not exist."""
+
+    return IMPL.quota_update(context, project_id, resource, limit)
+
+
+
+
+
+def quota_destroy(context, project_id, resource):
+
+    """Destroy the quota or raise if it does not exist."""
+
+    return IMPL.quota_destroy(context, project_id, resource)
+
+
+
+
+
+def quota_destroy_all_by_project(context, project_id):
+
+    """Destroy all quotas associated with a given project."""
+
+    return IMPL.quota_get_all_by_project(context, project_id)
+
+
+
+
+
+###################
+
+
+
+
+
+def volume_allocate_shelf_and_blade(context, volume_id):
+
+    """Atomically allocate a free shelf and blade from the pool."""
+
+    return IMPL.volume_allocate_shelf_and_blade(context, volume_id)
+
+
+
+
+
+def volume_allocate_iscsi_target(context, volume_id, host):
+
+    """Atomically allocate a free iscsi_target from the pool."""
+
+    return IMPL.volume_allocate_iscsi_target(context, volume_id, host)
+
+
+
+
+
+def volume_attached(context, volume_id, instance_id, mountpoint):
+
+    """Ensure that a volume is set as attached."""
+
+    return IMPL.volume_attached(context, volume_id, instance_id, mountpoint)
+
+
+
+
+
+def volume_create(context, values):
+
+    """Create a volume from the values dictionary."""
+
+    return IMPL.volume_create(context, values)
+
+
+
+
+
+def volume_data_get_for_project(context, project_id):
+
+    """Get (volume_count, gigabytes) for project."""
+
+    return IMPL.volume_data_get_for_project(context, project_id)
+
+
+
+
+
+def volume_destroy(context, volume_id):
+
+    """Destroy the volume or raise if it does not exist."""
+
+    return IMPL.volume_destroy(context, volume_id)
+
+
+
+
+
+def volume_detached(context, volume_id):
+
+    """Ensure that a volume is set as detached."""
+
+    return IMPL.volume_detached(context, volume_id)
+
+
+
+
+
+def volume_get(context, volume_id):
+
+    """Get a volume or raise if it does not exist."""
+
+    return IMPL.volume_get(context, volume_id)
+
+
+
+
+
+def volume_get_all(context):
+
+    """Get all volumes."""
+
+    return IMPL.volume_get_all(context)
+
+
+
+
+
+def volume_get_all_by_host(context, host):
+
+    """Get all volumes belonging to a host."""
+
+    return IMPL.volume_get_all_by_host(context, host)
+
+
+
+
+
+def volume_get_all_by_instance(context, instance_id):
+
+    """Get all volumes belonging to a instance."""
+
+    return IMPL.volume_get_all_by_instance(context, instance_id)
+
+
+
+
+
+def volume_get_all_by_project(context, project_id):
+
+    """Get all volumes belonging to a project."""
+
+    return IMPL.volume_get_all_by_project(context, project_id)
+
+
+
+
+
+def volume_get_by_ec2_id(context, ec2_id):
+
+    """Get a volume by ec2 id."""
+
+    return IMPL.volume_get_by_ec2_id(context, ec2_id)
+
+
+
+
+
+def volume_get_instance(context, volume_id):
+
+    """Get the instance that a volume is attached to."""
+
+    return IMPL.volume_get_instance(context, volume_id)
+
+
+
+
+
+def volume_get_shelf_and_blade(context, volume_id):
+
+    """Get the shelf and blade allocated to the volume."""
+
+    return IMPL.volume_get_shelf_and_blade(context, volume_id)
+
+
+
+
+
+def volume_get_iscsi_target_num(context, volume_id):
+
+    """Get the target num (tid) allocated to the volume."""
+
+    return IMPL.volume_get_iscsi_target_num(context, volume_id)
+
+
+
+
+
+def volume_update(context, volume_id, values):
+
+    """Set the given properties on an volume and update it.
+
+
+
+    Raises NotFound if volume does not exist.
+
+
+
+    """
+
+    return IMPL.volume_update(context, volume_id, values)
+
+
+
+
+
+####################
+
+
+
+
+
+def snapshot_create(context, values):
+
+    """Create a snapshot from the values dictionary."""
+
+    return IMPL.snapshot_create(context, values)
+
+
+
+
+
+def snapshot_destroy(context, snapshot_id):
+
+    """Destroy the snapshot or raise if it does not exist."""
+
+    return IMPL.snapshot_destroy(context, snapshot_id)
+
+
+
+
+
+def snapshot_get(context, snapshot_id):
+
+    """Get a snapshot or raise if it does not exist."""
+
+    return IMPL.snapshot_get(context, snapshot_id)
+
+
+
+
+
+def snapshot_get_all(context):
+
+    """Get all snapshots."""
+
+    return IMPL.snapshot_get_all(context)
+
+
+
+
+
+def snapshot_get_all_by_project(context, project_id):
+
+    """Get all snapshots belonging to a project."""
+
+    return IMPL.snapshot_get_all_by_project(context, project_id)
+
+
+
+
+
+def snapshot_update(context, snapshot_id, values):
+
+    """Set the given properties on an snapshot and update it.
+
+
+
+    Raises NotFound if snapshot does not exist.
+
+
+
+    """
+
+    return IMPL.snapshot_update(context, snapshot_id, values)
+
+
+
+
+
+####################
+
+
+
+
+
+def block_device_mapping_create(context, values):
+
+    """Create an entry of block device mapping"""
+
+    return IMPL.block_device_mapping_create(context, values)
+
+
+
+
+
+def block_device_mapping_update(context, bdm_id, values):
+
+    """Update an entry of block device mapping"""
+
+    return IMPL.block_device_mapping_update(context, bdm_id, values)
+
+
+
+
+
+def block_device_mapping_update_or_create(context, values):
+
+    """Update an entry of block device mapping.
+
+    If not existed, create a new entry"""
+
+    return IMPL.block_device_mapping_update_or_create(context, values)
+
+
+
+
+
+def block_device_mapping_get_all_by_instance(context, instance_id):
+
+    """Get all block device mapping belonging to a instance"""
+
+    return IMPL.block_device_mapping_get_all_by_instance(context, instance_id)
+
+
+
+
+
+def block_device_mapping_destroy(context, bdm_id):
+
+    """Destroy the block device mapping."""
+
+    return IMPL.block_device_mapping_destroy(context, bdm_id)
+
+
+
+
+
+def block_device_mapping_destroy_by_instance_and_volume(context, instance_id,
+
+                                                        volume_id):
+
+    """Destroy the block device mapping or raise if it does not exist."""
+
+    return IMPL.block_device_mapping_destroy_by_instance_and_volume(
+
+        context, instance_id, volume_id)
+
+
+
+
+
+####################
+
+
+
+
+
+def security_group_get_all(context):
+
+    """Get all security groups."""
+
+    return IMPL.security_group_get_all(context)
+
+
+
+
+
+def security_group_get(context, security_group_id):
+
+    """Get security group by its id."""
+
+    return IMPL.security_group_get(context, security_group_id)
+
+
+
+
+
+def security_group_get_by_name(context, project_id, group_name):
+
+    """Returns a security group with the specified name from a project."""
+
+    return IMPL.security_group_get_by_name(context, project_id, group_name)
+
+
+
+
+
+def security_group_get_by_project(context, project_id):
+
+    """Get all security groups belonging to a project."""
+
+    return IMPL.security_group_get_by_project(context, project_id)
+
+
+
+
+
+def security_group_get_by_instance(context, instance_id):
+
+    """Get security groups to which the instance is assigned."""
+
+    return IMPL.security_group_get_by_instance(context, instance_id)
+
+
+
+
+
+def security_group_exists(context, project_id, group_name):
+
+    """Indicates if a group name exists in a project."""
+
+    return IMPL.security_group_exists(context, project_id, group_name)
+
+
+
+
+
+def security_group_create(context, values):
+
+    """Create a new security group."""
+
+    return IMPL.security_group_create(context, values)
+
+
+
+
+
+def security_group_destroy(context, security_group_id):
+
+    """Deletes a security group."""
+
+    return IMPL.security_group_destroy(context, security_group_id)
+
+
+
+
+
+def security_group_destroy_all(context):
+
+    """Deletes a security group."""
+
+    return IMPL.security_group_destroy_all(context)
+
+
+
+
+
+####################
+
+
+
+
+
+def security_group_rule_create(context, values):
+
+    """Create a new security group."""
+
+    return IMPL.security_group_rule_create(context, values)
+
+
+
+
+
+def security_group_rule_get_by_security_group(context, security_group_id):
+
+    """Get all rules for a a given security group."""
+
+    return IMPL.security_group_rule_get_by_security_group(context,
+
+                                                          security_group_id)
+
+
+
+
+
+def security_group_rule_get_by_security_group_grantee(context,
+
+                                                      security_group_id):
+
+    """Get all rules that grant access to the given security group."""
+
+    return IMPL.security_group_rule_get_by_security_group_grantee(context,
+
+                                                             security_group_id)
+
+
+
+
+
+def security_group_rule_destroy(context, security_group_rule_id):
+
+    """Deletes a security group rule."""
+
+    return IMPL.security_group_rule_destroy(context, security_group_rule_id)
+
+
+
+
+
+def security_group_rule_get(context, security_group_rule_id):
+
+    """Gets a security group rule."""
+
+    return IMPL.security_group_rule_get(context, security_group_rule_id)
+
+
+
+
+
+###################
+
+
+
+
+
+def provider_fw_rule_create(context, rule):
+
+    """Add a firewall rule at the provider level (all hosts & instances)."""
+
+    return IMPL.provider_fw_rule_create(context, rule)
+
+
+
+
+
+def provider_fw_rule_get_all(context):
+
+    """Get all provider-level firewall rules."""
+
+    return IMPL.provider_fw_rule_get_all(context)
+
+
+
+
+
+def provider_fw_rule_get_all_by_cidr(context, cidr):
+
+    """Get all provider-level firewall rules."""
+
+    return IMPL.provider_fw_rule_get_all_by_cidr(context, cidr)
+
+
+
+
+
+def provider_fw_rule_destroy(context, rule_id):
+
+    """Delete a provider firewall rule from the database."""
+
+    return IMPL.provider_fw_rule_destroy(context, rule_id)
+
+
+
+
+
+###################
+
+
+
+
+
+def user_get(context, id):
+
+    """Get user by id."""
+
+    return IMPL.user_get(context, id)
+
+
+
+
+
+def user_get_by_uid(context, uid):
+
+    """Get user by uid."""
+
+    return IMPL.user_get_by_uid(context, uid)
+
+
+
+
+
+def user_get_by_access_key(context, access_key):
+
+    """Get user by access key."""
+
+    return IMPL.user_get_by_access_key(context, access_key)
+
+
+
+
+
+def user_create(context, values):
+
+    """Create a new user."""
+
+    return IMPL.user_create(context, values)
+
+
+
+
+
+def user_delete(context, id):
+
+    """Delete a user."""
+
+    return IMPL.user_delete(context, id)
+
+
+
+
+
+def user_get_all(context):
+
+    """Create a new user."""
+
+    return IMPL.user_get_all(context)
+
+
+
+
+
+def user_add_role(context, user_id, role):
+
+    """Add another global role for user."""
+
+    return IMPL.user_add_role(context, user_id, role)
+
+
+
+
+
+def user_remove_role(context, user_id, role):
+
+    """Remove global role from user."""
+
+    return IMPL.user_remove_role(context, user_id, role)
+
+
+
+
+
+def user_get_roles(context, user_id):
+
+    """Get global roles for user."""
+
+    return IMPL.user_get_roles(context, user_id)
+
+
+
+
+
+def user_add_project_role(context, user_id, project_id, role):
+
+    """Add project role for user."""
+
+    return IMPL.user_add_project_role(context, user_id, project_id, role)
+
+
+
+
+
+def user_remove_project_role(context, user_id, project_id, role):
+
+    """Remove project role from user."""
+
+    return IMPL.user_remove_project_role(context, user_id, project_id, role)
+
+
+
+
+
+def user_get_roles_for_project(context, user_id, project_id):
+
+    """Return list of roles a user holds on project."""
+
+    return IMPL.user_get_roles_for_project(context, user_id, project_id)
+
+
+
+
+
+def user_update(context, user_id, values):
+
+    """Update user."""
+
+    return IMPL.user_update(context, user_id, values)
+
+
+
+
+
+###################
+
+
+
+
+
+def project_get(context, id):
+
+    """Get project by id."""
+
+    return IMPL.project_get(context, id)
+
+
+
+
+
+def project_create(context, values):
+
+    """Create a new project."""
+
+    return IMPL.project_create(context, values)
+
+
+
+
+
+def project_add_member(context, project_id, user_id):
+
+    """Add user to project."""
+
+    return IMPL.project_add_member(context, project_id, user_id)
+
+
+
+
+
+def project_get_all(context):
+
+    """Get all projects."""
+
+    return IMPL.project_get_all(context)
+
+
+
+
+
+def project_get_by_user(context, user_id):
+
+    """Get all projects of which the given user is a member."""
+
+    return IMPL.project_get_by_user(context, user_id)
+
+
+
+
+
+def project_remove_member(context, project_id, user_id):
+
+    """Remove the given user from the given project."""
+
+    return IMPL.project_remove_member(context, project_id, user_id)
+
+
+
+
+
+def project_update(context, project_id, values):
+
+    """Update Remove the given user from the given project."""
+
+    return IMPL.project_update(context, project_id, values)
+
+
+
+
+
+def project_delete(context, project_id):
+
+    """Delete project."""
+
+    return IMPL.project_delete(context, project_id)
+
+
+
+
+
+def project_get_networks(context, project_id, associate=True):
+
+    """Return the network associated with the project.
+
+
+
+    If associate is true, it will attempt to associate a new
+
+    network if one is not found, otherwise it returns None.
+
+
+
+    """
+
+    return IMPL.project_get_networks(context, project_id, associate)
+
+
+
+
+
+def project_get_networks_v6(context, project_id):
+
+    return IMPL.project_get_networks_v6(context, project_id)
+
+
+
+
+
+###################
+
+
+
+
+
+def console_pool_create(context, values):
+
+    """Create console pool."""
+
+    return IMPL.console_pool_create(context, values)
+
+
+
+
+
+def console_pool_get(context, pool_id):
+
+    """Get a console pool."""
+
+    return IMPL.console_pool_get(context, pool_id)
+
+
+
+
+
+def console_pool_get_by_host_type(context, compute_host, proxy_host,
+
+                                  console_type):
+
+    """Fetch a console pool for a given proxy host, compute host, and type."""
+
+    return IMPL.console_pool_get_by_host_type(context,
+
+                                              compute_host,
+
+                                              proxy_host,
+
+                                              console_type)
+
+
+
+
+
+def console_pool_get_all_by_host_type(context, host, console_type):
+
+    """Fetch all pools for given proxy host and type."""
+
+    return IMPL.console_pool_get_all_by_host_type(context,
+
+                                                  host,
+
+                                                  console_type)
+
+
+
+
+
+def console_create(context, values):
+
+    """Create a console."""
+
+    return IMPL.console_create(context, values)
+
+
+
+
+
+def console_delete(context, console_id):
+
+    """Delete a console."""
+
+    return IMPL.console_delete(context, console_id)
+
+
+
+
+
+def console_get_by_pool_instance(context, pool_id, instance_id):
+
+    """Get console entry for a given instance and pool."""
+
+    return IMPL.console_get_by_pool_instance(context, pool_id, instance_id)
+
+
+
+
+
+def console_get_all_by_instance(context, instance_id):
+
+    """Get consoles for a given instance."""
+
+    return IMPL.console_get_all_by_instance(context, instance_id)
+
+
+
+
+
+def console_get(context, console_id, instance_id=None):
+
+    """Get a specific console (possibly on a given instance)."""
+
+    return IMPL.console_get(context, console_id, instance_id)
+
+
+
+
+
+    ##################
+
+
+
+
+
+def instance_type_create(context, values):
+
+    """Create a new instance type."""
+
+    return IMPL.instance_type_create(context, values)
+
+
+
+
+
+def instance_type_get_all(context, inactive=False):
+
+    """Get all instance types."""
+
+    return IMPL.instance_type_get_all(context, inactive)
+
+
+
+
+
+def instance_type_get(context, id):
+
+    """Get instance type by id."""
+
+    return IMPL.instance_type_get(context, id)
+
+
+
+
+
+def instance_type_get_by_name(context, name):
+
+    """Get instance type by name."""
+
+    return IMPL.instance_type_get_by_name(context, name)
+
+
+
+
+
+def instance_type_get_by_flavor_id(context, id):
+
+    """Get instance type by name."""
+
+    return IMPL.instance_type_get_by_flavor_id(context, id)
+
+
+
+
+
+def instance_type_destroy(context, name):
+
+    """Delete a instance type."""
+
+    return IMPL.instance_type_destroy(context, name)
+
+
+
+
+
+def instance_type_purge(context, name):
+
+    """Purges (removes) an instance type from DB.
+
+
+
+    Use instance_type_destroy for most cases
+
+
+
+    """
+
+    return IMPL.instance_type_purge(context, name)
+
+
+
+
+
+####################
+
+
+
+
+
+def zone_create(context, values):
+
+    """Create a new child Zone entry."""
+
+    return IMPL.zone_create(context, values)
+
+
+
+
+
+def zone_update(context, zone_id, values):
+
+    """Update a child Zone entry."""
+
+    return IMPL.zone_update(context, zone_id, values)
+
+
+
+
+
+def zone_delete(context, zone_id):
+
+    """Delete a child Zone."""
+
+    return IMPL.zone_delete(context, zone_id)
+
+
+
+
+
+def zone_get(context, zone_id):
+
+    """Get a specific child Zone."""
+
+    return IMPL.zone_get(context, zone_id)
+
+
+
+
+
+def zone_get_all(context):
+
+    """Get all child Zones."""
+
+    return IMPL.zone_get_all(context)
+
+
+
+
+
+####################
+
+
+
+
+
+def instance_metadata_get(context, instance_id):
+
+    """Get all metadata for an instance."""
+
+    return IMPL.instance_metadata_get(context, instance_id)
+
+
+
+
+
+def instance_metadata_delete(context, instance_id, key):
+
+    """Delete the given metadata item."""
+
+    IMPL.instance_metadata_delete(context, instance_id, key)
+
+
+
+
+
+def instance_metadata_update(context, instance_id, metadata, delete):
+
+    """Update metadata if it exists, otherwise create it."""
+
+    IMPL.instance_metadata_update(context, instance_id, metadata, delete)
+
+
+
+
+
+####################
+
+
+
+
+
+def agent_build_create(context, values):
+
+    """Create a new agent build entry."""
+
+    return IMPL.agent_build_create(context, values)
+
+
+
+
+
+def agent_build_get_by_triple(context, hypervisor, os, architecture):
+
+    """Get agent build by hypervisor/OS/architecture triple."""
+
+    return IMPL.agent_build_get_by_triple(context, hypervisor, os,
+
+            architecture)
+
+
+
+
+
+def agent_build_get_all(context):
+
+    """Get all agent builds."""
+
+    return IMPL.agent_build_get_all(context)
+
+
+
+
+
+def agent_build_destroy(context, agent_update_id):
+
+    """Destroy agent build entry."""
+
+    IMPL.agent_build_destroy(context, agent_update_id)
+
+
+
+
+
+def agent_build_update(context, agent_build_id, values):
+
+    """Update agent build entry."""
+
+    IMPL.agent_build_update(context, agent_build_id, values)
+
+
+
+
+
+####################
+
+
+
+
+
+def instance_type_extra_specs_get(context, instance_type_id):
+
+    """Get all extra specs for an instance type."""
+
+    return IMPL.instance_type_extra_specs_get(context, instance_type_id)
+
+
+
+
+
+def instance_type_extra_specs_delete(context, instance_type_id, key):
+
+    """Delete the given extra specs item."""
+
+    IMPL.instance_type_extra_specs_delete(context, instance_type_id, key)
+
+
+
+
+
+def instance_type_extra_specs_update_or_create(context, instance_type_id,
+
+                                               extra_specs):
+
+    """Create or update instance type extra specs. This adds or modifies the
+
+    key/value pairs specified in the extra specs dict argument"""
+
+    IMPL.instance_type_extra_specs_update_or_create(context, instance_type_id,
+
+                                                    extra_specs)
+
+
+
+
+
+##################
+
+
+
+
+
+def volume_metadata_get(context, volume_id):
+
+    """Get all metadata for a volume."""
+
+    return IMPL.volume_metadata_get(context, volume_id)
+
+
+
+
+
+def volume_metadata_delete(context, volume_id, key):
+
+    """Delete the given metadata item."""
+
+    IMPL.volume_metadata_delete(context, volume_id, key)
+
+
+
+
+
+def volume_metadata_update(context, volume_id, metadata, delete):
+
+    """Update metadata if it exists, otherwise create it."""
+
+    IMPL.volume_metadata_update(context, volume_id, metadata, delete)
+
+
+
+
+
+##################
+
+
+
+
+
+def volume_type_create(context, values):
+
+    """Create a new volume type."""
+
+    return IMPL.volume_type_create(context, values)
+
+
+
+
+
+def volume_type_get_all(context, inactive=False):
+
+    """Get all volume types."""
+
+    return IMPL.volume_type_get_all(context, inactive)
+
+
+
+
+
+def volume_type_get(context, id):
+
+    """Get volume type by id."""
+
+    return IMPL.volume_type_get(context, id)
+
+
+
+
+
+def volume_type_get_by_name(context, name):
+
+    """Get volume type by name."""
+
+    return IMPL.volume_type_get_by_name(context, name)
+
+
+
+
+
+def volume_type_destroy(context, name):
+
+    """Delete a volume type."""
+
+    return IMPL.volume_type_destroy(context, name)
+
+
+
+
+
+def volume_type_purge(context, name):
+
+    """Purges (removes) a volume type from DB.
+
+
+
+    Use volume_type_destroy for most cases
+
+
+
+    """
+
+    return IMPL.volume_type_purge(context, name)
+
+
+
+
+
+####################
+
+
+
+
+
+def volume_type_extra_specs_get(context, volume_type_id):
+
+    """Get all extra specs for a volume type."""
+
+    return IMPL.volume_type_extra_specs_get(context, volume_type_id)
+
+
+
+
+
+def volume_type_extra_specs_delete(context, volume_type_id, key):
+
+    """Delete the given extra specs item."""
+
+    IMPL.volume_type_extra_specs_delete(context, volume_type_id, key)
+
+
+
+
+
+def volume_type_extra_specs_update_or_create(context, volume_type_id,
+
+                                               extra_specs):
+
+    """Create or update volume type extra specs. This adds or modifies the
+
+    key/value pairs specified in the extra specs dict argument"""
+
+    IMPL.volume_type_extra_specs_update_or_create(context, volume_type_id,
+
+                                                    extra_specs)
+
+
+
+
+
+####################
+
+
+
+
+
+def vsa_create(context, values):
+
+    """Creates Virtual Storage Array record."""
+
+    return IMPL.vsa_create(context, values)
+
+
+
+
+
+def vsa_update(context, vsa_id, values):
+
+    """Updates Virtual Storage Array record."""
+
+    return IMPL.vsa_update(context, vsa_id, values)
+
+
+
+
+
+def vsa_destroy(context, vsa_id):
+
+    """Deletes Virtual Storage Array record."""
+
+    return IMPL.vsa_destroy(context, vsa_id)
+
+
+
+
+
+def vsa_get(context, vsa_id):
+
+    """Get Virtual Storage Array record by ID."""
+
+    return IMPL.vsa_get(context, vsa_id)
+
+
+
+
+
+def vsa_get_all(context):
+
+    """Get all Virtual Storage Array records."""
+
+    return IMPL.vsa_get_all(context)
+
+
+
+
+
+def vsa_get_all_by_project(context, project_id):
+
+    """Get all Virtual Storage Array records by project ID."""
+
+    return IMPL.vsa_get_all_by_project(context, project_id)

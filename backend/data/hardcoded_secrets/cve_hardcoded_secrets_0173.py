@@ -6,692 +6,358 @@
 
 
 
-# Copyright 2012 OpenStack LLC
+# Copyright 2012 United States Government as represented by the
+
+# Administrator of the National Aeronautics and Space Administration.
+
+# All Rights Reserved.
 
 #
 
-# Licensed under the Apache License, Version 2.0 (the "License"); you may
-
-# not use this file except in compliance with the License. You may obtain
-
-# a copy of the License at
+# Copyright 2012 Nebula, Inc.
 
 #
 
-#      http://www.apache.org/licenses/LICENSE-2.0
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+
+#    not use this file except in compliance with the License. You may obtain
+
+#    a copy of the License at
 
 #
 
-# Unless required by applicable law or agreed to in writing, software
+#         http://www.apache.org/licenses/LICENSE-2.0
 
-# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#
 
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    Unless required by applicable law or agreed to in writing, software
 
-# License for the specific language governing permissions and limitations
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-# under the License.
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
+#    License for the specific language governing permissions and limitations
 
-
-"""Main entry point into the EC2 Credentials service.
-
-
-
-This service allows the creation of access/secret credentials used for
-
-the ec2 interop layer of OpenStack.
-
-
-
-A user can create as many access/secret pairs, each of which map to a
-
-specific tenant.  This is required because OpenStack supports a user
-
-belonging to multiple tenants, whereas the signatures created on ec2-style
-
-requests don't allow specification of which tenant the user wishs to act
-
-upon.
-
-
-
-To complete the cycle, we provide a method that OpenStack services can
-
-use to validate a signature and get a corresponding openstack token.  This
-
-token allows method calls to other services within the context the
-
-access/secret was created.  As an example, nova requests keystone to validate
-
-the signature of a request, receives a token, and then makes a request to
-
-glance to list images needed to perform the requested task.
+#    under the License.
 
 
 
 """
 
+Forms used for Horizon's auth mechanisms.
 
-
-import uuid
-
-
-
-from keystone import catalog
-
-from keystone import config
-
-from keystone import exception
-
-from keystone import identity
-
-from keystone import policy
-
-from keystone import service
-
-from keystone import token
-
-from keystone.common import manager
-
-from keystone.common import utils
-
-from keystone.common import wsgi
+"""
 
 
 
-
-
-CONF = config.CONF
-
+import logging
 
 
 
+from django import shortcuts
 
-class Manager(manager.Manager):
+from django.conf import settings
 
-    """Default pivot point for the EC2 Credentials backend.
+from django.contrib import messages
+
+from django.contrib.auth import REDIRECT_FIELD_NAME
+
+from django.utils.translation import ugettext as _
+
+from keystoneclient import exceptions as keystone_exceptions
 
 
 
-    See :mod:`keystone.common.manager.Manager` for more details on how this
+from horizon import api
 
-    dynamically calls the backend.
+from horizon import base
+
+from horizon import exceptions
+
+from horizon import forms
+
+from horizon import users
 
 
+
+
+
+LOG = logging.getLogger(__name__)
+
+
+
+
+
+def _set_session_data(request, token):
+
+    request.session['serviceCatalog'] = token.serviceCatalog
+
+    request.session['tenant'] = token.tenant['name']
+
+    request.session['tenant_id'] = token.tenant['id']
+
+    request.session['token'] = token.id
+
+    request.session['user_name'] = token.user['name']
+
+    request.session['user_id'] = token.user['id']
+
+    request.session['roles'] = token.user['roles']
+
+
+
+
+
+class Login(forms.SelfHandlingForm):
+
+    """ Form used for logging in a user.
+
+
+
+    Handles authentication with Keystone, choosing a tenant, and fetching
+
+    a scoped token token for that tenant. Redirects to the URL returned
+
+    by :meth:`horizon.get_user_home` if successful.
+
+
+
+    Subclass of :class:`~horizon.forms.SelfHandlingForm`.
 
     """
 
+    region = forms.ChoiceField(label=_("Region"), required=False)
 
+    username = forms.CharField(label=_("User Name"))
 
-    def __init__(self):
+    password = forms.CharField(label=_("Password"),
 
-        super(Manager, self).__init__(CONF.ec2.driver)
+                               widget=forms.PasswordInput(render_value=False))
 
 
 
+    def __init__(self, *args, **kwargs):
 
+        super(Login, self).__init__(*args, **kwargs)
 
-class Ec2Extension(wsgi.ExtensionRouter):
+        # FIXME(gabriel): When we switch to region-only settings, we can
 
-    def add_routes(self, mapper):
+        # remove this default region business.
 
-        ec2_controller = Ec2Controller()
+        default_region = (settings.OPENSTACK_KEYSTONE_URL, "Default Region")
 
-        # validation
+        regions = getattr(settings, 'AVAILABLE_REGIONS', [default_region])
 
-        mapper.connect('/ec2tokens',
+        self.fields['region'].choices = regions
 
-                       controller=ec2_controller,
+        if len(regions) == 1:
 
-                       action='authenticate',
+            self.fields['region'].initial = default_region[0]
 
-                       conditions=dict(method=['POST']))
+            self.fields['region'].widget = forms.widgets.HiddenInput()
 
 
 
-        # crud
+    def handle(self, request, data):
 
-        mapper.connect('/users/{user_id}/credentials/OS-EC2',
+        # For now we'll allow fallback to OPENSTACK_KEYSTONE_URL if the
 
-                       controller=ec2_controller,
+        # form post doesn't include a region.
 
-                       action='create_credential',
+        endpoint = data.get('region', None) or settings.OPENSTACK_KEYSTONE_URL
 
-                       conditions=dict(method=['POST']))
+        region_name = dict(self.fields['region'].choices)[endpoint]
 
-        mapper.connect('/users/{user_id}/credentials/OS-EC2',
+        request.session['region_endpoint'] = endpoint
 
-                       controller=ec2_controller,
+        request.session['region_name'] = region_name
 
-                       action='get_credentials',
 
-                       conditions=dict(method=['GET']))
 
-        mapper.connect('/users/{user_id}/credentials/OS-EC2/{credential_id}',
+        redirect_to = request.REQUEST.get(REDIRECT_FIELD_NAME, "")
 
-                       controller=ec2_controller,
 
-                       action='get_credential',
 
-                       conditions=dict(method=['GET']))
+        if data.get('tenant', None):
 
-        mapper.connect('/users/{user_id}/credentials/OS-EC2/{credential_id}',
+            try:
 
-                       controller=ec2_controller,
+                token = api.token_create(request,
 
-                       action='delete_credential',
+                                         data.get('tenant'),
 
-                       conditions=dict(method=['DELETE']))
+                                         data['username'],
 
+                                         data['password'])
 
+                tenants = api.tenant_list_for_token(request, token.id)
 
+            except:
 
+                msg = _('Unable to authenticate for that project.')
 
-class Ec2Controller(wsgi.Application):
+                exceptions.handle(request,
 
-    def __init__(self):
+                                  message=msg,
 
-        self.catalog_api = catalog.Manager()
+                                  escalate=True)
 
-        self.identity_api = identity.Manager()
+            _set_session_data(request, token)
 
-        self.token_api = token.Manager()
+            user = users.get_user_from_request(request)
 
-        self.policy_api = policy.Manager()
+            redirect = redirect_to or base.Horizon.get_user_home(user)
 
-        self.ec2_api = Manager()
+            return shortcuts.redirect(redirect)
 
-        super(Ec2Controller, self).__init__()
 
 
+        elif data.get('username', None):
 
-    def check_signature(self, creds_ref, credentials):
+            try:
 
-        signer = utils.Ec2Signer(creds_ref['secret'])
+                unscoped_token = api.token_create(request,
 
-        signature = signer.generate(credentials)
+                                                  '',
 
-        if utils.auth_str_equal(credentials['signature'], signature):
+                                                  data['username'],
 
-            return
+                                                  data['password'])
 
-        # NOTE(vish): Some libraries don't use the port when signing
+            except keystone_exceptions.Unauthorized:
 
-        #             requests, so try again without port.
+                exceptions.handle(request,
 
-        elif ':' in credentials['signature']:
+                                  _('Invalid user name or password.'))
 
-            hostname, _port = credentials['host'].split(':')
+            except:
 
-            credentials['host'] = hostname
+                # If we get here we don't want to show a stack trace to the
 
-            signature = signer.generate(credentials)
+                # user. However, if we fail here, there may be bad session
 
-            if not utils.auth_str_equal(credentials.signature, signature):
+                # data that's been cached already.
 
-                raise exception.Unauthorized(message='Invalid EC2 signature.')
+                request.session.clear()
 
-        else:
+                exceptions.handle(request,
 
-            raise exception.Unauthorized(message='EC2 signature not supplied.')
+                                  message=_("An error occurred authenticating."
 
+                                            " Please try again later."),
 
+                                  escalate=True)
 
-    def authenticate(self, context, credentials=None,
 
-                         ec2Credentials=None):
 
-        """Validate a signed EC2 request and provide a token.
+            # Unscoped token
 
+            request.session['unscoped_token'] = unscoped_token.id
 
+            request.user.username = data['username']
 
-        Other services (such as Nova) use this **admin** call to determine
 
-        if a request they signed received is from a valid user.
 
+            # Get the tenant list, and log in using first tenant
 
+            # FIXME (anthony): add tenant chooser here?
 
-        If it is a valid signature, an openstack token that maps
+            try:
 
-        to the user/tenant is returned to the caller, along with
+                tenants = api.tenant_list_for_token(request, unscoped_token.id)
 
-        all the other details returned from a normal token validation
+            except:
 
-        call.
+                exceptions.handle(request)
 
+                tenants = []
 
 
-        The returned token is useful for making calls to other
 
-        OpenStack services within the context of the request.
+            # Abort if there are no valid tenants for this user
 
+            if not tenants:
 
+                messages.error(request,
 
-        :param context: standard context
+                               _('You are not authorized for any projects.') %
 
-        :param credentials: dict of ec2 signature
+                                {"user": data['username']},
 
-        :param ec2Credentials: DEPRECATED dict of ec2 signature
+                               extra_tags="login")
 
-        :returns: token: openstack token equivalent to access key along
+                return
 
-                         with the corresponding service catalog and roles
 
-        """
 
+            # Create a token.
 
+            # NOTE(gabriel): Keystone can return tenants that you're
 
-        # FIXME(ja): validate that a service token was used!
+            # authorized to administer but not to log into as a user, so in
 
+            # the case of an Unauthorized error we should iterate through
 
+            # the tenants until one succeeds or we've failed them all.
 
-        # NOTE(termie): backwards compat hack
+            while tenants:
 
-        if not credentials and ec2Credentials:
+                tenant = tenants.pop()
 
-            credentials = ec2Credentials
+                try:
 
+                    token = api.token_create_scoped(request,
 
+                                                    tenant.id,
 
-        if not 'access' in credentials:
+                                                    unscoped_token.id)
 
-            raise exception.Unauthorized(message='EC2 signature not supplied.')
+                    break
 
+                except:
 
+                    # This will continue for recognized Unauthorized
 
-        creds_ref = self._get_credentials(context,
+                    # exceptions from keystoneclient.
 
-                                          credentials['access'])
+                    exceptions.handle(request, ignore=True)
 
-        self.check_signature(creds_ref, credentials)
+                    token = None
 
+            if token is None:
 
+                raise exceptions.NotAuthorized(
 
-        # TODO(termie): don't create new tokens every time
+                    _("You are not authorized for any available projects."))
 
-        # TODO(termie): this is copied from TokenController.authenticate
 
-        token_id = uuid.uuid4().hex
 
-        tenant_ref = self.identity_api.get_tenant(
+            _set_session_data(request, token)
 
-                context=context,
+            user = users.get_user_from_request(request)
 
-                tenant_id=creds_ref['tenant_id'])
+        redirect = redirect_to or base.Horizon.get_user_home(user)
 
-        user_ref = self.identity_api.get_user(
+        return shortcuts.redirect(redirect)
 
-                context=context,
 
-                user_id=creds_ref['user_id'])
 
-        metadata_ref = self.identity_api.get_metadata(
 
-                context=context,
 
-                user_id=user_ref['id'],
+class LoginWithTenant(Login):
 
-                tenant_id=tenant_ref['id'])
+    """
 
-        catalog_ref = self.catalog_api.get_catalog(
+    Exactly like :class:`.Login` but includes the tenant id as a field
 
-                context=context,
+    so that the process of choosing a default tenant is bypassed.
 
-                user_id=user_ref['id'],
+    """
 
-                tenant_id=tenant_ref['id'],
+    region = forms.ChoiceField(required=False)
 
-                    metadata=metadata_ref)
+    username = forms.CharField(max_length="20",
 
+                       widget=forms.TextInput(attrs={'readonly': 'readonly'}))
 
-
-        token_ref = self.token_api.create_token(
-
-                context, token_id, dict(id=token_id,
-
-                                        user=user_ref,
-
-                                        tenant=tenant_ref,
-
-                                        metadata=metadata_ref))
-
-
-
-        # TODO(termie): optimize this call at some point and put it into the
-
-        #               the return for metadata
-
-        # fill out the roles in the metadata
-
-        roles_ref = []
-
-        for role_id in metadata_ref.get('roles', []):
-
-            roles_ref.append(self.identity_api.get_role(context, role_id))
-
-
-
-        # TODO(termie): make this a util function or something
-
-        # TODO(termie): i don't think the ec2 middleware currently expects a
-
-        #               full return, but it contains a note saying that it
-
-        #               would be better to expect a full return
-
-        token_controller = service.TokenController()
-
-        return token_controller._format_authenticate(
-
-                token_ref, roles_ref, catalog_ref)
-
-
-
-    def create_credential(self, context, user_id, tenant_id):
-
-        """Create a secret/access pair for use with ec2 style auth.
-
-
-
-        Generates a new set of credentials that map the the user/tenant
-
-        pair.
-
-
-
-        :param context: standard context
-
-        :param user_id: id of user
-
-        :param tenant_id: id of tenant
-
-        :returns: credential: dict of ec2 credential
-
-        """
-
-        if not self._is_admin(context):
-
-            self._assert_identity(context, user_id)
-
-
-
-        self._assert_valid_user_id(context, user_id)
-
-        self._assert_valid_tenant_id(context, tenant_id)
-
-
-
-        cred_ref = {'user_id': user_id,
-
-                    'tenant_id': tenant_id,
-
-                    'access': uuid.uuid4().hex,
-
-                    'secret': uuid.uuid4().hex}
-
-        self.ec2_api.create_credential(context, cred_ref['access'], cred_ref)
-
-        return {'credential': cred_ref}
-
-
-
-    def get_credentials(self, context, user_id):
-
-        """List all credentials for a user.
-
-
-
-        :param context: standard context
-
-        :param user_id: id of user
-
-        :returns: credentials: list of ec2 credential dicts
-
-        """
-
-        if not self._is_admin(context):
-
-            self._assert_identity(context, user_id)
-
-        self._assert_valid_user_id(context, user_id)
-
-        return {'credentials': self.ec2_api.list_credentials(context, user_id)}
-
-
-
-    def get_credential(self, context, user_id, credential_id):
-
-        """Retreive a user's access/secret pair by the access key.
-
-
-
-        Grab the full access/secret pair for a given access key.
-
-
-
-        :param context: standard context
-
-        :param user_id: id of user
-
-        :param credential_id: access key for credentials
-
-        :returns: credential: dict of ec2 credential
-
-        """
-
-        if not self._is_admin(context):
-
-            self._assert_identity(context, user_id)
-
-        self._assert_valid_user_id(context, user_id)
-
-        creds = self._get_credentials(context, credential_id)
-
-        return {'credential': creds}
-
-
-
-    def delete_credential(self, context, user_id, credential_id):
-
-        """Delete a user's access/secret pair.
-
-
-
-        Used to revoke a user's access/secret pair
-
-
-
-        :param context: standard context
-
-        :param user_id: id of user
-
-        :param credential_id: access key for credentials
-
-        :returns: bool: success
-
-        """
-
-        if not self._is_admin(context):
-
-            self._assert_identity(context, user_id)
-
-            self._assert_owner(context, user_id, credential_id)
-
-
-
-        self._assert_valid_user_id(context, user_id)
-
-        self._get_credentials(context, credential_id)
-
-        return self.ec2_api.delete_credential(context, credential_id)
-
-
-
-    def _get_credentials(self, context, credential_id):
-
-        """Return credentials from an ID.
-
-
-
-        :param context: standard context
-
-        :param credential_id: id of credential
-
-        :raises exception.Unauthorized: when credential id is invalid
-
-        :returns: credential: dict of ec2 credential.
-
-        """
-
-        creds = self.ec2_api.get_credential(context,
-
-                                            credential_id)
-
-        if not creds:
-
-            raise exception.Unauthorized(message='EC2 access key not found.')
-
-        return creds
-
-
-
-    def _assert_identity(self, context, user_id):
-
-        """Check that the provided token belongs to the user.
-
-
-
-        :param context: standard context
-
-        :param user_id: id of user
-
-        :raises exception.Forbidden: when token is invalid
-
-
-
-        """
-
-        try:
-
-            token_ref = self.token_api.get_token(context=context,
-
-                    token_id=context['token_id'])
-
-        except exception.TokenNotFound:
-
-            raise exception.Unauthorized()
-
-        token_user_id = token_ref['user'].get('id')
-
-        if not token_user_id == user_id:
-
-            raise exception.Forbidden()
-
-
-
-    def _is_admin(self, context):
-
-        """Wrap admin assertion error return statement.
-
-
-
-        :param context: standard context
-
-        :returns: bool: success
-
-
-
-        """
-
-        try:
-
-            self.assert_admin(context)
-
-            return True
-
-        except exception.Forbidden:
-
-            return False
-
-
-
-    def _assert_owner(self, context, user_id, credential_id):
-
-        """Ensure the provided user owns the credential.
-
-
-
-        :param context: standard context
-
-        :param user_id: expected credential owner
-
-        :param credential_id: id of credential object
-
-        :raises exception.Forbidden: on failure
-
-
-
-        """
-
-        cred_ref = self.ec2_api.get_credential(context, credential_id)
-
-        if not user_id == cred_ref['user_id']:
-
-            raise exception.Forbidden()
-
-
-
-    def _assert_valid_user_id(self, context, user_id):
-
-        """Ensure a valid user id.
-
-
-
-        :param context: standard context
-
-        :param user_id: expected credential owner
-
-        :raises exception.UserNotFound: on failure
-
-
-
-        """
-
-        user_ref = self.identity_api.get_user(
-
-            context=context,
-
-            user_id=user_id)
-
-        if not user_ref:
-
-            raise exception.UserNotFound(user_id=user_id)
-
-
-
-    def _assert_valid_tenant_id(self, context, tenant_id):
-
-        """Ensure a valid tenant id.
-
-
-
-        :param context: standard context
-
-        :param user_id: expected credential owner
-
-        :raises exception.UserNotFound: on failure
-
-
-
-        """
-
-        tenant_ref = self.identity_api.get_tenant(
-
-            context=context,
-
-            tenant_id=tenant_id)
-
-        if not tenant_ref:
-
-            raise exception.TenantNotFound(tenant_id=tenant_id)
+    tenant = forms.CharField(widget=forms.HiddenInput())

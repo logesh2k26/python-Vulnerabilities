@@ -1,479 +1,1703 @@
 # Source: CVEFixes dataset
-# Safety: vulnerable
+# Safety: safe
 # Category: safe
 
-# Copyright 2018 The TensorFlow Authors. All Rights Reserved.
-
-#
-
-# Licensed under the Apache License, Version 2.0 (the "License");
-
-# you may not use this file except in compliance with the License.
-
-# You may obtain a copy of the License at
-
-#
-
-#     http://www.apache.org/licenses/LICENSE-2.0
-
-#
-
-# Unless required by applicable law or agreed to in writing, software
-
-# distributed under the License is distributed on an "AS IS" BASIS,
-
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-
-# See the License for the specific language governing permissions and
-
-# limitations under the License.
-
-# ==============================================================================
-
-"""Tests for sparse ops."""
+# -*- coding: utf-8 -*-
 
 
-
-from __future__ import absolute_import
-
-from __future__ import division
 
 from __future__ import print_function
 
+from __future__ import absolute_import
 
 
-from absl.testing import parameterized
 
-import numpy as np
+from typing import List, TYPE_CHECKING
 
 
 
-from tensorflow.python.framework import constant_op
+from zulint.custom_rules import RuleList
 
-from tensorflow.python.framework import dtypes
+if TYPE_CHECKING:
 
-from tensorflow.python.framework import errors
+    from zulint.custom_rules import Rule
 
-from tensorflow.python.framework import ops
 
-from tensorflow.python.framework import sparse_tensor
 
-from tensorflow.python.framework import test_util
+# Rule help:
 
-# Need array_grad to register gradient for Identity.
+# By default, a rule applies to all files within the extension for which it is specified (e.g. all .py files)
 
-from tensorflow.python.ops import array_grad  # pylint: disable=unused-import
+# There are three operators we can use to manually include or exclude files from linting for a rule:
 
-from tensorflow.python.ops import array_ops
+# 'exclude': 'set([<path>, ...])' - if <path> is a filename, excludes that file.
 
-from tensorflow.python.ops import gradient_checker_v2 as gradient_checker
+#                                   if <path> is a directory, excludes all files directly below the directory <path>.
 
-from tensorflow.python.ops import math_ops
+# 'exclude_line': 'set([(<path>, <line>), ...])' - excludes all lines matching <line> in the file <path> from linting.
 
-# Need sparse_grad to register gradient for SparseToDense.
+# 'include_only': 'set([<path>, ...])' - includes only those files where <path> is a substring of the filepath.
 
-from tensorflow.python.ops import sparse_grad  # pylint: disable=unused-import
 
-from tensorflow.python.ops import sparse_ops
 
-from tensorflow.python.platform import googletest
+PYDELIMS = r'''"'()\[\]{}#\\'''
 
+PYREG = r"[^{}]".format(PYDELIMS)
 
+PYSQ = r'"(?:[^"\\]|\\.)*"'
 
+PYDQ = r"'(?:[^'\\]|\\.)*'"
 
+PYLEFT = r"[(\[{]"
 
-@test_util.run_all_in_graph_and_eager_modes
+PYRIGHT = r"[)\]}]"
 
-class SparseOpsTest(test_util.TensorFlowTestCase, parameterized.TestCase):
+PYCODE = PYREG
 
+for depth in range(5):
 
+    PYGROUP = r"""(?:{}|{}|{}{}*{})""".format(PYSQ, PYDQ, PYLEFT, PYCODE, PYRIGHT)
 
-  def testSparseEye(self):
+    PYCODE = r"""(?:{}|{})""".format(PYREG, PYGROUP)
 
-    def test_one(n, m, as_tensors):
 
-      expected = np.eye(n, m)
 
-      if as_tensors:
+FILES_WITH_LEGACY_SUBJECT = {
 
-        m = constant_op.constant(m)
+    # This basically requires a big DB migration:
 
-        n = constant_op.constant(n)
+    'zerver/lib/topic.py',
 
-      s = sparse_ops.sparse_eye(n, m)
 
-      d = sparse_ops.sparse_to_dense(s.indices, s.dense_shape, s.values)
 
-      self.assertAllEqual(self.evaluate(d), expected)
+    # This is for backward compatibility.
 
+    'zerver/tests/test_legacy_subject.py',
 
 
-    for n in range(2, 10, 2):
 
-      for m in range(2, 10, 2):
+    # Other migration-related changes require extreme care.
 
-        # Test with n and m as both constants and tensors.
+    'zerver/lib/fix_unreads.py',
 
-        test_one(n, m, True)
+    'zerver/tests/test_migrations.py',
 
-        test_one(n, m, False)
 
 
+    # These use subject in the email sense, and will
 
-  def testDenseFromConstantToSparse(self):
+    # probably always be exempt:
 
-    expected_constant = np.reshape(np.arange(24, dtype=np.int64), (3, 4, 2))
+    'zerver/lib/email_mirror.py',
 
-    tensor = constant_op.constant(expected_constant)
+    'zerver/lib/feedback.py',
 
-    sparse = sparse_ops.from_dense(tensor)
+    'zerver/tests/test_new_users.py',
 
-    dense = sparse_ops.sparse_to_dense(sparse.indices, sparse.dense_shape,
+    'zerver/tests/test_email_mirror.py',
 
-                                       sparse.values)
 
-    constant = self.evaluate(dense)
 
-    self.assertAllEqual(expected_constant, constant)
+    # These are tied more to our API than our DB model.
 
+    'zerver/openapi/python_examples.py',
 
+    'zerver/tests/test_openapi.py',
 
-  def testTransposePreservesShape(self):
 
-    with ops.Graph().as_default():
 
-      t = sparse_tensor.SparseTensor(indices=[[0, 0]],
+    # This has lots of query data embedded, so it's hard
 
-                                     values=[0.],
+    # to fix everything until we migrate the DB to "topic".
 
-                                     dense_shape=[3, 4])
+    'zerver/tests/test_narrow.py',
 
-      self.assertTrue(t.shape.is_fully_defined)
+}
 
-      transposed = sparse_ops.sparse_transpose(t)
 
-      self.assertAllEqual(transposed.shape, [4, 3])
 
+shebang_rules = [
 
+    {'pattern': '^#!',
 
-  def testSparseExpandDims(self):
+     'description': "zerver library code shouldn't have a shebang line.",
 
-    for rank in range(1, 4):
+     'include_only': set(['zerver/'])},
 
-      # Create a dummy input. When rank=3, shape=[2, 4, 6].
+    # /bin/sh and /usr/bin/env are the only two binaries
 
-      shape = np.arange(1, rank + 1) * 2
+    # that NixOS provides at a fixed path (outside a
 
-      before = np.arange(np.prod(shape)).reshape(shape)
+    # buildFHSUserEnv sandbox).
 
+    {'pattern': '^#!(?! *(?:/usr/bin/env|/bin/sh)(?: |$))',
 
+     'description': "Use `#!/usr/bin/env foo` instead of `#!/path/foo`"
 
-      # Make entries sparse.
+     " for interpreters other than sh."},
 
-      before *= np.random.binomial(1, .2, before.shape)
+    {'pattern': '^#!/usr/bin/env python$',
 
-      dense_shape = before.shape
+     'description': "Use `#!/usr/bin/env python3` instead of `#!/usr/bin/env python`."}
 
-      indices = np.array(np.where(before)).T
+]  # type: List[Rule]
 
-      values = before[before != 0]
 
 
+trailing_whitespace_rule = {
 
-      # Try every possible valid value of axis.
+    'pattern': r'\s+$',
 
-      for axis in range(-rank - 1, rank):
+    'strip': '\n',
 
-        expected_after = np.expand_dims(before, axis)
+    'description': 'Fix trailing whitespace'
 
+}  # type: Rule
 
+whitespace_rules = [
 
-        for axis_as_tensor in [False, True]:
+    # This linter should be first since bash_rules depends on it.
 
-          dense_shape_t = constant_op.constant(dense_shape, dtype=dtypes.int64)
+    trailing_whitespace_rule,
 
-          indices_t = constant_op.constant(indices)
+    {'pattern': 'http://zulip.readthedocs.io',
 
-          values_t = constant_op.constant(values)
+     'description': 'Use HTTPS when linking to ReadTheDocs',
 
-          before_t = sparse_tensor.SparseTensor(
+     },
 
-              indices=indices_t, values=values_t, dense_shape=dense_shape_t)
+    {'pattern': '\t',
 
+     'strip': '\n',
 
+     'exclude': set(['tools/ci/success-http-headers.txt']),
 
-          if axis_as_tensor:
+     'description': 'Fix tab-based whitespace'},
 
-            axis = constant_op.constant(axis)
+]  # type: List[Rule]
 
+comma_whitespace_rule = [
 
+    {'pattern': ', {2,}[^#/ ]',
 
-          s = sparse_ops.sparse_expand_dims(before_t, axis)
+     'exclude': set(['zerver/tests', 'frontend_tests/node_tests', 'corporate/tests']),
 
-          d = sparse_ops.sparse_to_dense(s.indices, s.dense_shape, s.values)
+     'description': "Remove multiple whitespaces after ','",
 
-          self.assertAllEqual(self.evaluate(d), expected_after)
+     'good_lines': ['foo(1, 2, 3)', 'foo = bar  # some inline comment'],
 
+     'bad_lines': ['foo(1,  2, 3)', 'foo(1,    2, 3)']},
 
+]  # type: List[Rule]
 
-  @parameterized.parameters([
+markdown_whitespace_rules = list([rule for rule in whitespace_rules if rule['pattern'] != r'\s+$']) + [
 
-      (math_ops.abs, [1.0, -1.0, 3.0, -4.0], [1.0, 1.0, 3.0, 4.0]),
+    # Two spaces trailing a line with other content is okay--it's a markdown line break.
 
-      (math_ops.negative, [1.0, -1.0, 3.0, -4.0], [-1.0, 1.0, -3.0, 4.0]),
+    # This rule finds one space trailing a non-space, three or more trailing spaces, and
 
-      (math_ops.sign, [3.0, -2.0, 0.0, -4.0], [1.0, -1.0, 0.0, -1.0]),
+    # spaces on an empty line.
 
-      (math_ops.square, [1.0, -1.0, 3.0, -4.0], [1.0, 1.0, 9.0, 16.0]),
+    {'pattern': r'((?<!\s)\s$)|(\s\s\s+$)|(^\s+$)',
 
-  ])
+     'strip': '\n',
 
-  def testUnarySparseDispatch(self, op, values, expected):
+     'description': 'Fix trailing whitespace'},
 
-    st = sparse_tensor.SparseTensor(
+    {'pattern': '^#+[A-Za-z0-9]',
 
-        indices=[[0, 0], [0, 1], [2, 0], [2, 4]],
+     'strip': '\n',
 
-        values=values,
+     'description': 'Missing space after # in heading',
 
-        dense_shape=[3, 6])
+     'good_lines': ['### some heading', '# another heading'],
 
-    result = op(st)
+     'bad_lines': ['###some heading', '#another heading']},
 
-    result_value = self.evaluate(result)
+]
 
-    self.assertAllEqual(result_value.indices, st.indices)
 
-    self.assertAllEqual(result_value.values, expected)
 
-    self.assertAllEqual(result_value.dense_shape, st.dense_shape)
 
 
+js_rules = RuleList(
 
-  def testSparseToDenseGradient(self):
+    langs=['js'],
 
+    rules=[
 
+        {'pattern': 'subject|SUBJECT',
 
-    def f(sparse_values, default_value):
+         'exclude': set(['static/js/util.js',
 
-      st = sparse_tensor.SparseTensor(
+                         'frontend_tests/']),
 
-          indices=[[0, 3, 6], [1, 4, 7], [2, 5, 8]],
+         'exclude_pattern': 'emails',
 
-          values=sparse_values,
+         'description': 'avoid subject in JS code',
 
-          dense_shape=[3, 6, 9])
+         'good_lines': ['topic_name'],
 
-      return sparse_ops.sparse_tensor_to_dense(st, default_value)
+         'bad_lines': ['subject="foo"', ' MAX_SUBJECT_LEN']},
 
+        {'pattern': r'[^_]function\(',
 
+         'description': 'The keyword "function" should be followed by a space'},
 
-    grads = gradient_checker.compute_gradient(
+        {'pattern': 'msgid|MSGID',
 
-        f, [constant_op.constant([1.0, 2.0, 3.0]),
+         'description': 'Avoid using "msgid" as a variable name; use "message_id" instead.'},
 
-            constant_op.constant(0.0)])
+        {'pattern': r'.*blueslip.warning\(.*',
 
-    epsilon = 1e-4
+         'description': 'The module blueslip has no function warning, try using blueslip.warn'},
 
-    self.assertLess(gradient_checker.max_error(*grads), epsilon)
+        {'pattern': '[)]{$',
 
+         'description': 'Missing space between ) and {'},
 
+        {'pattern': r'i18n\.t\([^)]+[^,\{\)]$',
 
-  def testSparseTensorToDenseString(self):
+         'description': 'i18n string should not be a multiline string'},
 
-    sp = sparse_tensor.SparseTensor(
+        {'pattern': r'''i18n\.t\(['"].+?['"]\s*\+''',
 
-        indices=[[0, 0], [1, 2]], values=['a', 'b'], dense_shape=[2, 3])
+         'description': 'Do not concatenate arguments within i18n.t()'},
 
-    dense = sparse_ops.sparse_tensor_to_dense(sp)
+        {'pattern': r'i18n\.t\(.+\).*\+',
 
-    expected_dense = [[b'a', b'', b''], [b'', b'', b'b']]
+         'description': 'Do not concatenate i18n strings'},
 
-    result_dense = self.evaluate(dense)
+        {'pattern': r'\+.*i18n\.t\(.+\)',
 
-    self.assertAllEqual(expected_dense, result_dense)
+         'description': 'Do not concatenate i18n strings'},
 
+        {'pattern': '[.]includes[(]',
 
+         'exclude': {'frontend_tests/'},
 
-  def testDenseSparseTensorMatMul(self):
+         'description': '.includes() is incompatible with Internet Explorer. Use .indexOf() !== -1 instead.'},
 
+        {'pattern': '[.]html[(]',
 
+         'exclude_pattern': r'''[.]html[(]("|'|render_|html|message.content|sub.rendered_description|i18n.t|rendered_|$|[)]|error_text|widget_elem|[$]error|[$][(]"<p>"[)])''',
 
-    np.random.seed(42)
+         'exclude': {'static/js/portico', 'static/js/lightbox.js', 'static/js/ui_report.js',
 
-    dense_numpy_array = np.random.rand(3, 3)
+                     'static/js/confirm_dialog.js',
 
-    independent_dense_tf = constant_op.constant(
+                     'frontend_tests/'},
 
-        dense_numpy_array, dtype='float32')
+         'description': 'Setting HTML content with jQuery .html() can lead to XSS security bugs.  Consider .text() or using rendered_foo as a variable name if content comes from handlebars and thus is already sanitized.'},
 
+        {'pattern': '["\']json/',
 
+         'description': 'Relative URL for JSON route not supported by i18n'},
 
-    sp = sparse_tensor.SparseTensor(
+        # This rule is constructed with + to avoid triggering on itself
 
-        indices=[[0, 0], [1, 2]], values=[4., 8.], dense_shape=[3, 3])
+        {'pattern': " =" + '[^ =>~"]',
 
-    dense_of_sparse = sparse_ops.sparse_to_dense(sp.indices, sp.shape,
+         'description': 'Missing whitespace after "="'},
 
-                                                 sp.values)
+        {'pattern': '^[ ]*//[A-Za-z0-9]',
 
+         'description': 'Missing space after // in comment'},
 
+        {'pattern': 'if[(]',
 
-    result = sparse_ops.sparse_tensor_dense_matmul(
+         'description': 'Missing space between if and ('},
 
-        independent_dense_tf, sp, adjoint_a=False, adjoint_b=False)
+        {'pattern': 'else{$',
 
-    expected = math_ops.matmul(independent_dense_tf, dense_of_sparse)
+         'description': 'Missing space between else and {'},
 
-    self.assertAllEqual(expected, result)
+        {'pattern': '^else {$',
 
+         'description': 'Write JS else statements on same line as }'},
 
+        {'pattern': '^else if',
 
-    result = sparse_ops.sparse_tensor_dense_matmul(
+         'description': 'Write JS else statements on same line as }'},
 
-        independent_dense_tf, sp, adjoint_a=False, adjoint_b=True)
+        {'pattern': 'console[.][a-z]',
 
-    expected = math_ops.matmul(independent_dense_tf,
+         'exclude': set(['static/js/blueslip.js',
 
-                               array_ops.transpose(dense_of_sparse))
+                         'frontend_tests/zjsunit',
 
-    self.assertAllEqual(expected, result)
+                         'frontend_tests/casper_lib/common.js',
 
+                         'frontend_tests/node_tests',
 
+                         'static/js/debug.js']),
 
-    result = sparse_ops.sparse_tensor_dense_matmul(
+         'description': 'console.log and similar should not be used in webapp'},
 
-        independent_dense_tf, sp, adjoint_a=True, adjoint_b=False)
+        {'pattern': r'''[.]text\(["'][a-zA-Z]''',
 
-    expected = math_ops.matmul(
+         'description': 'Strings passed to $().text should be wrapped in i18n.t() for internationalization',
 
-        array_ops.transpose(independent_dense_tf), dense_of_sparse)
+         'exclude': set(['frontend_tests/node_tests/'])},
 
-    self.assertAllEqual(expected, result)
+        {'pattern': r'''compose_error\(["']''',
 
+         'description': 'Argument to compose_error should be a literal string enclosed '
 
+                        'by i18n.t()'},
 
-    result = sparse_ops.sparse_tensor_dense_matmul(
+        {'pattern': r'ui.report_success\(',
 
-        independent_dense_tf, sp, adjoint_a=True, adjoint_b=True)
+         'description': 'Deprecated function, use ui_report.success.'},
 
-    expected = math_ops.matmul(
+        {'pattern': r'''report.success\(["']''',
 
-        array_ops.transpose(independent_dense_tf),
+         'description': 'Argument to report_success should be a literal string enclosed '
 
-        array_ops.transpose(dense_of_sparse))
+                        'by i18n.t()'},
 
-    self.assertAllEqual(expected, result)
+        {'pattern': r'ui.report_error\(',
 
+         'description': 'Deprecated function, use ui_report.error.'},
 
+        {'pattern': r'''report.error\(["'][^'"]''',
 
-  def testMapValues(self):
+         'description': 'Argument to ui_report.error should be a literal string enclosed '
 
-    # supplying no sparse tensor should result in ValueError
+                        'by i18n.t()',
 
-    with self.assertRaises(ValueError):
+         'good_lines': ['ui_report.error("")', 'ui_report.error(_("text"))'],
 
-      sparse_ops.map_values(math_ops.abs, 0.0)
+         'bad_lines': ['ui_report.error("test")']},
 
+        {'pattern': r'\$\(document\)\.ready\(',
 
+         'description': "`Use $(f) rather than `$(document).ready(f)`",
 
-    sp = sparse_ops.from_dense([[0.0, 1.0, 0.0], [-2.0, 1.0, 0.0]])
+         'good_lines': ['$(function () {foo();}'],
 
+         'bad_lines': ['$(document).ready(function () {foo();}']},
 
+        {'pattern': '[$][.](get|post|patch|delete|ajax)[(]',
 
-    # helper function to check equality of sparse tensor
+         'description': "Use channel module for AJAX calls",
 
-    def assert_sparse_equal(expected, result):
+         'exclude': set([
 
-      self.assertAllEqual(expected.values, result.values, msg='Values differ')
+             # Internal modules can do direct network calls
 
-      self.assertAllEqual(
+             'static/js/blueslip.js',
 
-          expected.indices, result.indices, msg='Indices differ')
+             'static/js/channel.js',
 
-      self.assertAllEqual(
+             # External modules that don't include channel.js
 
-          expected.dense_shape, result.dense_shape, msg='Shapes differ')
+             'static/js/stats/',
 
+             'static/js/portico/',
 
+             'static/js/billing/',
 
-    # check for a single sparse argument
+         ]),
 
-    expected = sparse_ops.from_dense([[0.0, 1.0, 0.0], [2.0, 1.0, 0.0]])
+         'good_lines': ['channel.get(...)'],
 
-    result = sparse_ops.map_values(math_ops.abs, sp)
+         'bad_lines': ['$.get()', '$.post()', '$.ajax()']},
 
-    assert_sparse_equal(expected, result)
+        {'pattern': 'style ?=',
 
+         'description': "Avoid using the `style=` attribute; we prefer styling in CSS files",
 
+         'exclude': set([
 
-    # check correct passing of keyword argument, and handling of two sparse
+             'frontend_tests/node_tests/copy_and_paste.js',
 
-    # arguments at the same time
+             'frontend_tests/node_tests/upload.js',
 
-    def mapping(arg1, arg2, kwarg):
+             'frontend_tests/node_tests/templates.js',
 
-      self.assertEqual(kwarg, 'kwarg')
+             'static/js/upload.js',
 
-      return arg1 + arg2
+             'static/js/stream_color.js',
 
+         ]),
 
+         'good_lines': ['#my-style {color: blue;}'],
 
-    result = sparse_ops.map_values(mapping, sp, sp, kwarg='kwarg')
+         'bad_lines': ['<p style="color: blue;">Foo</p>', 'style = "color: blue;"']},
 
-    expected = sparse_ops.from_dense([[0.0, 2.0, 0.0], [-4.0, 2.0, 0.0]])
+        *whitespace_rules,
 
-    assert_sparse_equal(expected, result)
+        *comma_whitespace_rule,
 
+    ],
 
+)
 
-    # check that index mismatches are correctly detected even if the `value`s
 
-    # have compatible shape
 
-    sp_incomp = sparse_ops.from_dense([[0.0, 1.0, 0.0], [-2.0, 0.0, 1.0]])
+python_rules = RuleList(
 
-    with self.assertRaises((errors.InvalidArgumentError, ValueError)):
+    langs=['py'],
 
-      result = sparse_ops.map_values(mapping, sp, sp_incomp, kwarg='kwarg')
+    rules=[
 
-      self.evaluate(result)
+        {'pattern': 'subject|SUBJECT',
 
+         'exclude_pattern': 'subject to the|email|outbox',
 
+         'description': 'avoid subject as a var',
 
-    # check that shape mismatches are correctly detected
+         'good_lines': ['topic_name'],
 
-    sp_incomp = sparse_tensor.SparseTensor(sp.indices, sp.values, (25, 25))
+         'bad_lines': ['subject="foo"', ' MAX_SUBJECT_LEN'],
 
-    with self.assertRaises((errors.InvalidArgumentError, ValueError)):
+         'exclude': FILES_WITH_LEGACY_SUBJECT,
 
-      result = sparse_ops.map_values(mapping, sp, sp_incomp, kwarg='kwarg')
+         'include_only': set([
 
-      self.evaluate(result)
+             'zerver/data_import/',
 
+             'zerver/lib/',
 
+             'zerver/tests/',
 
-  def testConstantStringToSparse(self):
+             'zerver/views/'])},
 
-    # Test case for GitHub issue 40633.
+        {'pattern': 'msgid|MSGID',
 
-    tensor = constant_op.constant(list('ababa'))
+         'exclude': set(['tools/check-capitalization',
 
-    sparse = sparse_ops.from_dense(tensor)
+                         'tools/i18n/tagmessages']),
 
-    result = self.evaluate(sparse)
+         'description': 'Avoid using "msgid" as a variable name; use "message_id" instead.'},
 
-    self.assertAllEqual([[0], [1], [2], [3], [4]], result.indices)
+        {'pattern': '^(?!#)@login_required',
 
-    self.assertAllEqual([b'a', b'b', b'a', b'b', b'a'], result.values)
+         'description': '@login_required is unsupported; use @zulip_login_required',
 
-    self.assertAllEqual([5], result.dense_shape)
+         'good_lines': ['@zulip_login_required', '# foo @login_required'],
 
+         'bad_lines': ['@login_required', ' @login_required']},
 
+        {'pattern': '^user_profile[.]save[(][)]',
 
+         'description': 'Always pass update_fields when saving user_profile objects',
 
+         'exclude_line': set([
 
-if __name__ == '__main__':
+             ('zerver/lib/actions.py', "user_profile.save()  # Can't use update_fields because of how the foreign key works."),
 
-  googletest.main()
+         ]),
+
+         'exclude': set(['zerver/tests', 'zerver/lib/create_user.py']),
+
+         'good_lines': ['user_profile.save(update_fields=["pointer"])'],
+
+         'bad_lines': ['user_profile.save()']},
+
+        {'pattern': r'^[^"]*"[^"]*"%\(',
+
+         'description': 'Missing space around "%"',
+
+         'good_lines': ['"%s" % ("foo")', '"%s" % (foo)'],
+
+         'bad_lines': ['"%s"%("foo")', '"%s"%(foo)']},
+
+        {'pattern': r"^[^']*'[^']*'%\(",
+
+         'description': 'Missing space around "%"',
+
+         'good_lines': ["'%s' % ('foo')", "'%s' % (foo)"],
+
+         'bad_lines': ["'%s'%('foo')", "'%s'%(foo)"]},
+
+        {'pattern': 'self: Any',
+
+         'description': 'you can omit Any annotation for self',
+
+         'good_lines': ['def foo (self):'],
+
+         'bad_lines': ['def foo(self: Any):']},
+
+        # This rule is constructed with + to avoid triggering on itself
+
+        {'pattern': " =" + '[^ =>~"]',
+
+         'description': 'Missing whitespace after "="',
+
+         'good_lines': ['a = b', '5 == 6'],
+
+         'bad_lines': ['a =b', 'asdf =42']},
+
+        {'pattern': r'":\w[^"]*$',
+
+         'description': 'Missing whitespace after ":"',
+
+         'exclude': set(['zerver/tests/test_push_notifications.py']),
+
+         'good_lines': ['"foo": bar', '"some:string:with:colons"'],
+
+         'bad_lines': ['"foo":bar', '"foo":1']},
+
+        {'pattern': r"':\w[^']*$",
+
+         'description': 'Missing whitespace after ":"',
+
+         'good_lines': ["'foo': bar", "'some:string:with:colons'"],
+
+         'bad_lines': ["'foo':bar", "'foo':1"]},
+
+        {'pattern': r"^\s+#\w",
+
+         'strip': '\n',
+
+         'exclude': set(['tools/droplets/create.py']),
+
+         'description': 'Missing whitespace after "#"',
+
+         'good_lines': ['a = b # some operation', '1+2 #  3 is the result'],
+
+         'bad_lines': [' #some operation', '  #not valid!!!']},
+
+        {'pattern': "assertEquals[(]",
+
+         'description': 'Use assertEqual, not assertEquals (which is deprecated).',
+
+         'good_lines': ['assertEqual(1, 2)'],
+
+         'bad_lines': ['assertEquals(1, 2)']},
+
+        {'pattern': "== None",
+
+         'description': 'Use `is None` to check whether something is None',
+
+         'good_lines': ['if foo is None'],
+
+         'bad_lines': ['foo == None']},
+
+        {'pattern': "type:[(]",
+
+         'description': 'Missing whitespace after ":" in type annotation',
+
+         'good_lines': ['# type: (Any, Any)', 'colon:separated:string:containing:type:as:keyword'],
+
+         'bad_lines': ['# type:(Any, Any)']},
+
+        {'pattern': "type: ignore$",
+
+         'exclude': set(['tools/tests',
+
+                         'zerver/lib/test_runner.py',
+
+                         'zerver/tests']),
+
+         'description': '"type: ignore" should always end with "# type: ignore # explanation for why"',
+
+         'good_lines': ['foo = bar  # type: ignore # explanation'],
+
+         'bad_lines': ['foo = bar  # type: ignore']},
+
+        {'pattern': "# type [(]",
+
+         'description': 'Missing : after type in type annotation',
+
+         'good_lines': ['foo = 42  # type: int', '# type: (str, int) -> None'],
+
+         'bad_lines': ['# type (str, int) -> None']},
+
+        {'pattern': "#type",
+
+         'description': 'Missing whitespace after "#" in type annotation',
+
+         'good_lines': ['foo = 42  # type: int'],
+
+         'bad_lines': ['foo = 42  #type: int']},
+
+        {'pattern': r'\b(if|else|while)[(]',
+
+         'description': 'Put a space between statements like if, else, etc. and (.',
+
+         'good_lines': ['if (1 == 2):', 'while (foo == bar):'],
+
+         'bad_lines': ['if(1 == 2):', 'while(foo == bar):']},
+
+        {'pattern': ", [)]",
+
+         'description': 'Unnecessary whitespace between "," and ")"',
+
+         'good_lines': ['foo = (1, 2, 3,)', 'foo(bar, 42)'],
+
+         'bad_lines': ['foo = (1, 2, 3, )']},
+
+        {'pattern': "%  [(]",
+
+         'description': 'Unnecessary whitespace between "%" and "("',
+
+         'good_lines': ['"foo %s bar" % ("baz",)'],
+
+         'bad_lines': ['"foo %s bar" %  ("baz",)']},
+
+        # This next check could have false positives, but it seems pretty
+
+        # rare; if we find any, they can be added to the exclude list for
+
+        # this rule.
+
+        {'pattern': r"""^(?:[^'"#\\]|{}|{})*(?:{}|{})\s*%\s*(?![\s({{\\]|dict\(|tuple\()(?:[^,{}]|{})+(?:$|[,#\\]|{})""".format(
+
+            PYSQ, PYDQ, PYSQ, PYDQ, PYDELIMS, PYGROUP, PYRIGHT),
+
+         'description': 'Used % formatting without a tuple',
+
+         'good_lines': ['"foo %s bar" % ("baz",)'],
+
+         'bad_lines': ['"foo %s bar" % "baz"']},
+
+        {'pattern': r"""^(?:[^'"#\\]|{}|{})*(?:{}|{})\s*%\s*\((?:[^,{}]|{})*\)""".format(
+
+            PYSQ, PYDQ, PYSQ, PYDQ, PYDELIMS, PYGROUP),
+
+         'description': 'Used % formatting with parentheses that do not form a tuple',
+
+         'good_lines': ['"foo %s bar" % ("baz",)"'],
+
+         'bad_lines': ['"foo %s bar" % ("baz")']},
+
+        {'pattern': 'sudo',
+
+         'include_only': set(['scripts/']),
+
+         'exclude': set(['scripts/lib/setup_venv.py']),
+
+         'exclude_line': set([
+
+             ('scripts/lib/zulip_tools.py', 'sudo_args = kwargs.pop(\'sudo_args\', [])'),
+
+             ('scripts/lib/zulip_tools.py', 'args = [\'sudo\'] + sudo_args + [\'--\'] + args'),
+
+         ]),
+
+         'description': 'Most scripts are intended to run on systems without sudo.',
+
+         'good_lines': ['subprocess.check_call(["ls"])'],
+
+         'bad_lines': ['subprocess.check_call(["sudo", "ls"])']},
+
+        {'pattern': 'django.utils.translation',
+
+         'include_only': set(['test/', 'zerver/views/development/']),
+
+         'description': 'Test strings should not be tagged for translation',
+
+         'good_lines': [''],
+
+         'bad_lines': ['django.utils.translation']},
+
+        {'pattern': 'userid',
+
+         'description': 'We prefer user_id over userid.',
+
+         'good_lines': ['id = alice.user_id'],
+
+         'bad_lines': ['id = alice.userid']},
+
+        {'pattern': r'json_success\({}\)',
+
+         'description': 'Use json_success() to return nothing',
+
+         'good_lines': ['return json_success()'],
+
+         'bad_lines': ['return json_success({})']},
+
+        {'pattern': r'\Wjson_error\(_\(?\w+\)',
+
+         'exclude': set(['zerver/tests', 'zerver/views/development/']),
+
+         'description': 'Argument to json_error should be a literal string enclosed by _()',
+
+         'good_lines': ['return json_error(_("string"))'],
+
+         'bad_lines': ['return json_error(_variable)', 'return json_error(_(variable))']},
+
+        {'pattern': r'''\Wjson_error\(['"].+[),]$''',
+
+         'exclude': set(['zerver/tests']),
+
+         'description': 'Argument to json_error should a literal string enclosed by _()'},
+
+        # To avoid JsonableError(_variable) and JsonableError(_(variable))
+
+        {'pattern': r'\WJsonableError\(_\(?\w.+\)',
+
+         'exclude': set(['zerver/tests', 'zerver/views/development/']),
+
+         'description': 'Argument to JsonableError should be a literal string enclosed by _()'},
+
+        {'pattern': r'''\WJsonableError\(["'].+\)''',
+
+         'exclude': set(['zerver/tests', 'zerver/views/development/']),
+
+         'description': 'Argument to JsonableError should be a literal string enclosed by _()'},
+
+        {'pattern': r"""\b_\((?:\s|{}|{})*[^\s'")]""".format(PYSQ, PYDQ),
+
+         'description': 'Called _() on a computed string',
+
+         'exclude_line': set([
+
+             ('zerver/lib/i18n.py', 'result = _(string)'),
+
+         ]),
+
+         'good_lines': ["return json_error(_('No presence data for %s') % (target.email,))"],
+
+         'bad_lines': ["return json_error(_('No presence data for %s' % (target.email,)))"]},
+
+        {'pattern': r'''([a-zA-Z0-9_]+)=REQ\(['"]\1['"]''',
+
+         'description': 'REQ\'s first argument already defaults to parameter name'},
+
+        {'pattern': r'self\.client\.(get|post|patch|put|delete)',
+
+         'description': \
+
+         '''Do not call self.client directly for put/patch/post/get.
+
+    See WRAPPER_COMMENT in test_helpers.py for details.
+
+    '''},
+
+        # Directly fetching Message objects in e.g. views code is often a security bug.
+
+        {'pattern': '[^r]Message.objects.get',
+
+         'exclude': set(["zerver/tests",
+
+                         "zerver/lib/onboarding.py",
+
+                         "zilencer/management/commands/add_mock_conversation.py",
+
+                         "zerver/worker/queue_processors.py",
+
+                         "zerver/management/commands/export.py",
+
+                         "zerver/lib/export.py"]),
+
+         'description': 'Please use access_message() to fetch Message objects',
+
+         },
+
+        {'pattern': 'Stream.objects.get',
+
+         'include_only': set(["zerver/views/"]),
+
+         'description': 'Please use access_stream_by_*() to fetch Stream objects',
+
+         },
+
+        {'pattern': 'get_stream[(]',
+
+         'include_only': set(["zerver/views/", "zerver/lib/actions.py"]),
+
+         'exclude_line': set([
+
+             # This one in check_message is kinda terrible, since it's
+
+             # how most instances are written, but better to exclude something than nothing
+
+             ('zerver/lib/actions.py', 'stream = get_stream(stream_name, realm)'),
+
+             ('zerver/lib/actions.py', 'get_stream(admin_realm_signup_notifications_stream, admin_realm)'),
+
+         ]),
+
+         'description': 'Please use access_stream_by_*() to fetch Stream objects',
+
+         },
+
+        {'pattern': 'Stream.objects.filter',
+
+         'include_only': set(["zerver/views/"]),
+
+         'description': 'Please use access_stream_by_*() to fetch Stream objects',
+
+         },
+
+        {'pattern': '^from (zerver|analytics|confirmation)',
+
+         'include_only': set(["/migrations/"]),
+
+         'exclude': set([
+
+             'zerver/migrations/0032_verify_all_medium_avatar_images.py',
+
+             'zerver/migrations/0060_move_avatars_to_be_uid_based.py',
+
+             'zerver/migrations/0104_fix_unreads.py',
+
+             'zerver/migrations/0206_stream_rendered_description.py',
+
+             'zerver/migrations/0209_user_profile_no_empty_password.py',
+
+             'pgroonga/migrations/0002_html_escape_subject.py',
+
+         ]),
+
+         'description': "Don't import models or other code in migrations; see docs/subsystems/schema-migrations.md",
+
+         },
+
+        {'pattern': 'datetime[.](now|utcnow)',
+
+         'include_only': set(["zerver/", "analytics/"]),
+
+         'description': "Don't use datetime in backend code.\n"
+
+         "See https://zulip.readthedocs.io/en/latest/contributing/code-style.html#naive-datetime-objects",
+
+         },
+
+        {'pattern': r'render_to_response\(',
+
+         'description': "Use render() instead of render_to_response().",
+
+         },
+
+        {'pattern': 'from os.path',
+
+         'description': "Don't use from when importing from the standard library",
+
+         },
+
+        {'pattern': 'import os.path',
+
+         'description': "Use import os instead of import os.path",
+
+         },
+
+        {'pattern': r'(logging|logger)\.warn\W',
+
+         'description': "Logger.warn is a deprecated alias for Logger.warning; Use 'warning' instead of 'warn'.",
+
+         'good_lines': ["logging.warning('I am a warning.')", "logger.warning('warning')"],
+
+         'bad_lines': ["logging.warn('I am a warning.')", "logger.warn('warning')"]},
+
+        {'pattern': r'\.pk',
+
+         'exclude_pattern': '[.]_meta[.]pk',
+
+         'description': "Use `id` instead of `pk`.",
+
+         'good_lines': ['if my_django_model.id == 42', 'self.user_profile._meta.pk'],
+
+         'bad_lines': ['if my_django_model.pk == 42']},
+
+        {'pattern': r'^[ ]*# type: \(',
+
+         'exclude': set([
+
+             # These directories, especially scripts/ and puppet/,
+
+             # have tools that need to run before a Zulip environment
+
+             # is provisioned; in some of those, the `typing` module
+
+             # might not be available yet, so care is required.
+
+             'scripts/',
+
+             'tools/',
+
+             'puppet/',
+
+             # Zerver files that we should just clean.
+
+             'zerver/tests',
+
+             'zerver/openapi/python_examples.py',
+
+             'zerver/lib/request.py',
+
+             'zerver/views/streams.py',
+
+             # thumbor is (currently) python2 only
+
+             'zthumbor/',
+
+         ]),
+
+         'description': 'Comment-style function type annotation. Use Python3 style annotations instead.',
+
+         },
+
+        {'pattern': r' = models[.].*null=True.*\)  # type: (?!Optional)',
+
+         'include_only': {"zerver/models.py"},
+
+         'description': 'Model variable with null=true not annotated as Optional.',
+
+         'good_lines': ['desc = models.TextField(null=True)  # type: Optional[Text]',
+
+                        'stream = models.ForeignKey(Stream, null=True, on_delete=CASCADE)  # type: Optional[Stream]',
+
+                        'desc = models.TextField()  # type: Text',
+
+                        'stream = models.ForeignKey(Stream, on_delete=CASCADE)  # type: Stream'],
+
+         'bad_lines': ['desc = models.CharField(null=True)  # type: Text',
+
+                       'stream = models.ForeignKey(Stream, null=True, on_delete=CASCADE)  # type: Stream'],
+
+         },
+
+        {'pattern': r' = models[.](?!NullBoolean).*\)  # type: Optional',  # Optional tag, except NullBoolean(Field)
+
+         'exclude_pattern': 'null=True',
+
+         'include_only': {"zerver/models.py"},
+
+         'description': 'Model variable annotated with Optional but variable does not have null=true.',
+
+         'good_lines': ['desc = models.TextField(null=True)  # type: Optional[Text]',
+
+                        'stream = models.ForeignKey(Stream, null=True, on_delete=CASCADE)  # type: Optional[Stream]',
+
+                        'desc = models.TextField()  # type: Text',
+
+                        'stream = models.ForeignKey(Stream, on_delete=CASCADE)  # type: Stream'],
+
+         'bad_lines': ['desc = models.TextField()  # type: Optional[Text]',
+
+                       'stream = models.ForeignKey(Stream, on_delete=CASCADE)  # type: Optional[Stream]'],
+
+         },
+
+        {'pattern': r'[\s([]Text([^\s\w]|$)',
+
+         'exclude': set([
+
+             # We are likely to want to keep these dirs Python 2+3 compatible,
+
+             # since the plan includes extracting them to a separate project eventually.
+
+             'tools/lib',
+
+             # TODO: Update our migrations from Text->str.
+
+             'zerver/migrations/',
+
+             # thumbor is (currently) python2 only
+
+             'zthumbor/',
+
+         ]),
+
+         'description': "Now that we're a Python 3 only codebase, we don't need to use typing.Text. Please use str instead.",
+
+         },
+
+        {'pattern': 'exit[(]1[)]',
+
+         'include_only': set(["/management/commands/"]),
+
+         'description': 'Raise CommandError to exit with failure in management commands',
+
+         },
+
+        *whitespace_rules,
+
+        *comma_whitespace_rule,
+
+    ],
+
+    max_length=110,
+
+    shebang_rules=shebang_rules,
+
+)
+
+
+
+bash_rules = RuleList(
+
+    langs=['bash'],
+
+    rules=[
+
+        {'pattern': '#!.*sh [-xe]',
+
+         'description': 'Fix shebang line with proper call to /usr/bin/env for Bash path, change -x|-e switches'
+
+                        ' to set -x|set -e'},
+
+        {'pattern': 'sudo',
+
+         'description': 'Most scripts are intended to work on systems without sudo',
+
+         'include_only': set(['scripts/']),
+
+         'exclude': set([
+
+             'scripts/lib/install',
+
+             'scripts/setup/configure-rabbitmq'
+
+         ]), },
+
+        *whitespace_rules[0:1],
+
+    ],
+
+    shebang_rules=shebang_rules,
+
+)
+
+
+
+css_rules = RuleList(
+
+    langs=['css', 'scss'],
+
+    rules=[
+
+        {'pattern': r'calc\([^+]+\+[^+]+\)',
+
+         'description': "Avoid using calc with '+' operator. See #8403 : in CSS.",
+
+         'good_lines': ["width: calc(20% - -14px);"],
+
+         'bad_lines': ["width: calc(20% + 14px);"]},
+
+        {'pattern': r'^[^:]*:\S[^:]*;$',
+
+         'description': "Missing whitespace after : in CSS",
+
+         'good_lines': ["background-color: white;", "text-size: 16px;"],
+
+         'bad_lines': ["background-color:white;", "text-size:16px;"]},
+
+        {'pattern': '[a-z]{',
+
+         'description': "Missing whitespace before '{' in CSS.",
+
+         'good_lines': ["input {", "body {"],
+
+         'bad_lines': ["input{", "body{"]},
+
+        {'pattern': 'https://',
+
+         'description': "Zulip CSS should have no dependencies on external resources",
+
+         'good_lines': ['background: url(/static/images/landing-page/pycon.jpg);'],
+
+         'bad_lines': ['background: url(https://example.com/image.png);']},
+
+        {'pattern': '^[ ][ ][a-zA-Z0-9]',
+
+         'description': "Incorrect 2-space indentation in CSS",
+
+         'strip': '\n',
+
+         'good_lines': ["    color: white;", "color: white;"],
+
+         'bad_lines': ["  color: white;"]},
+
+        {'pattern': r'{\w',
+
+         'description': "Missing whitespace after '{' in CSS (should be newline).",
+
+         'good_lines': ["{\n"],
+
+         'bad_lines': ["{color: LightGoldenRodYellow;"]},
+
+        {'pattern': ' thin[ ;]',
+
+         'description': "thin CSS attribute is under-specified, please use 1px.",
+
+         'good_lines': ["border-width: 1px;"],
+
+         'bad_lines': ["border-width: thin;", "border-width: thin solid black;"]},
+
+        {'pattern': ' medium[ ;]',
+
+         'description': "medium CSS attribute is under-specified, please use pixels.",
+
+         'good_lines': ["border-width: 3px;"],
+
+         'bad_lines': ["border-width: medium;", "border: medium solid black;"]},
+
+        {'pattern': ' thick[ ;]',
+
+         'description': "thick CSS attribute is under-specified, please use pixels.",
+
+         'good_lines': ["border-width: 5px;"],
+
+         'bad_lines': ["border-width: thick;", "border: thick solid black;"]},
+
+        {'pattern': r'rgba?\(',
+
+         'description': 'Use of rgb(a) format is banned, Please use hsl(a) instead',
+
+         'good_lines': ['hsl(0, 0%, 0%)', 'hsla(0, 0%, 100%, 0.1)'],
+
+         'bad_lines': ['rgb(0, 0, 0)', 'rgba(255, 255, 255, 0.1)']},
+
+        *whitespace_rules,
+
+        *comma_whitespace_rule,
+
+    ],
+
+)
+
+
+
+prose_style_rules = [
+
+    {'pattern': r'[^\/\#\-"]([jJ]avascript)',  # exclude usage in hrefs/divs
+
+     'exclude': set(["docs/documentation/api.md"]),
+
+     'description': "javascript should be spelled JavaScript"},
+
+    {'pattern': r'''[^\/\-\."'\_\=\>]([gG]ithub)[^\.\-\_"\<]''',  # exclude usage in hrefs/divs
+
+     'description': "github should be spelled GitHub"},
+
+    {'pattern': '[oO]rganisation',  # exclude usage in hrefs/divs
+
+     'description': "Organization is spelled with a z",
+
+     'exclude_line': {('docs/translating/french.md', '* organization - **organisation**')}},
+
+    {'pattern': '!!! warning',
+
+     'description': "!!! warning is invalid; it's spelled '!!! warn'"},
+
+    {'pattern': 'Terms of service',
+
+     'description': "The S in Terms of Service is capitalized"},
+
+    {'pattern': '[^-_p]botserver(?!rc)|bot server',
+
+     'description': "Use Botserver instead of botserver or bot server."},
+
+    *comma_whitespace_rule,
+
+]  # type: List[Rule]
+
+html_rules = whitespace_rules + prose_style_rules + [
+
+    {'pattern': 'subject|SUBJECT',
+
+     'exclude': set(['templates/zerver/email.html']),
+
+     'exclude_pattern': 'email subject',
+
+     'description': 'avoid subject in templates',
+
+     'good_lines': ['topic_name'],
+
+     'bad_lines': ['subject="foo"', ' MAX_SUBJECT_LEN']},
+
+    {'pattern': r'placeholder="[^{#](?:(?!\.com).)+$',
+
+     'description': "`placeholder` value should be translatable.",
+
+     'exclude_line': {('templates/zerver/register.html', 'placeholder="acme"'),
+
+                      ('templates/zerver/register.html', 'placeholder="Acme or Aκμή"')},
+
+     'exclude': set(["templates/analytics/support.html"]),
+
+     'good_lines': ['<input class="stream-list-filter" type="text" placeholder="{{ _(\'Search streams\') }}" />'],
+
+     'bad_lines': ['<input placeholder="foo">']},
+
+    {'pattern': "placeholder='[^{]",
+
+     'description': "`placeholder` value should be translatable.",
+
+     'good_lines': ['<input class="stream-list-filter" type="text" placeholder="{{ _(\'Search streams\') }}" />'],
+
+     'bad_lines': ["<input placeholder='foo'>"]},
+
+    {'pattern': "aria-label='[^{]",
+
+     'description': "`aria-label` value should be translatable.",
+
+     'good_lines': ['<button type="button" class="close close-alert-word-status" aria-label="{{t \'Close\' }}">'],
+
+     'bad_lines': ["<button aria-label='foo'></button>"]},
+
+    {'pattern': 'aria-label="[^{]',
+
+     'description': "`aria-label` value should be translatable.",
+
+     'good_lines': ['<button type="button" class="close close-alert-word-status" aria-label="{{t \'Close\' }}">'],
+
+     'bad_lines': ['<button aria-label="foo"></button>']},
+
+    {'pattern': 'script src="http',
+
+     'description': "Don't directly load dependencies from CDNs.  See docs/subsystems/html-css.md",
+
+     'exclude': set(["templates/corporate/billing.html", "templates/zerver/hello.html",
+
+                     "templates/corporate/upgrade.html"]),
+
+     'good_lines': ["{{ render_entrypoint('landing-page') }}"],
+
+     'bad_lines': ['<script src="https://ajax.googleapis.com/ajax/libs/jquery/3.2.1/jquery.min.js"></script>']},
+
+    {'pattern': "title='[^{]",
+
+     'description': "`title` value should be translatable.",
+
+     'good_lines': ['<link rel="author" title="{{ _(\'About these documents\') }}" />'],
+
+     'bad_lines': ["<p title='foo'></p>"]},
+
+    {'pattern': r'title="[^{\:]',
+
+     'exclude_line': set([
+
+         ('templates/zerver/app/markdown_help.html',
+
+             '<td class="rendered_markdown"><img alt=":heart:" class="emoji" src="/static/generated/emoji/images/emoji/heart.png" title=":heart:" /></td>')
+
+     ]),
+
+     'exclude': set(["templates/zerver/emails", "templates/analytics/realm_details.html", "templates/analytics/support.html"]),
+
+     'description': "`title` value should be translatable."},
+
+    {'pattern': r'''\Walt=["'][^{"']''',
+
+     'description': "alt argument should be enclosed by _() or it should be an empty string.",
+
+     'exclude': set(['static/templates/settings/display_settings.hbs',
+
+                     'templates/zerver/app/keyboard_shortcuts.html',
+
+                     'templates/zerver/app/markdown_help.html']),
+
+     'good_lines': ['<img src="{{source_url}}" alt="{{ _(name) }}" />', '<img alg="" />'],
+
+     'bad_lines': ['<img alt="Foo Image" />']},
+
+    {'pattern': r'''\Walt=["']{{ ?["']''',
+
+     'description': "alt argument should be enclosed by _().",
+
+     'good_lines': ['<img src="{{source_url}}" alt="{{ _(name) }}" />'],
+
+     'bad_lines': ['<img alt="{{ " />']},
+
+    {'pattern': r'\bon\w+ ?=',
+
+     'description': "Don't use inline event handlers (onclick=, etc. attributes) in HTML. Instead,"
+
+     "attach a jQuery event handler ($('#foo').on('click', function () {...})) when "
+
+     "the DOM is ready (inside a $(function () {...}) block).",
+
+     'exclude': set(['templates/zerver/dev_login.html', 'templates/corporate/upgrade.html']),
+
+     'good_lines': ["($('#foo').on('click', function () {}"],
+
+     'bad_lines': ["<button id='foo' onclick='myFunction()'>Foo</button>", "<input onchange='myFunction()'>"]},
+
+    {'pattern': 'style ?=',
+
+     'description': "Avoid using the `style=` attribute; we prefer styling in CSS files",
+
+     'exclude_pattern': r'.*style ?=["' + "'" + '](display: ?none|background: {{|color: {{|background-color: {{).*',
+
+     'exclude': set([
+
+         # KaTeX output uses style attribute
+
+         'templates/zerver/app/markdown_help.html',
+
+         # 5xx page doesn't have external CSS
+
+         'static/html/5xx.html',
+
+         # Group PMs color is dynamically calculated
+
+         'static/templates/group_pms.hbs',
+
+
+
+         # exclude_pattern above handles color, but have other issues:
+
+         'static/templates/draft.hbs',
+
+         'static/templates/subscription.hbs',
+
+         'static/templates/single_message.hbs',
+
+
+
+         # Old-style email templates need to use inline style
+
+         # attributes; it should be possible to clean these up
+
+         # when we convert these templates to use premailer.
+
+         'templates/zerver/emails/email_base_messages.html',
+
+
+
+         # Email log templates; should clean up.
+
+         'templates/zerver/email.html',
+
+         'templates/zerver/email_log.html',
+
+
+
+         # Social backend logos are dynamically loaded
+
+         'templates/zerver/accounts_home.html',
+
+         'templates/zerver/login.html',
+
+
+
+         # Probably just needs to be changed to display: none so the exclude works
+
+         'templates/zerver/app/navbar.html',
+
+
+
+         # Needs the width cleaned up; display: none is fine
+
+         'static/templates/settings/account_settings.hbs',
+
+
+
+         # background image property is dynamically generated
+
+         'static/templates/user_profile_modal.hbs',
+
+         'static/templates/sidebar_private_message_list.hbs',
+
+
+
+         # Inline styling for an svg; could be moved to CSS files?
+
+         'templates/zerver/landing_nav.html',
+
+         'templates/zerver/billing_nav.html',
+
+         'templates/zerver/app/home.html',
+
+         'templates/zerver/features.html',
+
+         'templates/zerver/portico-header.html',
+
+         'templates/corporate/billing.html',
+
+         'templates/corporate/upgrade.html',
+
+
+
+         # Miscellaneous violations to be cleaned up
+
+         'static/templates/user_info_popover_title.hbs',
+
+         'static/templates/subscription_invites_warning_modal.hbs',
+
+         'templates/zerver/reset_confirm.html',
+
+         'templates/zerver/config_error.html',
+
+         'templates/zerver/dev_env_email_access_details.html',
+
+         'templates/zerver/confirm_continue_registration.html',
+
+         'templates/zerver/register.html',
+
+         'templates/zerver/accounts_send_confirm.html',
+
+         'templates/zerver/integrations/index.html',
+
+         'templates/zerver/documentation_main.html',
+
+         'templates/analytics/realm_summary_table.html',
+
+         'templates/corporate/zephyr.html',
+
+         'templates/corporate/zephyr-mirror.html',
+
+     ]),
+
+     'good_lines': ['#my-style {color: blue;}', 'style="display: none"', "style='display: none"],
+
+     'bad_lines': ['<p style="color: blue;">Foo</p>', 'style = "color: blue;"']},
+
+]  # type: List[Rule]
+
+
+
+handlebars_rules = RuleList(
+
+    langs=['hbs'],
+
+    rules=html_rules + [
+
+        {'pattern': "[<]script",
+
+         'description': "Do not use inline <script> tags here; put JavaScript in static/js instead."},
+
+        {'pattern': '{{ t ("|\')',
+
+         'description': 'There should be no spaces before the "t" in a translation tag.'},
+
+        {'pattern': r"{{t '.*' }}[\.\?!]",
+
+         'description': "Period should be part of the translatable string."},
+
+        {'pattern': r'{{t ".*" }}[\.\?!]',
+
+         'description': "Period should be part of the translatable string."},
+
+        {'pattern': r"{{/tr}}[\.\?!]",
+
+         'description': "Period should be part of the translatable string."},
+
+        {'pattern': '{{t ("|\') ',
+
+         'description': 'Translatable strings should not have leading spaces.'},
+
+        {'pattern': "{{t '[^']+ ' }}",
+
+         'description': 'Translatable strings should not have trailing spaces.'},
+
+        {'pattern': '{{t "[^"]+ " }}',
+
+         'description': 'Translatable strings should not have trailing spaces.'},
+
+    ],
+
+)
+
+
+
+jinja2_rules = RuleList(
+
+    langs=['html'],
+
+    rules=html_rules + [
+
+        {'pattern': r"{% endtrans %}[\.\?!]",
+
+         'description': "Period should be part of the translatable string."},
+
+        {'pattern': r"{{ _(.+) }}[\.\?!]",
+
+         'description': "Period should be part of the translatable string."},
+
+    ],
+
+)
+
+
+
+json_rules = RuleList(
+
+    langs=['json'],
+
+    rules=[
+
+        # Here, we don't use `whitespace_rules`, because the tab-based
+
+        # whitespace rule flags a lot of third-party JSON fixtures
+
+        # under zerver/webhooks that we want preserved verbatim.  So
+
+        # we just include the trailing whitespace rule and a modified
+
+        # version of the tab-based whitespace rule (we can't just use
+
+        # exclude in whitespace_rules, since we only want to ignore
+
+        # JSON files with tab-based whitespace, not webhook code).
+
+        trailing_whitespace_rule,
+
+        {'pattern': '\t',
+
+         'strip': '\n',
+
+         'exclude': set(['zerver/webhooks/']),
+
+         'description': 'Fix tab-based whitespace'},
+
+        {'pattern': r'":["\[\{]',
+
+         'exclude': set(['zerver/webhooks/', 'zerver/tests/fixtures/']),
+
+         'description': 'Require space after : in JSON'},
+
+    ]
+
+)
+
+
+
+markdown_docs_length_exclude = {
+
+    # Has some example Vagrant output that's very long
+
+    "docs/development/setup-vagrant.md",
+
+    # Have wide output in code blocks
+
+    "docs/subsystems/logging.md",
+
+    "docs/subsystems/schema-migrations.md",
+
+    # Have curl commands with JSON that would be messy to wrap
+
+    "zerver/webhooks/helloworld/doc.md",
+
+    "zerver/webhooks/trello/doc.md",
+
+    # Has a very long configuration line
+
+    "templates/zerver/integrations/perforce.md",
+
+    # Has some example code that could perhaps be wrapped
+
+    "templates/zerver/api/incoming-webhooks-walkthrough.md",
+
+    # This macro has a long indented URL
+
+    "templates/zerver/help/include/git-webhook-url-with-branches-indented.md",
+
+    "templates/zerver/api/update-notification-settings.md",
+
+    # These two are the same file and have some too-long lines for GitHub badges
+
+    "README.md",
+
+    "docs/overview/readme.md",
+
+}
+
+
+
+markdown_rules = RuleList(
+
+    langs=['md'],
+
+    rules=markdown_whitespace_rules + prose_style_rules + [
+
+        {'pattern': r'\[(?P<url>[^\]]+)\]\((?P=url)\)',
+
+         'description': 'Linkified markdown URLs should use cleaner <http://example.com> syntax.'},
+
+        {'pattern': 'https://zulip.readthedocs.io/en/latest/[a-zA-Z0-9]',
+
+         'exclude': {'docs/overview/contributing.md', 'docs/overview/readme.md', 'docs/README.md'},
+
+         'include_only': set(['docs/']),
+
+         'description': "Use relative links (../foo/bar.html) to other documents in docs/",
+
+         },
+
+        {'pattern': "su zulip -c [^']",
+
+         'include_only': set(['docs/']),
+
+         'description': "Always quote arguments using `su zulip -c '` to avoid confusion about how su works.",
+
+         },
+
+        {'pattern': r'\][(][^#h]',
+
+         'include_only': set(['README.md', 'CONTRIBUTING.md']),
+
+         'description': "Use absolute links from docs served by GitHub",
+
+         },
+
+    ],
+
+    max_length=120,
+
+    length_exclude=markdown_docs_length_exclude,
+
+    exclude_files_in='templates/zerver/help/'
+
+)
+
+
+
+help_markdown_rules = RuleList(
+
+    langs=['md'],
+
+    rules=markdown_rules.rules + [
+
+        {'pattern': '[a-z][.][A-Z]',
+
+         'description': "Likely missing space after end of sentence",
+
+         'include_only': set(['templates/zerver/help/']),
+
+         },
+
+        {'pattern': r'\b[rR]ealm[s]?\b',
+
+         'include_only': set(['templates/zerver/help/']),
+
+         'good_lines': ['Organization', 'deactivate_realm', 'realm_filter'],
+
+         'bad_lines': ['Users are in a realm', 'Realm is the best model'],
+
+         'description': "Realms are referred to as Organizations in user-facing docs."},
+
+    ],
+
+    length_exclude=markdown_docs_length_exclude,
+
+)
+
+
+
+txt_rules = RuleList(
+
+    langs=['txt', 'text', 'yaml', 'rst'],
+
+    rules=whitespace_rules,
+
+)
+
+non_py_rules = [
+
+    handlebars_rules,
+
+    jinja2_rules,
+
+    css_rules,
+
+    js_rules,
+
+    json_rules,
+
+    markdown_rules,
+
+    help_markdown_rules,
+
+    bash_rules,
+
+    txt_rules,
+
+]

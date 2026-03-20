@@ -2,128 +2,252 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-from django.conf.urls import patterns, url
+#!/usr/bin/env python3
 
-from django.contrib.auth import context_processors
 
-from django.contrib.auth.urls import urlpatterns
 
-from django.contrib.auth.views import password_reset
+"""
 
-from django.contrib.auth.decorators import login_required
+This is the main CLI for lookatme
 
-from django.contrib.messages.api import info
+"""
 
-from django.http import HttpResponse
 
-from django.shortcuts import render_to_response
 
-from django.template import Template, RequestContext
 
-from django.views.decorators.cache import never_cache
 
+import click
 
+import logging
 
-@never_cache
+import io
 
-def remote_user_auth_view(request):
+import os
 
-    "Dummy view for remote user tests"
+import pygments.styles
 
-    t = Template("Username is {{ user }}.")
+import sys
 
-    c = RequestContext(request, {})
+import tempfile
 
-    return HttpResponse(t.render(c))
 
 
 
-def auth_processor_no_attr_access(request):
 
-    r1 = render_to_response('context_processors/auth_attrs_no_access.html',
+import lookatme.tui
 
-        RequestContext(request, {}, processors=[context_processors.auth]))
+import lookatme.log
 
-    # *After* rendering, we check whether the session was accessed
+import lookatme.config
 
-    return render_to_response('context_processors/auth_attrs_test_access.html',
+from lookatme.pres import Presentation
 
-        {'session_accessed':request.session.accessed})
+from lookatme.schemas import StyleSchema
 
 
 
-def auth_processor_attr_access(request):
 
-    r1 = render_to_response('context_processors/auth_attrs_access.html',
 
-        RequestContext(request, {}, processors=[context_processors.auth]))
+@click.command("lookatme")
 
-    return render_to_response('context_processors/auth_attrs_test_access.html',
+@click.option("--debug", "debug", is_flag="True", default=False)
 
-        {'session_accessed':request.session.accessed})
+@click.option(
 
+    "-l",
 
+    "--log",
 
-def auth_processor_user(request):
+    "log_path",
 
-    return render_to_response('context_processors/auth_attrs_user.html',
+    type=click.Path(writable=True),
 
-        RequestContext(request, {}, processors=[context_processors.auth]))
-
-
-
-def auth_processor_perms(request):
-
-    return render_to_response('context_processors/auth_attrs_perms.html',
-
-        RequestContext(request, {}, processors=[context_processors.auth]))
-
-
-
-def auth_processor_messages(request):
-
-    info(request, "Message 1")
-
-    return render_to_response('context_processors/auth_attrs_messages.html',
-
-         RequestContext(request, {}, processors=[context_processors.auth]))
-
-
-
-def userpage(request):
-
-    pass
-
-
-
-# special urls for auth test cases
-
-urlpatterns = urlpatterns + patterns('',
-
-    (r'^logout/custom_query/$', 'django.contrib.auth.views.logout', dict(redirect_field_name='follow')),
-
-    (r'^logout/next_page/$', 'django.contrib.auth.views.logout', dict(next_page='/somewhere/')),
-
-    (r'^remote_user/$', remote_user_auth_view),
-
-    (r'^password_reset_from_email/$', 'django.contrib.auth.views.password_reset', dict(from_email='staffmember@example.com')),
-
-    (r'^login_required/$', login_required(password_reset)),
-
-    (r'^login_required_login_url/$', login_required(password_reset, login_url='/somewhere/')),
-
-
-
-    (r'^auth_processor_no_attr_access/$', auth_processor_no_attr_access),
-
-    (r'^auth_processor_attr_access/$', auth_processor_attr_access),
-
-    (r'^auth_processor_user/$', auth_processor_user),
-
-    (r'^auth_processor_perms/$', auth_processor_perms),
-
-    (r'^auth_processor_messages/$', auth_processor_messages),
-
-    url(r'^userpage/(.+)/$', userpage, name="userpage"),
+    default=os.path.join(tempfile.gettempdir(), "lookatme.log"),
 
 )
+
+@click.option(
+
+    "-t",
+
+    "--theme",
+
+    "theme",
+
+    type=click.Choice(["dark", "light"]),
+
+    default="dark",
+
+)
+
+@click.option(
+
+    "-s",
+
+    "--style",
+
+    "code_style",
+
+    default=None,
+
+    type=click.Choice(list(pygments.styles.get_all_styles())),
+
+)
+
+@click.option(
+
+    "--dump-styles",
+
+    help="Dump the resolved styles that will be used with the presentation to stdout",
+
+    is_flag=True,
+
+    default=False,
+
+)
+
+@click.option(
+
+    "--live",
+
+    "--live-reload",
+
+    "live_reload",
+
+    help="Watch the input filename for modifications and automatically reload",
+
+    is_flag=True,
+
+    default=False,
+
+)
+
+@click.option(
+
+    "-e",
+
+    "--exts",
+
+    "extensions",
+
+    help="A comma-separated list of extension names to automatically load"
+
+         " (LOOKATME_EXTS)",
+
+    envvar="LOOKATME_EXTS",
+
+    default="",
+
+)
+
+@click.option(
+
+    "--single",
+
+    "--one",
+
+    "single_slide",
+
+    help="Render the source as a single slide",
+
+    is_flag=True,
+
+    default=False
+
+)
+
+@click.version_option(lookatme.__version__)
+
+@click.argument(
+
+    "input_files",
+
+    type=click.File("r"),
+
+    nargs=-1,
+
+)
+
+def main(debug, log_path, theme, code_style, dump_styles,
+
+         input_files, live_reload, extensions, single_slide):
+
+    """lookatme - An interactive, terminal-based markdown presentation tool.
+
+    """
+
+    if debug:
+
+        lookatme.config.LOG = lookatme.log.create_log(log_path)
+
+    else:
+
+        lookatme.config.LOG = lookatme.log.create_null_log()
+
+
+
+    if len(input_files) == 0:
+
+        input_files = [io.StringIO("")]
+
+
+
+    preload_exts = [x.strip() for x in extensions.split(',')]
+
+    preload_exts = list(filter(lambda x: x != '', preload_exts))
+
+    pres = Presentation(
+
+        input_files[0],
+
+        theme,
+
+        code_style,
+
+        live_reload=live_reload,
+
+        single_slide=single_slide,
+
+        preload_extensions=preload_exts,
+
+    )
+
+
+
+    if dump_styles:
+
+        print(StyleSchema().dumps(pres.styles))
+
+        return 0
+
+
+
+    try:
+
+        pres.run()
+
+    except Exception as e:
+
+        number = pres.tui.curr_slide.number + 1
+
+        click.echo(f"Error rendering slide {number}: {e}")
+
+        if not debug:
+
+            click.echo("Rerun with --debug to view the full traceback in logs")
+
+        else:
+
+            lookatme.config.LOG.exception(f"Error rendering slide {number}: {e}")
+
+            click.echo(f"See {log_path} for traceback")
+
+        raise click.Abort()
+
+
+
+
+
+if __name__ == "__main__":
+
+    main()

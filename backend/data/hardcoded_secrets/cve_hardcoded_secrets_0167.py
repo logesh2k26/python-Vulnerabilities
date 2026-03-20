@@ -2,268 +2,774 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# tests.descriptors_tests
+#!/usr/bin/python
 
-# Implements a base SettingsDescriptor for advanced configurations
+from k5test import *
 
-#
 
-# Author:   Benjamin Bengfort <benjamin@bengfort.com>
 
-# Created:  Thu Jun 11 09:34:33 2015 -0400
+# Skip this test if pkinit wasn't built.
 
-#
+if not os.path.exists(os.path.join(plugins, 'preauth', 'pkinit.so')):
 
-# Copyright (C) 2015 Bengfort.com
+    skip_rest('PKINIT tests', 'PKINIT module not built')
 
-# For license information, see LICENSE.txt
 
-#
 
-# ID: descriptors_tests.py [] benjamin@bengfort.com $
+# Check if soft-pkcs11.so is available.
 
+try:
 
+    import ctypes
 
-"""
+    lib = ctypes.LibraryLoader(ctypes.CDLL).LoadLibrary('soft-pkcs11.so')
 
-Implements a base SettingsDescriptor for advanced configurations
+    del lib
 
-"""
+    have_soft_pkcs11 = True
 
+except:
 
+    have_soft_pkcs11 = False
 
-##########################################################################
 
-## Imports
 
-##########################################################################
+# Construct a krb5.conf fragment configuring pkinit.
 
+certs = os.path.join(srctop, 'tests', 'dejagnu', 'pkinit-certs')
 
+ca_pem = os.path.join(certs, 'ca.pem')
 
-import pytest
+kdc_pem = os.path.join(certs, 'kdc.pem')
 
+user_pem = os.path.join(certs, 'user.pem')
 
+privkey_pem = os.path.join(certs, 'privkey.pem')
 
-from six import with_metaclass
+privkey_enc_pem = os.path.join(certs, 'privkey-enc.pem')
 
-from confire.descriptors import SettingsDescriptor, SettingsMeta
+user_p12 = os.path.join(certs, 'user.p12')
 
+user_enc_p12 = os.path.join(certs, 'user-enc.p12')
 
+user_upn_p12 = os.path.join(certs, 'user-upn.p12')
 
+user_upn2_p12 = os.path.join(certs, 'user-upn2.p12')
 
+user_upn3_p12 = os.path.join(certs, 'user-upn3.p12')
 
-##########################################################################
+path = os.path.join(os.getcwd(), 'testdir', 'tmp-pkinit-certs')
 
-## Mock Objects for Testing
+path_enc = os.path.join(os.getcwd(), 'testdir', 'tmp-pkinit-certs-enc')
 
-##########################################################################
 
 
+pkinit_krb5_conf = {'realms': {'$realm': {
 
-class MockObject(with_metaclass(SettingsMeta, object)):
+            'pkinit_anchors': 'FILE:%s' % ca_pem}}}
 
+pkinit_kdc_conf = {'realms': {'$realm': {
 
+            'default_principal_flags': '+preauth',
 
-    test_setting = SettingsDescriptor()
+            'pkinit_eku_checking': 'none',
 
+            'pkinit_identity': 'FILE:%s,%s' % (kdc_pem, privkey_pem),
 
+            'pkinit_indicator': ['indpkinit1', 'indpkinit2']}}}
 
+restrictive_kdc_conf = {'realms': {'$realm': {
 
+            'restrict_anonymous_to_tgt': 'true' }}}
 
-class BadMockObject(object):
 
-    """
 
-    Missing metaclass!
+testprincs = {'krbtgt/KRBTEST.COM': {'keys': 'aes128-cts'},
 
-    """
+              'user': {'keys': 'aes128-cts', 'flags': '+preauth'},
 
+              'user2': {'keys': 'aes128-cts', 'flags': '+preauth'}}
 
+alias_kdc_conf = {'realms': {'$realm': {
 
-    test_setting = SettingsDescriptor()
+            'default_principal_flags': '+preauth',
 
+            'pkinit_eku_checking': 'none',
 
+            'pkinit_allow_upn': 'true',
 
+            'pkinit_identity': 'FILE:%s,%s' % (kdc_pem, privkey_pem),
 
+            'database_module': 'test'}},
 
-##########################################################################
+                  'dbmodules': {'test': {
 
-## Test Cases
+                      'db_library': 'test',
 
-##########################################################################
+                      'alias': {'user@krbtest.com': 'user'},
 
+                      'princs': testprincs}}}
 
 
-class TestDescriptors(object):
 
+file_identity = 'FILE:%s,%s' % (user_pem, privkey_pem)
 
+file_enc_identity = 'FILE:%s,%s' % (user_pem, privkey_enc_pem)
 
-    def test_label(self):
+dir_identity = 'DIR:%s' % path
 
-        """
+dir_enc_identity = 'DIR:%s' % path_enc
 
-        Assert that descriptor label is not None
+dir_file_identity = 'FILE:%s,%s' % (os.path.join(path, 'user.crt'),
 
-        """
+                                    os.path.join(path, 'user.key'))
 
-        assert MockObject.test_setting.label is not None
+dir_file_enc_identity = 'FILE:%s,%s' % (os.path.join(path_enc, 'user.crt'),
 
-        assert MockObject.test_setting.label == "test_setting"
+                                        os.path.join(path_enc, 'user.key'))
 
+p12_identity = 'PKCS12:%s' % user_p12
 
+p12_upn_identity = 'PKCS12:%s' % user_upn_p12
 
-    def test_descriptor_set_get(self):
+p12_upn2_identity = 'PKCS12:%s' % user_upn2_p12
 
-        """
+p12_upn3_identity = 'PKCS12:%s' % user_upn3_p12
 
-        Test that the descriptor can be set and fetched
+p12_enc_identity = 'PKCS12:%s' % user_enc_p12
 
-        """
+p11_identity = 'PKCS11:soft-pkcs11.so'
 
-        obj = MockObject()
+p11_token_identity = ('PKCS11:module_name=soft-pkcs11.so:'
 
-        assert obj.test_setting is None
+                      'slotid=1:token=SoftToken (token)')
 
-        obj.test_setting = "foo"
 
-        assert obj.test_setting == "foo"
 
+# Start a realm with the test kdb module for the following UPN SAN tests.
 
+realm = K5Realm(krb5_conf=pkinit_krb5_conf, kdc_conf=alias_kdc_conf,
 
-    def test_descriptor_set_get_dict(self):
+                create_kdb=False)
 
-        """
+realm.start_kdc()
 
-        Test that the descriptor is in the instance dict
 
-        """
 
-        obj = MockObject()
+# Compatibility check: cert contains UPN "user", which matches the
 
-        assert obj.__dict__.get('test_setting') is None
+# request principal user@KRBTEST.COM if parsed as a normal principal.
 
-        obj.test_setting = "foo"
+realm.kinit(realm.user_princ,
 
-        assert obj.__dict__.get('test_setting') == "foo"
+            flags=['-X', 'X509_user_identity=%s' % p12_upn2_identity])
 
 
 
-    def test_descriptor_del(self):
+# Compatibility check: cert contains UPN "user@KRBTEST.COM", which matches
 
-        """
+# the request principal user@KRBTEST.COM if parsed as a normal principal.
 
-        Test that the descriptor can be deleted
+realm.kinit(realm.user_princ,
 
-        """
+            flags=['-X', 'X509_user_identity=%s' % p12_upn3_identity])
 
 
 
-        obj = MockObject()
+# Cert contains UPN "user@krbtest.com" which is aliased to the request
 
-        assert obj.test_setting is None
+# principal.
 
-        obj.test_setting = "foo"
+realm.kinit(realm.user_princ,
 
-        assert obj.test_setting is not None
+            flags=['-X', 'X509_user_identity=%s' % p12_upn_identity])
 
-        del obj.test_setting
 
-        assert obj.test_setting is None
 
+# Test an id-pkinit-san match to a post-canonical principal.
 
+realm.kinit('user@krbtest.com',
 
-    def test_descriptor_del_dict(self):
+            flags=['-E', '-X', 'X509_user_identity=%s' % p12_identity])
 
-        """
 
-        Test that the descriptor removes information from instance dict
 
-        """
+# Test a UPN match to a post-canonical principal.  (This only works
 
-        obj = MockObject()
+# for the cert with the UPN containing just "user", as we don't allow
 
-        assert obj.__dict__.get('test_setting') is None
+# UPN reparsing when comparing to the canonicalized client principal.)
 
-        obj.test_setting = "foo"
+realm.kinit('user@krbtest.com',
 
-        assert obj.__dict__.get('test_setting') is not None
+            flags=['-E', '-X', 'X509_user_identity=%s' % p12_upn2_identity])
 
-        del obj.test_setting
 
-        assert 'test_setting' not in obj.__dict__
 
+# Test a mismatch.
 
+msg = 'kinit: Client name mismatch while getting initial credentials'
 
-    def test_no_metaclass_get(self):
+realm.run([kinit, '-X', 'X509_user_identity=%s' % p12_upn2_identity, 'user2'],
 
-        """
+          expected_code=1, expected_msg=msg)
 
-        Test getattr when object doesn't have a metaclass
+realm.stop()
 
-        """
 
-        obj = BadMockObject()
 
-        with pytest.raises(TypeError):
+realm = K5Realm(krb5_conf=pkinit_krb5_conf, kdc_conf=pkinit_kdc_conf,
 
-            obj.test_setting
+                get_creds=False)
 
 
 
-    def test_no_metaclass_set(self):
+# Sanity check - password-based preauth should still work.
 
-        """
+realm.run(['./responder', '-r', 'password=%s' % password('user'),
 
-        Test setattr when object doesn't have a metaclass
+           realm.user_princ])
 
-        """
+realm.kinit(realm.user_princ, password=password('user'))
 
-        obj = BadMockObject()
+realm.klist(realm.user_princ)
 
-        with pytest.raises(TypeError):
+realm.run([kvno, realm.host_princ])
 
-            obj.test_setting = "foo"
 
 
+# Test anonymous PKINIT.
 
-    def test_no_metaclass_del(self):
+realm.kinit('@%s' % realm.realm, flags=['-n'], expected_code=1,
 
-        """
+            expected_msg='not found in Kerberos database')
 
-        Test delattr when object doesn't have a metaclass
+realm.addprinc('WELLKNOWN/ANONYMOUS')
 
-        """
+realm.kinit('@%s' % realm.realm, flags=['-n'])
 
-        obj = BadMockObject()
+realm.klist('WELLKNOWN/ANONYMOUS@WELLKNOWN:ANONYMOUS')
 
-        with pytest.raises(TypeError):
+realm.run([kvno, realm.host_princ])
 
-            del obj.test_setting
+out = realm.run(['./adata', realm.host_princ])
 
+if '97:' in out:
 
+    fail('auth indicators seen in anonymous PKINIT ticket')
 
-    def test_subclass_with_metaclass(self):
 
-        """
 
-        Ensure that subclasses also have metaclass
+# Test anonymous kadmin.
 
-        """
+f = open(os.path.join(realm.testdir, 'acl'), 'a')
 
+f.write('WELLKNOWN/ANONYMOUS@WELLKNOWN:ANONYMOUS a *')
 
+f.close()
 
-        class SubMockObject(MockObject):
+realm.start_kadmind()
 
+realm.run([kadmin, '-n', 'addprinc', '-pw', 'test', 'testadd'])
 
+realm.run([kadmin, '-n', 'getprinc', 'testadd'], expected_code=1,
 
-            subtest_setting = SettingsDescriptor()
+          expected_msg="Operation requires ``get'' privilege")
 
+realm.stop_kadmind()
 
 
-        assert SubMockObject.test_setting.label is not None
 
-        assert SubMockObject.test_setting.label == "test_setting"
+# Test with anonymous restricted; FAST should work but kvno should fail.
 
-        assert SubMockObject.subtest_setting.label is not None
+r_env = realm.special_env('restrict', True, kdc_conf=restrictive_kdc_conf)
 
-        assert SubMockObject.subtest_setting.label == "subtest_setting"
+realm.stop_kdc()
+
+realm.start_kdc(env=r_env)
+
+realm.kinit('@%s' % realm.realm, flags=['-n'])
+
+realm.kinit('@%s' % realm.realm, flags=['-n', '-T', realm.ccache])
+
+realm.run([kvno, realm.host_princ], expected_code=1,
+
+          expected_msg='KDC policy rejects request')
+
+
+
+# Regression test for #8458: S4U2Self requests crash the KDC if
+
+# anonymous is restricted.
+
+realm.kinit(realm.host_princ, flags=['-k'])
+
+realm.run([kvno, '-U', 'user', realm.host_princ])
+
+
+
+# Go back to a normal KDC and disable anonymous PKINIT.
+
+realm.stop_kdc()
+
+realm.start_kdc()
+
+realm.run([kadminl, 'delprinc', 'WELLKNOWN/ANONYMOUS'])
+
+
+
+# Run the basic test - PKINIT with FILE: identity, with no password on the key.
+
+realm.run(['./responder', '-x', 'pkinit=',
+
+           '-X', 'X509_user_identity=%s' % file_identity, realm.user_princ])
+
+realm.kinit(realm.user_princ,
+
+            flags=['-X', 'X509_user_identity=%s' % file_identity])
+
+realm.klist(realm.user_princ)
+
+realm.run([kvno, realm.host_princ])
+
+
+
+# Try again using RSA instead of DH.
+
+realm.kinit(realm.user_princ,
+
+            flags=['-X', 'X509_user_identity=%s' % file_identity,
+
+                   '-X', 'flag_RSA_PROTOCOL=yes'])
+
+realm.klist(realm.user_princ)
+
+
+
+# Test a DH parameter renegotiation by temporarily setting a 4096-bit
+
+# minimum on the KDC.  (Preauth type 16 is PKINIT PA_PK_AS_REQ;
+
+# 109 is PKINIT TD_DH_PARAMETERS; 133 is FAST PA-FX-COOKIE.)
+
+minbits_kdc_conf = {'realms': {'$realm': {'pkinit_dh_min_bits': '4096'}}}
+
+minbits_env = realm.special_env('restrict', True, kdc_conf=minbits_kdc_conf)
+
+realm.stop_kdc()
+
+realm.start_kdc(env=minbits_env)
+
+expected_trace = ('Sending unauthenticated request',
+
+                  '/Additional pre-authentication required',
+
+                  'Preauthenticating using KDC method data',
+
+                  'Preauth module pkinit (16) (real) returned: 0/Success',
+
+                  'Produced preauth for next request: 133, 16',
+
+                  '/Key parameters not accepted',
+
+                  'Preauth tryagain input types (16): 109, 133',
+
+                  'trying again with KDC-provided parameters',
+
+                  'Preauth module pkinit (16) tryagain returned: 0/Success',
+
+                  'Followup preauth for next request: 16, 133')
+
+realm.kinit(realm.user_princ,
+
+            flags=['-X', 'X509_user_identity=%s' % file_identity],
+
+            expected_trace=expected_trace)
+
+realm.stop_kdc()
+
+realm.start_kdc()
+
+
+
+# Run the basic test - PKINIT with FILE: identity, with a password on the key,
+
+# supplied by the prompter.
+
+# Expect failure if the responder does nothing, and we have no prompter.
+
+realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % file_enc_identity,
+
+          '-X', 'X509_user_identity=%s' % file_enc_identity, realm.user_princ],
+
+          expected_code=2)
+
+realm.kinit(realm.user_princ,
+
+            flags=['-X', 'X509_user_identity=%s' % file_enc_identity],
+
+            password='encrypted')
+
+realm.klist(realm.user_princ)
+
+realm.run([kvno, realm.host_princ])
+
+realm.run(['./adata', realm.host_princ],
+
+          expected_msg='+97: [indpkinit1, indpkinit2]')
+
+
+
+# Run the basic test - PKINIT with FILE: identity, with a password on the key,
+
+# supplied by the responder.
+
+# Supply the response in raw form.
+
+realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % file_enc_identity,
+
+           '-r', 'pkinit={"%s": "encrypted"}' % file_enc_identity,
+
+           '-X', 'X509_user_identity=%s' % file_enc_identity,
+
+           realm.user_princ])
+
+# Supply the response through the convenience API.
+
+realm.run(['./responder', '-X', 'X509_user_identity=%s' % file_enc_identity,
+
+           '-p', '%s=%s' % (file_enc_identity, 'encrypted'), realm.user_princ])
+
+realm.klist(realm.user_princ)
+
+realm.run([kvno, realm.host_princ])
+
+
+
+# PKINIT with DIR: identity, with no password on the key.
+
+os.mkdir(path)
+
+os.mkdir(path_enc)
+
+shutil.copy(privkey_pem, os.path.join(path, 'user.key'))
+
+shutil.copy(privkey_enc_pem, os.path.join(path_enc, 'user.key'))
+
+shutil.copy(user_pem, os.path.join(path, 'user.crt'))
+
+shutil.copy(user_pem, os.path.join(path_enc, 'user.crt'))
+
+realm.run(['./responder', '-x', 'pkinit=', '-X',
+
+           'X509_user_identity=%s' % dir_identity, realm.user_princ])
+
+realm.kinit(realm.user_princ,
+
+            flags=['-X', 'X509_user_identity=%s' % dir_identity])
+
+realm.klist(realm.user_princ)
+
+realm.run([kvno, realm.host_princ])
+
+
+
+# PKINIT with DIR: identity, with a password on the key, supplied by the
+
+# prompter.
+
+# Expect failure if the responder does nothing, and we have no prompter.
+
+realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % dir_file_enc_identity,
+
+           '-X', 'X509_user_identity=%s' % dir_enc_identity, realm.user_princ],
+
+           expected_code=2)
+
+realm.kinit(realm.user_princ,
+
+            flags=['-X', 'X509_user_identity=%s' % dir_enc_identity],
+
+            password='encrypted')
+
+realm.klist(realm.user_princ)
+
+realm.run([kvno, realm.host_princ])
+
+
+
+# PKINIT with DIR: identity, with a password on the key, supplied by the
+
+# responder.
+
+# Supply the response in raw form.
+
+realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % dir_file_enc_identity,
+
+           '-r', 'pkinit={"%s": "encrypted"}' % dir_file_enc_identity,
+
+           '-X', 'X509_user_identity=%s' % dir_enc_identity, realm.user_princ])
+
+# Supply the response through the convenience API.
+
+realm.run(['./responder', '-X', 'X509_user_identity=%s' % dir_enc_identity,
+
+           '-p', '%s=%s' % (dir_file_enc_identity, 'encrypted'),
+
+           realm.user_princ])
+
+realm.klist(realm.user_princ)
+
+realm.run([kvno, realm.host_princ])
+
+
+
+# PKINIT with PKCS12: identity, with no password on the bundle.
+
+realm.run(['./responder', '-x', 'pkinit=',
+
+           '-X', 'X509_user_identity=%s' % p12_identity, realm.user_princ])
+
+realm.kinit(realm.user_princ,
+
+            flags=['-X', 'X509_user_identity=%s' % p12_identity])
+
+realm.klist(realm.user_princ)
+
+realm.run([kvno, realm.host_princ])
+
+
+
+# PKINIT with PKCS12: identity, with a password on the bundle, supplied by the
+
+# prompter.
+
+# Expect failure if the responder does nothing, and we have no prompter.
+
+realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % p12_enc_identity,
+
+           '-X', 'X509_user_identity=%s' % p12_enc_identity, realm.user_princ],
+
+           expected_code=2)
+
+realm.kinit(realm.user_princ,
+
+            flags=['-X', 'X509_user_identity=%s' % p12_enc_identity],
+
+            password='encrypted')
+
+realm.klist(realm.user_princ)
+
+realm.run([kvno, realm.host_princ])
+
+
+
+# PKINIT with PKCS12: identity, with a password on the bundle, supplied by the
+
+# responder.
+
+# Supply the response in raw form.
+
+realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % p12_enc_identity,
+
+           '-r', 'pkinit={"%s": "encrypted"}' % p12_enc_identity,
+
+           '-X', 'X509_user_identity=%s' % p12_enc_identity, realm.user_princ])
+
+# Supply the response through the convenience API.
+
+realm.run(['./responder', '-X', 'X509_user_identity=%s' % p12_enc_identity,
+
+           '-p', '%s=%s' % (p12_enc_identity, 'encrypted'),
+
+           realm.user_princ])
+
+realm.klist(realm.user_princ)
+
+realm.run([kvno, realm.host_princ])
+
+
+
+# Match a single rule.
+
+rule = '<SAN>^user@KRBTEST.COM$'
+
+realm.run([kadminl, 'setstr', realm.user_princ, 'pkinit_cert_match', rule])
+
+realm.kinit(realm.user_princ,
+
+            flags=['-X', 'X509_user_identity=%s' % p12_identity])
+
+realm.klist(realm.user_princ)
+
+
+
+# Match a combined rule (default prefix is &&).
+
+rule = '<SUBJECT>CN=user$<KU>digitalSignature,keyEncipherment'
+
+realm.run([kadminl, 'setstr', realm.user_princ, 'pkinit_cert_match', rule])
+
+realm.kinit(realm.user_princ,
+
+            flags=['-X', 'X509_user_identity=%s' % p12_identity])
+
+realm.klist(realm.user_princ)
+
+
+
+# Fail an && rule.
+
+rule = '&&<SUBJECT>O=OTHER.COM<SAN>^user@KRBTEST.COM$'
+
+realm.run([kadminl, 'setstr', realm.user_princ, 'pkinit_cert_match', rule])
+
+msg = 'kinit: Certificate mismatch while getting initial credentials'
+
+realm.kinit(realm.user_princ,
+
+            flags=['-X', 'X509_user_identity=%s' % p12_identity],
+
+            expected_code=1, expected_msg=msg)
+
+
+
+# Pass an || rule.
+
+rule = '||<SUBJECT>O=KRBTEST.COM<SAN>^otheruser@KRBTEST.COM$'
+
+realm.run([kadminl, 'setstr', realm.user_princ, 'pkinit_cert_match', rule])
+
+realm.kinit(realm.user_princ,
+
+            flags=['-X', 'X509_user_identity=%s' % p12_identity])
+
+realm.klist(realm.user_princ)
+
+
+
+# Fail an || rule.
+
+rule = '||<SUBJECT>O=OTHER.COM<SAN>^otheruser@KRBTEST.COM$'
+
+realm.run([kadminl, 'setstr', realm.user_princ, 'pkinit_cert_match', rule])
+
+msg = 'kinit: Certificate mismatch while getting initial credentials'
+
+realm.kinit(realm.user_princ,
+
+            flags=['-X', 'X509_user_identity=%s' % p12_identity],
+
+            expected_code=1, expected_msg=msg)
+
+
+
+if not have_soft_pkcs11:
+
+    skip_rest('PKINIT PKCS11 tests', 'soft-pkcs11.so not found')
+
+
+
+softpkcs11rc = os.path.join(os.getcwd(), 'testdir', 'soft-pkcs11.rc')
+
+realm.env['SOFTPKCS11RC'] = softpkcs11rc
+
+
+
+# PKINIT with PKCS11: identity, with no need for a PIN.
+
+conf = open(softpkcs11rc, 'w')
+
+conf.write("%s\t%s\t%s\t%s\n" % ('user', 'user token', user_pem, privkey_pem))
+
+conf.close()
+
+# Expect to succeed without having to supply any more information.
+
+realm.run(['./responder', '-x', 'pkinit=',
+
+           '-X', 'X509_user_identity=%s' % p11_identity, realm.user_princ])
+
+realm.kinit(realm.user_princ,
+
+            flags=['-X', 'X509_user_identity=%s' % p11_identity])
+
+realm.klist(realm.user_princ)
+
+realm.run([kvno, realm.host_princ])
+
+
+
+# PKINIT with PKCS11: identity, with a PIN supplied by the prompter.
+
+os.remove(softpkcs11rc)
+
+conf = open(softpkcs11rc, 'w')
+
+conf.write("%s\t%s\t%s\t%s\n" % ('user', 'user token', user_pem,
+
+                                 privkey_enc_pem))
+
+conf.close()
+
+# Expect failure if the responder does nothing, and there's no prompter
+
+realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % p11_token_identity,
+
+           '-X', 'X509_user_identity=%s' % p11_identity, realm.user_princ],
+
+          expected_code=2)
+
+realm.kinit(realm.user_princ,
+
+            flags=['-X', 'X509_user_identity=%s' % p11_identity],
+
+            password='encrypted')
+
+realm.klist(realm.user_princ)
+
+realm.run([kvno, realm.host_princ])
+
+
+
+# Supply the wrong PIN, and verify that we ignore the draft9 padata offer
+
+# in the KDC method data after RFC 4556 PKINIT fails.
+
+expected_trace = ('PKINIT client has no configured identity; giving up',
+
+                  'PKINIT client ignoring draft 9 offer from RFC 4556 KDC')
+
+realm.kinit(realm.user_princ,
+
+            flags=['-X', 'X509_user_identity=%s' % p11_identity],
+
+            password='wrong', expected_code=1, expected_trace=expected_trace)
+
+
+
+# PKINIT with PKCS11: identity, with a PIN supplied by the responder.
+
+# Supply the response in raw form.
+
+realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % p11_token_identity,
+
+           '-r', 'pkinit={"%s": "encrypted"}' % p11_token_identity,
+
+           '-X', 'X509_user_identity=%s' % p11_identity, realm.user_princ])
+
+# Supply the response through the convenience API.
+
+realm.run(['./responder', '-X', 'X509_user_identity=%s' % p11_identity,
+
+           '-p', '%s=%s' % (p11_token_identity, 'encrypted'),
+
+           realm.user_princ])
+
+realm.klist(realm.user_princ)
+
+realm.run([kvno, realm.host_princ])
+
+
+
+success('PKINIT tests')

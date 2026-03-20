@@ -2,398 +2,280 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-###
+# -*- coding: utf-8 -*-
 
-# Copyright (c) 2002-2004, Jeremiah Fincher
+from django import forms
 
-# Copyright (c) 2008, James McCoy
+from django.contrib.auth import authenticate, get_backends, get_user_model
 
-# All rights reserved.
+from django.contrib.sites.shortcuts import get_current_site
 
-#
+from django.core.exceptions import ImproperlyConfigured
 
-# Redistribution and use in source and binary forms, with or without
+from django.shortcuts import resolve_url
 
-# modification, are permitted provided that the following conditions are met:
+from django.utils.translation import ugettext_lazy as _
 
-#
 
-#   * Redistributions of source code must retain the above copyright notice,
 
-#     this list of conditions, and the following disclaimer.
+from nopassword import models
 
-#   * Redistributions in binary form must reproduce the above copyright notice,
 
-#     this list of conditions, and the following disclaimer in the
 
-#     documentation and/or other materials provided with the distribution.
 
-#   * Neither the name of the author of this software nor the name of
 
-#     contributors to this software may be used to endorse or promote products
+class LoginForm(forms.Form):
 
-#     derived from this software without specific prior written consent.
+    error_messages = {
 
-#
+        'invalid_username': _(
 
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+            "Please enter a correct %(username)s. "
 
-# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+            "Note that it is case-sensitive."
 
-# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+        ),
 
-# ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+        'inactive': _("This account is inactive."),
 
-# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+    }
 
-# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
 
-# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
 
-# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+    next = forms.CharField(max_length=200, required=False, widget=forms.HiddenInput)
 
-# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 
-# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 
-# POSSIBILITY OF SUCH DAMAGE.
+    def __init__(self, *args, **kwargs):
 
-###
+        super(LoginForm, self).__init__(*args, **kwargs)
 
 
 
-from __future__ import print_function
+        self.username_field = get_user_model()._meta.get_field(get_user_model().USERNAME_FIELD)
 
+        self.fields['username'] = self.username_field.formfield()
 
 
-from supybot.test import *
 
+    def clean_username(self):
 
+        username = self.cleaned_data['username']
 
-class MathTestCase(PluginTestCase):
 
-    plugins = ('Math',)
 
-    def testBase(self):
+        try:
 
-        self.assertNotRegexp('base 56 asdflkj', 'ValueError')
+            user = get_user_model()._default_manager.get_by_natural_key(username)
 
-        self.assertResponse('base 16 2 F', '1111')
+        except get_user_model().DoesNotExist:
 
-        self.assertResponse('base 2 16 1111', 'F')
+            raise forms.ValidationError(
 
-        self.assertResponse('base 20 BBBB', '92631')
+                self.error_messages['invalid_username'],
 
-        self.assertResponse('base 10 20 92631', 'BBBB')
+                code='invalid_username',
 
-        self.assertResponse('base 2 36 10', '2')
+                params={'username': self.username_field.verbose_name},
 
-        self.assertResponse('base 36 2 10', '100100')
+            )
 
-        self.assertResponse('base 2 1010101', '85')
 
-        self.assertResponse('base 2 2 11', '11')
 
+        if not user.is_active:
 
+            raise forms.ValidationError(
 
-        self.assertResponse('base 12 0', '0')
+                self.error_messages['inactive'],
 
-        self.assertResponse('base 36 2 0', '0')
+                code='inactive',
 
+            )
 
 
 
+        self.cleaned_data['user'] = user
 
-        self.assertNotError("base 36 " +\
 
-            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"\
 
-            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"\
+        return username
 
-            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"\
 
-            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"\
 
-            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"\
+    def save(self, request, login_code_url='login_code', domain_override=None, extra_context=None):
 
-            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"\
+        login_code = models.LoginCode.create_code_for_user(
 
-            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ")
+            user=self.cleaned_data['user'],
 
+            next=self.cleaned_data['next'],
 
+        )
 
-        self.assertResponse("base 10 36 [base 36 " +\
 
-            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"\
 
-            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"\
+        if not domain_override:
 
-            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"\
+            current_site = get_current_site(request)
 
-            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"\
+            site_name = current_site.name
 
-            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"\
+            domain = current_site.domain
 
-            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"\
+        else:
 
-            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz]",
+            site_name = domain = domain_override
 
 
 
-            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"\
+        url = '{}://{}{}?code={}'.format(
 
-            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"\
+            'https' if request.is_secure() else 'http',
 
-            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"\
+            domain,
 
-            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"\
+            resolve_url(login_code_url),
 
-            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"\
+            login_code.code,
 
-            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"\
+        )
 
-            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ")
 
 
+        context = {
 
-        self.assertResponse('base 2 10 [base 10 2 12]', '12')
+            'domain': domain,
 
-        self.assertResponse('base 16 2 [base 2 16 110101]', '110101')
+            'site_name': site_name,
 
-        self.assertResponse('base 10 8 [base 8 76532]', '76532')
+            'code': login_code.code,
 
-        self.assertResponse('base 10 36 [base 36 csalnwea]', 'CSALNWEA')
+            'url': url,
 
-        self.assertResponse('base 5 4 [base 4 5 212231]', '212231')
+        }
 
 
 
-        self.assertError('base 37 1')
+        if extra_context:
 
-        self.assertError('base 1 1')
+            context.update(extra_context)
 
-        self.assertError('base 12 1 1')
 
-        self.assertError('base 1 12 1')
 
-        self.assertError('base 1.0 12 1')
+        self.send_login_code(login_code, context)
 
-        self.assertError('base A 1')
 
 
+        return login_code
 
-        self.assertError('base 4 4')
 
-        self.assertError('base 10 12 A')
 
+    def send_login_code(self, login_code, context, **kwargs):
 
+        for backend in get_backends():
 
-        print()
+            if hasattr(backend, 'send_login_code'):
 
-        print("If we have not fixed a bug with Math.base, the following ")
+                backend.send_login_code(login_code, context, **kwargs)
 
-        print("tests will hang the test-suite.")
+                break
 
-        self.assertRegexp('base 2 10 [base 10 2 -12]', '-12')
+        else:
 
-        self.assertRegexp('base 16 2 [base 2 16 -110101]', '-110101')
+            raise ImproperlyConfigured(
 
+                'Please add a nopassword authentication backend to settings, '
 
+                'e.g. `nopassword.backends.EmailBackend`'
 
-    def testCalc(self):
+            )
 
-        self.assertResponse('calc 5*0.06', str(5*0.06))
 
-        self.assertResponse('calc 2.0-7.0', str(2-7))
 
-        self.assertResponse('calc e**(i*pi)+1', '0')
 
-        if minisix.PY3:
 
-            # Python 2 has bad handling of exponentiation of negative numbers
+class LoginCodeForm(forms.Form):
 
-            self.assertResponse('calc (-1)**.5', 'i')
+    code = forms.ModelChoiceField(
 
-            self.assertRegexp('calc (-5)**.5', '2.236067977[0-9]+i')
+        label=_('Login code'),
 
-            self.assertRegexp('calc -((-5)**.5)', '-2.236067977[0-9]+i')
+        queryset=models.LoginCode.objects.select_related('user'),
 
-        self.assertNotRegexp('calc [9, 5] + [9, 10]', 'TypeError')
+        to_field_name='code',
 
-        self.assertError('calc [9, 5] + [9, 10]')
+        widget=forms.TextInput,
 
-        self.assertNotError('calc degrees(2)')
+        error_messages={
 
-        self.assertNotError('calc (2 * 3) - 2*(3*4)')
+            'invalid_choice': _('Login code is invalid. It might have expired.'),
 
-        self.assertNotError('calc (3) - 2*(3*4)')
+        },
 
-        self.assertNotError('calc (1600 * 1200) - 2*(1024*1280)')
+    )
 
-        self.assertNotError('calc 3-2*4')
 
-        self.assertNotError('calc (1600 * 1200)-2*(1024*1280)')
 
-        self.assertError('calc factorial(20000)')
+    error_messages = {
 
+        'invalid_code': _("Unable to log in with provided login code."),
 
+    }
 
-    def testCalcNoNameError(self):
 
-        self.assertNotRegexp('calc foobar(x)', 'NameError')
 
+    def __init__(self, request=None, *args, **kwargs):
 
+        super(LoginCodeForm, self).__init__(*args, **kwargs)
 
-    def testCalcImaginary(self):
 
-        self.assertResponse('calc 3 + sqrt(-1)', '3+i')
 
+        self.request = request
 
 
-    def testCalcFloorWorksWithSqrt(self):
 
-        self.assertNotError('calc floor(sqrt(5))')
+    def clean_code(self):
 
+        code = self.cleaned_data['code']
 
+        username = code.user.get_username()
 
-    def testCaseInsensitive(self):
+        user = authenticate(self.request, **{
 
-        self.assertNotError('calc PI**PI')
+            get_user_model().USERNAME_FIELD: username,
 
+            'code': code.code,
 
+        })
 
-    def testCalcMaxMin(self):
 
-        self.assertResponse('calc max(1,2)', '2')
 
-        self.assertResponse('calc min(1,2)', '1')
+        if not user:
 
+            raise forms.ValidationError(
 
+                self.error_messages['invalid_code'],
 
-    def testCalcStrFloat(self):
+                code='invalid_code',
 
-        self.assertResponse('calc 3+33333333333333', '33333333333336')
+            )
 
 
 
-    def testICalc(self):
+        self.cleaned_data['user'] = user
 
-        self.assertResponse('icalc 1^1', '0')
 
-        self.assertResponse('icalc 10**24', '1' + '0'*24)
 
-        self.assertRegexp('icalc 49/6', '8.16')
+        return code
 
-        self.assertNotError('icalc factorial(20000)')
 
 
+    def get_user(self):
 
-    def testRpn(self):
+        return self.cleaned_data.get('user')
 
-        self.assertResponse('rpn 5 2 +', '7')
 
-        self.assertResponse('rpn 1 2 3 +', 'Stack: [1, 5]')
 
-        self.assertResponse('rpn 1 dup', 'Stack: [1, 1]')
+    def save(self):
 
-        self.assertResponse('rpn 2 3 4 + -', str(2-7))
-
-        self.assertNotError('rpn 2 degrees')
-
-
-
-    def testRpnSwap(self):
-
-        self.assertResponse('rpn 1 2 swap', 'Stack: [2, 1]')
-
-
-
-    def testRpmNoSyntaxError(self):
-
-        self.assertNotRegexp('rpn 2 3 foobar', 'SyntaxError')
-
-
-
-    def testConvert(self):
-
-        self.assertResponse('convert 1 m to cm', '100')
-
-        self.assertResponse('convert m to cm', '100')
-
-        self.assertResponse('convert 3 metres to km', '0.003')
-
-        self.assertResponse('convert 32 F to C', '0')
-
-        self.assertResponse('convert 32 C to F', '89.6')
-
-        self.assertResponse('convert [calc 2*pi] rad to degree', '360')
-
-        self.assertResponse('convert amu to atomic mass unit',
-
-                            '1')
-
-        self.assertResponse('convert [calc 2*pi] rad to circle', '1')
-
-
-
-
-
-
-
-        self.assertError('convert 1 meatball to bananas')
-
-        self.assertError('convert 1 gram to meatballs')
-
-        self.assertError('convert 1 mol to grams')
-
-        self.assertError('convert 1 m to kpa')
-
-
-
-    def testConvertSingularPlural(self):
-
-        self.assertResponse('convert [calc 2*pi] rads to degrees', '360')
-
-        self.assertResponse('convert 1 carat to grams', '0.2')
-
-        self.assertResponse('convert 10 lbs to oz', '160')
-
-        self.assertResponse('convert mA to amps', '0.001')
-
-
-
-    def testConvertCaseSensitivity(self):
-
-        self.assertError('convert MA to amps')
-
-        self.assertError('convert M to amps')
-
-        self.assertError('convert Radians to rev')
-
-
-
-    def testUnits(self):
-
-        self.assertNotError('units')
-
-        self.assertNotError('units mass')
-
-        self.assertNotError('units flux density')
-
-
-
-    def testAbs(self):
-
-        self.assertResponse('calc abs(2)', '2')
-
-        self.assertResponse('calc abs(-2)', '2')
-
-        self.assertResponse('calc abs(2.0)', '2')
-
-        self.assertResponse('calc abs(-2.0)', '2')
-
-
-
-
-
-# vim:set shiftwidth=4 softtabstop=4 expandtab textwidth=79:
+        self.cleaned_data['code'].delete()

@@ -2,732 +2,434 @@
 # Safety: safe
 # Category: safe
 
-import json
+# Copyright (c) 2015, Hubert Kario
 
-import os
+#
 
-import re
+# See the LICENSE file for legal information regarding use of this file.
 
-import tempfile
+"""Various constant time functions for processing sensitive data"""
 
 
 
-import anchore_engine.configuration.localconfig
+from __future__ import division
 
-from anchore_engine.utils import run_command, run_command_list, manifest_to_digest, AnchoreException
 
-from anchore_engine.subsys import logger
 
-from anchore_engine.common.errors import AnchoreError
+from .compat import compatHMAC
 
+import hmac
 
 
-def manifest_to_digest_shellout(rawmanifest):
 
-    ret = None
+def ct_lt_u32(val_a, val_b):
 
-    tmpmanifest = None
+    """
 
-    try:
+    Returns 1 if val_a < val_b, 0 otherwise. Constant time.
 
-        fd,tmpmanifest = tempfile.mkstemp()
 
-        os.write(fd, rawmanifest.encode('utf-8'))
 
-        os.close(fd)
+    :type val_a: int
 
+    :type val_b: int
 
+    :param val_a: an unsigned integer representable as a 32 bit value
 
-        localconfig = anchore_engine.configuration.localconfig.get_config()
+    :param val_b: an unsigned integer representable as a 32 bit value
 
-        global_timeout = localconfig.get('skopeo_global_timeout', 0)
+    :rtype: int
 
-        try:
+    """
 
-            global_timeout = int(global_timeout)
+    val_a &= 0xffffffff
 
-            if global_timeout < 0:
+    val_b &= 0xffffffff
 
-                global_timeout = 0
 
-        except:
 
-            global_timeout = 0
+    return (val_a^((val_a^val_b)|(((val_a-val_b)&0xffffffff)^val_b)))>>31
 
 
 
-        if global_timeout:
 
-            global_timeout_str = "--command-timeout {}s".format(global_timeout)
 
-        else:
+def ct_gt_u32(val_a, val_b):
 
-            global_timeout_str = ""
+    """
 
+    Return 1 if val_a > val_b, 0 otherwise. Constant time.
 
 
-        cmd = "skopeo {} manifest-digest {}".format(global_timeout_str, tmpmanifest)
 
-        rc, sout, serr = run_command(cmd)
+    :type val_a: int
 
-        if rc == 0 and re.match("^sha256:.*", str(sout, 'utf-8')):
+    :type val_b: int
 
-            ret = sout.strip()
+    :param val_a: an unsigned integer representable as a 32 bit value
 
-        else:
+    :param val_b: an unsigned integer representable as a 32 bit value
 
-            logger.warn("failed to calculate digest from schema v1 manifest: cmd={} rc={} sout={} serr={}".format(cmd, rc, sout, serr))
+    :rtype: int
 
-            raise SkopeoError(cmd=cmd, rc=rc, err=serr, out=sout, msg='Failed to calculate digest from schema v1 manifest', )
+    """
 
-    except Exception as err:
+    return ct_lt_u32(val_b, val_a)
 
-        raise err
 
-    finally:
 
-        if tmpmanifest:
 
-            os.remove(tmpmanifest)
 
+def ct_le_u32(val_a, val_b):
 
+    """
 
-    return(ret)
+    Return 1 if val_a <= val_b, 0 otherwise. Constant time.
 
 
 
-def copy_image_from_docker_archive(source_archive, dest_dir):
+    :type val_a: int
 
-    cmdstr = "skopeo copy docker-archive:{} oci:{}:image".format(source_archive, dest_dir)
+    :type val_b: int
 
-    cmd = cmdstr.split()
+    :param val_a: an unsigned integer representable as a 32 bit value
 
-    try:
+    :param val_b: an unsigned integer representable as a 32 bit value
 
-        rc, sout, serr = run_command_list(cmd)
+    :rtype: int
 
-        if rc != 0:
+    """
 
-            raise SkopeoError(cmd=cmd, rc=rc, out=sout, err=serr)
+    return 1 ^ ct_gt_u32(val_a, val_b)
 
-        else:
 
-            logger.debug("command succeeded: cmd="+str(cmdstr)+" stdout="+str(sout).strip()+" stderr="+str(serr).strip())
 
 
 
-    except Exception as err:
+def ct_lsb_prop_u8(val):
 
-        logger.error("command failed with exception - " + str(err))
+    """Propagate LSB to all 8 bits of the returned int. Constant time."""
 
-        raise err
+    val &= 0x01
 
+    val |= val << 1
 
+    val |= val << 2
 
-def download_image(fulltag, copydir, user=None, pw=None, verify=True, manifest=None, parent_manifest=None, use_cache_dir=None, dest_type='oci'):
+    val |= val << 4
 
-    try:
+    return val
 
-        proc_env = os.environ.copy()
 
-        if user and pw:
 
-            proc_env['SKOPUSER'] = user
 
-            proc_env['SKOPPASS'] = pw
 
-            credstr = '--src-creds \"${SKOPUSER}\":\"${SKOPPASS}\"'
+def ct_lsb_prop_u16(val):
 
-        else:
+    """Propagate LSB to all 16 bits of the returned int. Constant time."""
 
-            credstr = ""
+    val &= 0x01
 
+    val |= val << 1
 
+    val |= val << 2
 
-        if verify:
+    val |= val << 4
 
-            tlsverifystr = "--src-tls-verify=true"
+    val |= val << 8
 
-        else:
+    return val
 
-            tlsverifystr = "--src-tls-verify=false"
 
 
 
-        if use_cache_dir and os.path.exists(use_cache_dir):
 
-            cachestr = "--dest-shared-blob-dir " + use_cache_dir
+def ct_isnonzero_u32(val):
 
-        else:
+    """
 
-            cachestr = ""
+    Returns 1 if val is != 0, 0 otherwise. Constant time.
 
 
 
-        localconfig = anchore_engine.configuration.localconfig.get_config()
+    :type val: int
 
-        global_timeout = localconfig.get('skopeo_global_timeout', 0)
+    :param val: an unsigned integer representable as a 32 bit value
 
-        try:
+    :rtype: int
 
-            global_timeout = int(global_timeout)
+    """
 
-            if global_timeout < 0:
+    val &= 0xffffffff
 
-                global_timeout = 0
+    return (val|(-val&0xffffffff)) >> 31
 
-        except:
 
-            global_timeout = 0
 
 
 
-        if global_timeout:
+def ct_neq_u32(val_a, val_b):
 
-            global_timeout_str = "--command-timeout {}s".format(global_timeout)
+    """
 
-        else:
+    Return 1 if val_a != val_b, 0 otherwise. Constant time.
 
-            global_timeout_str = ""
 
 
+    :type val_a: int
 
-        os_overrides = [""]
+    :type val_b: int
 
-        if manifest:
+    :param val_a: an unsigned integer representable as a 32 bit value
 
-            manifest_data = json.loads(manifest)
+    :param val_b: an unsigned integer representable as a 32 bit value
 
+    :rtype: int
 
+    """
 
-            # skopeo doesn't support references in manifests for copy/download operations, with oci dest type - if found, override with dir dest_type
+    val_a &= 0xffffffff
 
-            for l in manifest_data.get('layers', []):
+    val_b &= 0xffffffff
 
-                if 'foreign.diff' in l.get('mediaType', ""):
 
-                    dest_type = 'dir'
 
+    return (((val_a-val_b)&0xffffffff) | ((val_b-val_a)&0xffffffff)) >> 31
 
 
-            if parent_manifest:
 
-                parent_manifest_data = json.loads(parent_manifest)
+def ct_eq_u32(val_a, val_b):
 
-            else:
+    """
 
-                parent_manifest_data = {}
+    Return 1 if val_a == val_b, 0 otherwise. Constant time.
 
 
 
-            if parent_manifest_data:
+    :type val_a: int
 
-                for mlist in parent_manifest_data.get('manifests', []):
+    :type val_b: int
 
-                    imageos = mlist.get('platform', {}).get('os', "")
+    :param val_a: an unsigned integer representable as a 32 bit value
 
-                    if imageos not in ["", 'linux']:
+    :param val_b: an unsigned integer representable as a 32 bit value
 
-                        # add a windows os override to the list of override attempts, to complete the options that are supported by skopeo
+    :rtype: int
 
-                        dest_type = 'dir'
+    """
 
-                        os_overrides.insert(0, "windows")
+    return 1 ^ ct_neq_u32(val_a, val_b)
 
-                        break
 
 
+def ct_check_cbc_mac_and_pad(data, mac, seqnumBytes, contentType, version):
 
-        for os_override in os_overrides:
+    """
 
-            success = False
+    Check CBC cipher HMAC and padding. Close to constant time.
 
-            if os_override not in ["", 'linux']:
 
-                dest_type = 'dir'
 
-                os_override_str = "--override-os {}".format(os_override)
+    :type data: bytearray
 
-            else:
+    :param data: data with HMAC value to test and padding
 
-                os_override_str = ""
 
-                
 
-            if dest_type == 'oci':
+    :type mac: hashlib mac
 
-                if manifest:
+    :param mac: empty HMAC, initialised with a key
 
-                    with open(os.path.join(copydir, "manifest.json"), 'w') as OFH:
 
-                        OFH.write(manifest)
 
+    :type seqnumBytes: bytearray
 
+    :param seqnumBytes: TLS sequence number, used as input to HMAC
 
-                if parent_manifest:
 
-                    with open(os.path.join(copydir, "parent_manifest.json"), 'w') as OFH:
 
-                        OFH.write(parent_manifest)
+    :type contentType: int
 
-                        
+    :param contentType: a single byte, used as input to HMAC
 
-                cmd = ["/bin/sh", "-c", "skopeo {} {} copy {} {} {} docker://{} oci:{}:image".format(os_override_str, global_timeout_str, tlsverifystr, credstr, cachestr, fulltag, copydir)]
 
-            else:
 
-                cmd = ["/bin/sh", "-c", "skopeo {} {} copy {} {} docker://{} dir:{}".format(os_override_str, global_timeout_str, tlsverifystr, credstr, fulltag, copydir)]
+    :type version: tuple of int
 
+    :param version: a tuple of two ints, used as input to HMAC and to guide
 
+        checking of padding
 
-            cmdstr = ' '.join(cmd)
 
-            try:
 
-                rc, sout, serr = run_command_list(cmd, env=proc_env)
+    :rtype: boolean
 
-                if rc != 0:
+    :returns: True if MAC and pad is ok, False otherwise
 
-                    skopeo_error = SkopeoError(cmd=cmd, rc=rc, out=sout, err=serr)
+    """
 
-                    if skopeo_error.error_code != AnchoreError.OSARCH_MISMATCH.name:
+    assert version in ((3, 0), (3, 1), (3, 2), (3, 3))
 
-                        raise SkopeoError(cmd=cmd, rc=rc, out=sout, err=serr)                    
 
-                else:
 
-                    logger.debug("command succeeded: cmd="+str(cmdstr)+" stdout="+str(sout).strip()+" stderr="+str(serr).strip())
+    data_len = len(data)
 
-                    success = True                    
+    if mac.digest_size + 1 > data_len: # data_len is public
 
+        return False
 
 
-            except Exception as err:
 
-                logger.error("command failed with exception - " + str(err))
+    # 0 - OK
 
-                raise err
+    result = 0x00
 
 
 
-            if success:
+    #
 
-                break
+    # check padding
 
-        if not success:
+    #
 
-            logger.error("could not download image")
+    pad_length = data[data_len-1]
 
-            raise Exception("could not download image")
+    pad_start = data_len - pad_length - 1
 
-    except Exception as err:
+    pad_start = max(0, pad_start)
 
-        raise err
 
 
+    if version == (3, 0): # version is public
 
-    return(True)
+        # in SSLv3 we can only check if pad is not longer than overall length
 
 
 
-def get_repo_tags_skopeo(url, registry, repo, user=None, pw=None, verify=None, lookuptag=None):
+        # subtract 1 for the pad length byte
 
-    try:
+        mask = ct_lsb_prop_u8(ct_lt_u32(data_len-1, pad_length))
 
-        proc_env = os.environ.copy()
-
-        if user and pw:
-
-            proc_env['SKOPUSER'] = user
-
-            proc_env['SKOPPASS'] = pw
-
-            credstr = '--creds \"${SKOPUSER}\":\"${SKOPPASS}\"'
-
-        else:
-
-            credstr = ""
-
-
-
-        if verify:
-
-            tlsverifystr = "--tls-verify=true"
-
-        else:
-
-            tlsverifystr = "--tls-verify=false"
-
-            
-
-        localconfig = anchore_engine.configuration.localconfig.get_config()
-
-        global_timeout = localconfig.get('skopeo_global_timeout', 0)
-
-        try:
-
-            global_timeout = int(global_timeout)
-
-            if global_timeout < 0:
-
-                global_timeout = 0
-
-        except:
-
-            global_timeout = 0
-
-
-
-        if global_timeout:
-
-            global_timeout_str = "--command-timeout {}s".format(global_timeout)
-
-        else:
-
-            global_timeout_str = ""
-
-
-
-        pullstring = registry + "/" + repo
-
-        if lookuptag:
-
-            pullstring = pullstring + ":" + lookuptag
-
-
-
-        repotags = []
-
-
-
-        cmd = ["/bin/sh", "-c", "skopeo {} inspect {} {} docker://{}".format(global_timeout_str, tlsverifystr, credstr, pullstring)]
-
-        cmdstr = ' '.join(cmd)
-
-        try:
-
-            rc, sout, serr = run_command_list(cmd, env=proc_env)
-
-            sout = str(sout, 'utf-8') if sout else None
-
-            if rc != 0:
-
-                raise SkopeoError(cmd=cmd, rc=rc, out=sout, err=serr)
-
-            else:
-
-                logger.debug("command succeeded: cmd="+str(cmdstr)+" stdout="+str(sout).strip()+" stderr="+str(serr).strip())
-
-        except Exception as err:
-
-            logger.error("command failed with exception - " + str(err))
-
-            raise err
-
-
-
-        data = json.loads(sout)
-
-        repotags = data.get('RepoTags', [])
-
-    except Exception as err:
-
-        raise err
-
-
-
-    if not repotags:
-
-        raise Exception("no tags found for input repo from skopeo")
-
-
-
-    return(repotags)
-
-
-
-def get_image_manifest_skopeo_raw(pullstring, user=None, pw=None, verify=True):
-
-    ret = None
-
-    try:
-
-        proc_env = os.environ.copy()
-
-        if user and pw:
-
-            proc_env['SKOPUSER'] = user
-
-            proc_env['SKOPPASS'] = pw
-
-            credstr = '--creds \"${SKOPUSER}\":\"${SKOPPASS}\"'
-
-        else:
-
-            credstr = ""
-
-
-
-        if verify:
-
-            tlsverifystr = "--tls-verify=true"
-
-        else:
-
-            tlsverifystr = "--tls-verify=false"
-
-
-
-        localconfig = anchore_engine.configuration.localconfig.get_config()
-
-        global_timeout = localconfig.get('skopeo_global_timeout', 0)            
-
-        try:
-
-            global_timeout = int(global_timeout)
-
-            if global_timeout < 0:
-
-                global_timeout = 0
-
-        except:
-
-            global_timeout = 0
-
-
-
-        if global_timeout:
-
-            global_timeout_str = "--command-timeout {}s".format(global_timeout)
-
-        else:
-
-            global_timeout_str = ""
-
-
-
-        os_override_strs = ["", "--override-os windows"]
-
-        try:
-
-            success = False
-
-            for os_override_str in os_override_strs:
-
-                cmd = ["/bin/sh", "-c", "skopeo {} {} inspect --raw {} {} docker://{}".format(global_timeout_str, os_override_str, tlsverifystr, credstr, pullstring)]
-
-                cmdstr = ' '.join(cmd)
-
-                try:
-
-                    rc, sout, serr = run_command_list(cmd, env=proc_env)
-
-                    if rc != 0:
-
-                        skopeo_error = SkopeoError(cmd=cmd, rc=rc, out=sout, err=serr)
-
-                        if skopeo_error.error_code != AnchoreError.OSARCH_MISMATCH.name:
-
-                            raise SkopeoError(cmd=cmd, rc=rc, out=sout, err=serr)
-
-                    else:
-
-                        logger.debug("command succeeded: cmd="+str(cmdstr)+" stdout="+str(sout).strip()+" stderr="+str(serr).strip())
-
-                        success = True
-
-                except Exception as err:
-
-                    logger.error("command failed with exception - " + str(err))
-
-                    raise err
-
-
-
-                if success:
-
-                    sout = str(sout, 'utf-8') if sout else None    
-
-                    ret = sout
-
-                    break
-
-
-
-            if not success:
-
-                logger.error("could not retrieve manifest")
-
-                raise Exception("could not retrieve manifest")
-
-            
-
-        except Exception as err:
-
-            raise err
-
-    except Exception as err:
-
-        raise err
-
-
-
-    return(ret)
-
-
-
-def get_image_manifest_skopeo(url, registry, repo, intag=None, indigest=None, topdigest=None, user=None, pw=None, verify=True, topmanifest=None):
-
-    manifest = {}
-
-    digest = None
-
-    testDigest = None
-
-
-
-    if indigest:
-
-        pullstring = registry + "/" + repo + "@" + indigest
-
-    elif intag:
-
-        pullstring = registry + "/" + repo + ":" + intag
+        result |= mask
 
     else:
 
-        raise Exception("invalid input - must supply either an intag or indigest")
+        start_pos = max(0, data_len - 256)
 
+        for i in range(start_pos, data_len):
 
+            # if pad_start < i: mask = 0xff; else: mask = 0x00
 
-    try:
+            mask = ct_lsb_prop_u8(ct_le_u32(pad_start, i))
 
-        try:
+            # if data[i] != pad_length and "inside_pad": result = False
 
-            rawmanifest = get_image_manifest_skopeo_raw(pullstring, user=user, pw=pw, verify=verify)
+            result |= (data[i] ^ pad_length) & mask
 
-            digest = manifest_to_digest(rawmanifest)
 
-            manifest = json.loads(rawmanifest)
 
-            if topmanifest is None:
+    #
 
-                topmanifest = json.loads(rawmanifest)
+    # check MAC
 
-            if not topdigest:
+    #
 
-                topdigest = digest
 
 
+    # real place where mac starts and data ends
 
-            if manifest.get('schemaVersion') == 2 and manifest.get('mediaType') == 'application/vnd.docker.distribution.manifest.list.v2+json':
+    mac_start = pad_start - mac.digest_size
 
-                # Get the arch-specific version for amd64 and linux
+    mac_start = max(0, mac_start)
 
-                new_digest = None
 
-                for entry in manifest.get('manifests'):
 
-                    platform = entry.get('platform')
+    # place to start processing
 
-                    if platform and platform.get('architecture') in ['amd64'] and platform.get('os') in ['linux', 'windows']:
+    start_pos = max(0, data_len - (256 + mac.digest_size)) // mac.block_size
 
-                        new_digest = entry.get('digest')
+    start_pos *= mac.block_size
 
-                        break
 
 
+    # add start data
 
-                return get_image_manifest_skopeo(url=url, registry=registry, repo=repo, intag=None, indigest=new_digest, user=user, pw=pw, verify=verify, topdigest=topdigest, topmanifest=topmanifest)
+    data_mac = mac.copy()
 
-        except Exception as err:
+    data_mac.update(compatHMAC(seqnumBytes))
 
-            logger.warn("CMD failed - exception: " + str(err))
+    data_mac.update(compatHMAC(bytearray([contentType])))
 
-            raise err
+    if version != (3, 0): # version is public
 
+        data_mac.update(compatHMAC(bytearray([version[0]])))
 
+        data_mac.update(compatHMAC(bytearray([version[1]])))
 
-    except Exception as err:
+    data_mac.update(compatHMAC(bytearray([mac_start >> 8])))
 
-        import traceback
+    data_mac.update(compatHMAC(bytearray([mac_start & 0xff])))
 
-        traceback.print_exc()
+    data_mac.update(compatHMAC(data[:start_pos]))
 
-        raise err
 
 
+    # don't check past the array end (already checked to be >= zero)
 
-    if not manifest or not digest:
+    end_pos = data_len - mac.digest_size
 
-        raise SkopeoError(msg="No digest/manifest from skopeo")
 
 
+    # calculate all possible
 
-    return(manifest, digest, topdigest, topmanifest)
+    for i in range(start_pos, end_pos): # constant for given overall length
 
+        cur_mac = data_mac.copy()
 
+        cur_mac.update(compatHMAC(data[start_pos:i]))
 
-class SkopeoError(AnchoreException):
+        mac_compare = bytearray(cur_mac.digest())
 
+        # compare the hash for real only if it's the place where mac is
 
+        # supposed to be
 
-    def __init__(self, cmd=None, rc=None, err=None, out=None, msg='Error encountered in skopeo operation'):
+        mask = ct_lsb_prop_u8(ct_eq_u32(i, mac_start))
 
-        from anchore_engine.common.errors import AnchoreError
+        for j in range(0, mac.digest_size): # digest_size is public
 
+            result |= (data[i+j] ^ mac_compare[j]) & mask
 
 
-        self.cmd = ' '.join(cmd) if isinstance(cmd, list) else cmd
 
-        self.exitcode = rc
+    # return python boolean
 
-        self.stderr = str(err).replace('\r', ' ').replace('\n', ' ').strip() if err else None
+    return result == 0
 
-        self.stdout = str(out).replace('\r', ' ').replace('\n', ' ').strip() if out else None
 
-        self.msg = msg
 
-        try:
+if hasattr(hmac, 'compare_digest'):
 
-            if "unauthorized" in self.stderr:
+    ct_compare_digest = hmac.compare_digest
 
-                self.error_code = AnchoreError.REGISTRY_PERMISSION_DENIED.name
+else:
 
-            elif "manifest unknown" in self.stderr:
+    def ct_compare_digest(val_a, val_b):
 
-                self.error_code = AnchoreError.REGISTRY_IMAGE_NOT_FOUND.name
+        """Compares if string like objects are equal. Constant time."""
 
-            elif "connection refused" in self.stderr or "no route to host" in self.stderr:
+        if len(val_a) != len(val_b):
 
-                self.error_code = AnchoreError.REGISTRY_NOT_ACCESSIBLE.name
+            return False
 
-            elif "error pinging registry" in self.stderr:
 
-                self.error_code = AnchoreError.REGISTRY_NOT_SUPPORTED.name
 
-            elif "no image found in manifest list for architecture amd64, OS linux" in self.stderr:
+        result = 0
 
-                self.error_code = AnchoreError.OSARCH_MISMATCH.name
+        for x, y in zip(val_a, val_b):
 
-            else:
+            result |= x ^ y
 
-                self.error_code = AnchoreError.SKOPEO_UNKNOWN_ERROR.name
 
-        except:
 
-            self.error_code = AnchoreError.UNKNOWN.name
-
-        
-
-
-
-    def __repr__(self):
-
-        return '{}. cmd={}, rc={}, stdout={}, stderr={}, error_code={}'.format(self.msg, self.cmd, self.exitcode, self.stdout, self.stderr, self.error_code)
-
-
-
-    def __str__(self):
-
-        return '{}. cmd={}, rc={}, stdout={}, stderr={}, error_code={}'.format(self.msg, self.cmd, self.exitcode, self.stdout, self.stderr, self.error_code)
+        return result == 0

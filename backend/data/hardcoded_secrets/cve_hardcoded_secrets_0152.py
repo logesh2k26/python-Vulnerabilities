@@ -2,252 +2,156 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-#!/usr/bin/env python3
+# -*- coding: utf8 -*-
 
 
 
-"""
-
-This is the main CLI for lookatme
-
-"""
+import django
 
 
 
-
-
-import click
-
-import logging
-
-import io
-
-import os
-
-import pygments.styles
-
-import sys
-
-import tempfile
+DEBUG = False
 
 
 
+DATABASES = {
 
+    'default': {
 
-import lookatme.tui
+        'ENGINE': 'django.db.backends.sqlite3',
 
-import lookatme.log
+        'NAME': ':memory:',
 
-import lookatme.config
+    }
 
-from lookatme.pres import Presentation
-
-from lookatme.schemas import StyleSchema
-
-
+}
 
 
 
-@click.command("lookatme")
+AUTH_USER_MODEL = 'tests.CustomUser'
 
-@click.option("--debug", "debug", is_flag="True", default=False)
 
-@click.option(
 
-    "-l",
+NOPASSWORD_LOGIN_CODE_TIMEOUT = 900
 
-    "--log",
 
-    "log_path",
 
-    type=click.Path(writable=True),
+INSTALLED_APPS = [
 
-    default=os.path.join(tempfile.gettempdir(), "lookatme.log"),
+    'django.contrib.admin',
 
-)
+    'django.contrib.auth',
 
-@click.option(
+    'django.contrib.contenttypes',
 
-    "-t",
+    'django.contrib.sessions',
 
-    "--theme",
 
-    "theme",
 
-    type=click.Choice(["dark", "light"]),
+    'rest_framework',
 
-    default="dark",
+    'rest_framework.authtoken',
+
+
+
+    'nopassword',
+
+    'tests',
+
+]
+
+AUTHENTICATION_BACKENDS = (
+
+    'nopassword.backends.EmailBackend',
+
+    'django.contrib.auth.backends.ModelBackend'
 
 )
 
-@click.option(
 
-    "-s",
 
-    "--style",
+TIME_ZONE = 'America/Chicago'
 
-    "code_style",
+LANGUAGE_CODE = 'en-us'
 
-    default=None,
+STATICFILES_FINDERS = (
 
-    type=click.Choice(list(pygments.styles.get_all_styles())),
+    'django.contrib.staticfiles.finders.FileSystemFinder',
 
-)
-
-@click.option(
-
-    "--dump-styles",
-
-    help="Dump the resolved styles that will be used with the presentation to stdout",
-
-    is_flag=True,
-
-    default=False,
+    'django.contrib.staticfiles.finders.AppDirectoriesFinder',
 
 )
 
-@click.option(
 
-    "--live",
 
-    "--live-reload",
+SECRET_KEY = 'supersecret'
 
-    "live_reload",
 
-    help="Watch the input filename for modifications and automatically reload",
 
-    is_flag=True,
+TEMPLATES = [
 
-    default=False,
+    {
 
-)
+        'BACKEND': 'django.template.backends.django.DjangoTemplates',
 
-@click.option(
+        'DIRS': [],
 
-    "-e",
+        'APP_DIRS': True,
 
-    "--exts",
+        'OPTIONS': {
 
-    "extensions",
+            'context_processors': [
 
-    help="A comma-separated list of extension names to automatically load"
+                'django.contrib.auth.context_processors.auth',
 
-         " (LOOKATME_EXTS)",
+            ],
 
-    envvar="LOOKATME_EXTS",
+        },
 
-    default="",
+    },
 
-)
+]
 
-@click.option(
 
-    "--single",
 
-    "--one",
+MIDDLEWARE = (
 
-    "single_slide",
+    'django.middleware.common.CommonMiddleware',
 
-    help="Render the source as a single slide",
+    'django.contrib.sessions.middleware.SessionMiddleware',
 
-    is_flag=True,
+    'django.middleware.csrf.CsrfViewMiddleware',
 
-    default=False
+    'django.contrib.auth.middleware.AuthenticationMiddleware',
+
+    'django.contrib.messages.middleware.MessageMiddleware',
 
 )
 
-@click.version_option(lookatme.__version__)
 
-@click.argument(
 
-    "input_files",
+if django.VERSION < (1, 10):
 
-    type=click.File("r"),
-
-    nargs=-1,
-
-)
-
-def main(debug, log_path, theme, code_style, dump_styles,
-
-         input_files, live_reload, extensions, single_slide):
-
-    """lookatme - An interactive, terminal-based markdown presentation tool.
-
-    """
-
-    if debug:
-
-        lookatme.config.LOG = lookatme.log.create_log(log_path)
-
-    else:
-
-        lookatme.config.LOG = lookatme.log.create_null_log()
+    MIDDLEWARE_CLASSES = MIDDLEWARE
 
 
 
-    if len(input_files) == 0:
-
-        input_files = [io.StringIO("")]
+ROOT_URLCONF = 'tests.urls'
 
 
 
-    preload_exts = [x.strip() for x in extensions.split(',')]
-
-    preload_exts = list(filter(lambda x: x != '', preload_exts))
-
-    pres = Presentation(
-
-        input_files[0],
-
-        theme,
-
-        code_style,
-
-        live_reload=live_reload,
-
-        single_slide=single_slide,
-
-        preload_extensions=preload_exts,
-
-    )
+EMAIL_BACKEND = 'django.core.mail.backends.dummy.EmailBackend'
 
 
 
-    if dump_styles:
+REST_FRAMEWORK = {
 
-        print(StyleSchema().dumps(pres.styles))
+    'DEFAULT_AUTHENTICATION_CLASSES': (
 
-        return 0
+        'rest_framework.authentication.SessionAuthentication',
 
+        'rest_framework.authentication.TokenAuthentication',
 
+    ),
 
-    try:
-
-        pres.run()
-
-    except Exception as e:
-
-        number = pres.tui.curr_slide.number + 1
-
-        click.echo(f"Error rendering slide {number}: {e}")
-
-        if not debug:
-
-            click.echo("Rerun with --debug to view the full traceback in logs")
-
-        else:
-
-            lookatme.config.LOG.exception(f"Error rendering slide {number}: {e}")
-
-            click.echo(f"See {log_path} for traceback")
-
-        raise click.Abort()
-
-
-
-
-
-if __name__ == "__main__":
-
-    main()
+}

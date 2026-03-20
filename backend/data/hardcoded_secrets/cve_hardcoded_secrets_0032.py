@@ -2,200 +2,404 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# -*- coding: utf-8 -*-
+# Copyright (c) 2015, Hubert Kario
 
+#
 
+# See the LICENSE file for legal information regarding use of this file.
 
-##############################################################################
+"""Various constant time functions for processing sensitive data"""
 
-#                        2011 E2OpenPlugins                                  #
 
-#                                                                            #
 
-#  This file is open source software; you can redistribute it and/or modify  #
+from __future__ import division
 
-#     it under the terms of the GNU General Public License version 2 as      #
 
-#               published by the Free Software Foundation.                   #
 
-#                                                                            #
+from .compat import compatHMAC
 
-##############################################################################
+import hmac
 
 
 
-import os
+def ct_lt_u32(val_a, val_b):
 
-import re
+    """
 
-import glob
+    Returns 1 if val_a < val_b, 0 otherwise. Constant time.
 
-from urllib import quote
 
-import json
 
+    :type val_a: int
 
+    :type val_b: int
 
-from twisted.web import static, resource, http
+    :param val_a: an unsigned integer representable as a 32 bit value
 
+    :param val_b: an unsigned integer representable as a 32 bit value
 
+    :rtype: int
 
-from Components.config import config
+    """
 
-from Tools.Directories import fileExists
+    val_a &= 0xffffffff
 
+    val_b &= 0xffffffff
 
 
-def new_getRequestHostname(self):
 
-	host = self.getHeader(b'host')
+    return (val_a^((val_a^val_b)|(((val_a-val_b)&0xffffffff)^val_b)))>>31
 
-	if host:
 
-		if host[0]=='[':
 
-			return host.split(']',1)[0] + "]"
+def ct_gt_u32(val_a, val_b):
 
-		return host.split(':', 1)[0].encode('ascii')
+    """
 
-	return self.getHost().host.encode('ascii')
+    Return 1 if val_a > val_b, 0 otherwise. Constant time.
 
 
 
-http.Request.getRequestHostname = new_getRequestHostname
+    :type val_a: int
 
+    :type val_b: int
 
+    :param val_a: an unsigned integer representable as a 32 bit value
 
+    :param val_b: an unsigned integer representable as a 32 bit value
 
+    :rtype: int
 
-class FileController(resource.Resource):
+    """
 
-	def render(self, request):
+    return ct_lt_u32(val_b, val_a)
 
-		action = "download"
 
-		if "action" in request.args:
 
-			action = request.args["action"][0]
+def ct_le_u32(val_a, val_b):
 
+    """
 
+    Return 1 if val_a <= val_b, 0 otherwise. Constant time.
 
-		if "file" in request.args:
 
-			filename = request.args["file"][0].decode('utf-8', 'ignore').encode('utf-8')
 
-			filename = re.sub("^/+", "/", os.path.realpath(filename))
+    :type val_a: int
 
+    :type val_b: int
 
+    :param val_a: an unsigned integer representable as a 32 bit value
 
-			if not os.path.exists(filename):
+    :param val_b: an unsigned integer representable as a 32 bit value
 
-				return "File '%s' not found" % (filename)
+    :rtype: int
 
+    """
 
+    return 1 ^ ct_gt_u32(val_a, val_b)
 
-			if action == "stream":
 
-				name = "stream"
 
-				if "name" in request.args:
+def ct_lsb_prop_u8(val):
 
-					name = request.args["name"][0]
+    """Propagate LSB to all 8 bits of the returned byte. Constant time."""
 
+    val &= 0x01
 
+    val |= val << 1
 
-				port = config.OpenWebif.port.value
+    val |= val << 2
 
-				proto = 'http'
+    val |= val << 4
 
-				if request.isSecure():
+    return val
 
-					port = config.OpenWebif.https_port.value
 
-					proto = 'https'
 
-				ourhost = request.getHeader('host')
+def ct_isnonzero_u32(val):
 
-				m = re.match('.+\:(\d+)$', ourhost)
+    """
 
-				if m is not None:
+    Returns 1 if val is != 0, 0 otherwise. Constant time.
 
-					port = m.group(1)
 
 
+    :type val: int
 
-				response = "#EXTM3U\n#EXTVLCOPT--http-reconnect=true\n#EXTINF:-1,%s\n%s://%s:%s/file?action=download&file=%s" % (name, proto, request.getRequestHostname(), port, quote(filename))
+    :param val: an unsigned integer representable as a 32 bit value
 
-				request.setHeader("Content-Disposition", 'attachment;filename="%s.m3u"' % name)
+    :rtype: int
 
-				request.setHeader("Content-Type", "application/x-mpegurl")
+    """
 
-				return response
+    val &= 0xffffffff
 
-			elif action == "delete":
+    return (val|(-val&0xffffffff)) >> 31
 
-				request.setResponseCode(http.OK)
 
-				return "TODO: DELETE FILE: %s" % (filename)
 
-			elif action == "download":
+def ct_neq_u32(val_a, val_b):
 
-				request.setHeader("Content-Disposition", "attachment;filename=\"%s\"" % (filename.split('/')[-1]))
+    """
 
-				rfile = static.File(filename, defaultType = "application/octet-stream")
+    Return 1 if val_a != val_b, 0 otherwise. Constant time.
 
-				return rfile.render(request)
 
-			else: 
 
-				return "wrong action parameter"
+    :type val_a: int
 
+    :type val_b: int
 
+    :param val_a: an unsigned integer representable as a 32 bit value
 
-		if "dir" in request.args:
+    :param val_b: an unsigned integer representable as a 32 bit value
 
-			path = request.args["dir"][0]
+    :rtype: int
 
-			pattern = '*'
+    """
 
-			data = []
+    val_a &= 0xffffffff
 
-			if "pattern" in request.args:
+    val_b &= 0xffffffff
 
-				pattern = request.args["pattern"][0]
 
-			directories = []
 
-			files = []
+    return (((val_a-val_b)&0xffffffff) | ((val_b-val_a)&0xffffffff)) >> 31
 
-			if fileExists(path):
 
-				try:
 
-					files = glob.glob(path+'/'+pattern)
+def ct_eq_u32(val_a, val_b):
 
-				except:
+    """
 
-					files = []
+    Return 1 if val_a == val_b, 0 otherwise. Constant time.
 
-				files.sort()
 
-				tmpfiles = files[:]
 
-				for x in tmpfiles:
+    :type val_a: int
 
-					if os.path.isdir(x):
+    :type val_b: int
 
-						directories.append(x + '/')
+    :param val_a: an unsigned integer representable as a 32 bit value
 
-						files.remove(x)
+    :param val_b: an unsigned integer representable as a 32 bit value
 
-				data.append({"result": True,"dirs": directories,"files": files})
+    :rtype: int
 
-			else:
+    """
 
-				data.append({"result": False,"message": "path %s not exits" % (path)})
+    return 1 ^ ct_neq_u32(val_a, val_b)
 
-			request.setHeader("content-type", "application/json; charset=utf-8")
 
-			return json.dumps(data, indent=2)
+
+def ct_check_cbc_mac_and_pad(data, mac, seqnumBytes, contentType, version):
+
+    """
+
+    Check CBC cipher HMAC and padding. Close to constant time.
+
+
+
+    :type data: bytearray
+
+    :param data: data with HMAC value to test and padding
+
+
+
+    :type mac: hashlib mac
+
+    :param mac: empty HMAC, initialised with a key
+
+
+
+    :type seqnumBytes: bytearray
+
+    :param seqnumBytes: TLS sequence number, used as input to HMAC
+
+
+
+    :type contentType: int
+
+    :param contentType: a single byte, used as input to HMAC
+
+
+
+    :type version: tuple of int
+
+    :param version: a tuple of two ints, used as input to HMAC and to guide
+
+        checking of padding
+
+
+
+    :rtype: boolean
+
+    :returns: True if MAC and pad is ok, False otherwise
+
+    """
+
+    assert version in ((3, 0), (3, 1), (3, 2), (3, 3))
+
+
+
+    data_len = len(data)
+
+    if mac.digest_size + 1 > data_len: # data_len is public
+
+        return False
+
+
+
+    # 0 - OK
+
+    result = 0x00
+
+
+
+    #
+
+    # check padding
+
+    #
+
+    pad_length = data[data_len-1]
+
+    pad_start = data_len - pad_length - 1
+
+    pad_start = max(0, pad_start)
+
+
+
+    if version == (3, 0): # version is public
+
+        # in SSLv3 we can only check if pad is not longer than overall length
+
+
+
+        # subtract 1 for the pad length byte
+
+        mask = ct_lsb_prop_u8(ct_lt_u32(data_len-1, pad_length))
+
+        result |= mask
+
+    else:
+
+        start_pos = max(0, data_len - 256)
+
+        for i in range(start_pos, data_len):
+
+            # if pad_start < i: mask = 0xff; else: mask = 0x00
+
+            mask = ct_lsb_prop_u8(ct_le_u32(pad_start, i))
+
+            # if data[i] != pad_length and "inside_pad": result = False
+
+            result |= (data[i] ^ pad_length) & mask
+
+
+
+    #
+
+    # check MAC
+
+    #
+
+
+
+    # real place where mac starts and data ends
+
+    mac_start = pad_start - mac.digest_size
+
+    mac_start = max(0, mac_start)
+
+
+
+    # place to start processing
+
+    start_pos = max(0, data_len - (256 + mac.digest_size)) // mac.block_size
+
+    start_pos *= mac.block_size
+
+
+
+    # add start data
+
+    data_mac = mac.copy()
+
+    data_mac.update(compatHMAC(seqnumBytes))
+
+    data_mac.update(compatHMAC(bytearray([contentType])))
+
+    if version != (3, 0): # version is public
+
+        data_mac.update(compatHMAC(bytearray([version[0]])))
+
+        data_mac.update(compatHMAC(bytearray([version[1]])))
+
+    data_mac.update(compatHMAC(bytearray([mac_start >> 8])))
+
+    data_mac.update(compatHMAC(bytearray([mac_start & 0xff])))
+
+    data_mac.update(compatHMAC(data[:start_pos]))
+
+
+
+    # don't check past the array end (already checked to be >= zero)
+
+    end_pos = data_len - mac.digest_size
+
+
+
+    # calculate all possible
+
+    for i in range(start_pos, end_pos): # constant for given overall length
+
+        cur_mac = data_mac.copy()
+
+        cur_mac.update(compatHMAC(data[start_pos:i]))
+
+        mac_compare = bytearray(cur_mac.digest())
+
+        # compare the hash for real only if it's the place where mac is
+
+        # supposed to be
+
+        mask = ct_lsb_prop_u8(ct_eq_u32(i, mac_start))
+
+        for j in range(0, mac.digest_size): # digest_size is public
+
+            result |= (data[i+j] ^ mac_compare[j]) & mask
+
+
+
+    # return python boolean
+
+    return result == 0
+
+
+
+if hasattr(hmac, 'compare_digest'):
+
+    ct_compare_digest = hmac.compare_digest
+
+else:
+
+    def ct_compare_digest(val_a, val_b):
+
+        """Compares if string like objects are equal. Constant time."""
+
+        if len(val_a) != len(val_b):
+
+            return False
+
+
+
+        result = 0
+
+        for x, y in zip(val_a, val_b):
+
+            result |= x ^ y
+
+
+
+        return result == 0

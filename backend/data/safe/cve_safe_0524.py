@@ -2,3862 +2,896 @@
 # Safety: safe
 # Category: safe
 
-import hashlib
+# (c) 2012-2014, Michael DeHaan <michael.dehaan@gmail.com>
 
-import logging
+#
+
+# This file is part of Ansible
+
+#
+
+# Ansible is free software: you can redistribute it and/or modify
+
+# it under the terms of the GNU General Public License as published by
+
+# the Free Software Foundation, either version 3 of the License, or
+
+# (at your option) any later version.
+
+#
+
+# Ansible is distributed in the hope that it will be useful,
+
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+
+# GNU General Public License for more details.
+
+#
+
+# You should have received a copy of the GNU General Public License
+
+# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
+
+
+
+# Make coding more python3-ish
+
+from __future__ import (absolute_import, division, print_function)
+
+__metaclass__ = type
+
+
 
 import os
 
-import warnings
+import tempfile
 
-from base64 import b64encode
+from string import ascii_letters, digits
 
-from json import JSONDecodeError
 
-from typing import Any
 
-from typing import Dict
+from ansible.errors import AnsibleOptionsError
 
-from typing import List
+from ansible.module_utils.six import string_types
 
-from typing import Optional
+from ansible.module_utils.six.moves import configparser
 
-from typing import Tuple
+from ansible.module_utils._text import to_text
 
-from typing import Type
+from ansible.parsing.quoting import unquote
 
-from typing import Union
+from ansible.utils.path import makedirs_safe
 
-from typing import cast
 
-from urllib.parse import parse_qs
 
-from urllib.parse import urlparse
+BOOL_TRUE = frozenset([ "true", "t", "y", "1", "yes", "on" ])
 
 
 
-from jwkest import BadSyntax
+def mk_boolean(value):
 
-from jwkest import as_bytes
+    ret = value
 
-from jwkest import jwe
+    if not isinstance(value, bool):
 
-from jwkest import jws
+        if value is None:
 
-from jwkest import jwt
+            ret = False
 
-from jwkest.jwe import JWE
+        ret = (str(value).lower() in BOOL_TRUE)
 
-from requests import ConnectionError
+    return ret
 
 
 
-from oic import oauth2
+def shell_expand(path, expand_relative_paths=False):
 
-from oic import rndstr
+    '''
 
-from oic.exception import AccessDenied
+    shell_expand is needed as os.path.expanduser does not work
 
-from oic.exception import AuthnToOld
+    when path is None, which is the default for ANSIBLE_PRIVATE_KEY_FILE
 
-from oic.exception import AuthzError
+    '''
 
-from oic.exception import CommunicationError
+    if path:
 
-from oic.exception import MissingParameter
+        path = os.path.expanduser(os.path.expandvars(path))
 
-from oic.exception import ParameterError
+        if expand_relative_paths and not path.startswith('/'):
 
-from oic.exception import PyoidcError
+            # paths are always 'relative' to the config?
 
-from oic.exception import RegistrationError
+            if 'CONFIG_FILE' in globals():
 
-from oic.exception import RequestError
+                CFGDIR = os.path.dirname(CONFIG_FILE)
 
-from oic.exception import SubMismatch
+                path = os.path.join(CFGDIR, path)
 
-from oic.oauth2 import HTTP_ARGS
+            path = os.path.abspath(path)
 
-from oic.oauth2 import authz_error
+    return path
 
-from oic.oauth2.consumer import ConfigurationError
 
-from oic.oauth2.exception import MissingRequiredAttribute
 
-from oic.oauth2.exception import OtherError
+def get_config(p, section, key, env_var, default, value_type=None, expand_relative_paths=False):
 
-from oic.oauth2.exception import ParseError
+    ''' return a configuration variable with casting
 
-from oic.oauth2.message import ErrorResponse
 
-from oic.oauth2.message import Message
 
-from oic.oauth2.message import MessageFactory
+    :arg p: A ConfigParser object to look for the configuration in
 
-from oic.oauth2.message import WrongSigningAlgorithm
+    :arg section: A section of the ini config that should be examined for this section.
 
-from oic.oauth2.util import get_or_post
+    :arg key: The config key to get this config from
 
-from oic.oic.message import SCOPE2CLAIMS
+    :arg env_var: An Environment variable to check for the config var.  If
 
-from oic.oic.message import AccessTokenResponse
+        this is set to None then no environment variable will be used.
 
-from oic.oic.message import AuthorizationErrorResponse
+    :arg default: A default value to assign to the config var if nothing else sets it.
 
-from oic.oic.message import AuthorizationRequest
+    :kwarg value_type: The type of the value.  This can be any of the following strings:
 
-from oic.oic.message import AuthorizationResponse
+        :boolean: sets the value to a True or False value
 
-from oic.oic.message import Claims
+        :integer: Sets the value to an integer or raises a ValueType error
 
-from oic.oic.message import ClaimsRequest
+        :float: Sets the value to a float or raises a ValueType error
 
-from oic.oic.message import ClientRegistrationErrorResponse
+        :list: Treats the value as a comma separated list.  Split the value
 
-from oic.oic.message import EndSessionRequest
+            and return it as a python list.
 
-from oic.oic.message import IdToken
+        :none: Sets the value to None
 
-from oic.oic.message import JasonWebToken
+        :path: Expands any environment variables and tilde's in the value.
 
-from oic.oic.message import OIDCMessageFactory
+        :tmp_path: Create a unique temporary directory inside of the directory
 
-from oic.oic.message import OpenIDRequest
+            specified by value and return its path.
 
-from oic.oic.message import OpenIDSchema
+        :pathlist: Treat the value as a typical PATH string.  (On POSIX, this
 
-from oic.oic.message import RefreshSessionRequest
+            means colon separated strings.)  Split the value and then expand
 
-from oic.oic.message import RegistrationRequest
+            each part for environment variables and tildes.
 
-from oic.oic.message import RegistrationResponse
+    :kwarg expand_relative_paths: for pathlist and path types, if this is set
 
-from oic.oic.message import TokenErrorResponse
+        to True then also change any relative paths into absolute paths.  The
 
-from oic.oic.message import UserInfoErrorResponse
+        default is False.
 
-from oic.oic.message import UserInfoRequest
+    '''
 
-from oic.utils import time_util
+    value = _get_config(p, section, key, env_var, default)
 
-from oic.utils.http_util import Response
+    if value_type == 'boolean':
 
-from oic.utils.keyio import KeyJar
+        value = mk_boolean(value)
 
-from oic.utils.sanitize import sanitize
 
-from oic.utils.settings import OicClientSettings
 
-from oic.utils.settings import OicServerSettings
+    elif value:
 
-from oic.utils.settings import PyoidcSettings
+        if value_type == 'integer':
 
-from oic.utils.webfinger import OIC_ISSUER
+            value = int(value)
 
-from oic.utils.webfinger import WebFinger
 
 
+        elif value_type == 'float':
 
-__author__ = "rohe0002"
+            value = float(value)
 
 
 
-logger = logging.getLogger(__name__)
+        elif value_type == 'list':
 
+            if isinstance(value, string_types):
 
+                value = [x.strip() for x in value.split(',')]
 
-ENDPOINTS = [
 
-    "authorization_endpoint",
 
-    "token_endpoint",
+        elif value_type == 'none':
 
-    "userinfo_endpoint",
+            if value == "None":
 
-    "refresh_session_endpoint",
+                value = None
 
-    "end_session_endpoint",
 
-    "registration_endpoint",
 
-    "check_id_endpoint",
+        elif value_type == 'path':
 
-]
+            value = shell_expand(value, expand_relative_paths=expand_relative_paths)
 
 
 
-RESPONSE2ERROR: Dict[str, List] = {
+        elif value_type == 'tmppath':
 
-    "AuthorizationResponse": [AuthorizationErrorResponse, TokenErrorResponse],
+            value = shell_expand(value)
 
-    "AccessTokenResponse": [TokenErrorResponse],
+            if not os.path.exists(value):
 
-    "IdToken": [ErrorResponse],
+                makedirs_safe(value, 0o700)
 
-    "RegistrationResponse": [ClientRegistrationErrorResponse],
+            prefix = 'ansible-local-%s' % os.getpid()
 
-    "OpenIDSchema": [UserInfoErrorResponse],
+            value = tempfile.mkdtemp(prefix=prefix, dir=value)
 
-}
 
 
+        elif value_type == 'pathlist':
 
-REQUEST2ENDPOINT = {
+            if isinstance(value, string_types):
 
-    "AuthorizationRequest": "authorization_endpoint",
+                value = [shell_expand(x, expand_relative_paths=expand_relative_paths) \
 
-    "OpenIDRequest": "authorization_endpoint",
+                         for x in value.split(os.pathsep)]
 
-    "AccessTokenRequest": "token_endpoint",
 
-    "RefreshAccessTokenRequest": "token_endpoint",
 
-    "UserInfoRequest": "userinfo_endpoint",
+        elif isinstance(value, string_types):
 
-    "CheckSessionRequest": "check_session_endpoint",
+            value = unquote(value)
 
-    "CheckIDRequest": "check_id_endpoint",
 
-    "EndSessionRequest": "end_session_endpoint",
 
-    "RefreshSessionRequest": "refresh_session_endpoint",
+    return to_text(value, errors='surrogate_or_strict', nonstring='passthru')
 
-    "RegistrationRequest": "registration_endpoint",
 
-    "RotateSecret": "registration_endpoint",
 
-    # ---
 
-    "ResourceRequest": "resource_endpoint",
 
-    "TokenIntrospectionRequest": "introspection_endpoint",
+def _get_config(p, section, key, env_var, default):
 
-    "TokenRevocationRequest": "revocation_endpoint",
+    ''' helper function for get_config '''
 
-    "ROPCAccessTokenRequest": "token_endpoint",
+    value = default
 
-}
 
 
-
-# -----------------------------------------------------------------------------
-
-
-
-JWT_BEARER = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
-
-SAML2_BEARER_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:saml2-bearer"
-
-
-
-# This should probably be part of the configuration
-
-MAX_AUTHENTICATION_AGE = 86400
-
-DEF_SIGN_ALG = {
-
-    "id_token": "RS256",
-
-    "openid_request_object": "RS256",
-
-    "client_secret_jwt": "HS256",
-
-    "private_key_jwt": "RS256",
-
-}
-
-
-
-# -----------------------------------------------------------------------------
-
-ACR_LISTS = [["0", "1", "2", "3", "4"]]
-
-
-
-
-
-def verify_acr_level(req, level):
-
-    if req is None:
-
-        return level
-
-    elif "values" in req:
-
-        for _r in req["values"]:
-
-            for alist in ACR_LISTS:
-
-                try:
-
-                    if alist.index(_r) <= alist.index(level):
-
-                        return level
-
-                except ValueError:
-
-                    pass
-
-    else:  # Required or Optional
-
-        return level
-
-
-
-    raise AccessDenied("", req)
-
-
-
-
-
-def deser_id_token(inst, txt=""):
-
-    if not txt:
-
-        return None
-
-    else:
-
-        return IdToken().from_jwt(txt, keyjar=inst.keyjar)
-
-
-
-
-
-# -----------------------------------------------------------------------------
-
-def make_openid_request(
-
-    arq,
-
-    keys=None,
-
-    userinfo_claims=None,
-
-    idtoken_claims=None,
-
-    request_object_signing_alg=None,
-
-    **kwargs,
-
-):
-
-    """
-
-    Construct the specification of what I want returned.
-
-
-
-    The request will be signed.
-
-
-
-    :param arq: The Authorization request
-
-    :param keys: Keys to use for signing/encrypting
-
-    :param userinfo_claims: UserInfo claims
-
-    :param idtoken_claims: IdToken claims
-
-    :param request_object_signing_alg: Which signing algorithm to use
-
-    :return: JWT encoded OpenID request
-
-    """
-
-    oir_args = {}
-
-    for prop in OpenIDRequest.c_param.keys():
+    if p is not None:
 
         try:
 
-            oir_args[prop] = arq[prop]
+            value = p.get(section, key, raw=True)
 
-        except KeyError:
+        except:
 
             pass
 
 
 
-    for attr in ["scope", "response_type"]:
+    if env_var is not None:
 
-        if attr in oir_args:
+        env_value = os.environ.get(env_var, None)
 
-            oir_args[attr] = " ".join(oir_args[attr])
+        if env_value is not None:
 
+            value = env_value
 
 
-    c_args = {}
 
-    if userinfo_claims is not None:
+    return to_text(value, errors='surrogate_or_strict', nonstring='passthru')
 
-        # UserInfoClaims
 
-        c_args["userinfo"] = Claims(**userinfo_claims)
 
 
 
-    if idtoken_claims is not None:
+def load_config_file():
 
-        # IdTokenClaims
+    ''' Load Config File order(first found is used): ENV, CWD, HOME, /etc/ansible '''
 
-        c_args["id_token"] = Claims(**idtoken_claims)
 
 
+    p = configparser.ConfigParser()
 
-    if c_args:
 
-        oir_args["claims"] = ClaimsRequest(**c_args)
 
+    path0 = os.getenv("ANSIBLE_CONFIG", None)
 
+    if path0 is not None:
 
-    oir = OpenIDRequest(**oir_args)
+        path0 = os.path.expanduser(path0)
 
+        if os.path.isdir(path0):
 
+            path0 += "/ansible.cfg"
 
-    return oir.to_jwt(key=keys, algorithm=request_object_signing_alg)
+    try:
 
+        path1 = os.getcwd() + "/ansible.cfg"
 
+    except OSError:
 
+        path1 = None
 
+    path2 = os.path.expanduser("~/.ansible.cfg")
 
-class Token(oauth2.Token):
+    path3 = "/etc/ansible/ansible.cfg"
 
-    pass
 
 
+    for path in [path0, path1, path2, path3]:
 
-
-
-class Grant(oauth2.Grant):
-
-    _authz_resp = AuthorizationResponse
-
-    _acc_resp = AccessTokenResponse
-
-    _token_class = Token
-
-
-
-    def add_token(self, resp):
-
-        tok = self._token_class(resp)
-
-        if tok.access_token:
-
-            self.tokens.append(tok)
-
-        else:
-
-            _tmp = getattr(tok, "id_token", None)
-
-            if _tmp:
-
-                self.tokens.append(tok)
-
-
-
-
-
-PREFERENCE2PROVIDER = {
-
-    "request_object_signing_alg": "request_object_signing_alg_values_supported",
-
-    "request_object_encryption_alg": "request_object_encryption_alg_values_supported",
-
-    "request_object_encryption_enc": "request_object_encryption_enc_values_supported",
-
-    "userinfo_signed_response_alg": "userinfo_signing_alg_values_supported",
-
-    "userinfo_encrypted_response_alg": "userinfo_encryption_alg_values_supported",
-
-    "userinfo_encrypted_response_enc": "userinfo_encryption_enc_values_supported",
-
-    "id_token_signed_response_alg": "id_token_signing_alg_values_supported",
-
-    "id_token_encrypted_response_alg": "id_token_encryption_alg_values_supported",
-
-    "id_token_encrypted_response_enc": "id_token_encryption_enc_values_supported",
-
-    "default_acr_values": "acr_values_supported",
-
-    "subject_type": "subject_types_supported",
-
-    "token_endpoint_auth_method": "token_endpoint_auth_methods_supported",
-
-    "token_endpoint_auth_signing_alg": "token_endpoint_auth_signing_alg_values_supported",
-
-    "response_types": "response_types_supported",
-
-    "grant_types": "grant_types_supported",
-
-}
-
-
-
-PROVIDER2PREFERENCE = dict([(v, k) for k, v in PREFERENCE2PROVIDER.items()])
-
-
-
-PROVIDER_DEFAULT = {
-
-    "token_endpoint_auth_method": "client_secret_basic",
-
-    "id_token_signed_response_alg": "RS256",
-
-}
-
-
-
-PARAMMAP = {
-
-    "sign": "%s_signed_response_alg",
-
-    "alg": "%s_encrypted_response_alg",
-
-    "enc": "%s_encrypted_response_enc",
-
-}
-
-
-
-rt2gt = {
-
-    "code": ["authorization_code"],
-
-    "id_token": ["implicit"],
-
-    "id_token token": ["implicit"],
-
-    "code id_token": ["authorization_code", "implicit"],
-
-    "code token": ["authorization_code", "implicit"],
-
-    "code id_token token": ["authorization_code", "implicit"],
-
-}
-
-
-
-
-
-def response_types_to_grant_types(resp_types, **kwargs):
-
-    _res = set()
-
-
-
-    if "grant_types" in kwargs:
-
-        _res.update(set(kwargs["grant_types"]))
-
-
-
-    for response_type in resp_types:
-
-        _rt = response_type.split(" ")
-
-        _rt.sort()
-
-        try:
-
-            _gt = rt2gt[" ".join(_rt)]
-
-        except KeyError:
-
-            raise ValueError("No such response type combination: {}".format(resp_types))
-
-        else:
-
-            _res.update(set(_gt))
-
-
-
-    return list(_res)
-
-
-
-
-
-def claims_match(value, claimspec):
-
-    """
-
-    Implement matching according to section 5.5.1 of http://openid.net/specs/openid-connect-core-1_0.html.
-
-
-
-    The lack of value is not checked here.
-
-    Also the text doesn't prohibit having both 'value' and 'values'.
-
-
-
-    :param value: single value or list of values
-
-    :param claimspec: None or dictionary with 'essential', 'value' or 'values'
-
-    as key
-
-    :return: Boolean
-
-    """
-
-    if claimspec is None:  # match anything
-
-        return True
-
-
-
-    matched = False
-
-    for key, val in claimspec.items():
-
-        if key == "value":
-
-            if value == val:
-
-                matched = True
-
-        elif key == "values":
-
-            if value in val:
-
-                matched = True
-
-        elif key == "essential":
-
-            # Whether it's essential or not doesn't change anything here
-
-            continue
-
-
-
-        if matched:
-
-            break
-
-
-
-    if matched is False:
-
-        if list(claimspec.keys()) == ["essential"]:
-
-            return True
-
-
-
-    return matched
-
-
-
-
-
-class Client(oauth2.Client):
-
-    _endpoints = ENDPOINTS
-
-
-
-    def __init__(
-
-        self,
-
-        client_id=None,
-
-        client_prefs=None,
-
-        client_authn_method=None,
-
-        keyjar=None,
-
-        verify_ssl=None,
-
-        config=None,
-
-        client_cert=None,
-
-        requests_dir="requests",
-
-        message_factory: Type[MessageFactory] = OIDCMessageFactory,
-
-        settings: PyoidcSettings = None,
-
-    ):
-
-        """
-
-        Initialize the instance.
-
-
-
-        Keyword Args:
-
-            settings
-
-                Instance of :class:`OauthClientSettings` with configuration options.
-
-                Currently used settings are:
-
-                 - verify_ssl
-
-                 - client_cert
-
-                 - timeout
-
-        """
-
-        self.settings = settings or OicClientSettings()
-
-        if verify_ssl is not None:
-
-            warnings.warn(
-
-                "`verify_ssl` is deprecated, please use `settings` instead if you need to set a non-default value.",
-
-                DeprecationWarning,
-
-                stacklevel=2,
-
-            )
-
-            self.settings.verify_ssl = verify_ssl
-
-        if client_cert is not None:
-
-            warnings.warn(
-
-                "`client_cert` is deprecated, please use `settings` instead if you need to set a non-default value.",
-
-                DeprecationWarning,
-
-                stacklevel=2,
-
-            )
-
-            self.settings.client_cert = client_cert
-
-        oauth2.Client.__init__(
-
-            self,
-
-            client_id,
-
-            client_authn_method=client_authn_method,
-
-            keyjar=keyjar,
-
-            config=config,
-
-            message_factory=message_factory,
-
-            settings=self.settings,
-
-        )
-
-
-
-        self.file_store = "./file/"
-
-        self.file_uri = "http://localhost/"
-
-        self.base_url = ""
-
-
-
-        # OpenID connect specific endpoints
-
-        for endpoint in ENDPOINTS:
-
-            setattr(self, endpoint, "")
-
-
-
-        self.id_token: Dict[str, Token] = {}
-
-        self.log = None
-
-
-
-        self.request2endpoint = REQUEST2ENDPOINT
-
-        self.response2error = RESPONSE2ERROR
-
-
-
-        self.grant_class = Grant
-
-        self.token_class = Token
-
-        self.provider_info = Message()
-
-        self.registration_response: RegistrationResponse = RegistrationResponse()
-
-        self.client_prefs = client_prefs or {}
-
-
-
-        self.behaviour: Dict[str, Any] = {}
-
-        self.scope = ["openid"]
-
-
-
-        self.wf = WebFinger(OIC_ISSUER)
-
-        self.wf.httpd = self
-
-        self.allow = {}
-
-        self.post_logout_redirect_uris: List[str] = []
-
-        self.registration_expires = 0
-
-        self.registration_access_token = None
-
-        self.id_token_max_age = 0
-
-
-
-        # Default key by kid for different key types
-
-        # For instance {'sig': {"RSA":"abc"}}
-
-        self.kid = {"sig": {}, "enc": {}}
-
-        self.requests_dir = requests_dir
-
-
-
-    def _get_id_token(self, **kwargs):
-
-        try:
-
-            return kwargs["id_token"]
-
-        except KeyError:
-
-            grant = self.get_grant(**kwargs)
-
-
-
-        if grant:
+        if path is not None and os.path.exists(path):
 
             try:
 
-                _scope = kwargs["scope"]
+                p.read(path)
 
-            except KeyError:
+            except configparser.Error as e:
 
-                _scope = None
+                raise AnsibleOptionsError("Error reading config file: \n{0}".format(e))
 
+            return p, path
 
+    return None, ''
 
-            for token in grant.tokens:
 
-                if token.scope and _scope:
 
-                    flag = True
 
-                    for item in _scope:
 
-                        if item not in token.scope:
+p, CONFIG_FILE = load_config_file()
 
-                            flag = False
 
-                            break
 
-                    if not flag:
+# check all of these extensions when looking for yaml files for things like
 
-                        break
+# group variables -- really anything we can load
 
-                if token.id_token:
+YAML_FILENAME_EXTENSIONS = [ "", ".yml", ".yaml", ".json" ]
 
-                    return token.id_token.jwt
 
 
+# the default whitelist for cow stencils
 
-        return None
+DEFAULT_COW_WHITELIST = ['bud-frogs', 'bunny', 'cheese', 'daemon', 'default', 'dragon', 'elephant-in-snake', 'elephant',
 
+                         'eyes', 'hellokitty', 'kitty', 'luke-koala', 'meow', 'milk', 'moofasa', 'moose', 'ren', 'sheep',
 
+                         'small', 'stegosaurus', 'stimpy', 'supermilker', 'three-eyes', 'turkey', 'turtle', 'tux', 'udder',
 
-    def request_object_encryption(self, msg, **kwargs):
+                         'vader-koala', 'vader', 'www',]
 
-        try:
 
-            encalg = kwargs["request_object_encryption_alg"]
 
-        except KeyError:
+# sections in config file
 
-            try:
+DEFAULTS='defaults'
 
-                encalg = self.behaviour["request_object_encryption_alg"]
 
-            except KeyError:
 
-                return msg
 
 
+# FIXME: add deprecation warning when these get set
 
-        try:
+#### DEPRECATED VARS ####
 
-            encenc = kwargs["request_object_encryption_enc"]
+#
 
-        except KeyError:
 
-            try:
 
-                encenc = self.behaviour["request_object_encryption_enc"]
+#### If --tags or --skip-tags is given multiple times on the CLI and this is
 
-            except KeyError:
+# True, merge the lists of tags together.  If False, let the last argument
 
-                raise MissingRequiredAttribute(
+# overwrite any previous ones.  Behaviour is overwrite through 2.2.  2.3
 
-                    "No request_object_encryption_enc specified"
+# overwrites but prints deprecation.  2.4 the default is to merge.
 
-                )
+MERGE_MULTIPLE_CLI_TAGS = get_config(p, DEFAULTS, 'merge_multiple_cli_tags', 'ANSIBLE_MERGE_MULTIPLE_CLI_TAGS', True, value_type='boolean')
 
 
 
-        _jwe = JWE(msg, alg=encalg, enc=encenc)
+#### GENERALLY CONFIGURABLE THINGS ####
 
-        _kty = jwe.alg2keytype(encalg)
+DEFAULT_DEBUG             = get_config(p, DEFAULTS, 'debug',            'ANSIBLE_DEBUG',            False, value_type='boolean')
 
+DEFAULT_VERBOSITY         = get_config(p, DEFAULTS, 'verbosity',        'ANSIBLE_VERBOSITY',        0, value_type='integer')
 
+DEFAULT_HOST_LIST         = get_config(p, DEFAULTS,'inventory', 'ANSIBLE_INVENTORY', '/etc/ansible/hosts', value_type='path')
 
-        try:
+DEFAULT_ROLES_PATH        = get_config(p, DEFAULTS, 'roles_path',       'ANSIBLE_ROLES_PATH',
 
-            _kid = kwargs["enc_kid"]
+                                       '~/.ansible/roles:/usr/share/ansible/roles:/etc/ansible/roles',
 
-        except KeyError:
+                                       value_type='pathlist', expand_relative_paths=True)
 
-            _kid = ""
+DEFAULT_REMOTE_TMP        = get_config(p, DEFAULTS, 'remote_tmp',       'ANSIBLE_REMOTE_TEMP',      '~/.ansible/tmp')
 
+DEFAULT_LOCAL_TMP         = get_config(p, DEFAULTS, 'local_tmp',        'ANSIBLE_LOCAL_TEMP',      '~/.ansible/tmp', value_type='tmppath')
 
+DEFAULT_MODULE_NAME       = get_config(p, DEFAULTS, 'module_name',      None,                       'command')
 
-        if "target" not in kwargs:
+DEFAULT_FACT_PATH         = get_config(p, DEFAULTS, 'fact_path',        'ANSIBLE_FACT_PATH', None, value_type='path')
 
-            raise MissingRequiredAttribute("No target specified")
+DEFAULT_FORKS             = get_config(p, DEFAULTS, 'forks',            'ANSIBLE_FORKS',            5, value_type='integer')
 
+DEFAULT_MODULE_ARGS       = get_config(p, DEFAULTS, 'module_args',      'ANSIBLE_MODULE_ARGS',      '')
 
+DEFAULT_MODULE_LANG       = get_config(p, DEFAULTS, 'module_lang',      'ANSIBLE_MODULE_LANG',      os.getenv('LANG', 'en_US.UTF-8'))
 
-        if _kid:
+DEFAULT_MODULE_SET_LOCALE = get_config(p, DEFAULTS, 'module_set_locale','ANSIBLE_MODULE_SET_LOCALE',False, value_type='boolean')
 
-            _keys = self.keyjar.get_encrypt_key(_kty, owner=kwargs["target"], kid=_kid)
+DEFAULT_MODULE_COMPRESSION= get_config(p, DEFAULTS, 'module_compression', None, 'ZIP_DEFLATED')
 
-            _jwe["kid"] = _kid
+DEFAULT_TIMEOUT           = get_config(p, DEFAULTS, 'timeout',          'ANSIBLE_TIMEOUT',          10, value_type='integer')
 
-        else:
+DEFAULT_POLL_INTERVAL     = get_config(p, DEFAULTS, 'poll_interval',    'ANSIBLE_POLL_INTERVAL',    15, value_type='integer')
 
-            _keys = self.keyjar.get_encrypt_key(_kty, owner=kwargs["target"])
+DEFAULT_REMOTE_USER       = get_config(p, DEFAULTS, 'remote_user',      'ANSIBLE_REMOTE_USER',      None)
 
+DEFAULT_ASK_PASS          = get_config(p, DEFAULTS, 'ask_pass',  'ANSIBLE_ASK_PASS',    False, value_type='boolean')
 
+DEFAULT_PRIVATE_KEY_FILE  = get_config(p, DEFAULTS, 'private_key_file', 'ANSIBLE_PRIVATE_KEY_FILE', None, value_type='path')
 
-        return _jwe.encrypt(_keys)
+DEFAULT_REMOTE_PORT       = get_config(p, DEFAULTS, 'remote_port',      'ANSIBLE_REMOTE_PORT',      None, value_type='integer')
 
+DEFAULT_ASK_VAULT_PASS    = get_config(p, DEFAULTS, 'ask_vault_pass',    'ANSIBLE_ASK_VAULT_PASS',    False, value_type='boolean')
 
+DEFAULT_VAULT_PASSWORD_FILE = get_config(p, DEFAULTS, 'vault_password_file', 'ANSIBLE_VAULT_PASSWORD_FILE', None, value_type='path')
 
-    @staticmethod
+DEFAULT_TRANSPORT         = get_config(p, DEFAULTS, 'transport',        'ANSIBLE_TRANSPORT',        'smart')
 
-    def construct_redirect_uri(**kwargs):
+DEFAULT_SCP_IF_SSH        = get_config(p, 'ssh_connection', 'scp_if_ssh',       'ANSIBLE_SCP_IF_SSH',       'smart')
 
-        _filedir = kwargs["local_dir"]
+DEFAULT_SFTP_BATCH_MODE   = get_config(p, 'ssh_connection', 'sftp_batch_mode', 'ANSIBLE_SFTP_BATCH_MODE', True, value_type='boolean')
 
-        if not os.path.isdir(_filedir):
+DEFAULT_SSH_TRANSFER_METHOD = get_config(p, 'ssh_connection', 'transfer_method', 'ANSIBLE_SSH_TRANSFER_METHOD', None)
 
-            os.makedirs(_filedir)
+DEFAULT_MANAGED_STR       = get_config(p, DEFAULTS, 'ansible_managed',  None,           'Ansible managed')
 
-        _webpath = kwargs["base_path"]
+DEFAULT_SYSLOG_FACILITY   = get_config(p, DEFAULTS, 'syslog_facility',  'ANSIBLE_SYSLOG_FACILITY', 'LOG_USER')
 
-        _name = rndstr(10) + ".jwt"
+DEFAULT_KEEP_REMOTE_FILES = get_config(p, DEFAULTS, 'keep_remote_files', 'ANSIBLE_KEEP_REMOTE_FILES', False, value_type='boolean')
 
-        filename = os.path.join(_filedir, _name)
+DEFAULT_HASH_BEHAVIOUR    = get_config(p, DEFAULTS, 'hash_behaviour', 'ANSIBLE_HASH_BEHAVIOUR', 'replace')
 
-        while os.path.exists(filename):
+DEFAULT_PRIVATE_ROLE_VARS = get_config(p, DEFAULTS, 'private_role_vars', 'ANSIBLE_PRIVATE_ROLE_VARS', False, value_type='boolean')
 
-            _name = rndstr(10)
+DEFAULT_JINJA2_EXTENSIONS = get_config(p, DEFAULTS, 'jinja2_extensions', 'ANSIBLE_JINJA2_EXTENSIONS', None)
 
-            filename = os.path.join(_filedir, _name)
+DEFAULT_EXECUTABLE        = get_config(p, DEFAULTS, 'executable', 'ANSIBLE_EXECUTABLE', '/bin/sh')
 
-        _webname = "%s%s" % (_webpath, _name)
+DEFAULT_GATHERING         = get_config(p, DEFAULTS, 'gathering', 'ANSIBLE_GATHERING', 'implicit').lower()
 
-        return filename, _webname
+DEFAULT_GATHER_SUBSET     = get_config(p, DEFAULTS, 'gather_subset', 'ANSIBLE_GATHER_SUBSET', 'all').lower()
 
+DEFAULT_GATHER_TIMEOUT    = get_config(p, DEFAULTS, 'gather_timeout', 'ANSIBLE_GATHER_TIMEOUT', 10, value_type='integer')
 
+DEFAULT_LOG_PATH          = get_config(p, DEFAULTS, 'log_path',           'ANSIBLE_LOG_PATH', '', value_type='path')
 
-    def filename_from_webname(self, webname):
+DEFAULT_FORCE_HANDLERS    = get_config(p, DEFAULTS, 'force_handlers', 'ANSIBLE_FORCE_HANDLERS', False, value_type='boolean')
 
-        _filedir = self.requests_dir
+DEFAULT_INVENTORY_IGNORE  = get_config(p, DEFAULTS, 'inventory_ignore_extensions', 'ANSIBLE_INVENTORY_IGNORE',
 
-        if not os.path.isdir(_filedir):
+                                       ["~", ".orig", ".bak", ".ini", ".cfg", ".retry", ".pyc", ".pyo"], value_type='list')
 
-            os.makedirs(_filedir)
+DEFAULT_VAR_COMPRESSION_LEVEL = get_config(p, DEFAULTS, 'var_compression_level', 'ANSIBLE_VAR_COMPRESSION_LEVEL', 0, value_type='integer')
 
+DEFAULT_INTERNAL_POLL_INTERVAL = get_config(p, DEFAULTS, 'internal_poll_interval', None, 0.001, value_type='float')
 
+DEFAULT_ALLOW_UNSAFE_LOOKUPS = get_config(p, DEFAULTS, 'allow_unsafe_lookups', None, False, value_type='boolean')
 
-        if webname.startswith(self.base_url):
+ERROR_ON_MISSING_HANDLER  = get_config(p, DEFAULTS, 'error_on_missing_handler', 'ANSIBLE_ERROR_ON_MISSING_HANDLER', True, value_type='boolean')
 
-            return webname[len(self.base_url) :]
+SHOW_CUSTOM_STATS = get_config(p, DEFAULTS, 'show_custom_stats', 'ANSIBLE_SHOW_CUSTOM_STATS', False, value_type='boolean')
 
-        else:
+NAMESPACE_FACTS = get_config(p, DEFAULTS, 'restrict_facts_namespace', 'ANSIBLE_RESTRICT_FACTS', False, value_type='boolean')
 
-            raise ValueError("Invalid webname, must start with base_url")
 
 
+# static includes
 
-    def construct_AuthorizationRequest(
+DEFAULT_TASK_INCLUDES_STATIC    = get_config(p, DEFAULTS, 'task_includes_static', 'ANSIBLE_TASK_INCLUDES_STATIC', False, value_type='boolean')
 
-        self, request=None, request_args=None, extra_args=None, **kwargs
+DEFAULT_HANDLER_INCLUDES_STATIC = get_config(p, DEFAULTS, 'handler_includes_static', 'ANSIBLE_HANDLER_INCLUDES_STATIC', False, value_type='boolean')
 
-    ):
 
 
+# disclosure
 
-        if request_args is not None:
+DEFAULT_NO_LOG           = get_config(p, DEFAULTS, 'no_log', 'ANSIBLE_NO_LOG', False, value_type='boolean')
 
-            if "nonce" not in request_args:
+DEFAULT_NO_TARGET_SYSLOG   = get_config(p, DEFAULTS, 'no_target_syslog', 'ANSIBLE_NO_TARGET_SYSLOG', False, value_type='boolean')
 
-                _rt = request_args["response_type"]
+ALLOW_WORLD_READABLE_TMPFILES = get_config(p, DEFAULTS, 'allow_world_readable_tmpfiles', None, False, value_type='boolean')
 
-                if "token" in _rt or "id_token" in _rt:
 
-                    request_args["nonce"] = rndstr(32)
 
-        elif "response_type" in kwargs:
+# selinux
 
-            if "token" in kwargs["response_type"]:
+DEFAULT_SELINUX_SPECIAL_FS = get_config(p, 'selinux', 'special_context_filesystems', None, 'fuse, nfs, vboxsf, ramfs, 9p', value_type='list')
 
-                request_args = {"nonce": rndstr(32)}
+DEFAULT_LIBVIRT_LXC_NOSECLABEL = get_config(p, 'selinux', 'libvirt_lxc_noseclabel', 'LIBVIRT_LXC_NOSECLABEL', False, value_type='boolean')
 
-        else:  # Never wrong to specify a nonce
 
-            request_args = {"nonce": rndstr(32)}
 
+### PRIVILEGE ESCALATION ###
 
+# Backwards Compat
 
-        request_param = kwargs.get("request_param")
+DEFAULT_SU                = get_config(p, DEFAULTS, 'su', 'ANSIBLE_SU', False, value_type='boolean')
 
-        if "request_method" in kwargs:
+DEFAULT_SU_USER           = get_config(p, DEFAULTS, 'su_user', 'ANSIBLE_SU_USER', 'root')
 
-            if kwargs["request_method"] == "file":
+DEFAULT_SU_EXE            = get_config(p, DEFAULTS, 'su_exe', 'ANSIBLE_SU_EXE', None)
 
-                request_param = "request_uri"
+DEFAULT_SU_FLAGS          = get_config(p, DEFAULTS, 'su_flags', 'ANSIBLE_SU_FLAGS', None)
 
-            else:
+DEFAULT_ASK_SU_PASS       = get_config(p, DEFAULTS, 'ask_su_pass', 'ANSIBLE_ASK_SU_PASS', False, value_type='boolean')
 
-                request_param = "request"
+DEFAULT_SUDO              = get_config(p, DEFAULTS, 'sudo', 'ANSIBLE_SUDO', False, value_type='boolean')
 
-            del kwargs["request_method"]
+DEFAULT_SUDO_USER         = get_config(p, DEFAULTS, 'sudo_user',        'ANSIBLE_SUDO_USER',        'root')
 
+DEFAULT_SUDO_EXE          = get_config(p, DEFAULTS, 'sudo_exe', 'ANSIBLE_SUDO_EXE', None)
 
+DEFAULT_SUDO_FLAGS        = get_config(p, DEFAULTS, 'sudo_flags', 'ANSIBLE_SUDO_FLAGS', '-H -S -n')
 
-        areq = super().construct_AuthorizationRequest(
+DEFAULT_ASK_SUDO_PASS     = get_config(p, DEFAULTS, 'ask_sudo_pass',    'ANSIBLE_ASK_SUDO_PASS',    False, value_type='boolean')
 
-            request=request, request_args=request_args, extra_args=extra_args, **kwargs
 
-        )
 
+# Become
 
+BECOME_ERROR_STRINGS      = {
 
-        if request_param:
+    'sudo': 'Sorry, try again.',
 
-            alg = None
+    'su': 'Authentication failure',
 
-            for arg in ["request_object_signing_alg", "algorithm"]:
+    'pbrun': '',
 
-                try:  # Trumps everything
+    'pfexec': '',
 
-                    alg = kwargs[arg]
+    'doas': 'Permission denied',
 
-                except KeyError:
+    'dzdo': '',
 
-                    pass
+    'ksu': 'Password incorrect'
 
-                else:
+}  # FIXME: deal with i18n
 
-                    break
+BECOME_MISSING_STRINGS    = {
 
+    'sudo': 'sorry, a password is required to run sudo',
 
+    'su': '',
 
-            if not alg:
+    'pbrun': '',
 
-                try:
+    'pfexec': '',
 
-                    alg = self.behaviour["request_object_signing_alg"]
+    'doas': 'Authorization required',
 
-                except KeyError:
+    'dzdo': '',
 
-                    alg = "none"
+    'ksu': 'No password given'
 
+}  # FIXME: deal with i18n
 
+BECOME_METHODS            = ['sudo','su','pbrun','pfexec','doas','dzdo','ksu','runas']
 
-            kwargs["request_object_signing_alg"] = alg
+BECOME_ALLOW_SAME_USER    = get_config(p, 'privilege_escalation', 'become_allow_same_user', 'ANSIBLE_BECOME_ALLOW_SAME_USER', False, value_type='boolean')
 
+DEFAULT_BECOME_METHOD     = get_config(p, 'privilege_escalation', 'become_method', 'ANSIBLE_BECOME_METHOD',
 
+                                       'sudo' if DEFAULT_SUDO else 'su' if DEFAULT_SU else 'sudo').lower()
 
-            if "keys" not in kwargs and alg and alg != "none":
+DEFAULT_BECOME            = get_config(p, 'privilege_escalation', 'become', 'ANSIBLE_BECOME',False, value_type='boolean')
 
-                _kty = jws.alg2keytype(alg)
+DEFAULT_BECOME_USER       = get_config(p, 'privilege_escalation', 'become_user', 'ANSIBLE_BECOME_USER', 'root')
 
-                try:
+DEFAULT_BECOME_EXE        = get_config(p, 'privilege_escalation', 'become_exe', 'ANSIBLE_BECOME_EXE', None)
 
-                    _kid = kwargs["sig_kid"]
+DEFAULT_BECOME_FLAGS      = get_config(p, 'privilege_escalation', 'become_flags', 'ANSIBLE_BECOME_FLAGS', None)
 
-                except KeyError:
+DEFAULT_BECOME_ASK_PASS   = get_config(p, 'privilege_escalation', 'become_ask_pass', 'ANSIBLE_BECOME_ASK_PASS', False, value_type='boolean')
 
-                    _kid = self.kid["sig"].get(_kty, None)
 
 
 
-                kwargs["keys"] = self.keyjar.get_signing_key(_kty, kid=_kid)
 
+# PLUGINS
 
 
-            _req = make_openid_request(areq, **kwargs)
 
+# Modules that can optimize with_items loops into a single call.  Currently
 
+# these modules must (1) take a "name" or "pkg" parameter that is a list.  If
 
-            # Should the request be encrypted
+# the module takes both, bad things could happen.
 
-            _req = self.request_object_encryption(_req, **kwargs)
+# In the future we should probably generalize this even further
 
+# (mapping of param: squash field)
 
+DEFAULT_SQUASH_ACTIONS         = get_config(p, DEFAULTS, 'squash_actions', 'ANSIBLE_SQUASH_ACTIONS',
 
-            if request_param == "request":
+                                            "apk, apt, dnf, homebrew, openbsd_pkg, pacman, pkgng, yum, zypper", value_type='list')
 
-                areq["request"] = _req
+# paths
 
-            else:
 
-                try:
 
-                    _webname = self.registration_response["request_uris"][0]
+DEFAULT_ACTION_PLUGIN_PATH     = get_config(p, DEFAULTS, 'action_plugins', 'ANSIBLE_ACTION_PLUGINS',
 
-                    filename = self.filename_from_webname(_webname)
+                                            '~/.ansible/plugins/action:/usr/share/ansible/plugins/action', value_type='pathlist')
 
-                except KeyError:
+DEFAULT_CACHE_PLUGIN_PATH      = get_config(p, DEFAULTS, 'cache_plugins', 'ANSIBLE_CACHE_PLUGINS',
 
-                    filename, _webname = self.construct_redirect_uri(**kwargs)
+                                            '~/.ansible/plugins/cache:/usr/share/ansible/plugins/cache', value_type='pathlist')
 
-                with open(filename, mode="w") as fid:
+DEFAULT_CALLBACK_PLUGIN_PATH   = get_config(p, DEFAULTS, 'callback_plugins', 'ANSIBLE_CALLBACK_PLUGINS',
 
-                    fid.write(_req)
+                                            '~/.ansible/plugins/callback:/usr/share/ansible/plugins/callback', value_type='pathlist')
 
-                areq["request_uri"] = _webname
+DEFAULT_CONNECTION_PLUGIN_PATH = get_config(p, DEFAULTS, 'connection_plugins', 'ANSIBLE_CONNECTION_PLUGINS',
 
+                                            '~/.ansible/plugins/connection:/usr/share/ansible/plugins/connection', value_type='pathlist')
 
+DEFAULT_LOOKUP_PLUGIN_PATH     = get_config(p, DEFAULTS, 'lookup_plugins', 'ANSIBLE_LOOKUP_PLUGINS',
 
-        return areq
+                                            '~/.ansible/plugins/lookup:/usr/share/ansible/plugins/lookup', value_type='pathlist')
 
+DEFAULT_MODULE_PATH            = get_config(p, DEFAULTS, 'library',            'ANSIBLE_LIBRARY',
 
+                                            '~/.ansible/plugins/modules:/usr/share/ansible/plugins/modules', value_type='pathlist')
 
-    def construct_UserInfoRequest(
+DEFAULT_MODULE_UTILS_PATH      = get_config(p, DEFAULTS, 'module_utils',       'ANSIBLE_MODULE_UTILS',
 
-        self, request=None, request_args=None, extra_args=None, **kwargs
+                                            '~/.ansible/plugins/module_utils:/usr/share/ansible/plugins/module_utils', value_type='pathlist')
 
-    ):
+DEFAULT_INVENTORY_PLUGIN_PATH  = get_config(p, DEFAULTS, 'inventory_plugins', 'ANSIBLE_INVENTORY_PLUGINS',
 
+                                            '~/.ansible/plugins/inventory:/usr/share/ansible/plugins/inventory', value_type='pathlist')
 
+DEFAULT_VARS_PLUGIN_PATH       = get_config(p, DEFAULTS, 'vars_plugins', 'ANSIBLE_VARS_PLUGINS',
 
-        if request is None:
+                                            '~/.ansible/plugins/vars:/usr/share/ansible/plugins/vars', value_type='pathlist')
 
-            request = self.message_factory.get_request_type("userinfo_endpoint")
+DEFAULT_FILTER_PLUGIN_PATH     = get_config(p, DEFAULTS, 'filter_plugins', 'ANSIBLE_FILTER_PLUGINS',
 
-        if request_args is None:
+                                            '~/.ansible/plugins/filter:/usr/share/ansible/plugins/filter', value_type='pathlist')
 
-            request_args = {}
+DEFAULT_TEST_PLUGIN_PATH       = get_config(p, DEFAULTS, 'test_plugins', 'ANSIBLE_TEST_PLUGINS',
 
+                                            '~/.ansible/plugins/test:/usr/share/ansible/plugins/test', value_type='pathlist')
 
+DEFAULT_STRATEGY_PLUGIN_PATH   = get_config(p, DEFAULTS, 'strategy_plugins', 'ANSIBLE_STRATEGY_PLUGINS',
 
-        if "access_token" in request_args:
+                                            '~/.ansible/plugins/strategy:/usr/share/ansible/plugins/strategy', value_type='pathlist')
 
-            pass
 
-        else:
 
-            if "scope" not in kwargs:
+NETWORK_GROUP_MODULES          = get_config(p, DEFAULTS, 'network_group_modules','NETWORK_GROUP_MODULES', ['eos', 'nxos', 'ios', 'iosxr', 'junos',
 
-                kwargs["scope"] = "openid"
+                                                                                                           'vyos', 'sros', 'dellos9', 'dellos10', 'dellos6'],
 
-            token = self.get_token(**kwargs)
+                                            value_type='list')
 
-            if token is None:
+DEFAULT_STRATEGY               = get_config(p, DEFAULTS, 'strategy',           'ANSIBLE_STRATEGY', 'linear')
 
-                raise MissingParameter("No valid token available")
+DEFAULT_STDOUT_CALLBACK        = get_config(p, DEFAULTS, 'stdout_callback',    'ANSIBLE_STDOUT_CALLBACK', 'default')
 
+# cache
 
+CACHE_PLUGIN                   = get_config(p, DEFAULTS, 'fact_caching', 'ANSIBLE_CACHE_PLUGIN', 'memory')
 
-            request_args["access_token"] = token.access_token
+CACHE_PLUGIN_CONNECTION        = get_config(p, DEFAULTS, 'fact_caching_connection', 'ANSIBLE_CACHE_PLUGIN_CONNECTION', None)
 
+CACHE_PLUGIN_PREFIX            = get_config(p, DEFAULTS, 'fact_caching_prefix', 'ANSIBLE_CACHE_PLUGIN_PREFIX', 'ansible_facts')
 
+CACHE_PLUGIN_TIMEOUT           = get_config(p, DEFAULTS, 'fact_caching_timeout', 'ANSIBLE_CACHE_PLUGIN_TIMEOUT', 24 * 60 * 60, value_type='integer')
 
-        return self.construct_request(request, request_args, extra_args)
 
 
+# Display
 
-    def construct_RegistrationRequest(
+ANSIBLE_FORCE_COLOR            = get_config(p, DEFAULTS, 'force_color', 'ANSIBLE_FORCE_COLOR', None, value_type='boolean')
 
-        self, request=None, request_args=None, extra_args=None, **kwargs
+ANSIBLE_NOCOLOR                = get_config(p, DEFAULTS, 'nocolor', 'ANSIBLE_NOCOLOR', None, value_type='boolean')
 
-    ):
+ANSIBLE_NOCOWS                 = get_config(p, DEFAULTS, 'nocows', 'ANSIBLE_NOCOWS', None, value_type='boolean')
 
-        if request is None:
+ANSIBLE_COW_SELECTION          = get_config(p, DEFAULTS, 'cow_selection', 'ANSIBLE_COW_SELECTION', 'default')
 
-            request = self.message_factory.get_request_type("registration_endpoint")
+ANSIBLE_COW_WHITELIST          = get_config(p, DEFAULTS, 'cow_whitelist', 'ANSIBLE_COW_WHITELIST', DEFAULT_COW_WHITELIST, value_type='list')
 
-        return self.construct_request(request, request_args, extra_args)
+DISPLAY_SKIPPED_HOSTS          = get_config(p, DEFAULTS, 'display_skipped_hosts', 'DISPLAY_SKIPPED_HOSTS', True, value_type='boolean')
 
+DEFAULT_UNDEFINED_VAR_BEHAVIOR = get_config(p, DEFAULTS, 'error_on_undefined_vars', 'ANSIBLE_ERROR_ON_UNDEFINED_VARS', True, value_type='boolean')
 
+HOST_KEY_CHECKING              = get_config(p, DEFAULTS, 'host_key_checking',  'ANSIBLE_HOST_KEY_CHECKING',    True, value_type='boolean')
 
-    def construct_RefreshSessionRequest(
+SYSTEM_WARNINGS                = get_config(p, DEFAULTS, 'system_warnings', 'ANSIBLE_SYSTEM_WARNINGS', True, value_type='boolean')
 
-        self, request=None, request_args=None, extra_args=None, **kwargs
+DEPRECATION_WARNINGS           = get_config(p, DEFAULTS, 'deprecation_warnings', 'ANSIBLE_DEPRECATION_WARNINGS', True, value_type='boolean')
 
-    ):
+DEFAULT_CALLABLE_WHITELIST     = get_config(p, DEFAULTS, 'callable_whitelist', 'ANSIBLE_CALLABLE_WHITELIST', [], value_type='list')
 
-        if request is None:
+COMMAND_WARNINGS               = get_config(p, DEFAULTS, 'command_warnings', 'ANSIBLE_COMMAND_WARNINGS', True, value_type='boolean')
 
-            request = self.message_factory.get_request_type("refreshsession_endpoint")
+DEFAULT_LOAD_CALLBACK_PLUGINS  = get_config(p, DEFAULTS, 'bin_ansible_callbacks', 'ANSIBLE_LOAD_CALLBACK_PLUGINS', False, value_type='boolean')
 
-        return self.construct_request(request, request_args, extra_args)
+DEFAULT_CALLBACK_WHITELIST     = get_config(p, DEFAULTS, 'callback_whitelist', 'ANSIBLE_CALLBACK_WHITELIST', [], value_type='list')
 
+RETRY_FILES_ENABLED            = get_config(p, DEFAULTS, 'retry_files_enabled', 'ANSIBLE_RETRY_FILES_ENABLED', True, value_type='boolean')
 
+RETRY_FILES_SAVE_PATH          = get_config(p, DEFAULTS, 'retry_files_save_path', 'ANSIBLE_RETRY_FILES_SAVE_PATH', None, value_type='path')
 
-    def _id_token_based(self, request, request_args=None, extra_args=None, **kwargs):
+DEFAULT_NULL_REPRESENTATION    = get_config(p, DEFAULTS, 'null_representation', 'ANSIBLE_NULL_REPRESENTATION', None, value_type='none')
 
+DISPLAY_ARGS_TO_STDOUT         = get_config(p, DEFAULTS, 'display_args_to_stdout', 'ANSIBLE_DISPLAY_ARGS_TO_STDOUT', False, value_type='boolean')
 
+MAX_FILE_SIZE_FOR_DIFF         = get_config(p, DEFAULTS, 'max_diff_size', 'ANSIBLE_MAX_DIFF_SIZE', 1024*1024, value_type='integer')
 
-        if request_args is None:
 
-            request_args = {}
 
+# CONNECTION RELATED
 
+USE_PERSISTENT_CONNECTIONS     = get_config(p, DEFAULTS, 'use_persistent_connections', 'ANSIBLE_USE_PERSISTENT_CONNECTIONS', False, value_type='boolean')
 
-        try:
+ANSIBLE_SSH_ARGS               = get_config(p, 'ssh_connection', 'ssh_args', 'ANSIBLE_SSH_ARGS', '-C -o ControlMaster=auto -o ControlPersist=60s')
 
-            _prop = kwargs["prop"]
+### WARNING: Someone might be tempted to switch this from percent-formatting
 
-        except KeyError:
+# to .format() in the future.  be sure to read this:
 
-            _prop = "id_token"
+# http://lucumr.pocoo.org/2016/12/29/careful-with-str-format/ and understand
 
+# that it may be a security risk to do so.
 
+ANSIBLE_SSH_CONTROL_PATH       = get_config(p, 'ssh_connection', 'control_path', 'ANSIBLE_SSH_CONTROL_PATH', None)
 
-        if _prop in request_args:
+ANSIBLE_SSH_CONTROL_PATH_DIR   = get_config(p, 'ssh_connection', 'control_path_dir', 'ANSIBLE_SSH_CONTROL_PATH_DIR', u'~/.ansible/cp')
 
-            pass
+ANSIBLE_SSH_PIPELINING         = get_config(p, 'ssh_connection', 'pipelining', 'ANSIBLE_SSH_PIPELINING', False, value_type='boolean')
 
-        else:
+ANSIBLE_SSH_RETRIES            = get_config(p, 'ssh_connection', 'retries', 'ANSIBLE_SSH_RETRIES', 0, value_type='integer')
 
-            raw_id_token = self._get_id_token(**kwargs)
+ANSIBLE_SSH_EXECUTABLE         = get_config(p, 'ssh_connection', 'ssh_executable', 'ANSIBLE_SSH_EXECUTABLE', 'ssh')
 
-            if raw_id_token is None:
+PARAMIKO_RECORD_HOST_KEYS      = get_config(p, 'paramiko_connection', 'record_host_keys', 'ANSIBLE_PARAMIKO_RECORD_HOST_KEYS', True, value_type='boolean')
 
-                raise MissingParameter("No valid id token available")
+PARAMIKO_HOST_KEY_AUTO_ADD     = get_config(p, 'paramiko_connection', 'host_key_auto_add', 'ANSIBLE_PARAMIKO_HOST_KEY_AUTO_ADD', False, value_type='boolean')
 
+PARAMIKO_PROXY_COMMAND         = get_config(p, 'paramiko_connection', 'proxy_command', 'ANSIBLE_PARAMIKO_PROXY_COMMAND', None)
 
+PARAMIKO_LOOK_FOR_KEYS         = get_config(p, 'paramiko_connection', 'look_for_keys', 'ANSIBLE_PARAMIKO_LOOK_FOR_KEYS', True, value_type='boolean')
 
-            request_args[_prop] = raw_id_token
+PERSISTENT_CONNECT_TIMEOUT     = get_config(p, 'persistent_connection', 'connect_timeout', 'ANSIBLE_PERSISTENT_CONNECT_TIMEOUT', 30, value_type='integer')
 
+PERSISTENT_CONNECT_RETRIES     = get_config(p, 'persistent_connection', 'connect_retries', 'ANSIBLE_PERSISTENT_CONNECT_RETRIES', 30, value_type='integer')
 
+PERSISTENT_CONNECT_INTERVAL    = get_config(p, 'persistent_connection', 'connect_interval', 'ANSIBLE_PERSISTENT_CONNECT_INTERVAL', 1, value_type='integer')
 
-        return self.construct_request(request, request_args, extra_args)
 
 
+# obsolete -- will be formally removed
 
-    def construct_CheckSessionRequest(
+ACCELERATE_PORT                = get_config(p, 'accelerate', 'accelerate_port', 'ACCELERATE_PORT', 5099, value_type='integer')
 
-        self, request=None, request_args=None, extra_args=None, **kwargs
+ACCELERATE_TIMEOUT             = get_config(p, 'accelerate', 'accelerate_timeout', 'ACCELERATE_TIMEOUT', 30, value_type='integer')
 
-    ):
+ACCELERATE_CONNECT_TIMEOUT     = get_config(p, 'accelerate', 'accelerate_connect_timeout', 'ACCELERATE_CONNECT_TIMEOUT', 1.0, value_type='float')
 
-        if request is None:
+ACCELERATE_DAEMON_TIMEOUT      = get_config(p, 'accelerate', 'accelerate_daemon_timeout', 'ACCELERATE_DAEMON_TIMEOUT', 30, value_type='integer')
 
-            request = self.message_factory.get_request_type("checksession_endpoint")
+ACCELERATE_KEYS_DIR            = get_config(p, 'accelerate', 'accelerate_keys_dir', 'ACCELERATE_KEYS_DIR', '~/.fireball.keys')
 
+ACCELERATE_KEYS_DIR_PERMS      = get_config(p, 'accelerate', 'accelerate_keys_dir_perms', 'ACCELERATE_KEYS_DIR_PERMS', '700')
 
+ACCELERATE_KEYS_FILE_PERMS     = get_config(p, 'accelerate', 'accelerate_keys_file_perms', 'ACCELERATE_KEYS_FILE_PERMS', '600')
 
-        return self._id_token_based(request, request_args, extra_args, **kwargs)
+ACCELERATE_MULTI_KEY           = get_config(p, 'accelerate', 'accelerate_multi_key', 'ACCELERATE_MULTI_KEY', False, value_type='boolean')
 
+PARAMIKO_PTY                   = get_config(p, 'paramiko_connection', 'pty', 'ANSIBLE_PARAMIKO_PTY', True, value_type='boolean')
 
 
-    def construct_CheckIDRequest(
 
-        self, request=None, request_args=None, extra_args=None, **kwargs
+# galaxy related
 
-    ):
+GALAXY_SERVER                  = get_config(p, 'galaxy', 'server', 'ANSIBLE_GALAXY_SERVER', 'https://galaxy.ansible.com')
 
-        if request is None:
+GALAXY_IGNORE_CERTS            = get_config(p, 'galaxy', 'ignore_certs', 'ANSIBLE_GALAXY_IGNORE', False, value_type='boolean')
 
-            request = self.message_factory.get_request_type("checkid_endpoint")
+# this can be configured to blacklist SCMS but cannot add new ones unless the code is also updated
 
-        # access_token is where the id_token will be placed
+GALAXY_SCMS                    = get_config(p, 'galaxy', 'scms', 'ANSIBLE_GALAXY_SCMS', 'git, hg', value_type='list')
 
-        return self._id_token_based(
+GALAXY_ROLE_SKELETON = get_config(p, 'galaxy', 'role_skeleton', 'ANSIBLE_GALAXY_ROLE_SKELETON', None, value_type='path')
 
-            request, request_args, extra_args, prop="access_token", **kwargs
+GALAXY_ROLE_SKELETON_IGNORE = get_config(p, 'galaxy', 'role_skeleton_ignore', 'ANSIBLE_GALAXY_ROLE_SKELETON_IGNORE', ['^.git$', '^.*/.git_keep$'],
 
-        )
+                                         value_type='list')
 
 
 
-    def construct_EndSessionRequest(
+STRING_TYPE_FILTERS = get_config(p, 'jinja2', 'dont_type_filters', 'ANSIBLE_STRING_TYPE_FILTERS',
 
-        self, request=None, request_args=None, extra_args=None, **kwargs
+                                 ['string', 'to_json', 'to_nice_json', 'to_yaml', 'ppretty', 'json'], value_type='list' )
 
-    ):
 
 
+# colors
 
-        if request is None:
+COLOR_HIGHLIGHT   = get_config(p, 'colors', 'highlight', 'ANSIBLE_COLOR_HIGHLIGHT', 'white')
 
-            request = self.message_factory.get_request_type("endsession_endpoint")
+COLOR_VERBOSE     = get_config(p, 'colors', 'verbose', 'ANSIBLE_COLOR_VERBOSE', 'blue')
 
-        if request_args is None:
+COLOR_WARN        = get_config(p, 'colors', 'warn', 'ANSIBLE_COLOR_WARN', 'bright purple')
 
-            request_args = {}
+COLOR_ERROR       = get_config(p, 'colors', 'error', 'ANSIBLE_COLOR_ERROR', 'red')
 
+COLOR_DEBUG       = get_config(p, 'colors', 'debug', 'ANSIBLE_COLOR_DEBUG', 'dark gray')
 
+COLOR_DEPRECATE   = get_config(p, 'colors', 'deprecate', 'ANSIBLE_COLOR_DEPRECATE', 'purple')
 
-        if "state" in request_args and "state" not in kwargs:
+COLOR_SKIP        = get_config(p, 'colors', 'skip', 'ANSIBLE_COLOR_SKIP', 'cyan')
 
-            kwargs["state"] = request_args["state"]
+COLOR_UNREACHABLE = get_config(p, 'colors', 'unreachable', 'ANSIBLE_COLOR_UNREACHABLE', 'bright red')
 
+COLOR_OK          = get_config(p, 'colors', 'ok', 'ANSIBLE_COLOR_OK', 'green')
 
+COLOR_CHANGED     = get_config(p, 'colors', 'changed', 'ANSIBLE_COLOR_CHANGED', 'yellow')
 
-        return self._id_token_based(request, request_args, extra_args, **kwargs)
+COLOR_DIFF_ADD    = get_config(p, 'colors', 'diff_add', 'ANSIBLE_COLOR_DIFF_ADD', 'green')
 
+COLOR_DIFF_REMOVE = get_config(p, 'colors', 'diff_remove', 'ANSIBLE_COLOR_DIFF_REMOVE', 'red')
 
+COLOR_DIFF_LINES  = get_config(p, 'colors', 'diff_lines', 'ANSIBLE_COLOR_DIFF_LINES', 'cyan')
 
-    def do_authorization_request(
 
-        self,
 
-        state="",
+# diff
 
-        body_type="",
+DIFF_CONTEXT = get_config(p, 'diff', 'context', 'ANSIBLE_DIFF_CONTEXT', 3, value_type='integer')
 
-        method="GET",
+DIFF_ALWAYS = get_config(p, 'diff', 'always', 'ANSIBLE_DIFF_ALWAYS', False, value_type='bool')
 
-        request_args=None,
 
-        extra_args=None,
 
-        http_args=None,
+# non-configurable things
 
-        **kwargs,
+MODULE_REQUIRE_ARGS       = ['command', 'win_command', 'shell', 'win_shell', 'raw', 'script']
 
-    ):
+MODULE_NO_JSON            = ['command', 'win_command', 'shell', 'win_shell', 'raw']
 
-        algs = self.sign_enc_algs("id_token")
+DEFAULT_BECOME_PASS       = None
 
+DEFAULT_PASSWORD_CHARS = to_text(ascii_letters + digits + ".,:-_", errors='strict')  # characters included in auto-generated passwords
 
+DEFAULT_SUDO_PASS         = None
 
-        if "code_challenge" in self.config:
+DEFAULT_REMOTE_PASS       = None
 
-            _args, code_verifier = self.add_code_challenge()
+DEFAULT_SUBSET            = None
 
-            request_args.update(_args)
+DEFAULT_SU_PASS           = None
 
+VAULT_VERSION_MIN         = 1.0
 
+VAULT_VERSION_MAX         = 1.0
 
-        return super().do_authorization_request(
+TREE_DIR                  = None
 
-            state=state,
+LOCALHOST                 = frozenset(['127.0.0.1', 'localhost', '::1'])
 
-            body_type=body_type,
+# module search
 
-            method=method,
+BLACKLIST_EXTS = ('.pyc', '.swp', '.bak', '~', '.rpm', '.md', '.txt')
 
-            request_args=request_args,
+IGNORE_FILES = ["COPYING", "CONTRIBUTING", "LICENSE", "README", "VERSION", "GUIDELINES"]
 
-            extra_args=extra_args,
+INTERNAL_RESULT_KEYS      = ['add_host', 'add_group']
 
-            http_args=http_args,
-
-            algs=algs,
-
-        )
-
-
-
-    def do_access_token_request(
-
-        self,
-
-        scope="",
-
-        state="",
-
-        body_type="json",
-
-        method="POST",
-
-        request_args=None,
-
-        extra_args=None,
-
-        http_args=None,
-
-        authn_method="client_secret_basic",
-
-        **kwargs,
-
-    ):
-
-        atr = super().do_access_token_request(
-
-            scope=scope,
-
-            state=state,
-
-            body_type=body_type,
-
-            method=method,
-
-            request_args=request_args,
-
-            extra_args=extra_args,
-
-            http_args=http_args,
-
-            authn_method=authn_method,
-
-            **kwargs,
-
-        )
-
-        try:
-
-            _idt = atr["id_token"]
-
-        except KeyError:
-
-            pass
-
-        else:
-
-            try:
-
-                if self.state2nonce[state] != _idt["nonce"]:
-
-                    raise ParameterError('Someone has messed with "nonce"')
-
-            except KeyError:
-
-                pass
-
-        return atr
-
-
-
-    def do_registration_request(
-
-        self,
-
-        scope="",
-
-        state="",
-
-        body_type="json",
-
-        method="POST",
-
-        request_args=None,
-
-        extra_args=None,
-
-        http_args=None,
-
-    ):
-
-        request = self.message_factory.get_request_type("registration_endpoint")
-
-        url, body, ht_args, csi = self.request_info(
-
-            request,
-
-            method=method,
-
-            request_args=request_args,
-
-            extra_args=extra_args,
-
-            scope=scope,
-
-            state=state,
-
-        )
-
-
-
-        if http_args is None:
-
-            http_args = ht_args
-
-        else:
-
-            http_args.update(http_args)
-
-
-
-        response_cls = self.message_factory.get_response_type("registration_endpoint")
-
-        response = self.request_and_return(
-
-            url, response_cls, method, body, body_type, state=state, http_args=http_args
-
-        )
-
-        return response
-
-
-
-    def do_check_session_request(
-
-        self,
-
-        scope="",
-
-        state="",
-
-        body_type="json",
-
-        method="GET",
-
-        request_args=None,
-
-        extra_args=None,
-
-        http_args=None,
-
-    ):
-
-
-
-        request = self.message_factory.get_request_type("checksession_endpoint")
-
-        response_cls = self.message_factory.get_response_type("checksession_endpoint")
-
-
-
-        url, body, ht_args, csi = self.request_info(
-
-            request,
-
-            method=method,
-
-            request_args=request_args,
-
-            extra_args=extra_args,
-
-            scope=scope,
-
-            state=state,
-
-        )
-
-
-
-        if http_args is None:
-
-            http_args = ht_args
-
-        else:
-
-            http_args.update(http_args)
-
-
-
-        return self.request_and_return(
-
-            url, response_cls, method, body, body_type, state=state, http_args=http_args
-
-        )
-
-
-
-    def do_check_id_request(
-
-        self,
-
-        scope="",
-
-        state="",
-
-        body_type="json",
-
-        method="GET",
-
-        request_args=None,
-
-        extra_args=None,
-
-        http_args=None,
-
-    ):
-
-        request = self.message_factory.get_request_type("checkid_endpoint")
-
-        response_cls = self.message_factory.get_response_type("checkid_endpoint")
-
-
-
-        url, body, ht_args, csi = self.request_info(
-
-            request,
-
-            method=method,
-
-            request_args=request_args,
-
-            extra_args=extra_args,
-
-            scope=scope,
-
-            state=state,
-
-        )
-
-
-
-        if http_args is None:
-
-            http_args = ht_args
-
-        else:
-
-            http_args.update(http_args)
-
-
-
-        return self.request_and_return(
-
-            url, response_cls, method, body, body_type, state=state, http_args=http_args
-
-        )
-
-
-
-    def do_end_session_request(
-
-        self,
-
-        scope="",
-
-        state="",
-
-        body_type="",
-
-        method="GET",
-
-        request_args=None,
-
-        extra_args=None,
-
-        http_args=None,
-
-    ):
-
-        request = self.message_factory.get_request_type("endsession_endpoint")
-
-        response_cls = self.message_factory.get_response_type("endsession_endpoint")
-
-        url, body, ht_args, _ = self.request_info(
-
-            request,
-
-            method=method,
-
-            request_args=request_args,
-
-            extra_args=extra_args,
-
-            scope=scope,
-
-            state=state,
-
-        )
-
-
-
-        if http_args is None:
-
-            http_args = ht_args
-
-        else:
-
-            http_args.update(http_args)
-
-
-
-        return self.request_and_return(
-
-            url, response_cls, method, body, body_type, state=state, http_args=http_args
-
-        )
-
-
-
-    def user_info_request(self, method="GET", state="", scope="", **kwargs):
-
-        uir = self.message_factory.get_request_type("userinfo_endpoint")()
-
-        logger.debug("[user_info_request]: kwargs:%s" % (sanitize(kwargs),))
-
-        token: Optional[Token] = None
-
-        if "token" in kwargs:
-
-            if kwargs["token"]:
-
-                uir["access_token"] = kwargs["token"]
-
-                token = Token()
-
-                token.token_type = "Bearer"
-
-                token.access_token = kwargs["token"]
-
-                kwargs["behavior"] = "use_authorization_header"
-
-            else:
-
-                # What to do ? Need a callback
-
-                pass
-
-        elif "access_token" in kwargs and kwargs["access_token"]:
-
-            uir["access_token"] = kwargs["access_token"]
-
-            del kwargs["access_token"]
-
-        elif state:
-
-            token = self.grant[state].get_token(scope)
-
-            if token is None:
-
-                raise AccessDenied("invalid_token")
-
-            if token.is_valid():
-
-                uir["access_token"] = token.access_token
-
-                if (
-
-                    token.token_type
-
-                    and token.token_type.lower() == "bearer"
-
-                    and method == "GET"
-
-                ):
-
-                    kwargs["behavior"] = "use_authorization_header"
-
-            else:
-
-                # raise oauth2.OldAccessToken
-
-                if self.log:
-
-                    self.log.info("do access token refresh")
-
-                try:
-
-                    self.do_access_token_refresh(token=token, state=state)
-
-                    token = cast(Token, self.grant[state].get_token(scope))
-
-                    uir["access_token"] = token.access_token
-
-                except Exception:
-
-                    raise
-
-
-
-        uri = self._endpoint("userinfo_endpoint", **kwargs)
-
-        # If access token is a bearer token it might be sent in the
-
-        # authorization header
-
-        # 4 ways of sending the access_token:
-
-        # - POST with token in authorization header
-
-        # - POST with token in message body
-
-        # - GET with token in authorization header
-
-        # - GET with token as query parameter
-
-        if "behavior" in kwargs:
-
-            _behav = kwargs["behavior"]
-
-            _token = uir["access_token"]
-
-            _ttype = ""
-
-            try:
-
-                _ttype = kwargs["token_type"]
-
-            except KeyError:
-
-                if token:
-
-                    try:
-
-                        _ttype = cast(str, token.token_type)
-
-                    except AttributeError:
-
-                        raise MissingParameter("Unspecified token type")
-
-
-
-            if "as_query_parameter" == _behav:
-
-                method = "GET"
-
-            elif token:
-
-                # use_authorization_header, token_in_message_body
-
-                if "use_authorization_header" in _behav:
-
-                    token_header = "{type} {token}".format(
-
-                        type=_ttype.capitalize(), token=_token
-
-                    )
-
-                    if "headers" in kwargs:
-
-                        kwargs["headers"].update({"Authorization": token_header})
-
-                    else:
-
-                        kwargs["headers"] = {"Authorization": token_header}
-
-
-
-                if "token_in_message_body" not in _behav:
-
-                    # remove the token from the request
-
-                    del uir["access_token"]
-
-
-
-        path, body, kwargs = get_or_post(uri, method, uir, **kwargs)
-
-
-
-        h_args = dict([(k, v) for k, v in kwargs.items() if k in HTTP_ARGS])
-
-
-
-        return path, body, method, h_args
-
-
-
-    def do_user_info_request(
-
-        self, method="POST", state="", scope="openid", request="openid", **kwargs
-
-    ):
-
-
-
-        kwargs["request"] = request
-
-        path, body, method, h_args = self.user_info_request(
-
-            method, state, scope, **kwargs
-
-        )
-
-
-
-        logger.debug(
-
-            "[do_user_info_request] PATH:%s BODY:%s H_ARGS: %s"
-
-            % (sanitize(path), sanitize(body), sanitize(h_args))
-
-        )
-
-
-
-        if self.events:
-
-            self.events.store("Request", {"body": body})
-
-            self.events.store("request_url", path)
-
-            self.events.store("request_http_args", h_args)
-
-
-
-        try:
-
-            resp = self.http_request(path, method, data=body, **h_args)
-
-        except oauth2.exception.MissingRequiredAttribute:
-
-            raise
-
-
-
-        if resp.status_code == 200:
-
-            if "application/json" in resp.headers["content-type"]:
-
-                sformat = "json"
-
-            elif "application/jwt" in resp.headers["content-type"]:
-
-                sformat = "jwt"
-
-            else:
-
-                raise PyoidcError(
-
-                    "ERROR: Unexpected content-type: %s" % resp.headers["content-type"]
-
-                )
-
-        elif resp.status_code == 500:
-
-            raise PyoidcError("ERROR: Something went wrong: %s" % resp.text)
-
-        elif resp.status_code == 405:
-
-            # Method not allowed error
-
-            allowed_methods = [x.strip() for x in resp.headers["allow"].split(",")]
-
-            raise CommunicationError(
-
-                "Server responded with HTTP Error Code 405", "", allowed_methods
-
-            )
-
-        elif 400 <= resp.status_code < 500:
-
-            # the response text might be a OIDC message
-
-            try:
-
-                res = ErrorResponse().from_json(resp.text)
-
-            except Exception:
-
-                raise RequestError(resp.text)
-
-            else:
-
-                self.store_response(res, resp.text)
-
-                return res
-
-        else:
-
-            raise PyoidcError(
-
-                "ERROR: Something went wrong [%s]: %s" % (resp.status_code, resp.text)
-
-            )
-
-
-
-        try:
-
-            _schema = kwargs["user_info_schema"]
-
-        except KeyError:
-
-            _schema = OpenIDSchema
-
-
-
-        logger.debug("Reponse text: '%s'" % sanitize(resp.text))
-
-
-
-        _txt = resp.text
-
-        if sformat == "json":
-
-            res = _schema().from_json(txt=_txt)
-
-        else:
-
-            verify = kwargs.get("verify", True)
-
-            res = _schema().from_jwt(
-
-                _txt,
-
-                keyjar=self.keyjar,
-
-                sender=self.provider_info["issuer"],
-
-                verify=verify,
-
-            )
-
-
-
-        if "error" in res:  # Error response
-
-            res = UserInfoErrorResponse(**res.to_dict())
-
-
-
-        if state:
-
-            # Verify userinfo sub claim against what's returned in the ID Token
-
-            idt = self.grant[state].get_id_token()
-
-            if idt:
-
-                if idt["sub"] != res["sub"]:
-
-                    raise SubMismatch(
-
-                        "Sub identifier not the same in userinfo and Id Token"
-
-                    )
-
-
-
-        self.store_response(res, _txt)
-
-
-
-        return res
-
-
-
-    def get_userinfo_claims(
-
-        self, access_token, endpoint, method="POST", schema_class=OpenIDSchema, **kwargs
-
-    ):
-
-
-
-        uir = UserInfoRequest(access_token=access_token)
-
-
-
-        h_args = dict([(k, v) for k, v in kwargs.items() if k in HTTP_ARGS])
-
-
-
-        if "authn_method" in kwargs:
-
-            http_args = self.init_authentication_method(**kwargs)
-
-        else:
-
-            # If nothing defined this is the default
-
-            http_args = self.init_authentication_method(uir, "bearer_header", **kwargs)
-
-
-
-        h_args.update(http_args)
-
-        path, body, kwargs = get_or_post(endpoint, method, uir, **kwargs)
-
-
-
-        try:
-
-            resp = self.http_request(path, method, data=body, **h_args)
-
-        except MissingRequiredAttribute:
-
-            raise
-
-
-
-        if resp.status_code == 200:
-
-            # FIXME: Could this also encounter application/jwt for encrypted userinfo
-
-            #        the do_userinfo_request method already handles it
-
-            if "application/json" not in resp.headers["content-type"]:
-
-                raise PyoidcError(
-
-                    "ERROR: content-type in response unexpected: %s"
-
-                    % resp.headers["content-type"]
-
-                )
-
-        elif resp.status_code == 500:
-
-            raise PyoidcError("ERROR: Something went wrong: %s" % resp.text)
-
-        else:
-
-            raise PyoidcError(
-
-                "ERROR: Something went wrong [%s]: %s" % (resp.status_code, resp.text)
-
-            )
-
-
-
-        res = schema_class().from_json(txt=resp.text)
-
-        self.store_response(res, resp.text)
-
-        return res
-
-
-
-    def unpack_aggregated_claims(self, userinfo):
-
-        if userinfo["_claim_sources"]:
-
-            for csrc, spec in userinfo["_claim_sources"].items():
-
-                if "JWT" in spec:
-
-                    aggregated_claims = Message().from_jwt(
-
-                        spec["JWT"].encode("utf-8"), keyjar=self.keyjar, sender=csrc
-
-                    )
-
-                    claims = [
-
-                        value
-
-                        for value, src in userinfo["_claim_names"].items()
-
-                        if src == csrc
-
-                    ]
-
-
-
-                    if set(claims) != set(list(aggregated_claims.keys())):
-
-                        logger.warning(
-
-                            "Claims from claim source doesn't match what's in "
-
-                            "the userinfo"
-
-                        )
-
-
-
-                    for key, vals in aggregated_claims.items():
-
-                        userinfo[key] = vals
-
-
-
-        return userinfo
-
-
-
-    def fetch_distributed_claims(self, userinfo, callback=None):
-
-        for csrc, spec in userinfo["_claim_sources"].items():
-
-            if "endpoint" in spec:
-
-                if not spec["endpoint"].startswith("https://"):
-
-                    logger.warning(
-
-                        "Fetching distributed claims from an untrusted source: %s",
-
-                        spec["endpoint"],
-
-                    )
-
-                if "access_token" in spec:
-
-                    _uinfo = self.do_user_info_request(
-
-                        method="GET",
-
-                        token=spec["access_token"],
-
-                        userinfo_endpoint=spec["endpoint"],
-
-                        verify=False,
-
-                    )
-
-                else:
-
-                    if callback:
-
-                        _uinfo = self.do_user_info_request(
-
-                            method="GET",
-
-                            token=callback(spec["endpoint"]),
-
-                            userinfo_endpoint=spec["endpoint"],
-
-                            verify=False,
-
-                        )
-
-                    else:
-
-                        _uinfo = self.do_user_info_request(
-
-                            method="GET",
-
-                            userinfo_endpoint=spec["endpoint"],
-
-                            verify=False,
-
-                        )
-
-
-
-                claims = [
-
-                    value
-
-                    for value, src in userinfo["_claim_names"].items()
-
-                    if src == csrc
-
-                ]
-
-
-
-                if set(claims) != set(list(_uinfo.keys())):
-
-                    logger.warning(
-
-                        "Claims from claim source doesn't match what's in "
-
-                        "the userinfo"
-
-                    )
-
-
-
-                for key, vals in _uinfo.items():
-
-                    userinfo[key] = vals
-
-
-
-        # Remove the `_claim_sources` and `_claim_names` from userinfo and better be safe than sorry
-
-        if "_claim_sources" in userinfo:
-
-            del userinfo["_claim_sources"]
-
-        if "_claim_names" in userinfo:
-
-            del userinfo["_claim_names"]
-
-        return userinfo
-
-
-
-    def verify_alg_support(self, alg, usage, other):
-
-        """
-
-        Verify that the algorithm to be used are supported by the other side.
-
-
-
-        :param alg: The algorithm specification
-
-        :param usage: In which context the 'alg' will be used.
-
-            The following values are supported:
-
-            - userinfo
-
-            - id_token
-
-            - request_object
-
-            - token_endpoint_auth
-
-        :param other: The identifier for the other side
-
-        :return: True or False
-
-        """
-
-        try:
-
-            _pcr = self.provider_info
-
-            supported = _pcr["%s_algs_supported" % usage]
-
-        except KeyError:
-
-            try:
-
-                supported = getattr(self, "%s_algs_supported" % usage)
-
-            except AttributeError:
-
-                supported = None
-
-
-
-        if supported is None:
-
-            return True
-
-        else:
-
-            if alg in supported:
-
-                return True
-
-            else:
-
-                return False
-
-
-
-    def match_preferences(self, pcr=None, issuer=None):
-
-        """
-
-        Match the clients preferences against what the provider can do.
-
-
-
-        :param pcr: Provider configuration response if available
-
-        :param issuer: The issuer identifier
-
-        """
-
-        if not pcr:
-
-            pcr = self.provider_info
-
-
-
-        regreq = self.message_factory.get_request_type("registration_endpoint")
-
-
-
-        for _pref, _prov in PREFERENCE2PROVIDER.items():
-
-            try:
-
-                vals = self.client_prefs[_pref]
-
-            except KeyError:
-
-                continue
-
-
-
-            try:
-
-                _pvals = pcr[_prov]
-
-            except KeyError:
-
-                try:
-
-                    self.behaviour[_pref] = PROVIDER_DEFAULT[_pref]
-
-                except KeyError:
-
-                    if isinstance(pcr.c_param[_prov][0], list):
-
-                        self.behaviour[_pref] = []
-
-                    else:
-
-                        self.behaviour[_pref] = None
-
-                continue
-
-
-
-            if isinstance(vals, str):
-
-                if vals in _pvals:
-
-                    self.behaviour[_pref] = vals
-
-            else:
-
-                vtyp = regreq.c_param[_pref]
-
-
-
-                if isinstance(vtyp[0], list):
-
-                    self.behaviour[_pref] = []
-
-                    for val in vals:
-
-                        if val in _pvals:
-
-                            self.behaviour[_pref].append(val)
-
-                else:
-
-                    for val in vals:
-
-                        if val in _pvals:
-
-                            self.behaviour[_pref] = val
-
-                            break
-
-
-
-            if _pref not in self.behaviour:
-
-                raise ConfigurationError("OP couldn't match preference:%s" % _pref, pcr)
-
-
-
-        for key, val in self.client_prefs.items():
-
-            if key in self.behaviour:
-
-                continue
-
-
-
-            try:
-
-                vtyp = regreq.c_param[key]
-
-                if isinstance(vtyp[0], list):
-
-                    pass
-
-                elif isinstance(val, list) and not isinstance(val, str):
-
-                    val = val[0]
-
-            except KeyError:
-
-                pass
-
-            if key not in PREFERENCE2PROVIDER:
-
-                self.behaviour[key] = val
-
-
-
-    def store_registration_info(self, reginfo):
-
-        self.registration_response = reginfo
-
-        if "token_endpoint_auth_method" not in self.registration_response:
-
-            self.registration_response[
-
-                "token_endpoint_auth_method"  # nosec
-
-            ] = "client_secret_basic"
-
-        self.client_id = reginfo["client_id"]
-
-        try:
-
-            self.client_secret = reginfo["client_secret"]
-
-        except KeyError:  # Not required
-
-            pass
-
-        else:
-
-            try:
-
-                self.registration_expires = reginfo["client_secret_expires_at"]
-
-            except KeyError:
-
-                pass
-
-        try:
-
-            self.registration_access_token = reginfo["registration_access_token"]
-
-        except KeyError:
-
-            pass
-
-
-
-    def handle_registration_info(self, response):
-
-        err_msg = "Got error response: {}"
-
-        unk_msg = "Unknown response: {}"
-
-        if response.status_code in [200, 201]:
-
-            resp = self.message_factory.get_response_type(
-
-                "registration_endpoint"
-
-            )().deserialize(response.text, "json")
-
-            # Some implementations sends back a 200 with an error message inside
-
-            try:
-
-                resp.verify()
-
-            except oauth2.message.MissingRequiredAttribute as err:
-
-                logger.error(err)
-
-                raise RegistrationError(err)
-
-            except Exception:
-
-                resp = ErrorResponse().deserialize(response.text, "json")
-
-                if resp.verify():
-
-                    logger.error(err_msg.format(sanitize(resp.to_json())))
-
-                    if self.events:
-
-                        self.events.store("protocol response", resp)
-
-                    raise RegistrationError(resp.to_dict())
-
-                else:  # Something else
-
-                    logger.error(unk_msg.format(sanitize(response.text)))
-
-                    raise RegistrationError(response.text)
-
-            else:
-
-                # got a proper registration response
-
-                self.store_response(resp, response.text)
-
-                self.store_registration_info(resp)
-
-        elif 400 <= response.status_code <= 499:
-
-            try:
-
-                resp = ErrorResponse().deserialize(response.text, "json")
-
-            except JSONDecodeError:
-
-                logger.error(unk_msg.format(sanitize(response.text)))
-
-                raise RegistrationError(response.text)
-
-
-
-            if resp.verify():
-
-                logger.error(err_msg.format(sanitize(resp.to_json())))
-
-                if self.events:
-
-                    self.events.store("protocol response", resp)
-
-                raise RegistrationError(resp.to_dict())
-
-            else:  # Something else
-
-                logger.error(unk_msg.format(sanitize(response.text)))
-
-                raise RegistrationError(response.text)
-
-        else:
-
-            raise RegistrationError(response.text)
-
-
-
-        return resp
-
-
-
-    def registration_read(self, url="", registration_access_token=None):
-
-        """
-
-        Read the client registration info from the given url.
-
-
-
-        :raises RegistrationError: If an error happend
-
-        :return: RegistrationResponse
-
-        """
-
-        if not url:
-
-            url = self.registration_response["registration_client_uri"]
-
-
-
-        if not registration_access_token:
-
-            registration_access_token = self.registration_access_token
-
-
-
-        headers = {"Authorization": "Bearer %s" % registration_access_token}
-
-        rsp = self.http_request(url, "GET", headers=headers)
-
-
-
-        return self.handle_registration_info(rsp)
-
-
-
-    def generate_request_uris(self, request_dir):
-
-        """
-
-        Need to generate a path that is unique for the OP combo.
-
-
-
-        :return: A list of uris
-
-        """
-
-        m = hashlib.sha256()
-
-        m.update(as_bytes(self.provider_info["issuer"]))
-
-        m.update(as_bytes(self.base_url))
-
-        return "{}{}/{}".format(self.base_url, request_dir, m.hexdigest())
-
-
-
-    def create_registration_request(self, **kwargs):
-
-        """
-
-        Create a registration request.
-
-
-
-        :param kwargs: parameters to the registration request
-
-        :return:
-
-        """
-
-        req = self.message_factory.get_request_type("registration_endpoint")()
-
-
-
-        for prop in req.parameters():
-
-            try:
-
-                req[prop] = kwargs[prop]
-
-            except KeyError:
-
-                try:
-
-                    req[prop] = self.behaviour[prop]
-
-                except KeyError:
-
-                    pass
-
-
-
-        if "post_logout_redirect_uris" not in req:
-
-            try:
-
-                req["post_logout_redirect_uris"] = self.post_logout_redirect_uris
-
-            except AttributeError:
-
-                pass
-
-
-
-        if "redirect_uris" not in req:
-
-            try:
-
-                req["redirect_uris"] = self.redirect_uris
-
-            except AttributeError:
-
-                raise MissingRequiredAttribute("redirect_uris", req)
-
-
-
-        try:
-
-            if self.provider_info["require_request_uri_registration"] is True:
-
-                req["request_uris"] = self.generate_request_uris(self.requests_dir)
-
-        except KeyError:
-
-            pass
-
-
-
-        if "response_types" in req:
-
-            req["grant_types"] = response_types_to_grant_types(
-
-                req["response_types"], **kwargs
-
-            )
-
-
-
-        return req
-
-
-
-    def register(self, url, registration_token=None, **kwargs):
-
-        """
-
-        Register the client at an OP.
-
-
-
-        :param url: The OPs registration endpoint
-
-        :param registration_token: Initial Access Token for registration endpoint
-
-        :param kwargs: parameters to the registration request
-
-        :return:
-
-        """
-
-        req = self.create_registration_request(**kwargs)
-
-
-
-        logger.debug("[registration_request]: kwargs:%s" % (sanitize(kwargs),))
-
-
-
-        if self.events:
-
-            self.events.store("Protocol request", req)
-
-
-
-        headers = {"content-type": "application/json"}
-
-        if registration_token is not None:
-
-            try:
-
-                token = jwt.JWT()
-
-                token.unpack(registration_token)
-
-            except BadSyntax:
-
-                # no JWT
-
-                registration_token = b64encode(registration_token.encode()).decode()
-
-            finally:
-
-                headers["Authorization"] = "Bearer " + registration_token
-
-
-
-        rsp = self.http_request(url, "POST", data=req.to_json(), headers=headers)
-
-
-
-        return self.handle_registration_info(rsp)
-
-
-
-    def normalization(self, principal, idtype="mail"):
-
-        if idtype == "mail":
-
-            (_, domain) = principal.split("@")
-
-            subject = "acct:%s" % principal
-
-        elif idtype == "url":
-
-            p = urlparse(principal)
-
-            domain = p.netloc
-
-            subject = principal
-
-        else:
-
-            domain = ""
-
-            subject = principal
-
-
-
-        return subject, domain
-
-
-
-    def discover(self, principal, host=None):
-
-        return self.wf.discovery_query(principal, host=host)
-
-
-
-    def sign_enc_algs(self, typ):
-
-        resp = {}
-
-        for key, val in PARAMMAP.items():
-
-            try:
-
-                resp[key] = self.registration_response[val % typ]
-
-            except (TypeError, KeyError):
-
-                if key == "sign":
-
-                    resp[key] = DEF_SIGN_ALG["id_token"]
-
-        return resp
-
-
-
-    def _verify_id_token(
-
-        self,
-
-        id_token,
-
-        nonce="",
-
-        acr_values=None,
-
-        auth_time=0,
-
-        max_age=0,
-
-        response_type="",
-
-    ):
-
-        """
-
-        Verify IdToken.
-
-
-
-        If the JWT alg Header Parameter uses a MAC based algorithm such as
-
-        HS256, HS384, or HS512, the octets of the UTF-8 representation of the
-
-        client_secret corresponding to the client_id contained in the aud
-
-        (audience) Claim are used as the key to validate the signature. For MAC
-
-        based algorithms, the behavior is unspecified if the aud is
-
-        multi-valued or if an azp value is present that is different than the
-
-        aud value.
-
-
-
-        :param id_token: The ID Token tp check
-
-        :param nonce: The nonce specified in the authorization request
-
-        :param acr_values: Asked for acr values
-
-        :param auth_time: An auth_time claim
-
-        :param max_age: Max age of authentication
-
-        """
-
-        if self.provider_info["issuer"] != id_token["iss"]:
-
-            raise OtherError("issuer != iss")
-
-
-
-        if self.client_id not in id_token["aud"]:
-
-            raise OtherError("not intended for me")
-
-        if len(id_token["aud"]) > 1:
-
-            if "azp" not in id_token or id_token["azp"] != self.client_id:
-
-                raise OtherError("not intended for me")
-
-
-
-        _now = time_util.utc_time_sans_frac()
-
-
-
-        if _now > id_token["exp"]:
-
-            raise OtherError("Passed best before date")
-
-
-
-        if response_type != ["code"] and id_token.jws_header["alg"] == "none":
-
-            raise WrongSigningAlgorithm(
-
-                "none is not allowed outside Authorization Flow."
-
-            )
-
-
-
-        if (
-
-            self.id_token_max_age
-
-            and _now > int(id_token["iat"]) + self.id_token_max_age
-
-        ):
-
-            raise OtherError("I think this ID token is to old")
-
-
-
-        if nonce and nonce != id_token["nonce"]:
-
-            raise OtherError("nonce mismatch")
-
-
-
-        if acr_values and id_token["acr"] not in acr_values:
-
-            raise OtherError("acr mismatch")
-
-
-
-        if max_age and _now > int(id_token["auth_time"] + max_age):
-
-            raise AuthnToOld("To old authentication")
-
-
-
-        if auth_time:
-
-            if not claims_match(id_token["auth_time"], {"auth_time": auth_time}):
-
-                raise AuthnToOld("To old authentication")
-
-
-
-    def verify_id_token(self, id_token, authn_req):
-
-        kwa = {}
-
-        try:
-
-            kwa["nonce"] = authn_req["nonce"]
-
-        except KeyError:
-
-            pass
-
-
-
-        for param in ["acr_values", "max_age", "response_type"]:
-
-            try:
-
-                kwa[param] = authn_req[param]
-
-            except KeyError:
-
-                pass
-
-
-
-        self._verify_id_token(id_token, **kwa)
-
-
-
-
-
-class Server(oauth2.Server):
-
-    """OIC Server class."""
-
-
-
-    def __init__(
-
-        self,
-
-        verify_ssl: bool = None,
-
-        keyjar: KeyJar = None,
-
-        client_cert: Union[str, Tuple[str, str]] = None,
-
-        timeout: float = None,
-
-        message_factory: Type[MessageFactory] = OIDCMessageFactory,
-
-        settings: PyoidcSettings = None,
-
-    ):
-
-        """Initialize the server."""
-
-        self.settings = settings or OicServerSettings()
-
-        if verify_ssl is not None:
-
-            warnings.warn(
-
-                "`verify_ssl` is deprecated, please use `settings` instead if you need to set a non-default value.",
-
-                DeprecationWarning,
-
-                stacklevel=2,
-
-            )
-
-            self.settings.verify_ssl = verify_ssl
-
-        if client_cert is not None:
-
-            warnings.warn(
-
-                "`client_cert` is deprecated, please use `settings` instead if you need to set a non-default value.",
-
-                DeprecationWarning,
-
-                stacklevel=2,
-
-            )
-
-            self.settings.client_cert = client_cert
-
-        if timeout is not None:
-
-            warnings.warn(
-
-                "`timeout` is deprecated, please use `settings` instead if you need to set a non-default value.",
-
-                DeprecationWarning,
-
-                stacklevel=2,
-
-            )
-
-            self.settings.timeout = timeout
-
-
-
-        super().__init__(
-
-            keyjar=keyjar,
-
-            message_factory=message_factory,
-
-            settings=self.settings,
-
-        )
-
-
-
-    @staticmethod
-
-    def _parse_urlencoded(url=None, query=None):
-
-        if url:
-
-            parts = urlparse(url)
-
-            scheme, netloc, path, params, query, fragment = parts[:6]
-
-
-
-        return parse_qs(query)
-
-
-
-    def handle_request_uri(self, request_uri, verify=True, sender=""):
-
-        """
-
-        Handle request URI.
-
-
-
-        :param request_uri: URL pointing to where the signed request should be fetched from.
-
-        :param verify: Whether the signature on the request should be verified.
-
-        Don't use anything but the default unless you REALLY know what you're doing
-
-        :param sender: The issuer of the request JWT.
-
-        :return:
-
-        """
-
-        # Do a HTTP get
-
-        logger.debug("Get request from request_uri: {}".format(request_uri))
-
-        try:
-
-            http_req = self.http_request(request_uri)
-
-        except ConnectionError:
-
-            logger.error("Connection Error")
-
-            return authz_error("invalid_request_uri")
-
-
-
-        if not http_req:
-
-            logger.error("Nothing returned")
-
-            return authz_error("invalid_request_uri")
-
-        elif http_req.status_code >= 400:
-
-            logger.error("HTTP error {}:{}".format(http_req.status_code, http_req.text))
-
-            raise AuthzError("invalid_request")
-
-
-
-        # http_req.text is a signed JWT
-
-        try:
-
-            logger.debug("request txt: {}".format(http_req.text))
-
-            req = self.parse_jwt_request(
-
-                txt=http_req.text, verify=verify, sender=sender
-
-            )
-
-        except Exception as err:
-
-            logger.error(
-
-                "{}:{} encountered while parsing fetched request".format(
-
-                    err.__class__, err
-
-                )
-
-            )
-
-            raise AuthzError("invalid_openid_request_object")
-
-
-
-        logger.debug("Fetched request: {}".format(req))
-
-        return req
-
-
-
-    def parse_authorization_request(
-
-        self, request=AuthorizationRequest, url=None, query=None, keys=None
-
-    ):
-
-        if url:
-
-            parts = urlparse(url)
-
-            scheme, netloc, path, params, query, fragment = parts[:6]
-
-
-
-        if isinstance(query, dict):
-
-            sformat = "dict"
-
-        else:
-
-            sformat = "urlencoded"
-
-
-
-        _req = self._parse_request(request, query, sformat, verify=False)
-
-
-
-        if self.events:
-
-            self.events.store("Request", _req)
-
-
-
-        _req_req: Union[Message, Dict[str, Any]] = {}
-
-        try:
-
-            _request = _req["request"]
-
-        except KeyError:
-
-            try:
-
-                _url = _req["request_uri"]
-
-            except KeyError:
-
-                pass
-
-            else:
-
-                _req_req = self.handle_request_uri(
-
-                    _url, verify=False, sender=_req["client_id"]
-
-                )
-
-        else:
-
-            if isinstance(_request, Message):
-
-                _req_req = _request
-
-            else:
-
-                try:
-
-                    _req_req = self.parse_jwt_request(
-
-                        request, txt=_request, verify=False
-
-                    )
-
-                except Exception:
-
-                    _req_req = self._parse_request(
-
-                        request, _request, "urlencoded", verify=False
-
-                    )
-
-                else:  # remove JWT attributes
-
-                    for attr in JasonWebToken.c_param:
-
-                        try:
-
-                            del _req_req[attr]
-
-                        except KeyError:
-
-                            pass
-
-
-
-        if isinstance(_req_req, Response):
-
-            return _req_req
-
-
-
-        if _req_req:
-
-            if self.events:
-
-                self.events.store("Signed Request", _req_req)
-
-
-
-            for key, val in _req.items():
-
-                if key in ["request", "request_uri"]:
-
-                    continue
-
-                if key not in _req_req:
-
-                    _req_req[key] = val
-
-            _req = _req_req
-
-
-
-        if self.events:
-
-            self.events.store("Combined Request", _req)
-
-
-
-        try:
-
-            _req.verify(keyjar=self.keyjar)
-
-        except Exception as err:
-
-            if self.events:
-
-                self.events.store("Exception", err)
-
-            logger.error(err)
-
-            raise
-
-
-
-        return _req
-
-
-
-    def parse_jwt_request(
-
-        self,
-
-        request=AuthorizationRequest,
-
-        txt="",
-
-        keyjar=None,
-
-        verify=True,
-
-        sender="",
-
-        **kwargs,
-
-    ):
-
-        """Overridden to use OIC Message type."""
-
-        if "keys" in kwargs:
-
-            keyjar = kwargs["keys"]
-
-            warnings.warn(
-
-                "`keys` was renamed to `keyjar`, please update your code.",
-
-                DeprecationWarning,
-
-                stacklevel=2,
-
-            )
-
-        return super().parse_jwt_request(
-
-            request=request, txt=txt, keyjar=keyjar, verify=verify, sender=sender
-
-        )
-
-
-
-    def parse_check_session_request(self, url=None, query=None):
-
-        param = self._parse_urlencoded(url, query)
-
-        assert "id_token" in param  # nosec, ignore the rest
-
-        return deser_id_token(self, param["id_token"][0])
-
-
-
-    def parse_check_id_request(self, url=None, query=None):
-
-        param = self._parse_urlencoded(url, query)
-
-        assert "access_token" in param  # nosec, ignore the rest
-
-        return deser_id_token(self, param["access_token"][0])
-
-
-
-    def _parse_request(self, request_cls, data, sformat, client_id=None, verify=True):
-
-        if sformat == "json":
-
-            request = request_cls().from_json(data)
-
-        elif sformat == "jwt":
-
-            request = request_cls().from_jwt(data, keyjar=self.keyjar, sender=client_id)
-
-        elif sformat == "urlencoded":
-
-            if "?" in data:
-
-                parts = urlparse(data)
-
-                scheme, netloc, path, params, query, fragment = parts[:6]
-
-            else:
-
-                query = data
-
-            request = request_cls().from_urlencoded(query)
-
-        elif sformat == "dict":
-
-            request = request_cls(**data)
-
-        else:
-
-            raise ParseError(
-
-                "Unknown package format: '{}'".format(sformat), request_cls
-
-            )
-
-
-
-        # get the verification keys
-
-        if client_id:
-
-            keys = self.keyjar.verify_keys(client_id)
-
-            sender = client_id
-
-        else:
-
-            try:
-
-                keys = self.keyjar.verify_keys(request["client_id"])
-
-                sender = request["client_id"]
-
-            except KeyError:
-
-                keys = None
-
-                sender = ""
-
-
-
-        logger.debug("Found {} verify keys".format(len(keys or "")))
-
-        if verify:
-
-            request.verify(key=keys, keyjar=self.keyjar, sender=sender)
-
-        return request
-
-
-
-    def parse_open_id_request(self, data, sformat="urlencoded", client_id=None):
-
-        return self._parse_request(OpenIDRequest, data, sformat, client_id)
-
-
-
-    def parse_user_info_request(self, data, sformat="urlencoded"):
-
-        return self._parse_request(UserInfoRequest, data, sformat)
-
-
-
-    def parse_userinfo_request(self, data, sformat="urlencoded"):
-
-        return self._parse_request(UserInfoRequest, data, sformat)
-
-
-
-    def parse_refresh_session_request(self, url=None, query=None):
-
-        if url:
-
-            parts = urlparse(url)
-
-            query = parts.query
-
-        return RefreshSessionRequest().from_urlencoded(query)
-
-
-
-    def parse_registration_request(self, data, sformat="urlencoded"):
-
-        return self._parse_request(RegistrationRequest, data, sformat)
-
-
-
-    def parse_end_session_request(self, query, sformat="urlencoded"):
-
-        esr = self._parse_request(EndSessionRequest, query, sformat)
-
-        # if there is a id_token in there it is as a string
-
-        esr["id_token"] = deser_id_token(self, esr["id_token"])
-
-        return esr
-
-
-
-    @staticmethod
-
-    def update_claims(session, where, about, old_claims=None):
-
-        """
-
-        Update claims dictionary.
-
-
-
-        :param session:
-
-        :param where: Which request
-
-        :param about: userinfo or id_token
-
-        :param old_claims:
-
-        :return: claims or None
-
-        """
-
-        if old_claims is None:
-
-            old_claims = {}
-
-
-
-        req = None
-
-        if where == "oidreq":
-
-            try:
-
-                req = OpenIDRequest().deserialize(session[where], "json")
-
-            except KeyError:
-
-                pass
-
-        else:  # where == "authzreq"
-
-            try:
-
-                req = AuthorizationRequest().deserialize(session[where], "json")
-
-            except KeyError:
-
-                pass
-
-
-
-        if req:
-
-            logger.debug("%s: %s" % (where, sanitize(req.to_dict())))
-
-            try:
-
-                _claims = req["claims"][about]
-
-                if _claims:
-
-                    # update with old claims, do not overwrite
-
-                    for key, val in old_claims.items():
-
-                        if key not in _claims:
-
-                            _claims[key] = val
-
-                    return _claims
-
-            except KeyError:
-
-                pass
-
-
-
-        return old_claims
-
-
-
-    def id_token_claims(self, session):
-
-        """
-
-        Pick the IdToken claims from the request.
-
-
-
-        :param session: Session information
-
-        :return: The IdToken claims
-
-        """
-
-        itc: Dict[str, str] = {}
-
-        itc = self.update_claims(session, "authzreq", "id_token", itc)
-
-        itc = self.update_claims(session, "oidreq", "id_token", itc)
-
-        return itc
-
-
-
-    def make_id_token(
-
-        self,
-
-        session,
-
-        loa="2",
-
-        issuer="",
-
-        alg="RS256",
-
-        code=None,
-
-        access_token=None,
-
-        user_info=None,
-
-        auth_time=0,
-
-        exp=None,
-
-        extra_claims=None,
-
-    ):
-
-        """
-
-        Create ID Token.
-
-
-
-        :param session: Session information
-
-        :param loa: Level of Assurance/Authentication context
-
-        :param issuer: My identifier
-
-        :param alg: Which signing algorithm to use for the IdToken
-
-        :param code: Access grant
-
-        :param access_token: Access Token
-
-        :param user_info: If user info are to be part of the IdToken
-
-        :return: IDToken instance
-
-        """
-
-        # defaults
-
-        if exp is None:
-
-            inawhile = {"days": 1}
-
-        else:
-
-            inawhile = exp
-
-        # Handle the idtoken_claims
-
-        extra = {}
-
-        itc = self.id_token_claims(session)
-
-        if itc.keys():
-
-            try:
-
-                inawhile = {"seconds": itc["max_age"]}
-
-            except KeyError:
-
-                pass
-
-            for key, val in itc.items():
-
-                if key == "auth_time":
-
-                    extra["auth_time"] = auth_time
-
-                elif key == "acr":
-
-                    extra["acr"] = verify_acr_level(val, loa)
-
-        else:
-
-            if auth_time:
-
-                extra["auth_time"] = auth_time
-
-            if loa:
-
-                extra["acr"] = loa
-
-
-
-        if not user_info:
-
-            _args: Dict[str, str] = {}
-
-        else:
-
-            try:
-
-                _args = user_info.to_dict()
-
-            except AttributeError:
-
-                _args = user_info
-
-
-
-        # Make sure that there are no name clashes
-
-        for key in ["iss", "sub", "aud", "exp", "acr", "nonce", "auth_time"]:
-
-            try:
-
-                del _args[key]
-
-            except KeyError:
-
-                pass
-
-
-
-        halg = "HS%s" % alg[-3:]
-
-
-
-        if extra_claims is not None:
-
-            _args.update(extra_claims)
-
-        if code:
-
-            _args["c_hash"] = jws.left_hash(code.encode("utf-8"), halg)
-
-        if access_token:
-
-            _args["at_hash"] = jws.left_hash(access_token.encode("utf-8"), halg)
-
-
-
-        idt = IdToken(
-
-            iss=issuer,
-
-            sub=session["sub"],
-
-            aud=session["client_id"],
-
-            exp=time_util.epoch_in_a_while(**inawhile),
-
-            acr=loa,
-
-            iat=time_util.utc_time_sans_frac(),
-
-            **_args,
-
-        )
-
-
-
-        for key, val in extra.items():
-
-            idt[key] = val
-
-
-
-        if "nonce" in session:
-
-            idt["nonce"] = session["nonce"]
-
-
-
-        return idt
-
-
-
-
-
-def scope2claims(scopes, extra_scope_dict=None):
-
-    res: Dict[str, None] = {}
-
-    # Construct the scope translation map
-
-    trans_map: Dict[str, Any] = SCOPE2CLAIMS.copy()
-
-    if extra_scope_dict is not None:
-
-        trans_map.update(extra_scope_dict)
-
-    for scope in scopes:
-
-        try:
-
-            claims = dict([(name, None) for name in trans_map[scope]])
-
-            res.update(claims)
-
-        except KeyError:
-
-            continue
-
-    return res
+RESTRICTED_RESULT_KEYS    = ['ansible_rsync_path', 'ansible_playbook_python']

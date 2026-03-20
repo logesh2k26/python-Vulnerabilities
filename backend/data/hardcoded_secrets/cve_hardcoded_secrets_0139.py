@@ -2,828 +2,606 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
+"""
+
+Custom Authenticator to use Google OAuth with JupyterHub.
+
+
+
+Derived from the GitHub OAuth authenticator.
+
+"""
+
+
+
 import os
 
-import re
+import json
 
-import urllib
-
-
-
-from django.conf import settings
-
-from django.contrib.auth import SESSION_KEY, REDIRECT_FIELD_NAME
-
-from django.contrib.auth.forms import AuthenticationForm
-
-from django.contrib.sites.models import Site, RequestSite
-
-from django.contrib.auth.models import User
-
-from django.test import TestCase
-
-from django.core import mail
-
-from django.core.urlresolvers import reverse
-
-from django.http import QueryDict
+import urllib.parse
 
 
 
-class AuthViewsTestCase(TestCase):
+from tornado import gen
 
-    """
+from tornado.httpclient import HTTPRequest, AsyncHTTPClient
 
-    Helper base class for all the follow test cases.
+from tornado.auth import GoogleOAuth2Mixin
 
-    """
-
-    fixtures = ['authtestdata.json']
-
-    urls = 'django.contrib.auth.tests.urls'
+from tornado.web import HTTPError
 
 
 
-    def setUp(self):
+from traitlets import Dict, Unicode, List, default, validate, observe
 
-        self.old_LANGUAGES = settings.LANGUAGES
 
-        self.old_LANGUAGE_CODE = settings.LANGUAGE_CODE
 
-        settings.LANGUAGES = (('en', 'English'),)
+from jupyterhub.crypto import decrypt, EncryptionUnavailable, InvalidToken
 
-        settings.LANGUAGE_CODE = 'en'
+from jupyterhub.auth import LocalAuthenticator
 
-        self.old_TEMPLATE_DIRS = settings.TEMPLATE_DIRS
+from jupyterhub.utils import url_path_join
 
-        settings.TEMPLATE_DIRS = (
 
-            os.path.join(os.path.dirname(__file__), 'templates'),
+
+from .oauth2 import OAuthLoginHandler, OAuthCallbackHandler, OAuthenticator
+
+
+
+def check_user_in_groups(member_groups, allowed_groups):
+
+    # Check if user is a member of any group in the allowed groups
+
+    if any(g in member_groups for g in allowed_groups):
+
+        return True  # user _is_ in group
+
+    else:
+
+        return False
+
+
+
+
+
+class GoogleOAuthenticator(OAuthenticator, GoogleOAuth2Mixin):
+
+    _deprecated_aliases = {
+
+        "google_group_whitelist": ("allowed_google_groups", "0.12.0"),
+
+    }
+
+
+
+    @observe(*list(_deprecated_aliases))
+
+    def _deprecated_trait(self, change):
+
+        super()._deprecated_trait(change)
+
+
+
+    google_api_url = Unicode("https://www.googleapis.com", config=True)
+
+
+
+    @default('google_api_url')
+
+    def _google_api_url(self):
+
+        """get default google apis url from env"""
+
+        google_api_url = os.getenv('GOOGLE_API_URL')
+
+
+
+        # default to googleapis.com
+
+        if not google_api_url:
+
+            google_api_url = 'https://www.googleapis.com'
+
+
+
+        return google_api_url
+
+
+
+    @default('scope')
+
+    def _scope_default(self):
+
+        return ['openid', 'email']
+
+
+
+    @default("authorize_url")
+
+    def _authorize_url_default(self):
+
+        return "https://accounts.google.com/o/oauth2/v2/auth"
+
+
+
+    @default("token_url")
+
+    def _token_url_default(self):
+
+        return "%s/oauth2/v4/token" % (self.google_api_url)
+
+
+
+    google_service_account_keys = Dict(
+
+        Unicode(),
+
+        help="Service account keys to use with each domain, see https://developers.google.com/admin-sdk/directory/v1/guides/delegation"
+
+    ).tag(config=True)
+
+
+
+    gsuite_administrator = Dict(
+
+        Unicode(),
+
+        help="Username of a G Suite Administrator for the service account to act as"
+
+    ).tag(config=True)
+
+
+
+    google_group_whitelist = Dict(help="Deprecated, use `GoogleOAuthenticator.allowed_google_groups`", config=True,)
+
+
+
+    allowed_google_groups = Dict(
+
+        List(Unicode()),
+
+        help="Automatically allow members of selected groups"
+
+    ).tag(config=True)
+
+
+
+    admin_google_groups = Dict(
+
+        List(Unicode()),
+
+        help="Groups whose members should have Jupyterhub admin privileges"
+
+    ).tag(config=True)
+
+
+
+    user_info_url = Unicode(
+
+        "https://www.googleapis.com/oauth2/v1/userinfo", config=True
+
+    )
+
+
+
+    hosted_domain = List(
+
+        Unicode(),
+
+        config=True,
+
+        help="""List of domains used to restrict sign-in, e.g. mycollege.edu""",
+
+    )
+
+
+
+    @default('hosted_domain')
+
+    def _hosted_domain_from_env(self):
+
+        domains = []
+
+        for domain in os.environ.get('HOSTED_DOMAIN', '').split(';'):
+
+            if domain:
+
+                # check falsy to avoid trailing separators
+
+                # adding empty domains
+
+                domains.append(domain)
+
+        return domains
+
+
+
+    @validate('hosted_domain')
+
+    def _cast_hosted_domain(self, proposal):
+
+        """handle backward-compatibility with hosted_domain is a single domain as a string"""
+
+        if isinstance(proposal.value, str):
+
+            # pre-0.9 hosted_domain was a string
+
+            # set it to a single item list
+
+            # (or if it's empty, an empty list)
+
+            if proposal.value == '':
+
+                return []
+
+            return [proposal.value]
+
+        return proposal.value
+
+
+
+    login_service = Unicode(
+
+        os.environ.get('LOGIN_SERVICE', 'Google'),
+
+        config=True,
+
+        help="""Google Apps hosted domain string, e.g. My College""",
+
+    )
+
+
+
+    async def authenticate(self, handler, data=None, google_groups=None):
+
+        code = handler.get_argument("code")
+
+        body = urllib.parse.urlencode(
+
+            dict(
+
+                code=code,
+
+                redirect_uri=self.get_callback_url(handler),
+
+                client_id=self.client_id,
+
+                client_secret=self.client_secret,
+
+                grant_type="authorization_code",
+
+            )
 
         )
 
 
 
-    def tearDown(self):
-
-        settings.LANGUAGES = self.old_LANGUAGES
-
-        settings.LANGUAGE_CODE = self.old_LANGUAGE_CODE
-
-        settings.TEMPLATE_DIRS = self.old_TEMPLATE_DIRS
+        http_client = AsyncHTTPClient()
 
 
 
-    def login(self, password='password'):
+        response = await http_client.fetch(
 
-        response = self.client.post('/login/', {
+            self.token_url,
 
-            'username': 'testclient',
+            method="POST",
 
-            'password': password
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+
+            body=body,
+
+        )
+
+
+
+        user = json.loads(response.body.decode("utf-8", "replace"))
+
+        access_token = str(user['access_token'])
+
+        refresh_token = user.get('refresh_token', None)
+
+
+
+        response = await http_client.fetch(
+
+            self.user_info_url + '?access_token=' + access_token
+
+        )
+
+
+
+        if not response:
+
+            handler.clear_all_cookies()
+
+            raise HTTPError(500, 'Google authentication failed')
+
+
+
+        bodyjs = json.loads(response.body.decode())
+
+        user_email = username = bodyjs['email']
+
+        user_email_domain = user_email.split('@')[1]
+
+
+
+        if not bodyjs['verified_email']:
+
+            self.log.warning("Google OAuth unverified email attempt: %s", user_email)
+
+            raise HTTPError(403, "Google email {} not verified".format(user_email))
+
+
+
+        if self.hosted_domain:
+
+            if user_email_domain not in self.hosted_domain:
+
+                self.log.warning(
+
+                    "Google OAuth unauthorized domain attempt: %s", user_email
+
+                )
+
+                raise HTTPError(
+
+                    403,
+
+                    "Google account domain @{} not authorized.".format(
+
+                        user_email_domain
+
+                    ),
+
+                )
+
+            if len(self.hosted_domain) == 1:
+
+                # unambiguous domain, use only base name
+
+                username = user_email.split('@')[0]
+
+
+
+        if refresh_token is None:
+
+            self.log.debug("Refresh token was empty, will try to pull refresh_token from previous auth_state")
+
+            user = handler.find_user(username)
+
+
+
+            if user:
+
+                self.log.debug("encrypted_auth_state was found, will try to decrypt and pull refresh_token from it")
+
+                try:
+
+                    encrypted = user.encrypted_auth_state
+
+                    auth_state = await decrypt(encrypted)
+
+                    refresh_token = auth_state.get('refresh_token')
+
+                except (ValueError, InvalidToken, EncryptionUnavailable) as e:
+
+                    self.log.warning(
+
+                        "Failed to retrieve encrypted auth_state for %s because %s",
+
+                        username,
+
+                        e,
+
+                    )
+
+
+
+        user_info = {
+
+            'name': username,
+
+            'auth_state': {
+
+                'access_token': access_token,
+
+                'refresh_token': refresh_token,
+
+                'google_user': bodyjs
 
             }
 
-        )
+        }
 
-        self.assertEqual(response.status_code, 302)
 
-        self.assertTrue(response['Location'].endswith(settings.LOGIN_REDIRECT_URL))
 
-        self.assertTrue(SESSION_KEY in self.client.session)
+        if self.admin_google_groups or self.allowed_google_groups:
 
+            user_info = await self._add_google_groups_info(user_info, google_groups)
 
 
-class PasswordResetTest(AuthViewsTestCase):
 
+        return user_info
 
 
-    def test_email_not_found(self):
 
-        "Error is raised if the provided email address isn't currently registered"
+    def _service_client_credentials(self, scopes, user_email_domain):
 
-        response = self.client.get('/password_reset/')
+        """
 
-        self.assertEqual(response.status_code, 200)
+        Return a configured service client credentials for the API.
 
-        response = self.client.post('/password_reset/', {'email': 'not_a_real_email@email.com'})
+        """
 
-        self.assertContains(response, "That e-mail address doesn&#39;t have an associated user account")
+        try:
 
-        self.assertEqual(len(mail.outbox), 0)
+            from google.oauth2 import service_account
 
+        except:
 
+            raise ImportError(
 
-    def test_email_found(self):
+                "Could not import google.oauth2's service_account,"
 
-        "Email is sent if a valid email address is provided for password reset"
+                "you may need to run pip install oauthenticator[googlegroups] or not declare google groups"
 
-        response = self.client.post('/password_reset/', {'email': 'staffmember@example.com'})
+            )
 
-        self.assertEqual(response.status_code, 302)
 
-        self.assertEqual(len(mail.outbox), 1)
 
-        self.assertTrue("http://" in mail.outbox[0].body)
+        gsuite_administrator_email = "{}@{}".format(self.gsuite_administrator[user_email_domain], user_email_domain)
 
-        self.assertEqual(settings.DEFAULT_FROM_EMAIL, mail.outbox[0].from_email)
+        self.log.debug("scopes are %s, user_email_domain is %s", scopes, user_email_domain)
 
+        credentials = service_account.Credentials.from_service_account_file(
 
+            self.google_service_account_keys[user_email_domain],
 
-    def test_email_found_custom_from(self):
-
-        "Email is sent if a valid email address is provided for password reset when a custom from_email is provided."
-
-        response = self.client.post('/password_reset_from_email/', {'email': 'staffmember@example.com'})
-
-        self.assertEqual(response.status_code, 302)
-
-        self.assertEqual(len(mail.outbox), 1)
-
-        self.assertEqual("staffmember@example.com", mail.outbox[0].from_email)
-
-
-
-    def _test_confirm_start(self):
-
-        # Start by creating the email
-
-        response = self.client.post('/password_reset/', {'email': 'staffmember@example.com'})
-
-        self.assertEqual(response.status_code, 302)
-
-        self.assertEqual(len(mail.outbox), 1)
-
-        return self._read_signup_email(mail.outbox[0])
-
-
-
-    def _read_signup_email(self, email):
-
-        urlmatch = re.search(r"https?://[^/]*(/.*reset/\S*)", email.body)
-
-        self.assertTrue(urlmatch is not None, "No URL found in sent email")
-
-        return urlmatch.group(), urlmatch.groups()[0]
-
-
-
-    def test_confirm_valid(self):
-
-        url, path = self._test_confirm_start()
-
-        response = self.client.get(path)
-
-        # redirect to a 'complete' page:
-
-        self.assertEqual(response.status_code, 200)
-
-        self.assertTrue("Please enter your new password" in response.content)
-
-
-
-    def test_confirm_invalid(self):
-
-        url, path = self._test_confirm_start()
-
-        # Let's munge the token in the path, but keep the same length,
-
-        # in case the URLconf will reject a different length.
-
-        path = path[:-5] + ("0"*4) + path[-1]
-
-
-
-        response = self.client.get(path)
-
-        self.assertEqual(response.status_code, 200)
-
-        self.assertTrue("The password reset link was invalid" in response.content)
-
-
-
-    def test_confirm_invalid_user(self):
-
-        # Ensure that we get a 200 response for a non-existant user, not a 404
-
-        response = self.client.get('/reset/123456-1-1/')
-
-        self.assertEqual(response.status_code, 200)
-
-        self.assertTrue("The password reset link was invalid" in response.content)
-
-
-
-    def test_confirm_overflow_user(self):
-
-        # Ensure that we get a 200 response for a base36 user id that overflows int
-
-        response = self.client.get('/reset/zzzzzzzzzzzzz-1-1/')
-
-        self.assertEqual(response.status_code, 200)
-
-        self.assertTrue("The password reset link was invalid" in response.content)
-
-
-
-    def test_confirm_invalid_post(self):
-
-        # Same as test_confirm_invalid, but trying
-
-        # to do a POST instead.
-
-        url, path = self._test_confirm_start()
-
-        path = path[:-5] + ("0"*4) + path[-1]
-
-
-
-        response = self.client.post(path, {'new_password1': 'anewpassword',
-
-                                           'new_password2':' anewpassword'})
-
-        # Check the password has not been changed
-
-        u = User.objects.get(email='staffmember@example.com')
-
-        self.assertTrue(not u.check_password("anewpassword"))
-
-
-
-    def test_confirm_complete(self):
-
-        url, path = self._test_confirm_start()
-
-        response = self.client.post(path, {'new_password1': 'anewpassword',
-
-                                           'new_password2': 'anewpassword'})
-
-        # It redirects us to a 'complete' page:
-
-        self.assertEqual(response.status_code, 302)
-
-        # Check the password has been changed
-
-        u = User.objects.get(email='staffmember@example.com')
-
-        self.assertTrue(u.check_password("anewpassword"))
-
-
-
-        # Check we can't use the link again
-
-        response = self.client.get(path)
-
-        self.assertEqual(response.status_code, 200)
-
-        self.assertTrue("The password reset link was invalid" in response.content)
-
-
-
-    def test_confirm_different_passwords(self):
-
-        url, path = self._test_confirm_start()
-
-        response = self.client.post(path, {'new_password1': 'anewpassword',
-
-                                           'new_password2':' x'})
-
-        self.assertEqual(response.status_code, 200)
-
-        self.assertTrue("The two password fields didn&#39;t match" in response.content)
-
-
-
-class ChangePasswordTest(AuthViewsTestCase):
-
-
-
-    def fail_login(self, password='password'):
-
-        response = self.client.post('/login/', {
-
-            'username': 'testclient',
-
-            'password': password
-
-            }
+            scopes=scopes
 
         )
 
-        self.assertEqual(response.status_code, 200)
-
-        self.assertTrue("Please enter a correct username and password. Note that both fields are case-sensitive." in response.content)
 
 
-
-    def logout(self):
-
-        response = self.client.get('/logout/')
+        credentials = credentials.with_subject(gsuite_administrator_email)
 
 
 
-    def test_password_change_fails_with_invalid_old_password(self):
-
-        self.login()
-
-        response = self.client.post('/password_change/', {
-
-            'old_password': 'donuts',
-
-            'new_password1': 'password1',
-
-            'new_password2': 'password1',
-
-            }
-
-        )
-
-        self.assertEqual(response.status_code, 200)
-
-        self.assertTrue("Your old password was entered incorrectly. Please enter it again." in response.content)
+        return credentials
 
 
 
-    def test_password_change_fails_with_mismatched_passwords(self):
+    def _service_client(self, service_name, service_version, credentials, http=None):
 
-        self.login()
+        """
 
-        response = self.client.post('/password_change/', {
+        Return a configured service client for the API.
 
-            'old_password': 'password',
+        """
 
-            'new_password1': 'password1',
+        try:
 
-            'new_password2': 'donuts',
+            from googleapiclient.discovery import build
 
-            }
+        except:
 
-        )
+            raise ImportError(
 
-        self.assertEqual(response.status_code, 200)
+                "Could not import googleapiclient.discovery's build,"
 
-        self.assertTrue("The two password fields didn&#39;t match." in response.content)
+                "you may need to run pip install oauthenticator[googlegroups] or not declare google groups"
 
-
-
-    def test_password_change_succeeds(self):
-
-        self.login()
-
-        response = self.client.post('/password_change/', {
-
-            'old_password': 'password',
-
-            'new_password1': 'password1',
-
-            'new_password2': 'password1',
-
-            }
-
-        )
-
-        self.assertEqual(response.status_code, 302)
-
-        self.assertTrue(response['Location'].endswith('/password_change/done/'))
-
-        self.fail_login()
-
-        self.login(password='password1')
+            )
 
 
 
-class LoginTest(AuthViewsTestCase):
+        self.log.debug("service_name is %s, service_version is %s", service_name, service_version)
 
 
 
-    def test_current_site_in_context_after_login(self):
+        return build(
 
-        response = self.client.get(reverse('django.contrib.auth.views.login'))
+            serviceName=service_name,
 
-        self.assertEqual(response.status_code, 200)
+            version=service_version,
 
-        if Site._meta.installed:
+            credentials=credentials,
 
-            site = Site.objects.get_current()
+            cache_discovery=False,
 
-            self.assertEqual(response.context['site'], site)
+            http=http)
 
-            self.assertEqual(response.context['site_name'], site.name)
+
+
+    async def _google_groups_for_user(self, user_email, credentials, http=None):
+
+        """
+
+        Return google groups a given user is a member of
+
+        """
+
+        service = self._service_client(
+
+            service_name='admin',
+
+            service_version='directory_v1',
+
+            credentials=credentials,
+
+            http=http)
+
+
+
+        results = service.groups().list(userKey=user_email).execute()
+
+        results = [ g['email'].split('@')[0] for g in results.get('groups', [{'email': None}]) ]
+
+        self.log.debug("user_email %s is a member of %s", user_email, results)
+
+        return results
+
+
+
+    async def _add_google_groups_info(self, user_info, google_groups=None):
+
+        user_email_domain=user_info['auth_state']['google_user']['hd']
+
+        user_email=user_info['auth_state']['google_user']['email']
+
+        if google_groups is None:
+
+            credentials = self._service_client_credentials(
+
+                    scopes=['%s/auth/admin.directory.group.readonly' % (self.google_api_url)],
+
+                    user_email_domain=user_email_domain)
+
+            google_groups = await self._google_groups_for_user(
+
+                    user_email=user_email,
+
+                    credentials=credentials)
+
+        user_info['auth_state']['google_user']['google_groups'] = google_groups
+
+
+
+        # Check if user is a member of any admin groups.
+
+        if self.admin_google_groups:
+
+            is_admin = check_user_in_groups(google_groups, self.admin_google_groups[user_email_domain])
+
+        # Check if user is a member of any allowed groups.
+
+        user_in_group = check_user_in_groups(google_groups, self.allowed_google_groups[user_email_domain])
+
+
+
+        if self.admin_google_groups and (is_admin or user_in_group):
+
+            user_info['admin'] = is_admin
+
+            return user_info
+
+        elif user_in_group:
+
+            return user_info
 
         else:
 
-            self.assertIsInstance(response.context['site'], RequestSite)
+            return None
 
-        self.assertTrue(isinstance(response.context['form'], AuthenticationForm),
 
-                     'Login form is not an AuthenticationForm')
 
 
 
-    def test_security_check(self, password='password'):
+class LocalGoogleOAuthenticator(LocalAuthenticator, GoogleOAuthenticator):
 
-        login_url = reverse('django.contrib.auth.views.login')
+    """A version that mixes in local system user creation"""
 
 
 
-        # Those URLs should not pass the security check
-
-        for bad_url in ('http://example.com',
-
-                        'https://example.com',
-
-                        'ftp://exampel.com',
-
-                        '//example.com'):
-
-
-
-            nasty_url = '%(url)s?%(next)s=%(bad_url)s' % {
-
-                'url': login_url,
-
-                'next': REDIRECT_FIELD_NAME,
-
-                'bad_url': urllib.quote(bad_url)
-
-            }
-
-            response = self.client.post(nasty_url, {
-
-                'username': 'testclient',
-
-                'password': password,
-
-                }
-
-            )
-
-            self.assertEqual(response.status_code, 302)
-
-            self.assertFalse(bad_url in response['Location'],
-
-                             "%s should be blocked" % bad_url)
-
-
-
-        # These URLs *should* still pass the security check
-
-        for good_url in ('/view/?param=http://example.com',
-
-                         '/view/?param=https://example.com',
-
-                         '/view?param=ftp://exampel.com',
-
-                         'view/?param=//example.com',
-
-                         'https:///',
-
-                         '//testserver/',
-
-                         '/url%20with%20spaces/', # see ticket #12534
-
-                         ):
-
-            safe_url = '%(url)s?%(next)s=%(good_url)s' % {
-
-                'url': login_url,
-
-                'next': REDIRECT_FIELD_NAME,
-
-                'good_url': urllib.quote(good_url)
-
-            }
-
-            response = self.client.post(safe_url, {
-
-                    'username': 'testclient',
-
-                    'password': password,
-
-                }
-
-            )
-
-            self.assertEqual(response.status_code, 302)
-
-            self.assertTrue(good_url in response['Location'],
-
-                            "%s should be allowed" % good_url)
-
-
-
-
-
-class LoginURLSettings(AuthViewsTestCase):
-
-    urls = 'django.contrib.auth.tests.urls'
-
-
-
-    def setUp(self):
-
-        super(LoginURLSettings, self).setUp()
-
-        self.old_LOGIN_URL = settings.LOGIN_URL
-
-
-
-    def tearDown(self):
-
-        super(LoginURLSettings, self).tearDown()
-
-        settings.LOGIN_URL = self.old_LOGIN_URL
-
-
-
-    def get_login_required_url(self, login_url):
-
-        settings.LOGIN_URL = login_url
-
-        response = self.client.get('/login_required/')
-
-        self.assertEqual(response.status_code, 302)
-
-        return response['Location']
-
-
-
-    def test_standard_login_url(self):
-
-        login_url = '/login/'
-
-        login_required_url = self.get_login_required_url(login_url)
-
-        querystring = QueryDict('', mutable=True)
-
-        querystring['next'] = '/login_required/'
-
-        self.assertEqual(login_required_url,
-
-             'http://testserver%s?%s' % (login_url, querystring.urlencode('/')))
-
-
-
-    def test_remote_login_url(self):
-
-        login_url = 'http://remote.example.com/login'
-
-        login_required_url = self.get_login_required_url(login_url)
-
-        querystring = QueryDict('', mutable=True)
-
-        querystring['next'] = 'http://testserver/login_required/'
-
-        self.assertEqual(login_required_url,
-
-                         '%s?%s' % (login_url, querystring.urlencode('/')))
-
-
-
-    def test_https_login_url(self):
-
-        login_url = 'https:///login/'
-
-        login_required_url = self.get_login_required_url(login_url)
-
-        querystring = QueryDict('', mutable=True)
-
-        querystring['next'] = 'http://testserver/login_required/'
-
-        self.assertEqual(login_required_url,
-
-                         '%s?%s' % (login_url, querystring.urlencode('/')))
-
-
-
-    def test_login_url_with_querystring(self):
-
-        login_url = '/login/?pretty=1'
-
-        login_required_url = self.get_login_required_url(login_url)
-
-        querystring = QueryDict('pretty=1', mutable=True)
-
-        querystring['next'] = '/login_required/'
-
-        self.assertEqual(login_required_url, 'http://testserver/login/?%s' %
-
-                         querystring.urlencode('/'))
-
-
-
-    def test_remote_login_url_with_next_querystring(self):
-
-        login_url = 'http://remote.example.com/login/'
-
-        login_required_url = self.get_login_required_url('%s?next=/default/' %
-
-                                                         login_url)
-
-        querystring = QueryDict('', mutable=True)
-
-        querystring['next'] = 'http://testserver/login_required/'
-
-        self.assertEqual(login_required_url, '%s?%s' % (login_url,
-
-                                                    querystring.urlencode('/')))
-
-
-
-
-
-class LogoutTest(AuthViewsTestCase):
-
-    urls = 'django.contrib.auth.tests.urls'
-
-
-
-    def confirm_logged_out(self):
-
-        self.assertTrue(SESSION_KEY not in self.client.session)
-
-
-
-    def test_logout_default(self):
-
-        "Logout without next_page option renders the default template"
-
-        self.login()
-
-        response = self.client.get('/logout/')
-
-        self.assertEqual(200, response.status_code)
-
-        self.assertTrue('Logged out' in response.content)
-
-        self.confirm_logged_out()
-
-
-
-    def test_14377(self):
-
-        # Bug 14377
-
-        self.login()
-
-        response = self.client.get('/logout/')
-
-        self.assertTrue('site' in response.context)
-
-
-
-    def test_logout_with_overridden_redirect_url(self):
-
-        # Bug 11223
-
-        self.login()
-
-        response = self.client.get('/logout/next_page/')
-
-        self.assertEqual(response.status_code, 302)
-
-        self.assertTrue(response['Location'].endswith('/somewhere/'))
-
-
-
-        response = self.client.get('/logout/next_page/?next=/login/')
-
-        self.assertEqual(response.status_code, 302)
-
-        self.assertTrue(response['Location'].endswith('/login/'))
-
-
-
-        self.confirm_logged_out()
-
-
-
-    def test_logout_with_next_page_specified(self):
-
-        "Logout with next_page option given redirects to specified resource"
-
-        self.login()
-
-        response = self.client.get('/logout/next_page/')
-
-        self.assertEqual(response.status_code, 302)
-
-        self.assertTrue(response['Location'].endswith('/somewhere/'))
-
-        self.confirm_logged_out()
-
-
-
-    def test_logout_with_redirect_argument(self):
-
-        "Logout with query string redirects to specified resource"
-
-        self.login()
-
-        response = self.client.get('/logout/?next=/login/')
-
-        self.assertEqual(response.status_code, 302)
-
-        self.assertTrue(response['Location'].endswith('/login/'))
-
-        self.confirm_logged_out()
-
-
-
-    def test_logout_with_custom_redirect_argument(self):
-
-        "Logout with custom query string redirects to specified resource"
-
-        self.login()
-
-        response = self.client.get('/logout/custom_query/?follow=/somewhere/')
-
-        self.assertEqual(response.status_code, 302)
-
-        self.assertTrue(response['Location'].endswith('/somewhere/'))
-
-        self.confirm_logged_out()
-
-
-
-    def test_security_check(self, password='password'):
-
-        logout_url = reverse('django.contrib.auth.views.logout')
-
-
-
-        # Those URLs should not pass the security check
-
-        for bad_url in ('http://example.com',
-
-                        'https://example.com',
-
-                        'ftp://exampel.com',
-
-                        '//example.com'
-
-                        ):
-
-            nasty_url = '%(url)s?%(next)s=%(bad_url)s' % {
-
-                'url': logout_url,
-
-                'next': REDIRECT_FIELD_NAME,
-
-                'bad_url': urllib.quote(bad_url)
-
-            }
-
-            self.login()
-
-            response = self.client.get(nasty_url)
-
-            self.assertEqual(response.status_code, 302)
-
-            self.assertFalse(bad_url in response['Location'],
-
-                             "%s should be blocked" % bad_url)
-
-            self.confirm_logged_out()
-
-
-
-        # These URLs *should* still pass the security check
-
-        for good_url in ('/view/?param=http://example.com',
-
-                         '/view/?param=https://example.com',
-
-                         '/view?param=ftp://exampel.com',
-
-                         'view/?param=//example.com',
-
-                         'https:///',
-
-                         '//testserver/',
-
-                         '/url%20with%20spaces/', # see ticket #12534
-
-                         ):
-
-            safe_url = '%(url)s?%(next)s=%(good_url)s' % {
-
-                'url': logout_url,
-
-                'next': REDIRECT_FIELD_NAME,
-
-                'good_url': urllib.quote(good_url)
-
-            }
-
-            self.login()
-
-            response = self.client.get(safe_url)
-
-            self.assertEqual(response.status_code, 302)
-
-            self.assertTrue(good_url in response['Location'],
-
-                            "%s should be allowed" % good_url)
-
-            self.confirm_logged_out()
+    pass

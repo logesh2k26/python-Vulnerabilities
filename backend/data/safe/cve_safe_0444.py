@@ -1,421 +1,95 @@
 # Source: CVEFixes dataset
-# Safety: vulnerable
+# Safety: safe
 # Category: safe
 
-# This file is dual licensed under the terms of the Apache License, Version
+# -*- coding: utf-8 -*-
 
-# 2.0, and the BSD License. See the LICENSE file in the root of this repository
+from datetime import timedelta
 
-# for complete details.
 
 
+from django.conf import settings
 
-from __future__ import absolute_import, division, print_function
+from django.contrib.auth import get_user_model
 
+from django.contrib.auth.backends import ModelBackend
 
+from django.utils import timezone
 
-import binascii
 
 
+from nopassword.models import LoginCode
 
-import pytest
 
 
 
-from cryptography.exceptions import (
 
-    AlreadyFinalized, InvalidKey, _Reasons
+class NoPasswordBackend(ModelBackend):
 
-)
 
-from cryptography.hazmat.backends.interfaces import HMACBackend
 
-from cryptography.hazmat.primitives import hashes
+    def authenticate(self, request, username=None, code=None, **kwargs):
 
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF, HKDFExpand
+        if username is None:
 
+            username = kwargs.get(get_user_model().USERNAME_FIELD)
 
 
-from ...utils import raises_unsupported_algorithm
 
+        if not username or not code:
 
+            return
 
 
 
-@pytest.mark.requires_backend_interface(interface=HMACBackend)
+        try:
 
-class TestHKDF(object):
+            user = get_user_model()._default_manager.get_by_natural_key(username)
 
-    def test_length_limit(self, backend):
 
-        big_length = 255 * (hashes.SHA256().digest_size // 8) + 1
 
+            if not self.user_can_authenticate(user):
 
+                return
 
-        with pytest.raises(ValueError):
 
-            HKDF(
 
-                hashes.SHA256(),
+            timeout = getattr(settings, 'NOPASSWORD_LOGIN_CODE_TIMEOUT', 900)
 
-                big_length,
+            timestamp = timezone.now() - timedelta(seconds=timeout)
 
-                salt=None,
 
-                info=None,
 
-                backend=backend
+            # We don't delete the login code when authenticating,
 
-            )
+            # as that is done during validation of the login form
 
+            # and validation should not have any side effects.
 
+            # It is the responsibility of the view/form to delete the token
 
-    def test_already_finalized(self, backend):
+            # as soon as the login was successful.
 
-        hkdf = HKDF(
 
-            hashes.SHA256(),
 
-            16,
+            for c in LoginCode.objects.filter(user=user, timestamp__gt=timestamp):
 
-            salt=None,
+                if c.code == code:
 
-            info=None,
+                    user.login_code = c
 
-            backend=backend
+                    return user
 
-        )
+            return
 
 
 
-        hkdf.derive(b"\x01" * 16)
+        except (get_user_model().DoesNotExist, LoginCode.DoesNotExist):
 
+            return
 
 
-        with pytest.raises(AlreadyFinalized):
 
-            hkdf.derive(b"\x02" * 16)
+    def send_login_code(self, code, context, **kwargs):
 
-
-
-        hkdf = HKDF(
-
-            hashes.SHA256(),
-
-            16,
-
-            salt=None,
-
-            info=None,
-
-            backend=backend
-
-        )
-
-
-
-        hkdf.verify(b"\x01" * 16, b"gJ\xfb{\xb1Oi\xc5sMC\xb7\xe4@\xf7u")
-
-
-
-        with pytest.raises(AlreadyFinalized):
-
-            hkdf.verify(b"\x02" * 16, b"gJ\xfb{\xb1Oi\xc5sMC\xb7\xe4@\xf7u")
-
-
-
-        hkdf = HKDF(
-
-            hashes.SHA256(),
-
-            16,
-
-            salt=None,
-
-            info=None,
-
-            backend=backend
-
-        )
-
-
-
-    def test_verify(self, backend):
-
-        hkdf = HKDF(
-
-            hashes.SHA256(),
-
-            16,
-
-            salt=None,
-
-            info=None,
-
-            backend=backend
-
-        )
-
-
-
-        hkdf.verify(b"\x01" * 16, b"gJ\xfb{\xb1Oi\xc5sMC\xb7\xe4@\xf7u")
-
-
-
-    def test_verify_invalid(self, backend):
-
-        hkdf = HKDF(
-
-            hashes.SHA256(),
-
-            16,
-
-            salt=None,
-
-            info=None,
-
-            backend=backend
-
-        )
-
-
-
-        with pytest.raises(InvalidKey):
-
-            hkdf.verify(b"\x02" * 16, b"gJ\xfb{\xb1Oi\xc5sMC\xb7\xe4@\xf7u")
-
-
-
-    def test_unicode_typeerror(self, backend):
-
-        with pytest.raises(TypeError):
-
-            HKDF(
-
-                hashes.SHA256(),
-
-                16,
-
-                salt=u"foo",
-
-                info=None,
-
-                backend=backend
-
-            )
-
-
-
-        with pytest.raises(TypeError):
-
-            HKDF(
-
-                hashes.SHA256(),
-
-                16,
-
-                salt=None,
-
-                info=u"foo",
-
-                backend=backend
-
-            )
-
-
-
-        with pytest.raises(TypeError):
-
-            hkdf = HKDF(
-
-                hashes.SHA256(),
-
-                16,
-
-                salt=None,
-
-                info=None,
-
-                backend=backend
-
-            )
-
-
-
-            hkdf.derive(u"foo")
-
-
-
-        with pytest.raises(TypeError):
-
-            hkdf = HKDF(
-
-                hashes.SHA256(),
-
-                16,
-
-                salt=None,
-
-                info=None,
-
-                backend=backend
-
-            )
-
-
-
-            hkdf.verify(u"foo", b"bar")
-
-
-
-        with pytest.raises(TypeError):
-
-            hkdf = HKDF(
-
-                hashes.SHA256(),
-
-                16,
-
-                salt=None,
-
-                info=None,
-
-                backend=backend
-
-            )
-
-
-
-            hkdf.verify(b"foo", u"bar")
-
-
-
-
-
-@pytest.mark.requires_backend_interface(interface=HMACBackend)
-
-class TestHKDFExpand(object):
-
-    def test_derive(self, backend):
-
-        prk = binascii.unhexlify(
-
-            b"077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5"
-
-        )
-
-
-
-        okm = (b"3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c"
-
-               b"5bf34007208d5b887185865")
-
-
-
-        info = binascii.unhexlify(b"f0f1f2f3f4f5f6f7f8f9")
-
-        hkdf = HKDFExpand(hashes.SHA256(), 42, info, backend)
-
-
-
-        assert binascii.hexlify(hkdf.derive(prk)) == okm
-
-
-
-    def test_verify(self, backend):
-
-        prk = binascii.unhexlify(
-
-            b"077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5"
-
-        )
-
-
-
-        okm = (b"3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c"
-
-               b"5bf34007208d5b887185865")
-
-
-
-        info = binascii.unhexlify(b"f0f1f2f3f4f5f6f7f8f9")
-
-        hkdf = HKDFExpand(hashes.SHA256(), 42, info, backend)
-
-
-
-        assert hkdf.verify(prk, binascii.unhexlify(okm)) is None
-
-
-
-    def test_invalid_verify(self, backend):
-
-        prk = binascii.unhexlify(
-
-            b"077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5"
-
-        )
-
-
-
-        info = binascii.unhexlify(b"f0f1f2f3f4f5f6f7f8f9")
-
-        hkdf = HKDFExpand(hashes.SHA256(), 42, info, backend)
-
-
-
-        with pytest.raises(InvalidKey):
-
-            hkdf.verify(prk, b"wrong key")
-
-
-
-    def test_already_finalized(self, backend):
-
-        info = binascii.unhexlify(b"f0f1f2f3f4f5f6f7f8f9")
-
-        hkdf = HKDFExpand(hashes.SHA256(), 42, info, backend)
-
-
-
-        hkdf.derive(b"first")
-
-
-
-        with pytest.raises(AlreadyFinalized):
-
-            hkdf.derive(b"second")
-
-
-
-    def test_unicode_error(self, backend):
-
-        info = binascii.unhexlify(b"f0f1f2f3f4f5f6f7f8f9")
-
-        hkdf = HKDFExpand(hashes.SHA256(), 42, info, backend)
-
-
-
-        with pytest.raises(TypeError):
-
-            hkdf.derive(u"first")
-
-
-
-
-
-def test_invalid_backend():
-
-    pretend_backend = object()
-
-
-
-    with raises_unsupported_algorithm(_Reasons.BACKEND_MISSING_INTERFACE):
-
-        HKDF(hashes.SHA256(), 16, None, None, pretend_backend)
-
-
-
-    with raises_unsupported_algorithm(_Reasons.BACKEND_MISSING_INTERFACE):
-
-        HKDFExpand(hashes.SHA256(), 16, None, pretend_backend)
+        raise NotImplementedError

@@ -2,128 +2,410 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-#     Copyright 2014 Netflix, Inc.
+# -*- coding: utf-8 -*-
+
+# Copyright 2015, 2016 OpenMarket Ltd
 
 #
 
-#     Licensed under the Apache License, Version 2.0 (the "License");
+# Licensed under the Apache License, Version 2.0 (the "License");
 
-#     you may not use this file except in compliance with the License.
+# you may not use this file except in compliance with the License.
 
-#     You may obtain a copy of the License at
-
-#
-
-#         http://www.apache.org/licenses/LICENSE-2.0
+# You may obtain a copy of the License at
 
 #
 
-#     Unless required by applicable law or agreed to in writing, software
+#     http://www.apache.org/licenses/LICENSE-2.0
 
-#     distributed under the License is distributed on an "AS IS" BASIS,
+#
 
-#     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# Unless required by applicable law or agreed to in writing, software
 
-#     See the License for the specific language governing permissions and
+# distributed under the License is distributed on an "AS IS" BASIS,
 
-#     limitations under the License.
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 
-from setuptools import setup
+# See the License for the specific language governing permissions and
+
+# limitations under the License.
+
+import logging
 
 
 
-setup(
+from synapse.api.errors import SynapseError
 
-    name='security_monkey',
+from synapse.crypto.event_signing import check_event_content_hash
 
-    version='0.8.0',
+from synapse.events import FrozenEvent
 
-    long_description=__doc__,
+from synapse.events.utils import prune_event
 
-    packages=['security_monkey'],
+from synapse.http.servlet import assert_params_in_request
 
-    include_package_data=True,
+from synapse.util import unwrapFirstError, logcontext
 
-    zip_safe=False,
+from twisted.internet import defer
 
-    install_requires=[
 
-        'APScheduler==2.1.2',
 
-        'Flask==0.10.1',
+logger = logging.getLogger(__name__)
 
-        'Flask-Login==0.2.10',
 
-        'Flask-Mail==0.9.0',
 
-        'Flask-Migrate==1.3.1',
 
-        'Flask-Principal==0.4.0',
 
-        'Flask-RESTful==0.3.3',
+class FederationBase(object):
 
-        'Flask-SQLAlchemy==1.0',
+    def __init__(self, hs):
 
-        'Flask-Script==0.6.3',
+        self.hs = hs
 
-        'Flask-Security==1.7.4',
 
-        'Flask-WTF==0.9.5',
 
-        'Jinja2==2.8',
+        self.server_name = hs.hostname
 
-        'SQLAlchemy==0.9.2',
+        self.keyring = hs.get_keyring()
 
-        'boto>=2.41.0',
+        self.spam_checker = hs.get_spam_checker()
 
-        'ipaddr==2.1.11',
+        self.store = hs.get_datastore()
 
-        'itsdangerous==0.23',
+        self._clock = hs.get_clock()
 
-        'psycopg2==2.5.2',
 
-        'bcrypt==2.0.0',
 
-        'Sphinx==1.2.2',
+    @defer.inlineCallbacks
 
-        'gunicorn==18.0',
+    def _check_sigs_and_hash_and_fetch(self, origin, pdus, outlier=False,
 
-        'cryptography==1.3.2',
+                                       include_none=False):
 
-        'boto3>=1.4.2',
+        """Takes a list of PDUs and checks the signatures and hashs of each
 
-        'botocore>=1.4.81',
+        one. If a PDU fails its signature check then we check if we have it in
 
-        'dpath==1.3.2',
+        the database and if not then request if from the originating server of
 
-        'pyyaml==3.11',
+        that PDU.
 
-        'jira==0.32',
 
-        'cloudaux>=1.0.6',
 
-        'joblib>=0.9.4',
+        If a PDU fails its content hash check then it is redacted.
 
-        'pyjwt>=1.01',
 
-    ],
 
-    extras_require = {
+        The given list of PDUs are not modified, instead the function returns
 
-        'onelogin': ['python-saml>=2.2.0'],
+        a new list.
 
-        'tests': [
 
-            'nose==1.3.0',
 
-            'mock==1.0.1',
+        Args:
 
-            'moto==0.4.30',
+            pdu (list)
 
-            'freezegun>=0.3.7'
+            outlier (bool)
+
+
+
+        Returns:
+
+            Deferred : A list of PDUs that have valid signatures and hashes.
+
+        """
+
+        deferreds = self._check_sigs_and_hashes(pdus)
+
+
+
+        @defer.inlineCallbacks
+
+        def handle_check_result(pdu, deferred):
+
+            try:
+
+                res = yield logcontext.make_deferred_yieldable(deferred)
+
+            except SynapseError:
+
+                res = None
+
+
+
+            if not res:
+
+                # Check local db.
+
+                res = yield self.store.get_event(
+
+                    pdu.event_id,
+
+                    allow_rejected=True,
+
+                    allow_none=True,
+
+                )
+
+
+
+            if not res and pdu.origin != origin:
+
+                try:
+
+                    res = yield self.get_pdu(
+
+                        destinations=[pdu.origin],
+
+                        event_id=pdu.event_id,
+
+                        outlier=outlier,
+
+                        timeout=10000,
+
+                    )
+
+                except SynapseError:
+
+                    pass
+
+
+
+            if not res:
+
+                logger.warn(
+
+                    "Failed to find copy of %s with valid signature",
+
+                    pdu.event_id,
+
+                )
+
+
+
+            defer.returnValue(res)
+
+
+
+        handle = logcontext.preserve_fn(handle_check_result)
+
+        deferreds2 = [
+
+            handle(pdu, deferred)
+
+            for pdu, deferred in zip(pdus, deferreds)
 
         ]
 
-    }
 
-)
+
+        valid_pdus = yield logcontext.make_deferred_yieldable(
+
+            defer.gatherResults(
+
+                deferreds2,
+
+                consumeErrors=True,
+
+            )
+
+        ).addErrback(unwrapFirstError)
+
+
+
+        if include_none:
+
+            defer.returnValue(valid_pdus)
+
+        else:
+
+            defer.returnValue([p for p in valid_pdus if p])
+
+
+
+    def _check_sigs_and_hash(self, pdu):
+
+        return logcontext.make_deferred_yieldable(
+
+            self._check_sigs_and_hashes([pdu])[0],
+
+        )
+
+
+
+    def _check_sigs_and_hashes(self, pdus):
+
+        """Checks that each of the received events is correctly signed by the
+
+        sending server.
+
+
+
+        Args:
+
+            pdus (list[FrozenEvent]): the events to be checked
+
+
+
+        Returns:
+
+            list[Deferred]: for each input event, a deferred which:
+
+              * returns the original event if the checks pass
+
+              * returns a redacted version of the event (if the signature
+
+                matched but the hash did not)
+
+              * throws a SynapseError if the signature check failed.
+
+            The deferreds run their callbacks in the sentinel logcontext.
+
+        """
+
+
+
+        redacted_pdus = [
+
+            prune_event(pdu)
+
+            for pdu in pdus
+
+        ]
+
+
+
+        deferreds = self.keyring.verify_json_objects_for_server([
+
+            (p.origin, p.get_pdu_json())
+
+            for p in redacted_pdus
+
+        ])
+
+
+
+        ctx = logcontext.LoggingContext.current_context()
+
+
+
+        def callback(_, pdu, redacted):
+
+            with logcontext.PreserveLoggingContext(ctx):
+
+                if not check_event_content_hash(pdu):
+
+                    logger.warn(
+
+                        "Event content has been tampered, redacting %s: %s",
+
+                        pdu.event_id, pdu.get_pdu_json()
+
+                    )
+
+                    return redacted
+
+
+
+                if self.spam_checker.check_event_for_spam(pdu):
+
+                    logger.warn(
+
+                        "Event contains spam, redacting %s: %s",
+
+                        pdu.event_id, pdu.get_pdu_json()
+
+                    )
+
+                    return redacted
+
+
+
+                return pdu
+
+
+
+        def errback(failure, pdu):
+
+            failure.trap(SynapseError)
+
+            with logcontext.PreserveLoggingContext(ctx):
+
+                logger.warn(
+
+                    "Signature check failed for %s",
+
+                    pdu.event_id,
+
+                )
+
+            return failure
+
+
+
+        for deferred, pdu, redacted in zip(deferreds, pdus, redacted_pdus):
+
+            deferred.addCallbacks(
+
+                callback, errback,
+
+                callbackArgs=[pdu, redacted],
+
+                errbackArgs=[pdu],
+
+            )
+
+
+
+        return deferreds
+
+
+
+
+
+def event_from_pdu_json(pdu_json, outlier=False):
+
+    """Construct a FrozenEvent from an event json received over federation
+
+
+
+    Args:
+
+        pdu_json (object): pdu as received over federation
+
+        outlier (bool): True to mark this event as an outlier
+
+
+
+    Returns:
+
+        FrozenEvent
+
+
+
+    Raises:
+
+        SynapseError: if the pdu is missing required fields
+
+    """
+
+    # we could probably enforce a bunch of other fields here (room_id, sender,
+
+    # origin, etc etc)
+
+    assert_params_in_request(pdu_json, ('event_id', 'type'))
+
+    event = FrozenEvent(
+
+        pdu_json
+
+    )
+
+
+
+    event.internal_metadata.outlier = outlier
+
+
+
+    return event

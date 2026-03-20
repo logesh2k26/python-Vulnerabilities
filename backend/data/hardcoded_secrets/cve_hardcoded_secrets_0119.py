@@ -2,1180 +2,1330 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-##############################################################################
+#!/usr/bin/env python2
 
-#
+# vim:fileencoding=utf-8
 
-# Copyright (c) 2002 Zope Foundation and Contributors.
+from __future__ import (unicode_literals, division, absolute_import,
 
-# All Rights Reserved.
+                        print_function)
 
-#
 
-# This software is subject to the provisions of the Zope Public License,
 
-# Version 2.1 (ZPL).  A copy of the ZPL should accompany this distribution.
+__license__ = 'GPL v3'
 
-# THIS SOFTWARE IS PROVIDED "AS IS" AND ANY AND ALL EXPRESS OR IMPLIED
+__copyright__ = '2013, Kovid Goyal <kovid at kovidgoyal.net>'
 
-# WARRANTIES ARE DISCLAIMED, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
 
-# WARRANTIES OF TITLE, MERCHANTABILITY, AGAINST INFRINGEMENT, AND FITNESS
 
-# FOR A PARTICULAR PURPOSE.
+import time, textwrap, json
 
-#
+from bisect import bisect_right
 
-##############################################################################
+from base64 import b64encode
 
-"""HTTP Request Parser tests
+from future_builtins import map
 
-"""
+from threading import Thread
 
-import unittest
+from Queue import Queue, Empty
 
+from functools import partial
 
+from urlparse import urlparse
 
-from waitress.compat import text_, tobytes
 
 
+from PyQt5.Qt import (
 
+    QWidget, QVBoxLayout, QApplication, QSize, QNetworkAccessManager, QMenu, QIcon,
 
+    QNetworkReply, QTimer, QNetworkRequest, QUrl, Qt, QNetworkDiskCache, QToolBar,
 
-class TestHTTPRequestParser(unittest.TestCase):
+    pyqtSlot, pyqtSignal)
 
-    def setUp(self):
+from PyQt5.QtWebKitWidgets import QWebView, QWebInspector, QWebPage
 
-        from waitress.parser import HTTPRequestParser
 
-        from waitress.adjustments import Adjustments
 
+from calibre import prints
 
+from calibre.constants import iswindows
 
-        my_adj = Adjustments()
+from calibre.ebooks.oeb.polish.parsing import parse
 
-        self.parser = HTTPRequestParser(my_adj)
+from calibre.ebooks.oeb.base import serialize, OEB_DOCS
 
+from calibre.ptempfile import PersistentTemporaryDirectory
 
+from calibre.gui2 import error_dialog, open_url, NO_URL_FORMATTING
 
-    def test_get_body_stream_None(self):
+from calibre.gui2.tweak_book import current_container, editors, tprefs, actions, TOP
 
-        self.parser.body_recv = None
+from calibre.gui2.viewer.documentview import apply_settings
 
-        result = self.parser.get_body_stream()
+from calibre.gui2.viewer.config import config
 
-        self.assertEqual(result.getvalue(), b"")
+from calibre.gui2.widgets2 import HistoryLineEdit2
 
+from calibre.utils.ipc.simple_worker import offload_worker
 
 
-    def test_get_body_stream_nonNone(self):
 
-        body_rcv = DummyBodyStream()
+shutdown = object()
 
-        self.parser.body_rcv = body_rcv
 
-        result = self.parser.get_body_stream()
 
-        self.assertEqual(result, body_rcv)
 
 
+def get_data(name):
 
-    def test_received_get_no_headers(self):
+    'Get the data for name. Returns a unicode string if name is a text document/stylesheet'
 
-        data = b"HTTP/1.0 GET /foobar\r\n\r\n"
+    if name in editors:
 
-        result = self.parser.received(data)
+        return editors[name].get_raw_data()
 
-        self.assertEqual(result, 24)
+    return current_container().raw_data(name)
 
-        self.assertTrue(self.parser.completed)
 
-        self.assertEqual(self.parser.headers, {})
 
+# Parsing of html to add linenumbers {{{
 
 
-    def test_received_bad_host_header(self):
 
-        from waitress.utilities import BadRequest
 
 
+def parse_html(raw):
 
-        data = b"HTTP/1.0 GET /foobar\r\n Host: foo\r\n\r\n"
+    root = parse(raw, decoder=lambda x:x.decode('utf-8'), line_numbers=True, linenumber_attribute='data-lnum')
 
-        result = self.parser.received(data)
+    return serialize(root, 'text/html').encode('utf-8')
 
-        self.assertEqual(result, 36)
 
-        self.assertTrue(self.parser.completed)
 
-        self.assertEqual(self.parser.error.__class__, BadRequest)
 
 
+class ParseItem(object):
 
-    def test_received_bad_transfer_encoding(self):
 
-        from waitress.utilities import ServerNotImplemented
 
-        data = (
+    __slots__ = ('name', 'length', 'fingerprint', 'parsing_done', 'parsed_data')
 
-            b"GET /foobar HTTP/1.1\r\n"
 
-            b"Transfer-Encoding: foo\r\n"
 
-            b"\r\n"
+    def __init__(self, name):
 
-            b"1d;\r\n"
+        self.name = name
 
-            b"This string has 29 characters\r\n"
+        self.length, self.fingerprint = 0, None
 
-            b"0\r\n\r\n"
+        self.parsed_data = None
 
-        )
+        self.parsing_done = False
 
-        result = self.parser.received(data)
 
-        self.assertEqual(result, 48)
 
-        self.assertTrue(self.parser.completed)
+    def __repr__(self):
 
-        self.assertEqual(self.parser.error.__class__, ServerNotImplemented)
+        return 'ParsedItem(name=%r, length=%r, fingerprint=%r, parsing_done=%r, parsed_data_is_None=%r)' % (
 
+            self.name, self.length, self.fingerprint, self.parsing_done, self.parsed_data is None)
 
 
-    def test_received_nonsense_nothing(self):
 
-        data = b"\r\n\r\n"
 
-        result = self.parser.received(data)
 
-        self.assertEqual(result, 4)
+class ParseWorker(Thread):
 
-        self.assertTrue(self.parser.completed)
 
-        self.assertEqual(self.parser.headers, {})
 
+    daemon = True
 
+    SLEEP_TIME = 1
 
-    def test_received_no_doublecr(self):
 
-        data = b"GET /foobar HTTP/8.4\r\n"
 
-        result = self.parser.received(data)
+    def __init__(self):
 
-        self.assertEqual(result, 22)
+        Thread.__init__(self)
 
-        self.assertFalse(self.parser.completed)
+        self.requests = Queue()
 
-        self.assertEqual(self.parser.headers, {})
+        self.request_count = 0
 
+        self.parse_items = {}
 
+        self.launch_error = None
 
-    def test_received_already_completed(self):
 
-        self.parser.completed = True
 
-        result = self.parser.received(b"a")
+    def run(self):
 
-        self.assertEqual(result, 0)
-
-
-
-    def test_received_cl_too_large(self):
-
-        from waitress.utilities import RequestEntityTooLarge
-
-
-
-        self.parser.adj.max_request_body_size = 2
-
-        data = b"GET /foobar HTTP/8.4\r\nContent-Length: 10\r\n\r\n"
-
-        result = self.parser.received(data)
-
-        self.assertEqual(result, 44)
-
-        self.assertTrue(self.parser.completed)
-
-        self.assertTrue(isinstance(self.parser.error, RequestEntityTooLarge))
-
-
-
-    def test_received_headers_too_large(self):
-
-        from waitress.utilities import RequestHeaderFieldsTooLarge
-
-
-
-        self.parser.adj.max_request_header_size = 2
-
-        data = b"GET /foobar HTTP/8.4\r\nX-Foo: 1\r\n\r\n"
-
-        result = self.parser.received(data)
-
-        self.assertEqual(result, 34)
-
-        self.assertTrue(self.parser.completed)
-
-        self.assertTrue(isinstance(self.parser.error, RequestHeaderFieldsTooLarge))
-
-
-
-    def test_received_body_too_large(self):
-
-        from waitress.utilities import RequestEntityTooLarge
-
-
-
-        self.parser.adj.max_request_body_size = 2
-
-        data = (
-
-            b"GET /foobar HTTP/1.1\r\n"
-
-            b"Transfer-Encoding: chunked\r\n"
-
-            b"X-Foo: 1\r\n"
-
-            b"\r\n"
-
-            b"1d;\r\n"
-
-            b"This string has 29 characters\r\n"
-
-            b"0\r\n\r\n"
-
-        )
-
-
-
-        result = self.parser.received(data)
-
-        self.assertEqual(result, 62)
-
-        self.parser.received(data[result:])
-
-        self.assertTrue(self.parser.completed)
-
-        self.assertTrue(isinstance(self.parser.error, RequestEntityTooLarge))
-
-
-
-    def test_received_error_from_parser(self):
-
-        from waitress.utilities import BadRequest
-
-
-
-        data = (
-
-            b"GET /foobar HTTP/1.1\r\n"
-
-            b"Transfer-Encoding: chunked\r\n"
-
-            b"X-Foo: 1\r\n"
-
-            b"\r\n"
-
-            b"garbage\r\n"
-
-        )
-
-        # header
-
-        result = self.parser.received(data)
-
-        # body
-
-        result = self.parser.received(data[result:])
-
-        self.assertEqual(result, 9)
-
-        self.assertTrue(self.parser.completed)
-
-        self.assertTrue(isinstance(self.parser.error, BadRequest))
-
-
-
-    def test_received_chunked_completed_sets_content_length(self):
-
-        data = (
-
-            b"GET /foobar HTTP/1.1\r\n"
-
-            b"Transfer-Encoding: chunked\r\n"
-
-            b"X-Foo: 1\r\n"
-
-            b"\r\n"
-
-            b"1d;\r\n"
-
-            b"This string has 29 characters\r\n"
-
-            b"0\r\n\r\n"
-
-        )
-
-        result = self.parser.received(data)
-
-        self.assertEqual(result, 62)
-
-        data = data[result:]
-
-        result = self.parser.received(data)
-
-        self.assertTrue(self.parser.completed)
-
-        self.assertTrue(self.parser.error is None)
-
-        self.assertEqual(self.parser.headers["CONTENT_LENGTH"], "29")
-
-
-
-    def test_parse_header_gardenpath(self):
-
-        data = b"GET /foobar HTTP/8.4\r\nfoo: bar\r\n"
-
-        self.parser.parse_header(data)
-
-        self.assertEqual(self.parser.first_line, b"GET /foobar HTTP/8.4")
-
-        self.assertEqual(self.parser.headers["FOO"], "bar")
-
-
-
-    def test_parse_header_no_cr_in_headerplus(self):
-
-        from waitress.parser import ParsingError
-
-
-
-        data = b"GET /foobar HTTP/8.4"
-
-
+        mod, func = 'calibre.gui2.tweak_book.preview', 'parse_html'
 
         try:
 
-            self.parser.parse_header(data)
+            # Connect to the worker and send a dummy job to initialize it
 
-        except ParsingError:
+            self.worker = offload_worker(priority='low')
 
-            pass
+            self.worker(mod, func, '<p></p>')
 
-        else:  # pragma: nocover
+        except:
 
-            self.assertTrue(False)
+            import traceback
 
+            traceback.print_exc()
 
+            self.launch_error = traceback.format_exc()
 
-    def test_parse_header_bad_content_length(self):
+            return
 
-        from waitress.parser import ParsingError
 
 
+        while True:
 
-        data = b"GET /foobar HTTP/8.4\r\ncontent-length: abc\r\n"
+            time.sleep(self.SLEEP_TIME)
 
+            x = self.requests.get()
 
+            requests = [x]
 
-        try:
+            while True:
 
-            self.parser.parse_header(data)
+                try:
 
-        except ParsingError as e:
+                    requests.append(self.requests.get_nowait())
 
-            self.assertIn("Content-Length is invalid", e.args[0])
+                except Empty:
 
-        else:  # pragma: nocover
+                    break
 
-            self.assertTrue(False)
+            if shutdown in requests:
 
+                self.worker.shutdown()
 
+                break
 
-    def test_parse_header_multiple_content_length(self):
+            request = sorted(requests, reverse=True)[0]
 
-        from waitress.parser import ParsingError
+            del requests
 
+            pi, data = request[1:]
 
+            try:
 
-        data = b"GET /foobar HTTP/8.4\r\ncontent-length: 10\r\ncontent-length: 20\r\n"
+                res = self.worker(mod, func, data)
 
+            except:
 
+                import traceback
 
-        try:
+                traceback.print_exc()
 
-            self.parser.parse_header(data)
+            else:
 
-        except ParsingError as e:
+                pi.parsing_done = True
 
-            self.assertIn("Content-Length is invalid", e.args[0])
+                parsed_data = res['result']
 
-        else:  # pragma: nocover
+                if res['tb']:
 
-            self.assertTrue(False)
+                    prints("Parser error:")
 
+                    prints(res['tb'])
 
+                else:
 
-    def test_parse_header_11_te_chunked(self):
+                    pi.parsed_data = parsed_data
 
-        # NB: test that capitalization of header value is unimportant
 
-        data = b"GET /foobar HTTP/1.1\r\ntransfer-encoding: ChUnKed\r\n"
 
-        self.parser.parse_header(data)
+    def add_request(self, name):
 
-        self.assertEqual(self.parser.body_rcv.__class__.__name__, "ChunkedReceiver")
+        data = get_data(name)
 
+        ldata, hdata = len(data), hash(data)
 
+        pi = self.parse_items.get(name, None)
 
+        if pi is None:
 
+            self.parse_items[name] = pi = ParseItem(name)
 
-    def test_parse_header_transfer_encoding_invalid(self):
+        else:
 
-        from waitress.parser import TransferEncodingNotImplemented
-
-
-
-        data = b"GET /foobar HTTP/1.1\r\ntransfer-encoding: gzip\r\n"
-
-
-
-        try:
-
-            self.parser.parse_header(data)
-
-        except TransferEncodingNotImplemented as e:
-
-            self.assertIn("Transfer-Encoding requested is not supported.", e.args[0])
-
-        else:  # pragma: nocover
-
-            self.assertTrue(False)
-
-
-
-    def test_parse_header_transfer_encoding_invalid_multiple(self):
-
-        from waitress.parser import TransferEncodingNotImplemented
-
-
-
-        data = b"GET /foobar HTTP/1.1\r\ntransfer-encoding: gzip\r\ntransfer-encoding: chunked\r\n"
-
-
-
-        try:
-
-            self.parser.parse_header(data)
-
-        except TransferEncodingNotImplemented as e:
-
-            self.assertIn("Transfer-Encoding requested is not supported.", e.args[0])
-
-        else:  # pragma: nocover
-
-            self.assertTrue(False)
-
-
-
-    def test_parse_header_11_expect_continue(self):
-
-        data = b"GET /foobar HTTP/1.1\r\nexpect: 100-continue\r\n"
-
-        self.parser.parse_header(data)
-
-        self.assertEqual(self.parser.expect_continue, True)
-
-
-
-    def test_parse_header_connection_close(self):
-
-        data = b"GET /foobar HTTP/1.1\r\nConnection: close\r\n"
-
-        self.parser.parse_header(data)
-
-        self.assertEqual(self.parser.connection_close, True)
-
-
-
-    def test_close_with_body_rcv(self):
-
-        body_rcv = DummyBodyStream()
-
-        self.parser.body_rcv = body_rcv
-
-        self.parser.close()
-
-        self.assertTrue(body_rcv.closed)
-
-
-
-    def test_close_with_no_body_rcv(self):
-
-        self.parser.body_rcv = None
-
-        self.parser.close()  # doesn't raise
-
-
-
-    def test_parse_header_lf_only(self):
-
-        from waitress.parser import ParsingError
-
-
-
-        data = b"GET /foobar HTTP/8.4\nfoo: bar"
-
-
-
-        try:
-
-            self.parser.parse_header(data)
-
-        except ParsingError:
-
-            pass
-
-        else:  # pragma: nocover
-
-            self.assertTrue(False)
-
-
-
-    def test_parse_header_cr_only(self):
-
-        from waitress.parser import ParsingError
-
-
-
-        data = b"GET /foobar HTTP/8.4\rfoo: bar"
-
-        try:
-
-            self.parser.parse_header(data)
-
-        except ParsingError:
-
-            pass
-
-        else:  # pragma: nocover
-
-            self.assertTrue(False)
-
-
-
-    def test_parse_header_extra_lf_in_header(self):
-
-        from waitress.parser import ParsingError
-
-
-
-        data = b"GET /foobar HTTP/8.4\r\nfoo: \nbar\r\n"
-
-        try:
-
-            self.parser.parse_header(data)
-
-        except ParsingError as e:
-
-            self.assertIn("Bare CR or LF found in header line", e.args[0])
-
-        else:  # pragma: nocover
-
-            self.assertTrue(False)
-
-
-
-    def test_parse_header_extra_lf_in_first_line(self):
-
-        from waitress.parser import ParsingError
-
-
-
-        data = b"GET /foobar\n HTTP/8.4\r\n"
-
-        try:
-
-            self.parser.parse_header(data)
-
-        except ParsingError as e:
-
-            self.assertIn("Bare CR or LF found in HTTP message", e.args[0])
-
-        else:  # pragma: nocover
-
-            self.assertTrue(False)
-
-
-
-    def test_parse_header_invalid_whitespace(self):
-
-        from waitress.parser import ParsingError
-
-
-
-        data = b"GET /foobar HTTP/8.4\r\nfoo : bar\r\n"
-
-        try:
-
-            self.parser.parse_header(data)
-
-        except ParsingError as e:
-
-            self.assertIn("Invalid whitespace after field-name", e.args[0])
-
-        else:  # pragma: nocover
-
-            self.assertTrue(False)
-
-
-
-
-
-class Test_split_uri(unittest.TestCase):
-
-    def _callFUT(self, uri):
-
-        from waitress.parser import split_uri
-
-
-
-        (
-
-            self.proxy_scheme,
-
-            self.proxy_netloc,
-
-            self.path,
-
-            self.query,
-
-            self.fragment,
-
-        ) = split_uri(uri)
-
-
-
-    def test_split_uri_unquoting_unneeded(self):
-
-        self._callFUT(b"http://localhost:8080/abc def")
-
-        self.assertEqual(self.path, "/abc def")
-
-
-
-    def test_split_uri_unquoting_needed(self):
-
-        self._callFUT(b"http://localhost:8080/abc%20def")
-
-        self.assertEqual(self.path, "/abc def")
-
-
-
-    def test_split_url_with_query(self):
-
-        self._callFUT(b"http://localhost:8080/abc?a=1&b=2")
-
-        self.assertEqual(self.path, "/abc")
-
-        self.assertEqual(self.query, "a=1&b=2")
-
-
-
-    def test_split_url_with_query_empty(self):
-
-        self._callFUT(b"http://localhost:8080/abc?")
-
-        self.assertEqual(self.path, "/abc")
-
-        self.assertEqual(self.query, "")
-
-
-
-    def test_split_url_with_fragment(self):
-
-        self._callFUT(b"http://localhost:8080/#foo")
-
-        self.assertEqual(self.path, "/")
-
-        self.assertEqual(self.fragment, "foo")
-
-
-
-    def test_split_url_https(self):
-
-        self._callFUT(b"https://localhost:8080/")
-
-        self.assertEqual(self.path, "/")
-
-        self.assertEqual(self.proxy_scheme, "https")
-
-        self.assertEqual(self.proxy_netloc, "localhost:8080")
-
-
-
-    def test_split_uri_unicode_error_raises_parsing_error(self):
-
-        # See https://github.com/Pylons/waitress/issues/64
-
-        from waitress.parser import ParsingError
-
-
-
-        # Either pass or throw a ParsingError, just don't throw another type of
-
-        # exception as that will cause the connection to close badly:
-
-        try:
-
-            self._callFUT(b"/\xd0")
-
-        except ParsingError:
-
-            pass
-
-
-
-    def test_split_uri_path(self):
-
-        self._callFUT(b"//testing/whatever")
-
-        self.assertEqual(self.path, "//testing/whatever")
-
-        self.assertEqual(self.proxy_scheme, "")
-
-        self.assertEqual(self.proxy_netloc, "")
-
-        self.assertEqual(self.query, "")
-
-        self.assertEqual(self.fragment, "")
-
-
-
-    def test_split_uri_path_query(self):
-
-        self._callFUT(b"//testing/whatever?a=1&b=2")
-
-        self.assertEqual(self.path, "//testing/whatever")
-
-        self.assertEqual(self.proxy_scheme, "")
-
-        self.assertEqual(self.proxy_netloc, "")
-
-        self.assertEqual(self.query, "a=1&b=2")
-
-        self.assertEqual(self.fragment, "")
-
-
-
-    def test_split_uri_path_query_fragment(self):
-
-        self._callFUT(b"//testing/whatever?a=1&b=2#fragment")
-
-        self.assertEqual(self.path, "//testing/whatever")
-
-        self.assertEqual(self.proxy_scheme, "")
-
-        self.assertEqual(self.proxy_netloc, "")
-
-        self.assertEqual(self.query, "a=1&b=2")
-
-        self.assertEqual(self.fragment, "fragment")
-
-
-
-
-
-class Test_get_header_lines(unittest.TestCase):
-
-    def _callFUT(self, data):
-
-        from waitress.parser import get_header_lines
-
-
-
-        return get_header_lines(data)
-
-
-
-    def test_get_header_lines(self):
-
-        result = self._callFUT(b"slam\r\nslim")
-
-        self.assertEqual(result, [b"slam", b"slim"])
-
-
-
-    def test_get_header_lines_folded(self):
-
-        # From RFC2616:
-
-        # HTTP/1.1 header field values can be folded onto multiple lines if the
-
-        # continuation line begins with a space or horizontal tab. All linear
-
-        # white space, including folding, has the same semantics as SP. A
-
-        # recipient MAY replace any linear white space with a single SP before
-
-        # interpreting the field value or forwarding the message downstream.
-
-
-
-        # We are just preserving the whitespace that indicates folding.
-
-        result = self._callFUT(b"slim\r\n slam")
-
-        self.assertEqual(result, [b"slim slam"])
-
-
-
-    def test_get_header_lines_tabbed(self):
-
-        result = self._callFUT(b"slam\r\n\tslim")
-
-        self.assertEqual(result, [b"slam\tslim"])
-
-
-
-    def test_get_header_lines_malformed(self):
-
-        # https://corte.si/posts/code/pathod/pythonservers/index.html
-
-        from waitress.parser import ParsingError
-
-
-
-        self.assertRaises(ParsingError, self._callFUT, b" Host: localhost\r\n\r\n")
-
-
-
-
-
-class Test_crack_first_line(unittest.TestCase):
-
-    def _callFUT(self, line):
-
-        from waitress.parser import crack_first_line
-
-
-
-        return crack_first_line(line)
-
-
-
-    def test_crack_first_line_matchok(self):
-
-        result = self._callFUT(b"GET / HTTP/1.0")
-
-        self.assertEqual(result, (b"GET", b"/", b"1.0"))
-
-
-
-    def test_crack_first_line_lowercase_method(self):
-
-        from waitress.parser import ParsingError
-
-
-
-        self.assertRaises(ParsingError, self._callFUT, b"get / HTTP/1.0")
-
-
-
-    def test_crack_first_line_nomatch(self):
-
-        result = self._callFUT(b"GET / bleh")
-
-        self.assertEqual(result, (b"", b"", b""))
-
-
-
-        result = self._callFUT(b"GET /info?txtAirPlay&txtRAOP RTSP/1.0")
-
-        self.assertEqual(result, (b"", b"", b""))
-
-
-
-    def test_crack_first_line_missing_version(self):
-
-        result = self._callFUT(b"GET /")
-
-        self.assertEqual(result, (b"GET", b"/", b""))
-
-
-
-
-
-class TestHTTPRequestParserIntegration(unittest.TestCase):
-
-    def setUp(self):
-
-        from waitress.parser import HTTPRequestParser
-
-        from waitress.adjustments import Adjustments
-
-
-
-        my_adj = Adjustments()
-
-        self.parser = HTTPRequestParser(my_adj)
-
-
-
-    def feed(self, data):
-
-        parser = self.parser
-
-
-
-        for n in range(100):  # make sure we never loop forever
-
-            consumed = parser.received(data)
-
-            data = data[consumed:]
-
-
-
-            if parser.completed:
+            if pi.parsing_done and pi.length == ldata and pi.fingerprint == hdata:
 
                 return
 
-        raise ValueError("Looping")  # pragma: no cover
+            pi.parsed_data = None
 
+            pi.parsing_done = False
 
+        pi.length, pi.fingerprint = ldata, hdata
 
-    def testSimpleGET(self):
+        self.requests.put((self.request_count, pi, data))
 
-        data = (
+        self.request_count += 1
 
-            b"GET /foobar HTTP/8.4\r\n"
 
-            b"FirstName: mickey\r\n"
 
-            b"lastname: Mouse\r\n"
+    def shutdown(self):
 
-            b"content-length: 6\r\n"
+        self.requests.put(shutdown)
 
-            b"\r\n"
 
-            b"Hello."
 
-        )
+    def get_data(self, name):
 
-        parser = self.parser
+        return getattr(self.parse_items.get(name, None), 'parsed_data', None)
 
-        self.feed(data)
 
-        self.assertTrue(parser.completed)
 
-        self.assertEqual(parser.version, "8.4")
+    def clear(self):
 
-        self.assertFalse(parser.empty)
+        self.parse_items.clear()
 
-        self.assertEqual(
 
-            parser.headers,
 
-            {"FIRSTNAME": "mickey", "LASTNAME": "Mouse", "CONTENT_LENGTH": "6",},
+    def is_alive(self):
 
-        )
+        return Thread.is_alive(self) or (hasattr(self, 'worker') and self.worker.is_alive())
 
-        self.assertEqual(parser.path, "/foobar")
 
-        self.assertEqual(parser.command, "GET")
 
-        self.assertEqual(parser.query, "")
+parse_worker = ParseWorker()
 
-        self.assertEqual(parser.proxy_scheme, "")
+# }}}
 
-        self.assertEqual(parser.proxy_netloc, "")
 
-        self.assertEqual(parser.get_body_stream().getvalue(), b"Hello.")
 
+# Override network access to load data "live" from the editors {{{
 
 
-    def testComplexGET(self):
 
-        data = (
 
-            b"GET /foo/a+%2B%2F%C3%A4%3D%26a%3Aint?d=b+%2B%2F%3D%26b%3Aint&c+%2B%2F%3D%26c%3Aint=6 HTTP/8.4\r\n"
 
-            b"FirstName: mickey\r\n"
+class NetworkReply(QNetworkReply):
 
-            b"lastname: Mouse\r\n"
 
-            b"content-length: 10\r\n"
 
-            b"\r\n"
+    def __init__(self, parent, request, mime_type, name):
 
-            b"Hello mickey."
+        QNetworkReply.__init__(self, parent)
 
-        )
+        self.setOpenMode(QNetworkReply.ReadOnly | QNetworkReply.Unbuffered)
 
-        parser = self.parser
+        self.setRequest(request)
 
-        self.feed(data)
+        self.setUrl(request.url())
 
-        self.assertEqual(parser.command, "GET")
+        self._aborted = False
 
-        self.assertEqual(parser.version, "8.4")
+        if mime_type in OEB_DOCS:
 
-        self.assertFalse(parser.empty)
+            self.resource_name = name
 
-        self.assertEqual(
+            QTimer.singleShot(0, self.check_for_parse)
 
-            parser.headers,
+        else:
 
-            {"FIRSTNAME": "mickey", "LASTNAME": "Mouse", "CONTENT_LENGTH": "10"},
+            data = get_data(name)
 
-        )
+            if isinstance(data, type('')):
 
-        # path should be utf-8 encoded
+                data = data.encode('utf-8')
 
-        self.assertEqual(
+                mime_type += '; charset=utf-8'
 
-            tobytes(parser.path).decode("utf-8"),
+            self.__data = data
 
-            text_(b"/foo/a++/\xc3\xa4=&a:int", "utf-8"),
+            self.setHeader(QNetworkRequest.ContentTypeHeader, mime_type)
 
-        )
+            self.setHeader(QNetworkRequest.ContentLengthHeader, len(self.__data))
 
-        self.assertEqual(
+            QTimer.singleShot(0, self.finalize_reply)
 
-            parser.query, "d=b+%2B%2F%3D%26b%3Aint&c+%2B%2F%3D%26c%3Aint=6"
 
-        )
 
-        self.assertEqual(parser.get_body_stream().getvalue(), b"Hello mick")
+    def check_for_parse(self):
 
+        if self._aborted:
 
+            return
 
-    def testProxyGET(self):
+        data = parse_worker.get_data(self.resource_name)
 
-        data = (
+        if data is None:
 
-            b"GET https://example.com:8080/foobar HTTP/8.4\r\n"
+            return QTimer.singleShot(10, self.check_for_parse)
 
-            b"content-length: 6\r\n"
+        self.__data = data
 
-            b"\r\n"
+        self.setHeader(QNetworkRequest.ContentTypeHeader, 'application/xhtml+xml; charset=utf-8')
 
-            b"Hello."
+        self.setHeader(QNetworkRequest.ContentLengthHeader, len(self.__data))
 
-        )
+        self.finalize_reply()
 
-        parser = self.parser
 
-        self.feed(data)
 
-        self.assertTrue(parser.completed)
+    def bytesAvailable(self):
 
-        self.assertEqual(parser.version, "8.4")
+        try:
 
-        self.assertFalse(parser.empty)
+            return len(self.__data)
 
-        self.assertEqual(parser.headers, {"CONTENT_LENGTH": "6"})
+        except AttributeError:
 
-        self.assertEqual(parser.path, "/foobar")
+            return 0
 
-        self.assertEqual(parser.command, "GET")
 
-        self.assertEqual(parser.proxy_scheme, "https")
 
-        self.assertEqual(parser.proxy_netloc, "example.com:8080")
+    def isSequential(self):
 
-        self.assertEqual(parser.command, "GET")
+        return True
 
-        self.assertEqual(parser.query, "")
 
-        self.assertEqual(parser.get_body_stream().getvalue(), b"Hello.")
 
+    def abort(self):
 
+        self._aborted = True
 
-    def testDuplicateHeaders(self):
 
-        # Ensure that headers with the same key get concatenated as per
 
-        # RFC2616.
+    def readData(self, maxlen):
 
-        data = (
+        ans, self.__data = self.__data[:maxlen], self.__data[maxlen:]
 
-            b"GET /foobar HTTP/8.4\r\n"
+        return ans
 
-            b"x-forwarded-for: 10.11.12.13\r\n"
+    read = readData
 
-            b"x-forwarded-for: unknown,127.0.0.1\r\n"
 
-            b"X-Forwarded_for: 255.255.255.255\r\n"
 
-            b"content-length: 6\r\n"
+    def finalize_reply(self):
 
-            b"\r\n"
+        if self._aborted:
 
-            b"Hello."
+            return
 
-        )
+        self.setFinished(True)
 
-        self.feed(data)
+        self.setAttribute(QNetworkRequest.HttpStatusCodeAttribute, 200)
 
-        self.assertTrue(self.parser.completed)
+        self.setAttribute(QNetworkRequest.HttpReasonPhraseAttribute, "Ok")
 
-        self.assertEqual(
+        self.metaDataChanged.emit()
 
-            self.parser.headers,
+        self.downloadProgress.emit(len(self.__data), len(self.__data))
 
-            {
+        self.readyRead.emit()
 
-                "CONTENT_LENGTH": "6",
+        self.finished.emit()
 
-                "X_FORWARDED_FOR": "10.11.12.13, unknown,127.0.0.1",
 
-            },
 
-        )
 
 
+class NetworkAccessManager(QNetworkAccessManager):
 
-    def testSpoofedHeadersDropped(self):
 
-        data = (
 
-            b"GET /foobar HTTP/8.4\r\n"
+    OPERATION_NAMES = {getattr(QNetworkAccessManager, '%sOperation'%x) :
 
-            b"x-auth_user: bob\r\n"
+            x.upper() for x in ('Head', 'Get', 'Put', 'Post', 'Delete',
 
-            b"content-length: 6\r\n"
+                'Custom')
 
-            b"\r\n"
+    }
 
-            b"Hello."
 
-        )
 
-        self.feed(data)
+    def __init__(self, *args):
 
-        self.assertTrue(self.parser.completed)
+        QNetworkAccessManager.__init__(self, *args)
 
-        self.assertEqual(self.parser.headers, {"CONTENT_LENGTH": "6",})
+        self.current_root = None
 
+        self.cache = QNetworkDiskCache(self)
 
+        self.setCache(self.cache)
 
+        self.cache.setCacheDirectory(PersistentTemporaryDirectory(prefix='disk_cache_'))
 
+        self.cache.setMaximumCacheSize(0)
 
-class DummyBodyStream(object):
 
-    def getfile(self):
 
-        return self
+    def createRequest(self, operation, request, data):
 
+        url = unicode(request.url().toString(NO_URL_FORMATTING))
 
+        if operation == self.GetOperation and url.startswith('file://'):
 
-    def getbuf(self):
+            path = url[7:]
 
-        return self
+            if iswindows and path.startswith('/'):
 
+                path = path[1:]
 
+            c = current_container()
 
-    def close(self):
+            try:
 
-        self.closed = True
+                name = c.abspath_to_name(path, root=self.current_root)
+
+            except ValueError:  # Happens on windows with absolute paths on different drives
+
+                name = None
+
+            if c.has_name(name):
+
+                try:
+
+                    return NetworkReply(self, request, c.mime_map.get(name, 'application/octet-stream'), name)
+
+                except Exception:
+
+                    import traceback
+
+                    traceback.print_exc()
+
+        return QNetworkAccessManager.createRequest(self, operation, request, data)
+
+
+
+# }}}
+
+
+
+
+
+def uniq(vals):
+
+    ''' Remove all duplicates from vals, while preserving order.  '''
+
+    vals = vals or ()
+
+    seen = set()
+
+    seen_add = seen.add
+
+    return tuple(x for x in vals if x not in seen and not seen_add(x))
+
+
+
+
+
+def find_le(a, x):
+
+    'Find rightmost value in a less than or equal to x'
+
+    try:
+
+        return a[bisect_right(a, x)]
+
+    except IndexError:
+
+        return a[-1]
+
+
+
+
+
+class WebPage(QWebPage):
+
+
+
+    sync_requested = pyqtSignal(object, object, object)
+
+    split_requested = pyqtSignal(object, object)
+
+
+
+    def __init__(self, parent):
+
+        QWebPage.__init__(self, parent)
+
+        settings = self.settings()
+
+        apply_settings(settings, config().parse())
+
+        settings.setMaximumPagesInCache(0)
+
+        settings.setAttribute(settings.JavaEnabled, False)
+
+        settings.setAttribute(settings.PluginsEnabled, False)
+
+        settings.setAttribute(settings.PrivateBrowsingEnabled, True)
+
+        settings.setAttribute(settings.JavascriptCanOpenWindows, False)
+
+        settings.setAttribute(settings.JavascriptCanAccessClipboard, False)
+
+        settings.setAttribute(settings.LinksIncludedInFocusChain, False)
+
+        settings.setAttribute(settings.DeveloperExtrasEnabled, True)
+
+        settings.setDefaultTextEncoding('utf-8')
+
+        data = 'data:text/css;charset=utf-8;base64,'
+
+        css = '[data-in-split-mode="1"] [data-is-block="1"]:hover { cursor: pointer !important; border-top: solid 5px green !important }'
+
+        data += b64encode(css.encode('utf-8'))
+
+        settings.setUserStyleSheetUrl(QUrl(data))
+
+
+
+        self.setNetworkAccessManager(NetworkAccessManager(self))
+
+        self.setLinkDelegationPolicy(self.DelegateAllLinks)
+
+        self.mainFrame().javaScriptWindowObjectCleared.connect(self.init_javascript)
+
+        self.init_javascript()
+
+
+
+    @dynamic_property
+
+    def current_root(self):
+
+        def fget(self):
+
+            return self.networkAccessManager().current_root
+
+
+
+        def fset(self, val):
+
+            self.networkAccessManager().current_root = val
+
+        return property(fget=fget, fset=fset)
+
+
+
+    def javaScriptConsoleMessage(self, msg, lineno, source_id):
+
+        prints('preview js:%s:%s:'%(unicode(source_id), lineno), unicode(msg))
+
+
+
+    def init_javascript(self):
+
+        if not hasattr(self, 'js'):
+
+            from calibre.utils.resources import compiled_coffeescript
+
+            self.js = compiled_coffeescript('ebooks.oeb.display.utils', dynamic=False)
+
+            self.js += P('csscolorparser.js', data=True, allow_user_override=False)
+
+            self.js += compiled_coffeescript('ebooks.oeb.polish.preview', dynamic=False)
+
+        self._line_numbers = None
+
+        mf = self.mainFrame()
+
+        mf.addToJavaScriptWindowObject("py_bridge", self)
+
+        mf.evaluateJavaScript(self.js)
+
+
+
+    @pyqtSlot(str, str, str)
+
+    def request_sync(self, tag_name, href, sourceline_address):
+
+        try:
+
+            self.sync_requested.emit(unicode(tag_name), unicode(href), json.loads(unicode(sourceline_address)))
+
+        except (TypeError, ValueError, OverflowError, AttributeError):
+
+            pass
+
+
+
+    def go_to_anchor(self, anchor, lnum):
+
+        self.mainFrame().evaluateJavaScript('window.calibre_preview_integration.go_to_anchor(%s, %s)' % (
+
+            json.dumps(anchor), json.dumps(str(lnum))))
+
+
+
+    @pyqtSlot(str, str)
+
+    def request_split(self, loc, totals):
+
+        actions['split-in-preview'].setChecked(False)
+
+        loc, totals = json.loads(unicode(loc)), json.loads(unicode(totals))
+
+        if not loc or not totals:
+
+            return error_dialog(self.view(), _('Invalid location'),
+
+                                _('Cannot split on the body tag'), show=True)
+
+        self.split_requested.emit(loc, totals)
+
+
+
+    @property
+
+    def line_numbers(self):
+
+        if self._line_numbers is None:
+
+            def atoi(x):
+
+                try:
+
+                    ans = int(x)
+
+                except (TypeError, ValueError):
+
+                    ans = None
+
+                return ans
+
+            val = self.mainFrame().evaluateJavaScript('window.calibre_preview_integration.line_numbers()')
+
+            self._line_numbers = sorted(uniq(filter(lambda x:x is not None, map(atoi, val))))
+
+        return self._line_numbers
+
+
+
+    def go_to_line(self, lnum):
+
+        try:
+
+            lnum = find_le(self.line_numbers, lnum)
+
+        except IndexError:
+
+            return
+
+        self.mainFrame().evaluateJavaScript(
+
+            'window.calibre_preview_integration.go_to_line(%d)' % lnum)
+
+
+
+    def go_to_sourceline_address(self, sourceline_address):
+
+        lnum, tags = sourceline_address
+
+        if lnum is None:
+
+            return
+
+        tags = [x.lower() for x in tags]
+
+        self.mainFrame().evaluateJavaScript(
+
+            'window.calibre_preview_integration.go_to_sourceline_address(%d, %s)' % (lnum, json.dumps(tags)))
+
+
+
+    def split_mode(self, enabled):
+
+        self.mainFrame().evaluateJavaScript(
+
+            'window.calibre_preview_integration.split_mode(%s)' % (
+
+                'true' if enabled else 'false'))
+
+
+
+
+
+class WebView(QWebView):
+
+
+
+    def __init__(self, parent=None):
+
+        QWebView.__init__(self, parent)
+
+        self.inspector = QWebInspector(self)
+
+        w = QApplication.instance().desktop().availableGeometry(self).width()
+
+        self._size_hint = QSize(int(w/3), int(w/2))
+
+        self._page = WebPage(self)
+
+        self.setPage(self._page)
+
+        self.inspector.setPage(self._page)
+
+        self.clear()
+
+        self.setAcceptDrops(False)
+
+
+
+    def sizeHint(self):
+
+        return self._size_hint
+
+
+
+    def refresh(self):
+
+        self.pageAction(self.page().Reload).trigger()
+
+
+
+    @dynamic_property
+
+    def scroll_pos(self):
+
+        def fget(self):
+
+            mf = self.page().mainFrame()
+
+            return (mf.scrollBarValue(Qt.Horizontal), mf.scrollBarValue(Qt.Vertical))
+
+
+
+        def fset(self, val):
+
+            mf = self.page().mainFrame()
+
+            mf.setScrollBarValue(Qt.Horizontal, val[0])
+
+            mf.setScrollBarValue(Qt.Vertical, val[1])
+
+        return property(fget=fget, fset=fset)
+
+
+
+    def clear(self):
+
+        self.setHtml(_(
+
+            '''
+
+            <h3>Live preview</h3>
+
+
+
+            <p>Here you will see a live preview of the HTML file you are currently editing.
+
+            The preview will update automatically as you make changes.
+
+
+
+            <p style="font-size:x-small; color: gray">Note that this is a quick preview
+
+            only, it is not intended to simulate an actual ebook reader. Some
+
+            aspects of your ebook will not work, such as page breaks and page margins.
+
+            '''))
+
+        self.page().current_root = None
+
+
+
+    def setUrl(self, qurl):
+
+        self.page().current_root = current_container().root
+
+        return QWebView.setUrl(self, qurl)
+
+
+
+    def inspect(self):
+
+        self.inspector.parent().show()
+
+        self.inspector.parent().raise_()
+
+        self.pageAction(self.page().InspectElement).trigger()
+
+
+
+    def contextMenuEvent(self, ev):
+
+        menu = QMenu(self)
+
+        p = self.page()
+
+        mf = p.mainFrame()
+
+        r = mf.hitTestContent(ev.pos())
+
+        url = unicode(r.linkUrl().toString(NO_URL_FORMATTING)).strip()
+
+        ca = self.pageAction(QWebPage.Copy)
+
+        if ca.isEnabled():
+
+            menu.addAction(ca)
+
+        menu.addAction(actions['reload-preview'])
+
+        menu.addAction(QIcon(I('debug.png')), _('Inspect element'), self.inspect)
+
+        if url.partition(':')[0].lower() in {'http', 'https'}:
+
+            menu.addAction(_('Open link'), partial(open_url, r.linkUrl()))
+
+        menu.exec_(ev.globalPos())
+
+
+
+
+
+class Preview(QWidget):
+
+
+
+    sync_requested = pyqtSignal(object, object)
+
+    split_requested = pyqtSignal(object, object, object)
+
+    split_start_requested = pyqtSignal()
+
+    link_clicked = pyqtSignal(object, object)
+
+    refresh_starting = pyqtSignal()
+
+    refreshed = pyqtSignal()
+
+
+
+    def __init__(self, parent=None):
+
+        QWidget.__init__(self, parent)
+
+        self.l = l = QVBoxLayout()
+
+        self.setLayout(l)
+
+        l.setContentsMargins(0, 0, 0, 0)
+
+        self.view = WebView(self)
+
+        self.view.page().sync_requested.connect(self.request_sync)
+
+        self.view.page().split_requested.connect(self.request_split)
+
+        self.view.page().loadFinished.connect(self.load_finished)
+
+        self.inspector = self.view.inspector
+
+        self.inspector.setPage(self.view.page())
+
+        l.addWidget(self.view)
+
+        self.bar = QToolBar(self)
+
+        l.addWidget(self.bar)
+
+
+
+        ac = actions['auto-reload-preview']
+
+        ac.setCheckable(True)
+
+        ac.setChecked(True)
+
+        ac.toggled.connect(self.auto_reload_toggled)
+
+        self.auto_reload_toggled(ac.isChecked())
+
+        self.bar.addAction(ac)
+
+
+
+        ac = actions['sync-preview-to-editor']
+
+        ac.setCheckable(True)
+
+        ac.setChecked(True)
+
+        ac.toggled.connect(self.sync_toggled)
+
+        self.sync_toggled(ac.isChecked())
+
+        self.bar.addAction(ac)
+
+
+
+        self.bar.addSeparator()
+
+
+
+        ac = actions['split-in-preview']
+
+        ac.setCheckable(True)
+
+        ac.setChecked(False)
+
+        ac.toggled.connect(self.split_toggled)
+
+        self.split_toggled(ac.isChecked())
+
+        self.bar.addAction(ac)
+
+
+
+        ac = actions['reload-preview']
+
+        ac.triggered.connect(self.refresh)
+
+        self.bar.addAction(ac)
+
+
+
+        actions['preview-dock'].toggled.connect(self.visibility_changed)
+
+
+
+        self.current_name = None
+
+        self.last_sync_request = None
+
+        self.refresh_timer = QTimer(self)
+
+        self.refresh_timer.timeout.connect(self.refresh)
+
+        parse_worker.start()
+
+        self.current_sync_request = None
+
+
+
+        self.search = HistoryLineEdit2(self)
+
+        self.search.initialize('tweak_book_preview_search')
+
+        self.search.setPlaceholderText(_('Search in preview'))
+
+        self.search.returnPressed.connect(partial(self.find, 'next'))
+
+        self.bar.addSeparator()
+
+        self.bar.addWidget(self.search)
+
+        for d in ('next', 'prev'):
+
+            ac = actions['find-%s-preview' % d]
+
+            ac.triggered.connect(partial(self.find, d))
+
+            self.bar.addAction(ac)
+
+
+
+    def find(self, direction):
+
+        text = unicode(self.search.text())
+
+        self.view.findText(text, QWebPage.FindWrapsAroundDocument | (
+
+            QWebPage.FindBackward if direction == 'prev' else QWebPage.FindFlags(0)))
+
+
+
+    def request_sync(self, tagname, href, lnum):
+
+        if self.current_name:
+
+            c = current_container()
+
+            if tagname == 'a' and href:
+
+                if href and href.startswith('#'):
+
+                    name = self.current_name
+
+                else:
+
+                    name = c.href_to_name(href, self.current_name) if href else None
+
+                if name == self.current_name:
+
+                    return self.view.page().go_to_anchor(urlparse(href).fragment, lnum)
+
+                if name and c.exists(name) and c.mime_map[name] in OEB_DOCS:
+
+                    return self.link_clicked.emit(name, urlparse(href).fragment or TOP)
+
+            self.sync_requested.emit(self.current_name, lnum)
+
+
+
+    def request_split(self, loc, totals):
+
+        if self.current_name:
+
+            self.split_requested.emit(self.current_name, loc, totals)
+
+
+
+    def sync_to_editor(self, name, sourceline_address):
+
+        self.current_sync_request = (name, sourceline_address)
+
+        QTimer.singleShot(100, self._sync_to_editor)
+
+
+
+    def _sync_to_editor(self):
+
+        if not actions['sync-preview-to-editor'].isChecked():
+
+            return
+
+        try:
+
+            if self.refresh_timer.isActive() or self.current_sync_request[0] != self.current_name:
+
+                return QTimer.singleShot(100, self._sync_to_editor)
+
+        except TypeError:
+
+            return  # Happens if current_sync_request is None
+
+        sourceline_address = self.current_sync_request[1]
+
+        self.current_sync_request = None
+
+        self.view.page().go_to_sourceline_address(sourceline_address)
+
+
+
+    def report_worker_launch_error(self):
+
+        if parse_worker.launch_error is not None:
+
+            tb, parse_worker.launch_error = parse_worker.launch_error, None
+
+            error_dialog(self, _('Failed to launch worker'), _(
+
+                'Failed to launch the worker process used for rendering the preview'), det_msg=tb, show=True)
+
+
+
+    def show(self, name):
+
+        if name != self.current_name:
+
+            self.refresh_timer.stop()
+
+            self.current_name = name
+
+            self.report_worker_launch_error()
+
+            parse_worker.add_request(name)
+
+            self.view.setUrl(QUrl.fromLocalFile(current_container().name_to_abspath(name)))
+
+            return True
+
+
+
+    def refresh(self):
+
+        if self.current_name:
+
+            self.refresh_timer.stop()
+
+            # This will check if the current html has changed in its editor,
+
+            # and re-parse it if so
+
+            self.report_worker_launch_error()
+
+            parse_worker.add_request(self.current_name)
+
+            # Tell webkit to reload all html and associated resources
+
+            current_url = QUrl.fromLocalFile(current_container().name_to_abspath(self.current_name))
+
+            self.refresh_starting.emit()
+
+            if current_url != self.view.url():
+
+                # The container was changed
+
+                self.view.setUrl(current_url)
+
+            else:
+
+                self.view.refresh()
+
+            self.refreshed.emit()
+
+
+
+    def clear(self):
+
+        self.view.clear()
+
+        self.current_name = None
+
+
+
+    @property
+
+    def current_root(self):
+
+        return self.view.page().current_root
+
+
+
+    @property
+
+    def is_visible(self):
+
+        return actions['preview-dock'].isChecked()
+
+
+
+    @property
+
+    def live_css_is_visible(self):
+
+        try:
+
+            return actions['live-css-dock'].isChecked()
+
+        except KeyError:
+
+            return False
+
+
+
+    def start_refresh_timer(self):
+
+        if self.live_css_is_visible or (self.is_visible and actions['auto-reload-preview'].isChecked()):
+
+            self.refresh_timer.start(tprefs['preview_refresh_time'] * 1000)
+
+
+
+    def stop_refresh_timer(self):
+
+        self.refresh_timer.stop()
+
+
+
+    def auto_reload_toggled(self, checked):
+
+        if self.live_css_is_visible and not actions['auto-reload-preview'].isChecked():
+
+            actions['auto-reload-preview'].setChecked(True)
+
+            error_dialog(self, _('Cannot disable'), _(
+
+                'Auto reloading of the preview panel cannot be disabled while the'
+
+                ' Live CSS panel is open.'), show=True)
+
+        actions['auto-reload-preview'].setToolTip(_(
+
+            'Auto reload preview when text changes in editor') if not checked else _(
+
+                'Disable auto reload of preview'))
+
+
+
+    def sync_toggled(self, checked):
+
+        actions['sync-preview-to-editor'].setToolTip(_(
+
+            'Disable syncing of preview position to editor position') if checked else _(
+
+                'Enable syncing of preview position to editor position'))
+
+
+
+    def visibility_changed(self, is_visible):
+
+        if is_visible:
+
+            self.refresh()
+
+
+
+    def split_toggled(self, checked):
+
+        actions['split-in-preview'].setToolTip(textwrap.fill(_(
+
+            'Abort file split') if checked else _(
+
+                'Split this file at a specified location.\n\nAfter clicking this button, click'
+
+                ' inside the preview panel above at the location you want the file to be split.')))
+
+        if checked:
+
+            self.split_start_requested.emit()
+
+        else:
+
+            self.view.page().split_mode(False)
+
+
+
+    def do_start_split(self):
+
+        self.view.page().split_mode(True)
+
+
+
+    def stop_split(self):
+
+        actions['split-in-preview'].setChecked(False)
+
+
+
+    def load_finished(self, ok):
+
+        if actions['split-in-preview'].isChecked():
+
+            if ok:
+
+                self.do_start_split()
+
+            else:
+
+                self.stop_split()
+
+
+
+    def apply_settings(self):
+
+        s = self.view.page().settings()
+
+        s.setFontSize(s.DefaultFontSize, tprefs['preview_base_font_size'])
+
+        s.setFontSize(s.DefaultFixedFontSize, tprefs['preview_mono_font_size'])
+
+        s.setFontSize(s.MinimumLogicalFontSize, tprefs['preview_minimum_font_size'])
+
+        s.setFontSize(s.MinimumFontSize, tprefs['preview_minimum_font_size'])
+
+        sf, ssf, mf = tprefs['preview_serif_family'], tprefs['preview_sans_family'], tprefs['preview_mono_family']
+
+        s.setFontFamily(s.StandardFont, {'serif':sf, 'sans':ssf, 'mono':mf, None:sf}[tprefs['preview_standard_font_family']])
+
+        s.setFontFamily(s.SerifFont, sf)
+
+        s.setFontFamily(s.SansSerifFont, ssf)
+
+        s.setFontFamily(s.FixedFont, mf)

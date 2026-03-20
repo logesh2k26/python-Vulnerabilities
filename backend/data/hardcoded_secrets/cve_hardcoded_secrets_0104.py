@@ -2,410 +2,234 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# -*- coding: utf-8 -*-
+# This file is dual licensed under the terms of the Apache License, Version
 
-# Copyright 2015, 2016 OpenMarket Ltd
+# 2.0, and the BSD License. See the LICENSE file in the root of this repository
 
-#
+# for complete details.
 
-# Licensed under the Apache License, Version 2.0 (the "License");
 
-# you may not use this file except in compliance with the License.
 
-# You may obtain a copy of the License at
+from __future__ import absolute_import, division, print_function
 
-#
 
-#     http://www.apache.org/licenses/LICENSE-2.0
 
-#
+import six
 
-# Unless required by applicable law or agreed to in writing, software
 
-# distributed under the License is distributed on an "AS IS" BASIS,
 
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+from cryptography import utils
 
-# See the License for the specific language governing permissions and
+from cryptography.exceptions import (
 
-# limitations under the License.
+    AlreadyFinalized, InvalidKey, UnsupportedAlgorithm, _Reasons
 
-import logging
+)
 
+from cryptography.hazmat.backends.interfaces import HMACBackend
 
+from cryptography.hazmat.primitives import constant_time, hmac
 
-from synapse.api.errors import SynapseError
+from cryptography.hazmat.primitives.kdf import KeyDerivationFunction
 
-from synapse.crypto.event_signing import check_event_content_hash
 
-from synapse.events import FrozenEvent
 
-from synapse.events.utils import prune_event
 
-from synapse.http.servlet import assert_params_in_request
 
-from synapse.util import unwrapFirstError, logcontext
+@utils.register_interface(KeyDerivationFunction)
 
-from twisted.internet import defer
+class HKDF(object):
 
+    def __init__(self, algorithm, length, salt, info, backend):
 
+        if not isinstance(backend, HMACBackend):
 
-logger = logging.getLogger(__name__)
+            raise UnsupportedAlgorithm(
 
+                "Backend object does not implement HMACBackend.",
 
-
-
-
-class FederationBase(object):
-
-    def __init__(self, hs):
-
-        self.hs = hs
-
-
-
-        self.server_name = hs.hostname
-
-        self.keyring = hs.get_keyring()
-
-        self.spam_checker = hs.get_spam_checker()
-
-        self.store = hs.get_datastore()
-
-        self._clock = hs.get_clock()
-
-
-
-    @defer.inlineCallbacks
-
-    def _check_sigs_and_hash_and_fetch(self, origin, pdus, outlier=False,
-
-                                       include_none=False):
-
-        """Takes a list of PDUs and checks the signatures and hashs of each
-
-        one. If a PDU fails its signature check then we check if we have it in
-
-        the database and if not then request if from the originating server of
-
-        that PDU.
-
-
-
-        If a PDU fails its content hash check then it is redacted.
-
-
-
-        The given list of PDUs are not modified, instead the function returns
-
-        a new list.
-
-
-
-        Args:
-
-            pdu (list)
-
-            outlier (bool)
-
-
-
-        Returns:
-
-            Deferred : A list of PDUs that have valid signatures and hashes.
-
-        """
-
-        deferreds = self._check_sigs_and_hashes(pdus)
-
-
-
-        @defer.inlineCallbacks
-
-        def handle_check_result(pdu, deferred):
-
-            try:
-
-                res = yield logcontext.make_deferred_yieldable(deferred)
-
-            except SynapseError:
-
-                res = None
-
-
-
-            if not res:
-
-                # Check local db.
-
-                res = yield self.store.get_event(
-
-                    pdu.event_id,
-
-                    allow_rejected=True,
-
-                    allow_none=True,
-
-                )
-
-
-
-            if not res and pdu.origin != origin:
-
-                try:
-
-                    res = yield self.get_pdu(
-
-                        destinations=[pdu.origin],
-
-                        event_id=pdu.event_id,
-
-                        outlier=outlier,
-
-                        timeout=10000,
-
-                    )
-
-                except SynapseError:
-
-                    pass
-
-
-
-            if not res:
-
-                logger.warn(
-
-                    "Failed to find copy of %s with valid signature",
-
-                    pdu.event_id,
-
-                )
-
-
-
-            defer.returnValue(res)
-
-
-
-        handle = logcontext.preserve_fn(handle_check_result)
-
-        deferreds2 = [
-
-            handle(pdu, deferred)
-
-            for pdu, deferred in zip(pdus, deferreds)
-
-        ]
-
-
-
-        valid_pdus = yield logcontext.make_deferred_yieldable(
-
-            defer.gatherResults(
-
-                deferreds2,
-
-                consumeErrors=True,
-
-            )
-
-        ).addErrback(unwrapFirstError)
-
-
-
-        if include_none:
-
-            defer.returnValue(valid_pdus)
-
-        else:
-
-            defer.returnValue([p for p in valid_pdus if p])
-
-
-
-    def _check_sigs_and_hash(self, pdu):
-
-        return logcontext.make_deferred_yieldable(
-
-            self._check_sigs_and_hashes([pdu])[0],
-
-        )
-
-
-
-    def _check_sigs_and_hashes(self, pdus):
-
-        """Checks that each of the received events is correctly signed by the
-
-        sending server.
-
-
-
-        Args:
-
-            pdus (list[FrozenEvent]): the events to be checked
-
-
-
-        Returns:
-
-            list[Deferred]: for each input event, a deferred which:
-
-              * returns the original event if the checks pass
-
-              * returns a redacted version of the event (if the signature
-
-                matched but the hash did not)
-
-              * throws a SynapseError if the signature check failed.
-
-            The deferreds run their callbacks in the sentinel logcontext.
-
-        """
-
-
-
-        redacted_pdus = [
-
-            prune_event(pdu)
-
-            for pdu in pdus
-
-        ]
-
-
-
-        deferreds = self.keyring.verify_json_objects_for_server([
-
-            (p.origin, p.get_pdu_json())
-
-            for p in redacted_pdus
-
-        ])
-
-
-
-        ctx = logcontext.LoggingContext.current_context()
-
-
-
-        def callback(_, pdu, redacted):
-
-            with logcontext.PreserveLoggingContext(ctx):
-
-                if not check_event_content_hash(pdu):
-
-                    logger.warn(
-
-                        "Event content has been tampered, redacting %s: %s",
-
-                        pdu.event_id, pdu.get_pdu_json()
-
-                    )
-
-                    return redacted
-
-
-
-                if self.spam_checker.check_event_for_spam(pdu):
-
-                    logger.warn(
-
-                        "Event contains spam, redacting %s: %s",
-
-                        pdu.event_id, pdu.get_pdu_json()
-
-                    )
-
-                    return redacted
-
-
-
-                return pdu
-
-
-
-        def errback(failure, pdu):
-
-            failure.trap(SynapseError)
-
-            with logcontext.PreserveLoggingContext(ctx):
-
-                logger.warn(
-
-                    "Signature check failed for %s",
-
-                    pdu.event_id,
-
-                )
-
-            return failure
-
-
-
-        for deferred, pdu, redacted in zip(deferreds, pdus, redacted_pdus):
-
-            deferred.addCallbacks(
-
-                callback, errback,
-
-                callbackArgs=[pdu, redacted],
-
-                errbackArgs=[pdu],
+                _Reasons.BACKEND_MISSING_INTERFACE
 
             )
 
 
 
-        return deferreds
+        self._algorithm = algorithm
+
+
+
+        if not (salt is None or isinstance(salt, bytes)):
+
+            raise TypeError("salt must be bytes.")
+
+
+
+        if salt is None:
+
+            salt = b"\x00" * (self._algorithm.digest_size // 8)
+
+
+
+        self._salt = salt
+
+
+
+        self._backend = backend
+
+
+
+        self._hkdf_expand = HKDFExpand(self._algorithm, length, info, backend)
+
+
+
+    def _extract(self, key_material):
+
+        h = hmac.HMAC(self._salt, self._algorithm, backend=self._backend)
+
+        h.update(key_material)
+
+        return h.finalize()
+
+
+
+    def derive(self, key_material):
+
+        if not isinstance(key_material, bytes):
+
+            raise TypeError("key_material must be bytes.")
+
+
+
+        return self._hkdf_expand.derive(self._extract(key_material))
+
+
+
+    def verify(self, key_material, expected_key):
+
+        if not constant_time.bytes_eq(self.derive(key_material), expected_key):
+
+            raise InvalidKey
 
 
 
 
 
-def event_from_pdu_json(pdu_json, outlier=False):
+@utils.register_interface(KeyDerivationFunction)
 
-    """Construct a FrozenEvent from an event json received over federation
+class HKDFExpand(object):
 
+    def __init__(self, algorithm, length, info, backend):
 
+        if not isinstance(backend, HMACBackend):
 
-    Args:
+            raise UnsupportedAlgorithm(
 
-        pdu_json (object): pdu as received over federation
+                "Backend object does not implement HMACBackend.",
 
-        outlier (bool): True to mark this event as an outlier
+                _Reasons.BACKEND_MISSING_INTERFACE
 
-
-
-    Returns:
-
-        FrozenEvent
+            )
 
 
 
-    Raises:
-
-        SynapseError: if the pdu is missing required fields
-
-    """
-
-    # we could probably enforce a bunch of other fields here (room_id, sender,
-
-    # origin, etc etc)
-
-    assert_params_in_request(pdu_json, ('event_id', 'type'))
-
-    event = FrozenEvent(
-
-        pdu_json
-
-    )
+        self._algorithm = algorithm
 
 
 
-    event.internal_metadata.outlier = outlier
+        self._backend = backend
 
 
 
-    return event
+        max_length = 255 * (algorithm.digest_size // 8)
+
+
+
+        if length > max_length:
+
+            raise ValueError(
+
+                "Can not derive keys larger than {0} octets.".format(
+
+                    max_length
+
+                ))
+
+
+
+        self._length = length
+
+
+
+        if not (info is None or isinstance(info, bytes)):
+
+            raise TypeError("info must be bytes.")
+
+
+
+        if info is None:
+
+            info = b""
+
+
+
+        self._info = info
+
+
+
+        self._used = False
+
+
+
+    def _expand(self, key_material):
+
+        output = [b""]
+
+        counter = 1
+
+
+
+        while (self._algorithm.digest_size // 8) * len(output) < self._length:
+
+            h = hmac.HMAC(key_material, self._algorithm, backend=self._backend)
+
+            h.update(output[-1])
+
+            h.update(self._info)
+
+            h.update(six.int2byte(counter))
+
+            output.append(h.finalize())
+
+            counter += 1
+
+
+
+        return b"".join(output)[:self._length]
+
+
+
+    def derive(self, key_material):
+
+        if not isinstance(key_material, bytes):
+
+            raise TypeError("key_material must be bytes.")
+
+
+
+        if self._used:
+
+            raise AlreadyFinalized
+
+
+
+        self._used = True
+
+        return self._expand(key_material)
+
+
+
+    def verify(self, key_material, expected_key):
+
+        if not constant_time.bytes_eq(self.derive(key_material), expected_key):
+
+            raise InvalidKey

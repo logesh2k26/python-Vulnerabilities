@@ -2,390 +2,220 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
+#!/usr/bin/env python
+
+
+
+# Copyright 2017, New York University and the TUF contributors
+
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+
+
+"""
+
+<Program Name>
+
+  settings.py
+
+
+
+<Author>
+
+  Vladimir Diaz <vladimir.v.diaz@gmail.com>
+
+
+
+<Started>
+
+  January 11, 2017
+
+
+
+<Copyright>
+
+  See LICENSE-MIT OR LICENSE for licensing information.
+
+
+
+<Purpose>
+
+ A central location for TUF configuration settings.  Example options include
+
+ setting the destination of temporary files and downloaded content, the maximum
+
+ length of downloaded metadata (unknown file attributes), and download
+
+ behavior.
+
+"""
+
+
+
+# Help with Python 3 compatibility, where the print statement is a function, an
+
+# implicit relative import is invalid, and the '/' operator performs true
+
+# division.  Example:  print 'hello world' raises a 'SyntaxError' exception.
+
+from __future__ import print_function
+
+from __future__ import absolute_import
+
+from __future__ import division
+
 from __future__ import unicode_literals
 
 
 
-import sys
 
-import unittest
 
-from datetime import datetime
+# Set a directory that should be used for all temporary files. If this
 
+# is None, then the system default will be used. The system default
 
+# will also be used if a directory path set here is invalid or
 
-from django.utils import http, six
+# unusable.
 
-from django.utils.datastructures import MultiValueDict
+temporary_directory = None
 
 
 
+# Set a local directory to store metadata that is requested from mirrors.  This
 
+# directory contains subdirectories for different repositories, where each
 
-class TestUtilsHttp(unittest.TestCase):
+# subdirectory contains a different set of metadata.  For example:
 
+# tuf.settings.repositories_directory = /tmp/repositories.  The root file for a
 
+# repository named 'django_repo' can be found at:
 
-    def test_urlencode(self):
+# /tmp/repositories/django_repo/metadata/current/root.METADATA_EXTENSION
 
-        # 2-tuples (the norm)
+repositories_directory = None
 
-        result = http.urlencode((('a', 1), ('b', 2), ('c', 3)))
 
-        self.assertEqual(result, 'a=1&b=2&c=3')
 
+# The 'log.py' module manages TUF's logging system.  Users have the option to
 
+# enable/disable logging to a file via 'ENABLE_FILE_LOGGING', or
 
-        # A dictionary
+# tuf.log.enable_file_logging() and tuf.log.disable_file_logging().
 
-        result = http.urlencode({'a': 1, 'b': 2, 'c': 3})
+ENABLE_FILE_LOGGING = False
 
-        acceptable_results = [
 
-            # Need to allow all of these as dictionaries have to be treated as
 
-            # unordered
+# If file logging is enabled via 'ENABLE_FILE_LOGGING', TUF log messages will
 
-            'a=1&b=2&c=3',
+# be saved to 'LOG_FILENAME'
 
-            'a=1&c=3&b=2',
+LOG_FILENAME = 'tuf.log'
 
-            'b=2&a=1&c=3',
 
-            'b=2&c=3&a=1',
 
-            'c=3&a=1&b=2',
+# Since the timestamp role does not have signed metadata about itself, we set a
 
-            'c=3&b=2&a=1'
+# default but sane upper bound for the number of bytes required to download it.
 
-        ]
+DEFAULT_TIMESTAMP_REQUIRED_LENGTH = 16384 #bytes
 
-        self.assertIn(result, acceptable_results)
 
-        result = http.urlencode({'a': [1, 2]}, doseq=False)
 
-        self.assertEqual(result, 'a=%5B%271%27%2C+%272%27%5D')
+# The Root role may be updated without knowing its version if top-level
 
-        result = http.urlencode({'a': [1, 2]}, doseq=True)
+# metadata cannot be safely downloaded (e.g., keys may have been revoked, thus
 
-        self.assertEqual(result, 'a=1&a=2')
+# requiring a new Root file that includes the updated keys).  Set a default
 
-        result = http.urlencode({'a': []}, doseq=True)
+# upper bound for the maximum total bytes that may be downloaded for Root
 
-        self.assertEqual(result, '')
+# metadata.
 
+DEFAULT_ROOT_REQUIRED_LENGTH = 512000 #bytes
 
 
-        # A MultiValueDict
 
-        result = http.urlencode(MultiValueDict({
+# Set a default, but sane, upper bound for the number of bytes required to
 
-            'name': ['Adrian', 'Simon'],
+# download Snapshot metadata.
 
-            'position': ['Developer']
+DEFAULT_SNAPSHOT_REQUIRED_LENGTH = 2000000 #bytes
 
-        }), doseq=True)
 
-        acceptable_results = [
 
-            # MultiValueDicts are similarly unordered
+# Set a default, but sane, upper bound for the number of bytes required to
 
-            'name=Adrian&name=Simon&position=Developer',
+# download Targets metadata.
 
-            'position=Developer&name=Adrian&name=Simon'
+DEFAULT_TARGETS_REQUIRED_LENGTH = 5000000 #bytes
 
-        ]
 
-        self.assertIn(result, acceptable_results)
 
+# Set a timeout value in seconds (float) for non-blocking socket operations.
 
+SOCKET_TIMEOUT = 4 #seconds
 
-    def test_base36(self):
 
-        # reciprocity works
 
-        for n in [0, 1, 1000, 1000000]:
+# The maximum chunk of data, in bytes, we would download in every round.
 
-            self.assertEqual(n, http.base36_to_int(http.int_to_base36(n)))
+CHUNK_SIZE = 400000 #bytes
 
-        if six.PY2:
 
-            self.assertEqual(sys.maxint, http.base36_to_int(http.int_to_base36(sys.maxint)))
 
+# The minimum average download speed (bytes/second) that must be met to
 
+# avoid being considered as a slow retrieval attack.
 
-        # bad input
+MIN_AVERAGE_DOWNLOAD_SPEED = 50 #bytes/second
 
-        with self.assertRaises(ValueError):
 
-            http.int_to_base36(-1)
 
-        if six.PY2:
+# By default, limit number of delegatees we visit for any target.
 
-            with self.assertRaises(ValueError):
+MAX_NUMBER_OF_DELEGATIONS = 2**5
 
-                http.int_to_base36(sys.maxint + 1)
 
-        for n in ['1', 'foo', {1: 2}, (1, 2, 3), 3.141]:
 
-            with self.assertRaises(TypeError):
+# This configuration is for indicating how consistent files should be created.
 
-                http.int_to_base36(n)
+# There are two options: "copy" and "hard_link".  For "copy", the consistent
 
+# file with be a copy of root.json.  This approach will require the most disk
 
+# space out of the two options.  For "hard_link", the latest root.json will be
 
-        for n in ['#', ' ']:
+# a hard link to 2.root.json (for example).  This approach is more efficient in
 
-            with self.assertRaises(ValueError):
+# terms of disk space usage.  By default, we use 'copy'.
 
-                http.base36_to_int(n)
+CONSISTENT_METHOD = 'copy'
 
-        for n in [123, {1: 2}, (1, 2, 3), 3.141]:
 
-            with self.assertRaises(TypeError):
 
-                http.base36_to_int(n)
+# A setting for the instances where a default hashing algorithm is needed.
 
+# This setting is currently used to calculate the path hash prefixes of hashed
 
+# bin delegations, and digests of targets filepaths.  The other instances
 
-        # more explicit output testing
+# (e.g., digest of files) that require a hashing algorithm rely on settings in
 
-        for n, b36 in [(0, '0'), (1, '1'), (42, '16'), (818469960, 'django')]:
+# the securesystemslib external library.
 
-            self.assertEqual(http.int_to_base36(n), b36)
+DEFAULT_HASH_ALGORITHM = 'sha256'
 
-            self.assertEqual(http.base36_to_int(b36), n)
 
 
+# The client's update procedure (contained within a while-loop) can potentially
 
-    def test_is_safe_url(self):
+# hog the CPU.  The following setting can be used to force the update sequence
 
-        for bad_url in ('http://example.com',
+# to suspend execution for a specified amount of time.  See
 
-                        'http:///example.com',
+# theupdateframework/tuf/issue#338.
 
-                        'https://example.com',
-
-                        'ftp://example.com',
-
-                        r'\\example.com',
-
-                        r'\\\example.com',
-
-                        r'/\\/example.com',
-
-                        r'\\\example.com',
-
-                        r'\\example.com',
-
-                        r'\\//example.com',
-
-                        r'/\/example.com',
-
-                        r'\/example.com',
-
-                        r'/\example.com',
-
-                        'http:///example.com',
-
-                        'http:/\//example.com',
-
-                        'http:\/example.com',
-
-                        'http:/\example.com',
-
-                        'javascript:alert("XSS")',
-
-                        '\njavascript:alert(x)',
-
-                        '\x08//example.com',
-
-                        '\n'):
-
-            self.assertFalse(http.is_safe_url(bad_url, host='testserver'), "%s should be blocked" % bad_url)
-
-        for good_url in ('/view/?param=http://example.com',
-
-                     '/view/?param=https://example.com',
-
-                     '/view?param=ftp://example.com',
-
-                     'view/?param=//example.com',
-
-                     'https://testserver/',
-
-                     'HTTPS://testserver/',
-
-                     '//testserver/',
-
-                     '/url%20with%20spaces/'):
-
-            self.assertTrue(http.is_safe_url(good_url, host='testserver'), "%s should be allowed" % good_url)
-
-
-
-    def test_urlsafe_base64_roundtrip(self):
-
-        bytestring = b'foo'
-
-        encoded = http.urlsafe_base64_encode(bytestring)
-
-        decoded = http.urlsafe_base64_decode(encoded)
-
-        self.assertEqual(bytestring, decoded)
-
-
-
-    def test_urlquote(self):
-
-        self.assertEqual(http.urlquote('Paris & Orl\xe9ans'),
-
-            'Paris%20%26%20Orl%C3%A9ans')
-
-        self.assertEqual(http.urlquote('Paris & Orl\xe9ans', safe="&"),
-
-            'Paris%20&%20Orl%C3%A9ans')
-
-        self.assertEqual(
-
-            http.urlunquote('Paris%20%26%20Orl%C3%A9ans'),
-
-            'Paris & Orl\xe9ans')
-
-        self.assertEqual(
-
-            http.urlunquote('Paris%20&%20Orl%C3%A9ans'),
-
-            'Paris & Orl\xe9ans')
-
-        self.assertEqual(http.urlquote_plus('Paris & Orl\xe9ans'),
-
-            'Paris+%26+Orl%C3%A9ans')
-
-        self.assertEqual(http.urlquote_plus('Paris & Orl\xe9ans', safe="&"),
-
-            'Paris+&+Orl%C3%A9ans')
-
-        self.assertEqual(
-
-            http.urlunquote_plus('Paris+%26+Orl%C3%A9ans'),
-
-            'Paris & Orl\xe9ans')
-
-        self.assertEqual(
-
-            http.urlunquote_plus('Paris+&+Orl%C3%A9ans'),
-
-            'Paris & Orl\xe9ans')
-
-
-
-    def test_is_same_domain_good(self):
-
-        for pair in (
-
-            ('example.com', 'example.com'),
-
-            ('example.com', '.example.com'),
-
-            ('foo.example.com', '.example.com'),
-
-            ('example.com:8888', 'example.com:8888'),
-
-            ('example.com:8888', '.example.com:8888'),
-
-            ('foo.example.com:8888', '.example.com:8888'),
-
-        ):
-
-            self.assertTrue(http.is_same_domain(*pair))
-
-
-
-    def test_is_same_domain_bad(self):
-
-        for pair in (
-
-            ('example2.com', 'example.com'),
-
-            ('foo.example.com', 'example.com'),
-
-            ('example.com:9999', 'example.com:8888'),
-
-        ):
-
-            self.assertFalse(http.is_same_domain(*pair))
-
-
-
-
-
-class ETagProcessingTests(unittest.TestCase):
-
-    def test_parsing(self):
-
-        etags = http.parse_etags(r'"", "etag", "e\"t\"ag", "e\\tag", W/"weak"')
-
-        self.assertEqual(etags, ['', 'etag', 'e"t"ag', r'e\tag', 'weak'])
-
-
-
-    def test_quoting(self):
-
-        original_etag = r'e\t"ag'
-
-        quoted_etag = http.quote_etag(original_etag)
-
-        self.assertEqual(quoted_etag, r'"e\\t\"ag"')
-
-        self.assertEqual(http.unquote_etag(quoted_etag), original_etag)
-
-
-
-
-
-class HttpDateProcessingTests(unittest.TestCase):
-
-    def test_http_date(self):
-
-        t = 1167616461.0
-
-        self.assertEqual(http.http_date(t), 'Mon, 01 Jan 2007 01:54:21 GMT')
-
-
-
-    def test_cookie_date(self):
-
-        t = 1167616461.0
-
-        self.assertEqual(http.cookie_date(t), 'Mon, 01-Jan-2007 01:54:21 GMT')
-
-
-
-    def test_parsing_rfc1123(self):
-
-        parsed = http.parse_http_date('Sun, 06 Nov 1994 08:49:37 GMT')
-
-        self.assertEqual(datetime.utcfromtimestamp(parsed),
-
-                         datetime(1994, 11, 6, 8, 49, 37))
-
-
-
-    def test_parsing_rfc850(self):
-
-        parsed = http.parse_http_date('Sunday, 06-Nov-94 08:49:37 GMT')
-
-        self.assertEqual(datetime.utcfromtimestamp(parsed),
-
-                         datetime(1994, 11, 6, 8, 49, 37))
-
-
-
-    def test_parsing_asctime(self):
-
-        parsed = http.parse_http_date('Sun Nov  6 08:49:37 1994')
-
-        self.assertEqual(datetime.utcfromtimestamp(parsed),
-
-                         datetime(1994, 11, 6, 8, 49, 37))
+SLEEP_BEFORE_ROUND = None

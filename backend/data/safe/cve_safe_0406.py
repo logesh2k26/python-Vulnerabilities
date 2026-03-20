@@ -2,358 +2,378 @@
 # Safety: safe
 # Category: safe
 
-##############################################################################
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+
+
+
+# Copyright 2012 OpenStack LLC
+
+# Copyright 2012 Canonical Ltd.
 
 #
 
-# Copyright (c) 2001, 2002 Zope Foundation and Contributors.
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
 
-# All Rights Reserved.
+# not use this file except in compliance with the License. You may obtain
 
-#
-
-# This software is subject to the provisions of the Zope Public License,
-
-# Version 2.1 (ZPL).  A copy of the ZPL should accompany this distribution.
-
-# THIS SOFTWARE IS PROVIDED "AS IS" AND ANY AND ALL EXPRESS OR IMPLIED
-
-# WARRANTIES ARE DISCLAIMED, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
-
-# WARRANTIES OF TITLE, MERCHANTABILITY, AGAINST INFRINGEMENT, AND FITNESS
-
-# FOR A PARTICULAR PURPOSE.
+# a copy of the License at
 
 #
 
-##############################################################################
+#      http://www.apache.org/licenses/LICENSE-2.0
 
-"""Data Chunk Receiver
+#
 
-"""
+# Unless required by applicable law or agreed to in writing, software
 
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
-from waitress.utilities import BadRequest, find_double_newline
+# License for the specific language governing permissions and limitations
 
+# under the License.
 
 
 
+"""Main entry point into the Catalog service."""
 
-class FixedStreamReceiver(object):
 
 
+import uuid
 
-    # See IStreamConsumer
 
-    completed = False
 
-    error = None
+from keystone import config
 
+from keystone import exception
 
+from keystone import identity
 
-    def __init__(self, cl, buf):
+from keystone import policy
 
-        self.remain = cl
+from keystone import token
 
-        self.buf = buf
+from keystone.common import manager
 
+from keystone.common import wsgi
 
 
-    def __len__(self):
 
-        return self.buf.__len__()
 
 
+CONF = config.CONF
 
-    def received(self, data):
 
-        "See IStreamConsumer"
 
-        rm = self.remain
 
 
+class Manager(manager.Manager):
 
-        if rm < 1:
+    """Default pivot point for the Catalog backend.
 
-            self.completed = True  # Avoid any chance of spinning
 
 
+    See :mod:`keystone.common.manager.Manager` for more details on how this
 
-            return 0
+    dynamically calls the backend.
 
-        datalen = len(data)
 
 
+    """
 
-        if rm <= datalen:
 
-            self.buf.append(data[:rm])
 
-            self.remain = 0
+    def __init__(self):
 
-            self.completed = True
+        super(Manager, self).__init__(CONF.catalog.driver)
 
 
 
-            return rm
 
-        else:
 
-            self.buf.append(data)
+class Driver(object):
 
-            self.remain -= datalen
+    """Interface description for an Catalog driver."""
 
+    def list_services(self):
 
+        """List all service ids in catalog.
 
-            return datalen
 
 
+        Returns: list of service_ids or an empty list.
 
-    def getfile(self):
 
-        return self.buf.getfile()
 
+        """
 
+        raise exception.NotImplemented()
 
-    def getbuf(self):
 
-        return self.buf
 
+    def get_service(self, service_id):
 
+        """Get service by id.
 
 
 
-class ChunkedReceiver(object):
+        Returns: service_ref dict or None.
 
 
 
-    chunk_remainder = 0
+        """
 
-    validate_chunk_end = False
+        raise exception.NotImplemented()
 
-    control_line = b""
 
-    all_chunks_received = False
 
-    trailer = b""
+    def delete_service(self, service_id):
 
-    completed = False
+        raise exception.NotImplemented()
 
-    error = None
 
 
+    def create_service(self, service_id, service_ref):
 
-    # max_control_line = 1024
+        raise exception.NotImplemented()
 
-    # max_trailer = 65536
 
 
+    def create_endpoint(self, endpoint_id, endpoint_ref):
 
-    def __init__(self, buf):
+        raise exception.NotImplemented()
 
-        self.buf = buf
 
 
+    def delete_endpoint(self, endpoint_id):
 
-    def __len__(self):
+        raise exception.NotImplemented()
 
-        return self.buf.__len__()
 
 
+    def get_endpoint(self, endpoint_id):
 
-    def received(self, s):
+        """Get endpoint by id.
 
-        # Returns the number of bytes consumed.
 
 
+        Returns: endpoint_ref dict or None.
 
-        if self.completed:
 
-            return 0
 
-        orig_size = len(s)
+        """
 
+        raise exception.NotImplemented()
 
 
-        while s:
 
-            rm = self.chunk_remainder
+    def list_endpoints(self):
 
+        """List all endpoint ids in catalog.
 
 
-            if rm > 0:
 
-                # Receive the remainder of a chunk.
+        Returns: list of endpoint_ids or an empty list.
 
-                to_write = s[:rm]
 
-                self.buf.append(to_write)
 
-                written = len(to_write)
+        """
 
-                s = s[written:]
+        raise exception.NotImplemented()
 
 
 
-                self.chunk_remainder -= written
+    def get_catalog(self, user_id, tenant_id, metadata=None):
 
+        """Retreive and format the current service catalog.
 
 
-                if self.chunk_remainder == 0:
 
-                    self.validate_chunk_end = True
+        Returns: A nested dict representing the service catalog or an
 
-            elif self.validate_chunk_end:
+                 empty dict.
 
-                pos = s.find(b"\r\n")
 
 
+        Example:
 
-                if pos == 0:
 
-                    # Chop off the terminating CR LF from the chunk
 
-                    s = s[2:]
+            { 'RegionOne':
 
-                else:
+                {'compute': {
 
-                    self.error = BadRequest("Chunk not properly terminated")
+                    'adminURL': u'http://host:8774/v1.1/tenantid',
 
-                    self.all_chunks_received = True
+                    'internalURL': u'http://host:8774/v1.1/tenant_id',
 
+                    'name': 'Compute Service',
 
+                    'publicURL': u'http://host:8774/v1.1/tenantid'},
 
-                # Always exit this loop
+                 'ec2': {
 
-                self.validate_chunk_end = False
+                    'adminURL': 'http://host:8773/services/Admin',
 
-            elif not self.all_chunks_received:
+                    'internalURL': 'http://host:8773/services/Cloud',
 
-                # Receive a control line.
+                    'name': 'EC2 Service',
 
-                s = self.control_line + s
+                    'publicURL': 'http://host:8773/services/Cloud'}}
 
-                pos = s.find(b"\r\n")
 
 
+        """
 
-                if pos < 0:
+        raise exception.NotImplemented()
 
-                    # Control line not finished.
 
-                    self.control_line = s
 
-                    s = ""
 
-                else:
 
-                    # Control line finished.
+class ServiceController(wsgi.Application):
 
-                    line = s[:pos]
+    def __init__(self):
 
-                    s = s[pos + 2 :]
+        self.catalog_api = Manager()
 
-                    self.control_line = b""
+        self.identity_api = identity.Manager()
 
-                    line = line.strip()
+        self.policy_api = policy.Manager()
 
+        self.token_api = token.Manager()
 
+        super(ServiceController, self).__init__()
 
-                    if line:
 
-                        # Begin a new chunk.
 
-                        semi = line.find(b";")
+    # CRUD extensions
 
+    # NOTE(termie): this OS-KSADM stuff is not very consistent
 
+    def get_services(self, context):
 
-                        if semi >= 0:
+        self.assert_admin(context)
 
-                            # discard extension info.
+        service_list = self.catalog_api.list_services(context)
 
-                            line = line[:semi]
+        service_refs = [self.catalog_api.get_service(context, x)
 
-                        try:
+                        for x in service_list]
 
-                            sz = int(line.strip(), 16)  # hexadecimal
+        return {'OS-KSADM:services': service_refs}
 
-                        except ValueError:  # garbage in input
 
-                            self.error = BadRequest("garbage in chunked encoding input")
 
-                            sz = 0
+    def get_service(self, context, service_id):
 
+        self.assert_admin(context)
 
+        service_ref = self.catalog_api.get_service(context, service_id)
 
-                        if sz > 0:
+        if not service_ref:
 
-                            # Start a new chunk.
+            raise exception.ServiceNotFound(service_id=service_id)
 
-                            self.chunk_remainder = sz
+        return {'OS-KSADM:service': service_ref}
 
-                        else:
 
-                            # Finished chunks.
 
-                            self.all_chunks_received = True
+    def delete_service(self, context, service_id):
 
-                    # else expect a control line.
+        self.assert_admin(context)
 
-            else:
+        service_ref = self.catalog_api.get_service(context, service_id)
 
-                # Receive the trailer.
+        if not service_ref:
 
-                trailer = self.trailer + s
+            raise exception.ServiceNotFound(service_id=service_id)
 
+        self.catalog_api.delete_service(context, service_id)
 
 
-                if trailer.startswith(b"\r\n"):
 
-                    # No trailer.
+    def create_service(self, context, OS_KSADM_service):
 
-                    self.completed = True
+        self.assert_admin(context)
 
+        service_id = uuid.uuid4().hex
 
+        service_ref = OS_KSADM_service.copy()
 
-                    return orig_size - (len(trailer) - 2)
+        service_ref['id'] = service_id
 
-                pos = find_double_newline(trailer)
+        new_service_ref = self.catalog_api.create_service(
 
+                context, service_id, service_ref)
 
+        return {'OS-KSADM:service': new_service_ref}
 
-                if pos < 0:
 
-                    # Trailer not finished.
 
-                    self.trailer = trailer
 
-                    s = b""
 
-                else:
+class EndpointController(wsgi.Application):
 
-                    # Finished the trailer.
+    def __init__(self):
 
-                    self.completed = True
+        self.catalog_api = Manager()
 
-                    self.trailer = trailer[:pos]
+        self.identity_api = identity.Manager()
 
+        self.policy_api = policy.Manager()
 
+        self.token_api = token.Manager()
 
-                    return orig_size - (len(trailer) - pos)
+        super(EndpointController, self).__init__()
 
 
 
-        return orig_size
+    def get_endpoints(self, context):
 
+        self.assert_admin(context)
 
+        endpoint_list = self.catalog_api.list_endpoints(context)
 
-    def getfile(self):
+        endpoint_refs = [self.catalog_api.get_endpoint(context, e)
 
-        return self.buf.getfile()
+                         for e in endpoint_list]
 
+        return {'endpoints': endpoint_refs}
 
 
-    def getbuf(self):
 
-        return self.buf
+    def create_endpoint(self, context, endpoint):
+
+        self.assert_admin(context)
+
+        endpoint_id = uuid.uuid4().hex
+
+        endpoint_ref = endpoint.copy()
+
+        endpoint_ref['id'] = endpoint_id
+
+
+
+        service_id = endpoint_ref['service_id']
+
+        if not self.catalog_api.get_service(context, service_id):
+
+            raise exception.ServiceNotFound(service_id=service_id)
+
+
+
+        new_endpoint_ref = self.catalog_api.create_endpoint(
+
+                                context, endpoint_id, endpoint_ref)
+
+        return {'endpoint': new_endpoint_ref}
+
+
+
+    def delete_endpoint(self, context, endpoint_id):
+
+        self.assert_admin(context)
+
+        endpoint_ref = self.catalog_api.delete_endpoint(context, endpoint_id)

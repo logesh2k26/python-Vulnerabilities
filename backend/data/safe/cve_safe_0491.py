@@ -2,522 +2,1018 @@
 # Safety: safe
 # Category: safe
 
-#!/usr/bin/python
+# vim: ft=python fileencoding=utf-8 sts=4 sw=4 et:
 
-from k5test import *
 
 
+# Copyright 2016-2018 Florian Bruhin (The Compiler) <mail@qutebrowser.org>
 
-# Skip this test if pkinit wasn't built.
+#
 
-if not os.path.exists(os.path.join(plugins, 'preauth', 'pkinit.so')):
+# This file is part of qutebrowser.
 
-    skip_rest('PKINIT tests', 'PKINIT module not built')
+#
 
+# qutebrowser is free software: you can redistribute it and/or modify
 
+# it under the terms of the GNU General Public License as published by
 
-# Check if soft-pkcs11.so is available.
+# the Free Software Foundation, either version 3 of the License, or
 
-try:
+# (at your option) any later version.
 
-    import ctypes
+#
 
-    lib = ctypes.LibraryLoader(ctypes.CDLL).LoadLibrary('soft-pkcs11.so')
+# qutebrowser is distributed in the hope that it will be useful,
 
-    del lib
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
 
-    have_soft_pkcs11 = True
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 
-except:
+# GNU General Public License for more details.
 
-    have_soft_pkcs11 = False
+#
 
+# You should have received a copy of the GNU General Public License
 
+# along with qutebrowser.  If not, see <http://www.gnu.org/licenses/>.
 
-# Construct a krb5.conf fragment configuring pkinit.
 
-certs = os.path.join(srctop, 'tests', 'dejagnu', 'pkinit-certs')
 
-ca_pem = os.path.join(certs, 'ca.pem')
+"""Backend-independent qute://* code.
 
-kdc_pem = os.path.join(certs, 'kdc.pem')
 
-user_pem = os.path.join(certs, 'user.pem')
 
-privkey_pem = os.path.join(certs, 'privkey.pem')
+Module attributes:
 
-privkey_enc_pem = os.path.join(certs, 'privkey-enc.pem')
+    pyeval_output: The output of the last :pyeval command.
 
-user_p12 = os.path.join(certs, 'user.p12')
+    _HANDLERS: The handlers registered via decorators.
 
-user_enc_p12 = os.path.join(certs, 'user-enc.p12')
+"""
 
-path = os.path.join(os.getcwd(), 'testdir', 'tmp-pkinit-certs')
 
-path_enc = os.path.join(os.getcwd(), 'testdir', 'tmp-pkinit-certs-enc')
 
+import html
 
+import json
 
-pkinit_krb5_conf = {'realms': {'$realm': {
+import os
 
-            'pkinit_anchors': 'FILE:%s' % ca_pem}}}
+import time
 
-pkinit_kdc_conf = {'realms': {'$realm': {
+import textwrap
 
-            'default_principal_flags': '+preauth',
+import mimetypes
 
-            'pkinit_eku_checking': 'none',
+import urllib
 
-            'pkinit_identity': 'FILE:%s,%s' % (kdc_pem, privkey_pem),
+import collections
 
-            'pkinit_indicator': ['indpkinit1', 'indpkinit2']}}}
 
-restrictive_kdc_conf = {'realms': {'$realm': {
 
-            'restrict_anonymous_to_tgt': 'true' }}}
+import pkg_resources
 
+import sip
 
+from PyQt5.QtCore import QUrlQuery, QUrl
 
-file_identity = 'FILE:%s,%s' % (user_pem, privkey_pem)
 
-file_enc_identity = 'FILE:%s,%s' % (user_pem, privkey_enc_pem)
 
-dir_identity = 'DIR:%s' % path
+import qutebrowser
 
-dir_enc_identity = 'DIR:%s' % path_enc
+from qutebrowser.config import config, configdata, configexc, configdiff
 
-dir_file_identity = 'FILE:%s,%s' % (os.path.join(path, 'user.crt'),
+from qutebrowser.utils import (version, utils, jinja, log, message, docutils,
 
-                                    os.path.join(path, 'user.key'))
+                               objreg, urlutils)
 
-dir_file_enc_identity = 'FILE:%s,%s' % (os.path.join(path_enc, 'user.crt'),
+from qutebrowser.misc import objects
 
-                                        os.path.join(path_enc, 'user.key'))
 
-p12_identity = 'PKCS12:%s' % user_p12
 
-p12_enc_identity = 'PKCS12:%s' % user_enc_p12
 
-p11_identity = 'PKCS11:soft-pkcs11.so'
 
-p11_token_identity = ('PKCS11:module_name=soft-pkcs11.so:'
+pyeval_output = ":pyeval was never called"
 
-                      'slotid=1:token=SoftToken (token)')
+spawn_output = ":spawn was never called"
 
 
 
-realm = K5Realm(krb5_conf=pkinit_krb5_conf, kdc_conf=pkinit_kdc_conf,
 
-                get_creds=False)
 
+_HANDLERS = {}
 
 
-# Sanity check - password-based preauth should still work.
 
-realm.run(['./responder', '-r', 'password=%s' % password('user'),
 
-           realm.user_princ])
 
-realm.kinit(realm.user_princ, password=password('user'))
+class NoHandlerFound(Exception):
 
-realm.klist(realm.user_princ)
 
-realm.run([kvno, realm.host_princ])
 
+    """Raised when no handler was found for the given URL."""
 
 
-# Test anonymous PKINIT.
 
-out = realm.kinit('@%s' % realm.realm, flags=['-n'], expected_code=1)
+    pass
 
-if 'not found in Kerberos database' not in out:
 
-    fail('Wrong error for anonymous PKINIT without anonymous enabled')
 
-realm.addprinc('WELLKNOWN/ANONYMOUS')
 
-realm.kinit('@%s' % realm.realm, flags=['-n'])
 
-realm.klist('WELLKNOWN/ANONYMOUS@WELLKNOWN:ANONYMOUS')
+class QuteSchemeOSError(Exception):
 
-realm.run([kvno, realm.host_princ])
 
-out = realm.run(['./adata', realm.host_princ])
 
-if '97:' in out:
+    """Called when there was an OSError inside a handler."""
 
-    fail('auth indicators seen in anonymous PKINIT ticket')
 
 
+    pass
 
-# Test anonymous kadmin.
 
-f = open(os.path.join(realm.testdir, 'acl'), 'a')
 
-f.write('WELLKNOWN/ANONYMOUS@WELLKNOWN:ANONYMOUS a *')
 
-f.close()
 
-realm.start_kadmind()
+class QuteSchemeError(Exception):
 
-realm.run([kadmin, '-n', 'addprinc', '-pw', 'test', 'testadd'])
 
-out = realm.run([kadmin, '-n', 'getprinc', 'testadd'], expected_code=1)
 
-if "Operation requires ``get'' privilege" not in out:
+    """Exception to signal that a handler should return an ErrorReply.
 
-    fail('Anonymous kadmin has too much privilege')
 
-realm.stop_kadmind()
 
+    Attributes correspond to the arguments in
 
+    networkreply.ErrorNetworkReply.
 
-# Test with anonymous restricted; FAST should work but kvno should fail.
 
-r_env = realm.special_env('restrict', True, kdc_conf=restrictive_kdc_conf)
 
-realm.stop_kdc()
+    Attributes:
 
-realm.start_kdc(env=r_env)
+        errorstring: Error string to print.
 
-realm.kinit('@%s' % realm.realm, flags=['-n'])
+        error: Numerical error value.
 
-realm.kinit('@%s' % realm.realm, flags=['-n', '-T', realm.ccache])
+    """
 
-out = realm.run([kvno, realm.host_princ], expected_code=1)
 
-if 'KDC policy rejects request' not in out:
 
-    fail('Wrong error for restricted anonymous PKINIT')
+    def __init__(self, errorstring, error):
 
+        self.errorstring = errorstring
 
+        self.error = error
 
-# Regression test for #8458: S4U2Self requests crash the KDC if
+        super().__init__(errorstring)
 
-# anonymous is restricted.
 
-realm.kinit(realm.host_princ, flags=['-k'])
 
-realm.run([kvno, '-U', 'user', realm.host_princ])
 
 
+class Redirect(Exception):
 
-# Go back to a normal KDC and disable anonymous PKINIT.
 
-realm.stop_kdc()
 
-realm.start_kdc()
+    """Exception to signal a redirect should happen.
 
-realm.run([kadminl, 'delprinc', 'WELLKNOWN/ANONYMOUS'])
 
 
+    Attributes:
 
-# Run the basic test - PKINIT with FILE: identity, with no password on the key.
+        url: The URL to redirect to, as a QUrl.
 
-realm.run(['./responder', '-x', 'pkinit=',
+    """
 
-           '-X', 'X509_user_identity=%s' % file_identity, realm.user_princ])
 
-realm.kinit(realm.user_princ,
 
-            flags=['-X', 'X509_user_identity=%s' % file_identity])
+    def __init__(self, url):
 
-realm.klist(realm.user_princ)
+        super().__init__(url.toDisplayString())
 
-realm.run([kvno, realm.host_princ])
+        self.url = url
 
 
 
-# Run the basic test - PKINIT with FILE: identity, with a password on the key,
 
-# supplied by the prompter.
 
-# Expect failure if the responder does nothing, and we have no prompter.
+class add_handler:  # noqa: N801,N806 pylint: disable=invalid-name
 
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % file_enc_identity,
 
-          '-X', 'X509_user_identity=%s' % file_enc_identity, realm.user_princ],
 
-          expected_code=2)
+    """Decorator to register a qute://* URL handler.
 
-realm.kinit(realm.user_princ,
 
-            flags=['-X', 'X509_user_identity=%s' % file_enc_identity],
 
-            password='encrypted')
+    Attributes:
 
-realm.klist(realm.user_princ)
+        _name: The 'foo' part of qute://foo
 
-realm.run([kvno, realm.host_princ])
+        backend: Limit which backends the handler can run with.
 
-out = realm.run(['./adata', realm.host_princ])
+    """
 
-if '+97: [indpkinit1, indpkinit2]' not in out:
 
-    fail('auth indicators not seen in PKINIT ticket')
 
+    def __init__(self, name, backend=None):
 
+        self._name = name
 
-# Run the basic test - PKINIT with FILE: identity, with a password on the key,
+        self._backend = backend
 
-# supplied by the responder.
+        self._function = None
 
-# Supply the response in raw form.
 
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % file_enc_identity,
 
-           '-r', 'pkinit={"%s": "encrypted"}' % file_enc_identity,
+    def __call__(self, function):
 
-           '-X', 'X509_user_identity=%s' % file_enc_identity,
+        self._function = function
 
-           realm.user_princ])
+        _HANDLERS[self._name] = self.wrapper
 
-# Supply the response through the convenience API.
+        return function
 
-realm.run(['./responder', '-X', 'X509_user_identity=%s' % file_enc_identity,
 
-           '-p', '%s=%s' % (file_enc_identity, 'encrypted'), realm.user_princ])
 
-realm.klist(realm.user_princ)
+    def wrapper(self, *args, **kwargs):
 
-realm.run([kvno, realm.host_princ])
+        """Call the underlying function."""
 
+        if self._backend is not None and objects.backend != self._backend:
 
+            return self.wrong_backend_handler(*args, **kwargs)
 
-# PKINIT with DIR: identity, with no password on the key.
+        else:
 
-os.mkdir(path)
+            return self._function(*args, **kwargs)
 
-os.mkdir(path_enc)
 
-shutil.copy(privkey_pem, os.path.join(path, 'user.key'))
 
-shutil.copy(privkey_enc_pem, os.path.join(path_enc, 'user.key'))
+    def wrong_backend_handler(self, url):
 
-shutil.copy(user_pem, os.path.join(path, 'user.crt'))
+        """Show an error page about using the invalid backend."""
 
-shutil.copy(user_pem, os.path.join(path_enc, 'user.crt'))
+        html = jinja.render('error.html',
 
-realm.run(['./responder', '-x', 'pkinit=', '-X',
+                            title="Error while opening qute://url",
 
-           'X509_user_identity=%s' % dir_identity, realm.user_princ])
+                            url=url.toDisplayString(),
 
-realm.kinit(realm.user_princ,
+                            error='{} is not available with this '
 
-            flags=['-X', 'X509_user_identity=%s' % dir_identity])
+                                  'backend'.format(url.toDisplayString()))
 
-realm.klist(realm.user_princ)
+        return 'text/html', html
 
-realm.run([kvno, realm.host_princ])
 
 
 
-# PKINIT with DIR: identity, with a password on the key, supplied by the
 
-# prompter.
+def data_for_url(url):
 
-# Expect failure if the responder does nothing, and we have no prompter.
+    """Get the data to show for the given URL.
 
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % dir_file_enc_identity,
 
-           '-X', 'X509_user_identity=%s' % dir_enc_identity, realm.user_princ],
 
-           expected_code=2)
+    Args:
 
-realm.kinit(realm.user_princ,
+        url: The QUrl to show.
 
-            flags=['-X', 'X509_user_identity=%s' % dir_enc_identity],
 
-            password='encrypted')
 
-realm.klist(realm.user_princ)
+    Return:
 
-realm.run([kvno, realm.host_princ])
+        A (mimetype, data) tuple.
 
+    """
 
+    norm_url = url.adjusted(QUrl.NormalizePathSegments |
 
-# PKINIT with DIR: identity, with a password on the key, supplied by the
+                            QUrl.StripTrailingSlash)
 
-# responder.
+    if norm_url != url:
 
-# Supply the response in raw form.
+        raise Redirect(norm_url)
 
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % dir_file_enc_identity,
 
-           '-r', 'pkinit={"%s": "encrypted"}' % dir_file_enc_identity,
 
-           '-X', 'X509_user_identity=%s' % dir_enc_identity, realm.user_princ])
+    path = url.path()
 
-# Supply the response through the convenience API.
+    host = url.host()
 
-realm.run(['./responder', '-X', 'X509_user_identity=%s' % dir_enc_identity,
+    query = urlutils.query_string(url)
 
-           '-p', '%s=%s' % (dir_file_enc_identity, 'encrypted'),
+    # A url like "qute:foo" is split as "scheme:path", not "scheme:host".
 
-           realm.user_princ])
+    log.misc.debug("url: {}, path: {}, host {}".format(
 
-realm.klist(realm.user_princ)
+        url.toDisplayString(), path, host))
 
-realm.run([kvno, realm.host_princ])
+    if not path or not host:
 
+        new_url = QUrl()
 
+        new_url.setScheme('qute')
 
-# PKINIT with PKCS12: identity, with no password on the bundle.
+        # When path is absent, e.g. qute://help (with no trailing slash)
 
-realm.run(['./responder', '-x', 'pkinit=',
+        if host:
 
-           '-X', 'X509_user_identity=%s' % p12_identity, realm.user_princ])
+            new_url.setHost(host)
 
-realm.kinit(realm.user_princ,
+        # When host is absent, e.g. qute:help
 
-            flags=['-X', 'X509_user_identity=%s' % p12_identity])
+        else:
 
-realm.klist(realm.user_princ)
+            new_url.setHost(path)
 
-realm.run([kvno, realm.host_princ])
 
 
+        new_url.setPath('/')
 
-# PKINIT with PKCS12: identity, with a password on the bundle, supplied by the
+        if query:
 
-# prompter.
+            new_url.setQuery(query)
 
-# Expect failure if the responder does nothing, and we have no prompter.
+        if new_url.host():  # path was a valid host
 
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % p12_enc_identity,
+            raise Redirect(new_url)
 
-           '-X', 'X509_user_identity=%s' % p12_enc_identity, realm.user_princ],
 
-           expected_code=2)
 
-realm.kinit(realm.user_princ,
+    try:
 
-            flags=['-X', 'X509_user_identity=%s' % p12_enc_identity],
+        handler = _HANDLERS[host]
 
-            password='encrypted')
+    except KeyError:
 
-realm.klist(realm.user_princ)
+        raise NoHandlerFound(url)
 
-realm.run([kvno, realm.host_princ])
 
 
+    try:
 
-# PKINIT with PKCS12: identity, with a password on the bundle, supplied by the
+        mimetype, data = handler(url)
 
-# responder.
+    except OSError as e:
 
-# Supply the response in raw form.
+        # FIXME:qtwebengine how to handle this?
 
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % p12_enc_identity,
+        raise QuteSchemeOSError(e)
 
-           '-r', 'pkinit={"%s": "encrypted"}' % p12_enc_identity,
+    except QuteSchemeError:
 
-           '-X', 'X509_user_identity=%s' % p12_enc_identity, realm.user_princ])
+        raise
 
-# Supply the response through the convenience API.
 
-realm.run(['./responder', '-X', 'X509_user_identity=%s' % p12_enc_identity,
 
-           '-p', '%s=%s' % (p12_enc_identity, 'encrypted'),
+    assert mimetype is not None, url
 
-           realm.user_princ])
+    if mimetype == 'text/html' and isinstance(data, str):
 
-realm.klist(realm.user_princ)
+        # We let handlers return HTML as text
 
-realm.run([kvno, realm.host_princ])
+        data = data.encode('utf-8', errors='xmlcharrefreplace')
 
 
 
-if not have_soft_pkcs11:
+    return mimetype, data
 
-    skip_rest('PKINIT PKCS11 tests', 'soft-pkcs11.so not found')
 
 
 
-softpkcs11rc = os.path.join(os.getcwd(), 'testdir', 'soft-pkcs11.rc')
 
-realm.env['SOFTPKCS11RC'] = softpkcs11rc
+@add_handler('bookmarks')
 
+def qute_bookmarks(_url):
 
+    """Handler for qute://bookmarks. Display all quickmarks / bookmarks."""
 
-# PKINIT with PKCS11: identity, with no need for a PIN.
+    bookmarks = sorted(objreg.get('bookmark-manager').marks.items(),
 
-conf = open(softpkcs11rc, 'w')
+                       key=lambda x: x[1])  # Sort by title
 
-conf.write("%s\t%s\t%s\t%s\n" % ('user', 'user token', user_pem, privkey_pem))
+    quickmarks = sorted(objreg.get('quickmark-manager').marks.items(),
 
-conf.close()
+                        key=lambda x: x[0])  # Sort by name
 
-# Expect to succeed without having to supply any more information.
 
-realm.run(['./responder', '-x', 'pkinit=',
 
-           '-X', 'X509_user_identity=%s' % p11_identity, realm.user_princ])
+    html = jinja.render('bookmarks.html',
 
-realm.kinit(realm.user_princ,
+                        title='Bookmarks',
 
-            flags=['-X', 'X509_user_identity=%s' % p11_identity])
+                        bookmarks=bookmarks,
 
-realm.klist(realm.user_princ)
+                        quickmarks=quickmarks)
 
-realm.run([kvno, realm.host_princ])
+    return 'text/html', html
 
 
 
-# PKINIT with PKCS11: identity, with a PIN supplied by the prompter.
 
-os.remove(softpkcs11rc)
 
-conf = open(softpkcs11rc, 'w')
+@add_handler('tabs')
 
-conf.write("%s\t%s\t%s\t%s\n" % ('user', 'user token', user_pem,
+def qute_tabs(_url):
 
-                                 privkey_enc_pem))
+    """Handler for qute://tabs. Display information about all open tabs."""
 
-conf.close()
+    tabs = collections.defaultdict(list)
 
-# Expect failure if the responder does nothing, and there's no prompter
+    for win_id, window in objreg.window_registry.items():
 
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % p11_token_identity,
+        if sip.isdeleted(window):
 
-           '-X', 'X509_user_identity=%s' % p11_identity, realm.user_princ],
+            continue
 
-          expected_code=2)
+        tabbed_browser = objreg.get('tabbed-browser',
 
-realm.kinit(realm.user_princ,
+                                    scope='window',
 
-            flags=['-X', 'X509_user_identity=%s' % p11_identity],
+                                    window=win_id)
 
-            password='encrypted')
+        for tab in tabbed_browser.widgets():
 
-realm.klist(realm.user_princ)
+            if tab.url() not in [QUrl("qute://tabs/"), QUrl("qute://tabs")]:
 
-realm.run([kvno, realm.host_princ])
+                urlstr = tab.url().toDisplayString()
 
+                tabs[str(win_id)].append((tab.title(), urlstr))
 
 
-# PKINIT with PKCS11: identity, with a PIN supplied by the responder.
 
-# Supply the response in raw form.
+    html = jinja.render('tabs.html',
 
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % p11_token_identity,
+                        title='Tabs',
 
-           '-r', 'pkinit={"%s": "encrypted"}' % p11_token_identity,
+                        tab_list_by_window=tabs)
 
-           '-X', 'X509_user_identity=%s' % p11_identity, realm.user_princ])
+    return 'text/html', html
 
-# Supply the response through the convenience API.
 
-realm.run(['./responder', '-X', 'X509_user_identity=%s' % p11_identity,
 
-           '-p', '%s=%s' % (p11_token_identity, 'encrypted'),
 
-           realm.user_princ])
 
-realm.klist(realm.user_princ)
+def history_data(start_time, offset=None):
 
-realm.run([kvno, realm.host_princ])
+    """Return history data.
 
 
 
-success('PKINIT tests')
+    Arguments:
+
+        start_time: select history starting from this timestamp.
+
+        offset: number of items to skip
+
+    """
+
+    # history atimes are stored as ints, ensure start_time is not a float
+
+    start_time = int(start_time)
+
+    hist = objreg.get('web-history')
+
+    if offset is not None:
+
+        entries = hist.entries_before(start_time, limit=1000, offset=offset)
+
+    else:
+
+        # end is 24hrs earlier than start
+
+        end_time = start_time - 24*60*60
+
+        entries = hist.entries_between(end_time, start_time)
+
+
+
+    return [{"url": html.escape(e.url),
+
+             "title": html.escape(e.title) or html.escape(e.url),
+
+             "time": e.atime} for e in entries]
+
+
+
+
+
+@add_handler('history')
+
+def qute_history(url):
+
+    """Handler for qute://history. Display and serve history."""
+
+    if url.path() == '/data':
+
+        try:
+
+            offset = QUrlQuery(url).queryItemValue("offset")
+
+            offset = int(offset) if offset else None
+
+        except ValueError as e:
+
+            raise QuteSchemeError("Query parameter offset is invalid", e)
+
+        # Use start_time in query or current time.
+
+        try:
+
+            start_time = QUrlQuery(url).queryItemValue("start_time")
+
+            start_time = float(start_time) if start_time else time.time()
+
+        except ValueError as e:
+
+            raise QuteSchemeError("Query parameter start_time is invalid", e)
+
+
+
+        return 'text/html', json.dumps(history_data(start_time, offset))
+
+    else:
+
+        return 'text/html', jinja.render(
+
+            'history.html',
+
+            title='History',
+
+            gap_interval=config.val.history_gap_interval
+
+        )
+
+
+
+
+
+@add_handler('javascript')
+
+def qute_javascript(url):
+
+    """Handler for qute://javascript.
+
+
+
+    Return content of file given as query parameter.
+
+    """
+
+    path = url.path()
+
+    if path:
+
+        path = "javascript" + os.sep.join(path.split('/'))
+
+        return 'text/html', utils.read_file(path, binary=False)
+
+    else:
+
+        raise QuteSchemeError("No file specified", ValueError())
+
+
+
+
+
+@add_handler('pyeval')
+
+def qute_pyeval(_url):
+
+    """Handler for qute://pyeval."""
+
+    html = jinja.render('pre.html', title='pyeval', content=pyeval_output)
+
+    return 'text/html', html
+
+
+
+
+
+@add_handler('spawn-output')
+
+def qute_spawn_output(_url):
+
+    """Handler for qute://spawn-output."""
+
+    html = jinja.render('pre.html', title='spawn output', content=spawn_output)
+
+    return 'text/html', html
+
+
+
+
+
+@add_handler('version')
+
+@add_handler('verizon')
+
+def qute_version(_url):
+
+    """Handler for qute://version."""
+
+    html = jinja.render('version.html', title='Version info',
+
+                        version=version.version(),
+
+                        copyright=qutebrowser.__copyright__)
+
+    return 'text/html', html
+
+
+
+
+
+@add_handler('plainlog')
+
+def qute_plainlog(url):
+
+    """Handler for qute://plainlog.
+
+
+
+    An optional query parameter specifies the minimum log level to print.
+
+    For example, qute://log?level=warning prints warnings and errors.
+
+    Level can be one of: vdebug, debug, info, warning, error, critical.
+
+    """
+
+    if log.ram_handler is None:
+
+        text = "Log output was disabled."
+
+    else:
+
+        level = QUrlQuery(url).queryItemValue('level')
+
+        if not level:
+
+            level = 'vdebug'
+
+        text = log.ram_handler.dump_log(html=False, level=level)
+
+    html = jinja.render('pre.html', title='log', content=text)
+
+    return 'text/html', html
+
+
+
+
+
+@add_handler('log')
+
+def qute_log(url):
+
+    """Handler for qute://log.
+
+
+
+    An optional query parameter specifies the minimum log level to print.
+
+    For example, qute://log?level=warning prints warnings and errors.
+
+    Level can be one of: vdebug, debug, info, warning, error, critical.
+
+    """
+
+    if log.ram_handler is None:
+
+        html_log = None
+
+    else:
+
+        level = QUrlQuery(url).queryItemValue('level')
+
+        if not level:
+
+            level = 'vdebug'
+
+        html_log = log.ram_handler.dump_log(html=True, level=level)
+
+
+
+    html = jinja.render('log.html', title='log', content=html_log)
+
+    return 'text/html', html
+
+
+
+
+
+@add_handler('gpl')
+
+def qute_gpl(_url):
+
+    """Handler for qute://gpl. Return HTML content as string."""
+
+    return 'text/html', utils.read_file('html/license.html')
+
+
+
+
+
+@add_handler('help')
+
+def qute_help(url):
+
+    """Handler for qute://help."""
+
+    urlpath = url.path()
+
+    if not urlpath or urlpath == '/':
+
+        urlpath = 'index.html'
+
+    else:
+
+        urlpath = urlpath.lstrip('/')
+
+    if not docutils.docs_up_to_date(urlpath):
+
+        message.error("Your documentation is outdated! Please re-run "
+
+                      "scripts/asciidoc2html.py.")
+
+
+
+    path = 'html/doc/{}'.format(urlpath)
+
+    if not urlpath.endswith('.html'):
+
+        try:
+
+            bdata = utils.read_file(path, binary=True)
+
+        except OSError as e:
+
+            raise QuteSchemeOSError(e)
+
+        mimetype, _encoding = mimetypes.guess_type(urlpath)
+
+        assert mimetype is not None, url
+
+        return mimetype, bdata
+
+
+
+    try:
+
+        data = utils.read_file(path)
+
+    except OSError:
+
+        # No .html around, let's see if we find the asciidoc
+
+        asciidoc_path = path.replace('.html', '.asciidoc')
+
+        if asciidoc_path.startswith('html/doc/'):
+
+            asciidoc_path = asciidoc_path.replace('html/doc/', '../doc/help/')
+
+
+
+        try:
+
+            asciidoc = utils.read_file(asciidoc_path)
+
+        except OSError:
+
+            asciidoc = None
+
+
+
+        if asciidoc is None:
+
+            raise
+
+
+
+        preamble = textwrap.dedent("""
+
+            There was an error loading the documentation!
+
+
+
+            This most likely means the documentation was not generated
+
+            properly. If you are running qutebrowser from the git repository,
+
+            please (re)run scripts/asciidoc2html.py and reload this page.
+
+
+
+            If you're running a released version this is a bug, please use
+
+            :report to report it.
+
+
+
+            Falling back to the plaintext version.
+
+
+
+            ---------------------------------------------------------------
+
+
+
+
+
+        """)
+
+        return 'text/plain', (preamble + asciidoc).encode('utf-8')
+
+    else:
+
+        return 'text/html', data
+
+
+
+
+
+@add_handler('backend-warning')
+
+def qute_backend_warning(_url):
+
+    """Handler for qute://backend-warning."""
+
+    html = jinja.render('backend-warning.html',
+
+                        distribution=version.distribution(),
+
+                        Distribution=version.Distribution,
+
+                        version=pkg_resources.parse_version,
+
+                        title="Legacy backend warning")
+
+    return 'text/html', html
+
+
+
+
+
+def _qute_settings_set(url):
+
+    """Handler for qute://settings/set."""
+
+    query = QUrlQuery(url)
+
+    option = query.queryItemValue('option', QUrl.FullyDecoded)
+
+    value = query.queryItemValue('value', QUrl.FullyDecoded)
+
+
+
+    # https://github.com/qutebrowser/qutebrowser/issues/727
+
+    if option == 'content.javascript.enabled' and value == 'false':
+
+        msg = ("Refusing to disable javascript via qute://settings "
+
+               "as it needs javascript support.")
+
+        message.error(msg)
+
+        return 'text/html', b'error: ' + msg.encode('utf-8')
+
+
+
+    try:
+
+        config.instance.set_str(option, value, save_yaml=True)
+
+        return 'text/html', b'ok'
+
+    except configexc.Error as e:
+
+        message.error(str(e))
+
+        return 'text/html', b'error: ' + str(e).encode('utf-8')
+
+
+
+
+
+@add_handler('settings')
+
+def qute_settings(url):
+
+    """Handler for qute://settings. View/change qute configuration."""
+
+    if url.path() == '/set':
+
+        return _qute_settings_set(url)
+
+
+
+    html = jinja.render('settings.html', title='settings',
+
+                        configdata=configdata,
+
+                        confget=config.instance.get_str)
+
+    return 'text/html', html
+
+
+
+
+
+@add_handler('bindings')
+
+def qute_bindings(_url):
+
+    """Handler for qute://bindings. View keybindings."""
+
+    bindings = {}
+
+    defaults = config.val.bindings.default
+
+    modes = set(defaults.keys()).union(config.val.bindings.commands)
+
+    modes.remove('normal')
+
+    modes = ['normal'] + sorted(list(modes))
+
+    for mode in modes:
+
+        bindings[mode] = config.key_instance.get_bindings_for(mode)
+
+
+
+    html = jinja.render('bindings.html', title='Bindings',
+
+                        bindings=bindings)
+
+    return 'text/html', html
+
+
+
+
+
+@add_handler('back')
+
+def qute_back(url):
+
+    """Handler for qute://back.
+
+
+
+    Simple page to free ram / lazy load a site, goes back on focusing the tab.
+
+    """
+
+    html = jinja.render(
+
+        'back.html',
+
+        title='Suspended: ' + urllib.parse.unquote(url.fragment()))
+
+    return 'text/html', html
+
+
+
+
+
+@add_handler('configdiff')
+
+def qute_configdiff(url):
+
+    """Handler for qute://configdiff."""
+
+    if url.path() == '/old':
+
+        try:
+
+            return 'text/html', configdiff.get_diff()
+
+        except OSError as e:
+
+            error = (b'Failed to read old config: ' +
+
+                     str(e.strerror).encode('utf-8'))
+
+            return 'text/plain', error
+
+    else:
+
+        data = config.instance.dump_userconfig().encode('utf-8')
+
+        return 'text/plain', data
+
+
+
+
+
+@add_handler('pastebin-version')
+
+def qute_pastebin_version(_url):
+
+    """Handler that pastebins the version string."""
+
+    version.pastebin_version()
+
+    return 'text/plain', b'Paste called.'

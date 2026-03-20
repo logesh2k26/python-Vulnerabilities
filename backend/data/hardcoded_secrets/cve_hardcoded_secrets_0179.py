@@ -2,592 +2,312 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# tests.conf_tests
+# Author: Trevor Perrin
 
-# Testing the configuration module for Confire
+# See the LICENSE file for legal information regarding use of this file.
 
-#
 
-# Author:   Benjamin Bengfort <benjamin@bengfort.com>
 
-# Created:  Sun Jul 20 09:43:33 2014 -0400
+"""OpenSSL/M2Crypto RSA implementation."""
 
-#
 
-# Copyright (C) 2014 Bengfort.com
 
-# For license information, see LICENSE.txt
+from .cryptomath import *
 
-#
 
-# ID: conf_tests.py [] benjamin@bengfort.com $
 
+from .rsakey import *
 
+from .python_rsakey import Python_RSAKey
 
-"""
+from .compat import compatAscii2Bytes
 
-Testing the configuration module for Confire
 
 
+#copied from M2Crypto.util.py, so when we load the local copy of m2
 
-TODO: Write test for None values in config
+#we can still use it
 
-TODO: Ensure that "empty" values e.g. [], and {} override on config
+def password_callback(v, prompt1='Enter private key passphrase:',
 
-TODO: Ensure that configure method is working correctly
+                           prompt2='Verify passphrase:'):
 
-TODO: Ensure that testing is not dependent on a user's configuration
+    from getpass import getpass
 
-"""
-
-
-
-##########################################################################
-
-## Imports
-
-##########################################################################
-
-
-
-import os
-
-import shutil
-
-import pytest
-
-
-
-from copy import copy
-
-from confire.config import *
-
-from confire.exceptions import *
-
-
-
-
-
-##########################################################################
-
-## Fixtures
-
-##########################################################################
-
-
-
-os.environ['TESTING_CONFIRE_PASSWORD'] = 'supersecretsquirrel'
-
-TESTDATA = os.path.join(os.path.dirname(__file__), "testdata")
-
-TESTCONF = os.path.join(TESTDATA, "testconf.yaml")
-
-
-
-
-
-class SubNestedConfiguration(Configuration):
-
-
-
-    level = 2
-
-
-
-
-
-class NestedConfiguration(Configuration):
-
-
-
-    level  = 1
-
-    empty  = []
-
-    nested_path = path_setting(raises=False, required=False)
-
-    nested = SubNestedConfiguration()
-
-
-
-
-
-class MockConfiguration(Configuration):
-
-    """
-
-    A subclass of the Configuration class for testing purposes.
-
-    """
-
-
-
-    _notanopt = "joe"
-
-    NOTANOPT  = "bob"
-
-    mysetting = True
-
-    anoption  = 42
-
-    paththere = "/var/log/there.pth"
-
-    nested    = NestedConfiguration()
-
-    password  = environ_setting('TESTING_CONFIRE_PASSWORD')
-
-    myfile    = path_setting(raises=False)
-
-    datadir   = path_setting(default='/tmp/data/', raises=False)
-
-
-
-    def amethod(self):
-
-        return True
-
-
-
-
-
-@pytest.fixture(scope='function')
-
-def emptyconfig():
-
-    """
-
-    Remove default config paths to ensure clean tests
-
-    """
-
-    original_conf_paths = copy(Configuration.CONF_PATHS)
-
-    Configuration.CONF_PATHS = []
-
-    yield original_conf_paths
-
-    Configuration.CONF_PATHS = original_conf_paths
-
-
-
-
-
-@pytest.fixture(scope='function')
-
-def testconfig(tmpdir, emptyconfig):
-
-    """
-
-    Copy the testconf.yaml file to a temporary directory and modify the
-
-    lookup path of the Configuration object to look for it.
-
-    """
-
-    f = tmpdir.mkdir("conf").join("test.yaml")
-
-    path = str(f)
-
-    shutil.copy2(TESTCONF, path)
-
-    Configuration.CONF_PATHS = [path]
-
-    yield path
-
-    f.remove()
-
-
-
-
-
-##########################################################################
-
-## Configuration Unit Tests
-
-##########################################################################
-
-
-
-class TestConfig(object):
-
-
-
-    def test_search_path(self):
-
-        """
-
-        Assert there are default directories to search for configuration
-
-        """
-
-        assert len(Configuration.CONF_PATHS) > 0
-
-
-
-    def test_empty_conf_path(self, emptyconfig):
-
-        """
-
-        Test that an empty conf path raises no exceptions
-
-        """
-
-        config = MockConfiguration.load()
-
-        assert len(Configuration.CONF_PATHS) == 0
-
-        assert config['mysetting']
-
-        assert config.get('myprop') is None
-
-
-
-    @pytest.mark.filterwarnings("ignore")
-
-    def test_load_config(self, testconfig):
-
-        """
-
-        Assert config can load from YAML
-
-        """
-
-
-
-        config = MockConfiguration.load()
-
-
-
-        assert config.get('myfile') is not None
-
-        assert config.get('myprop') is not None
-
-        assert isinstance(config.get('nested'), NestedConfiguration)
-
-        assert config.get("nested").get("level") == "floor"
-
-
-
-    @pytest.mark.filterwarnings("ignore")
-
-    def test_load_override(self, testconfig):
-
-        """
-
-        Assert that loading config overrides default
-
-        """
-
-        config = MockConfiguration.load()
-
-        assert not config["mysetting"]
-
-
-
-    def test_configure_by_dict(self):
-
-        """
-
-        Check configuration by dictionary
-
-        """
-
-        config = MockConfiguration.load()
-
-        config.configure({"anoption":45, "foo":"bar"})
-
-        assert config["anoption"] == 45
-
-        assert config["foo"] == "bar"
-
-
-
-    @pytest.mark.filterwarnings("ignore")
-
-    def test_configure_by_conf(self):
-
-        """
-
-        Check configuration by other configuration
-
-        """
-
-
-
-        configa = MockConfiguration.load()
-
-        configb = MockConfiguration.load()
-
-
-
-        assert configa["anoption"] == configb["anoption"]
-
-
-
-        configa.anoption = 80
-
-        assert configa["anoption"] != configb["anoption"]
-
-
-
-        configb.configure(configa)
-
-        assert configa["anoption"] == configb["anoption"]
-
-
-
-    @pytest.mark.filterwarnings("ignore")
-
-    def test_configure_with_none(self):
-
-        """
-
-        Ensure None passed to configure doesn't break
-
-        """
-
-        config = MockConfiguration.load()
+    while 1:
 
         try:
 
-            config.configure(None)
+            p1=getpass(prompt1)
 
-        except Exception:
+            if v:
 
-            pytest.fail("None passed to configure raised an error!")
+                p2=getpass(prompt2)
 
+                if p1==p2:
 
+                    break
 
-    @pytest.mark.filterwarnings("ignore")
+            else:
 
-    def test_nested_configure(self):
+                break
 
-        """
+        except KeyboardInterrupt:
 
-        Ensure nested configurations work
+            return None
 
-        """
+    return p1
 
-        config = MockConfiguration.load()
 
-        data   = {"nested": {"nested": {"level":"basement"}, "level": "lobby"}}
 
-        config.configure(data)
 
-        assert isinstance(config.get('nested'), NestedConfiguration)
 
-        assert isinstance(config.get('nested').get('nested'), SubNestedConfiguration)
+if m2cryptoLoaded:
 
-        assert config.get('nested').get('level') == 'lobby'
+    class OpenSSL_RSAKey(RSAKey):
 
-        assert config.get('nested').get('nested').get('level') == 'basement'
+        def __init__(self, n=0, e=0):
 
+            self.rsa = None
 
+            self._hasPrivateKey = False
 
-    @pytest.mark.filterwarnings("ignore")
+            if (n and not e) or (e and not n):
 
-    def test_environ_configuration(self):
+                raise AssertionError()
 
-        """
+            if n and e:
 
-        Test the environ setting on a config
+                self.rsa = m2.rsa_new()
 
-        """
+                m2.rsa_set_n(self.rsa, numberToMPI(n))
 
-        config = MockConfiguration.load()
+                m2.rsa_set_e(self.rsa, numberToMPI(e))
 
-        assert config.get('password') == 'supersecretsquirrel'
 
 
+        def __del__(self):
 
-    @pytest.mark.filterwarnings("ignore")
+            if self.rsa:
 
-    def test_settings_file_environ_override(self, testconfig):
+                m2.rsa_free(self.rsa)
 
-        """
 
-        Test that the settings file overrides the environ
 
-        """
+        def __getattr__(self, name):
 
-        config = MockConfiguration.load()
+            if name == 'e':
 
-        assert config.get('password') == 'knockknock'
+                if not self.rsa:
 
+                    return 0
 
+                return mpiToNumber(m2.rsa_get_e(self.rsa))
 
-    def test_path_configuration(self, tmpdir):
+            elif name == 'n':
 
-        """
+                if not self.rsa:
 
-        Test the path setting on a config
+                    return 0
 
-        """
+                return mpiToNumber(m2.rsa_get_n(self.rsa))
 
-        config = MockConfiguration.load()
+            else:
 
-        with pytest.raises(ImproperlyConfigured):
+                raise AttributeError
 
-            config.myfile
 
 
+        def hasPrivateKey(self):
 
-        assert config.datadir == '/tmp/data/'
+            return self._hasPrivateKey
 
 
 
-    @pytest.mark.filterwarnings("ignore")
+        def _rawPrivateKeyOp(self, m):
 
-    def test_settings_file_path_configuration(self, testconfig):
+            b = numberToByteArray(m, numBytes(self.n))
 
-        """
+            s = m2.rsa_private_encrypt(self.rsa, bytes(b), m2.no_padding)
 
-        Test the paths loaded from the settings file
+            c = bytesToNumber(bytearray(s))
 
-        """
+            return c
 
-        config = MockConfiguration.load()
 
-        assert os.path.expanduser('~/tmp/data.txt') == config.myfile
 
-        assert '/tmp/data/' == config.datadir
+        def _rawPublicKeyOp(self, c):
 
+            b = numberToByteArray(c, numBytes(self.n))
 
+            s = m2.rsa_public_decrypt(self.rsa, bytes(b), m2.no_padding)
 
-    @pytest.mark.filterwarnings("ignore")
+            m = bytesToNumber(bytearray(s))
 
-    def test_nested_path(self, testconfig):
+            return m
 
-        """
 
-        Tested nested path configuration
 
-        """
+        def acceptsPassword(self): return True
 
-        config = MockConfiguration.load()
 
-        assert config.nested.nested_path == '/tmp'
 
-        assert config['nested']['nested_path'] == '/tmp'
+        def write(self, password=None):
 
-        assert config['NESTED']['NESTED_PATH'] == '/tmp'
+            bio = m2.bio_new(m2.bio_s_mem())
 
+            if self._hasPrivateKey:
 
+                if password:
 
-    def test_options(self):
+                    def f(v): return password
 
-        """
+                    m2.rsa_write_key(self.rsa, bio, m2.des_ede_cbc(), f)
 
-        Test the options method
+                else:
 
-        """
+                    def f(): pass
 
-        config = MockConfiguration.load()
+                    m2.rsa_write_key_no_cipher(self.rsa, bio, f)
 
-        options = dict(config.options())
+            else:
 
+                if password:
 
+                    raise AssertionError()
 
-        assert "mysetting" in options
+                m2.rsa_write_pub_key(self.rsa, bio)
 
-        assert "anoption" in options
+            s = m2.bio_read(bio, m2.bio_ctrl_pending(bio))
 
-        assert "paththere" in options
+            m2.bio_free(bio)
 
+            return s
 
 
-        assert "_notanopt" not in options
 
-        assert "amethod" not in options
+        def generate(bits):
 
-        assert "NOTANOPT" not in options
+            key = OpenSSL_RSAKey()
 
+            def f():pass
 
+            key.rsa = m2.rsa_generate_key(bits, 3, f)
 
-    def test_get(self):
+            key._hasPrivateKey = True
 
-        """
+            return key
 
-        Assert that get returns default or key
+        generate = staticmethod(generate)
 
-        """
 
-        config = MockConfiguration.load()
 
-        assert config.get("mysetting")
+        def parse(s, passwordCallback=None):
 
-        assert "notanopt" not in dict(config.options())
+            # Skip forward to the first PEM header
 
-        assert config.get("notanopt", 1) == 1
+            start = s.find("-----BEGIN ")
 
+            if start == -1:
 
+                raise SyntaxError()
 
-    def test__get__(self):
+            s = s[start:]            
 
-        """
+            if s.startswith("-----BEGIN "):
 
-        Check the getkey method
+                if passwordCallback==None:
 
-        """
+                    callback = password_callback
 
-        config = MockConfiguration.load()
+                else:
 
-        assert config["mysetting"]
+                    def f(v, prompt1=None, prompt2=None):
 
+                        return passwordCallback()
 
+                    callback = f
 
-    def test_case_insensitivity(self):
+                bio = m2.bio_new(m2.bio_s_mem())
 
-        """
+                try:
 
-        Assert case insensitivity in getitem
+                    m2.bio_write(bio, compatAscii2Bytes(s))
 
-        """
+                    key = OpenSSL_RSAKey()
 
-        config = MockConfiguration.load()
+                    # parse SSLay format PEM file
 
-        assert config["MYSETTING"]
+                    if s.startswith("-----BEGIN RSA PRIVATE KEY-----"):
 
+                        def f():pass
 
+                        key.rsa = m2.rsa_read_key(bio, callback)
 
-    def test_key_error(self):
+                        if key.rsa == None:
 
-        """
+                            raise SyntaxError()
 
-        Assert not found key raises an exception
+                        key._hasPrivateKey = True
 
-        """
+                    # parse a standard PKCS#8 PEM file
 
-        with pytest.raises(KeyError):
+                    elif s.startswith("-----BEGIN PRIVATE KEY-----"):
 
-            config = MockConfiguration.load()
+                        def f():pass
 
-            assert config["notanopt"]
+                        key.rsa = m2.pkey_read_pem(bio, callback)
 
+                        # the below code assumes RSA key while PKCS#8 files
 
+                        # (and by extension the EVP_PKEY structure) can be
 
-    @pytest.mark.filterwarnings("ignore")
+                        # also DSA or EC, thus the double check against None
 
-    def test_configure_back_to_empty(self, testconfig):
+                        # (first if the file was properly loaded and second
 
-        """
+                        # if the file actually has a RSA key in it)
 
-        Can override an empty list or dictionary from configuration
+                        # tlslite doesn't support DSA or EC so it's useless
 
-        """
+                        # to handle them in a different way
 
-        # Setup normal configuration
+                        if key.rsa == None:
 
-        config = MockConfiguration.load()
+                            raise SyntaxError()
 
-        assert len(config.nested.empty) > 0, "configuration was not loaded"
+                        key.rsa = m2.pkey_get1_rsa(key.rsa)
 
+                        if key.rsa == None:
 
+                            raise SyntaxError()
 
-        # Now reoverride with original settings - like the TestingConfig
+                        key._hasPrivateKey = True
 
-        config.nested.configure(NestedConfiguration())
+                    elif s.startswith("-----BEGIN PUBLIC KEY-----"):
 
-        assert len(config.nested.empty) == 0
+                        key.rsa = m2.rsa_read_pub_key(bio)
 
-        assert config.nested.level == 1
+                        if key.rsa == None:
+
+                            raise SyntaxError()
+
+                        key._hasPrivateKey = False
+
+                    else:
+
+                        raise SyntaxError()
+
+                    return key
+
+                finally:
+
+                    m2.bio_free(bio)
+
+            else:
+
+                raise SyntaxError()
+
+
+
+        parse = staticmethod(parse)

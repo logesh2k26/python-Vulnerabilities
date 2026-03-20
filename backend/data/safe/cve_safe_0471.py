@@ -2,204 +2,552 @@
 # Safety: safe
 # Category: safe
 
-# -*- coding: utf-8 -*-
+import Bcfg2.Server.Plugin
 
+import Bcfg2.Options
 
+import lxml.etree
 
-##############################################################################
+import posixpath
 
-#                        2011 E2OpenPlugins                                  #
+import tempfile
 
-#                                                                            #
-
-#  This file is open source software; you can redistribute it and/or modify  #
-
-#     it under the terms of the GNU General Public License version 2 as      #
-
-#               published by the Free Software Foundation.                   #
-
-#                                                                            #
-
-##############################################################################
-
-
+import pipes
 
 import os
 
-import re
+from subprocess import Popen, PIPE, STDOUT
 
-import glob
+# Compatibility import
 
-from urllib import quote
+from Bcfg2.Bcfg2Py3k import ConfigParser
 
-import json
 
 
 
-from twisted.web import static, resource, http
 
+class SSLCA(Bcfg2.Server.Plugin.GroupSpool):
 
+    """
 
-from Components.config import config
+    The SSLCA generator handles the creation and
 
-from Tools.Directories import fileExists
+    management of ssl certificates and their keys.
 
-from utilities import lenient_force_utf_8, sanitise_filename_slashes
+    """
 
+    name = 'SSLCA'
 
+    __version__ = '$Id:$'
 
+    __author__ = 'g.hagger@gmail.com'
 
+    __child__ = Bcfg2.Server.Plugin.FileBacked
 
-def new_getRequestHostname(self):
+    key_specs = {}
 
-	host = self.getHeader(b'host')
+    cert_specs = {}
 
-	if host:
+    CAs = {}
 
-		if host[0]=='[':
 
-			return host.split(']',1)[0] + "]"
 
-		return host.split(':', 1)[0].encode('ascii')
+    def HandleEvent(self, event=None):
 
-	return self.getHost().host.encode('ascii')
+        """
 
+        Updates which files this plugin handles based upon filesystem events.
 
+        Allows configuration items to be added/removed without server restarts.
 
-http.Request.getRequestHostname = new_getRequestHostname
+        """
 
+        action = event.code2str()
 
+        if event.filename[0] == '/':
 
+            return
 
+        epath = "".join([self.data, self.handles[event.requestID],
 
-class FileController(resource.Resource):
+                         event.filename])
 
-	def render(self, request):
+        if posixpath.isdir(epath):
 
-		action = "download"
+            ident = self.handles[event.requestID] + event.filename
 
-		if "action" in request.args:
+        else:
 
-			action = request.args["action"][0]
+            ident = self.handles[event.requestID][:-1]
 
 
 
-		if "file" in request.args:
+        fname = "".join([ident, '/', event.filename])
 
-			filename = lenient_force_utf_8(request.args["file"][0])
 
-			filename = sanitise_filename_slashes(os.path.realpath(filename))
 
+        if event.filename.endswith('.xml'):
 
+            if action in ['exists', 'created', 'changed']:
 
-			if not os.path.exists(filename):
+                if event.filename.endswith('key.xml'):
 
-				return "File '%s' not found" % (filename)
+                    key_spec = dict(list(lxml.etree.parse(epath).find('Key').items()))
 
+                    self.key_specs[ident] = {
 
+                        'bits': key_spec.get('bits', 2048),
 
-			if action == "stream":
+                        'type': key_spec.get('type', 'rsa')
 
-				name = "stream"
+                    }
 
-				if "name" in request.args:
+                    self.Entries['Path'][ident] = self.get_key
 
-					name = request.args["name"][0]
+                elif event.filename.endswith('cert.xml'):
 
+                    cert_spec = dict(list(lxml.etree.parse(epath).find('Cert').items()))
 
+                    ca = cert_spec.get('ca', 'default')
 
-				port = config.OpenWebif.port.value
+                    self.cert_specs[ident] = {
 
-				proto = 'http'
+                        'ca': ca,
 
-				if request.isSecure():
+                        'format': cert_spec.get('format', 'pem'),
 
-					port = config.OpenWebif.https_port.value
+                        'key': cert_spec.get('key'),
 
-					proto = 'https'
+                        'days': cert_spec.get('days', 365),
 
-				ourhost = request.getHeader('host')
+                        'C': cert_spec.get('c'),
 
-				m = re.match('.+\:(\d+)$', ourhost)
+                        'L': cert_spec.get('l'),
 
-				if m is not None:
+                        'ST': cert_spec.get('st'),
 
-					port = m.group(1)
+                        'OU': cert_spec.get('ou'),
 
+                        'O': cert_spec.get('o'),
 
+                        'emailAddress': cert_spec.get('emailaddress')
 
-				response = "#EXTM3U\n#EXTVLCOPT--http-reconnect=true\n#EXTINF:-1,%s\n%s://%s:%s/file?action=download&file=%s" % (name, proto, request.getRequestHostname(), port, quote(filename))
+                    }
 
-				request.setHeader("Content-Disposition", 'attachment;filename="%s.m3u"' % name)
+                    cp = ConfigParser()
 
-				request.setHeader("Content-Type", "application/x-mpegurl")
+                    cp.read(self.core.cfile)
 
-				return response
+                    self.CAs[ca] = dict(cp.items('sslca_' + ca))
 
-			elif action == "delete":
+                    self.Entries['Path'][ident] = self.get_cert
 
-				request.setResponseCode(http.OK)
+            if action == 'deleted':
 
-				return "TODO: DELETE FILE: %s" % (filename)
+                if ident in self.Entries['Path']:
 
-			elif action == "download":
+                    del self.Entries['Path'][ident]
 
-				request.setHeader("Content-Disposition", "attachment;filename=\"%s\"" % (filename.split('/')[-1]))
+        else:
 
-				rfile = static.File(filename, defaultType = "application/octet-stream")
+            if action in ['exists', 'created']:
 
-				return rfile.render(request)
+                if posixpath.isdir(epath):
 
-			else: 
+                    self.AddDirectoryMonitor(epath[len(self.data):])
 
-				return "wrong action parameter"
+                if ident not in self.entries and posixpath.isfile(epath):
 
+                    self.entries[fname] = self.__child__(epath)
 
+                    self.entries[fname].HandleEvent(event)
 
-		if "dir" in request.args:
+            if action == 'changed':
 
-			path = request.args["dir"][0]
+                self.entries[fname].HandleEvent(event)
 
-			pattern = '*'
+            elif action == 'deleted':
 
-			data = []
+                if fname in self.entries:
 
-			if "pattern" in request.args:
+                    del self.entries[fname]
 
-				pattern = request.args["pattern"][0]
+                else:
 
-			directories = []
+                    self.entries[fname].HandleEvent(event)
 
-			files = []
 
-			if fileExists(path):
 
-				try:
+    def get_key(self, entry, metadata):
 
-					files = glob.glob(path+'/'+pattern)
+        """
 
-				except:
+        either grabs a prexisting key hostfile, or triggers the generation
 
-					files = []
+        of a new key if one doesn't exist.
 
-				files.sort()
+        """
 
-				tmpfiles = files[:]
+        # set path type and permissions, otherwise bcfg2 won't bind the file
 
-				for x in tmpfiles:
+        permdata = {'owner': 'root',
 
-					if os.path.isdir(x):
+                    'group': 'root',
 
-						directories.append(x + '/')
+                    'type': 'file',
 
-						files.remove(x)
+                    'perms': '644'}
 
-				data.append({"result": True,"dirs": directories,"files": files})
+        [entry.attrib.__setitem__(key, permdata[key]) for key in permdata]
 
-			else:
 
-				data.append({"result": False,"message": "path %s not exits" % (path)})
 
-			request.setHeader("content-type", "application/json; charset=utf-8")
+        # check if we already have a hostfile, or need to generate a new key
 
-			return json.dumps(data, indent=2)
+        # TODO: verify key fits the specs
+
+        path = entry.get('name')
+
+        filename = "".join([path, '/', path.rsplit('/', 1)[1],
+
+                            '.H_', metadata.hostname])
+
+        if filename not in list(self.entries.keys()):
+
+            key = self.build_key(filename, entry, metadata)
+
+            open(self.data + filename, 'w').write(key)
+
+            entry.text = key
+
+            self.entries[filename] = self.__child__("%s%s" % (self.data,
+
+                                                              filename))
+
+            self.entries[filename].HandleEvent()
+
+        else:
+
+            entry.text = self.entries[filename].data
+
+
+
+    def build_key(self, filename, entry, metadata):
+
+        """
+
+        generates a new key according the the specification
+
+        """
+
+        type = self.key_specs[entry.get('name')]['type']
+
+        bits = self.key_specs[entry.get('name')]['bits']
+
+        if type == 'rsa':
+
+            cmd = ["openssl", "genrsa", bits]
+
+        elif type == 'dsa':
+
+            cmd = ["openssl", "dsaparam", "-noout", "-genkey", bits]
+
+        key = Popen(cmd, stdout=PIPE).stdout.read()
+
+        return key
+
+
+
+    def get_cert(self, entry, metadata):
+
+        """
+
+        either grabs a prexisting cert hostfile, or triggers the generation
+
+        of a new cert if one doesn't exist.
+
+        """
+
+        # set path type and permissions, otherwise bcfg2 won't bind the file
+
+        permdata = {'owner': 'root',
+
+                    'group': 'root',
+
+                    'type': 'file',
+
+                    'perms': '644'}
+
+        [entry.attrib.__setitem__(key, permdata[key]) for key in permdata]
+
+
+
+        path = entry.get('name')
+
+        filename = "".join([path, '/', path.rsplit('/', 1)[1],
+
+                            '.H_', metadata.hostname])
+
+
+
+        # first - ensure we have a key to work with
+
+        key = self.cert_specs[entry.get('name')].get('key')
+
+        key_filename = "".join([key, '/', key.rsplit('/', 1)[1],
+
+                                '.H_', metadata.hostname])
+
+        if key_filename not in self.entries:
+
+            e = lxml.etree.Element('Path')
+
+            e.attrib['name'] = key
+
+            self.core.Bind(e, metadata)
+
+
+
+        # check if we have a valid hostfile
+
+        if filename in list(self.entries.keys()) and self.verify_cert(filename,
+
+                                                                      key_filename,
+
+                                                                      entry):
+
+            entry.text = self.entries[filename].data
+
+        else:
+
+            cert = self.build_cert(key_filename, entry, metadata)
+
+            open(self.data + filename, 'w').write(cert)
+
+            self.entries[filename] = self.__child__("%s%s" % (self.data,
+
+                                                              filename))
+
+            self.entries[filename].HandleEvent()
+
+            entry.text = cert
+
+
+
+    def verify_cert(self, filename, key_filename, entry):
+
+        if self.verify_cert_against_ca(filename, entry):
+
+            if self.verify_cert_against_key(filename, key_filename):
+
+                return True
+
+        return False
+
+
+
+    def verify_cert_against_ca(self, filename, entry):
+
+        """
+
+        check that a certificate validates against the ca cert,
+
+        and that it has not expired.
+
+        """
+
+        chaincert = self.CAs[self.cert_specs[entry.get('name')]['ca']].get('chaincert')
+
+        cert = self.data + filename
+
+        res = Popen(["openssl", "verify", "-CAfile", chaincert, cert],
+
+                    stdout=PIPE, stderr=STDOUT).stdout.read()
+
+        if res == cert + ": OK\n":
+
+            return True
+
+        return False
+
+
+
+    def verify_cert_against_key(self, filename, key_filename):
+
+        """
+
+        check that a certificate validates against its private key.
+
+        """
+
+        cert = self.data + filename
+
+        key = self.data + key_filename
+
+        cmd = ("openssl x509 -noout -modulus -in %s | openssl md5" %
+
+               pipes.quote(cert))
+
+        cert_md5 = Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT).stdout.read()
+
+        cmd = ("openssl rsa -noout -modulus -in %s | openssl md5" %
+
+               pipes.quote(key))
+
+        key_md5 = Popen(cmd, shell=True, stdout=PIPE, stderr=STDOUT).stdout.read()
+
+        if cert_md5 == key_md5:
+
+            return True
+
+        return False
+
+
+
+    def build_cert(self, key_filename, entry, metadata):
+
+        """
+
+        creates a new certificate according to the specification
+
+        """
+
+        req_config = self.build_req_config(entry, metadata)
+
+        req = self.build_request(key_filename, req_config, entry)
+
+        ca = self.cert_specs[entry.get('name')]['ca']
+
+        ca_config = self.CAs[ca]['config']
+
+        days = self.cert_specs[entry.get('name')]['days']
+
+        passphrase = self.CAs[ca].get('passphrase')
+
+        cmd = ["openssl", "ca", "-config", ca_config, "-in", req,
+
+               "-days", days, "-batch"]
+
+        if passphrase:
+
+            cmd.extend(["-passin", "pass:%s" % passphrase])
+
+        cert = Popen(cmd, stdout=PIPE).stdout.read()
+
+        try:
+
+            os.unlink(req_config)
+
+            os.unlink(req)
+
+        except OSError:
+
+            self.logger.error("Failed to unlink temporary files")
+
+        return cert
+
+
+
+    def build_req_config(self, entry, metadata):
+
+        """
+
+        generates a temporary openssl configuration file that is
+
+        used to generate the required certificate request
+
+        """
+
+        # create temp request config file
+
+        conffile = open(tempfile.mkstemp()[1], 'w')
+
+        cp = ConfigParser({})
+
+        cp.optionxform = str
+
+        defaults = {
+
+            'req': {
+
+                'default_md': 'sha1',
+
+                'distinguished_name': 'req_distinguished_name',
+
+                'req_extensions': 'v3_req',
+
+                'x509_extensions': 'v3_req',
+
+                'prompt': 'no'
+
+            },
+
+            'req_distinguished_name': {},
+
+            'v3_req': {
+
+                'subjectAltName': '@alt_names'
+
+            },
+
+            'alt_names': {}
+
+        }
+
+        for section in list(defaults.keys()):
+
+            cp.add_section(section)
+
+            for key in defaults[section]:
+
+                cp.set(section, key, defaults[section][key])
+
+        x = 1
+
+        altnames = list(metadata.aliases)
+
+        altnames.append(metadata.hostname)
+
+        for altname in altnames:
+
+            cp.set('alt_names', 'DNS.' + str(x), altname)
+
+            x += 1
+
+        for item in ['C', 'L', 'ST', 'O', 'OU', 'emailAddress']:
+
+            if self.cert_specs[entry.get('name')][item]:
+
+                cp.set('req_distinguished_name', item, self.cert_specs[entry.get('name')][item])
+
+        cp.set('req_distinguished_name', 'CN', metadata.hostname)
+
+        cp.write(conffile)
+
+        conffile.close()
+
+        return conffile.name
+
+
+
+    def build_request(self, key_filename, req_config, entry):
+
+        """
+
+        creates the certificate request
+
+        """
+
+        req = tempfile.mkstemp()[1]
+
+        days = self.cert_specs[entry.get('name')]['days']
+
+        key = self.data + key_filename
+
+        cmd = ["openssl", "req", "-new", "-config", req_config,
+
+               "-days", days, "-key", key, "-text", "-out", req]
+
+        res = Popen(cmd, shell=True, stdout=PIPE).stdout.read()
+
+        return req

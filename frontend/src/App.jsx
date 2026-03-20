@@ -1,6 +1,10 @@
 import { useState, useCallback } from 'react'
 import Dashboard from './components/Dashboard'
+import FloatingChatBot from './components/FloatingChatBot'
 import './index.css'
+
+// API key for backend authentication
+const API_KEY = import.meta.env.VITE_API_KEY || 'test-secret-key-12345'
 
 function App() {
     const [analysisResult, setAnalysisResult] = useState(null)
@@ -14,7 +18,7 @@ function App() {
         try {
             const response = await fetch('/api/v1/analyze', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: { 'Content-Type': 'application/json', 'X-API-Key': API_KEY },
                 body: JSON.stringify({ content: code, filename })
             })
 
@@ -47,7 +51,7 @@ function App() {
         try {
             const response = await fetch('/api/v1/analyze/batch', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: { 'Content-Type': 'application/json', 'X-API-Key': API_KEY },
                 body: JSON.stringify({ files: fileContents })
             })
 
@@ -91,6 +95,8 @@ function App() {
                     <span>{error}</span>
                 </div>
             )}
+
+            <FloatingChatBot />
         </div>
     )
 }

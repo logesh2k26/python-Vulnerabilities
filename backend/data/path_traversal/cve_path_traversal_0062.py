@@ -2,526 +2,2006 @@
 # Safety: vulnerable
 # Category: path_traversal
 
+# -*- coding: utf-8 -*-
+
 from __future__ import unicode_literals
 
 
 
-import base64
+import os
 
-import calendar
+import tempfile
 
-import datetime
 
-import re
 
-import sys
+from django import forms
 
-try:
+from django.conf.urls import url
 
-    from urllib import parse as urllib_parse
+from django.contrib import admin
 
-except ImportError:     # Python 2
+from django.contrib.admin import BooleanFieldListFilter
 
-    import urllib as urllib_parse
+from django.contrib.admin.views.main import ChangeList
 
-    import urlparse
+from django.contrib.auth.admin import GroupAdmin, UserAdmin
 
-    urllib_parse.urlparse = urlparse.urlparse
+# Register core models we need in our tests
 
+from django.contrib.auth.models import Group, User
 
+from django.core.exceptions import ValidationError
 
-from binascii import Error as BinasciiError
+from django.core.files.storage import FileSystemStorage
 
-from email.utils import formatdate
+from django.core.mail import EmailMessage
 
+from django.core.servers.basehttp import FileWrapper
 
+from django.forms.models import BaseModelFormSet
 
-from django.utils.datastructures import MultiValueDict
+from django.http import HttpResponse, StreamingHttpResponse
 
-from django.utils.encoding import force_str, force_text
+from django.utils.safestring import mark_safe
 
-from django.utils.functional import allow_lazy
+from django.utils.six import StringIO
 
-from django.utils import six
 
 
+from .models import (
 
-ETAG_MATCH = re.compile(r'(?:W/)?"((?:\\.|[^"])*)"')
+    Actor, AdminOrderedAdminMethod, AdminOrderedCallable, AdminOrderedField,
 
+    AdminOrderedModelMethod, Album, Answer, Article, BarAccount, Book,
 
+    Category, Chapter, ChapterXtra1, Child, ChildOfReferer, Choice, City,
 
-MONTHS = 'jan feb mar apr may jun jul aug sep oct nov dec'.split()
+    Collector, Color, Color2, ComplexSortedPerson, CoverLetter, CustomArticle,
 
-__D = r'(?P<day>\d{2})'
+    CyclicOne, CyclicTwo, DependentChild, DooHickey, EmptyModel,
 
-__D2 = r'(?P<day>[ \d]\d)'
+    EmptyModelHidden, EmptyModelMixin, EmptyModelVisible, ExplicitlyProvidedPK,
 
-__M = r'(?P<mon>\w{3})'
+    ExternalSubscriber, Fabric, FancyDoodad, FieldOverridePost,
 
-__Y = r'(?P<year>\d{4})'
+    FilteredManager, FooAccount, FoodDelivery, FunkyTag, Gadget, Gallery,
 
-__Y2 = r'(?P<year>\d{2})'
+    GenRelReference, Grommet, ImplicitlyGeneratedPK, Ingredient,
 
-__T = r'(?P<hour>\d{2}):(?P<min>\d{2}):(?P<sec>\d{2})'
+    InlineReference, InlineReferer, Inquisition, Language, Link,
 
-RFC1123_DATE = re.compile(r'^\w{3}, %s %s %s %s GMT$' % (__D, __M, __Y, __T))
+    MainPrepopulated, ModelWithStringPrimaryKey, NotReferenced, OldSubscriber,
 
-RFC850_DATE = re.compile(r'^\w{6,9}, %s-%s-%s %s GMT$' % (__D, __M, __Y2, __T))
+    OtherStory, Paper, Parent, ParentWithDependentChildren, ParentWithUUIDPK,
 
-ASCTIME_DATE = re.compile(r'^\w{3} %s %s %s %s$' % (__M, __D2, __T, __Y))
+    Person, Persona, Picture, Pizza, Plot, PlotDetails, PlotProxy,
 
+    PluggableSearchPerson, Podcast, Post, PrePopulatedPost,
 
+    PrePopulatedPostLargeSlug, PrePopulatedSubPost, Promo, Question, Recipe,
 
-def urlquote(url, safe='/'):
+    Recommendation, Recommender, ReferencedByGenRel, ReferencedByInline,
 
-    """
+    ReferencedByParent, RelatedPrepopulated, RelatedWithUUIDPKModel, Report,
 
-    A version of Python's urllib.quote() function that can operate on unicode
+    Reservation, Restaurant, RowLevelChangePermissionModel, Section,
 
-    strings. The url is first UTF-8 encoded before quoting. The returned string
+    ShortMessage, Simple, Sketch, State, Story, StumpJoke, Subscriber,
 
-    can safely be used as part of an argument to a subsequent iri_to_uri() call
+    SuperVillain, Telegram, Thing, Topping, UnchangeableObject,
 
-    without double-quoting occurring.
+    UndeletableObject, UnorderedObject, UserMessenger, Villain, Vodcast,
 
-    """
+    Whatsit, Widget, Worker, WorkHour,
 
-    return force_text(urllib_parse.quote(force_str(url), force_str(safe)))
+)
 
-urlquote = allow_lazy(urlquote, six.text_type)
 
 
 
-def urlquote_plus(url, safe=''):
 
-    """
-
-    A version of Python's urllib.quote_plus() function that can operate on
-
-    unicode strings. The url is first UTF-8 encoded before quoting. The
-
-    returned string can safely be used as part of an argument to a subsequent
-
-    iri_to_uri() call without double-quoting occurring.
-
-    """
-
-    return force_text(urllib_parse.quote_plus(force_str(url), force_str(safe)))
-
-urlquote_plus = allow_lazy(urlquote_plus, six.text_type)
-
-
-
-def urlunquote(quoted_url):
-
-    """
-
-    A wrapper for Python's urllib.unquote() function that can operate on
-
-    the result of django.utils.http.urlquote().
-
-    """
-
-    return force_text(urllib_parse.unquote(force_str(quoted_url)))
-
-urlunquote = allow_lazy(urlunquote, six.text_type)
-
-
-
-def urlunquote_plus(quoted_url):
-
-    """
-
-    A wrapper for Python's urllib.unquote_plus() function that can operate on
-
-    the result of django.utils.http.urlquote_plus().
-
-    """
-
-    return force_text(urllib_parse.unquote_plus(force_str(quoted_url)))
-
-urlunquote_plus = allow_lazy(urlunquote_plus, six.text_type)
-
-
-
-def urlencode(query, doseq=0):
-
-    """
-
-    A version of Python's urllib.urlencode() function that can operate on
-
-    unicode strings. The parameters are first cast to UTF-8 encoded strings and
-
-    then encoded as per normal.
-
-    """
-
-    if isinstance(query, MultiValueDict):
-
-        query = query.lists()
-
-    elif hasattr(query, 'items'):
-
-        query = query.items()
-
-    return urllib_parse.urlencode(
-
-        [(force_str(k),
-
-         [force_str(i) for i in v] if isinstance(v, (list,tuple)) else force_str(v))
-
-            for k, v in query],
-
-        doseq)
-
-
-
-def cookie_date(epoch_seconds=None):
-
-    """
-
-    Formats the time to ensure compatibility with Netscape's cookie standard.
-
-
-
-    Accepts a floating point number expressed in seconds since the epoch, in
-
-    UTC - such as that outputted by time.time(). If set to None, defaults to
-
-    the current time.
-
-
-
-    Outputs a string in the format 'Wdy, DD-Mon-YYYY HH:MM:SS GMT'.
-
-    """
-
-    rfcdate = formatdate(epoch_seconds)
-
-    return '%s-%s-%s GMT' % (rfcdate[:7], rfcdate[8:11], rfcdate[12:25])
-
-
-
-def http_date(epoch_seconds=None):
-
-    """
-
-    Formats the time to match the RFC1123 date format as specified by HTTP
-
-    RFC2616 section 3.3.1.
-
-
-
-    Accepts a floating point number expressed in seconds since the epoch, in
-
-    UTC - such as that outputted by time.time(). If set to None, defaults to
-
-    the current time.
-
-
-
-    Outputs a string in the format 'Wdy, DD Mon YYYY HH:MM:SS GMT'.
-
-    """
-
-    return formatdate(epoch_seconds, usegmt=True)
-
-
-
-def parse_http_date(date):
-
-    """
-
-    Parses a date format as specified by HTTP RFC2616 section 3.3.1.
-
-
-
-    The three formats allowed by the RFC are accepted, even if only the first
-
-    one is still in widespread use.
-
-
-
-    Returns an integer expressed in seconds since the epoch, in UTC.
-
-    """
-
-    # emails.Util.parsedate does the job for RFC1123 dates; unfortunately
-
-    # RFC2616 makes it mandatory to support RFC850 dates too. So we roll
-
-    # our own RFC-compliant parsing.
-
-    for regex in RFC1123_DATE, RFC850_DATE, ASCTIME_DATE:
-
-        m = regex.match(date)
-
-        if m is not None:
-
-            break
-
-    else:
-
-        raise ValueError("%r is not in a valid HTTP date format" % date)
+def callable_year(dt_value):
 
     try:
 
-        year = int(m.group('year'))
+        return dt_value.year
 
-        if year < 100:
+    except AttributeError:
 
-            if year < 70:
+        return None
 
-                year += 2000
+callable_year.admin_order_field = 'date'
 
-            else:
 
-                year += 1900
 
-        month = MONTHS.index(m.group('mon').lower()) + 1
 
-        day = int(m.group('day'))
 
-        hour = int(m.group('hour'))
+class ArticleInline(admin.TabularInline):
 
-        min = int(m.group('min'))
+    model = Article
 
-        sec = int(m.group('sec'))
+    fk_name = 'section'
 
-        result = datetime.datetime(year, month, day, hour, min, sec)
+    prepopulated_fields = {
 
-        return calendar.timegm(result.utctimetuple())
+        'title': ('content',)
 
-    except Exception:
+    }
 
-        six.reraise(ValueError, ValueError("%r is not a valid date" % date), sys.exc_info()[2])
+    fieldsets = (
 
+        ('Some fields', {
 
+            'classes': ('collapse',),
 
-def parse_http_date_safe(date):
+            'fields': ('title', 'content')
 
-    """
+        }),
 
-    Same as parse_http_date, but returns None if the input is invalid.
+        ('Some other fields', {
 
-    """
+            'classes': ('wide',),
 
-    try:
+            'fields': ('date', 'section')
 
-        return parse_http_date(date)
+        })
 
-    except Exception:
+    )
 
-        pass
 
 
 
-# Base 36 functions: useful for generating compact URLs
 
+class ChapterInline(admin.TabularInline):
 
+    model = Chapter
 
-def base36_to_int(s):
 
-    """
 
-    Converts a base 36 string to an ``int``. Raises ``ValueError` if the
 
-    input won't fit into an int.
 
-    """
+class ChapterXtra1Admin(admin.ModelAdmin):
 
-    # To prevent overconsumption of server resources, reject any
+    list_filter = ('chap',
 
-    # base36 string that is long than 13 base36 digits (13 digits
+                   'chap__title',
 
-    # is sufficient to base36-encode any 64-bit integer)
+                   'chap__book',
 
-    if len(s) > 13:
+                   'chap__book__name',
 
-        raise ValueError("Base36 input too large")
+                   'chap__book__promo',
 
-    value = int(s, 36)
+                   'chap__book__promo__name',)
 
-    # ... then do a final check that the value will fit into an int to avoid
 
-    # returning a long (#15067). The long type was removed in Python 3.
 
-    if not six.PY3 and value > sys.maxint:
 
-        raise ValueError("Base36 input too large")
 
-    return value
+class ArticleAdmin(admin.ModelAdmin):
 
+    list_display = ('content', 'date', callable_year, 'model_year',
 
+                    'modeladmin_year', 'model_year_reversed')
 
-def int_to_base36(i):
+    list_filter = ('date', 'section')
 
-    """
+    view_on_site = False
 
-    Converts an integer to a base36 string
+    fieldsets = (
 
-    """
+        ('Some fields', {
 
-    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+            'classes': ('collapse',),
 
-    factor = 0
+            'fields': ('title', 'content')
 
-    if i < 0:
+        }),
 
-        raise ValueError("Negative base36 conversion input.")
+        ('Some other fields', {
 
-    if not six.PY3:
+            'classes': ('wide',),
 
-        if not isinstance(i, six.integer_types):
+            'fields': ('date', 'section', 'sub_section')
 
-            raise TypeError("Non-integer base36 conversion input.")
+        })
 
-        if i > sys.maxint:
+    )
 
-            raise ValueError("Base36 conversion input too large.")
 
-    # Find starting factor
 
-    while True:
+    def changelist_view(self, request):
 
-        factor += 1
+        "Test that extra_context works"
 
-        if i < 36 ** factor:
+        return super(ArticleAdmin, self).changelist_view(
 
-            factor -= 1
+            request, extra_context={
 
-            break
+                'extra_var': 'Hello!'
 
-    base36 = []
+            }
 
-    # Construct base36 representation
+        )
 
-    while factor >= 0:
 
-        j = 36 ** factor
 
-        base36.append(digits[i // j])
+    def modeladmin_year(self, obj):
 
-        i = i % j
+        return obj.date.year
 
-        factor -= 1
+    modeladmin_year.admin_order_field = 'date'
 
-    return ''.join(base36)
+    modeladmin_year.short_description = None
 
 
 
-def urlsafe_base64_encode(s):
+    def delete_model(self, request, obj):
 
-    """
+        EmailMessage(
 
-    Encodes a bytestring in base64 for use in URLs, stripping any trailing
+            'Greetings from a deleted object',
 
-    equal signs.
+            'I hereby inform you that some user deleted me',
 
-    """
+            'from@example.com',
 
-    return base64.urlsafe_b64encode(s).rstrip(b'\n=')
+            ['to@example.com']
 
+        ).send()
 
+        return super(ArticleAdmin, self).delete_model(request, obj)
 
-def urlsafe_base64_decode(s):
 
-    """
 
-    Decodes a base64 encoded string, adding back any trailing equal signs that
+    def save_model(self, request, obj, form, change=True):
 
-    might have been stripped.
+        EmailMessage(
 
-    """
+            'Greetings from a created object',
 
-    s = s.encode('utf-8') # base64encode should only return ASCII.
+            'I hereby inform you that some user created me',
 
-    try:
+            'from@example.com',
 
-        return base64.urlsafe_b64decode(s.ljust(len(s) + len(s) % 4, b'='))
+            ['to@example.com']
 
-    except (LookupError, BinasciiError) as e:
+        ).send()
 
-        raise ValueError(e)
+        return super(ArticleAdmin, self).save_model(request, obj, form, change)
 
 
 
-def parse_etags(etag_str):
 
-    """
 
-    Parses a string with one or several etags passed in If-None-Match and
+class ArticleAdmin2(admin.ModelAdmin):
 
-    If-Match headers by the rules in RFC 2616. Returns a list of etags
 
-    without surrounding double quotes (") and unescaped from \<CHAR>.
 
-    """
-
-    etags = ETAG_MATCH.findall(etag_str)
-
-    if not etags:
-
-        # etag_str has wrong format, treat it as an opaque string then
-
-        return [etag_str]
-
-    etags = [e.encode('ascii').decode('unicode_escape') for e in etags]
-
-    return etags
-
-
-
-def quote_etag(etag):
-
-    """
-
-    Wraps a string in double quotes escaping contents as necessary.
-
-    """
-
-    return '"%s"' % etag.replace('\\', '\\\\').replace('"', '\\"')
-
-
-
-def same_origin(url1, url2):
-
-    """
-
-    Checks if two URLs are 'same-origin'
-
-    """
-
-    p1, p2 = urllib_parse.urlparse(url1), urllib_parse.urlparse(url2)
-
-    try:
-
-        return (p1.scheme, p1.hostname, p1.port) == (p2.scheme, p2.hostname, p2.port)
-
-    except ValueError:
+    def has_module_permission(self, request):
 
         return False
 
 
 
-def is_safe_url(url, host=None):
+
+
+class RowLevelChangePermissionModelAdmin(admin.ModelAdmin):
+
+    def has_change_permission(self, request, obj=None):
+
+        """ Only allow changing objects with even id number """
+
+        return request.user.is_staff and (obj is not None) and (obj.id % 2 == 0)
+
+
+
+
+
+class CustomArticleAdmin(admin.ModelAdmin):
 
     """
 
-    Return ``True`` if the url is a safe redirection (i.e. it doesn't point to
-
-    a different host).
-
-
-
-    Always returns ``False`` on an empty url.
+    Tests various hooks for using custom templates and contexts.
 
     """
 
-    if not url:
+    change_list_template = 'custom_admin/change_list.html'
 
-        return False
+    change_form_template = 'custom_admin/change_form.html'
 
-    netloc = urllib_parse.urlparse(url)[1]
+    add_form_template = 'custom_admin/add_form.html'
 
-    return not netloc or netloc == host
+    object_history_template = 'custom_admin/object_history.html'
+
+    delete_confirmation_template = 'custom_admin/delete_confirmation.html'
+
+    delete_selected_confirmation_template = 'custom_admin/delete_selected_confirmation.html'
+
+
+
+    def changelist_view(self, request):
+
+        "Test that extra_context works"
+
+        return super(CustomArticleAdmin, self).changelist_view(
+
+            request, extra_context={
+
+                'extra_var': 'Hello!'
+
+            }
+
+        )
+
+
+
+
+
+class ThingAdmin(admin.ModelAdmin):
+
+    list_filter = ('color__warm', 'color__value', 'pub_date',)
+
+
+
+
+
+class InquisitionAdmin(admin.ModelAdmin):
+
+    list_display = ('leader', 'country', 'expected', 'sketch')
+
+
+
+    def sketch(self, obj):
+
+        # A method with the same name as a reverse accessor.
+
+        return 'list-display-sketch'
+
+
+
+
+
+class SketchAdmin(admin.ModelAdmin):
+
+    raw_id_fields = ('inquisition', 'defendant0', 'defendant1')
+
+
+
+
+
+class FabricAdmin(admin.ModelAdmin):
+
+    list_display = ('surface',)
+
+    list_filter = ('surface',)
+
+
+
+
+
+class BasePersonModelFormSet(BaseModelFormSet):
+
+    def clean(self):
+
+        for person_dict in self.cleaned_data:
+
+            person = person_dict.get('id')
+
+            alive = person_dict.get('alive')
+
+            if person and alive and person.name == "Grace Hopper":
+
+                raise forms.ValidationError("Grace is not a Zombie")
+
+
+
+
+
+class PersonAdmin(admin.ModelAdmin):
+
+    list_display = ('name', 'gender', 'alive')
+
+    list_editable = ('gender', 'alive')
+
+    list_filter = ('gender',)
+
+    search_fields = ('^name',)
+
+    save_as = True
+
+
+
+    def get_changelist_formset(self, request, **kwargs):
+
+        return super(PersonAdmin, self).get_changelist_formset(request,
+
+            formset=BasePersonModelFormSet, **kwargs)
+
+
+
+    def get_queryset(self, request):
+
+        # Order by a field that isn't in list display, to be able to test
+
+        # whether ordering is preserved.
+
+        return super(PersonAdmin, self).get_queryset(request).order_by('age')
+
+
+
+
+
+class FooAccountAdmin(admin.StackedInline):
+
+    model = FooAccount
+
+    extra = 1
+
+
+
+
+
+class BarAccountAdmin(admin.StackedInline):
+
+    model = BarAccount
+
+    extra = 1
+
+
+
+
+
+class PersonaAdmin(admin.ModelAdmin):
+
+    inlines = (
+
+        FooAccountAdmin,
+
+        BarAccountAdmin
+
+    )
+
+
+
+
+
+class SubscriberAdmin(admin.ModelAdmin):
+
+    actions = ['mail_admin']
+
+
+
+    def mail_admin(self, request, selected):
+
+        EmailMessage(
+
+            'Greetings from a ModelAdmin action',
+
+            'This is the test email from an admin action',
+
+            'from@example.com',
+
+            ['to@example.com']
+
+        ).send()
+
+
+
+
+
+def external_mail(modeladmin, request, selected):
+
+    EmailMessage(
+
+        'Greetings from a function action',
+
+        'This is the test email from a function action',
+
+        'from@example.com',
+
+        ['to@example.com']
+
+    ).send()
+
+external_mail.short_description = 'External mail (Another awesome action)'
+
+
+
+
+
+def redirect_to(modeladmin, request, selected):
+
+    from django.http import HttpResponseRedirect
+
+    return HttpResponseRedirect('/some-where-else/')
+
+redirect_to.short_description = 'Redirect to (Awesome action)'
+
+
+
+
+
+def download(modeladmin, request, selected):
+
+    buf = StringIO('This is the content of the file')
+
+    return StreamingHttpResponse(FileWrapper(buf))
+
+download.short_description = 'Download subscription'
+
+
+
+
+
+def no_perm(modeladmin, request, selected):
+
+    return HttpResponse(content='No permission to perform this action',
+
+                        status=403)
+
+no_perm.short_description = 'No permission to run'
+
+
+
+
+
+class ExternalSubscriberAdmin(admin.ModelAdmin):
+
+    actions = [redirect_to, external_mail, download, no_perm]
+
+
+
+
+
+class PodcastAdmin(admin.ModelAdmin):
+
+    list_display = ('name', 'release_date')
+
+    list_editable = ('release_date',)
+
+    date_hierarchy = 'release_date'
+
+    ordering = ('name',)
+
+
+
+
+
+class VodcastAdmin(admin.ModelAdmin):
+
+    list_display = ('name', 'released')
+
+    list_editable = ('released',)
+
+
+
+    ordering = ('name',)
+
+
+
+
+
+class ChildInline(admin.StackedInline):
+
+    model = Child
+
+
+
+
+
+class ParentAdmin(admin.ModelAdmin):
+
+    model = Parent
+
+    inlines = [ChildInline]
+
+
+
+    list_editable = ('name',)
+
+
+
+    def save_related(self, request, form, formsets, change):
+
+        super(ParentAdmin, self).save_related(request, form, formsets, change)
+
+        first_name, last_name = form.instance.name.split()
+
+        for child in form.instance.child_set.all():
+
+            if len(child.name.split()) < 2:
+
+                child.name = child.name + ' ' + last_name
+
+                child.save()
+
+
+
+
+
+class EmptyModelAdmin(admin.ModelAdmin):
+
+    def get_queryset(self, request):
+
+        return super(EmptyModelAdmin, self).get_queryset(request).filter(pk__gt=1)
+
+
+
+
+
+class OldSubscriberAdmin(admin.ModelAdmin):
+
+    actions = None
+
+
+
+
+
+temp_storage = FileSystemStorage(tempfile.mkdtemp())
+
+UPLOAD_TO = os.path.join(temp_storage.location, 'test_upload')
+
+
+
+
+
+class PictureInline(admin.TabularInline):
+
+    model = Picture
+
+    extra = 1
+
+
+
+
+
+class GalleryAdmin(admin.ModelAdmin):
+
+    inlines = [PictureInline]
+
+
+
+
+
+class PictureAdmin(admin.ModelAdmin):
+
+    pass
+
+
+
+
+
+class LanguageAdmin(admin.ModelAdmin):
+
+    list_display = ['iso', 'shortlist', 'english_name', 'name']
+
+    list_editable = ['shortlist']
+
+
+
+
+
+class RecommendationAdmin(admin.ModelAdmin):
+
+    show_full_result_count = False
+
+    search_fields = ('=titletranslation__text', '=recommender__titletranslation__text',)
+
+
+
+
+
+class WidgetInline(admin.StackedInline):
+
+    model = Widget
+
+
+
+
+
+class DooHickeyInline(admin.StackedInline):
+
+    model = DooHickey
+
+
+
+
+
+class GrommetInline(admin.StackedInline):
+
+    model = Grommet
+
+
+
+
+
+class WhatsitInline(admin.StackedInline):
+
+    model = Whatsit
+
+
+
+
+
+class FancyDoodadInline(admin.StackedInline):
+
+    model = FancyDoodad
+
+
+
+
+
+class CategoryAdmin(admin.ModelAdmin):
+
+    list_display = ('id', 'collector', 'order')
+
+    list_editable = ('order',)
+
+
+
+
+
+class CategoryInline(admin.StackedInline):
+
+    model = Category
+
+
+
+
+
+class CollectorAdmin(admin.ModelAdmin):
+
+    inlines = [
+
+        WidgetInline, DooHickeyInline, GrommetInline, WhatsitInline,
+
+        FancyDoodadInline, CategoryInline
+
+    ]
+
+
+
+
+
+class LinkInline(admin.TabularInline):
+
+    model = Link
+
+    extra = 1
+
+
+
+    readonly_fields = ("posted", "multiline", "readonly_link_content")
+
+
+
+    def multiline(self, instance):
+
+        return "InlineMultiline\ntest\nstring"
+
+
+
+
+
+class SubPostInline(admin.TabularInline):
+
+    model = PrePopulatedSubPost
+
+
+
+    prepopulated_fields = {
+
+        'subslug': ('subtitle',)
+
+    }
+
+
+
+    def get_readonly_fields(self, request, obj=None):
+
+        if obj and obj.published:
+
+            return ('subslug',)
+
+        return self.readonly_fields
+
+
+
+    def get_prepopulated_fields(self, request, obj=None):
+
+        if obj and obj.published:
+
+            return {}
+
+        return self.prepopulated_fields
+
+
+
+
+
+class PrePopulatedPostAdmin(admin.ModelAdmin):
+
+    list_display = ['title', 'slug']
+
+    prepopulated_fields = {
+
+        'slug': ('title',)
+
+    }
+
+
+
+    inlines = [SubPostInline]
+
+
+
+    def get_readonly_fields(self, request, obj=None):
+
+        if obj and obj.published:
+
+            return ('slug',)
+
+        return self.readonly_fields
+
+
+
+    def get_prepopulated_fields(self, request, obj=None):
+
+        if obj and obj.published:
+
+            return {}
+
+        return self.prepopulated_fields
+
+
+
+
+
+class PostAdmin(admin.ModelAdmin):
+
+    list_display = ['title', 'public']
+
+    readonly_fields = (
+
+        'posted', 'awesomeness_level', 'coolness', 'value',
+
+        'multiline', 'multiline_html', lambda obj: "foo", 'readonly_content',
+
+    )
+
+
+
+    inlines = [
+
+        LinkInline
+
+    ]
+
+
+
+    def coolness(self, instance):
+
+        if instance.pk:
+
+            return "%d amount of cool." % instance.pk
+
+        else:
+
+            return "Unknown coolness."
+
+
+
+    def value(self, instance):
+
+        return 1000
+
+
+
+    def multiline(self, instance):
+
+        return "Multiline\ntest\nstring"
+
+
+
+    def multiline_html(self, instance):
+
+        return mark_safe("Multiline<br>\nhtml<br>\ncontent")
+
+    multiline_html.allow_tags = True
+
+
+
+    value.short_description = 'Value in $US'
+
+
+
+
+
+class FieldOverridePostForm(forms.ModelForm):
+
+    model = FieldOverridePost
+
+
+
+    class Meta:
+
+        help_texts = {
+
+            'posted': 'Overridden help text for the date',
+
+        }
+
+        labels = {
+
+            'public': 'Overridden public label',
+
+        }
+
+
+
+
+
+class FieldOverridePostAdmin(PostAdmin):
+
+    form = FieldOverridePostForm
+
+
+
+
+
+class CustomChangeList(ChangeList):
+
+    def get_queryset(self, request):
+
+        return self.root_queryset.filter(pk=9999)  # Does not exist
+
+
+
+
+
+class GadgetAdmin(admin.ModelAdmin):
+
+    def get_changelist(self, request, **kwargs):
+
+        return CustomChangeList
+
+
+
+
+
+class ToppingAdmin(admin.ModelAdmin):
+
+    readonly_fields = ('pizzas',)
+
+
+
+
+
+class PizzaAdmin(admin.ModelAdmin):
+
+    readonly_fields = ('toppings',)
+
+
+
+
+
+class WorkHourAdmin(admin.ModelAdmin):
+
+    list_display = ('datum', 'employee')
+
+    list_filter = ('employee',)
+
+
+
+
+
+class FoodDeliveryAdmin(admin.ModelAdmin):
+
+    list_display = ('reference', 'driver', 'restaurant')
+
+    list_editable = ('driver', 'restaurant')
+
+
+
+
+
+class CoverLetterAdmin(admin.ModelAdmin):
+
+    """
+
+    A ModelAdmin with a custom get_queryset() method that uses defer(), to test
+
+    verbose_name display in messages shown after adding/editing CoverLetter
+
+    instances.
+
+    Note that the CoverLetter model defines a __unicode__ method.
+
+    For testing fix for ticket #14529.
+
+    """
+
+
+
+    def get_queryset(self, request):
+
+        return super(CoverLetterAdmin, self).get_queryset(request).defer('date_written')
+
+
+
+
+
+class PaperAdmin(admin.ModelAdmin):
+
+    """
+
+    A ModelAdmin with a custom get_queryset() method that uses only(), to test
+
+    verbose_name display in messages shown after adding/editing Paper
+
+    instances.
+
+    For testing fix for ticket #14529.
+
+    """
+
+
+
+    def get_queryset(self, request):
+
+        return super(PaperAdmin, self).get_queryset(request).only('title')
+
+
+
+
+
+class ShortMessageAdmin(admin.ModelAdmin):
+
+    """
+
+    A ModelAdmin with a custom get_queryset() method that uses defer(), to test
+
+    verbose_name display in messages shown after adding/editing ShortMessage
+
+    instances.
+
+    For testing fix for ticket #14529.
+
+    """
+
+
+
+    def get_queryset(self, request):
+
+        return super(ShortMessageAdmin, self).get_queryset(request).defer('timestamp')
+
+
+
+
+
+class TelegramAdmin(admin.ModelAdmin):
+
+    """
+
+    A ModelAdmin with a custom get_queryset() method that uses only(), to test
+
+    verbose_name display in messages shown after adding/editing Telegram
+
+    instances.
+
+    Note that the Telegram model defines a __unicode__ method.
+
+    For testing fix for ticket #14529.
+
+    """
+
+
+
+    def get_queryset(self, request):
+
+        return super(TelegramAdmin, self).get_queryset(request).only('title')
+
+
+
+
+
+class StoryForm(forms.ModelForm):
+
+    class Meta:
+
+        widgets = {'title': forms.HiddenInput}
+
+
+
+
+
+class StoryAdmin(admin.ModelAdmin):
+
+    list_display = ('id', 'title', 'content')
+
+    list_display_links = ('title',)  # 'id' not in list_display_links
+
+    list_editable = ('content', )
+
+    form = StoryForm
+
+    ordering = ["-pk"]
+
+
+
+
+
+class OtherStoryAdmin(admin.ModelAdmin):
+
+    list_display = ('id', 'title', 'content')
+
+    list_display_links = ('title', 'id')  # 'id' in list_display_links
+
+    list_editable = ('content', )
+
+    ordering = ["-pk"]
+
+
+
+
+
+class ComplexSortedPersonAdmin(admin.ModelAdmin):
+
+    list_display = ('name', 'age', 'is_employee', 'colored_name')
+
+    ordering = ('name',)
+
+
+
+    def colored_name(self, obj):
+
+        return '<span style="color: #%s;">%s</span>' % ('ff00ff', obj.name)
+
+    colored_name.allow_tags = True
+
+    colored_name.admin_order_field = 'name'
+
+
+
+
+
+class PluggableSearchPersonAdmin(admin.ModelAdmin):
+
+    list_display = ('name', 'age')
+
+    search_fields = ('name',)
+
+
+
+    def get_search_results(self, request, queryset, search_term):
+
+        queryset, use_distinct = super(PluggableSearchPersonAdmin, self).get_search_results(request, queryset, search_term)
+
+        try:
+
+            search_term_as_int = int(search_term)
+
+            queryset |= self.model.objects.filter(age=search_term_as_int)
+
+        except:
+
+            pass
+
+        return queryset, use_distinct
+
+
+
+
+
+class AlbumAdmin(admin.ModelAdmin):
+
+    list_filter = ['title']
+
+
+
+
+
+class PrePopulatedPostLargeSlugAdmin(admin.ModelAdmin):
+
+    prepopulated_fields = {
+
+        'slug': ('title',)
+
+    }
+
+
+
+
+
+class AdminOrderedFieldAdmin(admin.ModelAdmin):
+
+    ordering = ('order',)
+
+    list_display = ('stuff', 'order')
+
+
+
+
+
+class AdminOrderedModelMethodAdmin(admin.ModelAdmin):
+
+    ordering = ('order',)
+
+    list_display = ('stuff', 'some_order')
+
+
+
+
+
+class AdminOrderedAdminMethodAdmin(admin.ModelAdmin):
+
+    def some_admin_order(self, obj):
+
+        return obj.order
+
+    some_admin_order.admin_order_field = 'order'
+
+    ordering = ('order',)
+
+    list_display = ('stuff', 'some_admin_order')
+
+
+
+
+
+def admin_ordered_callable(obj):
+
+    return obj.order
+
+admin_ordered_callable.admin_order_field = 'order'
+
+
+
+
+
+class AdminOrderedCallableAdmin(admin.ModelAdmin):
+
+    ordering = ('order',)
+
+    list_display = ('stuff', admin_ordered_callable)
+
+
+
+
+
+class ReportAdmin(admin.ModelAdmin):
+
+    def extra(self, request):
+
+        return HttpResponse()
+
+
+
+    def get_urls(self):
+
+        # Corner case: Don't call parent implementation
+
+        return [
+
+            url(r'^extra/$',
+
+                self.extra,
+
+                name='cable_extra'),
+
+        ]
+
+
+
+
+
+class CustomTemplateBooleanFieldListFilter(BooleanFieldListFilter):
+
+    template = 'custom_filter_template.html'
+
+
+
+
+
+class CustomTemplateFilterColorAdmin(admin.ModelAdmin):
+
+    list_filter = (('warm', CustomTemplateBooleanFieldListFilter),)
+
+
+
+
+
+# For Selenium Prepopulated tests -------------------------------------
+
+class RelatedPrepopulatedInline1(admin.StackedInline):
+
+    fieldsets = (
+
+        (None, {
+
+            'fields': (('pubdate', 'status'), ('name', 'slug1', 'slug2',),)
+
+        }),
+
+    )
+
+    model = RelatedPrepopulated
+
+    extra = 1
+
+    prepopulated_fields = {'slug1': ['name', 'pubdate'],
+
+                           'slug2': ['status', 'name']}
+
+
+
+
+
+class RelatedPrepopulatedInline2(admin.TabularInline):
+
+    model = RelatedPrepopulated
+
+    extra = 1
+
+    prepopulated_fields = {'slug1': ['name', 'pubdate'],
+
+                           'slug2': ['status', 'name']}
+
+
+
+
+
+class MainPrepopulatedAdmin(admin.ModelAdmin):
+
+    inlines = [RelatedPrepopulatedInline1, RelatedPrepopulatedInline2]
+
+    fieldsets = (
+
+        (None, {
+
+            'fields': (('pubdate', 'status'), ('name', 'slug1', 'slug2',),)
+
+        }),
+
+    )
+
+    prepopulated_fields = {'slug1': ['name', 'pubdate'],
+
+                           'slug2': ['status', 'name']}
+
+
+
+
+
+class UnorderedObjectAdmin(admin.ModelAdmin):
+
+    list_display = ['name']
+
+    list_editable = ['name']
+
+    list_per_page = 2
+
+
+
+
+
+class UndeletableObjectAdmin(admin.ModelAdmin):
+
+    def change_view(self, *args, **kwargs):
+
+        kwargs['extra_context'] = {'show_delete': False}
+
+        return super(UndeletableObjectAdmin, self).change_view(*args, **kwargs)
+
+
+
+
+
+class UnchangeableObjectAdmin(admin.ModelAdmin):
+
+    def get_urls(self):
+
+        # Disable change_view, but leave other urls untouched
+
+        urlpatterns = super(UnchangeableObjectAdmin, self).get_urls()
+
+        return [p for p in urlpatterns if not p.name.endswith("_change")]
+
+
+
+
+
+def callable_on_unknown(obj):
+
+    return obj.unknown
+
+
+
+
+
+class AttributeErrorRaisingAdmin(admin.ModelAdmin):
+
+    list_display = [callable_on_unknown, ]
+
+
+
+
+
+class CustomManagerAdmin(admin.ModelAdmin):
+
+    def get_queryset(self, request):
+
+        return FilteredManager.objects
+
+
+
+
+
+class MessageTestingAdmin(admin.ModelAdmin):
+
+    actions = ["message_debug", "message_info", "message_success",
+
+               "message_warning", "message_error", "message_extra_tags"]
+
+
+
+    def message_debug(self, request, selected):
+
+        self.message_user(request, "Test debug", level="debug")
+
+
+
+    def message_info(self, request, selected):
+
+        self.message_user(request, "Test info", level="info")
+
+
+
+    def message_success(self, request, selected):
+
+        self.message_user(request, "Test success", level="success")
+
+
+
+    def message_warning(self, request, selected):
+
+        self.message_user(request, "Test warning", level="warning")
+
+
+
+    def message_error(self, request, selected):
+
+        self.message_user(request, "Test error", level="error")
+
+
+
+    def message_extra_tags(self, request, selected):
+
+        self.message_user(request, "Test tags", extra_tags="extra_tag")
+
+
+
+
+
+class ChoiceList(admin.ModelAdmin):
+
+    list_display = ['choice']
+
+    readonly_fields = ['choice']
+
+    fields = ['choice']
+
+
+
+
+
+class DependentChildAdminForm(forms.ModelForm):
+
+    """
+
+    Issue #20522
+
+    Form to test child dependency on parent object's validation
+
+    """
+
+    def clean(self):
+
+        parent = self.cleaned_data.get('parent')
+
+        if parent.family_name and parent.family_name != self.cleaned_data.get('family_name'):
+
+            raise ValidationError("Children must share a family name with their parents " +
+
+                                  "in this contrived test case")
+
+        return super(DependentChildAdminForm, self).clean()
+
+
+
+
+
+class DependentChildInline(admin.TabularInline):
+
+    model = DependentChild
+
+    form = DependentChildAdminForm
+
+
+
+
+
+class ParentWithDependentChildrenAdmin(admin.ModelAdmin):
+
+    inlines = [DependentChildInline]
+
+
+
+
+
+# Tests for ticket 11277 ----------------------------------
+
+
+
+class FormWithoutHiddenField(forms.ModelForm):
+
+    first = forms.CharField()
+
+    second = forms.CharField()
+
+
+
+
+
+class FormWithoutVisibleField(forms.ModelForm):
+
+    first = forms.CharField(widget=forms.HiddenInput)
+
+    second = forms.CharField(widget=forms.HiddenInput)
+
+
+
+
+
+class FormWithVisibleAndHiddenField(forms.ModelForm):
+
+    first = forms.CharField(widget=forms.HiddenInput)
+
+    second = forms.CharField()
+
+
+
+
+
+class EmptyModelVisibleAdmin(admin.ModelAdmin):
+
+    form = FormWithoutHiddenField
+
+    fieldsets = (
+
+        (None, {
+
+            'fields': (('first', 'second'),),
+
+        }),
+
+    )
+
+
+
+
+
+class EmptyModelHiddenAdmin(admin.ModelAdmin):
+
+    form = FormWithoutVisibleField
+
+    fieldsets = EmptyModelVisibleAdmin.fieldsets
+
+
+
+
+
+class EmptyModelMixinAdmin(admin.ModelAdmin):
+
+    form = FormWithVisibleAndHiddenField
+
+    fieldsets = EmptyModelVisibleAdmin.fieldsets
+
+
+
+
+
+class CityInlineAdmin(admin.TabularInline):
+
+    model = City
+
+    view_on_site = False
+
+
+
+
+
+class StateAdmin(admin.ModelAdmin):
+
+    inlines = [CityInlineAdmin]
+
+
+
+
+
+class RestaurantInlineAdmin(admin.TabularInline):
+
+    model = Restaurant
+
+    view_on_site = True
+
+
+
+
+
+class CityAdmin(admin.ModelAdmin):
+
+    inlines = [RestaurantInlineAdmin]
+
+    view_on_site = True
+
+
+
+
+
+class WorkerAdmin(admin.ModelAdmin):
+
+    def view_on_site(self, obj):
+
+        return '/worker/%s/%s/' % (obj.surname, obj.name)
+
+
+
+
+
+class WorkerInlineAdmin(admin.TabularInline):
+
+    model = Worker
+
+
+
+    def view_on_site(self, obj):
+
+        return '/worker_inline/%s/%s/' % (obj.surname, obj.name)
+
+
+
+
+
+class RestaurantAdmin(admin.ModelAdmin):
+
+    inlines = [WorkerInlineAdmin]
+
+    view_on_site = False
+
+
+
+    def get_changeform_initial_data(self, request):
+
+        return {'name': 'overridden_value'}
+
+
+
+
+
+class FunkyTagAdmin(admin.ModelAdmin):
+
+    list_display = ('name', 'content_object')
+
+
+
+
+
+class InlineReferenceInline(admin.TabularInline):
+
+    model = InlineReference
+
+
+
+
+
+class InlineRefererAdmin(admin.ModelAdmin):
+
+    inlines = [InlineReferenceInline]
+
+
+
+
+
+class PlotReadonlyAdmin(admin.ModelAdmin):
+
+    readonly_fields = ('plotdetails',)
+
+
+
+
+
+class GetFormsetsArgumentCheckingAdmin(admin.ModelAdmin):
+
+    fields = ['name']
+
+
+
+    def add_view(self, request, *args, **kwargs):
+
+        request.is_add_view = True
+
+        return super(GetFormsetsArgumentCheckingAdmin, self).add_view(request, *args, **kwargs)
+
+
+
+    def change_view(self, request, *args, **kwargs):
+
+        request.is_add_view = False
+
+        return super(GetFormsetsArgumentCheckingAdmin, self).change_view(request, *args, **kwargs)
+
+
+
+    def get_formsets_with_inlines(self, request, obj=None):
+
+        if request.is_add_view and obj is not None:
+
+            raise Exception("'obj' passed to get_formsets_with_inlines wasn't None during add_view")
+
+        if not request.is_add_view and obj is None:
+
+            raise Exception("'obj' passed to get_formsets_with_inlines was None during change_view")
+
+        return super(GetFormsetsArgumentCheckingAdmin, self).get_formsets_with_inlines(request, obj)
+
+
+
+
+
+site = admin.AdminSite(name="admin")
+
+site.site_url = '/my-site-url/'
+
+site.register(Article, ArticleAdmin)
+
+site.register(CustomArticle, CustomArticleAdmin)
+
+site.register(Section, save_as=True, inlines=[ArticleInline], readonly_fields=['name_property'])
+
+site.register(ModelWithStringPrimaryKey)
+
+site.register(Color)
+
+site.register(Thing, ThingAdmin)
+
+site.register(Actor)
+
+site.register(Inquisition, InquisitionAdmin)
+
+site.register(Sketch, SketchAdmin)
+
+site.register(Person, PersonAdmin)
+
+site.register(Persona, PersonaAdmin)
+
+site.register(Subscriber, SubscriberAdmin)
+
+site.register(ExternalSubscriber, ExternalSubscriberAdmin)
+
+site.register(OldSubscriber, OldSubscriberAdmin)
+
+site.register(Podcast, PodcastAdmin)
+
+site.register(Vodcast, VodcastAdmin)
+
+site.register(Parent, ParentAdmin)
+
+site.register(EmptyModel, EmptyModelAdmin)
+
+site.register(Fabric, FabricAdmin)
+
+site.register(Gallery, GalleryAdmin)
+
+site.register(Picture, PictureAdmin)
+
+site.register(Language, LanguageAdmin)
+
+site.register(Recommendation, RecommendationAdmin)
+
+site.register(Recommender)
+
+site.register(Collector, CollectorAdmin)
+
+site.register(Category, CategoryAdmin)
+
+site.register(Post, PostAdmin)
+
+site.register(FieldOverridePost, FieldOverridePostAdmin)
+
+site.register(Gadget, GadgetAdmin)
+
+site.register(Villain)
+
+site.register(SuperVillain)
+
+site.register(Plot)
+
+site.register(PlotDetails)
+
+site.register(PlotProxy, PlotReadonlyAdmin)
+
+site.register(CyclicOne)
+
+site.register(CyclicTwo)
+
+site.register(WorkHour, WorkHourAdmin)
+
+site.register(Reservation)
+
+site.register(FoodDelivery, FoodDeliveryAdmin)
+
+site.register(RowLevelChangePermissionModel, RowLevelChangePermissionModelAdmin)
+
+site.register(Paper, PaperAdmin)
+
+site.register(CoverLetter, CoverLetterAdmin)
+
+site.register(ShortMessage, ShortMessageAdmin)
+
+site.register(Telegram, TelegramAdmin)
+
+site.register(Story, StoryAdmin)
+
+site.register(OtherStory, OtherStoryAdmin)
+
+site.register(Report, ReportAdmin)
+
+site.register(MainPrepopulated, MainPrepopulatedAdmin)
+
+site.register(UnorderedObject, UnorderedObjectAdmin)
+
+site.register(UndeletableObject, UndeletableObjectAdmin)
+
+site.register(UnchangeableObject, UnchangeableObjectAdmin)
+
+site.register(State, StateAdmin)
+
+site.register(City, CityAdmin)
+
+site.register(Restaurant, RestaurantAdmin)
+
+site.register(Worker, WorkerAdmin)
+
+site.register(FunkyTag, FunkyTagAdmin)
+
+site.register(ReferencedByParent)
+
+site.register(ChildOfReferer)
+
+site.register(ReferencedByInline)
+
+site.register(InlineReferer, InlineRefererAdmin)
+
+site.register(ReferencedByGenRel)
+
+site.register(GenRelReference)
+
+
+
+# We intentionally register Promo and ChapterXtra1 but not Chapter nor ChapterXtra2.
+
+# That way we cover all four cases:
+
+#     related ForeignKey object registered in admin
+
+#     related ForeignKey object not registered in admin
+
+#     related OneToOne object registered in admin
+
+#     related OneToOne object not registered in admin
+
+# when deleting Book so as exercise all four troublesome (w.r.t escaping
+
+# and calling force_text to avoid problems on Python 2.3) paths through
+
+# contrib.admin.utils's get_deleted_objects function.
+
+site.register(Book, inlines=[ChapterInline])
+
+site.register(Promo)
+
+site.register(ChapterXtra1, ChapterXtra1Admin)
+
+site.register(Pizza, PizzaAdmin)
+
+site.register(Topping, ToppingAdmin)
+
+site.register(Album, AlbumAdmin)
+
+site.register(Question)
+
+site.register(Answer)
+
+site.register(PrePopulatedPost, PrePopulatedPostAdmin)
+
+site.register(ComplexSortedPerson, ComplexSortedPersonAdmin)
+
+site.register(FilteredManager, CustomManagerAdmin)
+
+site.register(PluggableSearchPerson, PluggableSearchPersonAdmin)
+
+site.register(PrePopulatedPostLargeSlug, PrePopulatedPostLargeSlugAdmin)
+
+site.register(AdminOrderedField, AdminOrderedFieldAdmin)
+
+site.register(AdminOrderedModelMethod, AdminOrderedModelMethodAdmin)
+
+site.register(AdminOrderedAdminMethod, AdminOrderedAdminMethodAdmin)
+
+site.register(AdminOrderedCallable, AdminOrderedCallableAdmin)
+
+site.register(Color2, CustomTemplateFilterColorAdmin)
+
+site.register(Simple, AttributeErrorRaisingAdmin)
+
+site.register(UserMessenger, MessageTestingAdmin)
+
+site.register(Choice, ChoiceList)
+
+site.register(ParentWithDependentChildren, ParentWithDependentChildrenAdmin)
+
+site.register(EmptyModelHidden, EmptyModelHiddenAdmin)
+
+site.register(EmptyModelVisible, EmptyModelVisibleAdmin)
+
+site.register(EmptyModelMixin, EmptyModelMixinAdmin)
+
+site.register(StumpJoke)
+
+site.register(Recipe)
+
+site.register(Ingredient)
+
+site.register(NotReferenced)
+
+site.register(ExplicitlyProvidedPK, GetFormsetsArgumentCheckingAdmin)
+
+site.register(ImplicitlyGeneratedPK, GetFormsetsArgumentCheckingAdmin)
+
+
+
+site.register(User, UserAdmin)
+
+site.register(Group, GroupAdmin)
+
+
+
+# Used to test URL namespaces
+
+site2 = admin.AdminSite(name="namespaced_admin")
+
+site2.register(User, UserAdmin)
+
+site2.register(Group, GroupAdmin)
+
+site2.register(ParentWithUUIDPK)
+
+site2.register(
+
+    RelatedWithUUIDPKModel,
+
+    list_display=['pk', 'parent'],
+
+    list_editable=['parent'],
+
+    raw_id_fields=['parent'],
+
+)
+
+
+
+site7 = admin.AdminSite(name="admin7")
+
+site7.register(Article, ArticleAdmin2)

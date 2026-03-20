@@ -2,490 +2,554 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-import itertools
+# Copyright (C) 2013, Red Hat, Inc.
 
-import random
+# All rights reserved.
 
-from typing import Union
+#
 
+# Permission is hereby granted, free of charge, to any person obtaining a copy
 
+# of this software and associated documentation files (the "Software"), to deal
 
-import aiohttp
+# in the Software without restriction, including without limitation the rights
 
-import discord
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 
-import inflection
+# copies of the Software, and to permit persons to whom the Software is
 
-from redbot.core import Config, checks, commands
+# furnished to do so, subject to the following conditions:
 
-from redbot.core.i18n import get_locale
+#
 
-from redbot.core.utils.chat_formatting import italics
+# The above copyright notice and this permission notice shall be included in
 
+# all copies or substantial portions of the Software.
 
+#
 
-from .helpers import *
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
 
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 
-class Act(commands.Cog):
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 
-    """
+# THE SOFTWARE.
 
-    This cog makes all commands, e.g. [p]fluff, into valid commands if
 
-    you command the bot to act on a user, e.g. [p]fluff [botname].
 
-    """
+import io
 
+import logging
 
+import select
 
-    __author__ = "Zephyrkul"
+import socket
 
+import struct
 
+import sys
 
-    async def red_get_data_for_user(self, *, user_id):
+import time
 
-        return {}  # No data to get
 
 
+try:  # Python 3.x
 
-    async def red_delete_data_for_user(self, *, requester, user_id):
+    import http.client as httplib
 
-        pass  # No data to delete
+    import urllib.parse as urlparse
 
+except ImportError:  # Python 2.x
 
+    import httplib
 
-    def __init__(self, bot):
+    import urlparse
 
-        super().__init__()
 
-        self.bot = bot
 
-        self.config = Config.get_conf(self, identifier=2_113_674_295, force_registration=True)
+import kdcproxy.codec as codec
 
-        self.config.register_global(custom={}, tenorkey=None)
+from kdcproxy.config import MetaResolver
 
-        self.config.register_guild(custom={})
 
-        self.try_after = None
 
 
 
-    async def initialize(self, bot):
+class HTTPException(Exception):
 
-        # temporary backwards compatibility
 
-        key = await self.config.tenorkey()
 
-        if not key:
+    def __init__(self, code, msg, headers=[]):
 
-            return
+        headers = list(filter(lambda h: h[0] != 'Content-Length', headers))
 
-        await bot.set_shared_api_tokens("tenor", api_key=key)
 
-        await self.config.tenorkey.clear()
 
+        if 'Content-Type' not in dict(headers):
 
+            headers.append(('Content-Type', 'text/plain; charset=utf-8'))
 
-    @commands.command(hidden=True)
 
-    async def act(self, ctx, *, target: Union[discord.Member, str] = None):
 
-        """
+        if sys.version_info.major == 3 and isinstance(msg, str):
 
-        Acts on the specified user.
+            msg = bytes(msg, "utf-8")
 
-        """
 
-        if not target or isinstance(target, str):
 
-            return  # no help text
+        headers.append(('Content-Length', str(len(msg))))
 
 
 
-        try:
+        super(HTTPException, self).__init__(code, msg, headers)
 
-            if not ctx.guild:
+        self.code = code
 
-                raise KeyError()
+        self.message = msg
 
-            message = await self.config.guild(ctx.guild).get_raw("custom", ctx.invoked_with)
+        self.headers = headers
 
-        except KeyError:
 
-            try:
 
-                message = await self.config.get_raw("custom", ctx.invoked_with)
+    def __str__(self):
 
-            except KeyError:
+        return "%d %s" % (self.code, httplib.responses[self.code])
 
-                message = NotImplemented
 
 
 
-        if message is None:  # ignored command
 
-            return
+class Application:
 
-        elif message is NotImplemented:  # default
+    SOCKTYPES = {
 
-            # humanize action text
+        "tcp": socket.SOCK_STREAM,
 
-            action = inflection.humanize(ctx.invoked_with).split()
+        "udp": socket.SOCK_DGRAM,
 
-            iverb = -1
+    }
 
 
 
-            for cycle in range(2):
+    def __init__(self):
 
-                if iverb > -1:
+        self.__resolver = MetaResolver()
 
-                    break
 
-                for i, act in enumerate(action):
 
-                    act = act.lower()
+    def __await_reply(self, pr, rsocks, wsocks, timeout):
 
-                    if (
+        extra = 0
 
-                        act in NOLY_ADV
+        read_buffers = {}
 
-                        or act in CONJ
+        while (timeout + extra) > time.time():
 
-                        or (act.endswith("ly") and act not in LY_VERBS)
+            if not wsocks and not rsocks:
 
-                        or (not cycle and act in SOFT_VERBS)
+                break
 
-                    ):
 
-                        continue
 
-                    action[i] = inflection.pluralize(action[i])
+            r, w, x = select.select(rsocks, wsocks, rsocks + wsocks,
 
-                    iverb = max(iverb, i)
+                                    (timeout + extra) - time.time())
 
+            for sock in x:
 
+                sock.close()
 
-            if iverb < 0:
+                try:
 
-                return
+                    rsocks.remove(sock)
 
-            action.insert(iverb + 1, target.mention)
+                except ValueError:
 
-            message = italics(" ".join(action))
+                    pass
+
+                try:
+
+                    wsocks.remove(sock)
+
+                except ValueError:
+
+                    pass
+
+
+
+            for sock in w:
+
+                try:
+
+                    if self.sock_type(sock) == socket.SOCK_DGRAM:
+
+                        # If we proxy over UDP, remove the 4-byte length
+
+                        # prefix since it is TCP only.
+
+                        sock.sendall(pr.request[4:])
+
+                    else:
+
+                        sock.sendall(pr.request)
+
+                        extra = 10  # New connections get 10 extra seconds
+
+                except Exception:
+
+                    logging.exception('Error in recv() of %s', sock)
+
+                    continue
+
+                rsocks.append(sock)
+
+                wsocks.remove(sock)
+
+
+
+            for sock in r:
+
+                try:
+
+                    reply = self.__handle_recv(sock, read_buffers)
+
+                except Exception:
+
+                    logging.exception('Error in recv() of %s', sock)
+
+                    if self.sock_type(sock) == socket.SOCK_STREAM:
+
+                        # Remove broken TCP socket from readers
+
+                        rsocks.remove(sock)
+
+                else:
+
+                    if reply is not None:
+
+                        return reply
+
+
+
+        return None
+
+
+
+    def __handle_recv(self, sock, read_buffers):
+
+        if self.sock_type(sock) == socket.SOCK_DGRAM:
+
+            # For UDP sockets, recv() returns an entire datagram
+
+            # package. KDC sends one datagram as reply.
+
+            reply = sock.recv(1048576)
+
+            # If we proxy over UDP, we will be missing the 4-byte
+
+            # length prefix. So add it.
+
+            reply = struct.pack("!I", len(reply)) + reply
+
+            return reply
 
         else:
 
-            message = message.format(target, user=target)
+            # TCP is a different story. The reply must be buffered
+
+            # until the full answer is accumulated.
+
+            buf = read_buffers.get(sock)
+
+            part = sock.recv(1048576)
+
+            if buf is None:
+
+                if len(part) > 4:
+
+                    # got enough data in the initial package. Now check
+
+                    # if we got the full package in the first run.
+
+                    (length, ) = struct.unpack("!I", part[0:4])
+
+                    if length + 4 == len(part):
+
+                        return part
+
+                read_buffers[sock] = buf = io.BytesIO()
 
 
 
-        # add reaction gif
+            if part:
 
-        if self.try_after and ctx.message.created_at < self.try_after:
+                # data received, accumulate it in a buffer
 
-            return await ctx.send(message)
+                buf.write(part)
 
-        if not await ctx.embed_requested():
-
-            return await ctx.send(message)
-
-        key = (await ctx.bot.get_shared_api_tokens("tenor")).get("api_key")
-
-        if not key:
-
-            return await ctx.send(message)
-
-        async with aiohttp.request(
-
-            "GET",
-
-            "https://api.tenor.com/v1/search",
-
-            params={
-
-                "q": ctx.invoked_with,
-
-                "key": key,
-
-                "anon_id": str(ctx.author.id ^ ctx.me.id),
-
-                "media_filter": "minimal",
-
-                "contentfilter": "off" if getattr(ctx.channel, "nsfw", False) else "low",
-
-                "ar_range": "wide",
-
-                "limit": "8",
-
-                "locale": get_locale(),
-
-            },
-
-        ) as response:
-
-            json: dict
-
-            if response.status == 429:
-
-                self.try_after = ctx.message.created_at + 30
-
-                json = {}
-
-            elif response.status >= 400:
-
-                json = {}
+                return None
 
             else:
 
-                json = await response.json()
+                # EOF received
 
-        if not json.get("results"):
+                read_buffers.pop(sock)
 
-            return await ctx.send(message)
+                reply = buf.getvalue()
 
-        message = f"{message}\n\n{random.choice(json['results'])['itemurl']}"
+                return reply
 
-        await ctx.send(
 
-            message,
 
-            allowed_mentions=discord.AllowedMentions(
+    def __filter_addr(self, addr):
 
-                users=False if target in ctx.message.mentions else [target]
+        if addr[0] not in (socket.AF_INET, socket.AF_INET6):
 
-            ),
+            return False
 
-        )
 
 
+        if addr[1] not in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
 
-    @commands.group()
+            return False
 
-    @checks.is_owner()
 
-    async def actset(self, ctx):
 
-        """
+        if addr[2] not in (socket.IPPROTO_TCP, socket.IPPROTO_UDP):
 
-        Configure various settings for the act cog.
+            return False
 
-        """
 
 
+        return True
 
-    @actset.group(aliases=["custom"], invoke_without_command=True)
 
-    @checks.admin_or_permissions(manage_guild=True)
 
-    @commands.guild_only()
-
-    async def customize(self, ctx, command: str.lower, *, response: str = None):
-
-        """
-
-        Customize the response to an action.
-
-
-
-        You can use {0} or {user} to dynamically replace with the specified target of the action.
-
-        Formats like {0.name} or {0.mention} can also be used.
-
-        """
-
-        if not response:
-
-            await self.config.guild(ctx.guild).clear_raw("custom", command)
-
-        else:
-
-            await self.config.guild(ctx.guild).set_raw("custom", command, value=response)
-
-        await ctx.tick()
-
-
-
-    @customize.command(name="global")
-
-    @checks.is_owner()
-
-    async def customize_global(self, ctx, command: str.lower, *, response: str = None):
-
-        """
-
-        Globally customize the response to an action.
-
-
-
-        You can use {0} or {user} to dynamically replace with the specified target of the action.
-
-        Formats like {0.name} or {0.mention} can also be used.
-
-        """
-
-        if not response:
-
-            await self.config.clear_raw("custom", command)
-
-        else:
-
-            await self.config.set_raw("custom", command, value=response)
-
-        await ctx.tick()
-
-
-
-    @actset.group(invoke_without_command=True)
-
-    @checks.admin_or_permissions(manage_guild=True)
-
-    @commands.guild_only()
-
-    async def ignore(self, ctx, command: str.lower):
-
-        """
-
-        Ignore or unignore the specified action.
-
-
-
-        The bot will no longer respond to these actions.
-
-        """
+    def sock_type(self, sock):
 
         try:
 
-            custom = await self.config.guild(ctx.guild).get_raw("custom", command)
+            return sock.type & ~socket.SOCK_NONBLOCK
 
-        except KeyError:
+        except AttributeError:
 
-            custom = NotImplemented
-
-        if custom is None:
-
-            await self.config.guild(ctx.guild).clear_raw("custom", command)
-
-            await ctx.send("I will no longer ignore the {command} action".format(command=command))
-
-        else:
-
-            await self.config.guild(ctx.guild).set_raw("custom", command, value=None)
-
-            await ctx.send("I will now ignore the {command} action".format(command=command))
+            return sock.type
 
 
 
-    @ignore.command(name="global")
-
-    @checks.is_owner()
-
-    async def ignore_global(self, ctx, command: str.lower):
-
-        """
-
-        Globally ignore or unignore the specified action.
-
-
-
-        The bot will no longer respond to these actions.
-
-        """
+    def __call__(self, env, start_response):
 
         try:
 
-            await self.config.get_raw("custom", command)
+            # Validate the method
 
-        except KeyError:
+            method = env["REQUEST_METHOD"].upper()
 
-            await self.config.set_raw("custom", command, value=None)
+            if method != "POST":
 
-        else:
-
-            await self.config.clear_raw("custom", command)
-
-        await ctx.tick()
+                raise HTTPException(405, "Method not allowed (%s)." % method)
 
 
 
-    @actset.command()
-
-    @checks.is_owner()
-
-    async def tenorkey(self, ctx):
-
-        """
-
-        Sets a Tenor GIF API key to enable reaction gifs with act commands.
-
-
-
-        You can obtain a key from here: https://tenor.com/developer/dashboard
-
-        """
-
-        instructions = [
-
-            "Go to the Tenor developer dashboard: https://tenor.com/developer/dashboard",
-
-            "Log in or sign up if you haven't already.",
-
-            "Click `+ Create new app` and fill out the form.",
-
-            "Copy the key from the app you just created.",
-
-            "Give the key to Red with this command:\n"
-
-            f"`{ctx.prefix}set api tenor api_key your_api_key`\n"
-
-            "Replace `your_api_key` with the key you just got.\n"
-
-            "Everything else should be the same.",
-
-        ]
-
-        instructions = [f"**{i}.** {v}" for i, v in enumerate(instructions, 1)]
-
-        await ctx.maybe_send_embed("\n".join(instructions))
-
-
-
-    @commands.Cog.listener()
-
-    async def on_message(self, message):
-
-        if message.author.bot:
-
-            return
-
-
-
-        ctx = await self.bot.get_context(message)
-
-        if ctx.prefix is None or not ctx.invoked_with.replace("_", "").isalpha():
-
-            return
-
-
-
-        if ctx.valid and ctx.command.enabled:
+            # Parse the request
 
             try:
 
-                if await ctx.command.can_run(ctx):
+                length = int(env["CONTENT_LENGTH"])
 
-                    return
+            except AttributeError:
 
-            except commands.errors.CheckFailure:
+                length = -1
 
-                return
+            try:
+
+                pr = codec.decode(env["wsgi.input"].read(length))
+
+            except codec.ParsingError as e:
+
+                raise HTTPException(400, e.message)
 
 
 
-        ctx.command = self.act
+            # Find the remote proxy
 
-        await self.bot.invoke(ctx)
+            servers = self.__resolver.lookup(
+
+                pr.realm,
+
+                kpasswd=isinstance(pr, codec.KPASSWDProxyRequest)
+
+            )
+
+            if not servers:
+
+                raise HTTPException(503, "Can't find remote (%s)." % pr)
+
+
+
+            # Contact the remote server
+
+            reply = None
+
+            wsocks = []
+
+            rsocks = []
+
+            for server in map(urlparse.urlparse, servers):
+
+                # Enforce valid, supported URIs
+
+                scheme = server.scheme.lower().split("+", 1)
+
+                if scheme[0] not in ("kerberos", "kpasswd"):
+
+                    continue
+
+                if len(scheme) > 1 and scheme[1] not in ("tcp", "udp"):
+
+                    continue
+
+
+
+                # Do the DNS lookup
+
+                try:
+
+                    port = server.port
+
+                    if port is None:
+
+                        port = scheme[0]
+
+                    addrs = socket.getaddrinfo(server.hostname, port)
+
+                except socket.gaierror:
+
+                    continue
+
+
+
+                # Sort addresses so that we get TCP first.
+
+                #
+
+                # Stick a None address on the end so we can get one
+
+                # more attempt after all servers have been contacted.
+
+                addrs = tuple(sorted(filter(self.__filter_addr, addrs)))
+
+                for addr in addrs + (None,):
+
+                    if addr is not None:
+
+                        # Bypass unspecified socktypes
+
+                        if (len(scheme) > 1
+
+                                and addr[1] != self.SOCKTYPES[scheme[1]]):
+
+                            continue
+
+
+
+                        # Create the socket
+
+                        sock = socket.socket(*addr[:3])
+
+                        sock.setblocking(0)
+
+
+
+                        # Connect
+
+                        try:
+
+                            # In Python 2.x, non-blocking connect() throws
+
+                            # socket.error() with errno == EINPROGRESS. In
+
+                            # Python 3.x, it throws io.BlockingIOError().
+
+                            sock.connect(addr[4])
+
+                        except socket.error as e:
+
+                            if e.errno != 115:  # errno != EINPROGRESS
+
+                                sock.close()
+
+                                continue
+
+                        except io.BlockingIOError:
+
+                            pass
+
+                        wsocks.append(sock)
+
+
+
+                    # Resend packets to UDP servers
+
+                    for sock in tuple(rsocks):
+
+                        if self.sock_type(sock) == socket.SOCK_DGRAM:
+
+                            wsocks.append(sock)
+
+                            rsocks.remove(sock)
+
+
+
+                    # Call select()
+
+                    timeout = time.time() + (15 if addr is None else 2)
+
+                    reply = self.__await_reply(pr, rsocks, wsocks, timeout)
+
+                    if reply is not None:
+
+                        break
+
+
+
+                if reply is not None:
+
+                    break
+
+
+
+            for sock in rsocks + wsocks:
+
+                sock.close()
+
+
+
+            if reply is None:
+
+                raise HTTPException(503, "Remote unavailable (%s)." % pr)
+
+
+
+            # Return the result to the client
+
+            raise HTTPException(200, codec.encode(reply),
+
+                                [("Content-Type", "application/kerberos")])
+
+        except HTTPException as e:
+
+            start_response(str(e), e.headers)
+
+            return [e.message]
+
+
+
+application = Application()

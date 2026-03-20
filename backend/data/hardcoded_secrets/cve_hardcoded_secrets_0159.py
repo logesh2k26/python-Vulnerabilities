@@ -2,548 +2,454 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-import itertools
+"""CILogon OAuthAuthenticator for JupyterHub
 
 
 
-from flask import request, abort, _app_ctx_stack, redirect
-
-from flask_security.core import AnonymousUser
-
-from security_monkey.datastore import User
+Uses OAuth 2.0 with cilogon.org (override with CILOGON_HOST)
 
 
 
-try:
-
-    from flask.ext.login import current_user
-
-except ImportError:
-
-    current_user = None
+Caveats:
 
 
 
-from .models import RBACRole, RBACUserMixin
+- For allowed user list /admin purposes, username will be the ePPN by default.
+
+  This is typically an email address and may not work as a Unix userid.
+
+  Normalization may be required to turn the JupyterHub username into a Unix username.
+
+- Default username_claim of ePPN does not work for all providers,
+
+  e.g. generic OAuth such as Google.
+
+  Use `c.CILogonOAuthenticator.username_claim = 'email'` to use
+
+  email instead of ePPN as the JupyterHub username.
+
+"""
 
 
-
-from . import anonymous
-
-
-
-from flask import Response
 
 import json
 
+import os
+
+
+
+from tornado.auth import OAuth2Mixin
+
+from tornado import web
+
+
+
+from tornado.httputil import url_concat
+
+from tornado.httpclient import HTTPRequest, AsyncHTTPClient
+
+
+
+from traitlets import Unicode, List, Bool, default, validate, observe
+
+
+
+from jupyterhub.auth import LocalAuthenticator
+
+
+
+from .oauth2 import OAuthLoginHandler, OAuthenticator
 
 
 
 
-class AccessControlList(object):
 
-    """
+class CILogonLoginHandler(OAuthLoginHandler):
 
-    This class record rules for access controling.
-
-    """
+    """See http://www.cilogon.org/oidc for general information."""
 
 
 
-    def __init__(self):
+    def authorize_redirect(self, *args, **kwargs):
 
-        self._allowed = []
+        """Add idp, skin to redirect params"""
 
-        self._exempt = []
+        extra_params = kwargs.setdefault('extra_params', {})
 
-        self.seted = False
+        if self.authenticator.idp:
+
+            extra_params["selected_idp"] = self.authenticator.idp
+
+        if self.authenticator.skin:
+
+            extra_params["skin"] = self.authenticator.skin
 
 
 
-    def allow(self, role, method, resource, with_children=True):
-
-        """Add allowing rules.
+        return super().authorize_redirect(*args, **kwargs)
 
 
 
-        :param role: Role of this rule.
 
-        :param method: Method to allow in rule, include GET, POST, PUT etc.
 
-        :param resource: Resource also view function.
+class CILogonOAuthenticator(OAuthenticator):
 
-        :param with_children: Allow role's children in rule as well
+    _deprecated_aliases = {
 
-                              if with_children is `True`
+        "idp_whitelist": ("allowed_idps", "0.12.0"),
+
+    }
+
+
+
+    @observe(*list(_deprecated_aliases))
+
+    def _deprecated_trait(self, change):
+
+        super()._deprecated_trait(change)
+
+
+
+    login_service = "CILogon"
+
+
+
+    client_id_env = 'CILOGON_CLIENT_ID'
+
+    client_secret_env = 'CILOGON_CLIENT_SECRET'
+
+    login_handler = CILogonLoginHandler
+
+
+
+    cilogon_host = Unicode(os.environ.get("CILOGON_HOST") or "cilogon.org", config=True)
+
+
+
+    @default("authorize_url")
+
+    def _authorize_url_default(self):
+
+        return "https://%s/authorize" % self.cilogon_host
+
+
+
+    @default("token_url")
+
+    def _token_url(self):
+
+        return "https://%s/oauth2/token" % self.cilogon_host
+
+
+
+    scope = List(
+
+        Unicode(),
+
+        default_value=['openid', 'email', 'org.cilogon.userinfo'],
+
+        config=True,
+
+        help="""The OAuth scopes to request.
+
+
+
+        See cilogon_scope.md for details.
+
+        At least 'openid' is required.
+
+        """,
+
+    )
+
+
+
+    @validate('scope')
+
+    def _validate_scope(self, proposal):
+
+        """ensure openid is requested"""
+
+        if 'openid' not in proposal.value:
+
+            return ['openid'] + proposal.value
+
+        return proposal.value
+
+
+
+    idp_whitelist = List(help="Deprecated, use `CIlogonOAuthenticator.allowed_idps`", config=True,)
+
+    allowed_idps = List(
+
+        config=True,
+
+        help="""A list of IDP which can be stripped from the username after the @ sign.""",
+
+    )
+
+    strip_idp_domain = Bool(
+
+        False,
+
+        config=True,
+
+        help="""Remove the IDP domain from the username. Note that only domains which
+
+             appear in the `allowed_idps` will be stripped.""",
+
+    )
+
+    idp = Unicode(
+
+        config=True,
+
+        help="""The `idp` attribute is the SAML Entity ID of the user's selected
+
+            identity provider.
+
+
+
+            See https://cilogon.org/include/idplist.xml for the list of identity
+
+            providers supported by CILogon.
+
+        """,
+
+    )
+
+    skin = Unicode(
+
+        config=True,
+
+        help="""The `skin` attribute is the name of the custom CILogon interface skin
+
+            for your application.
+
+
+
+            Contact help@cilogon.org to request a custom skin.
+
+        """,
+
+    )
+
+    username_claim = Unicode(
+
+        "eppn",
+
+        config=True,
+
+        help="""The claim in the userinfo response from which to get the JupyterHub username
+
+
+
+            Examples include: eppn, email
+
+
+
+            What keys are available will depend on the scopes requested.
+
+
+
+            See http://www.cilogon.org/oidc for details.
+
+        """,
+
+    )
+
+
+
+    additional_username_claims = List(
+
+        config=True,
+
+        help="""Additional claims to check if the username_claim fails.
+
+
+
+        This is useful for linked identities where not all of them return
+
+        the primary username_claim.
+
+        """,
+
+    )
+
+
+
+    async def authenticate(self, handler, data=None):
+
+        """We set up auth_state based on additional CILogon info if we
+
+        receive it.
 
         """
 
+        code = handler.get_argument("code")
 
+        # TODO: Configure the curl_httpclient for tornado
 
-        if with_children:
+        http_client = AsyncHTTPClient()
 
-            for r in role.get_children():
 
-                permission = (r.name, method, resource)
 
-                if permission not in self._allowed:
+        # Exchange the OAuth code for a CILogon Access Token
 
-                    self._allowed.append(permission)
+        # See: http://www.cilogon.org/oidc
 
-        permission = (role.name, method, resource)
+        headers = {"Accept": "application/json", "User-Agent": "JupyterHub"}
 
-        if permission not in self._allowed:
 
-            self._allowed.append(permission)
 
+        params = dict(
 
+            client_id=self.client_id,
 
-    def exempt(self, view_func):
+            client_secret=self.client_secret,
 
-        """Exempt a view function from being checked permission
+            redirect_uri=self.oauth_callback_url,
 
+            code=code,
 
+            grant_type='authorization_code',
 
-        :param view_func: The view function exempt from checking.
+        )
 
-        """
 
-        if not view_func in self._exempt:
 
-            self._exempt.append(view_func)
+        url = url_concat(self.token_url, params)
 
 
 
-    def is_allowed(self, role, method, resource):
+        req = HTTPRequest(url, headers=headers, method="POST", body='')
 
-        """Check whether role is allowed to access resource
 
 
+        resp = await http_client.fetch(req)
 
-        :param role: Role to be checked.
+        token_response = json.loads(resp.body.decode('utf8', 'replace'))
 
-        :param method: Method to be checked.
+        access_token = token_response['access_token']
 
-        :param resource: View function to be checked.
+        self.log.info("Access token acquired.")
 
-        """
+        # Determine who the logged in user is
 
-        return (role, method, resource) in self._allowed
+        params = dict(access_token=access_token)
 
+        req = HTTPRequest(
 
+            url_concat("https://%s/oauth2/userinfo" % self.cilogon_host, params),
 
-    def is_exempt(self, view_func):
+            headers=headers,
 
-        """Return whether view_func is exempted.
+        )
 
+        resp = await http_client.fetch(req)
 
+        resp_json = json.loads(resp.body.decode('utf8', 'replace'))
 
-        :param view_func: View function to be checked.
 
-        """
 
-        return view_func in self._exempt
+        claimlist = [self.username_claim]
 
+        if self.additional_username_claims:
 
+            claimlist.extend(self.additional_username_claims)
 
 
 
-class _RBACState(object):
+        for claim in claimlist:
 
-    """Records configuration for Flask-RBAC"""
+            username = resp_json.get(claim)
 
-    def __init__(self, rbac, app):
+            if username:
 
-        self.rbac = rbac
+                break
 
-        self.app = app
+        if not username:
 
+            if len(claimlist) < 2:
 
+                self.log.error(
 
+                    "Username claim %s not found in response: %s",
 
+                    self.username_claim,
 
-class RBAC(object):
+                    sorted(resp_json.keys()),
 
-    """
+                )
 
-    This class implements role-based access control module in Flask.
+            else:
 
-    There are two way to initialize Flask-RBAC::
+                self.log.error(
 
+                    "No username claim from %r in response: %s",
 
+                    claimlist,
 
-        app = Flask(__name__)
+                    sorted(resp_json.keys()),
 
-        rbac = RBAC(app)
+                )
 
+            raise web.HTTPError(500, "Failed to get username from CILogon")
 
 
-    :param app: the Flask object
 
-    """
+        if self.allowed_idps:
 
+            gotten_name, gotten_idp = username.split('@')
 
+            if gotten_idp not in self.allowed_idps:
 
-    _role_model = RBACRole
+                self.log.error(
 
-    _user_model = RBACUserMixin
+                    "Trying to login from not allowed domain %s", gotten_idp
 
+                )
 
+                raise web.HTTPError(500, "Trying to login from a domain not allowed")
 
-    def __init__(self, app):
+            if len(self.allowed_idps) == 1 and self.strip_idp_domain:
 
-        self.acl = AccessControlList()
+                username = gotten_name
 
-        self.before_acl = []
+        userdict = {"name": username}
 
+        # Now we set up auth_state
 
+        userdict["auth_state"] = auth_state = {}
 
-        self.app = app
+        # Save the token response and full CILogon reply in auth state
 
-        self.init_app(app)
+        # These can be used for user provisioning
 
+        #  in the Lab/Notebook environment.
 
+        auth_state['token_response'] = token_response
 
-    def init_app(self, app):
+        # store the whole user model in auth_state.cilogon_user
 
-        # Add (RBAC, app) to flask extensions.
+        # keep access_token as well, in case anyone was relying on it
 
-        # Add hook to authenticate permission before request.
+        auth_state['access_token'] = access_token
 
+        auth_state['cilogon_user'] = resp_json
 
+        return userdict
 
-        if not hasattr(app, 'extensions'):
 
-            app.extensions = {}
 
-        app.extensions['rbac'] = _RBACState(self, app)
 
 
+class LocalCILogonOAuthenticator(LocalAuthenticator, CILogonOAuthenticator):
 
-        self.acl.allow(anonymous, 'GET', app.view_functions['static'].__name__)
 
-        app.before_first_request(self._setup_acl)
 
-        app.before_request(self._authenticate)
+    """A version that mixes in local system user creation"""
 
 
 
-    def has_permission(self, method, endpoint, user=None):
-
-        """Return whether the current user can access the resource.
-
-        Example::
-
-
-
-            @app.route('/some_url', methods=['GET', 'POST'])
-
-            @rbac.allow(['anonymous'], ['GET'])
-
-            def a_view_func():
-
-                return Response('Blah Blah...')
-
-
-
-        If you are not logged.
-
-
-
-        `rbac.has_permission('GET', 'a_view_func')` return True.
-
-        `rbac.has_permission('POST', 'a_view_func')` return False.
-
-
-
-        :param method: The method wait to check.
-
-        :param endpoint: The application endpoint.
-
-        :param user: user who you need to check. Current user by default.
-
-        """
-
-        app = self.get_app()
-
-        _user = user or current_user
-
-        roles = _user.get_roles()
-
-        view_func = app.view_functions[endpoint]
-
-        return self._check_permission(roles, method, view_func)
-
-
-
-    def check_perm(self, role, method, callback=None):
-
-        def decorator(view_func):
-
-            if not self._check_permission([role], method, view_func):
-
-                if callable(callback):
-
-                    callback()
-
-                else:
-
-                    self._deny_hook()
-
-            return view_func
-
-        return decorator
-
-
-
-    def allow(self, roles, methods, with_children=True):
-
-        """Decorator: allow roles to access the view func with it.
-
-
-
-        :param roles: List, each name of roles. Please note that,
-
-                      `anonymous` is refered to anonymous.
-
-                      If you add `anonymous` to the rule,
-
-                      everyone can access the resource,
-
-                      unless you deny other roles.
-
-        :param methods: List, each name of methods.
-
-                        methods is valid in ['GET', 'POST', 'PUT', 'DELETE']
-
-        :param with_children: Whether allow children of roles as well.
-
-                              True by default.
-
-        """
-
-        def decorator(view_func):
-
-            _methods = [m.upper() for m in methods]
-
-            for r, m, v in itertools.product(roles, _methods, [view_func.__name__]):
-
-                self.before_acl.append((r, m, v, with_children))
-
-            return view_func
-
-        return decorator
-
-
-
-    def exempt(self, view_func):
-
-        """
-
-        Decorator function
-
-        Exempt a view function from being checked permission.
-
-        """
-
-        self.acl.exempt(view_func.__name__)
-
-        return view_func
-
-
-
-    def get_app(self, reference_app=None):
-
-        """
-
-        Helper to look up an app.
-
-        """
-
-        if reference_app is not None:
-
-            return reference_app
-
-        if self.app is not None:
-
-            return self.app
-
-        ctx = _app_ctx_stack.top
-
-        if ctx is not None:
-
-            return ctx.app
-
-        raise RuntimeError('application not registered on rbac '
-
-                           'instance and no application bound '
-
-                           'to current context')
-
-
-
-    def _authenticate(self):
-
-        app = self.get_app()
-
-        assert app, "Please initialize your application into Flask-RBAC."
-
-        assert self._role_model, "Please set role model before authenticate."
-
-        assert self._user_model, "Please set user model before authenticate."
-
-        user = current_user
-
-        if not isinstance(user._get_current_object(), self._user_model) and not isinstance(user._get_current_object(), AnonymousUser):
-
-            raise TypeError(
-
-                "%s is not an instance of %s" %
-
-                (user, self._user_model.__class__))
-
-
-
-        endpoint = request.endpoint
-
-        resource = app.view_functions.get(endpoint, None)
-
-
-
-        if not resource:
-
-            abort(404)
-
-
-
-        method = request.method
-
-        if not hasattr(user, 'get_roles'):
-
-            roles = [anonymous]
-
-        else:
-
-            roles = user.get_roles()
-
-
-
-        permit = self._check_permission(roles, method, resource)
-
-        if not permit:
-
-            return self._deny_hook(resource=resource)
-
-
-
-    def _check_permission(self, roles, method, resource):
-
-
-
-        resource = resource.__name__
-
-        if self.acl.is_exempt(resource):
-
-            return True
-
-
-
-        if not self.acl.seted:
-
-            self._setup_acl()
-
-
-
-        _roles = set()
-
-        _methods = {'*', method}
-
-        _resources = {None, resource}
-
-
-
-        _roles.add(anonymous)
-
-
-
-        _roles.update(roles)
-
-
-
-        for r, m, res in itertools.product(_roles, _methods, _resources):
-
-            if self.acl.is_allowed(r.name, m, res):
-
-                return True
-
-
-
-        return False
-
-
-
-    def _deny_hook(self, resource=None):
-
-        app = self.get_app()
-
-        if current_user.is_authenticated():
-
-            status = 403
-
-        else:
-
-            status = 401
-
-        #abort(status)
-
-
-
-        if app.config.get('FRONTED_BY_NGINX'):
-
-                url = "https://{}:{}{}".format(app.config.get('FQDN'), app.config.get('NGINX_PORT'), '/login')
-
-        else:
-
-                url = "http://{}:{}{}".format(app.config.get('FQDN'), app.config.get('API_PORT'), '/login')
-
-        if current_user.is_authenticated():
-
-            auth_dict = {
-
-                "authenticated": True,
-
-                "user": current_user.email,
-
-                "roles": current_user.role,
-
-            }
-
-        else:
-
-            auth_dict = {
-
-                "authenticated": False,
-
-                "user": None,
-
-                "url": url
-
-            }
-
-
-
-        return Response(response=json.dumps({"auth": auth_dict}), status=status, mimetype="application/json")
-
-
-
-
-
-    def _setup_acl(self):
-
-        for rn, method, resource, with_children in self.before_acl:
-
-            role = self._role_model.get_by_name(rn)
-
-            self.acl.allow(role, method, resource, with_children)
-
-        self.acl.seted = True
+    pass

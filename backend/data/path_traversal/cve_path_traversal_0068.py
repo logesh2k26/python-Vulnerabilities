@@ -2,158 +2,498 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-#!/usr/bin/env python
-
 # -*- coding: utf-8 -*-
 
-#**
+'''
 
-#
+Test the verification routines
 
-#########
+'''
 
-# trape #
 
-#########
 
-#
+# Import Python libs
 
-# trape depends of this file
+from __future__ import absolute_import
 
-# For full copyright information this visit: https://github.com/boxug/trape
+import getpass
 
-#
+import os
 
-# Copyright 2017 by boxug / <hey@boxug.com>
+import sys
 
-#**
+import stat
 
-import urllib2
+import shutil
 
-from flask import Flask, render_template, session, request, json
+import resource
 
-from core.trape import Trape
+import tempfile
 
-from core.db import Database
+import socket
 
 
 
-# Main parts, to generate relationships among others
+# Import Salt Testing libs
 
-trape = Trape()
+from tests.support.unit import skipIf, TestCase
 
-app = Flask(__name__, template_folder='../templates', static_folder='../static')
+from tests.support.paths import TMP
 
+from tests.support.helpers import (
 
+    requires_network,
 
-# call database
+    TestsLoggingHandler
 
-db = Database()
+)
 
+from tests.support.mock import (
 
+    MagicMock,
 
-# preview header tool in console
+    patch,
 
-trape.header()
+    NO_MOCK,
 
+    NO_MOCK_REASON
 
+)
 
-@app.route("/" + trape.stats_path)
 
-def index():
 
-    return render_template("/login.html")
+# Import salt libs
 
+import salt.utils
 
+from salt.utils.verify import (
 
-@app.route("/logout")
+    check_user,
 
-def logout():
+    verify_env,
 
-    return render_template("/login.html")
+    verify_socket,
 
+    zmq_version,
 
+    check_max_open_files,
 
-@app.route("/login", methods=["POST"])
+    valid_id,
 
-def login():
+    log,
 
-    id = request.form['id']
+    verify_log,
 
-    if id == trape.stats_key:
+)
 
-        return json.dumps({'status':'OK', 'path' : trape.home_path, 'victim_path' : trape.victim_path, 'url_to_clone' : trape.url_to_clone, 'app_port' : trape.app_port, 'date_start' : trape.date_start, 'user_ip' : '127.0.0.1'});
 
-    else:
 
-      return json.dumps({'status':'NOPE', 'path' : '/'});
+# Import 3rd-party libs
 
+from salt.ext.six.moves import range  # pylint: disable=import-error,redefined-builtin
 
 
-@app.route("/get_data", methods=["POST"])
 
-def home_get_dat():
 
-    d = db.sentences_stats('get_data')
 
-    n = db.sentences_stats('all_networks')
+class TestVerify(TestCase):
 
+    '''
 
+    Verify module tests
 
-    ('clean_online')
+    '''
 
-    rows = db.sentences_stats('get_clicks')
 
-    c = rows[0][0]
 
-    rows = db.sentences_stats('get_sessions')
+    def test_valid_id_exception_handler(self):
 
-    s = rows[0][0]
+        '''
 
-    rows = db.sentences_stats('get_online')
+        Ensure we just return False if we pass in invalid or undefined paths.
 
-    o = rows[0][0]
+        Refs #8259
 
+        '''
 
+        opts = {'pki_dir': '/tmp/whatever'}
 
-    return json.dumps({'status' : 'OK', 'd' : d, 'n' : n, 'c' : c, 's' : s, 'o' : o});
+        self.assertFalse(valid_id(opts, None))
 
 
 
-@app.route("/get_preview", methods=["POST"])
+    def test_zmq_verify(self):
 
-def home_get_preview():
+        self.assertTrue(zmq_version())
 
-    vId = request.form['vId']
 
-    d = db.sentences_stats('get_preview', vId)
 
-    n = db.sentences_stats('id_networks', vId)
+    def test_zmq_verify_insufficient(self):
 
-    return json.dumps({'status' : 'OK', 'vId' : vId, 'd' : d, 'n' : n});
+        import zmq
 
+        with patch.object(zmq, '__version__', '2.1.0'):
 
+            self.assertFalse(zmq_version())
 
-@app.route("/get_title", methods=["POST"])
 
-def home_get_title():
 
-    opener = urllib2.build_opener()
+    def test_user(self):
 
-    html = opener.open(trape.url_to_clone).read()
+        self.assertTrue(check_user(getpass.getuser()))
 
-    html = html[html.find('<title>') + 7 : html.find('</title>')]
 
-    return json.dumps({'status' : 'OK', 'title' : html});
 
+    def test_no_user(self):
 
+        # Catch sys.stderr here since no logging is configured and
 
-@app.route("/get_requests", methods=["POST"])
+        # check_user WILL write to sys.stderr
 
-def home_get_requests():
+        class FakeWriter(object):
 
-    d = db.sentences_stats('get_requests')
+            def __init__(self):
 
+                self.output = ""
 
 
-    return json.dumps({'status' : 'OK', 'd' : d});
+
+            def write(self, data):
+
+                self.output += data
+
+        stderr = sys.stderr
+
+        writer = FakeWriter()
+
+        sys.stderr = writer
+
+        # Now run the test
+
+        self.assertFalse(check_user('nouser'))
+
+        # Restore sys.stderr
+
+        sys.stderr = stderr
+
+        if writer.output != 'CRITICAL: User not found: "nouser"\n':
+
+            # If there's a different error catch, write it to sys.stderr
+
+            sys.stderr.write(writer.output)
+
+
+
+    @skipIf(sys.platform.startswith('win'), 'No verify_env Windows')
+
+    def test_verify_env(self):
+
+        root_dir = tempfile.mkdtemp(dir=TMP)
+
+        var_dir = os.path.join(root_dir, 'var', 'log', 'salt')
+
+        verify_env([var_dir], getpass.getuser())
+
+        self.assertTrue(os.path.exists(var_dir))
+
+        dir_stat = os.stat(var_dir)
+
+        self.assertEqual(dir_stat.st_uid, os.getuid())
+
+        self.assertEqual(dir_stat.st_mode & stat.S_IRWXU, stat.S_IRWXU)
+
+        self.assertEqual(dir_stat.st_mode & stat.S_IRWXG, 40)
+
+        self.assertEqual(dir_stat.st_mode & stat.S_IRWXO, 5)
+
+
+
+    @requires_network(only_local_network=True)
+
+    def test_verify_socket(self):
+
+        self.assertTrue(verify_socket('', 18000, 18001))
+
+        if socket.has_ipv6:
+
+            # Only run if Python is built with IPv6 support; otherwise
+
+            # this will just fail.
+
+            try:
+
+                self.assertTrue(verify_socket('::', 18000, 18001))
+
+            except socket.error as serr:
+
+                # Python has IPv6 enabled, but the system cannot create
+
+                # IPv6 sockets (otherwise the test would return a bool)
+
+                # - skip the test
+
+                #
+
+                # FIXME - possibly emit a message that the system does
+
+                # not support IPv6.
+
+                pass
+
+
+
+    @skipIf(True, 'Skipping until we can find why Jenkins is bailing out')
+
+    def test_max_open_files(self):
+
+        with TestsLoggingHandler() as handler:
+
+            logmsg_dbg = (
+
+                'DEBUG:This salt-master instance has accepted {0} minion keys.'
+
+            )
+
+            logmsg_chk = (
+
+                '{0}:The number of accepted minion keys({1}) should be lower '
+
+                'than 1/4 of the max open files soft setting({2}). According '
+
+                'to the system\'s hard limit, there\'s still a margin of {3} '
+
+                'to raise the salt\'s max_open_files setting. Please consider '
+
+                'raising this value.'
+
+            )
+
+            logmsg_crash = (
+
+                '{0}:The number of accepted minion keys({1}) should be lower '
+
+                'than 1/4 of the max open files soft setting({2}). '
+
+                'salt-master will crash pretty soon! According to the '
+
+                'system\'s hard limit, there\'s still a margin of {3} to '
+
+                'raise the salt\'s max_open_files setting. Please consider '
+
+                'raising this value.'
+
+            )
+
+
+
+            mof_s, mof_h = resource.getrlimit(resource.RLIMIT_NOFILE)
+
+            tempdir = tempfile.mkdtemp(prefix='fake-keys')
+
+            keys_dir = os.path.join(tempdir, 'minions')
+
+            os.makedirs(keys_dir)
+
+
+
+            mof_test = 256
+
+
+
+            resource.setrlimit(resource.RLIMIT_NOFILE, (mof_test, mof_h))
+
+
+
+            try:
+
+                prev = 0
+
+                for newmax, level in ((24, None), (66, 'INFO'),
+
+                                      (127, 'WARNING'), (196, 'CRITICAL')):
+
+
+
+                    for n in range(prev, newmax):
+
+                        kpath = os.path.join(keys_dir, str(n))
+
+                        with salt.utils.fopen(kpath, 'w') as fp_:
+
+                            fp_.write(str(n))
+
+
+
+                    opts = {
+
+                        'max_open_files': newmax,
+
+                        'pki_dir': tempdir
+
+                    }
+
+
+
+                    check_max_open_files(opts)
+
+
+
+                    if level is None:
+
+                        # No log message is triggered, only the DEBUG one which
+
+                        # tells us how many minion keys were accepted.
+
+                        self.assertEqual(
+
+                            [logmsg_dbg.format(newmax)], handler.messages
+
+                        )
+
+                    else:
+
+                        self.assertIn(
+
+                            logmsg_dbg.format(newmax), handler.messages
+
+                        )
+
+                        self.assertIn(
+
+                            logmsg_chk.format(
+
+                                level,
+
+                                newmax,
+
+                                mof_test,
+
+                                mof_h - newmax,
+
+                            ),
+
+                            handler.messages
+
+                        )
+
+                    handler.clear()
+
+                    prev = newmax
+
+
+
+                newmax = mof_test
+
+                for n in range(prev, newmax):
+
+                    kpath = os.path.join(keys_dir, str(n))
+
+                    with salt.utils.fopen(kpath, 'w') as fp_:
+
+                        fp_.write(str(n))
+
+
+
+                opts = {
+
+                    'max_open_files': newmax,
+
+                    'pki_dir': tempdir
+
+                }
+
+
+
+                check_max_open_files(opts)
+
+                self.assertIn(logmsg_dbg.format(newmax), handler.messages)
+
+                self.assertIn(
+
+                    logmsg_crash.format(
+
+                        'CRITICAL',
+
+                        newmax,
+
+                        mof_test,
+
+                        mof_h - newmax,
+
+                    ),
+
+                    handler.messages
+
+                )
+
+                handler.clear()
+
+            except IOError as err:
+
+                if err.errno == 24:
+
+                    # Too many open files
+
+                    self.skipTest('We\'ve hit the max open files setting')
+
+                raise
+
+            finally:
+
+                shutil.rmtree(tempdir)
+
+                resource.setrlimit(resource.RLIMIT_NOFILE, (mof_s, mof_h))
+
+
+
+    @skipIf(NO_MOCK, NO_MOCK_REASON)
+
+    def test_verify_log(self):
+
+        '''
+
+        Test that verify_log works as expected
+
+        '''
+
+        message = 'Insecure logging configuration detected! Sensitive data may be logged.'
+
+
+
+        mock_cheese = MagicMock()
+
+        with patch.object(log, 'warning', mock_cheese):
+
+            verify_log({'log_level': 'cheeseshop'})
+
+            mock_cheese.assert_called_once_with(message)
+
+
+
+        mock_trace = MagicMock()
+
+        with patch.object(log, 'warning', mock_trace):
+
+            verify_log({'log_level': 'trace'})
+
+            mock_trace.assert_called_once_with(message)
+
+
+
+        mock_none = MagicMock()
+
+        with patch.object(log, 'warning', mock_none):
+
+            verify_log({})
+
+            mock_none.assert_called_once_with(message)
+
+
+
+        mock_info = MagicMock()
+
+        with patch.object(log, 'warning', mock_info):
+
+            verify_log({'log_level': 'info'})
+
+            self.assertTrue(mock_info.call_count == 0)

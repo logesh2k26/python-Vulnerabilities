@@ -2,1050 +2,976 @@
 # Safety: safe
 # Category: safe
 
+#!/usr/bin/python
+
 # -*- coding: utf-8 -*-
 
-"""
-
-    werkzeug.debug
-
-    ~~~~~~~~~~~~~~
 
 
+# Copyright: (c) 2016, Yanis Guenane <yanis+ansible@guenane.org>
 
-    WSGI application traceback debugger.
+# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 
 
 
-    :copyright: 2007 Pallets
+from __future__ import absolute_import, division, print_function
 
-    :license: BSD-3-Clause
+__metaclass__ = type
 
-"""
 
-import getpass
 
-import hashlib
 
-import json
 
-import mimetypes
+DOCUMENTATION = r'''
+
+---
+
+module: openssl_publickey
+
+short_description: Generate an OpenSSL public key from its private key.
+
+description:
+
+    - This module allows one to (re)generate OpenSSL public keys from their private keys.
+
+    - Keys are generated in PEM or OpenSSH format.
+
+    - "The module can use the cryptography Python library, or the pyOpenSSL Python
+
+      library. By default, it tries to detect which one is available. This can be
+
+      overridden with the I(select_crypto_backend) option. When I(format) is C(OpenSSH),
+
+      the C(cryptography) backend has to be used. Please note that the PyOpenSSL backend
+
+      was deprecated in Ansible 2.9 and will be removed in community.crypto 2.0.0."
+
+requirements:
+
+    - Either cryptography >= 1.2.3 (older versions might work as well)
+
+    - Or pyOpenSSL >= 16.0.0
+
+    - Needs cryptography >= 1.4 if I(format) is C(OpenSSH)
+
+author:
+
+    - Yanis Guenane (@Spredzy)
+
+    - Felix Fontein (@felixfontein)
+
+options:
+
+    state:
+
+        description:
+
+            - Whether the public key should exist or not, taking action if the state is different from what is stated.
+
+        type: str
+
+        default: present
+
+        choices: [ absent, present ]
+
+    force:
+
+        description:
+
+            - Should the key be regenerated even it it already exists.
+
+        type: bool
+
+        default: no
+
+    format:
+
+        description:
+
+            - The format of the public key.
+
+        type: str
+
+        default: PEM
+
+        choices: [ OpenSSH, PEM ]
+
+    path:
+
+        description:
+
+            - Name of the file in which the generated TLS/SSL public key will be written.
+
+        type: path
+
+        required: true
+
+    privatekey_path:
+
+        description:
+
+            - Path to the TLS/SSL private key from which to generate the public key.
+
+            - Either I(privatekey_path) or I(privatekey_content) must be specified, but not both.
+
+              If I(state) is C(present), one of them is required.
+
+        type: path
+
+    privatekey_content:
+
+        description:
+
+            - The content of the TLS/SSL private key from which to generate the public key.
+
+            - Either I(privatekey_path) or I(privatekey_content) must be specified, but not both.
+
+              If I(state) is C(present), one of them is required.
+
+        type: str
+
+        version_added: '1.0.0'
+
+    privatekey_passphrase:
+
+        description:
+
+            - The passphrase for the private key.
+
+        type: str
+
+    backup:
+
+        description:
+
+            - Create a backup file including a timestamp so you can get the original
+
+              public key back if you overwrote it with a different one by accident.
+
+        type: bool
+
+        default: no
+
+    select_crypto_backend:
+
+        description:
+
+            - Determines which crypto backend to use.
+
+            - The default choice is C(auto), which tries to use C(cryptography) if available, and falls back to C(pyopenssl).
+
+            - If set to C(pyopenssl), will try to use the L(pyOpenSSL,https://pypi.org/project/pyOpenSSL/) library.
+
+            - If set to C(cryptography), will try to use the L(cryptography,https://cryptography.io/) library.
+
+        type: str
+
+        default: auto
+
+        choices: [ auto, cryptography, pyopenssl ]
+
+    return_content:
+
+        description:
+
+            - If set to C(yes), will return the (current or generated) public key's content as I(publickey).
+
+        type: bool
+
+        default: no
+
+        version_added: '1.0.0'
+
+extends_documentation_fragment:
+
+- files
+
+seealso:
+
+- module: community.crypto.x509_certificate
+
+- module: community.crypto.openssl_csr
+
+- module: community.crypto.openssl_dhparam
+
+- module: community.crypto.openssl_pkcs12
+
+- module: community.crypto.openssl_privatekey
+
+'''
+
+
+
+EXAMPLES = r'''
+
+- name: Generate an OpenSSL public key in PEM format
+
+  community.crypto.openssl_publickey:
+
+    path: /etc/ssl/public/ansible.com.pem
+
+    privatekey_path: /etc/ssl/private/ansible.com.pem
+
+
+
+- name: Generate an OpenSSL public key in PEM format from an inline key
+
+  community.crypto.openssl_publickey:
+
+    path: /etc/ssl/public/ansible.com.pem
+
+    privatekey_content: "{{ private_key_content }}"
+
+
+
+- name: Generate an OpenSSL public key in OpenSSH v2 format
+
+  community.crypto.openssl_publickey:
+
+    path: /etc/ssl/public/ansible.com.pem
+
+    privatekey_path: /etc/ssl/private/ansible.com.pem
+
+    format: OpenSSH
+
+
+
+- name: Generate an OpenSSL public key with a passphrase protected private key
+
+  community.crypto.openssl_publickey:
+
+    path: /etc/ssl/public/ansible.com.pem
+
+    privatekey_path: /etc/ssl/private/ansible.com.pem
+
+    privatekey_passphrase: ansible
+
+
+
+- name: Force regenerate an OpenSSL public key if it already exists
+
+  community.crypto.openssl_publickey:
+
+    path: /etc/ssl/public/ansible.com.pem
+
+    privatekey_path: /etc/ssl/private/ansible.com.pem
+
+    force: yes
+
+
+
+- name: Remove an OpenSSL public key
+
+  community.crypto.openssl_publickey:
+
+    path: /etc/ssl/public/ansible.com.pem
+
+    state: absent
+
+'''
+
+
+
+RETURN = r'''
+
+privatekey:
+
+    description:
+
+    - Path to the TLS/SSL private key the public key was generated from.
+
+    - Will be C(none) if the private key has been provided in I(privatekey_content).
+
+    returned: changed or success
+
+    type: str
+
+    sample: /etc/ssl/private/ansible.com.pem
+
+format:
+
+    description: The format of the public key (PEM, OpenSSH, ...).
+
+    returned: changed or success
+
+    type: str
+
+    sample: PEM
+
+filename:
+
+    description: Path to the generated TLS/SSL public key file.
+
+    returned: changed or success
+
+    type: str
+
+    sample: /etc/ssl/public/ansible.com.pem
+
+fingerprint:
+
+    description:
+
+    - The fingerprint of the public key. Fingerprint will be generated for each hashlib.algorithms available.
+
+    - Requires PyOpenSSL >= 16.0 for meaningful output.
+
+    returned: changed or success
+
+    type: dict
+
+    sample:
+
+      md5: "84:75:71:72:8d:04:b5:6c:4d:37:6d:66:83:f5:4c:29"
+
+      sha1: "51:cc:7c:68:5d:eb:41:43:88:7e:1a:ae:c7:f8:24:72:ee:71:f6:10"
+
+      sha224: "b1:19:a6:6c:14:ac:33:1d:ed:18:50:d3:06:5c:b2:32:91:f1:f1:52:8c:cb:d5:75:e9:f5:9b:46"
+
+      sha256: "41:ab:c7:cb:d5:5f:30:60:46:99:ac:d4:00:70:cf:a1:76:4f:24:5d:10:24:57:5d:51:6e:09:97:df:2f:de:c7"
+
+      sha384: "85:39:50:4e:de:d9:19:33:40:70:ae:10:ab:59:24:19:51:c3:a2:e4:0b:1c:b1:6e:dd:b3:0c:d9:9e:6a:46:af:da:18:f8:ef:ae:2e:c0:9a:75:2c:9b:b3:0f:3a:5f:3d"
+
+      sha512: "fd:ed:5e:39:48:5f:9f:fe:7f:25:06:3f:79:08:cd:ee:a5:e7:b3:3d:13:82:87:1f:84:e1:f5:c7:28:77:53:94:86:56:38:69:f0:d9:35:22:01:1e:a6:60:...:0f:9b"
+
+backup_file:
+
+    description: Name of backup file created.
+
+    returned: changed and if I(backup) is C(yes)
+
+    type: str
+
+    sample: /path/to/publickey.pem.2019-03-09@11:22~
+
+publickey:
+
+    description: The (current or generated) public key's content.
+
+    returned: if I(state) is C(present) and I(return_content) is C(yes)
+
+    type: str
+
+    version_added: '1.0.0'
+
+'''
+
+
 
 import os
 
-import pkgutil
+import traceback
 
-import re
 
-import sys
 
-import time
+from distutils.version import LooseVersion
 
-import uuid
 
-from itertools import chain
 
-from os.path import basename
+from ansible.module_utils.basic import AnsibleModule, missing_required_lib
 
-from os.path import join
+from ansible.module_utils._text import to_native
 
 
 
-from .._compat import text_type
+from ansible_collections.community.crypto.plugins.module_utils.io import (
 
-from .._internal import _log
+    load_file_if_exists,
 
-from ..http import parse_cookie
+    write_file,
 
-from ..security import gen_salt
+)
 
-from ..wrappers import BaseRequest as Request
 
-from ..wrappers import BaseResponse as Response
 
-from .console import Console
+from ansible_collections.community.crypto.plugins.module_utils.crypto.basic import (
 
-from .repr import debug_repr as _debug_repr
+    OpenSSLObjectError,
 
-from .tbtools import get_current_traceback
+    OpenSSLBadPassphraseError,
 
-from .tbtools import render_console_html
+)
 
 
 
+from ansible_collections.community.crypto.plugins.module_utils.crypto.support import (
 
+    OpenSSLObject,
 
-def debug_repr(*args, **kwargs):
+    load_privatekey,
 
-    import warnings
+    get_fingerprint,
 
+)
 
 
-    warnings.warn(
 
-        "'debug_repr' has moved to 'werkzeug.debug.repr.debug_repr'"
+MINIMAL_PYOPENSSL_VERSION = '16.0.0'
 
-        " as of version 0.7. This old import will be removed in version"
+MINIMAL_CRYPTOGRAPHY_VERSION = '1.2.3'
 
-        " 1.0.",
+MINIMAL_CRYPTOGRAPHY_VERSION_OPENSSH = '1.4'
 
-        DeprecationWarning,
 
-        stacklevel=2,
 
-    )
+PYOPENSSL_IMP_ERR = None
 
-    return _debug_repr(*args, **kwargs)
+try:
 
+    import OpenSSL
 
+    from OpenSSL import crypto
 
+    PYOPENSSL_VERSION = LooseVersion(OpenSSL.__version__)
 
+except ImportError:
 
-# A week
+    PYOPENSSL_IMP_ERR = traceback.format_exc()
 
-PIN_TIME = 60 * 60 * 24 * 7
+    PYOPENSSL_FOUND = False
 
+else:
 
+    PYOPENSSL_FOUND = True
 
 
 
-def hash_pin(pin):
+CRYPTOGRAPHY_IMP_ERR = None
 
-    if isinstance(pin, text_type):
+try:
 
-        pin = pin.encode("utf-8", "replace")
+    import cryptography
 
-    return hashlib.md5(pin + b"shittysalt").hexdigest()[:12]
+    from cryptography.hazmat.backends import default_backend
 
+    from cryptography.hazmat.primitives import serialization as crypto_serialization
 
+    CRYPTOGRAPHY_VERSION = LooseVersion(cryptography.__version__)
 
+except ImportError:
 
+    CRYPTOGRAPHY_IMP_ERR = traceback.format_exc()
 
-_machine_id = None
+    CRYPTOGRAPHY_FOUND = False
 
+else:
 
+    CRYPTOGRAPHY_FOUND = True
 
 
 
-def get_machine_id():
 
-    global _machine_id
 
-    rv = _machine_id
+class PublicKeyError(OpenSSLObjectError):
 
-    if rv is not None:
+    pass
 
-        return rv
 
 
 
-    def _generate():
 
-        # docker containers share the same machine id, get the
+class PublicKey(OpenSSLObject):
 
-        # container id instead
 
-        try:
 
-            with open("/proc/self/cgroup") as f:
+    def __init__(self, module, backend):
 
-                value = f.readline()
+        super(PublicKey, self).__init__(
 
-        except IOError:
+            module.params['path'],
 
-            pass
+            module.params['state'],
+
+            module.params['force'],
+
+            module.check_mode
+
+        )
+
+        self.format = module.params['format']
+
+        self.privatekey_path = module.params['privatekey_path']
+
+        self.privatekey_content = module.params['privatekey_content']
+
+        if self.privatekey_content is not None:
+
+            self.privatekey_content = self.privatekey_content.encode('utf-8')
+
+        self.privatekey_passphrase = module.params['privatekey_passphrase']
+
+        self.privatekey = None
+
+        self.publickey_bytes = None
+
+        self.return_content = module.params['return_content']
+
+        self.fingerprint = {}
+
+        self.backend = backend
+
+
+
+        self.backup = module.params['backup']
+
+        self.backup_file = None
+
+
+
+    def _create_publickey(self, module):
+
+        self.privatekey = load_privatekey(
+
+            path=self.privatekey_path,
+
+            content=self.privatekey_content,
+
+            passphrase=self.privatekey_passphrase,
+
+            backend=self.backend
+
+        )
+
+        if self.backend == 'cryptography':
+
+            if self.format == 'OpenSSH':
+
+                return self.privatekey.public_key().public_bytes(
+
+                    crypto_serialization.Encoding.OpenSSH,
+
+                    crypto_serialization.PublicFormat.OpenSSH
+
+                )
+
+            else:
+
+                return self.privatekey.public_key().public_bytes(
+
+                    crypto_serialization.Encoding.PEM,
+
+                    crypto_serialization.PublicFormat.SubjectPublicKeyInfo
+
+                )
 
         else:
 
-            value = value.strip().partition("/docker/")[2]
+            try:
+
+                return crypto.dump_publickey(crypto.FILETYPE_PEM, self.privatekey)
+
+            except AttributeError as dummy:
+
+                raise PublicKeyError('You need to have PyOpenSSL>=16.0.0 to generate public keys')
 
 
 
-            if value:
+    def generate(self, module):
 
-                return value
+        """Generate the public key."""
 
 
 
-        # Potential sources of secret information on linux.  The machine-id
+        if self.privatekey_content is None and not os.path.exists(self.privatekey_path):
 
-        # is stable across boots, the boot id is not
+            raise PublicKeyError(
 
-        for filename in "/etc/machine-id", "/proc/sys/kernel/random/boot_id":
+                'The private key %s does not exist' % self.privatekey_path
+
+            )
+
+
+
+        if not self.check(module, perms_required=False) or self.force:
 
             try:
 
-                with open(filename, "rb") as f:
+                publickey_content = self._create_publickey(module)
 
-                    return f.readline().strip()
+                if self.return_content:
 
-            except IOError:
-
-                continue
+                    self.publickey_bytes = publickey_content
 
 
 
-        # On OS X we can use the computer's serial number assuming that
+                if self.backup:
 
-        # ioreg exists and can spit out that information.
+                    self.backup_file = module.backup_local(self.path)
 
-        try:
-
-            # Also catch import errors: subprocess may not be available, e.g.
-
-            # Google App Engine
-
-            # See https://github.com/pallets/werkzeug/issues/925
-
-            from subprocess import Popen, PIPE
+                write_file(module, publickey_content)
 
 
 
-            dump = Popen(
+                self.changed = True
 
-                ["ioreg", "-c", "IOPlatformExpertDevice", "-d", "2"], stdout=PIPE
+            except OpenSSLBadPassphraseError as exc:
 
-            ).communicate()[0]
+                raise PublicKeyError(exc)
 
-            match = re.search(b'"serial-number" = <([^>]+)', dump)
+            except (IOError, OSError) as exc:
 
-            if match is not None:
-
-                return match.group(1)
-
-        except (OSError, ImportError):
-
-            pass
+                raise PublicKeyError(exc)
 
 
 
-        # On Windows we can use winreg to get the machine guid
+        self.fingerprint = get_fingerprint(
 
-        wr = None
+            path=self.privatekey_path,
 
-        try:
+            content=self.privatekey_content,
 
-            import winreg as wr
+            passphrase=self.privatekey_passphrase,
 
-        except ImportError:
+            backend=self.backend,
+
+        )
+
+        file_args = module.load_file_common_arguments(module.params)
+
+        if module.set_fs_attributes_if_different(file_args, False):
+
+            self.changed = True
+
+
+
+    def check(self, module, perms_required=True):
+
+        """Ensure the resource is in its desired state."""
+
+
+
+        state_and_perms = super(PublicKey, self).check(module, perms_required)
+
+
+
+        def _check_privatekey():
+
+            if self.privatekey_content is None and not os.path.exists(self.privatekey_path):
+
+                return False
+
+
 
             try:
 
-                import _winreg as wr
+                with open(self.path, 'rb') as public_key_fh:
 
-            except ImportError:
+                    publickey_content = public_key_fh.read()
 
-                pass
+                if self.return_content:
 
-        if wr is not None:
+                    self.publickey_bytes = publickey_content
 
-            try:
+                if self.backend == 'cryptography':
 
-                with wr.OpenKey(
+                    if self.format == 'OpenSSH':
 
-                    wr.HKEY_LOCAL_MACHINE,
+                        # Read and dump public key. Makes sure that the comment is stripped off.
 
-                    "SOFTWARE\\Microsoft\\Cryptography",
+                        current_publickey = crypto_serialization.load_ssh_public_key(publickey_content, backend=default_backend())
 
-                    0,
+                        publickey_content = current_publickey.public_bytes(
 
-                    wr.KEY_READ | wr.KEY_WOW64_64KEY,
+                            crypto_serialization.Encoding.OpenSSH,
 
-                ) as rk:
+                            crypto_serialization.PublicFormat.OpenSSH
 
-                    machineGuid, wrType = wr.QueryValueEx(rk, "MachineGuid")
-
-                    if wrType == wr.REG_SZ:
-
-                        return machineGuid.encode("utf-8")
+                        )
 
                     else:
 
-                        return machineGuid
+                        current_publickey = crypto_serialization.load_pem_public_key(publickey_content, backend=default_backend())
 
-            except WindowsError:
+                        publickey_content = current_publickey.public_bytes(
 
-                pass
+                            crypto_serialization.Encoding.PEM,
 
+                            crypto_serialization.PublicFormat.SubjectPublicKeyInfo
 
+                        )
 
-    _machine_id = rv = _generate()
+                else:
 
-    return rv
+                    publickey_content = crypto.dump_publickey(
 
+                        crypto.FILETYPE_PEM,
 
+                        crypto.load_publickey(crypto.FILETYPE_PEM, publickey_content)
 
+                    )
 
+            except Exception as dummy:
 
-class _ConsoleFrame(object):
-
-    """Helper class so that we can reuse the frame console code for the
-
-    standalone console.
-
-    """
-
-
-
-    def __init__(self, namespace):
-
-        self.console = Console(namespace)
-
-        self.id = 0
+                return False
 
 
 
+            try:
 
+                desired_publickey = self._create_publickey(module)
 
-def get_pin_and_cookie_name(app):
+            except OpenSSLBadPassphraseError as exc:
 
-    """Given an application object this returns a semi-stable 9 digit pin
-
-    code and a random key.  The hope is that this is stable between
-
-    restarts to not make debugging particularly frustrating.  If the pin
-
-    was forcefully disabled this returns `None`.
+                raise PublicKeyError(exc)
 
 
 
-    Second item in the resulting tuple is the cookie name for remembering.
-
-    """
-
-    pin = os.environ.get("WERKZEUG_DEBUG_PIN")
-
-    rv = None
-
-    num = None
+            return publickey_content == desired_publickey
 
 
 
-    # Pin was explicitly disabled
+        if not state_and_perms:
 
-    if pin == "off":
-
-        return None, None
+            return state_and_perms
 
 
 
-    # Pin was provided explicitly
-
-    if pin is not None and pin.replace("-", "").isdigit():
-
-        # If there are separators in the pin, return it directly
-
-        if "-" in pin:
-
-            rv = pin
-
-        else:
-
-            num = pin
+        return _check_privatekey()
 
 
 
-    modname = getattr(app, "__module__", app.__class__.__module__)
+    def remove(self, module):
+
+        if self.backup:
+
+            self.backup_file = module.backup_local(self.path)
+
+        super(PublicKey, self).remove(module)
+
+
+
+    def dump(self):
+
+        """Serialize the object into a dictionary."""
+
+
+
+        result = {
+
+            'privatekey': self.privatekey_path,
+
+            'filename': self.path,
+
+            'format': self.format,
+
+            'changed': self.changed,
+
+            'fingerprint': self.fingerprint,
+
+        }
+
+        if self.backup_file:
+
+            result['backup_file'] = self.backup_file
+
+        if self.return_content:
+
+            if self.publickey_bytes is None:
+
+                self.publickey_bytes = load_file_if_exists(self.path, ignore_errors=True)
+
+            result['publickey'] = self.publickey_bytes.decode('utf-8') if self.publickey_bytes else None
+
+
+
+        return result
+
+
+
+
+
+def main():
+
+
+
+    module = AnsibleModule(
+
+        argument_spec=dict(
+
+            state=dict(type='str', default='present', choices=['present', 'absent']),
+
+            force=dict(type='bool', default=False),
+
+            path=dict(type='path', required=True),
+
+            privatekey_path=dict(type='path'),
+
+            privatekey_content=dict(type='str', no_log=True),
+
+            format=dict(type='str', default='PEM', choices=['OpenSSH', 'PEM']),
+
+            privatekey_passphrase=dict(type='str', no_log=True),
+
+            backup=dict(type='bool', default=False),
+
+            select_crypto_backend=dict(type='str', choices=['auto', 'pyopenssl', 'cryptography'], default='auto'),
+
+            return_content=dict(type='bool', default=False),
+
+        ),
+
+        supports_check_mode=True,
+
+        add_file_common_args=True,
+
+        required_if=[('state', 'present', ['privatekey_path', 'privatekey_content'], True)],
+
+        mutually_exclusive=(
+
+            ['privatekey_path', 'privatekey_content'],
+
+        ),
+
+    )
+
+
+
+    minimal_cryptography_version = MINIMAL_CRYPTOGRAPHY_VERSION
+
+    if module.params['format'] == 'OpenSSH':
+
+        minimal_cryptography_version = MINIMAL_CRYPTOGRAPHY_VERSION_OPENSSH
+
+
+
+    backend = module.params['select_crypto_backend']
+
+    if backend == 'auto':
+
+        # Detection what is possible
+
+        can_use_cryptography = CRYPTOGRAPHY_FOUND and CRYPTOGRAPHY_VERSION >= LooseVersion(minimal_cryptography_version)
+
+        can_use_pyopenssl = PYOPENSSL_FOUND and PYOPENSSL_VERSION >= LooseVersion(MINIMAL_PYOPENSSL_VERSION)
+
+
+
+        # Decision
+
+        if can_use_cryptography:
+
+            backend = 'cryptography'
+
+        elif can_use_pyopenssl:
+
+            if module.params['format'] == 'OpenSSH':
+
+                module.fail_json(
+
+                    msg=missing_required_lib('cryptography >= {0}'.format(MINIMAL_CRYPTOGRAPHY_VERSION_OPENSSH)),
+
+                    exception=CRYPTOGRAPHY_IMP_ERR
+
+                )
+
+            backend = 'pyopenssl'
+
+
+
+        # Success?
+
+        if backend == 'auto':
+
+            module.fail_json(msg=("Can't detect any of the required Python libraries "
+
+                                  "cryptography (>= {0}) or PyOpenSSL (>= {1})").format(
+
+                                      minimal_cryptography_version,
+
+                                      MINIMAL_PYOPENSSL_VERSION))
+
+
+
+    if module.params['format'] == 'OpenSSH' and backend != 'cryptography':
+
+        module.fail_json(msg="Format OpenSSH requires the cryptography backend.")
+
+
+
+    if backend == 'pyopenssl':
+
+        if not PYOPENSSL_FOUND:
+
+            module.fail_json(msg=missing_required_lib('pyOpenSSL >= {0}'.format(MINIMAL_PYOPENSSL_VERSION)),
+
+                             exception=PYOPENSSL_IMP_ERR)
+
+        module.deprecate('The module is using the PyOpenSSL backend. This backend has been deprecated',
+
+                         version='2.0.0', collection_name='community.crypto')
+
+    elif backend == 'cryptography':
+
+        if not CRYPTOGRAPHY_FOUND:
+
+            module.fail_json(msg=missing_required_lib('cryptography >= {0}'.format(minimal_cryptography_version)),
+
+                             exception=CRYPTOGRAPHY_IMP_ERR)
+
+
+
+    base_dir = os.path.dirname(module.params['path']) or '.'
+
+    if not os.path.isdir(base_dir):
+
+        module.fail_json(
+
+            name=base_dir,
+
+            msg="The directory '%s' does not exist or the file is not a directory" % base_dir
+
+        )
 
 
 
     try:
 
-        # getuser imports the pwd module, which does not exist in Google
-
-        # App Engine. It may also raise a KeyError if the UID does not
-
-        # have a username, such as in Docker.
-
-        username = getpass.getuser()
-
-    except (ImportError, KeyError):
-
-        username = None
+        public_key = PublicKey(module, backend)
 
 
 
-    mod = sys.modules.get(modname)
+        if public_key.state == 'present':
+
+            if module.check_mode:
+
+                result = public_key.dump()
+
+                result['changed'] = module.params['force'] or not public_key.check(module)
+
+                module.exit_json(**result)
 
 
 
-    # This information only exists to make the cookie unique on the
-
-    # computer, not as a security feature.
-
-    probably_public_bits = [
-
-        username,
-
-        modname,
-
-        getattr(app, "__name__", app.__class__.__name__),
-
-        getattr(mod, "__file__", None),
-
-    ]
-
-
-
-    # This information is here to make it harder for an attacker to
-
-    # guess the cookie name.  They are unlikely to be contained anywhere
-
-    # within the unauthenticated debug page.
-
-    private_bits = [str(uuid.getnode()), get_machine_id()]
-
-
-
-    h = hashlib.md5()
-
-    for bit in chain(probably_public_bits, private_bits):
-
-        if not bit:
-
-            continue
-
-        if isinstance(bit, text_type):
-
-            bit = bit.encode("utf-8")
-
-        h.update(bit)
-
-    h.update(b"cookiesalt")
-
-
-
-    cookie_name = "__wzd" + h.hexdigest()[:20]
-
-
-
-    # If we need to generate a pin we salt it a bit more so that we don't
-
-    # end up with the same value and generate out 9 digits
-
-    if num is None:
-
-        h.update(b"pinsalt")
-
-        num = ("%09d" % int(h.hexdigest(), 16))[:9]
-
-
-
-    # Format the pincode in groups of digits for easier remembering if
-
-    # we don't have a result yet.
-
-    if rv is None:
-
-        for group_size in 5, 4, 3:
-
-            if len(num) % group_size == 0:
-
-                rv = "-".join(
-
-                    num[x : x + group_size].rjust(group_size, "0")
-
-                    for x in range(0, len(num), group_size)
-
-                )
-
-                break
+            public_key.generate(module)
 
         else:
 
-            rv = num
+            if module.check_mode:
 
+                result = public_key.dump()
 
+                result['changed'] = os.path.exists(module.params['path'])
 
-    return rv, cookie_name
+                module.exit_json(**result)
 
 
 
+            public_key.remove(module)
 
 
-class DebuggedApplication(object):
 
-    """Enables debugging support for a given application::
+        result = public_key.dump()
 
+        module.exit_json(**result)
 
+    except OpenSSLObjectError as exc:
 
-        from werkzeug.debug import DebuggedApplication
+        module.fail_json(msg=to_native(exc))
 
-        from myapp import app
 
-        app = DebuggedApplication(app, evalex=True)
 
 
 
-    The `evalex` keyword argument allows evaluating expressions in a
+if __name__ == '__main__':
 
-    traceback's frame context.
-
-
-
-    .. versionadded:: 0.9
-
-       The `lodgeit_url` parameter was deprecated.
-
-
-
-    :param app: the WSGI application to run debugged.
-
-    :param evalex: enable exception evaluation feature (interactive
-
-                   debugging).  This requires a non-forking server.
-
-    :param request_key: The key that points to the request object in ths
-
-                        environment.  This parameter is ignored in current
-
-                        versions.
-
-    :param console_path: the URL for a general purpose console.
-
-    :param console_init_func: the function that is executed before starting
-
-                              the general purpose console.  The return value
-
-                              is used as initial namespace.
-
-    :param show_hidden_frames: by default hidden traceback frames are skipped.
-
-                               You can show them by setting this parameter
-
-                               to `True`.
-
-    :param pin_security: can be used to disable the pin based security system.
-
-    :param pin_logging: enables the logging of the pin system.
-
-    """
-
-
-
-    def __init__(
-
-        self,
-
-        app,
-
-        evalex=False,
-
-        request_key="werkzeug.request",
-
-        console_path="/console",
-
-        console_init_func=None,
-
-        show_hidden_frames=False,
-
-        lodgeit_url=None,
-
-        pin_security=True,
-
-        pin_logging=True,
-
-    ):
-
-        if lodgeit_url is not None:
-
-            from warnings import warn
-
-
-
-            warn(
-
-                "'lodgeit_url' is no longer used as of version 0.9 and"
-
-                " will be removed in version 1.0. Werkzeug uses"
-
-                " https://gist.github.com/ instead.",
-
-                DeprecationWarning,
-
-                stacklevel=2,
-
-            )
-
-        if not console_init_func:
-
-            console_init_func = None
-
-        self.app = app
-
-        self.evalex = evalex
-
-        self.frames = {}
-
-        self.tracebacks = {}
-
-        self.request_key = request_key
-
-        self.console_path = console_path
-
-        self.console_init_func = console_init_func
-
-        self.show_hidden_frames = show_hidden_frames
-
-        self.secret = gen_salt(20)
-
-        self._failed_pin_auth = 0
-
-
-
-        self.pin_logging = pin_logging
-
-        if pin_security:
-
-            # Print out the pin for the debugger on standard out.
-
-            if os.environ.get("WERKZEUG_RUN_MAIN") == "true" and pin_logging:
-
-                _log("warning", " * Debugger is active!")
-
-                if self.pin is None:
-
-                    _log("warning", " * Debugger PIN disabled. DEBUGGER UNSECURED!")
-
-                else:
-
-                    _log("info", " * Debugger PIN: %s" % self.pin)
-
-        else:
-
-            self.pin = None
-
-
-
-    def _get_pin(self):
-
-        if not hasattr(self, "_pin"):
-
-            self._pin, self._pin_cookie = get_pin_and_cookie_name(self.app)
-
-        return self._pin
-
-
-
-    def _set_pin(self, value):
-
-        self._pin = value
-
-
-
-    pin = property(_get_pin, _set_pin)
-
-    del _get_pin, _set_pin
-
-
-
-    @property
-
-    def pin_cookie_name(self):
-
-        """The name of the pin cookie."""
-
-        if not hasattr(self, "_pin_cookie"):
-
-            self._pin, self._pin_cookie = get_pin_and_cookie_name(self.app)
-
-        return self._pin_cookie
-
-
-
-    def debug_application(self, environ, start_response):
-
-        """Run the application and conserve the traceback frames."""
-
-        app_iter = None
-
-        try:
-
-            app_iter = self.app(environ, start_response)
-
-            for item in app_iter:
-
-                yield item
-
-            if hasattr(app_iter, "close"):
-
-                app_iter.close()
-
-        except Exception:
-
-            if hasattr(app_iter, "close"):
-
-                app_iter.close()
-
-            traceback = get_current_traceback(
-
-                skip=1,
-
-                show_hidden_frames=self.show_hidden_frames,
-
-                ignore_system_exceptions=True,
-
-            )
-
-            for frame in traceback.frames:
-
-                self.frames[frame.id] = frame
-
-            self.tracebacks[traceback.id] = traceback
-
-
-
-            try:
-
-                start_response(
-
-                    "500 INTERNAL SERVER ERROR",
-
-                    [
-
-                        ("Content-Type", "text/html; charset=utf-8"),
-
-                        # Disable Chrome's XSS protection, the debug
-
-                        # output can cause false-positives.
-
-                        ("X-XSS-Protection", "0"),
-
-                    ],
-
-                )
-
-            except Exception:
-
-                # if we end up here there has been output but an error
-
-                # occurred.  in that situation we can do nothing fancy any
-
-                # more, better log something into the error log and fall
-
-                # back gracefully.
-
-                environ["wsgi.errors"].write(
-
-                    "Debugging middleware caught exception in streamed "
-
-                    "response at a point where response headers were already "
-
-                    "sent.\n"
-
-                )
-
-            else:
-
-                is_trusted = bool(self.check_pin_trust(environ))
-
-                yield traceback.render_full(
-
-                    evalex=self.evalex, evalex_trusted=is_trusted, secret=self.secret
-
-                ).encode("utf-8", "replace")
-
-
-
-            traceback.log(environ["wsgi.errors"])
-
-
-
-    def execute_command(self, request, command, frame):
-
-        """Execute a command in a console."""
-
-        return Response(frame.console.eval(command), mimetype="text/html")
-
-
-
-    def display_console(self, request):
-
-        """Display a standalone shell."""
-
-        if 0 not in self.frames:
-
-            if self.console_init_func is None:
-
-                ns = {}
-
-            else:
-
-                ns = dict(self.console_init_func())
-
-            ns.setdefault("app", self.app)
-
-            self.frames[0] = _ConsoleFrame(ns)
-
-        is_trusted = bool(self.check_pin_trust(request.environ))
-
-        return Response(
-
-            render_console_html(secret=self.secret, evalex_trusted=is_trusted),
-
-            mimetype="text/html",
-
-        )
-
-
-
-    def paste_traceback(self, request, traceback):
-
-        """Paste the traceback and return a JSON response."""
-
-        rv = traceback.paste()
-
-        return Response(json.dumps(rv), mimetype="application/json")
-
-
-
-    def get_resource(self, request, filename):
-
-        """Return a static resource from the shared folder."""
-
-        filename = join("shared", basename(filename))
-
-        try:
-
-            data = pkgutil.get_data(__package__, filename)
-
-        except OSError:
-
-            data = None
-
-        if data is not None:
-
-            mimetype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-
-            return Response(data, mimetype=mimetype)
-
-        return Response("Not Found", status=404)
-
-
-
-    def check_pin_trust(self, environ):
-
-        """Checks if the request passed the pin test.  This returns `True` if the
-
-        request is trusted on a pin/cookie basis and returns `False` if not.
-
-        Additionally if the cookie's stored pin hash is wrong it will return
-
-        `None` so that appropriate action can be taken.
-
-        """
-
-        if self.pin is None:
-
-            return True
-
-        val = parse_cookie(environ).get(self.pin_cookie_name)
-
-        if not val or "|" not in val:
-
-            return False
-
-        ts, pin_hash = val.split("|", 1)
-
-        if not ts.isdigit():
-
-            return False
-
-        if pin_hash != hash_pin(self.pin):
-
-            return None
-
-        return (time.time() - PIN_TIME) < int(ts)
-
-
-
-    def _fail_pin_auth(self):
-
-        time.sleep(5.0 if self._failed_pin_auth > 5 else 0.5)
-
-        self._failed_pin_auth += 1
-
-
-
-    def pin_auth(self, request):
-
-        """Authenticates with the pin."""
-
-        exhausted = False
-
-        auth = False
-
-        trust = self.check_pin_trust(request.environ)
-
-
-
-        # If the trust return value is `None` it means that the cookie is
-
-        # set but the stored pin hash value is bad.  This means that the
-
-        # pin was changed.  In this case we count a bad auth and unset the
-
-        # cookie.  This way it becomes harder to guess the cookie name
-
-        # instead of the pin as we still count up failures.
-
-        bad_cookie = False
-
-        if trust is None:
-
-            self._fail_pin_auth()
-
-            bad_cookie = True
-
-
-
-        # If we're trusted, we're authenticated.
-
-        elif trust:
-
-            auth = True
-
-
-
-        # If we failed too many times, then we're locked out.
-
-        elif self._failed_pin_auth > 10:
-
-            exhausted = True
-
-
-
-        # Otherwise go through pin based authentication
-
-        else:
-
-            entered_pin = request.args.get("pin")
-
-            if entered_pin.strip().replace("-", "") == self.pin.replace("-", ""):
-
-                self._failed_pin_auth = 0
-
-                auth = True
-
-            else:
-
-                self._fail_pin_auth()
-
-
-
-        rv = Response(
-
-            json.dumps({"auth": auth, "exhausted": exhausted}),
-
-            mimetype="application/json",
-
-        )
-
-        if auth:
-
-            rv.set_cookie(
-
-                self.pin_cookie_name,
-
-                "%s|%s" % (int(time.time()), hash_pin(self.pin)),
-
-                httponly=True,
-
-            )
-
-        elif bad_cookie:
-
-            rv.delete_cookie(self.pin_cookie_name)
-
-        return rv
-
-
-
-    def log_pin_request(self):
-
-        """Log the pin if needed."""
-
-        if self.pin_logging and self.pin is not None:
-
-            _log(
-
-                "info", " * To enable the debugger you need to enter the security pin:"
-
-            )
-
-            _log("info", " * Debugger pin code: %s" % self.pin)
-
-        return Response("")
-
-
-
-    def __call__(self, environ, start_response):
-
-        """Dispatch the requests."""
-
-        # important: don't ever access a function here that reads the incoming
-
-        # form data!  Otherwise the application won't have access to that data
-
-        # any more!
-
-        request = Request(environ)
-
-        response = self.debug_application
-
-        if request.args.get("__debugger__") == "yes":
-
-            cmd = request.args.get("cmd")
-
-            arg = request.args.get("f")
-
-            secret = request.args.get("s")
-
-            traceback = self.tracebacks.get(request.args.get("tb", type=int))
-
-            frame = self.frames.get(request.args.get("frm", type=int))
-
-            if cmd == "resource" and arg:
-
-                response = self.get_resource(request, arg)
-
-            elif cmd == "paste" and traceback is not None and secret == self.secret:
-
-                response = self.paste_traceback(request, traceback)
-
-            elif cmd == "pinauth" and secret == self.secret:
-
-                response = self.pin_auth(request)
-
-            elif cmd == "printpin" and secret == self.secret:
-
-                response = self.log_pin_request()
-
-            elif (
-
-                self.evalex
-
-                and cmd is not None
-
-                and frame is not None
-
-                and self.secret == secret
-
-                and self.check_pin_trust(environ)
-
-            ):
-
-                response = self.execute_command(request, cmd, frame)
-
-        elif (
-
-            self.evalex
-
-            and self.console_path is not None
-
-            and request.path == self.console_path
-
-        ):
-
-            response = self.display_console(request)
-
-        return response(environ, start_response)
+    main()

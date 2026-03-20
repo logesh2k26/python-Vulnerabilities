@@ -2,1732 +2,2520 @@
 # Safety: safe
 # Category: safe
 
-from typing import List, Optional, Tuple
+import sys
 
+import unicodedata
 
+import unittest
 
-import graphene
+import urllib.parse
 
-from django.conf import settings
 
-from django.core.exceptions import ObjectDoesNotExist, ValidationError
 
-from django.db import transaction
+RFC1808_BASE = "http://a/b/c/d;p?q#f"
 
-from django.db.models import Prefetch
+RFC2396_BASE = "http://a/b/c/d;p?q"
 
-from graphql_jwt.exceptions import PermissionDenied
+RFC3986_BASE = 'http://a/b/c/d;p?q'
 
+SIMPLE_BASE  = 'http://a/b/c/d'
 
 
-from ...account.error_codes import AccountErrorCode
 
-from ...checkout import models
+# Each parse_qsl testcase is a two-tuple that contains
 
-from ...checkout.error_codes import CheckoutErrorCode
+# a string with the query and a list with the expected result.
 
-from ...checkout.utils import (
 
-    abort_order_data,
 
-    add_promo_code_to_checkout,
+parse_qsl_test_cases = [
 
-    add_variant_to_checkout,
+    ("", []),
 
-    change_billing_address_in_checkout,
+    ("&", []),
 
-    change_shipping_address_in_checkout,
+    ("&&", []),
 
-    clean_checkout,
+    ("=", [('', '')]),
 
-    create_order,
+    ("=a", [('', 'a')]),
 
-    get_user_checkout,
+    ("a", [('a', '')]),
 
-    get_valid_shipping_methods_for_checkout,
+    ("a=", [('a', '')]),
 
-    prepare_order_data,
+    ("&a=b", [('a', 'b')]),
 
-    recalculate_checkout_discount,
+    ("a=a+b&b=b+c", [('a', 'a b'), ('b', 'b c')]),
 
-    remove_promo_code_from_checkout,
+    ("a=1&a=2", [('a', '1'), ('a', '2')]),
 
-)
+    (b"", []),
 
-from ...core import analytics
+    (b"&", []),
 
-from ...core.exceptions import InsufficientStock
+    (b"&&", []),
 
-from ...core.permissions import OrderPermissions
+    (b"=", [(b'', b'')]),
 
-from ...core.taxes import TaxError
+    (b"=a", [(b'', b'a')]),
 
-from ...core.utils.url import validate_storefront_url
+    (b"a", [(b'a', b'')]),
 
-from ...discount import models as voucher_model
+    (b"a=", [(b'a', b'')]),
 
-from ...payment import PaymentError, gateway, models as payment_models
+    (b"&a=b", [(b'a', b'b')]),
 
-from ...payment.interface import AddressData
+    (b"a=a+b&b=b+c", [(b'a', b'a b'), (b'b', b'b c')]),
 
-from ...payment.utils import store_customer_id
+    (b"a=1&a=2", [(b'a', b'1'), (b'a', b'2')]),
 
-from ...product import models as product_models
+    (";", []),
 
-from ...warehouse.availability import check_stock_quantity, get_available_quantity
+    (";;", []),
 
-from ..account.i18n import I18nMixin
+    (";a=b", [('a', 'b')]),
 
-from ..account.types import AddressInput
+    ("a=a+b;b=b+c", [('a', 'a b'), ('b', 'b c')]),
 
-from ..core.mutations import (
+    ("a=1;a=2", [('a', '1'), ('a', '2')]),
 
-    BaseMutation,
+    (b";", []),
 
-    ClearMetaBaseMutation,
+    (b";;", []),
 
-    ModelMutation,
+    (b";a=b", [(b'a', b'b')]),
 
-    UpdateMetaBaseMutation,
+    (b"a=a+b;b=b+c", [(b'a', b'a b'), (b'b', b'b c')]),
 
-)
+    (b"a=1;a=2", [(b'a', b'1'), (b'a', b'2')]),
 
-from ..core.types.common import CheckoutError
+]
 
-from ..core.utils import from_global_id_strict_type
 
-from ..order.types import Order
 
-from ..product.types import ProductVariant
+# Each parse_qs testcase is a two-tuple that contains
 
-from ..shipping.types import ShippingMethod
+# a string with the query and a dictionary with the expected result.
 
-from .types import Checkout, CheckoutLine
 
 
+parse_qs_test_cases = [
 
-ERROR_DOES_NOT_SHIP = "This checkout doesn't need shipping"
+    ("", {}),
 
+    ("&", {}),
 
+    ("&&", {}),
 
+    ("=", {'': ['']}),
 
+    ("=a", {'': ['a']}),
 
-def clean_shipping_method(
+    ("a", {'a': ['']}),
 
-    checkout: models.Checkout, method: Optional[models.ShippingMethod], discounts
+    ("a=", {'a': ['']}),
 
-) -> bool:
+    ("&a=b", {'a': ['b']}),
 
-    """Check if current shipping method is valid."""
+    ("a=a+b&b=b+c", {'a': ['a b'], 'b': ['b c']}),
 
+    ("a=1&a=2", {'a': ['1', '2']}),
 
+    (b"", {}),
 
-    if not method:
+    (b"&", {}),
 
-        # no shipping method was provided, it is valid
+    (b"&&", {}),
 
-        return True
+    (b"=", {b'': [b'']}),
 
+    (b"=a", {b'': [b'a']}),
 
+    (b"a", {b'a': [b'']}),
 
-    if not checkout.is_shipping_required():
+    (b"a=", {b'a': [b'']}),
 
-        raise ValidationError(
+    (b"&a=b", {b'a': [b'b']}),
 
-            ERROR_DOES_NOT_SHIP, code=CheckoutErrorCode.SHIPPING_NOT_REQUIRED.value
+    (b"a=a+b&b=b+c", {b'a': [b'a b'], b'b': [b'b c']}),
+
+    (b"a=1&a=2", {b'a': [b'1', b'2']}),
+
+    (";", {}),
+
+    (";;", {}),
+
+    (";a=b", {'a': ['b']}),
+
+    ("a=a+b;b=b+c", {'a': ['a b'], 'b': ['b c']}),
+
+    ("a=1;a=2", {'a': ['1', '2']}),
+
+    (b";", {}),
+
+    (b";;", {}),
+
+    (b";a=b", {b'a': [b'b']}),
+
+    (b"a=a+b;b=b+c", {b'a': [b'a b'], b'b': [b'b c']}),
+
+    (b"a=1;a=2", {b'a': [b'1', b'2']}),
+
+]
+
+
+
+class UrlParseTestCase(unittest.TestCase):
+
+
+
+    def checkRoundtrips(self, url, parsed, split):
+
+        result = urllib.parse.urlparse(url)
+
+        self.assertEqual(result, parsed)
+
+        t = (result.scheme, result.netloc, result.path,
+
+             result.params, result.query, result.fragment)
+
+        self.assertEqual(t, parsed)
+
+        # put it back together and it should be the same
+
+        result2 = urllib.parse.urlunparse(result)
+
+        self.assertEqual(result2, url)
+
+        self.assertEqual(result2, result.geturl())
+
+
+
+        # the result of geturl() is a fixpoint; we can always parse it
+
+        # again to get the same result:
+
+        result3 = urllib.parse.urlparse(result.geturl())
+
+        self.assertEqual(result3.geturl(), result.geturl())
+
+        self.assertEqual(result3,          result)
+
+        self.assertEqual(result3.scheme,   result.scheme)
+
+        self.assertEqual(result3.netloc,   result.netloc)
+
+        self.assertEqual(result3.path,     result.path)
+
+        self.assertEqual(result3.params,   result.params)
+
+        self.assertEqual(result3.query,    result.query)
+
+        self.assertEqual(result3.fragment, result.fragment)
+
+        self.assertEqual(result3.username, result.username)
+
+        self.assertEqual(result3.password, result.password)
+
+        self.assertEqual(result3.hostname, result.hostname)
+
+        self.assertEqual(result3.port,     result.port)
+
+
+
+        # check the roundtrip using urlsplit() as well
+
+        result = urllib.parse.urlsplit(url)
+
+        self.assertEqual(result, split)
+
+        t = (result.scheme, result.netloc, result.path,
+
+             result.query, result.fragment)
+
+        self.assertEqual(t, split)
+
+        result2 = urllib.parse.urlunsplit(result)
+
+        self.assertEqual(result2, url)
+
+        self.assertEqual(result2, result.geturl())
+
+
+
+        # check the fixpoint property of re-parsing the result of geturl()
+
+        result3 = urllib.parse.urlsplit(result.geturl())
+
+        self.assertEqual(result3.geturl(), result.geturl())
+
+        self.assertEqual(result3,          result)
+
+        self.assertEqual(result3.scheme,   result.scheme)
+
+        self.assertEqual(result3.netloc,   result.netloc)
+
+        self.assertEqual(result3.path,     result.path)
+
+        self.assertEqual(result3.query,    result.query)
+
+        self.assertEqual(result3.fragment, result.fragment)
+
+        self.assertEqual(result3.username, result.username)
+
+        self.assertEqual(result3.password, result.password)
+
+        self.assertEqual(result3.hostname, result.hostname)
+
+        self.assertEqual(result3.port,     result.port)
+
+
+
+    def test_qsl(self):
+
+        for orig, expect in parse_qsl_test_cases:
+
+            result = urllib.parse.parse_qsl(orig, keep_blank_values=True)
+
+            self.assertEqual(result, expect, "Error parsing %r" % orig)
+
+            expect_without_blanks = [v for v in expect if len(v[1])]
+
+            result = urllib.parse.parse_qsl(orig, keep_blank_values=False)
+
+            self.assertEqual(result, expect_without_blanks,
+
+                            "Error parsing %r" % orig)
+
+
+
+    def test_qs(self):
+
+        for orig, expect in parse_qs_test_cases:
+
+            result = urllib.parse.parse_qs(orig, keep_blank_values=True)
+
+            self.assertEqual(result, expect, "Error parsing %r" % orig)
+
+            expect_without_blanks = {v: expect[v]
+
+                                     for v in expect if len(expect[v][0])}
+
+            result = urllib.parse.parse_qs(orig, keep_blank_values=False)
+
+            self.assertEqual(result, expect_without_blanks,
+
+                            "Error parsing %r" % orig)
+
+
+
+    def test_roundtrips(self):
+
+        str_cases = [
+
+            ('file:///tmp/junk.txt',
+
+             ('file', '', '/tmp/junk.txt', '', '', ''),
+
+             ('file', '', '/tmp/junk.txt', '', '')),
+
+            ('imap://mail.python.org/mbox1',
+
+             ('imap', 'mail.python.org', '/mbox1', '', '', ''),
+
+             ('imap', 'mail.python.org', '/mbox1', '', '')),
+
+            ('mms://wms.sys.hinet.net/cts/Drama/09006251100.asf',
+
+             ('mms', 'wms.sys.hinet.net', '/cts/Drama/09006251100.asf',
+
+              '', '', ''),
+
+             ('mms', 'wms.sys.hinet.net', '/cts/Drama/09006251100.asf',
+
+              '', '')),
+
+            ('nfs://server/path/to/file.txt',
+
+             ('nfs', 'server', '/path/to/file.txt', '', '', ''),
+
+             ('nfs', 'server', '/path/to/file.txt', '', '')),
+
+            ('svn+ssh://svn.zope.org/repos/main/ZConfig/trunk/',
+
+             ('svn+ssh', 'svn.zope.org', '/repos/main/ZConfig/trunk/',
+
+              '', '', ''),
+
+             ('svn+ssh', 'svn.zope.org', '/repos/main/ZConfig/trunk/',
+
+              '', '')),
+
+            ('git+ssh://git@github.com/user/project.git',
+
+            ('git+ssh', 'git@github.com','/user/project.git',
+
+             '','',''),
+
+            ('git+ssh', 'git@github.com','/user/project.git',
+
+             '', '')),
+
+            ]
+
+        def _encode(t):
+
+            return (t[0].encode('ascii'),
+
+                    tuple(x.encode('ascii') for x in t[1]),
+
+                    tuple(x.encode('ascii') for x in t[2]))
+
+        bytes_cases = [_encode(x) for x in str_cases]
+
+        for url, parsed, split in str_cases + bytes_cases:
+
+            self.checkRoundtrips(url, parsed, split)
+
+
+
+    def test_http_roundtrips(self):
+
+        # urllib.parse.urlsplit treats 'http:' as an optimized special case,
+
+        # so we test both 'http:' and 'https:' in all the following.
+
+        # Three cheers for white box knowledge!
+
+        str_cases = [
+
+            ('://www.python.org',
+
+             ('www.python.org', '', '', '', ''),
+
+             ('www.python.org', '', '', '')),
+
+            ('://www.python.org#abc',
+
+             ('www.python.org', '', '', '', 'abc'),
+
+             ('www.python.org', '', '', 'abc')),
+
+            ('://www.python.org?q=abc',
+
+             ('www.python.org', '', '', 'q=abc', ''),
+
+             ('www.python.org', '', 'q=abc', '')),
+
+            ('://www.python.org/#abc',
+
+             ('www.python.org', '/', '', '', 'abc'),
+
+             ('www.python.org', '/', '', 'abc')),
+
+            ('://a/b/c/d;p?q#f',
+
+             ('a', '/b/c/d', 'p', 'q', 'f'),
+
+             ('a', '/b/c/d;p', 'q', 'f')),
+
+            ]
+
+        def _encode(t):
+
+            return (t[0].encode('ascii'),
+
+                    tuple(x.encode('ascii') for x in t[1]),
+
+                    tuple(x.encode('ascii') for x in t[2]))
+
+        bytes_cases = [_encode(x) for x in str_cases]
+
+        str_schemes = ('http', 'https')
+
+        bytes_schemes = (b'http', b'https')
+
+        str_tests = str_schemes, str_cases
+
+        bytes_tests = bytes_schemes, bytes_cases
+
+        for schemes, test_cases in (str_tests, bytes_tests):
+
+            for scheme in schemes:
+
+                for url, parsed, split in test_cases:
+
+                    url = scheme + url
+
+                    parsed = (scheme,) + parsed
+
+                    split = (scheme,) + split
+
+                    self.checkRoundtrips(url, parsed, split)
+
+
+
+    def checkJoin(self, base, relurl, expected):
+
+        str_components = (base, relurl, expected)
+
+        self.assertEqual(urllib.parse.urljoin(base, relurl), expected)
+
+        bytes_components = baseb, relurlb, expectedb = [
+
+                            x.encode('ascii') for x in str_components]
+
+        self.assertEqual(urllib.parse.urljoin(baseb, relurlb), expectedb)
+
+
+
+    def test_unparse_parse(self):
+
+        str_cases = ['Python', './Python','x-newscheme://foo.com/stuff','x://y','x:/y','x:/','/',]
+
+        bytes_cases = [x.encode('ascii') for x in str_cases]
+
+        for u in str_cases + bytes_cases:
+
+            self.assertEqual(urllib.parse.urlunsplit(urllib.parse.urlsplit(u)), u)
+
+            self.assertEqual(urllib.parse.urlunparse(urllib.parse.urlparse(u)), u)
+
+
+
+    def test_RFC1808(self):
+
+        # "normal" cases from RFC 1808:
+
+        self.checkJoin(RFC1808_BASE, 'g:h', 'g:h')
+
+        self.checkJoin(RFC1808_BASE, 'g', 'http://a/b/c/g')
+
+        self.checkJoin(RFC1808_BASE, './g', 'http://a/b/c/g')
+
+        self.checkJoin(RFC1808_BASE, 'g/', 'http://a/b/c/g/')
+
+        self.checkJoin(RFC1808_BASE, '/g', 'http://a/g')
+
+        self.checkJoin(RFC1808_BASE, '//g', 'http://g')
+
+        self.checkJoin(RFC1808_BASE, 'g?y', 'http://a/b/c/g?y')
+
+        self.checkJoin(RFC1808_BASE, 'g?y/./x', 'http://a/b/c/g?y/./x')
+
+        self.checkJoin(RFC1808_BASE, '#s', 'http://a/b/c/d;p?q#s')
+
+        self.checkJoin(RFC1808_BASE, 'g#s', 'http://a/b/c/g#s')
+
+        self.checkJoin(RFC1808_BASE, 'g#s/./x', 'http://a/b/c/g#s/./x')
+
+        self.checkJoin(RFC1808_BASE, 'g?y#s', 'http://a/b/c/g?y#s')
+
+        self.checkJoin(RFC1808_BASE, 'g;x', 'http://a/b/c/g;x')
+
+        self.checkJoin(RFC1808_BASE, 'g;x?y#s', 'http://a/b/c/g;x?y#s')
+
+        self.checkJoin(RFC1808_BASE, '.', 'http://a/b/c/')
+
+        self.checkJoin(RFC1808_BASE, './', 'http://a/b/c/')
+
+        self.checkJoin(RFC1808_BASE, '..', 'http://a/b/')
+
+        self.checkJoin(RFC1808_BASE, '../', 'http://a/b/')
+
+        self.checkJoin(RFC1808_BASE, '../g', 'http://a/b/g')
+
+        self.checkJoin(RFC1808_BASE, '../..', 'http://a/')
+
+        self.checkJoin(RFC1808_BASE, '../../', 'http://a/')
+
+        self.checkJoin(RFC1808_BASE, '../../g', 'http://a/g')
+
+
+
+        # "abnormal" cases from RFC 1808:
+
+        self.checkJoin(RFC1808_BASE, '', 'http://a/b/c/d;p?q#f')
+
+        self.checkJoin(RFC1808_BASE, 'g.', 'http://a/b/c/g.')
+
+        self.checkJoin(RFC1808_BASE, '.g', 'http://a/b/c/.g')
+
+        self.checkJoin(RFC1808_BASE, 'g..', 'http://a/b/c/g..')
+
+        self.checkJoin(RFC1808_BASE, '..g', 'http://a/b/c/..g')
+
+        self.checkJoin(RFC1808_BASE, './../g', 'http://a/b/g')
+
+        self.checkJoin(RFC1808_BASE, './g/.', 'http://a/b/c/g/')
+
+        self.checkJoin(RFC1808_BASE, 'g/./h', 'http://a/b/c/g/h')
+
+        self.checkJoin(RFC1808_BASE, 'g/../h', 'http://a/b/c/h')
+
+
+
+        # RFC 1808 and RFC 1630 disagree on these (according to RFC 1808),
+
+        # so we'll not actually run these tests (which expect 1808 behavior).
+
+        #self.checkJoin(RFC1808_BASE, 'http:g', 'http:g')
+
+        #self.checkJoin(RFC1808_BASE, 'http:', 'http:')
+
+
+
+        # XXX: The following tests are no longer compatible with RFC3986
+
+        # self.checkJoin(RFC1808_BASE, '../../../g', 'http://a/../g')
+
+        # self.checkJoin(RFC1808_BASE, '../../../../g', 'http://a/../../g')
+
+        # self.checkJoin(RFC1808_BASE, '/./g', 'http://a/./g')
+
+        # self.checkJoin(RFC1808_BASE, '/../g', 'http://a/../g')
+
+
+
+
+
+    def test_RFC2368(self):
+
+        # Issue 11467: path that starts with a number is not parsed correctly
+
+        self.assertEqual(urllib.parse.urlparse('mailto:1337@example.org'),
+
+                ('mailto', '', '1337@example.org', '', '', ''))
+
+
+
+    def test_RFC2396(self):
+
+        # cases from RFC 2396
+
+
+
+        self.checkJoin(RFC2396_BASE, 'g:h', 'g:h')
+
+        self.checkJoin(RFC2396_BASE, 'g', 'http://a/b/c/g')
+
+        self.checkJoin(RFC2396_BASE, './g', 'http://a/b/c/g')
+
+        self.checkJoin(RFC2396_BASE, 'g/', 'http://a/b/c/g/')
+
+        self.checkJoin(RFC2396_BASE, '/g', 'http://a/g')
+
+        self.checkJoin(RFC2396_BASE, '//g', 'http://g')
+
+        self.checkJoin(RFC2396_BASE, 'g?y', 'http://a/b/c/g?y')
+
+        self.checkJoin(RFC2396_BASE, '#s', 'http://a/b/c/d;p?q#s')
+
+        self.checkJoin(RFC2396_BASE, 'g#s', 'http://a/b/c/g#s')
+
+        self.checkJoin(RFC2396_BASE, 'g?y#s', 'http://a/b/c/g?y#s')
+
+        self.checkJoin(RFC2396_BASE, 'g;x', 'http://a/b/c/g;x')
+
+        self.checkJoin(RFC2396_BASE, 'g;x?y#s', 'http://a/b/c/g;x?y#s')
+
+        self.checkJoin(RFC2396_BASE, '.', 'http://a/b/c/')
+
+        self.checkJoin(RFC2396_BASE, './', 'http://a/b/c/')
+
+        self.checkJoin(RFC2396_BASE, '..', 'http://a/b/')
+
+        self.checkJoin(RFC2396_BASE, '../', 'http://a/b/')
+
+        self.checkJoin(RFC2396_BASE, '../g', 'http://a/b/g')
+
+        self.checkJoin(RFC2396_BASE, '../..', 'http://a/')
+
+        self.checkJoin(RFC2396_BASE, '../../', 'http://a/')
+
+        self.checkJoin(RFC2396_BASE, '../../g', 'http://a/g')
+
+        self.checkJoin(RFC2396_BASE, '', RFC2396_BASE)
+
+        self.checkJoin(RFC2396_BASE, 'g.', 'http://a/b/c/g.')
+
+        self.checkJoin(RFC2396_BASE, '.g', 'http://a/b/c/.g')
+
+        self.checkJoin(RFC2396_BASE, 'g..', 'http://a/b/c/g..')
+
+        self.checkJoin(RFC2396_BASE, '..g', 'http://a/b/c/..g')
+
+        self.checkJoin(RFC2396_BASE, './../g', 'http://a/b/g')
+
+        self.checkJoin(RFC2396_BASE, './g/.', 'http://a/b/c/g/')
+
+        self.checkJoin(RFC2396_BASE, 'g/./h', 'http://a/b/c/g/h')
+
+        self.checkJoin(RFC2396_BASE, 'g/../h', 'http://a/b/c/h')
+
+        self.checkJoin(RFC2396_BASE, 'g;x=1/./y', 'http://a/b/c/g;x=1/y')
+
+        self.checkJoin(RFC2396_BASE, 'g;x=1/../y', 'http://a/b/c/y')
+
+        self.checkJoin(RFC2396_BASE, 'g?y/./x', 'http://a/b/c/g?y/./x')
+
+        self.checkJoin(RFC2396_BASE, 'g?y/../x', 'http://a/b/c/g?y/../x')
+
+        self.checkJoin(RFC2396_BASE, 'g#s/./x', 'http://a/b/c/g#s/./x')
+
+        self.checkJoin(RFC2396_BASE, 'g#s/../x', 'http://a/b/c/g#s/../x')
+
+
+
+        # XXX: The following tests are no longer compatible with RFC3986
+
+        # self.checkJoin(RFC2396_BASE, '../../../g', 'http://a/../g')
+
+        # self.checkJoin(RFC2396_BASE, '../../../../g', 'http://a/../../g')
+
+        # self.checkJoin(RFC2396_BASE, '/./g', 'http://a/./g')
+
+        # self.checkJoin(RFC2396_BASE, '/../g', 'http://a/../g')
+
+
+
+    def test_RFC3986(self):
+
+        self.checkJoin(RFC3986_BASE, '?y','http://a/b/c/d;p?y')
+
+        self.checkJoin(RFC3986_BASE, ';x', 'http://a/b/c/;x')
+
+        self.checkJoin(RFC3986_BASE, 'g:h','g:h')
+
+        self.checkJoin(RFC3986_BASE, 'g','http://a/b/c/g')
+
+        self.checkJoin(RFC3986_BASE, './g','http://a/b/c/g')
+
+        self.checkJoin(RFC3986_BASE, 'g/','http://a/b/c/g/')
+
+        self.checkJoin(RFC3986_BASE, '/g','http://a/g')
+
+        self.checkJoin(RFC3986_BASE, '//g','http://g')
+
+        self.checkJoin(RFC3986_BASE, '?y','http://a/b/c/d;p?y')
+
+        self.checkJoin(RFC3986_BASE, 'g?y','http://a/b/c/g?y')
+
+        self.checkJoin(RFC3986_BASE, '#s','http://a/b/c/d;p?q#s')
+
+        self.checkJoin(RFC3986_BASE, 'g#s','http://a/b/c/g#s')
+
+        self.checkJoin(RFC3986_BASE, 'g?y#s','http://a/b/c/g?y#s')
+
+        self.checkJoin(RFC3986_BASE, ';x','http://a/b/c/;x')
+
+        self.checkJoin(RFC3986_BASE, 'g;x','http://a/b/c/g;x')
+
+        self.checkJoin(RFC3986_BASE, 'g;x?y#s','http://a/b/c/g;x?y#s')
+
+        self.checkJoin(RFC3986_BASE, '','http://a/b/c/d;p?q')
+
+        self.checkJoin(RFC3986_BASE, '.','http://a/b/c/')
+
+        self.checkJoin(RFC3986_BASE, './','http://a/b/c/')
+
+        self.checkJoin(RFC3986_BASE, '..','http://a/b/')
+
+        self.checkJoin(RFC3986_BASE, '../','http://a/b/')
+
+        self.checkJoin(RFC3986_BASE, '../g','http://a/b/g')
+
+        self.checkJoin(RFC3986_BASE, '../..','http://a/')
+
+        self.checkJoin(RFC3986_BASE, '../../','http://a/')
+
+        self.checkJoin(RFC3986_BASE, '../../g','http://a/g')
+
+        self.checkJoin(RFC3986_BASE, '../../../g', 'http://a/g')
+
+
+
+        # Abnormal Examples
+
+
+
+        # The 'abnormal scenarios' are incompatible with RFC2986 parsing
+
+        # Tests are here for reference.
+
+
+
+        self.checkJoin(RFC3986_BASE, '../../../g','http://a/g')
+
+        self.checkJoin(RFC3986_BASE, '../../../../g','http://a/g')
+
+        self.checkJoin(RFC3986_BASE, '/./g','http://a/g')
+
+        self.checkJoin(RFC3986_BASE, '/../g','http://a/g')
+
+        self.checkJoin(RFC3986_BASE, 'g.','http://a/b/c/g.')
+
+        self.checkJoin(RFC3986_BASE, '.g','http://a/b/c/.g')
+
+        self.checkJoin(RFC3986_BASE, 'g..','http://a/b/c/g..')
+
+        self.checkJoin(RFC3986_BASE, '..g','http://a/b/c/..g')
+
+        self.checkJoin(RFC3986_BASE, './../g','http://a/b/g')
+
+        self.checkJoin(RFC3986_BASE, './g/.','http://a/b/c/g/')
+
+        self.checkJoin(RFC3986_BASE, 'g/./h','http://a/b/c/g/h')
+
+        self.checkJoin(RFC3986_BASE, 'g/../h','http://a/b/c/h')
+
+        self.checkJoin(RFC3986_BASE, 'g;x=1/./y','http://a/b/c/g;x=1/y')
+
+        self.checkJoin(RFC3986_BASE, 'g;x=1/../y','http://a/b/c/y')
+
+        self.checkJoin(RFC3986_BASE, 'g?y/./x','http://a/b/c/g?y/./x')
+
+        self.checkJoin(RFC3986_BASE, 'g?y/../x','http://a/b/c/g?y/../x')
+
+        self.checkJoin(RFC3986_BASE, 'g#s/./x','http://a/b/c/g#s/./x')
+
+        self.checkJoin(RFC3986_BASE, 'g#s/../x','http://a/b/c/g#s/../x')
+
+        #self.checkJoin(RFC3986_BASE, 'http:g','http:g') # strict parser
+
+        self.checkJoin(RFC3986_BASE, 'http:g','http://a/b/c/g') #relaxed parser
+
+
+
+        # Test for issue9721
+
+        self.checkJoin('http://a/b/c/de', ';x','http://a/b/c/;x')
+
+
+
+    def test_urljoins(self):
+
+        self.checkJoin(SIMPLE_BASE, 'g:h','g:h')
+
+        self.checkJoin(SIMPLE_BASE, 'http:g','http://a/b/c/g')
+
+        self.checkJoin(SIMPLE_BASE, 'http:','http://a/b/c/d')
+
+        self.checkJoin(SIMPLE_BASE, 'g','http://a/b/c/g')
+
+        self.checkJoin(SIMPLE_BASE, './g','http://a/b/c/g')
+
+        self.checkJoin(SIMPLE_BASE, 'g/','http://a/b/c/g/')
+
+        self.checkJoin(SIMPLE_BASE, '/g','http://a/g')
+
+        self.checkJoin(SIMPLE_BASE, '//g','http://g')
+
+        self.checkJoin(SIMPLE_BASE, '?y','http://a/b/c/d?y')
+
+        self.checkJoin(SIMPLE_BASE, 'g?y','http://a/b/c/g?y')
+
+        self.checkJoin(SIMPLE_BASE, 'g?y/./x','http://a/b/c/g?y/./x')
+
+        self.checkJoin(SIMPLE_BASE, '.','http://a/b/c/')
+
+        self.checkJoin(SIMPLE_BASE, './','http://a/b/c/')
+
+        self.checkJoin(SIMPLE_BASE, '..','http://a/b/')
+
+        self.checkJoin(SIMPLE_BASE, '../','http://a/b/')
+
+        self.checkJoin(SIMPLE_BASE, '../g','http://a/b/g')
+
+        self.checkJoin(SIMPLE_BASE, '../..','http://a/')
+
+        self.checkJoin(SIMPLE_BASE, '../../g','http://a/g')
+
+        self.checkJoin(SIMPLE_BASE, './../g','http://a/b/g')
+
+        self.checkJoin(SIMPLE_BASE, './g/.','http://a/b/c/g/')
+
+        self.checkJoin(SIMPLE_BASE, 'g/./h','http://a/b/c/g/h')
+
+        self.checkJoin(SIMPLE_BASE, 'g/../h','http://a/b/c/h')
+
+        self.checkJoin(SIMPLE_BASE, 'http:g','http://a/b/c/g')
+
+        self.checkJoin(SIMPLE_BASE, 'http:','http://a/b/c/d')
+
+        self.checkJoin(SIMPLE_BASE, 'http:?y','http://a/b/c/d?y')
+
+        self.checkJoin(SIMPLE_BASE, 'http:g?y','http://a/b/c/g?y')
+
+        self.checkJoin(SIMPLE_BASE, 'http:g?y/./x','http://a/b/c/g?y/./x')
+
+        self.checkJoin('http:///', '..','http:///')
+
+        self.checkJoin('', 'http://a/b/c/g?y/./x','http://a/b/c/g?y/./x')
+
+        self.checkJoin('', 'http://a/./g', 'http://a/./g')
+
+        self.checkJoin('svn://pathtorepo/dir1', 'dir2', 'svn://pathtorepo/dir2')
+
+        self.checkJoin('svn+ssh://pathtorepo/dir1', 'dir2', 'svn+ssh://pathtorepo/dir2')
+
+        self.checkJoin('ws://a/b','g','ws://a/g')
+
+        self.checkJoin('wss://a/b','g','wss://a/g')
+
+
+
+        # XXX: The following tests are no longer compatible with RFC3986
+
+        # self.checkJoin(SIMPLE_BASE, '../../../g','http://a/../g')
+
+        # self.checkJoin(SIMPLE_BASE, '/./g','http://a/./g')
+
+
+
+        # test for issue22118 duplicate slashes
+
+        self.checkJoin(SIMPLE_BASE + '/', 'foo', SIMPLE_BASE + '/foo')
+
+
+
+        # Non-RFC-defined tests, covering variations of base and trailing
+
+        # slashes
+
+        self.checkJoin('http://a/b/c/d/e/', '../../f/g/', 'http://a/b/c/f/g/')
+
+        self.checkJoin('http://a/b/c/d/e', '../../f/g/', 'http://a/b/f/g/')
+
+        self.checkJoin('http://a/b/c/d/e/', '/../../f/g/', 'http://a/f/g/')
+
+        self.checkJoin('http://a/b/c/d/e', '/../../f/g/', 'http://a/f/g/')
+
+        self.checkJoin('http://a/b/c/d/e/', '../../f/g', 'http://a/b/c/f/g')
+
+        self.checkJoin('http://a/b/', '../../f/g/', 'http://a/f/g/')
+
+
+
+        # issue 23703: don't duplicate filename
+
+        self.checkJoin('a', 'b', 'b')
+
+
+
+    def test_RFC2732(self):
+
+        str_cases = [
+
+            ('http://Test.python.org:5432/foo/', 'test.python.org', 5432),
+
+            ('http://12.34.56.78:5432/foo/', '12.34.56.78', 5432),
+
+            ('http://[::1]:5432/foo/', '::1', 5432),
+
+            ('http://[dead:beef::1]:5432/foo/', 'dead:beef::1', 5432),
+
+            ('http://[dead:beef::]:5432/foo/', 'dead:beef::', 5432),
+
+            ('http://[dead:beef:cafe:5417:affe:8FA3:deaf:feed]:5432/foo/',
+
+             'dead:beef:cafe:5417:affe:8fa3:deaf:feed', 5432),
+
+            ('http://[::12.34.56.78]:5432/foo/', '::12.34.56.78', 5432),
+
+            ('http://[::ffff:12.34.56.78]:5432/foo/',
+
+             '::ffff:12.34.56.78', 5432),
+
+            ('http://Test.python.org/foo/', 'test.python.org', None),
+
+            ('http://12.34.56.78/foo/', '12.34.56.78', None),
+
+            ('http://[::1]/foo/', '::1', None),
+
+            ('http://[dead:beef::1]/foo/', 'dead:beef::1', None),
+
+            ('http://[dead:beef::]/foo/', 'dead:beef::', None),
+
+            ('http://[dead:beef:cafe:5417:affe:8FA3:deaf:feed]/foo/',
+
+             'dead:beef:cafe:5417:affe:8fa3:deaf:feed', None),
+
+            ('http://[::12.34.56.78]/foo/', '::12.34.56.78', None),
+
+            ('http://[::ffff:12.34.56.78]/foo/',
+
+             '::ffff:12.34.56.78', None),
+
+            ('http://Test.python.org:/foo/', 'test.python.org', None),
+
+            ('http://12.34.56.78:/foo/', '12.34.56.78', None),
+
+            ('http://[::1]:/foo/', '::1', None),
+
+            ('http://[dead:beef::1]:/foo/', 'dead:beef::1', None),
+
+            ('http://[dead:beef::]:/foo/', 'dead:beef::', None),
+
+            ('http://[dead:beef:cafe:5417:affe:8FA3:deaf:feed]:/foo/',
+
+             'dead:beef:cafe:5417:affe:8fa3:deaf:feed', None),
+
+            ('http://[::12.34.56.78]:/foo/', '::12.34.56.78', None),
+
+            ('http://[::ffff:12.34.56.78]:/foo/',
+
+             '::ffff:12.34.56.78', None),
+
+            ]
+
+        def _encode(t):
+
+            return t[0].encode('ascii'), t[1].encode('ascii'), t[2]
+
+        bytes_cases = [_encode(x) for x in str_cases]
+
+        for url, hostname, port in str_cases + bytes_cases:
+
+            urlparsed = urllib.parse.urlparse(url)
+
+            self.assertEqual((urlparsed.hostname, urlparsed.port) , (hostname, port))
+
+
+
+        str_cases = [
+
+                'http://::12.34.56.78]/',
+
+                'http://[::1/foo/',
+
+                'ftp://[::1/foo/bad]/bad',
+
+                'http://[::1/foo/bad]/bad',
+
+                'http://[::ffff:12.34.56.78']
+
+        bytes_cases = [x.encode('ascii') for x in str_cases]
+
+        for invalid_url in str_cases + bytes_cases:
+
+            self.assertRaises(ValueError, urllib.parse.urlparse, invalid_url)
+
+
+
+    def test_urldefrag(self):
+
+        str_cases = [
+
+            ('http://python.org#frag', 'http://python.org', 'frag'),
+
+            ('http://python.org', 'http://python.org', ''),
+
+            ('http://python.org/#frag', 'http://python.org/', 'frag'),
+
+            ('http://python.org/', 'http://python.org/', ''),
+
+            ('http://python.org/?q#frag', 'http://python.org/?q', 'frag'),
+
+            ('http://python.org/?q', 'http://python.org/?q', ''),
+
+            ('http://python.org/p#frag', 'http://python.org/p', 'frag'),
+
+            ('http://python.org/p?q', 'http://python.org/p?q', ''),
+
+            (RFC1808_BASE, 'http://a/b/c/d;p?q', 'f'),
+
+            (RFC2396_BASE, 'http://a/b/c/d;p?q', ''),
+
+        ]
+
+        def _encode(t):
+
+            return type(t)(x.encode('ascii') for x in t)
+
+        bytes_cases = [_encode(x) for x in str_cases]
+
+        for url, defrag, frag in str_cases + bytes_cases:
+
+            result = urllib.parse.urldefrag(url)
+
+            self.assertEqual(result.geturl(), url)
+
+            self.assertEqual(result, (defrag, frag))
+
+            self.assertEqual(result.url, defrag)
+
+            self.assertEqual(result.fragment, frag)
+
+
+
+    def test_urlsplit_scoped_IPv6(self):
+
+        p = urllib.parse.urlsplit('http://[FE80::822a:a8ff:fe49:470c%tESt]:1234')
+
+        self.assertEqual(p.hostname, "fe80::822a:a8ff:fe49:470c%tESt")
+
+        self.assertEqual(p.netloc, '[FE80::822a:a8ff:fe49:470c%tESt]:1234')
+
+
+
+        p = urllib.parse.urlsplit(b'http://[FE80::822a:a8ff:fe49:470c%tESt]:1234')
+
+        self.assertEqual(p.hostname, b"fe80::822a:a8ff:fe49:470c%tESt")
+
+        self.assertEqual(p.netloc, b'[FE80::822a:a8ff:fe49:470c%tESt]:1234')
+
+
+
+    def test_urlsplit_attributes(self):
+
+        url = "HTTP://WWW.PYTHON.ORG/doc/#frag"
+
+        p = urllib.parse.urlsplit(url)
+
+        self.assertEqual(p.scheme, "http")
+
+        self.assertEqual(p.netloc, "WWW.PYTHON.ORG")
+
+        self.assertEqual(p.path, "/doc/")
+
+        self.assertEqual(p.query, "")
+
+        self.assertEqual(p.fragment, "frag")
+
+        self.assertEqual(p.username, None)
+
+        self.assertEqual(p.password, None)
+
+        self.assertEqual(p.hostname, "www.python.org")
+
+        self.assertEqual(p.port, None)
+
+        # geturl() won't return exactly the original URL in this case
+
+        # since the scheme is always case-normalized
+
+        # We handle this by ignoring the first 4 characters of the URL
+
+        self.assertEqual(p.geturl()[4:], url[4:])
+
+
+
+        url = "http://User:Pass@www.python.org:080/doc/?query=yes#frag"
+
+        p = urllib.parse.urlsplit(url)
+
+        self.assertEqual(p.scheme, "http")
+
+        self.assertEqual(p.netloc, "User:Pass@www.python.org:080")
+
+        self.assertEqual(p.path, "/doc/")
+
+        self.assertEqual(p.query, "query=yes")
+
+        self.assertEqual(p.fragment, "frag")
+
+        self.assertEqual(p.username, "User")
+
+        self.assertEqual(p.password, "Pass")
+
+        self.assertEqual(p.hostname, "www.python.org")
+
+        self.assertEqual(p.port, 80)
+
+        self.assertEqual(p.geturl(), url)
+
+
+
+        # Addressing issue1698, which suggests Username can contain
+
+        # "@" characters.  Though not RFC compliant, many ftp sites allow
+
+        # and request email addresses as usernames.
+
+
+
+        url = "http://User@example.com:Pass@www.python.org:080/doc/?query=yes#frag"
+
+        p = urllib.parse.urlsplit(url)
+
+        self.assertEqual(p.scheme, "http")
+
+        self.assertEqual(p.netloc, "User@example.com:Pass@www.python.org:080")
+
+        self.assertEqual(p.path, "/doc/")
+
+        self.assertEqual(p.query, "query=yes")
+
+        self.assertEqual(p.fragment, "frag")
+
+        self.assertEqual(p.username, "User@example.com")
+
+        self.assertEqual(p.password, "Pass")
+
+        self.assertEqual(p.hostname, "www.python.org")
+
+        self.assertEqual(p.port, 80)
+
+        self.assertEqual(p.geturl(), url)
+
+
+
+        # And check them all again, only with bytes this time
+
+        url = b"HTTP://WWW.PYTHON.ORG/doc/#frag"
+
+        p = urllib.parse.urlsplit(url)
+
+        self.assertEqual(p.scheme, b"http")
+
+        self.assertEqual(p.netloc, b"WWW.PYTHON.ORG")
+
+        self.assertEqual(p.path, b"/doc/")
+
+        self.assertEqual(p.query, b"")
+
+        self.assertEqual(p.fragment, b"frag")
+
+        self.assertEqual(p.username, None)
+
+        self.assertEqual(p.password, None)
+
+        self.assertEqual(p.hostname, b"www.python.org")
+
+        self.assertEqual(p.port, None)
+
+        self.assertEqual(p.geturl()[4:], url[4:])
+
+
+
+        url = b"http://User:Pass@www.python.org:080/doc/?query=yes#frag"
+
+        p = urllib.parse.urlsplit(url)
+
+        self.assertEqual(p.scheme, b"http")
+
+        self.assertEqual(p.netloc, b"User:Pass@www.python.org:080")
+
+        self.assertEqual(p.path, b"/doc/")
+
+        self.assertEqual(p.query, b"query=yes")
+
+        self.assertEqual(p.fragment, b"frag")
+
+        self.assertEqual(p.username, b"User")
+
+        self.assertEqual(p.password, b"Pass")
+
+        self.assertEqual(p.hostname, b"www.python.org")
+
+        self.assertEqual(p.port, 80)
+
+        self.assertEqual(p.geturl(), url)
+
+
+
+        url = b"http://User@example.com:Pass@www.python.org:080/doc/?query=yes#frag"
+
+        p = urllib.parse.urlsplit(url)
+
+        self.assertEqual(p.scheme, b"http")
+
+        self.assertEqual(p.netloc, b"User@example.com:Pass@www.python.org:080")
+
+        self.assertEqual(p.path, b"/doc/")
+
+        self.assertEqual(p.query, b"query=yes")
+
+        self.assertEqual(p.fragment, b"frag")
+
+        self.assertEqual(p.username, b"User@example.com")
+
+        self.assertEqual(p.password, b"Pass")
+
+        self.assertEqual(p.hostname, b"www.python.org")
+
+        self.assertEqual(p.port, 80)
+
+        self.assertEqual(p.geturl(), url)
+
+
+
+        # Verify an illegal port raises ValueError
+
+        url = b"HTTP://WWW.PYTHON.ORG:65536/doc/#frag"
+
+        p = urllib.parse.urlsplit(url)
+
+        with self.assertRaisesRegex(ValueError, "out of range"):
+
+            p.port
+
+
+
+    def test_attributes_bad_port(self):
+
+        """Check handling of invalid ports."""
+
+        for bytes in (False, True):
+
+            for parse in (urllib.parse.urlsplit, urllib.parse.urlparse):
+
+                for port in ("foo", "1.5", "-1", "0x10"):
+
+                    with self.subTest(bytes=bytes, parse=parse, port=port):
+
+                        netloc = "www.example.net:" + port
+
+                        url = "http://" + netloc
+
+                        if bytes:
+
+                            netloc = netloc.encode("ascii")
+
+                            url = url.encode("ascii")
+
+                        p = parse(url)
+
+                        self.assertEqual(p.netloc, netloc)
+
+                        with self.assertRaises(ValueError):
+
+                            p.port
+
+
+
+    def test_attributes_without_netloc(self):
+
+        # This example is straight from RFC 3261.  It looks like it
+
+        # should allow the username, hostname, and port to be filled
+
+        # in, but doesn't.  Since it's a URI and doesn't use the
+
+        # scheme://netloc syntax, the netloc and related attributes
+
+        # should be left empty.
+
+        uri = "sip:alice@atlanta.com;maddr=239.255.255.1;ttl=15"
+
+        p = urllib.parse.urlsplit(uri)
+
+        self.assertEqual(p.netloc, "")
+
+        self.assertEqual(p.username, None)
+
+        self.assertEqual(p.password, None)
+
+        self.assertEqual(p.hostname, None)
+
+        self.assertEqual(p.port, None)
+
+        self.assertEqual(p.geturl(), uri)
+
+
+
+        p = urllib.parse.urlparse(uri)
+
+        self.assertEqual(p.netloc, "")
+
+        self.assertEqual(p.username, None)
+
+        self.assertEqual(p.password, None)
+
+        self.assertEqual(p.hostname, None)
+
+        self.assertEqual(p.port, None)
+
+        self.assertEqual(p.geturl(), uri)
+
+
+
+        # You guessed it, repeating the test with bytes input
+
+        uri = b"sip:alice@atlanta.com;maddr=239.255.255.1;ttl=15"
+
+        p = urllib.parse.urlsplit(uri)
+
+        self.assertEqual(p.netloc, b"")
+
+        self.assertEqual(p.username, None)
+
+        self.assertEqual(p.password, None)
+
+        self.assertEqual(p.hostname, None)
+
+        self.assertEqual(p.port, None)
+
+        self.assertEqual(p.geturl(), uri)
+
+
+
+        p = urllib.parse.urlparse(uri)
+
+        self.assertEqual(p.netloc, b"")
+
+        self.assertEqual(p.username, None)
+
+        self.assertEqual(p.password, None)
+
+        self.assertEqual(p.hostname, None)
+
+        self.assertEqual(p.port, None)
+
+        self.assertEqual(p.geturl(), uri)
+
+
+
+    def test_noslash(self):
+
+        # Issue 1637: http://foo.com?query is legal
+
+        self.assertEqual(urllib.parse.urlparse("http://example.com?blahblah=/foo"),
+
+                         ('http', 'example.com', '', '', 'blahblah=/foo', ''))
+
+        self.assertEqual(urllib.parse.urlparse(b"http://example.com?blahblah=/foo"),
+
+                         (b'http', b'example.com', b'', b'', b'blahblah=/foo', b''))
+
+
+
+    def test_withoutscheme(self):
+
+        # Test urlparse without scheme
+
+        # Issue 754016: urlparse goes wrong with IP:port without scheme
+
+        # RFC 1808 specifies that netloc should start with //, urlparse expects
+
+        # the same, otherwise it classifies the portion of url as path.
+
+        self.assertEqual(urllib.parse.urlparse("path"),
+
+                ('','','path','','',''))
+
+        self.assertEqual(urllib.parse.urlparse("//www.python.org:80"),
+
+                ('','www.python.org:80','','','',''))
+
+        self.assertEqual(urllib.parse.urlparse("http://www.python.org:80"),
+
+                ('http','www.python.org:80','','','',''))
+
+        # Repeat for bytes input
+
+        self.assertEqual(urllib.parse.urlparse(b"path"),
+
+                (b'',b'',b'path',b'',b'',b''))
+
+        self.assertEqual(urllib.parse.urlparse(b"//www.python.org:80"),
+
+                (b'',b'www.python.org:80',b'',b'',b'',b''))
+
+        self.assertEqual(urllib.parse.urlparse(b"http://www.python.org:80"),
+
+                (b'http',b'www.python.org:80',b'',b'',b'',b''))
+
+
+
+    def test_portseparator(self):
+
+        # Issue 754016 makes changes for port separator ':' from scheme separator
+
+        self.assertEqual(urllib.parse.urlparse("path:80"),
+
+                ('','','path:80','','',''))
+
+        self.assertEqual(urllib.parse.urlparse("http:"),('http','','','','',''))
+
+        self.assertEqual(urllib.parse.urlparse("https:"),('https','','','','',''))
+
+        self.assertEqual(urllib.parse.urlparse("http://www.python.org:80"),
+
+                ('http','www.python.org:80','','','',''))
+
+        # As usual, need to check bytes input as well
+
+        self.assertEqual(urllib.parse.urlparse(b"path:80"),
+
+                (b'',b'',b'path:80',b'',b'',b''))
+
+        self.assertEqual(urllib.parse.urlparse(b"http:"),(b'http',b'',b'',b'',b'',b''))
+
+        self.assertEqual(urllib.parse.urlparse(b"https:"),(b'https',b'',b'',b'',b'',b''))
+
+        self.assertEqual(urllib.parse.urlparse(b"http://www.python.org:80"),
+
+                (b'http',b'www.python.org:80',b'',b'',b'',b''))
+
+
+
+    def test_usingsys(self):
+
+        # Issue 3314: sys module is used in the error
+
+        self.assertRaises(TypeError, urllib.parse.urlencode, "foo")
+
+
+
+    def test_anyscheme(self):
+
+        # Issue 7904: s3://foo.com/stuff has netloc "foo.com".
+
+        self.assertEqual(urllib.parse.urlparse("s3://foo.com/stuff"),
+
+                         ('s3', 'foo.com', '/stuff', '', '', ''))
+
+        self.assertEqual(urllib.parse.urlparse("x-newscheme://foo.com/stuff"),
+
+                         ('x-newscheme', 'foo.com', '/stuff', '', '', ''))
+
+        self.assertEqual(urllib.parse.urlparse("x-newscheme://foo.com/stuff?query#fragment"),
+
+                         ('x-newscheme', 'foo.com', '/stuff', '', 'query', 'fragment'))
+
+        self.assertEqual(urllib.parse.urlparse("x-newscheme://foo.com/stuff?query"),
+
+                         ('x-newscheme', 'foo.com', '/stuff', '', 'query', ''))
+
+
+
+        # And for bytes...
+
+        self.assertEqual(urllib.parse.urlparse(b"s3://foo.com/stuff"),
+
+                         (b's3', b'foo.com', b'/stuff', b'', b'', b''))
+
+        self.assertEqual(urllib.parse.urlparse(b"x-newscheme://foo.com/stuff"),
+
+                         (b'x-newscheme', b'foo.com', b'/stuff', b'', b'', b''))
+
+        self.assertEqual(urllib.parse.urlparse(b"x-newscheme://foo.com/stuff?query#fragment"),
+
+                         (b'x-newscheme', b'foo.com', b'/stuff', b'', b'query', b'fragment'))
+
+        self.assertEqual(urllib.parse.urlparse(b"x-newscheme://foo.com/stuff?query"),
+
+                         (b'x-newscheme', b'foo.com', b'/stuff', b'', b'query', b''))
+
+
+
+    def test_default_scheme(self):
+
+        # Exercise the scheme parameter of urlparse() and urlsplit()
+
+        for func in (urllib.parse.urlparse, urllib.parse.urlsplit):
+
+            with self.subTest(function=func):
+
+                result = func("http://example.net/", "ftp")
+
+                self.assertEqual(result.scheme, "http")
+
+                result = func(b"http://example.net/", b"ftp")
+
+                self.assertEqual(result.scheme, b"http")
+
+                self.assertEqual(func("path", "ftp").scheme, "ftp")
+
+                self.assertEqual(func("path", scheme="ftp").scheme, "ftp")
+
+                self.assertEqual(func(b"path", scheme=b"ftp").scheme, b"ftp")
+
+                self.assertEqual(func("path").scheme, "")
+
+                self.assertEqual(func(b"path").scheme, b"")
+
+                self.assertEqual(func(b"path", "").scheme, b"")
+
+
+
+    def test_parse_fragments(self):
+
+        # Exercise the allow_fragments parameter of urlparse() and urlsplit()
+
+        tests = (
+
+            ("http:#frag", "path", "frag"),
+
+            ("//example.net#frag", "path", "frag"),
+
+            ("index.html#frag", "path", "frag"),
+
+            (";a=b#frag", "params", "frag"),
+
+            ("?a=b#frag", "query", "frag"),
+
+            ("#frag", "path", "frag"),
+
+            ("abc#@frag", "path", "@frag"),
+
+            ("//abc#@frag", "path", "@frag"),
+
+            ("//abc:80#@frag", "path", "@frag"),
+
+            ("//abc#@frag:80", "path", "@frag:80"),
 
         )
 
+        for url, attr, expected_frag in tests:
 
+            for func in (urllib.parse.urlparse, urllib.parse.urlsplit):
 
-    if not checkout.shipping_address:
+                if attr == "params" and func is urllib.parse.urlsplit:
 
-        raise ValidationError(
+                    attr = "path"
 
-            "Cannot choose a shipping method for a checkout without the "
+                with self.subTest(url=url, function=func):
 
-            "shipping address.",
+                    result = func(url, allow_fragments=False)
 
-            code=CheckoutErrorCode.SHIPPING_ADDRESS_NOT_SET.value,
+                    self.assertEqual(result.fragment, "")
 
-        )
+                    self.assertTrue(
 
+                            getattr(result, attr).endswith("#" + expected_frag))
 
+                    self.assertEqual(func(url, "", False).fragment, "")
 
-    valid_methods = get_valid_shipping_methods_for_checkout(checkout, discounts)
 
-    return method in valid_methods
 
+                    result = func(url, allow_fragments=True)
 
+                    self.assertEqual(result.fragment, expected_frag)
 
+                    self.assertFalse(
 
+                            getattr(result, attr).endswith(expected_frag))
 
-def update_checkout_shipping_method_if_invalid(checkout: models.Checkout, discounts):
+                    self.assertEqual(func(url, "", True).fragment,
 
-    # remove shipping method when empty checkout
+                                     expected_frag)
 
-    if checkout.quantity == 0 or not checkout.is_shipping_required():
+                    self.assertEqual(func(url).fragment, expected_frag)
 
-        checkout.shipping_method = None
 
-        checkout.save(update_fields=["shipping_method", "last_change"])
 
+    def test_mixed_types_rejected(self):
 
+        # Several functions that process either strings or ASCII encoded bytes
 
-    is_valid = clean_shipping_method(
+        # accept multiple arguments. Check they reject mixed type input
 
-        checkout=checkout, method=checkout.shipping_method, discounts=discounts
+        with self.assertRaisesRegex(TypeError, "Cannot mix str"):
 
-    )
+            urllib.parse.urlparse("www.python.org", b"http")
 
+        with self.assertRaisesRegex(TypeError, "Cannot mix str"):
 
+            urllib.parse.urlparse(b"www.python.org", "http")
 
-    if not is_valid:
+        with self.assertRaisesRegex(TypeError, "Cannot mix str"):
 
-        cheapest_alternative = get_valid_shipping_methods_for_checkout(
+            urllib.parse.urlsplit("www.python.org", b"http")
 
-            checkout, discounts
+        with self.assertRaisesRegex(TypeError, "Cannot mix str"):
 
-        ).first()
+            urllib.parse.urlsplit(b"www.python.org", "http")
 
-        checkout.shipping_method = cheapest_alternative
+        with self.assertRaisesRegex(TypeError, "Cannot mix str"):
 
-        checkout.save(update_fields=["shipping_method", "last_change"])
+            urllib.parse.urlunparse(( b"http", "www.python.org","","","",""))
 
+        with self.assertRaisesRegex(TypeError, "Cannot mix str"):
 
+            urllib.parse.urlunparse(("http", b"www.python.org","","","",""))
 
+        with self.assertRaisesRegex(TypeError, "Cannot mix str"):
 
+            urllib.parse.urlunsplit((b"http", "www.python.org","","",""))
 
-def check_lines_quantity(variants, quantities, country):
+        with self.assertRaisesRegex(TypeError, "Cannot mix str"):
 
-    """Check if stock is sufficient for each line in the list of dicts."""
+            urllib.parse.urlunsplit(("http", b"www.python.org","","",""))
 
-    for variant, quantity in zip(variants, quantities):
+        with self.assertRaisesRegex(TypeError, "Cannot mix str"):
 
-        if quantity < 0:
+            urllib.parse.urljoin("http://python.org", b"http://python.org")
 
-            raise ValidationError(
+        with self.assertRaisesRegex(TypeError, "Cannot mix str"):
 
-                {
+            urllib.parse.urljoin(b"http://python.org", "http://python.org")
 
-                    "quantity": ValidationError(
 
-                        "The quantity should be higher than zero.",
 
-                        code=CheckoutErrorCode.ZERO_QUANTITY,
+    def _check_result_type(self, str_type):
 
-                    )
+        num_args = len(str_type._fields)
 
-                }
+        bytes_type = str_type._encoded_counterpart
 
-            )
+        self.assertIs(bytes_type._decoded_counterpart, str_type)
 
-        if quantity > settings.MAX_CHECKOUT_LINE_QUANTITY:
+        str_args = ('',) * num_args
 
-            raise ValidationError(
+        bytes_args = (b'',) * num_args
 
-                {
+        str_result = str_type(*str_args)
 
-                    "quantity": ValidationError(
+        bytes_result = bytes_type(*bytes_args)
 
-                        "Cannot add more than %d times this item."
+        encoding = 'ascii'
 
-                        "" % settings.MAX_CHECKOUT_LINE_QUANTITY,
+        errors = 'strict'
 
-                        code=CheckoutErrorCode.QUANTITY_GREATER_THAN_LIMIT,
+        self.assertEqual(str_result, str_args)
 
-                    )
+        self.assertEqual(bytes_result.decode(), str_args)
 
-                }
+        self.assertEqual(bytes_result.decode(), str_result)
 
-            )
+        self.assertEqual(bytes_result.decode(encoding), str_args)
 
-        try:
+        self.assertEqual(bytes_result.decode(encoding), str_result)
 
-            check_stock_quantity(variant, country, quantity)
+        self.assertEqual(bytes_result.decode(encoding, errors), str_args)
 
-        except InsufficientStock as e:
+        self.assertEqual(bytes_result.decode(encoding, errors), str_result)
 
-            available_quantity = get_available_quantity(e.item, country)
+        self.assertEqual(bytes_result, bytes_args)
 
-            message = (
+        self.assertEqual(str_result.encode(), bytes_args)
 
-                "Could not add item "
+        self.assertEqual(str_result.encode(), bytes_result)
 
-                + "%(item_name)s. Only %(remaining)d remaining in stock."
+        self.assertEqual(str_result.encode(encoding), bytes_args)
 
-                % {
+        self.assertEqual(str_result.encode(encoding), bytes_result)
 
-                    "remaining": available_quantity,
+        self.assertEqual(str_result.encode(encoding, errors), bytes_args)
 
-                    "item_name": e.item.display_product(),
+        self.assertEqual(str_result.encode(encoding, errors), bytes_result)
 
-                }
 
-            )
 
-            raise ValidationError({"quantity": ValidationError(message, code=e.code)})
+    def test_result_pairs(self):
 
+        # Check encoding and decoding between result pairs
 
+        result_types = [
 
+          urllib.parse.DefragResult,
 
+          urllib.parse.SplitResult,
 
-class CheckoutLineInput(graphene.InputObjectType):
+          urllib.parse.ParseResult,
 
-    quantity = graphene.Int(required=True, description="The number of items purchased.")
+        ]
 
-    variant_id = graphene.ID(required=True, description="ID of the product variant.")
+        for result_type in result_types:
 
+            self._check_result_type(result_type)
 
 
 
+    def test_parse_qs_encoding(self):
 
-class CheckoutCreateInput(graphene.InputObjectType):
+        result = urllib.parse.parse_qs("key=\u0141%E9", encoding="latin-1")
 
-    lines = graphene.List(
+        self.assertEqual(result, {'key': ['\u0141\xE9']})
 
-        CheckoutLineInput,
+        result = urllib.parse.parse_qs("key=\u0141%C3%A9", encoding="utf-8")
 
-        description=(
+        self.assertEqual(result, {'key': ['\u0141\xE9']})
 
-            "A list of checkout lines, each containing information about "
+        result = urllib.parse.parse_qs("key=\u0141%C3%A9", encoding="ascii")
 
-            "an item in the checkout."
+        self.assertEqual(result, {'key': ['\u0141\ufffd\ufffd']})
 
-        ),
+        result = urllib.parse.parse_qs("key=\u0141%E9-", encoding="ascii")
 
-        required=True,
+        self.assertEqual(result, {'key': ['\u0141\ufffd-']})
 
-    )
+        result = urllib.parse.parse_qs("key=\u0141%E9-", encoding="ascii",
 
-    email = graphene.String(description="The customer's email address.")
+                                                          errors="ignore")
 
-    shipping_address = AddressInput(
+        self.assertEqual(result, {'key': ['\u0141-']})
 
-        description=(
 
-            "The mailing address to where the checkout will be shipped. "
 
-            "Note: the address will be ignored if the checkout "
+    def test_parse_qsl_encoding(self):
 
-            "doesn't contain shippable items."
+        result = urllib.parse.parse_qsl("key=\u0141%E9", encoding="latin-1")
 
-        )
+        self.assertEqual(result, [('key', '\u0141\xE9')])
 
-    )
+        result = urllib.parse.parse_qsl("key=\u0141%C3%A9", encoding="utf-8")
 
-    billing_address = AddressInput(description="Billing address of the customer.")
+        self.assertEqual(result, [('key', '\u0141\xE9')])
 
+        result = urllib.parse.parse_qsl("key=\u0141%C3%A9", encoding="ascii")
 
+        self.assertEqual(result, [('key', '\u0141\ufffd\ufffd')])
 
+        result = urllib.parse.parse_qsl("key=\u0141%E9-", encoding="ascii")
 
+        self.assertEqual(result, [('key', '\u0141\ufffd-')])
 
-class CheckoutCreate(ModelMutation, I18nMixin):
+        result = urllib.parse.parse_qsl("key=\u0141%E9-", encoding="ascii",
 
-    created = graphene.Field(
+                                                          errors="ignore")
 
-        graphene.Boolean,
+        self.assertEqual(result, [('key', '\u0141-')])
 
-        description=(
 
-            "Whether the checkout was created or the current active one was returned. "
 
-            "Refer to checkoutLinesAdd and checkoutLinesUpdate to merge a cart "
+    def test_parse_qsl_max_num_fields(self):
 
-            "with an active checkout."
+        with self.assertRaises(ValueError):
 
-        ),
+            urllib.parse.parse_qs('&'.join(['a=a']*11), max_num_fields=10)
 
-    )
+        with self.assertRaises(ValueError):
 
+            urllib.parse.parse_qs(';'.join(['a=a']*11), max_num_fields=10)
 
+        urllib.parse.parse_qs('&'.join(['a=a']*10), max_num_fields=10)
 
-    class Arguments:
 
-        input = CheckoutCreateInput(
 
-            required=True, description="Fields required to create checkout."
+    def test_urlencode_sequences(self):
 
-        )
+        # Other tests incidentally urlencode things; test non-covered cases:
 
+        # Sequence and object values.
 
+        result = urllib.parse.urlencode({'a': [1, 2], 'b': (3, 4, 5)}, True)
 
-    class Meta:
+        # we cannot rely on ordering here
 
-        description = "Create a new checkout."
+        assert set(result.split('&')) == {'a=1', 'a=2', 'b=3', 'b=4', 'b=5'}
 
-        model = models.Checkout
 
-        return_field_name = "checkout"
 
-        error_type_class = CheckoutError
+        class Trivial:
 
-        error_type_field = "checkout_errors"
+            def __str__(self):
 
+                return 'trivial'
 
 
-    @classmethod
 
-    def process_checkout_lines(
+        result = urllib.parse.urlencode({'a': Trivial()}, True)
 
-        cls, lines, country
+        self.assertEqual(result, 'a=trivial')
 
-    ) -> Tuple[List[product_models.ProductVariant], List[int]]:
 
-        variant_ids = [line.get("variant_id") for line in lines]
 
-        variants = cls.get_nodes_or_error(
+    def test_urlencode_quote_via(self):
 
-            variant_ids,
+        result = urllib.parse.urlencode({'a': 'some value'})
 
-            "variant_id",
+        self.assertEqual(result, "a=some+value")
 
-            ProductVariant,
+        result = urllib.parse.urlencode({'a': 'some value/another'},
 
-            qs=product_models.ProductVariant.objects.prefetch_related(
+                                        quote_via=urllib.parse.quote)
 
-                "product__product_type"
+        self.assertEqual(result, "a=some%20value%2Fanother")
 
-            ),
+        result = urllib.parse.urlencode({'a': 'some value/another'},
 
-        )
+                                        safe='/', quote_via=urllib.parse.quote)
 
-        quantities = [line.get("quantity") for line in lines]
+        self.assertEqual(result, "a=some%20value/another")
 
 
 
-        check_lines_quantity(variants, quantities, country)
+    def test_quote_from_bytes(self):
 
+        self.assertRaises(TypeError, urllib.parse.quote_from_bytes, 'foo')
 
+        result = urllib.parse.quote_from_bytes(b'archaeological arcana')
 
-        return variants, quantities
+        self.assertEqual(result, 'archaeological%20arcana')
 
+        result = urllib.parse.quote_from_bytes(b'')
 
+        self.assertEqual(result, '')
 
-    @classmethod
 
-    def retrieve_shipping_address(cls, user, data: dict) -> Optional[models.Address]:
 
-        if "shipping_address" in data:
+    def test_unquote_to_bytes(self):
 
-            return cls.validate_address(data["shipping_address"])
+        result = urllib.parse.unquote_to_bytes('abc%20def')
 
-        if user.is_authenticated:
+        self.assertEqual(result, b'abc def')
 
-            return user.default_shipping_address
+        result = urllib.parse.unquote_to_bytes('')
 
-        return None
+        self.assertEqual(result, b'')
 
 
 
-    @classmethod
+    def test_quote_errors(self):
 
-    def retrieve_billing_address(cls, user, data: dict) -> Optional[models.Address]:
+        self.assertRaises(TypeError, urllib.parse.quote, b'foo',
 
-        if "billing_address" in data:
+                          encoding='utf-8')
 
-            return cls.validate_address(data["billing_address"])
+        self.assertRaises(TypeError, urllib.parse.quote, b'foo', errors='strict')
 
-        if user.is_authenticated:
 
-            return user.default_billing_address
 
-        return None
+    def test_issue14072(self):
 
+        p1 = urllib.parse.urlsplit('tel:+31-641044153')
 
+        self.assertEqual(p1.scheme, 'tel')
 
-    @classmethod
+        self.assertEqual(p1.path, '+31-641044153')
 
-    def clean_input(cls, info, instance: models.Checkout, data, input_cls=None):
+        p2 = urllib.parse.urlsplit('tel:+31641044153')
 
-        cleaned_input = super().clean_input(info, instance, data)
+        self.assertEqual(p2.scheme, 'tel')
 
-        user = info.context.user
+        self.assertEqual(p2.path, '+31641044153')
 
-        country = info.context.country.code
+        # assert the behavior for urlparse
 
+        p1 = urllib.parse.urlparse('tel:+31-641044153')
 
+        self.assertEqual(p1.scheme, 'tel')
 
-        # Resolve and process the lines, retrieving the variants and quantities
+        self.assertEqual(p1.path, '+31-641044153')
 
-        lines = data.pop("lines", None)
+        p2 = urllib.parse.urlparse('tel:+31641044153')
 
-        if lines:
+        self.assertEqual(p2.scheme, 'tel')
 
-            (
+        self.assertEqual(p2.path, '+31641044153')
 
-                cleaned_input["variants"],
 
-                cleaned_input["quantities"],
 
-            ) = cls.process_checkout_lines(lines, country)
+    def test_port_casting_failure_message(self):
 
+        message = "Port could not be cast to integer value as 'oracle'"
 
+        p1 = urllib.parse.urlparse('http://Server=sde; Service=sde:oracle')
 
-        cleaned_input["shipping_address"] = cls.retrieve_shipping_address(user, data)
+        with self.assertRaisesRegex(ValueError, message):
 
-        cleaned_input["billing_address"] = cls.retrieve_billing_address(user, data)
+            p1.port
 
 
 
-        # Use authenticated user's email as default email
+        p2 = urllib.parse.urlsplit('http://Server=sde; Service=sde:oracle')
 
-        if user.is_authenticated:
+        with self.assertRaisesRegex(ValueError, message):
 
-            email = data.pop("email", None)
+            p2.port
 
-            cleaned_input["email"] = email or user.email
 
 
+    def test_telurl_params(self):
 
-        return cleaned_input
+        p1 = urllib.parse.urlparse('tel:123-4;phone-context=+1-650-516')
 
+        self.assertEqual(p1.scheme, 'tel')
 
+        self.assertEqual(p1.path, '123-4')
 
-    @classmethod
+        self.assertEqual(p1.params, 'phone-context=+1-650-516')
 
-    def save_addresses(cls, instance: models.Checkout, cleaned_input: dict):
 
-        shipping_address = cleaned_input.get("shipping_address")
 
-        billing_address = cleaned_input.get("billing_address")
+        p1 = urllib.parse.urlparse('tel:+1-201-555-0123')
 
+        self.assertEqual(p1.scheme, 'tel')
 
+        self.assertEqual(p1.path, '+1-201-555-0123')
 
-        updated_fields = ["last_change"]
+        self.assertEqual(p1.params, '')
 
 
 
-        if shipping_address and instance.is_shipping_required():
+        p1 = urllib.parse.urlparse('tel:7042;phone-context=example.com')
 
-            shipping_address.save()
+        self.assertEqual(p1.scheme, 'tel')
 
-            instance.shipping_address = shipping_address.get_copy()
+        self.assertEqual(p1.path, '7042')
 
-            updated_fields.append("shipping_address")
+        self.assertEqual(p1.params, 'phone-context=example.com')
 
-        if billing_address:
 
-            billing_address.save()
 
-            instance.billing_address = billing_address.get_copy()
+        p1 = urllib.parse.urlparse('tel:863-1234;phone-context=+1-914-555')
 
-            updated_fields.append("billing_address")
+        self.assertEqual(p1.scheme, 'tel')
 
+        self.assertEqual(p1.path, '863-1234')
 
+        self.assertEqual(p1.params, 'phone-context=+1-914-555')
 
-        # Note django will simply return if the list is empty
 
-        instance.save(update_fields=updated_fields)
 
+    def test_Quoter_repr(self):
 
+        quoter = urllib.parse.Quoter(urllib.parse._ALWAYS_SAFE)
 
-    @classmethod
+        self.assertIn('Quoter', repr(quoter))
 
-    @transaction.atomic()
 
-    def save(cls, info, instance: models.Checkout, cleaned_input):
 
-        # Create the checkout object
+    def test_all(self):
 
-        instance.save()
+        expected = []
 
-        country = info.context.country
+        undocumented = {
 
-        instance.set_country(country.code, commit=True)
+            'splitattr', 'splithost', 'splitnport', 'splitpasswd',
 
+            'splitport', 'splitquery', 'splittag', 'splittype', 'splituser',
 
+            'splitvalue',
 
-        # Retrieve the lines to create
+            'Quoter', 'ResultBase', 'clear_cache', 'to_bytes', 'unwrap',
 
-        variants = cleaned_input.get("variants")
+        }
 
-        quantities = cleaned_input.get("quantities")
+        for name in dir(urllib.parse):
 
+            if name.startswith('_') or name in undocumented:
 
+                continue
 
-        # Create the checkout lines
+            object = getattr(urllib.parse, name)
 
-        if variants and quantities:
+            if getattr(object, '__module__', None) == 'urllib.parse':
 
-            for variant, quantity in zip(variants, quantities):
+                expected.append(name)
 
-                try:
+        self.assertCountEqual(urllib.parse.__all__, expected)
 
-                    add_variant_to_checkout(instance, variant, quantity)
 
-                except InsufficientStock as exc:
 
-                    raise ValidationError(
+    def test_urlsplit_normalization(self):
 
-                        f"Insufficient product stock: {exc.item}", code=exc.code
+        # Certain characters should never occur in the netloc,
 
-                    )
+        # including under normalization.
 
+        # Ensure that ALL of them are detected and cause an error
 
+        illegal_chars = '/:#?@'
 
-        # Save provided addresses and associate them to the checkout
+        hex_chars = {'{:04X}'.format(ord(c)) for c in illegal_chars}
 
-        cls.save_addresses(instance, cleaned_input)
+        denorm_chars = [
 
+            c for c in map(chr, range(128, sys.maxunicode))
 
+            if (hex_chars & set(unicodedata.decomposition(c).split()))
 
-    @classmethod
+            and c not in illegal_chars
 
-    def perform_mutation(cls, _root, info, **data):
+        ]
 
-        user = info.context.user
+        # Sanity check that we found at least one such character
 
+        self.assertIn('\u2100', denorm_chars)
 
+        self.assertIn('\uFF03', denorm_chars)
 
-        # `perform_mutation` is overridden to properly get or create a checkout
 
-        # instance here and abort mutation if needed.
 
-        if user.is_authenticated:
+        # bpo-36742: Verify port separators are ignored when they
 
-            checkout, _ = get_user_checkout(user)
+        # existed prior to decomposition
 
+        urllib.parse.urlsplit('http://\u30d5\u309a:80')
 
+        with self.assertRaises(ValueError):
 
-            if checkout is not None:
+            urllib.parse.urlsplit('http://\u30d5\u309a\ufe1380')
 
-                # If user has an active checkout, return it without any
 
-                # modifications.
 
-                return CheckoutCreate(checkout=checkout, created=False)
+        for scheme in ["http", "https", "ftp"]:
 
+            for netloc in ["netloc{}false.netloc", "n{}user@netloc"]:
 
+                for c in denorm_chars:
 
-            checkout = models.Checkout(user=user)
+                    url = "{}://{}/path".format(scheme, netloc.format(c))
 
-        else:
+                    with self.subTest(url=url, char='{:04X}'.format(ord(c))):
 
-            checkout = models.Checkout()
+                        with self.assertRaises(ValueError):
 
+                            urllib.parse.urlsplit(url)
 
 
-        cleaned_input = cls.clean_input(info, checkout, data.get("input"))
 
-        checkout = cls.construct_instance(checkout, cleaned_input)
+class Utility_Tests(unittest.TestCase):
 
-        cls.clean_instance(info, checkout)
+    """Testcase to test the various utility functions in the urllib."""
 
-        cls.save(info, checkout, cleaned_input)
+    # In Python 2 this test class was in test_urllib.
 
-        cls._save_m2m(info, checkout, cleaned_input)
 
-        return CheckoutCreate(checkout=checkout, created=True)
 
+    def test_splittype(self):
 
+        splittype = urllib.parse._splittype
 
+        self.assertEqual(splittype('type:opaquestring'), ('type', 'opaquestring'))
 
+        self.assertEqual(splittype('opaquestring'), (None, 'opaquestring'))
 
-class CheckoutLinesAdd(BaseMutation):
+        self.assertEqual(splittype(':opaquestring'), (None, ':opaquestring'))
 
-    checkout = graphene.Field(Checkout, description="An updated checkout.")
+        self.assertEqual(splittype('type:'), ('type', ''))
 
+        self.assertEqual(splittype('type:opaque:string'), ('type', 'opaque:string'))
 
 
-    class Arguments:
 
-        checkout_id = graphene.ID(description="The ID of the checkout.", required=True)
+    def test_splithost(self):
 
-        lines = graphene.List(
+        splithost = urllib.parse._splithost
 
-            CheckoutLineInput,
+        self.assertEqual(splithost('//www.example.org:80/foo/bar/baz.html'),
 
-            required=True,
+                         ('www.example.org:80', '/foo/bar/baz.html'))
 
-            description=(
+        self.assertEqual(splithost('//www.example.org:80'),
 
-                "A list of checkout lines, each containing information about "
+                         ('www.example.org:80', ''))
 
-                "an item in the checkout."
+        self.assertEqual(splithost('/foo/bar/baz.html'),
 
-            ),
+                         (None, '/foo/bar/baz.html'))
 
-        )
 
 
+        # bpo-30500: # starts a fragment.
 
-    class Meta:
+        self.assertEqual(splithost('//127.0.0.1#@host.com'),
 
-        description = "Adds a checkout line to the existing checkout."
+                         ('127.0.0.1', '/#@host.com'))
 
-        error_type_class = CheckoutError
+        self.assertEqual(splithost('//127.0.0.1#@host.com:80'),
 
-        error_type_field = "checkout_errors"
+                         ('127.0.0.1', '/#@host.com:80'))
 
+        self.assertEqual(splithost('//127.0.0.1:80#@host.com'),
 
+                         ('127.0.0.1:80', '/#@host.com'))
 
-    @classmethod
 
-    def perform_mutation(cls, _root, info, checkout_id, lines, replace=False):
 
-        checkout = cls.get_node_or_error(
+        # Empty host is returned as empty string.
 
-            info, checkout_id, only_type=Checkout, field="checkout_id"
+        self.assertEqual(splithost("///file"),
 
-        )
+                         ('', '/file'))
 
 
 
-        variant_ids = [line.get("variant_id") for line in lines]
+        # Trailing semicolon, question mark and hash symbol are kept.
 
-        variants = cls.get_nodes_or_error(variant_ids, "variant_id", ProductVariant)
+        self.assertEqual(splithost("//example.net/file;"),
 
-        quantities = [line.get("quantity") for line in lines]
+                         ('example.net', '/file;'))
 
+        self.assertEqual(splithost("//example.net/file?"),
 
+                         ('example.net', '/file?'))
 
-        check_lines_quantity(variants, quantities, checkout.get_country())
+        self.assertEqual(splithost("//example.net/file#"),
 
+                         ('example.net', '/file#'))
 
 
-        if variants and quantities:
 
-            for variant, quantity in zip(variants, quantities):
+    def test_splituser(self):
 
-                try:
+        splituser = urllib.parse._splituser
 
-                    add_variant_to_checkout(
+        self.assertEqual(splituser('User:Pass@www.python.org:080'),
 
-                        checkout, variant, quantity, replace=replace
+                         ('User:Pass', 'www.python.org:080'))
 
-                    )
+        self.assertEqual(splituser('@www.python.org:080'),
 
-                except InsufficientStock as exc:
+                         ('', 'www.python.org:080'))
 
-                    raise ValidationError(
+        self.assertEqual(splituser('www.python.org:080'),
 
-                        f"Insufficient product stock: {exc.item}", code=exc.code
+                         (None, 'www.python.org:080'))
 
-                    )
+        self.assertEqual(splituser('User:Pass@'),
 
+                         ('User:Pass', ''))
 
+        self.assertEqual(splituser('User@example.com:Pass@www.python.org:080'),
 
-        update_checkout_shipping_method_if_invalid(checkout, info.context.discounts)
+                         ('User@example.com:Pass', 'www.python.org:080'))
 
-        recalculate_checkout_discount(checkout, info.context.discounts)
 
 
+    def test_splitpasswd(self):
 
-        return CheckoutLinesAdd(checkout=checkout)
+        # Some of the password examples are not sensible, but it is added to
 
+        # confirming to RFC2617 and addressing issue4675.
 
+        splitpasswd = urllib.parse._splitpasswd
 
+        self.assertEqual(splitpasswd('user:ab'), ('user', 'ab'))
 
+        self.assertEqual(splitpasswd('user:a\nb'), ('user', 'a\nb'))
 
-class CheckoutLinesUpdate(CheckoutLinesAdd):
+        self.assertEqual(splitpasswd('user:a\tb'), ('user', 'a\tb'))
 
-    checkout = graphene.Field(Checkout, description="An updated checkout.")
+        self.assertEqual(splitpasswd('user:a\rb'), ('user', 'a\rb'))
 
+        self.assertEqual(splitpasswd('user:a\fb'), ('user', 'a\fb'))
 
+        self.assertEqual(splitpasswd('user:a\vb'), ('user', 'a\vb'))
 
-    class Meta:
+        self.assertEqual(splitpasswd('user:a:b'), ('user', 'a:b'))
 
-        description = "Updates checkout line in the existing checkout."
+        self.assertEqual(splitpasswd('user:a b'), ('user', 'a b'))
 
-        error_type_class = CheckoutError
+        self.assertEqual(splitpasswd('user 2:ab'), ('user 2', 'ab'))
 
-        error_type_field = "checkout_errors"
+        self.assertEqual(splitpasswd('user+1:a+b'), ('user+1', 'a+b'))
 
+        self.assertEqual(splitpasswd('user:'), ('user', ''))
 
+        self.assertEqual(splitpasswd('user'), ('user', None))
 
-    @classmethod
+        self.assertEqual(splitpasswd(':ab'), ('', 'ab'))
 
-    def perform_mutation(cls, root, info, checkout_id, lines):
 
-        return super().perform_mutation(root, info, checkout_id, lines, replace=True)
 
+    def test_splitport(self):
 
+        splitport = urllib.parse._splitport
 
+        self.assertEqual(splitport('parrot:88'), ('parrot', '88'))
 
+        self.assertEqual(splitport('parrot'), ('parrot', None))
 
-class CheckoutLineDelete(BaseMutation):
+        self.assertEqual(splitport('parrot:'), ('parrot', None))
 
-    checkout = graphene.Field(Checkout, description="An updated checkout.")
+        self.assertEqual(splitport('127.0.0.1'), ('127.0.0.1', None))
 
+        self.assertEqual(splitport('parrot:cheese'), ('parrot:cheese', None))
 
+        self.assertEqual(splitport('[::1]:88'), ('[::1]', '88'))
 
-    class Arguments:
+        self.assertEqual(splitport('[::1]'), ('[::1]', None))
 
-        checkout_id = graphene.ID(description="The ID of the checkout.", required=True)
+        self.assertEqual(splitport(':88'), ('', '88'))
 
-        line_id = graphene.ID(description="ID of the checkout line to delete.")
 
 
+    def test_splitnport(self):
 
-    class Meta:
+        splitnport = urllib.parse._splitnport
 
-        description = "Deletes a CheckoutLine."
+        self.assertEqual(splitnport('parrot:88'), ('parrot', 88))
 
-        error_type_class = CheckoutError
+        self.assertEqual(splitnport('parrot'), ('parrot', -1))
 
-        error_type_field = "checkout_errors"
+        self.assertEqual(splitnport('parrot', 55), ('parrot', 55))
 
+        self.assertEqual(splitnport('parrot:'), ('parrot', -1))
 
+        self.assertEqual(splitnport('parrot:', 55), ('parrot', 55))
 
-    @classmethod
+        self.assertEqual(splitnport('127.0.0.1'), ('127.0.0.1', -1))
 
-    def perform_mutation(cls, _root, info, checkout_id, line_id):
+        self.assertEqual(splitnport('127.0.0.1', 55), ('127.0.0.1', 55))
 
-        checkout = cls.get_node_or_error(
+        self.assertEqual(splitnport('parrot:cheese'), ('parrot', None))
 
-            info, checkout_id, only_type=Checkout, field="checkout_id"
+        self.assertEqual(splitnport('parrot:cheese', 55), ('parrot', None))
 
-        )
 
-        line = cls.get_node_or_error(
 
-            info, line_id, only_type=CheckoutLine, field="line_id"
+    def test_splitquery(self):
 
-        )
+        # Normal cases are exercised by other tests; ensure that we also
 
+        # catch cases with no port specified (testcase ensuring coverage)
 
+        splitquery = urllib.parse._splitquery
 
-        if line and line in checkout.lines.all():
+        self.assertEqual(splitquery('http://python.org/fake?foo=bar'),
 
-            line.delete()
+                         ('http://python.org/fake', 'foo=bar'))
 
+        self.assertEqual(splitquery('http://python.org/fake?foo=bar?'),
 
+                         ('http://python.org/fake?foo=bar', ''))
 
-        update_checkout_shipping_method_if_invalid(checkout, info.context.discounts)
+        self.assertEqual(splitquery('http://python.org/fake'),
 
-        recalculate_checkout_discount(checkout, info.context.discounts)
+                         ('http://python.org/fake', None))
 
+        self.assertEqual(splitquery('?foo=bar'), ('', 'foo=bar'))
 
 
-        return CheckoutLineDelete(checkout=checkout)
 
+    def test_splittag(self):
 
+        splittag = urllib.parse._splittag
 
+        self.assertEqual(splittag('http://example.com?foo=bar#baz'),
 
+                         ('http://example.com?foo=bar', 'baz'))
 
-class CheckoutCustomerAttach(BaseMutation):
+        self.assertEqual(splittag('http://example.com?foo=bar#'),
 
-    checkout = graphene.Field(Checkout, description="An updated checkout.")
+                         ('http://example.com?foo=bar', ''))
 
+        self.assertEqual(splittag('#baz'), ('', 'baz'))
 
+        self.assertEqual(splittag('http://example.com?foo=bar'),
 
-    class Arguments:
+                         ('http://example.com?foo=bar', None))
 
-        checkout_id = graphene.ID(required=True, description="ID of the checkout.")
+        self.assertEqual(splittag('http://example.com?foo=bar#baz#boo'),
 
-        customer_id = graphene.ID(
+                         ('http://example.com?foo=bar#baz', 'boo'))
 
-            required=False,
 
-            description=(
 
-                "The ID of the customer. DEPRECATED: This field is deprecated and will "
+    def test_splitattr(self):
 
-                "be removed in Saleor 2.11. To identify a customer you should "
+        splitattr = urllib.parse._splitattr
 
-                "authenticate with JWT token."
+        self.assertEqual(splitattr('/path;attr1=value1;attr2=value2'),
 
-            ),
+                         ('/path', ['attr1=value1', 'attr2=value2']))
 
-        )
+        self.assertEqual(splitattr('/path;'), ('/path', ['']))
 
+        self.assertEqual(splitattr(';attr1=value1;attr2=value2'),
 
+                         ('', ['attr1=value1', 'attr2=value2']))
 
-    class Meta:
+        self.assertEqual(splitattr('/path'), ('/path', []))
 
-        description = "Sets the customer as the owner of the checkout."
 
-        error_type_class = CheckoutError
 
-        error_type_field = "checkout_errors"
+    def test_splitvalue(self):
 
+        # Normal cases are exercised by other tests; test pathological cases
 
+        # with no key/value pairs. (testcase ensuring coverage)
 
-    @classmethod
+        splitvalue = urllib.parse._splitvalue
 
-    def check_permissions(cls, context):
+        self.assertEqual(splitvalue('foo=bar'), ('foo', 'bar'))
 
-        return context.user.is_authenticated
+        self.assertEqual(splitvalue('foo='), ('foo', ''))
 
+        self.assertEqual(splitvalue('=bar'), ('', 'bar'))
 
+        self.assertEqual(splitvalue('foobar'), ('foobar', None))
 
-    @classmethod
+        self.assertEqual(splitvalue('foo=bar=baz'), ('foo', 'bar=baz'))
 
-    def perform_mutation(cls, _root, info, checkout_id, customer_id=None):
 
-        checkout = cls.get_node_or_error(
 
-            info, checkout_id, only_type=Checkout, field="checkout_id"
+    def test_to_bytes(self):
 
-        )
+        result = urllib.parse._to_bytes('http://www.python.org')
 
+        self.assertEqual(result, 'http://www.python.org')
 
+        self.assertRaises(UnicodeError, urllib.parse._to_bytes,
 
-        # Check if provided customer_id matches with the authenticated user and raise
+                          'http://www.python.org/medi\u00e6val')
 
-        # error if it doesn't. This part can be removed when `customer_id` field is
 
-        # removed.
 
-        if customer_id:
+    def test_unwrap(self):
 
-            current_user_id = graphene.Node.to_global_id("User", info.context.user.id)
+        for wrapped_url in ('<URL:scheme://host/path>', '<scheme://host/path>',
 
-            if current_user_id != customer_id:
+                            'URL:scheme://host/path', 'scheme://host/path'):
 
-                raise PermissionDenied()
+            url = urllib.parse.unwrap(wrapped_url)
 
+            self.assertEqual(url, 'scheme://host/path')
 
 
-        checkout.user = info.context.user
 
-        checkout.save(update_fields=["user", "last_change"])
 
-        return CheckoutCustomerAttach(checkout=checkout)
 
+class DeprecationTest(unittest.TestCase):
 
 
 
+    def test_splittype_deprecation(self):
 
-class CheckoutCustomerDetach(BaseMutation):
+        with self.assertWarns(DeprecationWarning) as cm:
 
-    checkout = graphene.Field(Checkout, description="An updated checkout.")
+            urllib.parse.splittype('')
 
+        self.assertEqual(str(cm.warning),
 
+                         'urllib.parse.splittype() is deprecated as of 3.8, '
 
-    class Arguments:
+                         'use urllib.parse.urlparse() instead')
 
-        checkout_id = graphene.ID(description="Checkout ID.", required=True)
 
 
+    def test_splithost_deprecation(self):
 
-    class Meta:
+        with self.assertWarns(DeprecationWarning) as cm:
 
-        description = "Removes the user assigned as the owner of the checkout."
+            urllib.parse.splithost('')
 
-        error_type_class = CheckoutError
+        self.assertEqual(str(cm.warning),
 
-        error_type_field = "checkout_errors"
+                         'urllib.parse.splithost() is deprecated as of 3.8, '
 
+                         'use urllib.parse.urlparse() instead')
 
 
-    @classmethod
 
-    def check_permissions(cls, context):
+    def test_splituser_deprecation(self):
 
-        return context.user.is_authenticated
+        with self.assertWarns(DeprecationWarning) as cm:
 
+            urllib.parse.splituser('')
 
+        self.assertEqual(str(cm.warning),
 
-    @classmethod
+                         'urllib.parse.splituser() is deprecated as of 3.8, '
 
-    def perform_mutation(cls, _root, info, checkout_id):
+                         'use urllib.parse.urlparse() instead')
 
-        checkout = cls.get_node_or_error(
 
-            info, checkout_id, only_type=Checkout, field="checkout_id"
 
-        )
+    def test_splitpasswd_deprecation(self):
 
+        with self.assertWarns(DeprecationWarning) as cm:
 
+            urllib.parse.splitpasswd('')
 
-        # Raise error if the current user doesn't own the checkout of the given ID.
+        self.assertEqual(str(cm.warning),
 
-        if checkout.user and checkout.user != info.context.user:
+                         'urllib.parse.splitpasswd() is deprecated as of 3.8, '
 
-            raise PermissionDenied()
+                         'use urllib.parse.urlparse() instead')
 
 
 
-        checkout.user = None
+    def test_splitport_deprecation(self):
 
-        checkout.save(update_fields=["user", "last_change"])
+        with self.assertWarns(DeprecationWarning) as cm:
 
-        return CheckoutCustomerDetach(checkout=checkout)
+            urllib.parse.splitport('')
 
+        self.assertEqual(str(cm.warning),
 
+                         'urllib.parse.splitport() is deprecated as of 3.8, '
 
+                         'use urllib.parse.urlparse() instead')
 
 
-class CheckoutShippingAddressUpdate(BaseMutation, I18nMixin):
 
-    checkout = graphene.Field(Checkout, description="An updated checkout.")
+    def test_splitnport_deprecation(self):
 
+        with self.assertWarns(DeprecationWarning) as cm:
 
+            urllib.parse.splitnport('')
 
-    class Arguments:
+        self.assertEqual(str(cm.warning),
 
-        checkout_id = graphene.ID(required=True, description="ID of the checkout.")
+                         'urllib.parse.splitnport() is deprecated as of 3.8, '
 
-        shipping_address = AddressInput(
+                         'use urllib.parse.urlparse() instead')
 
-            required=True,
 
-            description="The mailing address to where the checkout will be shipped.",
 
-        )
+    def test_splitquery_deprecation(self):
 
+        with self.assertWarns(DeprecationWarning) as cm:
 
+            urllib.parse.splitquery('')
 
-    class Meta:
+        self.assertEqual(str(cm.warning),
 
-        description = "Update shipping address in the existing checkout."
+                         'urllib.parse.splitquery() is deprecated as of 3.8, '
 
-        error_type_class = CheckoutError
+                         'use urllib.parse.urlparse() instead')
 
-        error_type_field = "checkout_errors"
 
 
+    def test_splittag_deprecation(self):
 
-    @classmethod
+        with self.assertWarns(DeprecationWarning) as cm:
 
-    def perform_mutation(cls, _root, info, checkout_id, shipping_address):
+            urllib.parse.splittag('')
 
-        pk = from_global_id_strict_type(checkout_id, Checkout, field="checkout_id")
+        self.assertEqual(str(cm.warning),
 
+                         'urllib.parse.splittag() is deprecated as of 3.8, '
 
+                         'use urllib.parse.urlparse() instead')
 
-        try:
 
-            checkout = models.Checkout.objects.prefetch_related(
 
-                "lines__variant__product__product_type"
+    def test_splitattr_deprecation(self):
 
-            ).get(pk=pk)
+        with self.assertWarns(DeprecationWarning) as cm:
 
-        except ObjectDoesNotExist:
+            urllib.parse.splitattr('')
 
-            raise ValidationError(
+        self.assertEqual(str(cm.warning),
 
-                {
+                         'urllib.parse.splitattr() is deprecated as of 3.8, '
 
-                    "checkout_id": ValidationError(
+                         'use urllib.parse.urlparse() instead')
 
-                        f"Couldn't resolve to a node: {checkout_id}",
 
-                        code=CheckoutErrorCode.NOT_FOUND,
 
-                    )
+    def test_splitvalue_deprecation(self):
 
-                }
+        with self.assertWarns(DeprecationWarning) as cm:
 
-            )
+            urllib.parse.splitvalue('')
 
+        self.assertEqual(str(cm.warning),
 
+                         'urllib.parse.splitvalue() is deprecated as of 3.8, '
 
-        if not checkout.is_shipping_required():
+                         'use urllib.parse.parse_qsl() instead')
 
-            raise ValidationError(
 
-                {
 
-                    "shipping_address": ValidationError(
+    def test_to_bytes_deprecation(self):
 
-                        ERROR_DOES_NOT_SHIP,
+        with self.assertWarns(DeprecationWarning) as cm:
 
-                        code=CheckoutErrorCode.SHIPPING_NOT_REQUIRED,
+            urllib.parse.to_bytes('')
 
-                    )
+        self.assertEqual(str(cm.warning),
 
-                }
+                         'urllib.parse.to_bytes() is deprecated as of 3.8')
 
-            )
 
 
 
-        shipping_address = cls.validate_address(
 
-            shipping_address, instance=checkout.shipping_address, info=info
+if __name__ == "__main__":
 
-        )
-
-
-
-        update_checkout_shipping_method_if_invalid(checkout, info.context.discounts)
-
-
-
-        with transaction.atomic():
-
-            shipping_address.save()
-
-            change_shipping_address_in_checkout(checkout, shipping_address)
-
-        recalculate_checkout_discount(checkout, info.context.discounts)
-
-
-
-        return CheckoutShippingAddressUpdate(checkout=checkout)
-
-
-
-
-
-class CheckoutBillingAddressUpdate(CheckoutShippingAddressUpdate):
-
-    checkout = graphene.Field(Checkout, description="An updated checkout.")
-
-
-
-    class Arguments:
-
-        checkout_id = graphene.ID(required=True, description="ID of the checkout.")
-
-        billing_address = AddressInput(
-
-            required=True, description="The billing address of the checkout."
-
-        )
-
-
-
-    class Meta:
-
-        description = "Update billing address in the existing checkout."
-
-        error_type_class = CheckoutError
-
-        error_type_field = "checkout_errors"
-
-
-
-    @classmethod
-
-    def perform_mutation(cls, _root, info, checkout_id, billing_address):
-
-        checkout = cls.get_node_or_error(
-
-            info, checkout_id, only_type=Checkout, field="checkout_id"
-
-        )
-
-
-
-        billing_address = cls.validate_address(
-
-            billing_address, instance=checkout.billing_address, info=info
-
-        )
-
-        with transaction.atomic():
-
-            billing_address.save()
-
-            change_billing_address_in_checkout(checkout, billing_address)
-
-        return CheckoutBillingAddressUpdate(checkout=checkout)
-
-
-
-
-
-class CheckoutEmailUpdate(BaseMutation):
-
-    checkout = graphene.Field(Checkout, description="An updated checkout.")
-
-
-
-    class Arguments:
-
-        checkout_id = graphene.ID(description="Checkout ID.")
-
-        email = graphene.String(required=True, description="email.")
-
-
-
-    class Meta:
-
-        description = "Updates email address in the existing checkout object."
-
-        error_type_class = CheckoutError
-
-        error_type_field = "checkout_errors"
-
-
-
-    @classmethod
-
-    def perform_mutation(cls, _root, info, checkout_id, email):
-
-        checkout = cls.get_node_or_error(
-
-            info, checkout_id, only_type=Checkout, field="checkout_id"
-
-        )
-
-
-
-        checkout.email = email
-
-        cls.clean_instance(info, checkout)
-
-        checkout.save(update_fields=["email", "last_change"])
-
-        return CheckoutEmailUpdate(checkout=checkout)
-
-
-
-
-
-class CheckoutShippingMethodUpdate(BaseMutation):
-
-    checkout = graphene.Field(Checkout, description="An updated checkout.")
-
-
-
-    class Arguments:
-
-        checkout_id = graphene.ID(description="Checkout ID.")
-
-        shipping_method_id = graphene.ID(required=True, description="Shipping method.")
-
-
-
-    class Meta:
-
-        description = "Updates the shipping address of the checkout."
-
-        error_type_class = CheckoutError
-
-        error_type_field = "checkout_errors"
-
-
-
-    @classmethod
-
-    def perform_mutation(cls, _root, info, checkout_id, shipping_method_id):
-
-        pk = from_global_id_strict_type(
-
-            checkout_id, only_type=Checkout, field="checkout_id"
-
-        )
-
-
-
-        try:
-
-            checkout = models.Checkout.objects.prefetch_related(
-
-                "lines__variant__product__collections",
-
-                "lines__variant__product__product_type",
-
-            ).get(pk=pk)
-
-        except ObjectDoesNotExist:
-
-            raise ValidationError(
-
-                {
-
-                    "checkout_id": ValidationError(
-
-                        f"Couldn't resolve to a node: {checkout_id}",
-
-                        code=CheckoutErrorCode.NOT_FOUND,
-
-                    )
-
-                }
-
-            )
-
-
-
-        if not checkout.is_shipping_required():
-
-            raise ValidationError(
-
-                {
-
-                    "shipping_method": ValidationError(
-
-                        ERROR_DOES_NOT_SHIP,
-
-                        code=CheckoutErrorCode.SHIPPING_NOT_REQUIRED,
-
-                    )
-
-                }
-
-            )
-
-
-
-        shipping_method = cls.get_node_or_error(
-
-            info,
-
-            shipping_method_id,
-
-            only_type=ShippingMethod,
-
-            field="shipping_method_id",
-
-        )
-
-
-
-        shipping_method_is_valid = clean_shipping_method(
-
-            checkout=checkout, method=shipping_method, discounts=info.context.discounts
-
-        )
-
-
-
-        if not shipping_method_is_valid:
-
-            raise ValidationError(
-
-                {
-
-                    "shipping_method": ValidationError(
-
-                        "This shipping method is not applicable.",
-
-                        code=CheckoutErrorCode.SHIPPING_METHOD_NOT_APPLICABLE,
-
-                    )
-
-                }
-
-            )
-
-
-
-        checkout.shipping_method = shipping_method
-
-        checkout.save(update_fields=["shipping_method", "last_change"])
-
-        recalculate_checkout_discount(checkout, info.context.discounts)
-
-
-
-        return CheckoutShippingMethodUpdate(checkout=checkout)
-
-
-
-
-
-class CheckoutComplete(BaseMutation):
-
-    order = graphene.Field(Order, description="Placed order.")
-
-
-
-    class Arguments:
-
-        checkout_id = graphene.ID(description="Checkout ID.", required=True)
-
-        store_source = graphene.Boolean(
-
-            default_value=False,
-
-            description=(
-
-                "Determines whether to store the payment source for future usage."
-
-            ),
-
-        )
-
-        redirect_url = graphene.String(
-
-            required=False,
-
-            description=(
-
-                "URL of a view where users should be redirected to "
-
-                "see the order details. URL in RFC 1808 format."
-
-            ),
-
-        )
-
-
-
-    class Meta:
-
-        description = (
-
-            "Completes the checkout. As a result a new order is created and "
-
-            "a payment charge is made. This action requires a successful "
-
-            "payment before it can be performed."
-
-        )
-
-        error_type_class = CheckoutError
-
-        error_type_field = "checkout_errors"
-
-
-
-    @classmethod
-
-    def perform_mutation(cls, _root, info, checkout_id, store_source, **data):
-
-        checkout = cls.get_node_or_error(
-
-            info,
-
-            checkout_id,
-
-            only_type=Checkout,
-
-            field="checkout_id",
-
-            qs=models.Checkout.objects.prefetch_related(
-
-                "gift_cards",
-
-                "lines",
-
-                Prefetch(
-
-                    "payments",
-
-                    queryset=payment_models.Payment.objects.prefetch_related(
-
-                        "order", "order__lines"
-
-                    ),
-
-                ),
-
-            ).select_related("shipping_method", "shipping_method__shipping_zone"),
-
-        )
-
-
-
-        discounts = info.context.discounts
-
-        user = info.context.user
-
-        clean_checkout(checkout, discounts)
-
-
-
-        payment = checkout.get_last_active_payment()
-
-
-
-        with transaction.atomic():
-
-            try:
-
-                order_data = prepare_order_data(
-
-                    checkout=checkout,
-
-                    tracking_code=analytics.get_client_id(info.context),
-
-                    discounts=discounts,
-
-                )
-
-            except InsufficientStock as e:
-
-                raise ValidationError(
-
-                    f"Insufficient product stock: {e.item}", code=e.code
-
-                )
-
-            except voucher_model.NotApplicable:
-
-                raise ValidationError(
-
-                    "Voucher not applicable",
-
-                    code=CheckoutErrorCode.VOUCHER_NOT_APPLICABLE,
-
-                )
-
-            except TaxError as tax_error:
-
-                return ValidationError(
-
-                    "Unable to calculate taxes - %s" % str(tax_error),
-
-                    code=CheckoutErrorCode.TAX_ERROR,
-
-                )
-
-
-
-        billing_address = order_data["billing_address"]
-
-        shipping_address = order_data.get("shipping_address", None)
-
-
-
-        billing_address = AddressData(**billing_address.as_data())
-
-
-
-        if shipping_address is not None:
-
-            shipping_address = AddressData(**shipping_address.as_data())
-
-
-
-        try:
-
-            txn = gateway.process_payment(
-
-                payment=payment, token=payment.token, store_source=store_source
-
-            )
-
-
-
-            if not txn.is_success:
-
-                raise PaymentError(txn.error)
-
-
-
-        except PaymentError as e:
-
-            abort_order_data(order_data)
-
-            raise ValidationError(str(e), code=CheckoutErrorCode.PAYMENT_ERROR)
-
-
-
-        if txn.customer_id and user.is_authenticated:
-
-            store_customer_id(user, payment.gateway, txn.customer_id)
-
-
-
-        redirect_url = data.get("redirect_url", "")
-
-        if redirect_url:
-
-            try:
-
-                validate_storefront_url(redirect_url)
-
-            except ValidationError as error:
-
-                raise ValidationError(
-
-                    {"redirect_url": error}, code=AccountErrorCode.INVALID
-
-                )
-
-
-
-        # create the order into the database
-
-        order = create_order(
-
-            checkout=checkout,
-
-            order_data=order_data,
-
-            user=user,
-
-            redirect_url=redirect_url,
-
-        )
-
-
-
-        # remove checkout after order is successfully paid
-
-        checkout.delete()
-
-
-
-        # return the success response with the newly created order data
-
-        return CheckoutComplete(order=order)
-
-
-
-
-
-class CheckoutAddPromoCode(BaseMutation):
-
-    checkout = graphene.Field(
-
-        Checkout, description="The checkout with the added gift card or voucher."
-
-    )
-
-
-
-    class Arguments:
-
-        checkout_id = graphene.ID(description="Checkout ID.", required=True)
-
-        promo_code = graphene.String(
-
-            description="Gift card code or voucher code.", required=True
-
-        )
-
-
-
-    class Meta:
-
-        description = "Adds a gift card or a voucher to a checkout."
-
-        error_type_class = CheckoutError
-
-        error_type_field = "checkout_errors"
-
-
-
-    @classmethod
-
-    def perform_mutation(cls, _root, info, checkout_id, promo_code):
-
-        checkout = cls.get_node_or_error(
-
-            info, checkout_id, only_type=Checkout, field="checkout_id"
-
-        )
-
-        add_promo_code_to_checkout(checkout, promo_code, info.context.discounts)
-
-        return CheckoutAddPromoCode(checkout=checkout)
-
-
-
-
-
-class CheckoutRemovePromoCode(BaseMutation):
-
-    checkout = graphene.Field(
-
-        Checkout, description="The checkout with the removed gift card or voucher."
-
-    )
-
-
-
-    class Arguments:
-
-        checkout_id = graphene.ID(description="Checkout ID.", required=True)
-
-        promo_code = graphene.String(
-
-            description="Gift card code or voucher code.", required=True
-
-        )
-
-
-
-    class Meta:
-
-        description = "Remove a gift card or a voucher from a checkout."
-
-        error_type_class = CheckoutError
-
-        error_type_field = "checkout_errors"
-
-
-
-    @classmethod
-
-    def perform_mutation(cls, _root, info, checkout_id, promo_code):
-
-        checkout = cls.get_node_or_error(
-
-            info, checkout_id, only_type=Checkout, field="checkout_id"
-
-        )
-
-        remove_promo_code_from_checkout(checkout, promo_code)
-
-        return CheckoutRemovePromoCode(checkout=checkout)
-
-
-
-
-
-class CheckoutUpdateMeta(UpdateMetaBaseMutation):
-
-    class Meta:
-
-        description = "Updates metadata for checkout."
-
-        permissions = (OrderPermissions.MANAGE_ORDERS,)
-
-        model = models.Checkout
-
-        public = True
-
-        error_type_class = CheckoutError
-
-        error_type_field = "checkout_errors"
-
-
-
-
-
-class CheckoutUpdatePrivateMeta(UpdateMetaBaseMutation):
-
-    class Meta:
-
-        description = "Updates private metadata for checkout."
-
-        permissions = (OrderPermissions.MANAGE_ORDERS,)
-
-        model = models.Checkout
-
-        public = False
-
-        error_type_class = CheckoutError
-
-        error_type_field = "checkout_errors"
-
-
-
-
-
-class CheckoutClearMeta(ClearMetaBaseMutation):
-
-    class Meta:
-
-        description = "Clear metadata for checkout."
-
-        permissions = (OrderPermissions.MANAGE_ORDERS,)
-
-        model = models.Checkout
-
-        public = True
-
-        error_type_class = CheckoutError
-
-        error_type_field = "checkout_errors"
-
-
-
-
-
-class CheckoutClearPrivateMeta(ClearMetaBaseMutation):
-
-    class Meta:
-
-        description = "Clear private metadata for checkout."
-
-        permissions = (OrderPermissions.MANAGE_ORDERS,)
-
-        model = models.Checkout
-
-        public = False
-
-        error_type_class = CheckoutError
-
-        error_type_field = "checkout_errors"
+    unittest.main()

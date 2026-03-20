@@ -2,1102 +2,446 @@
 # Safety: safe
 # Category: safe
 
-#!/usr/bin/env python
+# This file is dual licensed under the terms of the Apache License, Version
 
+# 2.0, and the BSD License. See the LICENSE file in the root of this repository
 
+# for complete details.
 
-# Copyright 2012 - 2017, New York University and the TUF contributors
 
-# SPDX-License-Identifier: MIT OR Apache-2.0
 
+from __future__ import absolute_import, division, print_function
 
 
-"""
 
-<Program Name>
+from cryptography import utils
 
-  test_sig.py
+from cryptography.exceptions import InvalidTag, UnsupportedAlgorithm, _Reasons
 
+from cryptography.hazmat.primitives import ciphers
 
+from cryptography.hazmat.primitives.ciphers import modes
 
-<Author>
 
-  Geremy Condra
 
-  Vladimir Diaz <vladimir.v.diaz@gmail.com>
 
 
+@utils.register_interface(ciphers.CipherContext)
 
-<Started>
+@utils.register_interface(ciphers.AEADCipherContext)
 
-  February 28, 2012.  Based on a previous version of this module.
+@utils.register_interface(ciphers.AEADEncryptionContext)
 
+@utils.register_interface(ciphers.AEADDecryptionContext)
 
+class _CipherContext(object):
 
-<Copyright>
+    _ENCRYPT = 1
 
-  See LICENSE-MIT OR LICENSE for licensing information.
+    _DECRYPT = 0
 
 
 
-<Purpose>
+    def __init__(self, backend, cipher, mode, operation):
 
-  Test cases for sig.py.
+        self._backend = backend
 
-"""
+        self._cipher = cipher
 
+        self._mode = mode
 
+        self._operation = operation
 
-# Help with Python 3 compatibility, where the print statement is a function, an
+        self._tag = None
 
-# implicit relative import is invalid, and the '/' operator performs true
 
-# division.  Example:  print 'hello world' raises a 'SyntaxError' exception.
 
-from __future__ import print_function
+        if isinstance(self._cipher, ciphers.BlockCipherAlgorithm):
 
-from __future__ import absolute_import
+            self._block_size_bytes = self._cipher.block_size // 8
 
-from __future__ import division
+        else:
 
-from __future__ import unicode_literals
+            self._block_size_bytes = 1
 
 
 
-import unittest
+        ctx = self._backend._lib.EVP_CIPHER_CTX_new()
 
-import logging
+        ctx = self._backend._ffi.gc(
 
-import copy
+            ctx, self._backend._lib.EVP_CIPHER_CTX_free
 
+        )
 
 
-import tuf
 
-import tuf.log
+        registry = self._backend._cipher_registry
 
-import tuf.formats
+        try:
 
-import tuf.keydb
+            adapter = registry[type(cipher), type(mode)]
 
-import tuf.roledb
+        except KeyError:
 
-import tuf.sig
+            raise UnsupportedAlgorithm(
 
-import tuf.exceptions
+                "cipher {0} in {1} mode is not supported "
 
+                "by this backend.".format(
 
+                    cipher.name, mode.name if mode else mode),
 
-import securesystemslib
+                _Reasons.UNSUPPORTED_CIPHER
 
-import securesystemslib.keys
+            )
 
 
 
-logger = logging.getLogger('tuf.test_sig')
+        evp_cipher = adapter(self._backend, cipher, mode)
 
+        if evp_cipher == self._backend._ffi.NULL:
 
+            raise UnsupportedAlgorithm(
 
-# Setup the keys to use in our test cases.
+                "cipher {0} in {1} mode is not supported "
 
-KEYS = []
+                "by this backend.".format(
 
-for _ in range(3):
+                    cipher.name, mode.name if mode else mode),
 
-  KEYS.append(securesystemslib.keys.generate_rsa_key(2048))
+                _Reasons.UNSUPPORTED_CIPHER
 
+            )
 
 
 
+        if isinstance(mode, modes.ModeWithInitializationVector):
 
+            iv_nonce = mode.initialization_vector
 
+        elif isinstance(mode, modes.ModeWithTweak):
 
-class TestSig(unittest.TestCase):
+            iv_nonce = mode.tweak
 
-  def setUp(self):
+        elif isinstance(mode, modes.ModeWithNonce):
 
-    pass
+            iv_nonce = mode.nonce
 
+        elif isinstance(cipher, modes.ModeWithNonce):
 
+            iv_nonce = cipher.nonce
 
-  def tearDown(self):
+        else:
 
-    tuf.roledb.clear_roledb()
+            iv_nonce = self._backend._ffi.NULL
 
-    tuf.keydb.clear_keydb()
+        # begin init with cipher and operation type
 
+        res = self._backend._lib.EVP_CipherInit_ex(ctx, evp_cipher,
 
+                                                   self._backend._ffi.NULL,
 
+                                                   self._backend._ffi.NULL,
 
+                                                   self._backend._ffi.NULL,
 
-  def test_get_signature_status_no_role(self):
+                                                   operation)
 
-    signable = {'signed': 'test', 'signatures': []}
+        self._backend.openssl_assert(res != 0)
 
+        # set the key length to handle variable key ciphers
 
+        res = self._backend._lib.EVP_CIPHER_CTX_set_key_length(
 
-    # A valid, but empty signature status.
+            ctx, len(cipher.key)
 
-    sig_status = tuf.sig.get_signature_status(signable)
+        )
 
-    self.assertTrue(tuf.formats.SIGNATURESTATUS_SCHEMA.matches(sig_status))
+        self._backend.openssl_assert(res != 0)
 
+        if isinstance(mode, modes.GCM):
 
+            res = self._backend._lib.EVP_CIPHER_CTX_ctrl(
 
-    self.assertEqual(0, sig_status['threshold'])
+                ctx, self._backend._lib.EVP_CTRL_AEAD_SET_IVLEN,
 
-    self.assertEqual([], sig_status['good_sigs'])
+                len(iv_nonce), self._backend._ffi.NULL
 
-    self.assertEqual([], sig_status['bad_sigs'])
+            )
 
-    self.assertEqual([], sig_status['unknown_sigs'])
+            self._backend.openssl_assert(res != 0)
 
-    self.assertEqual([], sig_status['untrusted_sigs'])
+            if mode.tag is not None:
 
-    self.assertEqual([], sig_status['unknown_signing_schemes'])
+                res = self._backend._lib.EVP_CIPHER_CTX_ctrl(
 
+                    ctx, self._backend._lib.EVP_CTRL_AEAD_SET_TAG,
 
+                    len(mode.tag), mode.tag
 
-    # A valid signable, but non-existent role argument.
+                )
 
-    self.assertRaises(tuf.exceptions.UnknownRoleError,
+                self._backend.openssl_assert(res != 0)
 
-      tuf.sig.get_signature_status, signable, 'unknown_role')
+                self._tag = mode.tag
 
+            elif (
 
+                self._operation == self._DECRYPT and
 
-    # Should verify we are not adding a duplicate signature
+                self._backend._lib.CRYPTOGRAPHY_OPENSSL_LESS_THAN_102 and
 
-    # when doing the following action.  Here we know 'signable'
+                not self._backend._lib.CRYPTOGRAPHY_IS_LIBRESSL
 
-    # has only one signature so it's okay.
+            ):
 
-    signed = securesystemslib.formats.encode_canonical(signable['signed']).encode('utf-8')
+                raise NotImplementedError(
 
-    signable['signatures'].append(securesystemslib.keys.create_signature(
+                    "delayed passing of GCM tag requires OpenSSL >= 1.0.2."
 
-                                  KEYS[0], signed))
+                    " To use this feature please update OpenSSL"
 
+                )
 
 
-    tuf.keydb.add_key(KEYS[0])
 
+        # pass key/iv
 
+        res = self._backend._lib.EVP_CipherInit_ex(
 
-    # Improperly formatted role.
+            ctx,
 
-    self.assertRaises(securesystemslib.exceptions.FormatError,
+            self._backend._ffi.NULL,
 
-      tuf.sig.get_signature_status, signable, 1)
+            self._backend._ffi.NULL,
 
+            cipher.key,
 
+            iv_nonce,
 
-    # Not allowed to call verify() without having specified a role.
+            operation
 
-    args = (signable, None)
+        )
 
-    self.assertRaises(securesystemslib.exceptions.Error, tuf.sig.verify, *args)
+        self._backend.openssl_assert(res != 0)
 
+        # We purposely disable padding here as it's handled higher up in the
 
+        # API.
 
-    # Done.  Let's remove the added key(s) from the key database.
+        self._backend._lib.EVP_CIPHER_CTX_set_padding(ctx, 0)
 
-    tuf.keydb.remove_key(KEYS[0]['keyid'])
+        self._ctx = ctx
 
 
 
+    def update(self, data):
 
+        buf = bytearray(len(data) + self._block_size_bytes - 1)
 
-  def test_get_signature_status_bad_sig(self):
+        n = self.update_into(data, buf)
 
-    signable = {'signed' : 'test', 'signatures' : []}
+        return bytes(buf[:n])
 
-    signed = securesystemslib.formats.encode_canonical(signable['signed']).encode('utf-8')
 
 
+    def update_into(self, data, buf):
 
-    signable['signatures'].append(securesystemslib.keys.create_signature(
+        if len(buf) < (len(data) + self._block_size_bytes - 1):
 
-                                  KEYS[0], signed))
+            raise ValueError(
 
-    signable['signed'] += 'signature no longer matches signed data'
+                "buffer must be at least {0} bytes for this "
 
+                "payload".format(len(data) + self._block_size_bytes - 1)
 
+            )
 
-    tuf.keydb.add_key(KEYS[0])
 
-    threshold = 1
 
+        buf = self._backend._ffi.cast(
 
+            "unsigned char *", self._backend._ffi.from_buffer(buf)
 
-    roleinfo = tuf.formats.build_dict_conforming_to_schema(
+        )
 
-        tuf.formats.ROLE_SCHEMA, keyids=[KEYS[0]['keyid']], threshold=threshold)
+        outlen = self._backend._ffi.new("int *")
 
+        res = self._backend._lib.EVP_CipherUpdate(self._ctx, buf, outlen,
 
+                                                  data, len(data))
 
-    tuf.roledb.add_role('Root', roleinfo)
+        self._backend.openssl_assert(res != 0)
 
+        return outlen[0]
 
 
-    sig_status = tuf.sig.get_signature_status(signable, 'Root')
 
+    def finalize(self):
 
+        # OpenSSL 1.0.1 on Ubuntu 12.04 (and possibly other distributions)
 
-    self.assertEqual(1, sig_status['threshold'])
+        # appears to have a bug where you must make at least one call to update
 
-    self.assertEqual([], sig_status['good_sigs'])
+        # even if you are only using authenticate_additional_data or the
 
-    self.assertEqual([KEYS[0]['keyid']], sig_status['bad_sigs'])
+        # GCM tag will be wrong. An (empty) call to update resolves this
 
-    self.assertEqual([], sig_status['unknown_sigs'])
+        # and is harmless for all other versions of OpenSSL.
 
-    self.assertEqual([], sig_status['untrusted_sigs'])
+        if isinstance(self._mode, modes.GCM):
 
-    self.assertEqual([], sig_status['unknown_signing_schemes'])
+            self.update(b"")
 
 
 
-    self.assertFalse(tuf.sig.verify(signable, 'Root'))
+        if (
 
+            self._operation == self._DECRYPT and
 
+            isinstance(self._mode, modes.ModeWithAuthenticationTag) and
 
-    # Done.  Let's remove the added key(s) from the key database.
+            self.tag is None
 
-    tuf.keydb.remove_key(KEYS[0]['keyid'])
+        ):
 
-    # Remove the role.
+            raise ValueError(
 
-    tuf.roledb.remove_role('Root')
+                "Authentication tag must be provided when decrypting."
 
+            )
 
 
 
+        buf = self._backend._ffi.new("unsigned char[]", self._block_size_bytes)
 
-  def test_get_signature_status_unknown_signing_scheme(self):
+        outlen = self._backend._ffi.new("int *")
 
-    signable = {'signed' : 'test', 'signatures' : []}
+        res = self._backend._lib.EVP_CipherFinal_ex(self._ctx, buf, outlen)
 
-    signed = securesystemslib.formats.encode_canonical(signable['signed']).encode('utf-8')
+        if res == 0:
 
+            errors = self._backend._consume_errors()
 
 
-    signable['signatures'].append(securesystemslib.keys.create_signature(
 
-                                  KEYS[0], signed))
+            if not errors and isinstance(self._mode, modes.GCM):
 
+                raise InvalidTag
 
 
-    valid_scheme = KEYS[0]['scheme']
 
-    KEYS[0]['scheme'] = 'unknown_signing_scheme'
+            self._backend.openssl_assert(
 
-    tuf.keydb.add_key(KEYS[0])
+                errors[0]._lib_reason_match(
 
-    threshold = 1
+                    self._backend._lib.ERR_LIB_EVP,
 
+                    self._backend._lib.EVP_R_DATA_NOT_MULTIPLE_OF_BLOCK_LENGTH
 
+                )
 
-    roleinfo = tuf.formats.build_dict_conforming_to_schema(
+            )
 
-        tuf.formats.ROLE_SCHEMA, keyids=[KEYS[0]['keyid']], threshold=threshold)
+            raise ValueError(
 
+                "The length of the provided data is not a multiple of "
 
+                "the block length."
 
-    tuf.roledb.add_role('root', roleinfo)
+            )
 
 
 
-    sig_status = tuf.sig.get_signature_status(signable, 'root')
+        if (isinstance(self._mode, modes.GCM) and
 
+           self._operation == self._ENCRYPT):
 
+            tag_buf = self._backend._ffi.new(
 
-    self.assertEqual(1, sig_status['threshold'])
+                "unsigned char[]", self._block_size_bytes
 
-    self.assertEqual([], sig_status['good_sigs'])
+            )
 
-    self.assertEqual([], sig_status['bad_sigs'])
+            res = self._backend._lib.EVP_CIPHER_CTX_ctrl(
 
-    self.assertEqual([], sig_status['unknown_sigs'])
+                self._ctx, self._backend._lib.EVP_CTRL_AEAD_GET_TAG,
 
-    self.assertEqual([], sig_status['untrusted_sigs'])
+                self._block_size_bytes, tag_buf
 
-    self.assertEqual([KEYS[0]['keyid']],
+            )
 
-                    sig_status['unknown_signing_schemes'])
+            self._backend.openssl_assert(res != 0)
 
+            self._tag = self._backend._ffi.buffer(tag_buf)[:]
 
 
-    self.assertFalse(tuf.sig.verify(signable, 'root'))
 
+        res = self._backend._lib.EVP_CIPHER_CTX_cleanup(self._ctx)
 
+        self._backend.openssl_assert(res == 1)
 
-    # Done.  Let's remove the added key(s) from the key database.
+        return self._backend._ffi.buffer(buf)[:outlen[0]]
 
-    KEYS[0]['scheme'] = valid_scheme
 
-    tuf.keydb.remove_key(KEYS[0]['keyid'])
 
-    # Remove the role.
+    def finalize_with_tag(self, tag):
 
-    tuf.roledb.remove_role('root')
+        if (
 
+            self._backend._lib.CRYPTOGRAPHY_OPENSSL_LESS_THAN_102 and
 
+            not self._backend._lib.CRYPTOGRAPHY_IS_LIBRESSL
 
+        ):
 
+            raise NotImplementedError(
 
-  def test_get_signature_status_single_key(self):
+                "finalize_with_tag requires OpenSSL >= 1.0.2. To use this "
 
-    signable = {'signed' : 'test', 'signatures' : []}
+                "method please update OpenSSL"
 
-    signed = securesystemslib.formats.encode_canonical(signable['signed']).encode('utf-8')
+            )
 
+        if len(tag) < self._mode._min_tag_length:
 
+            raise ValueError(
 
-    signable['signatures'].append(securesystemslib.keys.create_signature(
+                "Authentication tag must be {0} bytes or longer.".format(
 
-                                  KEYS[0], signed))
+                    self._mode._min_tag_length)
 
+            )
 
+        res = self._backend._lib.EVP_CIPHER_CTX_ctrl(
 
-    threshold = 1
+            self._ctx, self._backend._lib.EVP_CTRL_AEAD_SET_TAG,
 
+            len(tag), tag
 
+        )
 
-    roleinfo = tuf.formats.build_dict_conforming_to_schema(
+        self._backend.openssl_assert(res != 0)
 
-        tuf.formats.ROLE_SCHEMA, keyids=[KEYS[0]['keyid']], threshold=threshold)
+        self._tag = tag
 
+        return self.finalize()
 
 
-    tuf.roledb.add_role('Root', roleinfo)
 
-    tuf.keydb.add_key(KEYS[0])
+    def authenticate_additional_data(self, data):
 
+        outlen = self._backend._ffi.new("int *")
 
+        res = self._backend._lib.EVP_CipherUpdate(
 
-    sig_status = tuf.sig.get_signature_status(signable, 'Root')
+            self._ctx, self._backend._ffi.NULL, outlen, data, len(data)
 
+        )
 
+        self._backend.openssl_assert(res != 0)
 
-    self.assertEqual(1, sig_status['threshold'])
 
-    self.assertEqual([KEYS[0]['keyid']], sig_status['good_sigs'])
 
-    self.assertEqual([], sig_status['bad_sigs'])
-
-    self.assertEqual([], sig_status['unknown_sigs'])
-
-    self.assertEqual([], sig_status['untrusted_sigs'])
-
-    self.assertEqual([], sig_status['unknown_signing_schemes'])
-
-
-
-    self.assertTrue(tuf.sig.verify(signable, 'Root'))
-
-
-
-    # Test for an unknown signature when 'role' is left unspecified.
-
-    sig_status = tuf.sig.get_signature_status(signable)
-
-
-
-    self.assertEqual(0, sig_status['threshold'])
-
-    self.assertEqual([], sig_status['good_sigs'])
-
-    self.assertEqual([], sig_status['bad_sigs'])
-
-    self.assertEqual([KEYS[0]['keyid']], sig_status['unknown_sigs'])
-
-    self.assertEqual([], sig_status['untrusted_sigs'])
-
-    self.assertEqual([], sig_status['unknown_signing_schemes'])
-
-
-
-    # Done.  Let's remove the added key(s) from the key database.
-
-    tuf.keydb.remove_key(KEYS[0]['keyid'])
-
-    # Remove the role.
-
-    tuf.roledb.remove_role('Root')
-
-
-
-
-
-  def test_get_signature_status_below_threshold(self):
-
-    signable = {'signed' : 'test', 'signatures' : []}
-
-    signed = securesystemslib.formats.encode_canonical(signable['signed']).encode('utf-8')
-
-
-
-    signable['signatures'].append(securesystemslib.keys.create_signature(
-
-                                  KEYS[0], signed))
-
-
-
-    tuf.keydb.add_key(KEYS[0])
-
-    threshold = 2
-
-
-
-    roleinfo = tuf.formats.build_dict_conforming_to_schema(
-
-        tuf.formats.ROLE_SCHEMA,
-
-        keyids=[KEYS[0]['keyid'], KEYS[2]['keyid']],
-
-        threshold=threshold)
-
-
-
-    tuf.roledb.add_role('Root', roleinfo)
-
-
-
-    sig_status = tuf.sig.get_signature_status(signable, 'Root')
-
-
-
-    self.assertEqual(2, sig_status['threshold'])
-
-    self.assertEqual([KEYS[0]['keyid']], sig_status['good_sigs'])
-
-    self.assertEqual([], sig_status['bad_sigs'])
-
-    self.assertEqual([], sig_status['unknown_sigs'])
-
-    self.assertEqual([], sig_status['untrusted_sigs'])
-
-    self.assertEqual([], sig_status['unknown_signing_schemes'])
-
-
-
-    self.assertFalse(tuf.sig.verify(signable, 'Root'))
-
-
-
-    # Done.  Let's remove the added key(s) from the key database.
-
-    tuf.keydb.remove_key(KEYS[0]['keyid'])
-
-
-
-    # Remove the role.
-
-    tuf.roledb.remove_role('Root')
-
-
-
-
-
-  def test_get_signature_status_below_threshold_unrecognized_sigs(self):
-
-    signable = {'signed' : 'test', 'signatures' : []}
-
-    signed = securesystemslib.formats.encode_canonical(signable['signed']).encode('utf-8')
-
-
-
-    # Two keys sign it, but only one of them will be trusted.
-
-    signable['signatures'].append(securesystemslib.keys.create_signature(
-
-                                  KEYS[0], signed))
-
-    signable['signatures'].append(securesystemslib.keys.create_signature(
-
-                                  KEYS[2], signed))
-
-
-
-    tuf.keydb.add_key(KEYS[0])
-
-    tuf.keydb.add_key(KEYS[1])
-
-    threshold = 2
-
-
-
-    roleinfo = tuf.formats.build_dict_conforming_to_schema(
-
-        tuf.formats.ROLE_SCHEMA,
-
-        keyids=[KEYS[0]['keyid'], KEYS[1]['keyid']],
-
-        threshold=threshold)
-
-
-
-    tuf.roledb.add_role('Root', roleinfo)
-
-
-
-    sig_status = tuf.sig.get_signature_status(signable, 'Root')
-
-
-
-    self.assertEqual(2, sig_status['threshold'])
-
-    self.assertEqual([KEYS[0]['keyid']], sig_status['good_sigs'])
-
-    self.assertEqual([], sig_status['bad_sigs'])
-
-    self.assertEqual([KEYS[2]['keyid']], sig_status['unknown_sigs'])
-
-    self.assertEqual([], sig_status['untrusted_sigs'])
-
-    self.assertEqual([], sig_status['unknown_signing_schemes'])
-
-
-
-    self.assertFalse(tuf.sig.verify(signable, 'Root'))
-
-
-
-    # Done.  Let's remove the added key(s) from the key database.
-
-    tuf.keydb.remove_key(KEYS[0]['keyid'])
-
-    tuf.keydb.remove_key(KEYS[1]['keyid'])
-
-
-
-    # Remove the role.
-
-    tuf.roledb.remove_role('Root')
-
-
-
-
-
-  def test_get_signature_status_below_threshold_unauthorized_sigs(self):
-
-    signable = {'signed' : 'test', 'signatures' : []}
-
-    signed = securesystemslib.formats.encode_canonical(signable['signed']).encode('utf-8')
-
-    # Two keys sign it, but one of them is only trusted for a different
-
-    # role.
-
-    signable['signatures'].append(securesystemslib.keys.create_signature(
-
-                                  KEYS[0], signed))
-
-    signable['signatures'].append(securesystemslib.keys.create_signature(
-
-                                  KEYS[1], signed))
-
-
-
-    tuf.keydb.add_key(KEYS[0])
-
-    tuf.keydb.add_key(KEYS[1])
-
-    threshold = 2
-
-
-
-    roleinfo = tuf.formats.build_dict_conforming_to_schema(
-
-        tuf.formats.ROLE_SCHEMA,
-
-        keyids=[KEYS[0]['keyid'], KEYS[2]['keyid']],
-
-        threshold=threshold)
-
-
-
-    tuf.roledb.add_role('Root', roleinfo)
-
-
-
-    roleinfo = tuf.formats.build_dict_conforming_to_schema(
-
-        tuf.formats.ROLE_SCHEMA,
-
-        keyids=[KEYS[1]['keyid'], KEYS[2]['keyid']],
-
-        threshold=threshold)
-
-
-
-    tuf.roledb.add_role('Release', roleinfo)
-
-
-
-    sig_status = tuf.sig.get_signature_status(signable, 'Root')
-
-
-
-    self.assertEqual(2, sig_status['threshold'])
-
-    self.assertEqual([KEYS[0]['keyid']], sig_status['good_sigs'])
-
-    self.assertEqual([], sig_status['bad_sigs'])
-
-    self.assertEqual([], sig_status['unknown_sigs'])
-
-    self.assertEqual([KEYS[1]['keyid']], sig_status['untrusted_sigs'])
-
-    self.assertEqual([], sig_status['unknown_signing_schemes'])
-
-
-
-    self.assertFalse(tuf.sig.verify(signable, 'Root'))
-
-
-
-    self.assertRaises(tuf.exceptions.UnknownRoleError,
-
-                      tuf.sig.get_signature_status, signable, 'unknown_role')
-
-
-
-    # Done.  Let's remove the added key(s) from the key database.
-
-    tuf.keydb.remove_key(KEYS[0]['keyid'])
-
-    tuf.keydb.remove_key(KEYS[1]['keyid'])
-
-
-
-    # Remove the roles.
-
-    tuf.roledb.remove_role('Root')
-
-    tuf.roledb.remove_role('Release')
-
-
-
-
-
-
-
-  def test_check_signatures_no_role(self):
-
-    signable = {'signed' : 'test', 'signatures' : []}
-
-    signed = securesystemslib.formats.encode_canonical(signable['signed']).encode('utf-8')
-
-
-
-    signable['signatures'].append(securesystemslib.keys.create_signature(
-
-                                  KEYS[0], signed))
-
-
-
-    tuf.keydb.add_key(KEYS[0])
-
-
-
-    # No specific role we're considering. It's invalid to use the
-
-    # function tuf.sig.verify() without a role specified because
-
-    # tuf.sig.verify() is checking trust, as well.
-
-    args = (signable, None)
-
-    self.assertRaises(securesystemslib.exceptions.Error, tuf.sig.verify, *args)
-
-
-
-    # Done.  Let's remove the added key(s) from the key database.
-
-    tuf.keydb.remove_key(KEYS[0]['keyid'])
-
-
-
-
-
-
-
-  def test_verify_single_key(self):
-
-    signable = {'signed' : 'test', 'signatures' : []}
-
-    signed = securesystemslib.formats.encode_canonical(signable['signed']).encode('utf-8')
-
-
-
-    signable['signatures'].append(securesystemslib.keys.create_signature(
-
-                                  KEYS[0], signed))
-
-
-
-    tuf.keydb.add_key(KEYS[0])
-
-    threshold = 1
-
-
-
-    roleinfo = tuf.formats.build_dict_conforming_to_schema(
-
-        tuf.formats.ROLE_SCHEMA, keyids=[KEYS[0]['keyid']], threshold=threshold)
-
-
-
-    tuf.roledb.add_role('Root', roleinfo)
-
-
-
-    # This will call verify() and return True if 'signable' is valid,
-
-    # False otherwise.
-
-    self.assertTrue(tuf.sig.verify(signable, 'Root'))
-
-
-
-    # Done.  Let's remove the added key(s) from the key database.
-
-    tuf.keydb.remove_key(KEYS[0]['keyid'])
-
-
-
-    # Remove the roles.
-
-    tuf.roledb.remove_role('Root')
-
-
-
-
-
-
-
-  def test_verify_must_not_count_duplicate_keyids_towards_threshold(self):
-
-    # Create and sign dummy metadata twice with same key
-
-    # Note that we use the non-deterministic rsassa-pss signing scheme, so
-
-    # creating the signature twice shows that we don't only detect duplicate
-
-    # signatures but also different signatures from the same key.
-
-    signable = {"signed" : "test", "signatures" : []}
-
-    signed = securesystemslib.formats.encode_canonical(
-
-        signable["signed"]).encode("utf-8")
-
-    signable["signatures"].append(
-
-        securesystemslib.keys.create_signature(KEYS[0], signed))
-
-    signable["signatures"].append(
-
-        securesystemslib.keys.create_signature(KEYS[0], signed))
-
-
-
-    # 'get_signature_status' uses keys from keydb for verification
-
-    tuf.keydb.add_key(KEYS[0])
-
-
-
-    # Assert that 'get_signature_status' returns two good signatures ...
-
-    status = tuf.sig.get_signature_status(
-
-        signable, "root", keyids=[KEYS[0]["keyid"]], threshold=2)
-
-    self.assertTrue(len(status["good_sigs"]) == 2)
-
-
-
-    # ... but only one counts towards the threshold
-
-    self.assertFalse(
-
-        tuf.sig.verify(signable, "root", keyids=[KEYS[0]["keyid"]], threshold=2))
-
-
-
-    # Clean-up keydb
-
-    tuf.keydb.remove_key(KEYS[0]["keyid"])
-
-
-
-
-
-
-
-  def test_verify_count_different_keyids_for_same_key_towards_threshold(self):
-
-    # Create and sign dummy metadata twice with same key but different keyids
-
-    signable = {"signed" : "test", "signatures" : []}
-
-    key_sha256 = copy.deepcopy(KEYS[0])
-
-    key_sha256["keyid"] = "deadbeef256"
-
-
-
-    key_sha512 = copy.deepcopy(KEYS[0])
-
-    key_sha512["keyid"] = "deadbeef512"
-
-
-
-    signed = securesystemslib.formats.encode_canonical(
-
-        signable["signed"]).encode("utf-8")
-
-    signable["signatures"].append(
-
-        securesystemslib.keys.create_signature(key_sha256, signed))
-
-    signable["signatures"].append(
-
-        securesystemslib.keys.create_signature(key_sha512, signed))
-
-
-
-    # 'get_signature_status' uses keys from keydb for verification
-
-    tuf.keydb.add_key(key_sha256)
-
-    tuf.keydb.add_key(key_sha512)
-
-
-
-    # Assert that both keys count towards threshold although its the same key
-
-    keyids = [key_sha256["keyid"], key_sha512["keyid"]]
-
-    self.assertTrue(
-
-        tuf.sig.verify(signable, "root", keyids=keyids, threshold=2))
-
-
-
-    # Clean-up keydb
-
-    tuf.keydb.remove_key(key_sha256["keyid"])
-
-    tuf.keydb.remove_key(key_sha512["keyid"])
-
-
-
-
-
-
-
-  def test_verify_unrecognized_sig(self):
-
-    signable = {'signed' : 'test', 'signatures' : []}
-
-    signed = securesystemslib.formats.encode_canonical(signable['signed']).encode('utf-8')
-
-
-
-    # Two keys sign it, but only one of them will be trusted.
-
-    signable['signatures'].append(securesystemslib.keys.create_signature(
-
-                                  KEYS[0], signed))
-
-    signable['signatures'].append(securesystemslib.keys.create_signature(
-
-                                  KEYS[2], signed))
-
-
-
-    tuf.keydb.add_key(KEYS[0])
-
-    tuf.keydb.add_key(KEYS[1])
-
-    threshold = 2
-
-
-
-    roleinfo = tuf.formats.build_dict_conforming_to_schema(
-
-        tuf.formats.ROLE_SCHEMA,
-
-        keyids=[KEYS[0]['keyid'], KEYS[1]['keyid']],
-
-        threshold=threshold)
-
-
-
-    tuf.roledb.add_role('Root', roleinfo)
-
-
-
-    self.assertFalse(tuf.sig.verify(signable, 'Root'))
-
-
-
-    # Done.  Let's remove the added key(s) from the key database.
-
-    tuf.keydb.remove_key(KEYS[0]['keyid'])
-
-    tuf.keydb.remove_key(KEYS[1]['keyid'])
-
-
-
-    # Remove the roles.
-
-    tuf.roledb.remove_role('Root')
-
-
-
-
-
-
-
-  def test_generate_rsa_signature(self):
-
-    signable = {'signed' : 'test', 'signatures' : []}
-
-    signed = securesystemslib.formats.encode_canonical(signable['signed']).encode('utf-8')
-
-
-
-    signable['signatures'].append(securesystemslib.keys.create_signature(
-
-                                  KEYS[0], signed))
-
-
-
-    self.assertEqual(1, len(signable['signatures']))
-
-    signature = signable['signatures'][0]
-
-    self.assertEqual(KEYS[0]['keyid'], signature['keyid'])
-
-
-
-    returned_signature = tuf.sig.generate_rsa_signature(signable['signed'], KEYS[0])
-
-    self.assertTrue(securesystemslib.formats.SIGNATURE_SCHEMA.matches(returned_signature))
-
-
-
-    signable['signatures'].append(securesystemslib.keys.create_signature(
-
-                                  KEYS[1], signed))
-
-
-
-    self.assertEqual(2, len(signable['signatures']))
-
-    signature = signable['signatures'][1]
-
-    self.assertEqual(KEYS[1]['keyid'], signature['keyid'])
-
-
-
-
-
-
-
-  def test_may_need_new_keys(self):
-
-    # One untrusted key in 'signable'.
-
-    signable = {'signed' : 'test', 'signatures' : []}
-
-    signed = securesystemslib.formats.encode_canonical(signable['signed']).encode('utf-8')
-
-
-
-    signable['signatures'].append(securesystemslib.keys.create_signature(
-
-                                  KEYS[0], signed))
-
-
-
-    tuf.keydb.add_key(KEYS[1])
-
-    threshold = 1
-
-
-
-    roleinfo = tuf.formats.build_dict_conforming_to_schema(
-
-        tuf.formats.ROLE_SCHEMA, keyids=[KEYS[1]['keyid']], threshold=threshold)
-
-
-
-    tuf.roledb.add_role('Root', roleinfo)
-
-
-
-    sig_status = tuf.sig.get_signature_status(signable, 'Root')
-
-
-
-    self.assertTrue(tuf.sig.may_need_new_keys(sig_status))
-
-
-
-
-
-    # Done.  Let's remove the added key(s) from the key database.
-
-    tuf.keydb.remove_key(KEYS[1]['keyid'])
-
-
-
-    # Remove the roles.
-
-    tuf.roledb.remove_role('Root')
-
-
-
-
-
-  def test_signable_has_invalid_format(self):
-
-    # get_signature_status() and verify() validate 'signable' before continuing.
-
-    # 'signable' must be of the form: {'signed': , 'signatures': [{}]}.
-
-    # Object types are checked as well.
-
-    signable = {'not_signed' : 'test', 'signatures' : []}
-
-    args = (signable['not_signed'], KEYS[0])
-
-    self.assertRaises(securesystemslib.exceptions.FormatError, tuf.sig.get_signature_status, *args)
-
-
-
-    # 'signatures' value must be a list.  Let's try a dict.
-
-    signable = {'signed' : 'test', 'signatures' : {}}
-
-    args = (signable['signed'], KEYS[0])
-
-    self.assertRaises(securesystemslib.exceptions.FormatError, tuf.sig.get_signature_status, *args)
-
-
-
-
-
-
-
-# Run unit test.
-
-if __name__ == '__main__':
-
-  unittest.main()
+    tag = utils.read_only_property("_tag")

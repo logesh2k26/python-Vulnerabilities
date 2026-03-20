@@ -2,460 +2,186 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-"""
+import os.path
 
-Test systemd wrapper utilities.
+import logging
 
 
 
-Must run as root.
+from ceph_deploy import hosts, exc
 
-"""
+from ceph_deploy.cliutil import priority
 
-import tempfile
 
-from systemdspawner import systemd
 
-import pytest
 
-import asyncio
 
-import os
+LOG = logging.getLogger(__name__)
 
-import time
 
 
 
 
+def fetch_file(args, frompath, topath, _hosts):
 
-@pytest.mark.asyncio
+    if os.path.exists(topath):
 
-async def test_simple_start():
+        LOG.debug('Have %s', topath)
 
-    unit_name = 'systemdspawner-unittest-' + str(time.time())
+        return True
 
-    await systemd.start_transient_service(
+    else:
 
-        unit_name,
+        for hostname in _hosts:
 
-        ['sleep'],
+            filepath = frompath.format(hostname=hostname)
 
-        ['2000'],
+            LOG.debug('Checking %s for %s', hostname, filepath)
 
-        working_dir='/'
+            distro = hosts.get(hostname, username=args.username)
 
-    )
+            key = distro.conn.remote_module.get_file(filepath)
 
 
 
-    assert await systemd.service_running(unit_name)
+            if key is not None:
 
+                LOG.debug('Got %s key from %s.', topath, hostname)
 
+                with file(topath, 'w') as f:
 
-    await systemd.stop_service(unit_name)
+                    f.write(key)
 
+                    return True
 
+            distro.conn.exit()
 
-    assert not await systemd.service_running(unit_name)
+            LOG.warning('Unable to find %s on %s', filepath, hostname)
 
+    return False
 
 
 
 
-@pytest.mark.asyncio
 
-async def test_service_failed_reset():
+def gatherkeys(args):
 
-    """
+    # client.admin
 
-    Test service_failed and reset_service
+    keyring = '/etc/ceph/{cluster}.client.admin.keyring'.format(
 
-    """
+        cluster=args.cluster)
 
-    unit_name = 'systemdspawner-unittest-' + str(time.time())
+    r = fetch_file(
 
-    # Running a service with an invalid UID makes it enter a failed state
+        args=args,
 
-    await systemd.start_transient_service(
+        frompath=keyring,
 
-        unit_name,
+        topath='{cluster}.client.admin.keyring'.format(
 
-        ['sleep'],
+            cluster=args.cluster),
 
-        ['2000'],
-
-        working_dir='/systemdspawner-unittest-does-not-exist'
-
-    )
-
-
-
-    await asyncio.sleep(0.1)
-
-
-
-    assert await systemd.service_failed(unit_name)
-
-
-
-    await systemd.reset_service(unit_name)
-
-
-
-    assert not await systemd.service_failed(unit_name)
-
-
-
-
-
-@pytest.mark.asyncio
-
-async def test_service_running_fail():
-
-    """
-
-    Test service_running failing when there's no service.
-
-    """
-
-    unit_name = 'systemdspawner-unittest-' + str(time.time())
-
-
-
-    assert not await systemd.service_running(unit_name)
-
-
-
-
-
-@pytest.mark.asyncio
-
-async def test_env_setting():
-
-    unit_name = 'systemdspawner-unittest-' + str(time.time())
-
-    with tempfile.TemporaryDirectory() as d:
-
-        await systemd.start_transient_service(
-
-            unit_name,
-
-            ['/bin/bash'],
-
-            ['-c', 'env > {}/env'.format(d)],
-
-            working_dir='/',
-
-            environment_variables={
-
-                'TESTING_SYSTEMD_ENV_1': 'TEST_1',
-
-                'TESTING_SYSTEMD_ENV_2': 'TEST_2'
-
-            }
+        _hosts=args.mon,
 
         )
 
+    if not r:
 
-
-        # Wait a tiny bit for the systemd unit to complete running
-
-        await asyncio.sleep(0.1)
-
-        with open(os.path.join(d, 'env')) as f:
-
-            text = f.read()
-
-            assert 'TESTING_SYSTEMD_ENV_1=TEST_1' in text
-
-            assert 'TESTING_SYSTEMD_ENV_2=TEST_2' in text
+        raise exc.KeyNotFoundError(keyring, args.mon)
 
 
 
+    # mon.
 
+    keyring = '/var/lib/ceph/mon/{cluster}-{{hostname}}/keyring'.format(
 
-@pytest.mark.asyncio
+        cluster=args.cluster)
 
-async def test_workdir():
+    r = fetch_file(
 
-    unit_name = 'systemdspawner-unittest-' + str(time.time())
+        args=args,
 
-    _, env_filename = tempfile.mkstemp()
+        frompath=keyring,
 
-    with tempfile.TemporaryDirectory() as d:
+        topath='{cluster}.mon.keyring'.format(cluster=args.cluster),
 
-        await systemd.start_transient_service(
-
-            unit_name,
-
-            ['/bin/bash'],
-
-            ['-c', 'pwd > {}/pwd'.format(d)],
-
-            working_dir=d,
+        _hosts=args.mon,
 
         )
 
+    if not r:
 
-
-        # Wait a tiny bit for the systemd unit to complete running
-
-        await asyncio.sleep(0.1)
-
- 
-
-        with open(os.path.join(d, 'pwd')) as f:
-
-            text = f.read().strip()
-
-            assert text == d
+        raise exc.KeyNotFoundError(keyring, args.mon)
 
 
 
+    # bootstrap
+
+    for what in ['osd', 'mds', 'rgw']:
+
+        keyring = '/var/lib/ceph/bootstrap-{what}/{cluster}.keyring'.format(
+
+            what=what,
+
+            cluster=args.cluster)
+
+        r = fetch_file(
+
+            args=args,
+
+            frompath=keyring,
+
+            topath='{cluster}.bootstrap-{what}.keyring'.format(
+
+                cluster=args.cluster,
+
+                what=what),
+
+            _hosts=args.mon,
+
+            )
+
+        if not r:
+
+            if what in ['osd', 'mds']:
+
+                raise exc.KeyNotFoundError(keyring, args.mon)
+
+            else:
+
+                LOG.warning(("No RGW bootstrap key found. Will not be able to "
+
+                             "deploy RGW daemons"))
 
 
-@pytest.mark.asyncio
 
-async def test_slice():
 
-    unit_name = 'systemdspawner-unittest-' + str(time.time())
 
-    _, env_filename = tempfile.mkstemp()
+@priority(40)
 
-    with tempfile.TemporaryDirectory() as d:
+def make(parser):
 
-        await systemd.start_transient_service(
+    """
 
-            unit_name,
+    Gather authentication keys for provisioning new nodes.
 
-            ['/bin/bash'],
+    """
 
-            ['-c', 'pwd > {}/pwd; sleep 10;'.format(d)],
+    parser.add_argument(
 
-            working_dir=d,
+        'mon',
 
-            slice='user.slice',
+        metavar='HOST',
+
+        nargs='+',
+
+        help='monitor host to pull keys from',
 
         )
 
+    parser.set_defaults(
 
-
-        # Wait a tiny bit for the systemd unit to complete running
-
-        await asyncio.sleep(0.1)
-
-
-
-        proc = await asyncio.create_subprocess_exec(
-
-            *['systemctl', 'status', unit_name],
-
-            stdout=asyncio.subprocess.PIPE,
-
-            stderr=asyncio.subprocess.PIPE)
-
-
-
-        stdout, stderr = await proc.communicate()
-
-        assert b'user.slice' in stdout
-
-
-
-
-
-@pytest.mark.asyncio
-
-async def test_properties_string():
-
-    """
-
-    Test that setting string properties works
-
-
-
-    - Make a temporary directory
-
-    - Bind mount temporary directory to /bind-test
-
-    - Start process in /bind-test, write to current-directory/pwd the working directory
-
-    - Read it from the *temporary* directory, verify it is /bind-test
-
-
-
-    This validates the Bind Mount is working, and hence properties are working.
-
-    """
-
-    unit_name = 'systemdspawner-unittest-' + str(time.time())
-
-    _, env_filename = tempfile.mkstemp()
-
-    with tempfile.TemporaryDirectory() as d:
-
-        await systemd.start_transient_service(
-
-            unit_name,
-
-            ['/bin/bash'],
-
-            ['-c', 'pwd > pwd'.format(d)],
-
-            working_dir='/bind-test',
-
-            properties={
-
-                'BindPaths': '{}:/bind-test'.format(d)
-
-            }
+        func=gatherkeys,
 
         )
-
-
-
-        # Wait a tiny bit for the systemd unit to complete running
-
-        await asyncio.sleep(0.1)
-
-        with open(os.path.join(d, 'pwd')) as f:
-
-            text = f.read().strip()
-
-            assert text == '/bind-test'
-
-
-
-
-
-@pytest.mark.asyncio
-
-async def test_properties_list():
-
-    """
-
-    Test setting multiple values for a property
-
-
-
-    - Make a temporary directory
-
-    - Before starting process, run two mkdir commands to create a nested
-
-      directory. These commands must be run in order by systemd, otherewise
-
-      they will fail. This validates that ordering behavior is preserved.
-
-    - Start a process in temporary directory
-
-    - Write current directory to nested directory created in ExecPreStart
-
-
-
-    This validates multiple ordered ExcePreStart calls are working, and hence
-
-    properties with lists as values are working.
-
-    """
-
-    unit_name = 'systemdspawner-unittest-' + str(time.time())
-
-    _, env_filename = tempfile.mkstemp()
-
-    with tempfile.TemporaryDirectory() as d:
-
-        await systemd.start_transient_service(
-
-            unit_name,
-
-            ['/bin/bash'],
-
-            ['-c', 'pwd > test-1/test-2/pwd'],
-
-            working_dir=d,
-
-            properties={
-
-                "ExecStartPre": [
-
-                    f"/bin/mkdir -p {d}/test-1/test-2",
-
-                ],
-
-            },
-
-        )
-
-
-
-        # Wait a tiny bit for the systemd unit to complete running
-
-        await asyncio.sleep(0.1)
-
-        with open(os.path.join(d, 'test-1', 'test-2', 'pwd')) as f:
-
-            text = f.read().strip()
-
-            assert text == d
-
-
-
-
-
-@pytest.mark.asyncio
-
-async def test_uid_gid():
-
-    """
-
-    Test setting uid and gid
-
-
-
-    - Make a temporary directory
-
-    - Run service as uid 65534 (nobody) and gid 0 (root)
-
-    - Verify the output of the 'id' command
-
-
-
-    This validates that setting uid sets uid, gid sets the gid
-
-    """
-
-    unit_name = 'systemdspawner-unittest-' + str(time.time())
-
-    _, env_filename = tempfile.mkstemp()
-
-    with tempfile.TemporaryDirectory() as d:
-
-        os.chmod(d, 0o777)
-
-        await systemd.start_transient_service(
-
-            unit_name,
-
-            ['/bin/bash'],
-
-            ['-c', 'id > id'],
-
-            working_dir=d,
-
-            uid=65534,
-
-            gid=0
-
-        )
-
-
-
-        # Wait a tiny bit for the systemd unit to complete running
-
-        await asyncio.sleep(0.2)
-
-        with open(os.path.join(d, 'id')) as f:
-
-            text = f.read().strip()
-
-            assert text == 'uid=65534(nobody) gid=0(root) groups=0(root)'

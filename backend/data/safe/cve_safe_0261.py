@@ -2,498 +2,158 @@
 # Safety: vulnerable
 # Category: safe
 
-#
+# -*- coding: utf-8 -*-
 
-# Licensed to the Apache Software Foundation (ASF) under one
+# See https://zulip.readthedocs.io/en/latest/subsystems/thumbnailing.html
 
-# or more contributor license agreements. See the NOTICE file
+import base64
 
-# distributed with this work for additional information
+import os
 
-# regarding copyright ownership. The ASF licenses this file
+import sys
 
-# to you under the Apache License, Version 2.0 (the
+import urllib
 
-# "License"); you may not use this file except in compliance
+from django.conf import settings
 
-# with the License. You may obtain a copy of the License at
+from libthumbor import CryptoURL
 
-#
 
-#   http://www.apache.org/licenses/LICENSE-2.0
 
-#
+ZULIP_PATH = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath('__file__'))))
 
-# Unless required by applicable law or agreed to in writing,
+sys.path.append(ZULIP_PATH)
 
-# software distributed under the License is distributed on an
 
-# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 
-# KIND, either express or implied. See the License for the
+from zthumbor.loaders.helpers import (
 
-# specific language governing permissions and limitations
+    THUMBOR_S3_TYPE, THUMBOR_LOCAL_FILE_TYPE, THUMBOR_EXTERNAL_TYPE
 
-# under the License.
+)
 
-#
+from zerver.lib.camo import get_camo_url
 
 
 
-from __future__ import absolute_import
+def is_thumbor_enabled() -> bool:
 
-from __future__ import division
+    return settings.THUMBOR_URL != ''
 
-from __future__ import print_function
 
-from __future__ import unicode_literals
 
+def user_uploads_or_external(url: str) -> bool:
 
+    return url.startswith('http') or url.lstrip('/').startswith('user_uploads/')
 
-from thrift.Thrift import *
 
 
+def get_source_type(url: str) -> str:
 
-class TProtocolException(TException):
+    if not url.startswith('/user_uploads/'):
 
+        return THUMBOR_EXTERNAL_TYPE
 
 
-    """Custom Protocol Exception class"""
 
+    local_uploads_dir = settings.LOCAL_UPLOADS_DIR
 
+    if local_uploads_dir:
 
-    UNKNOWN = 0
+        return THUMBOR_LOCAL_FILE_TYPE
 
-    INVALID_DATA = 1
+    return THUMBOR_S3_TYPE
 
-    NEGATIVE_SIZE = 2
 
-    SIZE_LIMIT = 3
 
-    BAD_VERSION = 4
+def generate_thumbnail_url(path: str,
 
-    INVALID_PROTOCOL = 5
+                           size: str='0x0',
 
-    MISSING_REQUIRED_FIELD = 6
+                           is_camo_url: bool=False) -> str:
 
+    if not (path.startswith('https://') or path.startswith('http://')):
 
+        path = '/' + path
 
-    def __init__(self, type=UNKNOWN, message=None):
 
-        TException.__init__(self, message)
 
-        self.type = type
+    if not is_thumbor_enabled():
 
+        if path.startswith('http://'):
 
+            return get_camo_url(path)
 
-class TProtocolBase:
+        return path
 
 
 
-    """Base class for Thrift protocol driver."""
+    if not user_uploads_or_external(path):
 
+        return path
 
 
-    def __init__(self, trans):
 
-        self.trans = trans
+    source_type = get_source_type(path)
 
+    safe_url = base64.urlsafe_b64encode(path.encode()).decode('utf-8')
 
+    image_url = '%s/source_type/%s' % (safe_url, source_type)
 
-    def writeMessageBegin(self, name, ttype, seqid):
+    width, height = map(int, size.split('x'))
 
-        pass
+    crypto = CryptoURL(key=settings.THUMBOR_KEY)
 
 
 
-    def writeMessageEnd(self):
+    smart_crop_enabled = True
 
-        pass
+    apply_filters = ['no_upscale()']
 
+    if is_camo_url:
 
+        smart_crop_enabled = False
 
-    def writeStructBegin(self, name):
+        apply_filters.append('quality(100)')
 
-        pass
+    if size != '0x0':
 
+        apply_filters.append('sharpen(0.5,0.2,true)')
 
 
-    def writeStructEnd(self):
 
-        pass
+    encrypted_url = crypto.generate(
 
+        width=width,
 
+        height=height,
 
-    def writeUnionBegin(self, name):
+        smart=smart_crop_enabled,
 
-        self.writeStructBegin(name)
+        filters=apply_filters,
 
+        image_url=image_url
 
+    )
 
-    def writeUnionEnd(self):
 
-        self.writeStructEnd()
 
+    if settings.THUMBOR_URL == 'http://127.0.0.1:9995':
 
+        # If THUMBOR_URL is the default then thumbor is hosted on same machine
 
-    def writeFieldBegin(self, name, type, id):
+        # as the Zulip server and we should serve a relative URL.
 
-        pass
+        # We add a /thumbor in front of the relative url because we make
 
+        # use of a proxy pass to redirect request internally in Nginx to 9995
 
+        # port where thumbor is running.
 
-    def writeFieldEnd(self):
+        thumbnail_url = '/thumbor' + encrypted_url
 
-        pass
+    else:
 
+        thumbnail_url = urllib.parse.urljoin(settings.THUMBOR_URL, encrypted_url)
 
-
-    def writeFieldStop(self):
-
-        pass
-
-
-
-    def writeMapBegin(self, ktype, vtype, size):
-
-        pass
-
-
-
-    def writeMapEnd(self):
-
-        pass
-
-
-
-    def writeListBegin(self, etype, size):
-
-        pass
-
-
-
-    def writeListEnd(self):
-
-        pass
-
-
-
-    def writeSetBegin(self, etype, size):
-
-        pass
-
-
-
-    def writeSetEnd(self):
-
-        pass
-
-
-
-    def writeBool(self, bool_val):
-
-        pass
-
-
-
-    def writeByte(self, byte):
-
-        pass
-
-
-
-    def writeI16(self, i16):
-
-        pass
-
-
-
-    def writeI32(self, i32):
-
-        pass
-
-
-
-    def writeI64(self, i64):
-
-        pass
-
-
-
-    def writeDouble(self, dub):
-
-        pass
-
-
-
-    def writeFloat(self, flt):
-
-        pass
-
-
-
-    def writeString(self, str):
-
-        pass
-
-
-
-    def readMessageBegin(self):
-
-        pass
-
-
-
-    def readMessageEnd(self):
-
-        pass
-
-
-
-    def readStructBegin(self):
-
-        pass
-
-
-
-    def readStructEnd(self):
-
-        pass
-
-
-
-    def readFieldBegin(self):
-
-        pass
-
-
-
-    def readFieldEnd(self):
-
-        pass
-
-
-
-    def readMapBegin(self):
-
-        pass
-
-
-
-    def readMapEnd(self):
-
-        pass
-
-
-
-    def readListBegin(self):
-
-        pass
-
-
-
-    def readListEnd(self):
-
-        pass
-
-
-
-    def readSetBegin(self):
-
-        pass
-
-
-
-    def readSetEnd(self):
-
-        pass
-
-
-
-    def readBool(self):
-
-        pass
-
-
-
-    def readByte(self):
-
-        pass
-
-
-
-    def readI16(self):
-
-        pass
-
-
-
-    def readI32(self):
-
-        pass
-
-
-
-    def readI64(self):
-
-        pass
-
-
-
-    def readDouble(self):
-
-        pass
-
-
-
-    def readFloat(self):
-
-        pass
-
-
-
-    def readString(self):
-
-        pass
-
-
-
-    def skip(self, type):
-
-        if type == TType.STOP:
-
-            return
-
-        elif type == TType.BOOL:
-
-            self.readBool()
-
-        elif type == TType.BYTE:
-
-            self.readByte()
-
-        elif type == TType.I16:
-
-            self.readI16()
-
-        elif type == TType.I32:
-
-            self.readI32()
-
-        elif type == TType.I64:
-
-            self.readI64()
-
-        elif type == TType.DOUBLE:
-
-            self.readDouble()
-
-        elif type == TType.FLOAT:
-
-            self.readFloat()
-
-        elif type == TType.STRING:
-
-            self.readString()
-
-        elif type == TType.STRUCT:
-
-            name = self.readStructBegin()
-
-            while True:
-
-                (name, type, id) = self.readFieldBegin()
-
-                if type == TType.STOP:
-
-                    break
-
-                self.skip(type)
-
-                self.readFieldEnd()
-
-            self.readStructEnd()
-
-        elif type == TType.MAP:
-
-            (ktype, vtype, size) = self.readMapBegin()
-
-            for _ in range(size):
-
-                self.skip(ktype)
-
-                self.skip(vtype)
-
-            self.readMapEnd()
-
-        elif type == TType.SET:
-
-            (etype, size) = self.readSetBegin()
-
-            for _ in range(size):
-
-                self.skip(etype)
-
-            self.readSetEnd()
-
-        elif type == TType.LIST:
-
-            (etype, size) = self.readListBegin()
-
-            for _ in range(size):
-
-                self.skip(etype)
-
-            self.readListEnd()
-
-
-
-    def readIntegral(self, type):
-
-        if type == TType.BOOL:
-
-            return self.readBool()
-
-        elif type == TType.BYTE:
-
-            return self.readByte()
-
-        elif type == TType.I16:
-
-            return self.readI16()
-
-        elif type == TType.I32:
-
-            return self.readI32()
-
-        elif type == TType.I64:
-
-            return self.readI64()
-
-        else:
-
-            raise Exception("Unknown integral type: %s" % str(type))
-
-
-
-    def readFloatingPoint(self, type):
-
-        if type == TType.FLOAT:
-
-            return self.readFloat()
-
-        elif type == TType.DOUBLE:
-
-            return self.readDouble()
-
-        else:
-
-            raise Exception("Unknown floating point type: %s" % str(type))
-
-
-
-class TProtocolFactory:
-
-    def getProtocol(self, trans):
-
-        pass
+    return thumbnail_url

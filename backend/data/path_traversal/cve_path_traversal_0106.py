@@ -2,484 +2,1316 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-from __future__ import unicode_literals
+import difflib
 
 
 
-import calendar
+from bs4 import BeautifulSoup
 
-import datetime
+from django.utils.encoding import force_str
 
-import re
+from django.utils.html import escape, format_html, format_html_join
 
-import sys
+from django.utils.safestring import mark_safe
 
-try:
+from django.utils.text import capfirst
 
-    from urllib import parse as urllib_parse
+from django.utils.translation import ugettext_lazy as _
 
-except ImportError:     # Python 2
 
-    import urllib as urllib_parse
 
-    import urlparse
+from wagtail.core import blocks
 
-    urllib_parse.urlparse = urlparse.urlparse
 
 
 
 
+class FieldComparison:
 
-from email.utils import formatdate
+    is_field = True
 
+    is_child_relation = False
 
 
-from django.utils.datastructures import MultiValueDict
 
-from django.utils.encoding import force_str, force_text
+    def __init__(self, field, obj_a, obj_b):
 
-from django.utils.functional import allow_lazy
+        self.field = field
 
-from django.utils import six
+        self.val_a = field.value_from_object(obj_a)
 
+        self.val_b = field.value_from_object(obj_b)
 
 
-ETAG_MATCH = re.compile(r'(?:W/)?"((?:\\.|[^"])*)"')
 
+    def field_label(self):
 
+        """
 
-MONTHS = 'jan feb mar apr may jun jul aug sep oct nov dec'.split()
+        Returns a label for this field to be displayed to the user
 
-__D = r'(?P<day>\d{2})'
+        """
 
-__D2 = r'(?P<day>[ \d]\d)'
+        verbose_name = getattr(self.field, 'verbose_name', None)
 
-__M = r'(?P<mon>\w{3})'
 
-__Y = r'(?P<year>\d{4})'
 
-__Y2 = r'(?P<year>\d{2})'
+        if verbose_name is None:
 
-__T = r'(?P<hour>\d{2}):(?P<min>\d{2}):(?P<sec>\d{2})'
+            # Relations don't have a verbose_name
 
-RFC1123_DATE = re.compile(r'^\w{3}, %s %s %s %s GMT$' % (__D, __M, __Y, __T))
+            verbose_name = self.field.name.replace('_', ' ')
 
-RFC850_DATE = re.compile(r'^\w{6,9}, %s-%s-%s %s GMT$' % (__D, __M, __Y2, __T))
 
-ASCTIME_DATE = re.compile(r'^\w{3} %s %s %s %s$' % (__M, __D2, __T, __Y))
 
+        return capfirst(verbose_name)
 
 
-def urlquote(url, safe='/'):
 
-    """
+    def htmldiff(self):
 
-    A version of Python's urllib.quote() function that can operate on unicode
+        if self.val_a != self.val_b:
 
-    strings. The url is first UTF-8 encoded before quoting. The returned string
+            return TextDiff([('deletion', self.val_a), ('addition', self.val_b)]).to_html()
 
-    can safely be used as part of an argument to a subsequent iri_to_uri() call
+        else:
 
-    without double-quoting occurring.
+            return escape(self.val_a)
 
-    """
 
-    return force_text(urllib_parse.quote(force_str(url), force_str(safe)))
 
-urlquote = allow_lazy(urlquote, six.text_type)
+    def has_changed(self):
 
+        """
 
+        Returns True if the field has changed
 
-def urlquote_plus(url, safe=''):
+        """
 
-    """
+        return self.val_a != self.val_b
 
-    A version of Python's urllib.quote_plus() function that can operate on
 
-    unicode strings. The url is first UTF-8 encoded before quoting. The
 
-    returned string can safely be used as part of an argument to a subsequent
 
-    iri_to_uri() call without double-quoting occurring.
 
-    """
+class TextFieldComparison(FieldComparison):
 
-    return force_text(urllib_parse.quote_plus(force_str(url), force_str(safe)))
+    def htmldiff(self):
 
-urlquote_plus = allow_lazy(urlquote_plus, six.text_type)
+        return diff_text(self.val_a, self.val_b).to_html()
 
 
 
-def urlunquote(quoted_url):
 
-    """
 
-    A wrapper for Python's urllib.unquote() function that can operate on
+class RichTextFieldComparison(TextFieldComparison):
 
-    the result of django.utils.http.urlquote().
+    def htmldiff(self):
 
-    """
+        return diff_text(
 
-    return force_text(urllib_parse.unquote(force_str(quoted_url)))
+            BeautifulSoup(force_str(self.val_a), 'html5lib').getText(),
 
-urlunquote = allow_lazy(urlunquote, six.text_type)
+            BeautifulSoup(force_str(self.val_b), 'html5lib').getText()
 
+        ).to_html()
 
 
-def urlunquote_plus(quoted_url):
 
-    """
 
-    A wrapper for Python's urllib.unquote_plus() function that can operate on
 
-    the result of django.utils.http.urlquote_plus().
+def get_comparison_class_for_block(block):
 
-    """
+    if hasattr(block, 'get_comparison_class'):
 
-    return force_text(urllib_parse.unquote_plus(force_str(quoted_url)))
+        return block.get_comparison_class()
 
-urlunquote_plus = allow_lazy(urlunquote_plus, six.text_type)
+    elif isinstance(block, blocks.CharBlock):
 
+        return CharBlockComparison
 
+    elif isinstance(block, blocks.RichTextBlock):
 
-def urlencode(query, doseq=0):
+        return RichTextBlockComparison
 
-    """
+    elif isinstance(block, blocks.StructBlock):
 
-    A version of Python's urllib.urlencode() function that can operate on
-
-    unicode strings. The parameters are first case to UTF-8 encoded strings and
-
-    then encoded as per normal.
-
-    """
-
-    if isinstance(query, MultiValueDict):
-
-        query = query.lists()
-
-    elif hasattr(query, 'items'):
-
-        query = query.items()
-
-    return urllib_parse.urlencode(
-
-        [(force_str(k),
-
-         [force_str(i) for i in v] if isinstance(v, (list,tuple)) else force_str(v))
-
-            for k, v in query],
-
-        doseq)
-
-
-
-def cookie_date(epoch_seconds=None):
-
-    """
-
-    Formats the time to ensure compatibility with Netscape's cookie standard.
-
-
-
-    Accepts a floating point number expressed in seconds since the epoch, in
-
-    UTC - such as that outputted by time.time(). If set to None, defaults to
-
-    the current time.
-
-
-
-    Outputs a string in the format 'Wdy, DD-Mon-YYYY HH:MM:SS GMT'.
-
-    """
-
-    rfcdate = formatdate(epoch_seconds)
-
-    return '%s-%s-%s GMT' % (rfcdate[:7], rfcdate[8:11], rfcdate[12:25])
-
-
-
-def http_date(epoch_seconds=None):
-
-    """
-
-    Formats the time to match the RFC1123 date format as specified by HTTP
-
-    RFC2616 section 3.3.1.
-
-
-
-    Accepts a floating point number expressed in seconds since the epoch, in
-
-    UTC - such as that outputted by time.time(). If set to None, defaults to
-
-    the current time.
-
-
-
-    Outputs a string in the format 'Wdy, DD Mon YYYY HH:MM:SS GMT'.
-
-    """
-
-    rfcdate = formatdate(epoch_seconds)
-
-    return '%s GMT' % rfcdate[:25]
-
-
-
-def parse_http_date(date):
-
-    """
-
-    Parses a date format as specified by HTTP RFC2616 section 3.3.1.
-
-
-
-    The three formats allowed by the RFC are accepted, even if only the first
-
-    one is still in widespread use.
-
-
-
-    Returns an integer expressed in seconds since the epoch, in UTC.
-
-    """
-
-    # emails.Util.parsedate does the job for RFC1123 dates; unfortunately
-
-    # RFC2616 makes it mandatory to support RFC850 dates too. So we roll
-
-    # our own RFC-compliant parsing.
-
-    for regex in RFC1123_DATE, RFC850_DATE, ASCTIME_DATE:
-
-        m = regex.match(date)
-
-        if m is not None:
-
-            break
+        return StructBlockComparison
 
     else:
 
-        raise ValueError("%r is not in a valid HTTP date format" % date)
+        # As all stream field blocks have a HTML representation, fall back to diffing that.
 
-    try:
+        return RichTextBlockComparison
 
-        year = int(m.group('year'))
 
-        if year < 100:
 
-            if year < 70:
 
-                year += 2000
+
+class BlockComparison:
+
+    def __init__(self, block, exists_a, exists_b, val_a, val_b):
+
+        self.block = block
+
+        self.exists_a = exists_a
+
+        self.exists_b = exists_b
+
+        self.val_a = val_a
+
+        self.val_b = val_b
+
+
+
+    def is_new(self):
+
+        return self.exists_b and not self.exists_a
+
+
+
+    def is_deleted(self):
+
+        return self.exists_a and not self.exists_b
+
+
+
+    def has_changed(self):
+
+        return self.val_a != self.val_b
+
+
+
+    def htmlvalue(self, val):
+
+        return self.block.render_basic(val)
+
+
+
+
+
+class CharBlockComparison(BlockComparison):
+
+    def htmldiff(self):
+
+        return diff_text(
+
+            force_str(self.val_a),
+
+            force_str(self.val_b)
+
+        ).to_html()
+
+
+
+
+
+class RichTextBlockComparison(BlockComparison):
+
+    def htmldiff(self):
+
+        return diff_text(
+
+            BeautifulSoup(force_str(self.val_a), 'html5lib').getText(),
+
+            BeautifulSoup(force_str(self.val_b), 'html5lib').getText()
+
+        ).to_html()
+
+
+
+
+
+class StructBlockComparison(BlockComparison):
+
+    def htmlvalue(self, val):
+
+        htmlvalues = []
+
+        for name, block in self.block.child_blocks.items():
+
+            label = self.block.child_blocks[name].label
+
+            comparison_class = get_comparison_class_for_block(block)
+
+
+
+            htmlvalues.append((label, comparison_class(block, True, True, val[name], val[name]).htmlvalue(val[name])))
+
+
+
+        return format_html('<dl>\n{}\n</dl>', format_html_join(
+
+            '\n', '    <dt>{}</dt>\n    <dd>{}</dd>', htmlvalues))
+
+
+
+    def htmldiff(self):
+
+        htmldiffs = []
+
+        for name, block in self.block.child_blocks.items():
+
+            label = self.block.child_blocks[name].label
+
+            comparison_class = get_comparison_class_for_block(block)
+
+
+
+            htmldiffs.append((label, comparison_class(block, self.exists_a, self.exists_b, self.val_a[name], self.val_b[name]).htmldiff()))
+
+
+
+        return format_html('<dl>\n{}\n</dl>', format_html_join(
+
+            '\n', '    <dt>{}</dt>\n    <dd>{}</dd>', htmldiffs))
+
+
+
+
+
+class StreamBlockComparison(BlockComparison):
+
+    def get_block_comparisons(self):
+
+        a_blocks = list(self.val_a) or []
+
+        b_blocks = list(self.val_b) or []
+
+
+
+        a_blocks_by_id = {block.id: block for block in a_blocks}
+
+        b_blocks_by_id = {block.id: block for block in b_blocks}
+
+
+
+        deleted_ids = a_blocks_by_id.keys() - b_blocks_by_id.keys()
+
+
+
+        comparisons = []
+
+        for block in b_blocks:
+
+            comparison_class = get_comparison_class_for_block(block.block)
+
+
+
+            if block.id in a_blocks_by_id:
+
+                # Changed/existing block
+
+                comparisons.append(comparison_class(block.block, True, True, a_blocks_by_id[block.id].value, block.value))
 
             else:
 
-                year += 1900
+                # New block
 
-        month = MONTHS.index(m.group('mon').lower()) + 1
+                comparisons.append(comparison_class(block.block, False, True, None, block.value))
 
-        day = int(m.group('day'))
 
-        hour = int(m.group('hour'))
 
-        min = int(m.group('min'))
+        # Insert deleted blocks at the index where they used to be
 
-        sec = int(m.group('sec'))
+        deleted_block_indices = [(block, i) for i, block in enumerate(a_blocks) if block.id in deleted_ids]
 
-        result = datetime.datetime(year, month, day, hour, min, sec)
 
-        return calendar.timegm(result.utctimetuple())
 
-    except Exception:
+        for block, index in deleted_block_indices:
 
-        raise ValueError("%r is not a valid date" % date)
+            comparison_class = get_comparison_class_for_block(block.block)
 
+            comparison_to_insert = comparison_class(block.block, True, False, block.value, None)
 
 
-def parse_http_date_safe(date):
 
-    """
+            # Insert the block back in where it was before it was deleted.
 
-    Same as parse_http_date, but returns None if the input is invalid.
+            # Note: we need to account for new blocks when finding the position.
 
-    """
+            current_index = 0
 
-    try:
+            block_inserted = False
 
-        return parse_http_date(date)
+            for i, comparison in enumerate(comparisons):
 
-    except Exception:
+                if comparison.is_new():
 
-        pass
+                    continue
 
 
 
-# Base 36 functions: useful for generating compact URLs
+                if current_index == index:
 
+                    comparisons.insert(i, comparison_to_insert)
 
+                    block_inserted = True
 
-def base36_to_int(s):
+                    break
 
-    """
 
-    Converts a base 36 string to an ``int``. Raises ``ValueError` if the
 
-    input won't fit into an int.
+                current_index += 1
 
-    """
 
-    # To prevent overconsumption of server resources, reject any
 
-    # base36 string that is long than 13 base36 digits (13 digits
+            # Deleted block was from the end
 
-    # is sufficient to base36-encode any 64-bit integer)
+            if not block_inserted:
 
-    if len(s) > 13:
+                comparisons.append(comparison_to_insert)
 
-        raise ValueError("Base36 input too large")
 
-    value = int(s, 36)
 
-    # ... then do a final check that the value will fit into an int to avoid
+        return comparisons
 
-    # returning a long (#15067). The long type was removed in Python 3.
 
-    if not six.PY3 and value > sys.maxint:
 
-        raise ValueError("Base36 input too large")
+    def htmldiff(self):
 
-    return value
+        comparisons_html = []
 
 
 
-def int_to_base36(i):
+        for comparison in self.get_block_comparisons():
 
-    """
+            classes = ['comparison__child-object']
 
-    Converts an integer to a base36 string
+            if comparison.is_new():
 
-    """
+                classes.append('addition')
 
-    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+                block_rendered = comparison.htmlvalue(comparison.val_b)
 
-    factor = 0
+            elif comparison.is_deleted():
 
-    if i < 0:
+                classes.append('deletion')
 
-        raise ValueError("Negative base36 conversion input.")
+                block_rendered = comparison.htmlvalue(comparison.val_a)
 
-    if not six.PY3:
+            elif comparison.has_changed():
 
-        if not isinstance(i, six.integer_types):
+                block_rendered = comparison.htmldiff()
 
-            raise TypeError("Non-integer base36 conversion input.")
+            else:
 
-        if i > sys.maxint:
+                block_rendered = comparison.htmlvalue(comparison.val_a)
 
-            raise ValueError("Base36 conversion input too large.")
 
-    # Find starting factor
 
-    while True:
+            classes = ' '.join(classes)
 
-        factor += 1
+            comparisons_html.append('<div class="{0}">{1}</div>'.format(classes, block_rendered))
 
-        if i < 36 ** factor:
 
-            factor -= 1
 
-            break
+        return mark_safe('\n'.join(comparisons_html))
 
-    base36 = []
 
-    # Construct base36 representation
 
-    while factor >= 0:
 
-        j = 36 ** factor
 
-        base36.append(digits[i // j])
+class StreamFieldComparison(FieldComparison):
 
-        i = i % j
+    def has_block_ids(self, val):
 
-        factor -= 1
+        if not val:
 
-    return ''.join(base36)
+            return True
 
 
 
-def parse_etags(etag_str):
+        return bool(val[0].id)
 
-    """
 
-    Parses a string with one or several etags passed in If-None-Match and
 
-    If-Match headers by the rules in RFC 2616. Returns a list of etags
+    def htmldiff(self):
 
-    without surrounding double quotes (") and unescaped from \<CHAR>.
+        # Our method for diffing streamfields relies on the blocks in both revisions having UUIDs.
 
-    """
+        # But as UUIDs were added in Wagtail 1.11 we can't compare revisions that were created before
 
-    etags = ETAG_MATCH.findall(etag_str)
+        # that Wagtail version.
 
-    if not etags:
+        if self.has_block_ids(self.val_a) and self.has_block_ids(self.val_b):
 
-        # etag_str has wrong format, treat it as an opaque string then
+            return StreamBlockComparison(self.field.stream_block, True, True, self.val_a, self.val_b).htmldiff()
 
-        return [etag_str]
+        else:
 
-    etags = [e.encode('ascii').decode('unicode_escape') for e in etags]
+            # Fall back to diffing the HTML representation
 
-    return etags
+            return diff_text(
 
+                BeautifulSoup(force_str(self.val_a), 'html5lib').getText(),
 
+                BeautifulSoup(force_str(self.val_b), 'html5lib').getText()
 
-def quote_etag(etag):
+            ).to_html()
 
-    """
 
-    Wraps a string in double quotes escaping contents as necessary.
 
-    """
 
-    return '"%s"' % etag.replace('\\', '\\\\').replace('"', '\\"')
 
+class ChoiceFieldComparison(FieldComparison):
 
+    def htmldiff(self):
 
-def same_origin(url1, url2):
+        val_a = force_str(dict(self.field.flatchoices).get(self.val_a, self.val_a), strings_only=True)
 
-    """
+        val_b = force_str(dict(self.field.flatchoices).get(self.val_b, self.val_b), strings_only=True)
 
-    Checks if two URLs are 'same-origin'
 
-    """
 
-    p1, p2 = urllib_parse.urlparse(url1), urllib_parse.urlparse(url2)
+        if self.val_a != self.val_b:
 
-    return (p1.scheme, p1.hostname, p1.port) == (p2.scheme, p2.hostname, p2.port)
+            diffs = []
 
 
 
-def is_safe_url(url, host=None):
+            if val_a:
 
-    """
+                diffs += [('deletion', val_a)]
 
-    Return ``True`` if the url is a safe redirection (i.e. it doesn't point to
+            if val_b:
 
-    a different host).
+                diffs += [('addition', val_b)]
 
 
 
-    Always returns ``False`` on an empty url.
+            return TextDiff(diffs).to_html()
 
-    """
+        else:
 
-    if not url:
+            return escape(val_a)
+
+
+
+
+
+class M2MFieldComparison(FieldComparison):
+
+    def get_items(self):
+
+        return list(self.val_a), list(self.val_b)
+
+
+
+    def get_item_display(self, item):
+
+        return str(item)
+
+
+
+    def htmldiff(self):
+
+        # Get tags
+
+        items_a, items_b = self.get_items()
+
+
+
+        # Calculate changes
+
+        sm = difflib.SequenceMatcher(0, items_a, items_b)
+
+        changes = []
+
+        for op, i1, i2, j1, j2 in sm.get_opcodes():
+
+            if op == 'replace':
+
+                for item in items_a[i1:i2]:
+
+                    changes.append(('deletion', self.get_item_display(item)))
+
+                for item in items_b[j1:j2]:
+
+                    changes.append(('addition', self.get_item_display(item)))
+
+            elif op == 'delete':
+
+                for item in items_a[i1:i2]:
+
+                    changes.append(('deletion', self.get_item_display(item)))
+
+            elif op == 'insert':
+
+                for item in items_b[j1:j2]:
+
+                    changes.append(('addition', self.get_item_display(item)))
+
+            elif op == 'equal':
+
+                for item in items_a[i1:i2]:
+
+                    changes.append(('equal', self.get_item_display(item)))
+
+
+
+        # Convert changelist to HTML
+
+        return TextDiff(changes, separator=", ").to_html()
+
+
+
+    def has_changed(self):
+
+        items_a, items_b = self.get_items()
+
+        return items_a != items_b
+
+
+
+
+
+class TagsFieldComparison(M2MFieldComparison):
+
+    def get_item_display(self, tag):
+
+        return tag.slug
+
+
+
+
+
+class ForeignObjectComparison(FieldComparison):
+
+    def get_objects(self):
+
+        model = self.field.related_model
+
+        obj_a = model.objects.filter(pk=self.val_a).first()
+
+        obj_b = model.objects.filter(pk=self.val_b).first()
+
+        return obj_a, obj_b
+
+
+
+    def htmldiff(self):
+
+        obj_a, obj_b = self.get_objects()
+
+
+
+        if obj_a != obj_b:
+
+            if obj_a and obj_b:
+
+                # Changed
+
+                return TextDiff([('deletion', force_str(obj_a)), ('addition', force_str(obj_b))]).to_html()
+
+            elif obj_b:
+
+                # Added
+
+                return TextDiff([('addition', force_str(obj_b))]).to_html()
+
+            elif obj_a:
+
+                # Removed
+
+                return TextDiff([('deletion', force_str(obj_a))]).to_html()
+
+        else:
+
+            if obj_a:
+
+                return escape(force_str(obj_a))
+
+            else:
+
+                return mark_safe(_("None"))
+
+
+
+
+
+class ChildRelationComparison:
+
+    is_field = False
+
+    is_child_relation = True
+
+
+
+    def __init__(self, field, field_comparisons, obj_a, obj_b):
+
+        self.field = field
+
+        self.field_comparisons = field_comparisons
+
+        self.val_a = getattr(obj_a, field.related_name)
+
+        self.val_b = getattr(obj_b, field.related_name)
+
+
+
+    def field_label(self):
+
+        """
+
+        Returns a label for this field to be displayed to the user
+
+        """
+
+        verbose_name = getattr(self.field, 'verbose_name', None)
+
+
+
+        if verbose_name is None:
+
+            # Relations don't have a verbose_name
+
+            verbose_name = self.field.name.replace('_', ' ')
+
+
+
+        return capfirst(verbose_name)
+
+
+
+    def get_mapping(self, objs_a, objs_b):
+
+        """
+
+        This bit of code attempts to match the objects in the A revision with
+
+        their counterpart in the B revision.
+
+
+
+        A match is firstly attempted by PK (where a matching ID indicates they're the same).
+
+        We compare remaining the objects by their field data; the objects with the fewest
+
+        fields changed are matched until there are no more possible matches left.
+
+
+
+        This returns 4 values:
+
+         - map_forwards => a mapping of object indexes from the B version to the A version
+
+         - map_backwards => a mapping of object indexes from the A version to the B version
+
+         - added => a list of indices for objects that didn't exist in the B version
+
+         - deleted => a list of indices for objects that didn't exist in the A version
+
+
+
+        Note the indices are 0-based array indices indicating the location of the object in either
+
+        the objs_a or objs_b arrays.
+
+
+
+        For example:
+
+
+
+        objs_a => A, B, C, D
+
+        objs_b => B, C, D, E
+
+
+
+        Will return the following:
+
+
+
+        map_forwards = {
+
+            1: 0,  # B (objs_a: objs_b)
+
+            2: 1,  # C (objs_a: objs_b)
+
+            3: 2,  # D (objs_a: objs_b)
+
+        }
+
+        map_backwards = {
+
+            0: 1,  # B (objs_b: objs_a)
+
+            1: 2,  # C (objs_b: objs_a)
+
+            2: 3,  # D (objs_b: objs_a)
+
+        }
+
+        added = [4]  # D in objs_b
+
+        deleted = [0]  # A in objs_a
+
+        """
+
+        map_forwards = {}
+
+        map_backwards = {}
+
+        added = []
+
+        deleted = []
+
+
+
+        # Match child objects on PK (ID)
+
+        for a_idx, a_child in enumerate(objs_a):
+
+            for b_idx, b_child in enumerate(objs_b):
+
+                if b_idx in map_backwards:
+
+                    continue
+
+
+
+                if a_child.pk is not None and b_child.pk is not None and a_child.pk == b_child.pk:
+
+                    map_forwards[a_idx] = b_idx
+
+                    map_backwards[b_idx] = a_idx
+
+
+
+        # Now try to match them by data
+
+        matches = []
+
+        for a_idx, a_child in enumerate(objs_a):
+
+            if a_idx not in map_forwards:
+
+                for b_idx, b_child in enumerate(objs_b):
+
+                    if b_idx not in map_backwards:
+
+                        # If they both have a PK (ID) that is different, they can't be the same child object
+
+                        if a_child.pk and b_child.pk and a_child.pk != b_child.pk:
+
+                            continue
+
+
+
+                        comparison = self.get_child_comparison(objs_a[a_idx], objs_b[b_idx])
+
+                        num_differences = comparison.get_num_differences()
+
+
+
+                        matches.append((a_idx, b_idx, num_differences))
+
+
+
+        # Objects with the least differences will be matched first. So only the best possible matches are made
+
+        matches.sort(key=lambda match: match[2])
+
+        for a_idx, b_idx, num_differences in matches:
+
+            # Make sure both objects were not matched previously
+
+            if a_idx in map_forwards or b_idx in map_backwards:
+
+                continue
+
+
+
+            # Match!
+
+            map_forwards[a_idx] = b_idx
+
+            map_backwards[b_idx] = a_idx
+
+
+
+        # Mark unmapped objects as added/deleted
+
+        for a_idx, a_child in enumerate(objs_a):
+
+            if a_idx not in map_forwards:
+
+                deleted.append(a_idx)
+
+
+
+        for b_idx, b_child in enumerate(objs_b):
+
+            if b_idx not in map_backwards:
+
+                added.append(b_idx)
+
+
+
+        return map_forwards, map_backwards, added, deleted
+
+
+
+    def get_child_comparison(self, obj_a, obj_b):
+
+        return ChildObjectComparison(self.field.related_model, self.field_comparisons, obj_a, obj_b)
+
+
+
+    def get_child_comparisons(self):
+
+        """
+
+        Returns a list of ChildObjectComparison objects. Representing all child
+
+        objects that existed in either version.
+
+
+
+        They are returned in the order they appear in the B version with deletions
+
+        appended at the end.
+
+
+
+        All child objects are returned, regardless of whether they were actually changed.
+
+        """
+
+        objs_a = list(self.val_a.all())
+
+        objs_b = list(self.val_b.all())
+
+
+
+        map_forwards, map_backwards, added, deleted = self.get_mapping(objs_a, objs_b)
+
+        objs_a = dict(enumerate(objs_a))
+
+        objs_b = dict(enumerate(objs_b))
+
+
+
+        comparisons = []
+
+
+
+        for b_idx, b_child in objs_b.items():
+
+            if b_idx in added:
+
+                comparisons.append(self.get_child_comparison(None, b_child))
+
+            else:
+
+                comparisons.append(self.get_child_comparison(objs_a[map_backwards[b_idx]], b_child))
+
+
+
+        for a_idx, a_child in objs_a.items():
+
+            if a_idx in deleted:
+
+                comparisons.append(self.get_child_comparison(a_child, None))
+
+
+
+        return comparisons
+
+
+
+    def has_changed(self):
+
+        """
+
+        Returns true if any changes were made to any of the child objects. This includes
+
+        adding, deleting and reordering.
+
+        """
+
+        objs_a = list(self.val_a.all())
+
+        objs_b = list(self.val_b.all())
+
+
+
+        map_forwards, map_backwards, added, deleted = self.get_mapping(objs_a, objs_b)
+
+
+
+        if added or deleted:
+
+            return True
+
+
+
+        for a_idx, b_idx in map_forwards.items():
+
+            comparison = self.get_child_comparison(objs_a[a_idx], objs_b[b_idx])
+
+
+
+            if comparison.has_changed():
+
+                return True
+
+
 
         return False
 
-    netloc = urllib_parse.urlparse(url)[1]
 
-    return not netloc or netloc == host
+
+
+
+class ChildObjectComparison:
+
+    def __init__(self, model, field_comparisons, obj_a, obj_b):
+
+        self.model = model
+
+        self.field_comparisons = field_comparisons
+
+        self.obj_a = obj_a
+
+        self.obj_b = obj_b
+
+
+
+    def is_addition(self):
+
+        """
+
+        Returns True if this child object was created since obj_a
+
+        """
+
+        return self.obj_b and not self.obj_a
+
+
+
+    def is_deletion(self):
+
+        """
+
+        Returns True if this child object was deleted in obj_b
+
+        """
+
+        return self.obj_a and not self.obj_b
+
+
+
+    def get_position_change(self):
+
+        """
+
+        Returns the change in position as an integer. Positive if the object
+
+        was moved down, negative if it moved up.
+
+
+
+        For example: '3' indicates the object moved down three spaces. '-1'
+
+        indicates the object moved up one space.
+
+        """
+
+        if not self.is_addition() and not self.is_deletion():
+
+            sort_a = getattr(self.obj_a, 'sort_order', 0) or 0
+
+            sort_b = getattr(self.obj_b, 'sort_order', 0) or 0
+
+            return sort_b - sort_a
+
+
+
+    def get_field_comparisons(self):
+
+        """
+
+        Returns a list of comparisons for all the fields in this object.
+
+        Fields that haven't changed are included as well.
+
+        """
+
+        comparisons = []
+
+
+
+        if self.is_addition() or self.is_deletion():
+
+            # Display the fields without diff as one of the versions are missing
+
+            obj = self.obj_a or self.obj_b
+
+
+
+            for field_comparison in self.field_comparisons:
+
+                comparisons.append(field_comparison(obj, obj))
+
+        else:
+
+            for field_comparison in self.field_comparisons:
+
+                comparisons.append(field_comparison(self.obj_a, self.obj_b))
+
+
+
+        return comparisons
+
+
+
+    def has_changed(self):
+
+        for comparison in self.get_field_comparisons():
+
+            if comparison.has_changed():
+
+                return True
+
+
+
+        return False
+
+
+
+    def get_num_differences(self):
+
+        """
+
+        Returns the number of fields that differ between the two
+
+        objects.
+
+        """
+
+        num_differences = 0
+
+
+
+        for comparison in self.get_field_comparisons():
+
+            if comparison.has_changed():
+
+                num_differences += 1
+
+
+
+        return num_differences
+
+
+
+
+
+class TextDiff:
+
+    def __init__(self, changes, separator=""):
+
+        self.changes = changes
+
+        self.separator = separator
+
+
+
+    def to_html(self, tag='span', addition_class='addition', deletion_class='deletion'):
+
+        html = []
+
+
+
+        for change_type, value in self.changes:
+
+            if change_type == 'equal':
+
+                html.append(escape(value))
+
+            elif change_type == 'addition':
+
+                html.append('<{tag} class="{classname}">{value}</{tag}>'.format(
+
+                    tag=tag,
+
+                    classname=addition_class,
+
+                    value=escape(value)
+
+                ))
+
+            elif change_type == 'deletion':
+
+                html.append('<{tag} class="{classname}">{value}</{tag}>'.format(
+
+                    tag=tag,
+
+                    classname=deletion_class,
+
+                    value=escape(value)
+
+                ))
+
+
+
+        return mark_safe(self.separator.join(html))
+
+
+
+
+
+def diff_text(a, b):
+
+    """
+
+    Performs a diffing algorithm on two pieces of text. Returns
+
+    a string of HTML containing the content of both texts with
+
+    <span> tags inserted indicating where the differences are.
+
+    """
+
+    def tokenise(text):
+
+        """
+
+        Tokenises a string by spliting it into individual characters
+
+        and grouping the alphanumeric ones together.
+
+
+
+        This means that punctuation, whitespace, CJK characters, etc
+
+        become separate tokens and words/numbers are merged together
+
+        to form bigger tokens.
+
+
+
+        This makes the output of the diff easier to read as words are
+
+        not broken up.
+
+        """
+
+        tokens = []
+
+        current_token = ""
+
+
+
+        for c in text or "":
+
+            if c.isalnum():
+
+                current_token += c
+
+            else:
+
+                if current_token:
+
+                    tokens.append(current_token)
+
+                    current_token = ""
+
+
+
+                tokens.append(c)
+
+
+
+        if current_token:
+
+            tokens.append(current_token)
+
+
+
+        return tokens
+
+
+
+    a_tok = tokenise(a)
+
+    b_tok = tokenise(b)
+
+    sm = difflib.SequenceMatcher(lambda t: len(t) <= 4, a_tok, b_tok)
+
+
+
+    changes = []
+
+
+
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+
+        if op == 'replace':
+
+            for token in a_tok[i1:i2]:
+
+                changes.append(('deletion', token))
+
+            for token in b_tok[j1:j2]:
+
+                changes.append(('addition', token))
+
+        elif op == 'delete':
+
+            for token in a_tok[i1:i2]:
+
+                changes.append(('deletion', token))
+
+        elif op == 'insert':
+
+            for token in b_tok[j1:j2]:
+
+                changes.append(('addition', token))
+
+        elif op == 'equal':
+
+            for token in a_tok[i1:i2]:
+
+                changes.append(('equal', token))
+
+
+
+    # Merge ajacent changes which have the same type. This just cleans up the HTML a bit
+
+    merged_changes = []
+
+    current_value = []
+
+    current_change_type = None
+
+    for change_type, value in changes:
+
+        if change_type != current_change_type:
+
+            if current_change_type is not None:
+
+                merged_changes.append((current_change_type, ''.join(current_value)))
+
+                current_value = []
+
+
+
+            current_change_type = change_type
+
+
+
+        current_value.append(value)
+
+
+
+    if current_value:
+
+        merged_changes.append((current_change_type, ''.join(current_value)))
+
+
+
+    return TextDiff(merged_changes)

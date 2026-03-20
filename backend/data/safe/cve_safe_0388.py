@@ -2,1414 +2,680 @@
 # Safety: safe
 # Category: safe
 
-import base64
+"""
 
-import re
+Form Widget classes specific to the Django admin site.
 
-from datetime import datetime
+"""
 
-import logging
+from __future__ import unicode_literals
 
-import ssl
 
-from xml.etree import ElementTree
 
+import copy
 
 
-import iso8601
 
-import six
+from django import forms
 
+from django.contrib.admin.templatetags.admin_static import static
 
+from django.core.urlresolvers import reverse
 
-import recurly
+from django.forms.widgets import RadioFieldRenderer
 
-import recurly.errors
+from django.forms.util import flatatt
 
-from recurly.link_header import parse_link_value
+from django.utils.html import escape, format_html, format_html_join, smart_urlquote
 
-from six.moves import http_client
+from django.utils.text import Truncator
 
-from six.moves.urllib.parse import urlencode, urlsplit, quote
+from django.utils.translation import ugettext as _
 
+from django.utils.safestring import mark_safe
 
+from django.utils.encoding import force_text
 
-class Money(object):
+from django.utils import six
 
 
 
-    """An amount of money in one or more currencies."""
 
 
-
-    def __init__(self, *args, **kwargs):
-
-        if args and kwargs:
-
-            raise ValueError("Money may be single currency or multi-currency but not both")
-
-        elif kwargs:
-
-            self.currencies = dict(kwargs)
-
-        elif args and len(args) > 1:
-
-            raise ValueError("Multi-currency Money must be instantiated with codes")
-
-        elif args:
-
-            self.currencies = { recurly.DEFAULT_CURRENCY: args[0] }
-
-        else:
-
-            self.currencies = dict()
-
-
-
-    @classmethod
-
-    def from_element(cls, elem):
-
-        currency = dict()
-
-        for child_el in elem:
-
-            if not child_el.tag:
-
-                continue
-
-            currency[child_el.tag] = int(child_el.text)
-
-        return cls(**currency)
-
-
-
-    def add_to_element(self, elem):
-
-        for currency, amount in self.currencies.items():
-
-            currency_el = ElementTree.Element(currency)
-
-            currency_el.attrib['type'] = 'integer'
-
-            currency_el.text = six.text_type(amount)
-
-            elem.append(currency_el)
-
-
-
-    def __getitem__(self, name):
-
-        return self.currencies[name]
-
-
-
-    def __setitem__(self, name, value):
-
-        self.currencies[name] = value
-
-
-
-    def __delitem__(self, name, value):
-
-        del self.currencies[name]
-
-
-
-    def __contains__(self, name):
-
-        return name in self.currencies
-
-
-
-
-
-class PageError(ValueError):
-
-    """An error raised when requesting to continue to a stream page that
-
-    doesn't exist.
-
-
-
-    This error can be raised when requesting the next page for the last page in
-
-    a series, or the first page for the first page in a series.
-
-
+class FilteredSelectMultiple(forms.SelectMultiple):
 
     """
 
-    pass
+    A SelectMultiple with a JavaScript filter interface.
 
 
 
+    Note that the resulting JavaScript assumes that the jsi18n
 
-
-class Page(list):
-
-
-
-    """A set of related `Resource` instances retrieved together from
-
-    the API.
-
-
-
-    Use `Page` instances as `list` instances to access their contents.
-
-
+    catalog has been loaded in the page
 
     """
 
-    def __iter__(self):
+    @property
 
-        if not self:
+    def media(self):
 
-            raise StopIteration
+        js = ["core.js", "SelectBox.js", "SelectFilter2.js"]
 
-        page = self
+        return forms.Media(js=[static("admin/js/%s" % path) for path in js])
 
-        while page:
 
-            for x in list.__iter__(page):
 
-                yield x
+    def __init__(self, verbose_name, is_stacked, attrs=None, choices=()):
 
-            try:
+        self.verbose_name = verbose_name
 
-                page = page.next_page()
+        self.is_stacked = is_stacked
 
-            except PageError:
+        super(FilteredSelectMultiple, self).__init__(attrs, choices)
 
-                try:
 
-                    del self.next_url
 
-                except AttributeError:
+    def render(self, name, value, attrs=None, choices=()):
 
-                    pass
+        if attrs is None:
 
-                raise StopIteration
+            attrs = {}
 
+        attrs['class'] = 'selectfilter'
 
+        if self.is_stacked:
 
-    def next_page(self):
+            attrs['class'] += 'stacked'
 
-        """Return the next `Page` after this one in the result sequence
+        output = [super(FilteredSelectMultiple, self).render(name, value, attrs, choices)]
 
-        it's from.
+        output.append('<script type="text/javascript">addEvent(window, "load", function(e) {')
 
+        # TODO: "id_" is hard-coded here. This should instead use the correct
 
+        # API to determine the ID dynamically.
 
-        If the current page is the last page in the sequence, calling
+        output.append('SelectFilter.init("id_%s", "%s", %s, "%s"); });</script>\n'
 
-        this method raises a `ValueError`.
+            % (name, self.verbose_name.replace('"', '\\"'), int(self.is_stacked), static('admin/')))
 
+        return mark_safe(''.join(output))
 
 
-        """
 
-        try:
+class AdminDateWidget(forms.DateInput):
 
-            next_url = self.next_url
 
-        except AttributeError:
 
-            raise PageError("Page %r has no next page" % self)
+    @property
 
-        return self.page_for_url(next_url)
+    def media(self):
 
+        js = ["calendar.js", "admin/DateTimeShortcuts.js"]
 
+        return forms.Media(js=[static("admin/js/%s" % path) for path in js])
 
-    def first_page(self):
 
-        """Return the first `Page` in the result sequence this `Page`
 
-        instance is from.
+    def __init__(self, attrs=None, format=None):
 
+        final_attrs = {'class': 'vDateField', 'size': '10'}
 
+        if attrs is not None:
 
-        If the current page is already the first page in the sequence,
+            final_attrs.update(attrs)
 
-        calling this method raises a `ValueError`.
+        super(AdminDateWidget, self).__init__(attrs=final_attrs, format=format)
 
 
 
-        """
+class AdminTimeWidget(forms.TimeInput):
 
-        try:
 
-            start_url = self.start_url
 
-        except AttributeError:
+    @property
 
-            raise PageError("Page %r is already the first page" % self)
+    def media(self):
 
-        return self.page_for_url(start_url)
+        js = ["calendar.js", "admin/DateTimeShortcuts.js"]
 
+        return forms.Media(js=[static("admin/js/%s" % path) for path in js])
 
 
-    @classmethod
 
-    def page_for_url(cls, url):
+    def __init__(self, attrs=None, format=None):
 
-        """Return a new `Page` containing the items at the given
+        final_attrs = {'class': 'vTimeField', 'size': '8'}
 
-        endpoint URL."""
+        if attrs is not None:
 
-        resp, elem = Resource.element_for_url(url)
+            final_attrs.update(attrs)
 
+        super(AdminTimeWidget, self).__init__(attrs=final_attrs, format=format)
 
 
-        value = Resource.value_for_element(elem)
 
-
-
-        return cls.page_for_value(resp, value)
-
-
-
-    @classmethod
-
-    def count_for_url(cls, url):
-
-        """Return the count of server side resources given a url"""
-
-        headers = Resource.headers_for_url(url)
-
-        return int(headers['X-Records'])
-
-
-
-    @classmethod
-
-    def page_for_value(cls, resp, value):
-
-        """Return a new `Page` representing the given resource `value`
-
-        retrieved using the HTTP response `resp`.
-
-
-
-        This method records pagination ``Link`` headers present in `resp`, so
-
-        that the returned `Page` can return their resources from its
-
-        `next_page()` and `first_page()` methods.
-
-
-
-        """
-
-        page = cls(value)
-
-        links = parse_link_value(resp.getheader('Link'))
-
-        for url, data in six.iteritems(links):
-
-            if data.get('rel') == 'start':
-
-                page.start_url = url
-
-            if data.get('rel') == 'next':
-
-                page.next_url = url
-
-
-
-        return page
-
-
-
-
-
-class Resource(object):
-
-
-
-    """A Recurly API resource.
-
-
-
-    This superclass implements the general behavior for all the
-
-    specific Recurly API resources.
-
-
-
-    All method parameters and return values that are XML elements are
-
-    `xml.etree.ElementTree.Element` instances.
-
-
+class AdminSplitDateTime(forms.SplitDateTimeWidget):
 
     """
 
+    A SplitDateTime Widget that has some admin-specific styling.
 
+    """
 
-    _classes_for_nodename = dict()
+    def __init__(self, attrs=None):
 
+        widgets = [AdminDateWidget, AdminTimeWidget]
 
+        # Note that we're calling MultiWidget, not SplitDateTimeWidget, because
 
-    sensitive_attributes = ()
+        # we want to define widgets.
 
-    """Attributes that are not logged with the rest of a `Resource`
-
-    of this class when submitted in a ``POST`` or ``PUT`` request."""
-
-    xml_attribute_attributes = ()
-
-    """Attributes of a `Resource` of this class that are not serialized
-
-    as subelements, but rather attributes of the top level element."""
-
-    inherits_currency = False
-
-    """Whether a `Resource` of this class inherits a currency from a
-
-    parent `Resource`, and therefore should not use `Money` instances
-
-    even though this `Resource` class has no ``currency`` attribute of
-
-    its own."""
+        forms.MultiWidget.__init__(self, widgets, attrs)
 
 
 
-    def serializable_attributes(self):
+    def format_output(self, rendered_widgets):
 
-        """ Attributes to be serialized in a ``POST`` or ``PUT`` request.
+        return format_html('<p class="datetime">{0} {1}<br />{2} {3}</p>',
 
-        Returns all attributes unless a blacklist is specified
+                           _('Date:'), rendered_widgets[0],
 
-        """
-
-
-
-        if hasattr(self, 'blacklist_attributes'):
-
-            return [attr for attr in self.attributes if attr not in
-
-                    self.blacklist_attributes]
-
-        else:
-
-            return self.attributes
+                           _('Time:'), rendered_widgets[1])
 
 
 
+class AdminRadioFieldRenderer(RadioFieldRenderer):
+
+    def render(self):
+
+        """Outputs a <ul> for this set of radio fields."""
+
+        return format_html('<ul{0}>\n{1}\n</ul>',
+
+                           flatatt(self.attrs),
+
+                           format_html_join('\n', '<li>{0}</li>',
+
+                                            ((force_text(w),) for w in self)))
 
 
-    def __init__(self, **kwargs):
+
+class AdminRadioSelect(forms.RadioSelect):
+
+    renderer = AdminRadioFieldRenderer
+
+
+
+class AdminFileWidget(forms.ClearableFileInput):
+
+    template_with_initial = ('<p class="file-upload">%s</p>'
+
+                            % forms.ClearableFileInput.template_with_initial)
+
+    template_with_clear = ('<span class="clearable-file-input">%s</span>'
+
+                           % forms.ClearableFileInput.template_with_clear)
+
+
+
+def url_params_from_lookup_dict(lookups):
+
+    """
+
+    Converts the type of lookups specified in a ForeignKey limit_choices_to
+
+    attribute to a dictionary of query parameters
+
+    """
+
+    params = {}
+
+    if lookups and hasattr(lookups, 'items'):
+
+        items = []
+
+        for k, v in lookups.items():
+
+            if isinstance(v, (tuple, list)):
+
+                v = ','.join([str(x) for x in v])
+
+            elif isinstance(v, bool):
+
+                # See django.db.fields.BooleanField.get_prep_lookup
+
+                v = ('0', '1')[v]
+
+            else:
+
+                v = six.text_type(v)
+
+            items.append((k, v))
+
+        params.update(dict(items))
+
+    return params
+
+
+
+class ForeignKeyRawIdWidget(forms.TextInput):
+
+    """
+
+    A Widget for displaying ForeignKeys in the "raw_id" interface rather than
+
+    in a <select> box.
+
+    """
+
+    def __init__(self, rel, admin_site, attrs=None, using=None):
+
+        self.rel = rel
+
+        self.admin_site = admin_site
+
+        self.db = using
+
+        super(ForeignKeyRawIdWidget, self).__init__(attrs)
+
+
+
+    def render(self, name, value, attrs=None):
+
+        rel_to = self.rel.to
+
+        if attrs is None:
+
+            attrs = {}
+
+        extra = []
+
+        if rel_to in self.admin_site._registry:
+
+            # The related object is registered with the same AdminSite
+
+            related_url = reverse('admin:%s_%s_changelist' %
+
+                                    (rel_to._meta.app_label,
+
+                                    rel_to._meta.module_name),
+
+                                    current_app=self.admin_site.name)
+
+
+
+            params = self.url_parameters()
+
+            if params:
+
+                url = '?' + '&amp;'.join(['%s=%s' % (k, v) for k, v in params.items()])
+
+            else:
+
+                url = ''
+
+            if "class" not in attrs:
+
+                attrs['class'] = 'vForeignKeyRawIdAdminField' # The JavaScript code looks for this hook.
+
+            # TODO: "lookup_id_" is hard-coded here. This should instead use
+
+            # the correct API to determine the ID dynamically.
+
+            extra.append('<a href="%s%s" class="related-lookup" id="lookup_id_%s" onclick="return showRelatedObjectLookupPopup(this);"> '
+
+                            % (related_url, url, name))
+
+            extra.append('<img src="%s" width="16" height="16" alt="%s" /></a>'
+
+                            % (static('admin/img/selector-search.gif'), _('Lookup')))
+
+        output = [super(ForeignKeyRawIdWidget, self).render(name, value, attrs)] + extra
+
+        if value:
+
+            output.append(self.label_for_value(value))
+
+        return mark_safe(''.join(output))
+
+
+
+    def base_url_parameters(self):
+
+        return url_params_from_lookup_dict(self.rel.limit_choices_to)
+
+
+
+    def url_parameters(self):
+
+        from django.contrib.admin.views.main import TO_FIELD_VAR
+
+        params = self.base_url_parameters()
+
+        params.update({TO_FIELD_VAR: self.rel.get_related_field().name})
+
+        return params
+
+
+
+    def label_for_value(self, value):
+
+        key = self.rel.get_related_field().name
 
         try:
 
-            self.attributes.index('currency') # Test for currency attribute,
+            obj = self.rel.to._default_manager.using(self.db).get(**{key: value})
 
-            self.currency                     # and test if it's set.
+            return '&nbsp;<strong>%s</strong>' % escape(Truncator(obj).words(14, truncate='...'))
 
-        except ValueError:
+        except (ValueError, self.rel.to.DoesNotExist):
 
-            pass
-
-        except AttributeError:
-
-            self.currency = recurly.DEFAULT_CURRENCY
+            return ''
 
 
 
-        for key, value in six.iteritems(kwargs):
+class ManyToManyRawIdWidget(ForeignKeyRawIdWidget):
 
-            setattr(self, key, value)
+    """
 
+    A Widget for displaying ManyToMany ids in the "raw_id" interface rather than
 
+    in a <select multiple> box.
 
-    @classmethod
+    """
 
-    def http_request(cls, url, method='GET', body=None, headers=None):
+    def render(self, name, value, attrs=None):
 
-        """Make an HTTP request with the given method to the given URL,
+        if attrs is None:
 
-        returning the resulting `http_client.HTTPResponse` instance.
+            attrs = {}
 
+        if self.rel.to in self.admin_site._registry:
 
+            # The related object is registered with the same AdminSite
 
-        If the `body` argument is a `Resource` instance, it is serialized
+            attrs['class'] = 'vManyToManyRawIdAdminField'
 
-        to XML by calling its `to_element()` method before submitting it.
+        if value:
 
-        Requests are authenticated per the Recurly API specification
-
-        using the ``recurly.API_KEY`` value for the API key.
-
-
-
-        Requests and responses are logged at the ``DEBUG`` level to the
-
-        ``recurly.http.request`` and ``recurly.http.response`` loggers
-
-        respectively.
-
-
-
-        """
-
-
-
-        if recurly.API_KEY is None:
-
-            raise recurly.UnauthorizedError('recurly.API_KEY not set')
-
-
-
-        is_non_ascii = lambda s: any(ord(c) >= 128 for c in s)
-
-
-
-        if is_non_ascii(recurly.API_KEY) or is_non_ascii(recurly.SUBDOMAIN):
-
-            raise recurly.ConfigurationError("""Setting API_KEY or SUBDOMAIN to
-
-                    unicode strings may cause problems. Please use strings.
-
-                    Issue described here:
-
-                    https://gist.github.com/maximehardy/d3a0a6427d2b6791b3dc""")
-
-
-
-        urlparts = urlsplit(url)
-
-        connection_options = {}
-
-        if recurly.SOCKET_TIMEOUT_SECONDS:
-
-            connection_options['timeout'] = recurly.SOCKET_TIMEOUT_SECONDS
-
-        if urlparts.scheme != 'https':
-
-            connection = http_client.HTTPConnection(urlparts.netloc, **connection_options)
-
-        elif recurly.CA_CERTS_FILE is None:
-
-            connection = http_client.HTTPSConnection(urlparts.netloc, **connection_options)
+            value = ','.join([force_text(v) for v in value])
 
         else:
 
-            connection_options['context'] = ssl.create_default_context(cafile=recurly.CA_CERTS_FILE)
+            value = ''
 
-            connection = http_client.HTTPSConnection(urlparts.netloc, **connection_options)
+        return super(ManyToManyRawIdWidget, self).render(name, value, attrs)
 
 
 
-        headers = {} if headers is None else dict(headers)
+    def url_parameters(self):
 
-        headers.setdefault('Accept', 'application/xml')
+        return self.base_url_parameters()
 
-        headers.update({
 
-            'User-Agent': recurly.USER_AGENT
 
-        })
+    def label_for_value(self, value):
 
-        headers['X-Api-Version'] = recurly.api_version()
+        return ''
 
-        headers['Authorization'] = 'Basic %s' % base64.b64encode(six.b('%s:' % recurly.API_KEY)).decode()
 
 
+    def value_from_datadict(self, data, files, name):
 
-        log = logging.getLogger('recurly.http.request')
+        value = data.get(name)
 
-        if log.isEnabledFor(logging.DEBUG):
+        if value:
 
-            log.debug("%s %s HTTP/1.1", method, url)
+            return value.split(',')
 
-            for header, value in six.iteritems(headers):
 
-                if header == 'Authorization':
 
-                    value = '<redacted>'
+    def _has_changed(self, initial, data):
 
-                log.debug("%s: %s", header, value)
+        if initial is None:
 
-            log.debug('')
+            initial = []
 
-            if method in ('POST', 'PUT') and body is not None:
+        if data is None:
 
-                if isinstance(body, Resource):
+            data = []
 
-                    log.debug(body.as_log_output())
+        if len(initial) != len(data):
 
-                else:
+            return True
 
-                    log.debug(body)
+        for pk1, pk2 in zip(initial, data):
 
+            if force_text(pk1) != force_text(pk2):
 
+                return True
 
-        if isinstance(body, Resource):
+        return False
 
-            body = ElementTree.tostring(body.to_element(), encoding='UTF-8')
 
-            headers['Content-Type'] = 'application/xml; charset=utf-8'
 
-        if method in ('POST', 'PUT') and body is None:
+class RelatedFieldWidgetWrapper(forms.Widget):
 
-            headers['Content-Length'] = '0'
+    """
 
-        connection.request(method, url, body, headers)
+    This class is a wrapper to a given widget to add the add icon for the
 
-        resp = connection.getresponse()
+    admin interface.
 
+    """
 
+    def __init__(self, widget, rel, admin_site, can_add_related=None):
 
-        resp_headers = cls.headers_as_dict(resp)
+        self.is_hidden = widget.is_hidden
 
+        self.needs_multipart_form = widget.needs_multipart_form
 
+        self.attrs = widget.attrs
 
-        log = logging.getLogger('recurly.http.response')
+        self.choices = widget.choices
 
-        if log.isEnabledFor(logging.DEBUG):
+        self.widget = widget
 
-            log.debug("HTTP/1.1 %d %s", resp.status, resp.reason)
+        self.rel = rel
 
-            log.debug(resp_headers)
+        # Backwards compatible check for whether a user can add related
 
-            log.debug('')
+        # objects.
 
+        if can_add_related is None:
 
+            can_add_related = rel.to in admin_site._registry
 
-        recurly.cache_rate_limit_headers(resp_headers)
+        self.can_add_related = can_add_related
 
+        # so we can check if the related object is registered with this AdminSite
 
+        self.admin_site = admin_site
 
-        return resp
 
 
+    def __deepcopy__(self, memo):
 
-    @classmethod
+        obj = copy.copy(self)
 
-    def headers_as_dict(cls, resp):
+        obj.widget = copy.deepcopy(self.widget, memo)
 
-        """Turns an array of response headers into a dictionary"""
+        obj.attrs = self.widget.attrs
 
-        if six.PY2:
+        memo[id(self)] = obj
 
-            pairs = [header.split(': ') for header in resp.msg.headers]
+        return obj
 
-            return dict([(k, v.strip()) for k, v in pairs])
 
-        else:
 
-            return dict([(k, v.strip()) for k, v in resp.msg._headers])
+    @property
 
+    def media(self):
 
+        return self.widget.media
 
-    def as_log_output(self):
 
-        """Returns an XML string containing a serialization of this
 
-        instance suitable for logging.
+    def render(self, name, value, *args, **kwargs):
 
+        rel_to = self.rel.to
 
+        info = (rel_to._meta.app_label, rel_to._meta.object_name.lower())
 
-        Attributes named in the instance's `sensitive_attributes` are
+        self.widget.choices = self.choices
 
-        redacted.
+        output = [self.widget.render(name, value, *args, **kwargs)]
 
+        if self.can_add_related:
 
+            related_url = reverse('admin:%s_%s_add' % info, current_app=self.admin_site.name)
 
-        """
+            # TODO: "add_id_" is hard-coded here. This should instead use the
 
-        elem = self.to_element()
+            # correct API to determine the ID dynamically.
 
-        for attrname in self.sensitive_attributes:
+            output.append('<a href="%s" class="add-another" id="add_id_%s" onclick="return showAddAnotherPopup(this);"> '
 
-            for sensitive_el in elem.iter(attrname):
+                          % (related_url, name))
 
-                sensitive_el.text = 'XXXXXXXXXXXXXXXX'
+            output.append('<img src="%s" width="10" height="10" alt="%s"/></a>'
 
-        return ElementTree.tostring(elem, encoding='UTF-8')
+                          % (static('admin/img/icon_addlink.gif'), _('Add Another')))
 
+        return mark_safe(''.join(output))
 
 
-    @classmethod
 
-    def _learn_nodenames(cls, classes):
+    def build_attrs(self, extra_attrs=None, **kwargs):
 
-        for resource_class in classes:
+        "Helper function for building an attribute dictionary."
 
-            try:
+        self.attrs = self.widget.build_attrs(extra_attrs=None, **kwargs)
 
-                rc_is_subclass = issubclass(resource_class, cls)
+        return self.attrs
 
-            except TypeError:
 
-                continue
 
-            if not rc_is_subclass:
+    def value_from_datadict(self, data, files, name):
 
-                continue
+        return self.widget.value_from_datadict(data, files, name)
 
-            nodename = getattr(resource_class, 'nodename', None)
 
-            if nodename is None:
 
-                continue
+    def _has_changed(self, initial, data):
 
+        return self.widget._has_changed(initial, data)
 
 
-            cls._classes_for_nodename[nodename] = resource_class
 
+    def id_for_label(self, id_):
 
+        return self.widget.id_for_label(id_)
 
-    @classmethod
 
-    def get(cls, uuid):
 
-        """Return a `Resource` instance of this class identified by
+class AdminTextareaWidget(forms.Textarea):
 
-        the given code or UUID.
+    def __init__(self, attrs=None):
 
+        final_attrs = {'class': 'vLargeTextField'}
 
+        if attrs is not None:
 
-        Only `Resource` classes with specified `member_path` attributes
+            final_attrs.update(attrs)
 
-        can be directly requested with this method.
+        super(AdminTextareaWidget, self).__init__(attrs=final_attrs)
 
 
 
-        """
+class AdminTextInputWidget(forms.TextInput):
 
-        uuid = quote(str(uuid))
+    def __init__(self, attrs=None):
 
-        url = recurly.base_uri() + (cls.member_path % (uuid,))
+        final_attrs = {'class': 'vTextField'}
 
-        resp, elem = cls.element_for_url(url)
+        if attrs is not None:
 
-        return cls.from_element(elem)
+            final_attrs.update(attrs)
 
+        super(AdminTextInputWidget, self).__init__(attrs=final_attrs)
 
 
-    @classmethod
 
-    def headers_for_url(cls, url):
+class AdminURLFieldWidget(forms.TextInput):
 
-        """Return the headers only for the given URL as a dict"""
+    def __init__(self, attrs=None):
 
-        response = cls.http_request(url, method='HEAD')
+        final_attrs = {'class': 'vURLField'}
 
-        if response.status != 200:
+        if attrs is not None:
 
-            cls.raise_http_error(response)
+            final_attrs.update(attrs)
 
+        super(AdminURLFieldWidget, self).__init__(attrs=final_attrs)
 
 
-        return Resource.headers_as_dict(response)
 
+    def render(self, name, value, attrs=None):
 
+        html = super(AdminURLFieldWidget, self).render(name, value, attrs)
 
-    @classmethod
+        if value:
 
-    def element_for_url(cls, url):
+            value = force_text(self._format_value(value))
 
-        """Return the resource at the given URL, as a
+            final_attrs = {'href': smart_urlquote(value)}
 
-        (`http_client.HTTPResponse`, `xml.etree.ElementTree.Element`) tuple
+            html = format_html(
 
-        resulting from a ``GET`` request to that URL."""
+                '<p class="url">{0} <a{1}>{2}</a><br />{3} {4}</p>',
 
-        response = cls.http_request(url)
+                _('Currently:'), flatatt(final_attrs), value,
 
-        if response.status != 200:
+                _('Change:'), html
 
-            cls.raise_http_error(response)
+            )
 
+        return html
 
 
-        assert response.getheader('Content-Type').startswith('application/xml')
 
 
 
-        response_xml = response.read()
+class AdminIntegerFieldWidget(forms.TextInput):
 
-        logging.getLogger('recurly.http.response').debug(response_xml)
+    class_name = 'vIntegerField'
 
-        response_doc = ElementTree.fromstring(response_xml)
 
 
+    def __init__(self, attrs=None):
 
-        return response, response_doc
+        final_attrs = {'class': self.class_name}
 
+        if attrs is not None:
 
+            final_attrs.update(attrs)
 
-    @classmethod
+        super(AdminIntegerFieldWidget, self).__init__(attrs=final_attrs)
 
-    def _subclass_for_nodename(cls, nodename):
 
-        try:
 
-            return cls._classes_for_nodename[nodename]
+class AdminBigIntegerFieldWidget(AdminIntegerFieldWidget):
 
-        except KeyError:
+    class_name = 'vBigIntegerField'
 
-            raise ValueError("Could not determine resource class for array member with tag %r"
 
-                % nodename)
 
+class AdminCommaSeparatedIntegerFieldWidget(forms.TextInput):
 
+    def __init__(self, attrs=None):
 
-    @classmethod
+        final_attrs = {'class': 'vCommaSeparatedIntegerField'}
 
-    def value_for_element(cls, elem):
+        if attrs is not None:
 
-        """Deserialize the given XML `Element` into its representative
+            final_attrs.update(attrs)
 
-        value.
-
-
-
-        Depending on the content of the element, the returned value may be:
-
-        * a string, integer, or boolean value
-
-        * a `datetime.datetime` instance
-
-        * a list of `Resource` instances
-
-        * a single `Resource` instance
-
-        * a `Money` instance
-
-        * ``None``
-
-
-
-        """
-
-        log = logging.getLogger('recurly.resource')
-
-        if elem is None:
-
-            log.debug("Converting %r element into None value", elem)
-
-            return
-
-
-
-        if elem.attrib.get('nil') is not None:
-
-            log.debug("Converting %r element with nil attribute into None value", elem.tag)
-
-            return
-
-
-
-        if elem.tag.endswith('_in_cents') and 'currency' not in cls.attributes and not cls.inherits_currency:
-
-            log.debug("Converting %r element in class with no matching 'currency' into a Money value", elem.tag)
-
-            return Money.from_element(elem)
-
-
-
-        attr_type = elem.attrib.get('type')
-
-        log.debug("Converting %r element with type %r", elem.tag, attr_type)
-
-
-
-        if attr_type == 'integer':
-
-            return int(elem.text.strip())
-
-        if attr_type == 'float':
-
-            return float(elem.text.strip())
-
-        if attr_type == 'boolean':
-
-            return elem.text.strip() == 'true'
-
-        if attr_type == 'datetime':
-
-            return iso8601.parse_date(elem.text.strip())
-
-        if attr_type == 'array':
-
-            return [cls._subclass_for_nodename(sub_elem.tag).from_element(sub_elem) for sub_elem in elem]
-
-
-
-        # Unknown types may be the names of resource classes.
-
-        if attr_type is not None:
-
-            try:
-
-                value_class = cls._subclass_for_nodename(attr_type)
-
-            except ValueError:
-
-                log.debug("Not converting %r element with type %r to a resource as that matches no known nodename",
-
-                    elem.tag, attr_type)
-
-            else:
-
-                return value_class.from_element(elem)
-
-
-
-        # Untyped complex elements should still be resource instances. Guess from the nodename.
-
-        if len(elem):  # has children
-
-            value_class = cls._subclass_for_nodename(elem.tag)
-
-            log.debug("Converting %r tag into a %s", elem.tag, value_class.__name__)
-
-            return value_class.from_element(elem)
-
-
-
-        value = elem.text or ''
-
-        return value.strip()
-
-
-
-    @classmethod
-
-    def element_for_value(cls, attrname, value):
-
-        """Serialize the given value into an XML `Element` with the
-
-        given tag name, returning it.
-
-
-
-        The value argument may be:
-
-        * a `Resource` instance
-
-        * a `Money` instance
-
-        * a `datetime.datetime` instance
-
-        * a string, integer, or boolean value
-
-        * ``None``
-
-        * a list or tuple of these values
-
-
-
-        """
-
-        if isinstance(value, Resource):
-
-            if attrname in cls._classes_for_nodename:
-
-                # override the child's node name with this attribute name
-
-                return value.to_element(attrname)
-
-
-
-            return value.to_element()
-
-
-
-        el = ElementTree.Element(attrname)
-
-
-
-        if value is None:
-
-            el.attrib['nil'] = 'nil'
-
-        elif isinstance(value, bool):
-
-            el.attrib['type'] = 'boolean'
-
-            el.text = 'true' if value else 'false'
-
-        elif isinstance(value, int):
-
-            el.attrib['type'] = 'integer'
-
-            el.text = str(value)
-
-        elif isinstance(value, datetime):
-
-            el.attrib['type'] = 'datetime'
-
-            el.text = value.strftime('%Y-%m-%dT%H:%M:%SZ')
-
-        elif isinstance(value, list) or isinstance(value, tuple):
-
-            for sub_resource in value:
-
-                if hasattr(sub_resource, 'to_element'):
-
-                  el.append(sub_resource.to_element())
-
-                else:
-
-                  el.append(cls.element_for_value(re.sub(r"s$", "", attrname), sub_resource))
-
-        elif isinstance(value, Money):
-
-            value.add_to_element(el)
-
-        else:
-
-            el.text = six.text_type(value)
-
-
-
-        return el
-
-
-
-    @classmethod
-
-    def paginated(self, url):
-
-        """ Exposes Page.page_for_url in Resource """
-
-        return Page.page_for_url(url)
-
-
-
-    @classmethod
-
-    def from_element(cls, elem):
-
-        """Return a new instance of this `Resource` class representing
-
-        the given XML element."""
-
-        return cls().update_from_element(elem)
-
-
-
-    def update_from_element(self, elem):
-
-        """Reset this `Resource` instance to represent the values in
-
-        the given XML element."""
-
-        self._elem = elem
-
-
-
-        for attrname in self.attributes:
-
-            try:
-
-                delattr(self, attrname)
-
-            except AttributeError:
-
-                pass
-
-
-
-        document_url = elem.attrib.get('href')
-
-        if document_url is not None:
-
-            self._url = document_url
-
-
-
-        return self
-
-
-
-    def _make_actionator(self, url, method, extra_handler=None):
-
-        def actionator(*args, **kwargs):
-
-            if kwargs:
-
-                full_url = '%s?%s' % (url, urlencode(kwargs))
-
-            else:
-
-                full_url = url
-
-
-
-            body = args[0] if args else None
-
-            response = self.http_request(full_url, method, body)
-
-
-
-            if response.status == 200:
-
-                response_xml = response.read()
-
-                logging.getLogger('recurly.http.response').debug(response_xml)
-
-                return self.update_from_element(ElementTree.fromstring(response_xml))
-
-            elif response.status == 201:
-
-                response_xml = response.read()
-
-                logging.getLogger('recurly.http.response').debug(response_xml)
-
-                elem = ElementTree.fromstring(response_xml)
-
-                return self.value_for_element(elem)
-
-            elif response.status == 204:
-
-                pass
-
-            elif extra_handler is not None:
-
-                return extra_handler(response)
-
-            else:
-
-                self.raise_http_error(response)
-
-        return actionator
-
-
-
-    #usually the path is the same as the element name
-
-    def __getpath__(self, name):
-
-        return name
-
-
-
-    def __getattr__(self, name):
-
-        if name.startswith('_'):
-
-            raise AttributeError(name)
-
-
-
-        try:
-
-            selfnode = self._elem
-
-        except AttributeError:
-
-            raise AttributeError(name)
-
-
-
-        if name in self.xml_attribute_attributes:
-
-            try:
-
-                return selfnode.attrib[name]
-
-            except KeyError:
-
-                raise AttributeError(name)
-
-
-
-        elem = selfnode.find(self.__getpath__(name))
-
-
-
-        if elem is None:
-
-            # It might be an <a name> link.
-
-            for anchor_elem in selfnode.findall('a'):
-
-                if anchor_elem.attrib.get('name') == name:
-
-                    url = anchor_elem.attrib['href']
-
-                    method = anchor_elem.attrib['method'].upper()
-
-                    return self._make_actionator(url, method)
-
-
-
-            raise AttributeError(name)
-
-
-
-        # Follow links.
-
-        if 'href' in elem.attrib:
-
-            def make_relatitator(url):
-
-                def relatitator(**kwargs):
-
-                    if kwargs:
-
-                        full_url = '%s?%s' % (url, urlencode(kwargs))
-
-                    else:
-
-                        full_url = url
-
-
-
-                    resp, elem = Resource.element_for_url(full_url)
-
-                    value = Resource.value_for_element(elem)
-
-
-
-                    if isinstance(value, list):
-
-                        return Page.page_for_value(resp, value)
-
-                    return value
-
-                return relatitator
-
-
-
-            url = elem.attrib['href']
-
-
-
-            if url is '':
-
-                return Resource.value_for_element(elem)
-
-            else:
-
-                return make_relatitator(url)
-
-
-
-        return self.value_for_element(elem)
-
-
-
-    @classmethod
-
-    def all(cls, **kwargs):
-
-        """Return a `Page` of instances of this `Resource` class from
-
-        its general collection endpoint.
-
-
-
-        Only `Resource` classes with specified `collection_path`
-
-        endpoints can be requested with this method. Any provided
-
-        keyword arguments are passed to the API endpoint as query
-
-        parameters.
-
-
-
-        """
-
-        url = recurly.base_uri() + cls.collection_path
-
-        if kwargs:
-
-            url = '%s?%s' % (url, urlencode(kwargs))
-
-        return Page.page_for_url(url)
-
-
-
-    @classmethod
-
-    def count(cls, **kwargs):
-
-        """Return a count of server side resources given
-
-        filtering arguments in kwargs.
-
-        """
-
-        url = recurly.base_uri() + cls.collection_path
-
-        if kwargs:
-
-            url = '%s?%s' % (url, urlencode(kwargs))
-
-        return Page.count_for_url(url)
-
-
-
-    def save(self):
-
-        """Save this `Resource` instance to the service.
-
-
-
-        If this is a new instance, it is created through a ``POST``
-
-        request to its collection endpoint. If this instance already
-
-        exists in the service, it is updated through a ``PUT`` request
-
-        to its own URL.
-
-
-
-        """
-
-        if hasattr(self, '_url'):
-
-            return self._update()
-
-        return self._create()
-
-
-
-    def _update(self):
-
-        return self.put(self._url)
-
-
-
-    def _create(self):
-
-        url = recurly.base_uri() + self.collection_path
-
-        return self.post(url)
-
-
-
-    def put(self, url):
-
-        """Sends this `Resource` instance to the service with a
-
-        ``PUT`` request to the given URL."""
-
-        response = self.http_request(url, 'PUT', self, {'Content-Type': 'application/xml; charset=utf-8'})
-
-        if response.status != 200:
-
-            self.raise_http_error(response)
-
-
-
-        response_xml = response.read()
-
-        logging.getLogger('recurly.http.response').debug(response_xml)
-
-        self.update_from_element(ElementTree.fromstring(response_xml))
-
-
-
-    def post(self, url, body=None):
-
-        """Sends this `Resource` instance to the service with a
-
-        ``POST`` request to the given URL. Takes an optional body"""
-
-        response = self.http_request(url, 'POST', body or self, {'Content-Type': 'application/xml; charset=utf-8'})
-
-        if response.status not in (200, 201, 204):
-
-            self.raise_http_error(response)
-
-
-
-        self._url = response.getheader('Location')
-
-
-
-        if response.status in (200, 201):
-
-            response_xml = response.read()
-
-            logging.getLogger('recurly.http.response').debug(response_xml)
-
-            self.update_from_element(ElementTree.fromstring(response_xml))
-
-
-
-    def delete(self):
-
-        """Submits a deletion request for this `Resource` instance as
-
-        a ``DELETE`` request to its URL."""
-
-        response = self.http_request(self._url, 'DELETE')
-
-        if response.status != 204:
-
-            self.raise_http_error(response)
-
-
-
-    @classmethod
-
-    def raise_http_error(cls, response):
-
-        """Raise a `ResponseError` of the appropriate subclass in
-
-        reaction to the given `http_client.HTTPResponse`."""
-
-        response_xml = response.read()
-
-        logging.getLogger('recurly.http.response').debug(response_xml)
-
-        exc_class = recurly.errors.error_class_for_http_status(response.status)
-
-        raise exc_class(response_xml)
-
-
-
-    def to_element(self, root_name=None):
-
-        """Serialize this `Resource` instance to an XML element."""
-
-        if not root_name:
-
-            root_name = self.nodename
-
-        elem = ElementTree.Element(root_name)
-
-        for attrname in self.serializable_attributes():
-
-            # Only use values that have been loaded into the internal
-
-            # __dict__. For retrieved objects we look into the XML response at
-
-            # access time, so the internal __dict__ contains only the elements
-
-            # that have been set on the client side.
-
-            try:
-
-                value = self.__dict__[attrname]
-
-            except KeyError:
-
-                continue
-
-
-
-            if attrname in self.xml_attribute_attributes:
-
-                elem.attrib[attrname] = six.text_type(value)
-
-            else:
-
-                sub_elem = self.element_for_value(attrname, value)
-
-                elem.append(sub_elem)
-
-
-
-        return elem
+        super(AdminCommaSeparatedIntegerFieldWidget, self).__init__(attrs=final_attrs)

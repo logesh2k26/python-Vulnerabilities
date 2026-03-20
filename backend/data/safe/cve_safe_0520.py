@@ -2,350 +2,926 @@
 # Safety: safe
 # Category: safe
 
-import datetime
+# This file is dual licensed under the terms of the Apache License, Version
 
-from dataclasses import asdict, field
+# 2.0, and the BSD License. See the LICENSE file in the root of this repository
 
-from typing import Any, Dict, List, Optional, Union, cast
-
-
-
-import httpx
+# for complete details.
 
 
 
-from ..client import AuthenticatedClient, Client
-
-from ..errors import ApiResponseError
-
-from ..models.a_model import AModel
-
-from ..models.an_enum import AnEnum
-
-from ..models.body_upload_file_tests_upload_post import BodyUploadFileTestsUploadPost
-
-from ..models.http_validation_error import HTTPValidationError
+from __future__ import absolute_import, division, print_function
 
 
 
+from cryptography import utils
+
+from cryptography.exceptions import (
+
+    InvalidSignature,
+
+    UnsupportedAlgorithm,
+
+    _Reasons,
+
+)
+
+from cryptography.hazmat.backends.openssl.utils import (
+
+    _calculate_digest_and_algorithm,
+
+    _check_not_prehashed,
+
+    _warn_sign_verify_deprecated,
+
+)
+
+from cryptography.hazmat.primitives import hashes
+
+from cryptography.hazmat.primitives.asymmetric import (
+
+    AsymmetricSignatureContext,
+
+    AsymmetricVerificationContext,
+
+    rsa,
+
+)
+
+from cryptography.hazmat.primitives.asymmetric.padding import (
+
+    AsymmetricPadding,
+
+    MGF1,
+
+    OAEP,
+
+    PKCS1v15,
+
+    PSS,
+
+    calculate_max_pss_salt_length,
+
+)
+
+from cryptography.hazmat.primitives.asymmetric.rsa import (
+
+    RSAPrivateKeyWithSerialization,
+
+    RSAPublicKeyWithSerialization,
+
+)
 
 
-def get_user_list(
-
-    *, client: Client, an_enum_value: List[AnEnum], some_date: Union[datetime.date, datetime.datetime],
-
-) -> Union[
-
-    List[AModel], HTTPValidationError,
-
-]:
 
 
 
-    """ Get a list of things  """
+def _get_rsa_pss_salt_length(pss, key, hash_algorithm):
 
-    url = "{}/tests/".format(client.base_url)
-
-
-
-    headers: Dict[str, Any] = client.get_headers()
+    salt = pss._salt_length
 
 
 
-    json_an_enum_value = []
+    if salt is MGF1.MAX_LENGTH or salt is PSS.MAX_LENGTH:
 
-    for an_enum_value_item_data in an_enum_value:
+        return calculate_max_pss_salt_length(key, hash_algorithm)
 
-        an_enum_value_item = an_enum_value_item_data.value
+    else:
 
-
-
-        json_an_enum_value.append(an_enum_value_item)
+        return salt
 
 
 
-    if isinstance(some_date, datetime.date):
 
-        json_some_date = some_date.isoformat()
+
+def _enc_dec_rsa(backend, key, data, padding):
+
+    if not isinstance(padding, AsymmetricPadding):
+
+        raise TypeError("Padding must be an instance of AsymmetricPadding.")
+
+
+
+    if isinstance(padding, PKCS1v15):
+
+        padding_enum = backend._lib.RSA_PKCS1_PADDING
+
+    elif isinstance(padding, OAEP):
+
+        padding_enum = backend._lib.RSA_PKCS1_OAEP_PADDING
+
+
+
+        if not isinstance(padding._mgf, MGF1):
+
+            raise UnsupportedAlgorithm(
+
+                "Only MGF1 is supported by this backend.",
+
+                _Reasons.UNSUPPORTED_MGF,
+
+            )
+
+
+
+        if not backend.rsa_padding_supported(padding):
+
+            raise UnsupportedAlgorithm(
+
+                "This combination of padding and hash algorithm is not "
+
+                "supported by this backend.",
+
+                _Reasons.UNSUPPORTED_PADDING,
+
+            )
 
 
 
     else:
 
-        json_some_date = some_date.isoformat()
+        raise UnsupportedAlgorithm(
+
+            "{} is not supported by this backend.".format(padding.name),
+
+            _Reasons.UNSUPPORTED_PADDING,
+
+        )
 
 
 
-    params: Dict[str, Any] = {
-
-        "an_enum_value": json_an_enum_value,
-
-        "some_date": json_some_date,
-
-    }
+    return _enc_dec_rsa_pkey_ctx(backend, key, data, padding_enum, padding)
 
 
 
-    response = httpx.get(url=url, headers=headers, params=params,)
 
 
+def _enc_dec_rsa_pkey_ctx(backend, key, data, padding_enum, padding):
 
-    if response.status_code == 200:
+    if isinstance(key, _RSAPublicKey):
 
-        return [AModel.from_dict(item) for item in cast(List[Dict[str, Any]], response.json())]
+        init = backend._lib.EVP_PKEY_encrypt_init
 
-    if response.status_code == 422:
-
-        return HTTPValidationError.from_dict(cast(Dict[str, Any], response.json()))
+        crypt = backend._lib.EVP_PKEY_encrypt
 
     else:
 
-        raise ApiResponseError(response=response)
+        init = backend._lib.EVP_PKEY_decrypt_init
+
+        crypt = backend._lib.EVP_PKEY_decrypt
+
+
+
+    pkey_ctx = backend._lib.EVP_PKEY_CTX_new(key._evp_pkey, backend._ffi.NULL)
+
+    backend.openssl_assert(pkey_ctx != backend._ffi.NULL)
+
+    pkey_ctx = backend._ffi.gc(pkey_ctx, backend._lib.EVP_PKEY_CTX_free)
+
+    res = init(pkey_ctx)
+
+    backend.openssl_assert(res == 1)
+
+    res = backend._lib.EVP_PKEY_CTX_set_rsa_padding(pkey_ctx, padding_enum)
+
+    backend.openssl_assert(res > 0)
+
+    buf_size = backend._lib.EVP_PKEY_size(key._evp_pkey)
+
+    backend.openssl_assert(buf_size > 0)
+
+    if isinstance(padding, OAEP) and backend._lib.Cryptography_HAS_RSA_OAEP_MD:
+
+        mgf1_md = backend._evp_md_non_null_from_algorithm(
+
+            padding._mgf._algorithm
+
+        )
+
+        res = backend._lib.EVP_PKEY_CTX_set_rsa_mgf1_md(pkey_ctx, mgf1_md)
+
+        backend.openssl_assert(res > 0)
+
+        oaep_md = backend._evp_md_non_null_from_algorithm(padding._algorithm)
+
+        res = backend._lib.EVP_PKEY_CTX_set_rsa_oaep_md(pkey_ctx, oaep_md)
+
+        backend.openssl_assert(res > 0)
+
+
+
+    if (
+
+        isinstance(padding, OAEP)
+
+        and padding._label is not None
+
+        and len(padding._label) > 0
+
+    ):
+
+        # set0_rsa_oaep_label takes ownership of the char * so we need to
+
+        # copy it into some new memory
+
+        labelptr = backend._lib.OPENSSL_malloc(len(padding._label))
+
+        backend.openssl_assert(labelptr != backend._ffi.NULL)
+
+        backend._ffi.memmove(labelptr, padding._label, len(padding._label))
+
+        res = backend._lib.EVP_PKEY_CTX_set0_rsa_oaep_label(
+
+            pkey_ctx, labelptr, len(padding._label)
+
+        )
+
+        backend.openssl_assert(res == 1)
+
+
+
+    outlen = backend._ffi.new("size_t *", buf_size)
+
+    buf = backend._ffi.new("unsigned char[]", buf_size)
+
+    # Everything from this line onwards is written with the goal of being as
+
+    # constant-time as is practical given the constraints of Python and our
+
+    # API. See Bleichenbacher's '98 attack on RSA, and its many many variants.
+
+    # As such, you should not attempt to change this (particularly to "clean it
+
+    # up") without understanding why it was written this way (see
+
+    # Chesterton's Fence), and without measuring to verify you have not
+
+    # introduced observable time differences.
+
+    res = crypt(pkey_ctx, buf, outlen, data, len(data))
+
+    resbuf = backend._ffi.buffer(buf)[: outlen[0]]
+
+    backend._lib.ERR_clear_error()
+
+    if res <= 0:
+
+        raise ValueError("Encryption/decryption failed.")
+
+    return resbuf
 
 
 
 
 
-def upload_file_tests_upload_post(
+def _rsa_sig_determine_padding(backend, key, padding, algorithm):
 
-    *, client: Client, multipart_data: BodyUploadFileTestsUploadPost, keep_alive: Optional[bool] = None,
+    if not isinstance(padding, AsymmetricPadding):
 
-) -> Union[
-
-    None, HTTPValidationError,
-
-]:
+        raise TypeError("Expected provider of AsymmetricPadding.")
 
 
 
-    """ Upload a file  """
+    pkey_size = backend._lib.EVP_PKEY_size(key._evp_pkey)
 
-    url = "{}/tests/upload".format(client.base_url)
-
-
-
-    headers: Dict[str, Any] = client.get_headers()
-
-    if keep_alive is not None:
-
-        headers["keep-alive"] = keep_alive
+    backend.openssl_assert(pkey_size > 0)
 
 
 
-    response = httpx.post(url=url, headers=headers, files=multipart_data.to_dict(),)
+    if isinstance(padding, PKCS1v15):
+
+        padding_enum = backend._lib.RSA_PKCS1_PADDING
+
+    elif isinstance(padding, PSS):
+
+        if not isinstance(padding._mgf, MGF1):
+
+            raise UnsupportedAlgorithm(
+
+                "Only MGF1 is supported by this backend.",
+
+                _Reasons.UNSUPPORTED_MGF,
+
+            )
 
 
 
-    if response.status_code == 200:
+        # Size of key in bytes - 2 is the maximum
 
-        return None
+        # PSS signature length (salt length is checked later)
 
-    if response.status_code == 422:
+        if pkey_size - algorithm.digest_size - 2 < 0:
 
-        return HTTPValidationError.from_dict(cast(Dict[str, Any], response.json()))
+            raise ValueError(
+
+                "Digest too large for key size. Use a larger "
+
+                "key or different digest."
+
+            )
+
+
+
+        padding_enum = backend._lib.RSA_PKCS1_PSS_PADDING
 
     else:
 
-        raise ApiResponseError(response=response)
+        raise UnsupportedAlgorithm(
 
+            "{} is not supported by this backend.".format(padding.name),
 
+            _Reasons.UNSUPPORTED_PADDING,
 
+        )
 
 
-def json_body_tests_json_body_post(
 
-    *, client: Client, json_body: AModel,
+    return padding_enum
 
-) -> Union[
 
-    None, HTTPValidationError,
 
-]:
 
 
+def _rsa_sig_setup(backend, padding, algorithm, key, data, init_func):
 
-    """ Try sending a JSON body  """
+    padding_enum = _rsa_sig_determine_padding(backend, key, padding, algorithm)
 
-    url = "{}/tests/json_body".format(client.base_url)
+    evp_md = backend._evp_md_non_null_from_algorithm(algorithm)
 
+    pkey_ctx = backend._lib.EVP_PKEY_CTX_new(key._evp_pkey, backend._ffi.NULL)
 
+    backend.openssl_assert(pkey_ctx != backend._ffi.NULL)
 
-    headers: Dict[str, Any] = client.get_headers()
+    pkey_ctx = backend._ffi.gc(pkey_ctx, backend._lib.EVP_PKEY_CTX_free)
 
+    res = init_func(pkey_ctx)
 
+    backend.openssl_assert(res == 1)
 
-    json_json_body = json_body.to_dict()
+    res = backend._lib.EVP_PKEY_CTX_set_signature_md(pkey_ctx, evp_md)
 
+    if res == 0:
 
+        backend._consume_errors()
 
-    response = httpx.post(url=url, headers=headers, json=json_json_body,)
+        raise UnsupportedAlgorithm(
 
+            "{} is not supported by this backend for RSA signing.".format(
 
+                algorithm.name
 
-    if response.status_code == 200:
+            ),
 
-        return None
+            _Reasons.UNSUPPORTED_HASH,
 
-    if response.status_code == 422:
+        )
 
-        return HTTPValidationError.from_dict(cast(Dict[str, Any], response.json()))
+    res = backend._lib.EVP_PKEY_CTX_set_rsa_padding(pkey_ctx, padding_enum)
 
-    else:
+    backend.openssl_assert(res > 0)
 
-        raise ApiResponseError(response=response)
+    if isinstance(padding, PSS):
 
+        res = backend._lib.EVP_PKEY_CTX_set_rsa_pss_saltlen(
 
+            pkey_ctx, _get_rsa_pss_salt_length(padding, key, algorithm)
 
+        )
 
+        backend.openssl_assert(res > 0)
 
-def test_defaults_tests_test_defaults_post(
 
-    *,
 
-    client: Client,
+        mgf1_md = backend._evp_md_non_null_from_algorithm(
 
-    json_body: Dict[Any, Any],
+            padding._mgf._algorithm
 
-    string_prop: Optional[str] = "the default string",
+        )
 
-    datetime_prop: Optional[datetime.datetime] = datetime.datetime(1010, 10, 10, 0, 0),
+        res = backend._lib.EVP_PKEY_CTX_set_rsa_mgf1_md(pkey_ctx, mgf1_md)
 
-    date_prop: Optional[datetime.date] = datetime.date(1010, 10, 10),
+        backend.openssl_assert(res > 0)
 
-    float_prop: Optional[float] = 3.14,
 
-    int_prop: Optional[int] = 7,
 
-    boolean_prop: Optional[bool] = False,
+    return pkey_ctx
 
-    list_prop: Optional[List[AnEnum]] = field(
 
-        default_factory=lambda: cast(Optional[List[AnEnum]], [AnEnum.FIRST_VALUE, AnEnum.SECOND_VALUE])
 
-    ),
 
-    union_prop: Optional[Union[Optional[float], Optional[str]]] = "not a float",
 
-    enum_prop: Optional[AnEnum] = None,
+def _rsa_sig_sign(backend, padding, algorithm, private_key, data):
 
-) -> Union[
+    pkey_ctx = _rsa_sig_setup(
 
-    None, HTTPValidationError,
+        backend,
 
-]:
+        padding,
 
+        algorithm,
 
+        private_key,
 
-    """  """
+        data,
 
-    url = "{}/tests/test_defaults".format(client.base_url)
+        backend._lib.EVP_PKEY_sign_init,
 
+    )
 
+    buflen = backend._ffi.new("size_t *")
 
-    headers: Dict[str, Any] = client.get_headers()
+    res = backend._lib.EVP_PKEY_sign(
 
+        pkey_ctx, backend._ffi.NULL, buflen, data, len(data)
 
+    )
 
-    json_datetime_prop = datetime_prop.isoformat() if datetime_prop else None
+    backend.openssl_assert(res == 1)
 
+    buf = backend._ffi.new("unsigned char[]", buflen[0])
 
+    res = backend._lib.EVP_PKEY_sign(pkey_ctx, buf, buflen, data, len(data))
 
-    json_date_prop = date_prop.isoformat() if date_prop else None
+    if res != 1:
 
+        errors = backend._consume_errors_with_text()
 
+        raise ValueError(
 
-    if list_prop is None:
+            "Digest or salt length too long for key size. Use a larger key "
 
-        json_list_prop = None
+            "or shorter salt length if you are specifying a PSS salt",
 
-    else:
+            errors,
 
-        json_list_prop = []
+        )
 
-        for list_prop_item_data in list_prop:
 
-            list_prop_item = list_prop_item_data.value
 
+    return backend._ffi.buffer(buf)[:]
 
 
-            json_list_prop.append(list_prop_item)
 
 
 
-    if union_prop is None:
+def _rsa_sig_verify(backend, padding, algorithm, public_key, signature, data):
 
-        json_union_prop: Optional[Union[Optional[float], Optional[str]]] = None
+    pkey_ctx = _rsa_sig_setup(
 
-    elif isinstance(union_prop, float):
+        backend,
 
-        json_union_prop = union_prop
+        padding,
 
-    else:
+        algorithm,
 
-        json_union_prop = union_prop
+        public_key,
 
+        data,
 
+        backend._lib.EVP_PKEY_verify_init,
 
-    json_enum_prop = enum_prop.value if enum_prop else None
+    )
 
+    res = backend._lib.EVP_PKEY_verify(
 
+        pkey_ctx, signature, len(signature), data, len(data)
 
-    params: Dict[str, Any] = {}
+    )
 
-    if string_prop is not None:
+    # The previous call can return negative numbers in the event of an
 
-        params["string_prop"] = string_prop
+    # error. This is not a signature failure but we need to fail if it
 
-    if datetime_prop is not None:
+    # occurs.
 
-        params["datetime_prop"] = json_datetime_prop
+    backend.openssl_assert(res >= 0)
 
-    if date_prop is not None:
+    if res == 0:
 
-        params["date_prop"] = json_date_prop
+        backend._consume_errors()
 
-    if float_prop is not None:
+        raise InvalidSignature
 
-        params["float_prop"] = float_prop
 
-    if int_prop is not None:
 
-        params["int_prop"] = int_prop
 
-    if boolean_prop is not None:
 
-        params["boolean_prop"] = boolean_prop
+@utils.register_interface(AsymmetricSignatureContext)
 
-    if list_prop is not None:
+class _RSASignatureContext(object):
 
-        params["list_prop"] = json_list_prop
+    def __init__(self, backend, private_key, padding, algorithm):
 
-    if union_prop is not None:
+        self._backend = backend
 
-        params["union_prop"] = json_union_prop
+        self._private_key = private_key
 
-    if enum_prop is not None:
 
-        params["enum_prop"] = json_enum_prop
 
+        # We now call _rsa_sig_determine_padding in _rsa_sig_setup. However
 
+        # we need to make a pointless call to it here so we maintain the
 
-    json_json_body = json_body
+        # API of erroring on init with this context if the values are invalid.
 
+        _rsa_sig_determine_padding(backend, private_key, padding, algorithm)
 
+        self._padding = padding
 
-    response = httpx.post(url=url, headers=headers, json=json_json_body, params=params,)
+        self._algorithm = algorithm
 
+        self._hash_ctx = hashes.Hash(self._algorithm, self._backend)
 
 
-    if response.status_code == 200:
 
-        return None
+    def update(self, data):
 
-    if response.status_code == 422:
+        self._hash_ctx.update(data)
 
-        return HTTPValidationError.from_dict(cast(Dict[str, Any], response.json()))
 
-    else:
 
-        raise ApiResponseError(response=response)
+    def finalize(self):
+
+        return _rsa_sig_sign(
+
+            self._backend,
+
+            self._padding,
+
+            self._algorithm,
+
+            self._private_key,
+
+            self._hash_ctx.finalize(),
+
+        )
+
+
+
+
+
+@utils.register_interface(AsymmetricVerificationContext)
+
+class _RSAVerificationContext(object):
+
+    def __init__(self, backend, public_key, signature, padding, algorithm):
+
+        self._backend = backend
+
+        self._public_key = public_key
+
+        self._signature = signature
+
+        self._padding = padding
+
+        # We now call _rsa_sig_determine_padding in _rsa_sig_setup. However
+
+        # we need to make a pointless call to it here so we maintain the
+
+        # API of erroring on init with this context if the values are invalid.
+
+        _rsa_sig_determine_padding(backend, public_key, padding, algorithm)
+
+
+
+        padding = padding
+
+        self._algorithm = algorithm
+
+        self._hash_ctx = hashes.Hash(self._algorithm, self._backend)
+
+
+
+    def update(self, data):
+
+        self._hash_ctx.update(data)
+
+
+
+    def verify(self):
+
+        return _rsa_sig_verify(
+
+            self._backend,
+
+            self._padding,
+
+            self._algorithm,
+
+            self._public_key,
+
+            self._signature,
+
+            self._hash_ctx.finalize(),
+
+        )
+
+
+
+
+
+@utils.register_interface(RSAPrivateKeyWithSerialization)
+
+class _RSAPrivateKey(object):
+
+    def __init__(self, backend, rsa_cdata, evp_pkey):
+
+        res = backend._lib.RSA_check_key(rsa_cdata)
+
+        if res != 1:
+
+            errors = backend._consume_errors_with_text()
+
+            raise ValueError("Invalid private key", errors)
+
+
+
+        self._backend = backend
+
+        self._rsa_cdata = rsa_cdata
+
+        self._evp_pkey = evp_pkey
+
+
+
+        n = self._backend._ffi.new("BIGNUM **")
+
+        self._backend._lib.RSA_get0_key(
+
+            self._rsa_cdata,
+
+            n,
+
+            self._backend._ffi.NULL,
+
+            self._backend._ffi.NULL,
+
+        )
+
+        self._backend.openssl_assert(n[0] != self._backend._ffi.NULL)
+
+        self._key_size = self._backend._lib.BN_num_bits(n[0])
+
+
+
+    key_size = utils.read_only_property("_key_size")
+
+
+
+    def signer(self, padding, algorithm):
+
+        _warn_sign_verify_deprecated()
+
+        _check_not_prehashed(algorithm)
+
+        return _RSASignatureContext(self._backend, self, padding, algorithm)
+
+
+
+    def decrypt(self, ciphertext, padding):
+
+        key_size_bytes = (self.key_size + 7) // 8
+
+        if key_size_bytes != len(ciphertext):
+
+            raise ValueError("Ciphertext length must be equal to key size.")
+
+
+
+        return _enc_dec_rsa(self._backend, self, ciphertext, padding)
+
+
+
+    def public_key(self):
+
+        ctx = self._backend._lib.RSAPublicKey_dup(self._rsa_cdata)
+
+        self._backend.openssl_assert(ctx != self._backend._ffi.NULL)
+
+        ctx = self._backend._ffi.gc(ctx, self._backend._lib.RSA_free)
+
+        res = self._backend._lib.RSA_blinding_on(ctx, self._backend._ffi.NULL)
+
+        self._backend.openssl_assert(res == 1)
+
+        evp_pkey = self._backend._rsa_cdata_to_evp_pkey(ctx)
+
+        return _RSAPublicKey(self._backend, ctx, evp_pkey)
+
+
+
+    def private_numbers(self):
+
+        n = self._backend._ffi.new("BIGNUM **")
+
+        e = self._backend._ffi.new("BIGNUM **")
+
+        d = self._backend._ffi.new("BIGNUM **")
+
+        p = self._backend._ffi.new("BIGNUM **")
+
+        q = self._backend._ffi.new("BIGNUM **")
+
+        dmp1 = self._backend._ffi.new("BIGNUM **")
+
+        dmq1 = self._backend._ffi.new("BIGNUM **")
+
+        iqmp = self._backend._ffi.new("BIGNUM **")
+
+        self._backend._lib.RSA_get0_key(self._rsa_cdata, n, e, d)
+
+        self._backend.openssl_assert(n[0] != self._backend._ffi.NULL)
+
+        self._backend.openssl_assert(e[0] != self._backend._ffi.NULL)
+
+        self._backend.openssl_assert(d[0] != self._backend._ffi.NULL)
+
+        self._backend._lib.RSA_get0_factors(self._rsa_cdata, p, q)
+
+        self._backend.openssl_assert(p[0] != self._backend._ffi.NULL)
+
+        self._backend.openssl_assert(q[0] != self._backend._ffi.NULL)
+
+        self._backend._lib.RSA_get0_crt_params(
+
+            self._rsa_cdata, dmp1, dmq1, iqmp
+
+        )
+
+        self._backend.openssl_assert(dmp1[0] != self._backend._ffi.NULL)
+
+        self._backend.openssl_assert(dmq1[0] != self._backend._ffi.NULL)
+
+        self._backend.openssl_assert(iqmp[0] != self._backend._ffi.NULL)
+
+        return rsa.RSAPrivateNumbers(
+
+            p=self._backend._bn_to_int(p[0]),
+
+            q=self._backend._bn_to_int(q[0]),
+
+            d=self._backend._bn_to_int(d[0]),
+
+            dmp1=self._backend._bn_to_int(dmp1[0]),
+
+            dmq1=self._backend._bn_to_int(dmq1[0]),
+
+            iqmp=self._backend._bn_to_int(iqmp[0]),
+
+            public_numbers=rsa.RSAPublicNumbers(
+
+                e=self._backend._bn_to_int(e[0]),
+
+                n=self._backend._bn_to_int(n[0]),
+
+            ),
+
+        )
+
+
+
+    def private_bytes(self, encoding, format, encryption_algorithm):
+
+        return self._backend._private_key_bytes(
+
+            encoding,
+
+            format,
+
+            encryption_algorithm,
+
+            self,
+
+            self._evp_pkey,
+
+            self._rsa_cdata,
+
+        )
+
+
+
+    def sign(self, data, padding, algorithm):
+
+        data, algorithm = _calculate_digest_and_algorithm(
+
+            self._backend, data, algorithm
+
+        )
+
+        return _rsa_sig_sign(self._backend, padding, algorithm, self, data)
+
+
+
+
+
+@utils.register_interface(RSAPublicKeyWithSerialization)
+
+class _RSAPublicKey(object):
+
+    def __init__(self, backend, rsa_cdata, evp_pkey):
+
+        self._backend = backend
+
+        self._rsa_cdata = rsa_cdata
+
+        self._evp_pkey = evp_pkey
+
+
+
+        n = self._backend._ffi.new("BIGNUM **")
+
+        self._backend._lib.RSA_get0_key(
+
+            self._rsa_cdata,
+
+            n,
+
+            self._backend._ffi.NULL,
+
+            self._backend._ffi.NULL,
+
+        )
+
+        self._backend.openssl_assert(n[0] != self._backend._ffi.NULL)
+
+        self._key_size = self._backend._lib.BN_num_bits(n[0])
+
+
+
+    key_size = utils.read_only_property("_key_size")
+
+
+
+    def verifier(self, signature, padding, algorithm):
+
+        _warn_sign_verify_deprecated()
+
+        utils._check_bytes("signature", signature)
+
+
+
+        _check_not_prehashed(algorithm)
+
+        return _RSAVerificationContext(
+
+            self._backend, self, signature, padding, algorithm
+
+        )
+
+
+
+    def encrypt(self, plaintext, padding):
+
+        return _enc_dec_rsa(self._backend, self, plaintext, padding)
+
+
+
+    def public_numbers(self):
+
+        n = self._backend._ffi.new("BIGNUM **")
+
+        e = self._backend._ffi.new("BIGNUM **")
+
+        self._backend._lib.RSA_get0_key(
+
+            self._rsa_cdata, n, e, self._backend._ffi.NULL
+
+        )
+
+        self._backend.openssl_assert(n[0] != self._backend._ffi.NULL)
+
+        self._backend.openssl_assert(e[0] != self._backend._ffi.NULL)
+
+        return rsa.RSAPublicNumbers(
+
+            e=self._backend._bn_to_int(e[0]),
+
+            n=self._backend._bn_to_int(n[0]),
+
+        )
+
+
+
+    def public_bytes(self, encoding, format):
+
+        return self._backend._public_key_bytes(
+
+            encoding, format, self, self._evp_pkey, self._rsa_cdata
+
+        )
+
+
+
+    def verify(self, signature, data, padding, algorithm):
+
+        data, algorithm = _calculate_digest_and_algorithm(
+
+            self._backend, data, algorithm
+
+        )
+
+        return _rsa_sig_verify(
+
+            self._backend, padding, algorithm, self, signature, data
+
+        )

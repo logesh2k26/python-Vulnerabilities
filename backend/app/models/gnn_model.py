@@ -1,8 +1,9 @@
-"""Graph Neural Network model for vulnerability detection."""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional
+from torch_scatter import scatter_softmax, scatter_add
+
 
 
 class GraphAttentionLayer(nn.Module):
@@ -31,25 +32,25 @@ class GraphAttentionLayer(nn.Module):
         
         src, dst = edge_index[0], edge_index[1]
         
-        # Compute attention coefficients
+        # Compute attention coefficients (sparse)
         Wh_src = Wh[src]
         Wh_dst = Wh[dst]
         edge_features = torch.cat([Wh_src, Wh_dst], dim=1)
         e = self.leakyrelu(torch.matmul(edge_features, self.a).squeeze(-1))
         
-        # Softmax over neighbors
-        attention = torch.zeros(N, N, device=x.device)
-        attention[src, dst] = e
-        attention = F.softmax(attention, dim=1)
-        attention = self.dropout_layer(attention)
+        # Sparse Softmax over neighbors (dst is the target)
+        alpha = scatter_softmax(e, dst, dim=0)
+        alpha = self.dropout_layer(alpha)
         
-        # Node importance (sum of incoming attention)
-        node_importance = attention.sum(dim=0)
+        # Aggregate: h_prime[i] = sum_{j in neighbors(i)} alpha_{ji} * Wh[j]
+        # Here src are the neighbors, dst is the node being updated
+        h_prime = scatter_add(Wh[src] * alpha.view(-1, 1), dst, dim=0, dim_size=N)
         
-        # Aggregate
-        h_prime = torch.matmul(attention, Wh)
+        # Node importance (sum of incoming attention weights)
+        node_importance = scatter_add(alpha, dst, dim=0, dim_size=N)
         
         return F.elu(h_prime), node_importance
+
 
 
 class VulnerabilityGNN(nn.Module):
@@ -103,8 +104,12 @@ class VulnerabilityGNN(nn.Module):
         self,
         x: torch.Tensor,
         edge_index: torch.Tensor,
+        batch: Optional[torch.Tensor] = None,
         return_attention: bool = False
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if batch is None:
+            batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+            
         # Input projection
         h = F.relu(self.input_proj(x))
         
@@ -123,9 +128,13 @@ class VulnerabilityGNN(nn.Module):
         # Store for explainability
         self.node_attention_weights = total_importance / (self.num_layers * self.num_heads)
         
-        # Global attention pooling
-        attn_weights = F.softmax(self.pool_attn(h), dim=0)
-        graph_emb = (attn_weights * h).sum(dim=0, keepdim=True)
+        # Global attention pooling (per graph in batch)
+        # 1. Compute attention weights per node
+        node_attn_scores = self.pool_attn(h)
+        # 2. Softmax within each graph in the batch
+        gate = scatter_softmax(node_attn_scores, batch, dim=0)
+        # 3. Weighted sum of node features per graph
+        graph_emb = scatter_add(gate * h, batch, dim=0)
         
         # Classification
         logits = self.classifier(graph_emb)
@@ -134,6 +143,7 @@ class VulnerabilityGNN(nn.Module):
         if return_attention:
             return probs, self.node_attention_weights
         return probs, None
+
     
     def get_node_importance(self) -> Optional[torch.Tensor]:
         return self.node_attention_weights
@@ -145,7 +155,7 @@ def create_model(device: torch.device, pretrained_path: str = None) -> Vulnerabi
     
     if pretrained_path:
         try:
-            state_dict = torch.load(pretrained_path, map_location=device)
+            state_dict = torch.load(pretrained_path, map_location=device, weights_only=True)
             model.load_state_dict(state_dict)
         except FileNotFoundError:
             pass  # Use random init

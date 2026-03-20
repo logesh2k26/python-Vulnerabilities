@@ -2,774 +2,334 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-#!/usr/bin/python
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-from k5test import *
 
 
+# Copyright 2012 OpenStack LLC
 
-# Skip this test if pkinit wasn't built.
+#
 
-if not os.path.exists(os.path.join(plugins, 'preauth', 'pkinit.so')):
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
 
-    skip_rest('PKINIT tests', 'PKINIT module not built')
+# not use this file except in compliance with the License. You may obtain
 
+# a copy of the License at
 
+#
 
-# Check if soft-pkcs11.so is available.
+#      http://www.apache.org/licenses/LICENSE-2.0
 
-try:
+#
 
-    import ctypes
+# Unless required by applicable law or agreed to in writing, software
 
-    lib = ctypes.LibraryLoader(ctypes.CDLL).LoadLibrary('soft-pkcs11.so')
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-    del lib
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
-    have_soft_pkcs11 = True
+# License for the specific language governing permissions and limitations
 
-except:
+# under the License.
 
-    have_soft_pkcs11 = False
 
 
+from keystone.common import serializer
 
-# Construct a krb5.conf fragment configuring pkinit.
+from keystone.common import wsgi
 
-certs = os.path.join(srctop, 'tests', 'dejagnu', 'pkinit-certs')
+from keystone import config
 
-ca_pem = os.path.join(certs, 'ca.pem')
+from keystone import exception
 
-kdc_pem = os.path.join(certs, 'kdc.pem')
+from keystone.openstack.common import jsonutils
 
-user_pem = os.path.join(certs, 'user.pem')
 
-privkey_pem = os.path.join(certs, 'privkey.pem')
 
-privkey_enc_pem = os.path.join(certs, 'privkey-enc.pem')
 
-user_p12 = os.path.join(certs, 'user.p12')
 
-user_enc_p12 = os.path.join(certs, 'user-enc.p12')
+CONF = config.CONF
 
-user_upn_p12 = os.path.join(certs, 'user-upn.p12')
 
-user_upn2_p12 = os.path.join(certs, 'user-upn2.p12')
 
-user_upn3_p12 = os.path.join(certs, 'user-upn3.p12')
 
-path = os.path.join(os.getcwd(), 'testdir', 'tmp-pkinit-certs')
 
-path_enc = os.path.join(os.getcwd(), 'testdir', 'tmp-pkinit-certs-enc')
+# Header used to transmit the auth token
 
+AUTH_TOKEN_HEADER = 'X-Auth-Token'
 
 
-pkinit_krb5_conf = {'realms': {'$realm': {
 
-            'pkinit_anchors': 'FILE:%s' % ca_pem}}}
 
-pkinit_kdc_conf = {'realms': {'$realm': {
 
-            'default_principal_flags': '+preauth',
+# Environment variable used to pass the request context
 
-            'pkinit_eku_checking': 'none',
+CONTEXT_ENV = wsgi.CONTEXT_ENV
 
-            'pkinit_identity': 'FILE:%s,%s' % (kdc_pem, privkey_pem),
 
-            'pkinit_indicator': ['indpkinit1', 'indpkinit2']}}}
 
-restrictive_kdc_conf = {'realms': {'$realm': {
 
-            'restrict_anonymous_to_tgt': 'true' }}}
 
+# Environment variable used to pass the request params
 
+PARAMS_ENV = wsgi.PARAMS_ENV
 
-testprincs = {'krbtgt/KRBTEST.COM': {'keys': 'aes128-cts'},
 
-              'user': {'keys': 'aes128-cts', 'flags': '+preauth'},
 
-              'user2': {'keys': 'aes128-cts', 'flags': '+preauth'}}
 
-alias_kdc_conf = {'realms': {'$realm': {
 
-            'default_principal_flags': '+preauth',
+class TokenAuthMiddleware(wsgi.Middleware):
 
-            'pkinit_eku_checking': 'none',
+    def process_request(self, request):
 
-            'pkinit_allow_upn': 'true',
+        token = request.headers.get(AUTH_TOKEN_HEADER)
 
-            'pkinit_identity': 'FILE:%s,%s' % (kdc_pem, privkey_pem),
+        context = request.environ.get(CONTEXT_ENV, {})
 
-            'database_module': 'test'}},
+        context['token_id'] = token
 
-                  'dbmodules': {'test': {
+        request.environ[CONTEXT_ENV] = context
 
-                      'db_library': 'test',
 
-                      'alias': {'user@krbtest.com': 'user'},
 
-                      'princs': testprincs}}}
 
 
+class AdminTokenAuthMiddleware(wsgi.Middleware):
 
-file_identity = 'FILE:%s,%s' % (user_pem, privkey_pem)
+    """A trivial filter that checks for a pre-defined admin token.
 
-file_enc_identity = 'FILE:%s,%s' % (user_pem, privkey_enc_pem)
 
-dir_identity = 'DIR:%s' % path
 
-dir_enc_identity = 'DIR:%s' % path_enc
+    Sets 'is_admin' to true in the context, expected to be checked by
 
-dir_file_identity = 'FILE:%s,%s' % (os.path.join(path, 'user.crt'),
+    methods that are admin-only.
 
-                                    os.path.join(path, 'user.key'))
 
-dir_file_enc_identity = 'FILE:%s,%s' % (os.path.join(path_enc, 'user.crt'),
 
-                                        os.path.join(path_enc, 'user.key'))
+    """
 
-p12_identity = 'PKCS12:%s' % user_p12
 
-p12_upn_identity = 'PKCS12:%s' % user_upn_p12
 
-p12_upn2_identity = 'PKCS12:%s' % user_upn2_p12
+    def process_request(self, request):
 
-p12_upn3_identity = 'PKCS12:%s' % user_upn3_p12
+        token = request.headers.get(AUTH_TOKEN_HEADER)
 
-p12_enc_identity = 'PKCS12:%s' % user_enc_p12
+        context = request.environ.get(CONTEXT_ENV, {})
 
-p11_identity = 'PKCS11:soft-pkcs11.so'
+        context['is_admin'] = (token == CONF.admin_token)
 
-p11_token_identity = ('PKCS11:module_name=soft-pkcs11.so:'
+        request.environ[CONTEXT_ENV] = context
 
-                      'slotid=1:token=SoftToken (token)')
 
 
 
-# Start a realm with the test kdb module for the following UPN SAN tests.
 
-realm = K5Realm(krb5_conf=pkinit_krb5_conf, kdc_conf=alias_kdc_conf,
+class PostParamsMiddleware(wsgi.Middleware):
 
-                create_kdb=False)
+    """Middleware to allow method arguments to be passed as POST parameters.
 
-realm.start_kdc()
 
 
+    Filters out the parameters `self`, `context` and anything beginning with
 
-# Compatibility check: cert contains UPN "user", which matches the
+    an underscore.
 
-# request principal user@KRBTEST.COM if parsed as a normal principal.
 
-realm.kinit(realm.user_princ,
 
-            flags=['-X', 'X509_user_identity=%s' % p12_upn2_identity])
+    """
 
 
 
-# Compatibility check: cert contains UPN "user@KRBTEST.COM", which matches
+    def process_request(self, request):
 
-# the request principal user@KRBTEST.COM if parsed as a normal principal.
+        params_parsed = request.params
 
-realm.kinit(realm.user_princ,
+        params = {}
 
-            flags=['-X', 'X509_user_identity=%s' % p12_upn3_identity])
+        for k, v in params_parsed.iteritems():
 
+            if k in ('self', 'context'):
 
+                continue
 
-# Cert contains UPN "user@krbtest.com" which is aliased to the request
+            if k.startswith('_'):
 
-# principal.
+                continue
 
-realm.kinit(realm.user_princ,
+            params[k] = v
 
-            flags=['-X', 'X509_user_identity=%s' % p12_upn_identity])
 
 
+        request.environ[PARAMS_ENV] = params
 
-# Test an id-pkinit-san match to a post-canonical principal.
 
-realm.kinit('user@krbtest.com',
 
-            flags=['-E', '-X', 'X509_user_identity=%s' % p12_identity])
 
 
+class JsonBodyMiddleware(wsgi.Middleware):
 
-# Test a UPN match to a post-canonical principal.  (This only works
+    """Middleware to allow method arguments to be passed as serialized JSON.
 
-# for the cert with the UPN containing just "user", as we don't allow
 
-# UPN reparsing when comparing to the canonicalized client principal.)
 
-realm.kinit('user@krbtest.com',
+    Accepting arguments as JSON is useful for accepting data that may be more
 
-            flags=['-E', '-X', 'X509_user_identity=%s' % p12_upn2_identity])
+    complex than simple primitives.
 
 
 
-# Test a mismatch.
+    In this case we accept it as urlencoded data under the key 'json' as in
 
-msg = 'kinit: Client name mismatch while getting initial credentials'
+    json=<urlencoded_json> but this could be extended to accept raw JSON
 
-realm.run([kinit, '-X', 'X509_user_identity=%s' % p12_upn2_identity, 'user2'],
+    in the POST body.
 
-          expected_code=1, expected_msg=msg)
 
-realm.stop()
 
+    Filters out the parameters `self`, `context` and anything beginning with
 
+    an underscore.
 
-realm = K5Realm(krb5_conf=pkinit_krb5_conf, kdc_conf=pkinit_kdc_conf,
 
-                get_creds=False)
 
+    """
 
+    def process_request(self, request):
 
-# Sanity check - password-based preauth should still work.
+        # Abort early if we don't have any work to do
 
-realm.run(['./responder', '-r', 'password=%s' % password('user'),
+        params_json = request.body
 
-           realm.user_princ])
+        if not params_json:
 
-realm.kinit(realm.user_princ, password=password('user'))
+            return
 
-realm.klist(realm.user_princ)
 
-realm.run([kvno, realm.host_princ])
 
+        # Reject unrecognized content types. Empty string indicates
 
+        # the client did not explicitly set the header
 
-# Test anonymous PKINIT.
+        if not request.content_type in ('application/json', ''):
 
-realm.kinit('@%s' % realm.realm, flags=['-n'], expected_code=1,
+            e = exception.ValidationError(attribute='application/json',
 
-            expected_msg='not found in Kerberos database')
+                                          target='Content-Type header')
 
-realm.addprinc('WELLKNOWN/ANONYMOUS')
+            return wsgi.render_exception(e)
 
-realm.kinit('@%s' % realm.realm, flags=['-n'])
 
-realm.klist('WELLKNOWN/ANONYMOUS@WELLKNOWN:ANONYMOUS')
 
-realm.run([kvno, realm.host_princ])
+        params_parsed = {}
 
-out = realm.run(['./adata', realm.host_princ])
+        try:
 
-if '97:' in out:
+            params_parsed = jsonutils.loads(params_json)
 
-    fail('auth indicators seen in anonymous PKINIT ticket')
+        except ValueError:
 
+            e = exception.ValidationError(attribute='valid JSON',
 
+                                          target='request body')
 
-# Test anonymous kadmin.
+            return wsgi.render_exception(e)
 
-f = open(os.path.join(realm.testdir, 'acl'), 'a')
+        finally:
 
-f.write('WELLKNOWN/ANONYMOUS@WELLKNOWN:ANONYMOUS a *')
+            if not params_parsed:
 
-f.close()
+                params_parsed = {}
 
-realm.start_kadmind()
 
-realm.run([kadmin, '-n', 'addprinc', '-pw', 'test', 'testadd'])
 
-realm.run([kadmin, '-n', 'getprinc', 'testadd'], expected_code=1,
+        params = {}
 
-          expected_msg="Operation requires ``get'' privilege")
+        for k, v in params_parsed.iteritems():
 
-realm.stop_kadmind()
+            if k in ('self', 'context'):
 
+                continue
 
+            if k.startswith('_'):
 
-# Test with anonymous restricted; FAST should work but kvno should fail.
+                continue
 
-r_env = realm.special_env('restrict', True, kdc_conf=restrictive_kdc_conf)
+            params[k] = v
 
-realm.stop_kdc()
 
-realm.start_kdc(env=r_env)
 
-realm.kinit('@%s' % realm.realm, flags=['-n'])
+        request.environ[PARAMS_ENV] = params
 
-realm.kinit('@%s' % realm.realm, flags=['-n', '-T', realm.ccache])
 
-realm.run([kvno, realm.host_princ], expected_code=1,
 
-          expected_msg='KDC policy rejects request')
 
 
+class XmlBodyMiddleware(wsgi.Middleware):
 
-# Regression test for #8458: S4U2Self requests crash the KDC if
+    """De/serializes XML to/from JSON."""
 
-# anonymous is restricted.
 
-realm.kinit(realm.host_princ, flags=['-k'])
 
-realm.run([kvno, '-U', 'user', realm.host_princ])
+    def process_request(self, request):
 
+        """Transform the request from XML to JSON."""
 
+        incoming_xml = 'application/xml' in str(request.content_type)
 
-# Go back to a normal KDC and disable anonymous PKINIT.
+        if incoming_xml and request.body:
 
-realm.stop_kdc()
+            request.content_type = 'application/json'
 
-realm.start_kdc()
+            request.body = jsonutils.dumps(serializer.from_xml(request.body))
 
-realm.run([kadminl, 'delprinc', 'WELLKNOWN/ANONYMOUS'])
 
 
+    def process_response(self, request, response):
 
-# Run the basic test - PKINIT with FILE: identity, with no password on the key.
+        """Transform the response from JSON to XML."""
 
-realm.run(['./responder', '-x', 'pkinit=',
+        outgoing_xml = 'application/xml' in str(request.accept)
 
-           '-X', 'X509_user_identity=%s' % file_identity, realm.user_princ])
+        if outgoing_xml and response.body:
 
-realm.kinit(realm.user_princ,
+            response.content_type = 'application/xml'
 
-            flags=['-X', 'X509_user_identity=%s' % file_identity])
+            try:
 
-realm.klist(realm.user_princ)
+                body_obj = jsonutils.loads(response.body)
 
-realm.run([kvno, realm.host_princ])
+                response.body = serializer.to_xml(body_obj)
 
+            except Exception:
 
+                raise exception.Error(message=response.body)
 
-# Try again using RSA instead of DH.
+        return response
 
-realm.kinit(realm.user_princ,
 
-            flags=['-X', 'X509_user_identity=%s' % file_identity,
 
-                   '-X', 'flag_RSA_PROTOCOL=yes'])
 
-realm.klist(realm.user_princ)
 
+class NormalizingFilter(wsgi.Middleware):
 
+    """Middleware filter to handle URL normalization."""
 
-# Test a DH parameter renegotiation by temporarily setting a 4096-bit
 
-# minimum on the KDC.  (Preauth type 16 is PKINIT PA_PK_AS_REQ;
 
-# 109 is PKINIT TD_DH_PARAMETERS; 133 is FAST PA-FX-COOKIE.)
+    def process_request(self, request):
 
-minbits_kdc_conf = {'realms': {'$realm': {'pkinit_dh_min_bits': '4096'}}}
+        """Normalizes URLs."""
 
-minbits_env = realm.special_env('restrict', True, kdc_conf=minbits_kdc_conf)
+        # Removes a trailing slash from the given path, if any.
 
-realm.stop_kdc()
+        if (len(request.environ['PATH_INFO']) > 1 and
 
-realm.start_kdc(env=minbits_env)
+                request.environ['PATH_INFO'][-1] == '/'):
 
-expected_trace = ('Sending unauthenticated request',
+            request.environ['PATH_INFO'] = request.environ['PATH_INFO'][:-1]
 
-                  '/Additional pre-authentication required',
+        # Rewrites path to root if no path is given.
 
-                  'Preauthenticating using KDC method data',
+        elif not request.environ['PATH_INFO']:
 
-                  'Preauth module pkinit (16) (real) returned: 0/Success',
-
-                  'Produced preauth for next request: 133, 16',
-
-                  '/Key parameters not accepted',
-
-                  'Preauth tryagain input types (16): 109, 133',
-
-                  'trying again with KDC-provided parameters',
-
-                  'Preauth module pkinit (16) tryagain returned: 0/Success',
-
-                  'Followup preauth for next request: 16, 133')
-
-realm.kinit(realm.user_princ,
-
-            flags=['-X', 'X509_user_identity=%s' % file_identity],
-
-            expected_trace=expected_trace)
-
-realm.stop_kdc()
-
-realm.start_kdc()
-
-
-
-# Run the basic test - PKINIT with FILE: identity, with a password on the key,
-
-# supplied by the prompter.
-
-# Expect failure if the responder does nothing, and we have no prompter.
-
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % file_enc_identity,
-
-          '-X', 'X509_user_identity=%s' % file_enc_identity, realm.user_princ],
-
-          expected_code=2)
-
-realm.kinit(realm.user_princ,
-
-            flags=['-X', 'X509_user_identity=%s' % file_enc_identity],
-
-            password='encrypted')
-
-realm.klist(realm.user_princ)
-
-realm.run([kvno, realm.host_princ])
-
-realm.run(['./adata', realm.host_princ],
-
-          expected_msg='+97: [indpkinit1, indpkinit2]')
-
-
-
-# Run the basic test - PKINIT with FILE: identity, with a password on the key,
-
-# supplied by the responder.
-
-# Supply the response in raw form.
-
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % file_enc_identity,
-
-           '-r', 'pkinit={"%s": "encrypted"}' % file_enc_identity,
-
-           '-X', 'X509_user_identity=%s' % file_enc_identity,
-
-           realm.user_princ])
-
-# Supply the response through the convenience API.
-
-realm.run(['./responder', '-X', 'X509_user_identity=%s' % file_enc_identity,
-
-           '-p', '%s=%s' % (file_enc_identity, 'encrypted'), realm.user_princ])
-
-realm.klist(realm.user_princ)
-
-realm.run([kvno, realm.host_princ])
-
-
-
-# PKINIT with DIR: identity, with no password on the key.
-
-os.mkdir(path)
-
-os.mkdir(path_enc)
-
-shutil.copy(privkey_pem, os.path.join(path, 'user.key'))
-
-shutil.copy(privkey_enc_pem, os.path.join(path_enc, 'user.key'))
-
-shutil.copy(user_pem, os.path.join(path, 'user.crt'))
-
-shutil.copy(user_pem, os.path.join(path_enc, 'user.crt'))
-
-realm.run(['./responder', '-x', 'pkinit=', '-X',
-
-           'X509_user_identity=%s' % dir_identity, realm.user_princ])
-
-realm.kinit(realm.user_princ,
-
-            flags=['-X', 'X509_user_identity=%s' % dir_identity])
-
-realm.klist(realm.user_princ)
-
-realm.run([kvno, realm.host_princ])
-
-
-
-# PKINIT with DIR: identity, with a password on the key, supplied by the
-
-# prompter.
-
-# Expect failure if the responder does nothing, and we have no prompter.
-
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % dir_file_enc_identity,
-
-           '-X', 'X509_user_identity=%s' % dir_enc_identity, realm.user_princ],
-
-           expected_code=2)
-
-realm.kinit(realm.user_princ,
-
-            flags=['-X', 'X509_user_identity=%s' % dir_enc_identity],
-
-            password='encrypted')
-
-realm.klist(realm.user_princ)
-
-realm.run([kvno, realm.host_princ])
-
-
-
-# PKINIT with DIR: identity, with a password on the key, supplied by the
-
-# responder.
-
-# Supply the response in raw form.
-
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % dir_file_enc_identity,
-
-           '-r', 'pkinit={"%s": "encrypted"}' % dir_file_enc_identity,
-
-           '-X', 'X509_user_identity=%s' % dir_enc_identity, realm.user_princ])
-
-# Supply the response through the convenience API.
-
-realm.run(['./responder', '-X', 'X509_user_identity=%s' % dir_enc_identity,
-
-           '-p', '%s=%s' % (dir_file_enc_identity, 'encrypted'),
-
-           realm.user_princ])
-
-realm.klist(realm.user_princ)
-
-realm.run([kvno, realm.host_princ])
-
-
-
-# PKINIT with PKCS12: identity, with no password on the bundle.
-
-realm.run(['./responder', '-x', 'pkinit=',
-
-           '-X', 'X509_user_identity=%s' % p12_identity, realm.user_princ])
-
-realm.kinit(realm.user_princ,
-
-            flags=['-X', 'X509_user_identity=%s' % p12_identity])
-
-realm.klist(realm.user_princ)
-
-realm.run([kvno, realm.host_princ])
-
-
-
-# PKINIT with PKCS12: identity, with a password on the bundle, supplied by the
-
-# prompter.
-
-# Expect failure if the responder does nothing, and we have no prompter.
-
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % p12_enc_identity,
-
-           '-X', 'X509_user_identity=%s' % p12_enc_identity, realm.user_princ],
-
-           expected_code=2)
-
-realm.kinit(realm.user_princ,
-
-            flags=['-X', 'X509_user_identity=%s' % p12_enc_identity],
-
-            password='encrypted')
-
-realm.klist(realm.user_princ)
-
-realm.run([kvno, realm.host_princ])
-
-
-
-# PKINIT with PKCS12: identity, with a password on the bundle, supplied by the
-
-# responder.
-
-# Supply the response in raw form.
-
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % p12_enc_identity,
-
-           '-r', 'pkinit={"%s": "encrypted"}' % p12_enc_identity,
-
-           '-X', 'X509_user_identity=%s' % p12_enc_identity, realm.user_princ])
-
-# Supply the response through the convenience API.
-
-realm.run(['./responder', '-X', 'X509_user_identity=%s' % p12_enc_identity,
-
-           '-p', '%s=%s' % (p12_enc_identity, 'encrypted'),
-
-           realm.user_princ])
-
-realm.klist(realm.user_princ)
-
-realm.run([kvno, realm.host_princ])
-
-
-
-# Match a single rule.
-
-rule = '<SAN>^user@KRBTEST.COM$'
-
-realm.run([kadminl, 'setstr', realm.user_princ, 'pkinit_cert_match', rule])
-
-realm.kinit(realm.user_princ,
-
-            flags=['-X', 'X509_user_identity=%s' % p12_identity])
-
-realm.klist(realm.user_princ)
-
-
-
-# Match a combined rule (default prefix is &&).
-
-rule = '<SUBJECT>CN=user$<KU>digitalSignature,keyEncipherment'
-
-realm.run([kadminl, 'setstr', realm.user_princ, 'pkinit_cert_match', rule])
-
-realm.kinit(realm.user_princ,
-
-            flags=['-X', 'X509_user_identity=%s' % p12_identity])
-
-realm.klist(realm.user_princ)
-
-
-
-# Fail an && rule.
-
-rule = '&&<SUBJECT>O=OTHER.COM<SAN>^user@KRBTEST.COM$'
-
-realm.run([kadminl, 'setstr', realm.user_princ, 'pkinit_cert_match', rule])
-
-msg = 'kinit: Certificate mismatch while getting initial credentials'
-
-realm.kinit(realm.user_princ,
-
-            flags=['-X', 'X509_user_identity=%s' % p12_identity],
-
-            expected_code=1, expected_msg=msg)
-
-
-
-# Pass an || rule.
-
-rule = '||<SUBJECT>O=KRBTEST.COM<SAN>^otheruser@KRBTEST.COM$'
-
-realm.run([kadminl, 'setstr', realm.user_princ, 'pkinit_cert_match', rule])
-
-realm.kinit(realm.user_princ,
-
-            flags=['-X', 'X509_user_identity=%s' % p12_identity])
-
-realm.klist(realm.user_princ)
-
-
-
-# Fail an || rule.
-
-rule = '||<SUBJECT>O=OTHER.COM<SAN>^otheruser@KRBTEST.COM$'
-
-realm.run([kadminl, 'setstr', realm.user_princ, 'pkinit_cert_match', rule])
-
-msg = 'kinit: Certificate mismatch while getting initial credentials'
-
-realm.kinit(realm.user_princ,
-
-            flags=['-X', 'X509_user_identity=%s' % p12_identity],
-
-            expected_code=1, expected_msg=msg)
-
-
-
-if not have_soft_pkcs11:
-
-    skip_rest('PKINIT PKCS11 tests', 'soft-pkcs11.so not found')
-
-
-
-softpkcs11rc = os.path.join(os.getcwd(), 'testdir', 'soft-pkcs11.rc')
-
-realm.env['SOFTPKCS11RC'] = softpkcs11rc
-
-
-
-# PKINIT with PKCS11: identity, with no need for a PIN.
-
-conf = open(softpkcs11rc, 'w')
-
-conf.write("%s\t%s\t%s\t%s\n" % ('user', 'user token', user_pem, privkey_pem))
-
-conf.close()
-
-# Expect to succeed without having to supply any more information.
-
-realm.run(['./responder', '-x', 'pkinit=',
-
-           '-X', 'X509_user_identity=%s' % p11_identity, realm.user_princ])
-
-realm.kinit(realm.user_princ,
-
-            flags=['-X', 'X509_user_identity=%s' % p11_identity])
-
-realm.klist(realm.user_princ)
-
-realm.run([kvno, realm.host_princ])
-
-
-
-# PKINIT with PKCS11: identity, with a PIN supplied by the prompter.
-
-os.remove(softpkcs11rc)
-
-conf = open(softpkcs11rc, 'w')
-
-conf.write("%s\t%s\t%s\t%s\n" % ('user', 'user token', user_pem,
-
-                                 privkey_enc_pem))
-
-conf.close()
-
-# Expect failure if the responder does nothing, and there's no prompter
-
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % p11_token_identity,
-
-           '-X', 'X509_user_identity=%s' % p11_identity, realm.user_princ],
-
-          expected_code=2)
-
-realm.kinit(realm.user_princ,
-
-            flags=['-X', 'X509_user_identity=%s' % p11_identity],
-
-            password='encrypted')
-
-realm.klist(realm.user_princ)
-
-realm.run([kvno, realm.host_princ])
-
-
-
-# Supply the wrong PIN, and verify that we ignore the draft9 padata offer
-
-# in the KDC method data after RFC 4556 PKINIT fails.
-
-expected_trace = ('PKINIT client has no configured identity; giving up',
-
-                  'PKINIT client ignoring draft 9 offer from RFC 4556 KDC')
-
-realm.kinit(realm.user_princ,
-
-            flags=['-X', 'X509_user_identity=%s' % p11_identity],
-
-            password='wrong', expected_code=1, expected_trace=expected_trace)
-
-
-
-# PKINIT with PKCS11: identity, with a PIN supplied by the responder.
-
-# Supply the response in raw form.
-
-realm.run(['./responder', '-x', 'pkinit={"%s": 0}' % p11_token_identity,
-
-           '-r', 'pkinit={"%s": "encrypted"}' % p11_token_identity,
-
-           '-X', 'X509_user_identity=%s' % p11_identity, realm.user_princ])
-
-# Supply the response through the convenience API.
-
-realm.run(['./responder', '-X', 'X509_user_identity=%s' % p11_identity,
-
-           '-p', '%s=%s' % (p11_token_identity, 'encrypted'),
-
-           realm.user_princ])
-
-realm.klist(realm.user_princ)
-
-realm.run([kvno, realm.host_princ])
-
-
-
-success('PKINIT tests')
+            request.environ['PATH_INFO'] = '/'

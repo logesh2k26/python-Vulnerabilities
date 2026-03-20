@@ -2,1412 +2,874 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-from __future__ import absolute_import
-
-from __future__ import division
-
-from __future__ import print_function
+"""Base Tornado handlers for the notebook.
 
 
 
-import email.utils
+Authors:
 
-import errno
 
-import httplib2
 
-import mock
+* Brian Granger
+
+"""
+
+
+
+#-----------------------------------------------------------------------------
+
+#  Copyright (C) 2011  The IPython Development Team
+
+#
+
+#  Distributed under the terms of the BSD License.  The full license is in
+
+#  the file COPYING, distributed as part of this software.
+
+#-----------------------------------------------------------------------------
+
+
+
+#-----------------------------------------------------------------------------
+
+# Imports
+
+#-----------------------------------------------------------------------------
+
+
+
+
+
+import functools
+
+import json
+
+import logging
 
 import os
 
-import pytest
+import re
 
-from six.moves import http_client, urllib
+import sys
 
-import socket
+import traceback
 
-import tests
+try:
 
+    # py3
 
+    from http.client import responses
 
+except ImportError:
 
-
-def _raise_connection_refused_exception(*args, **kwargs):
-
-    raise socket.error(errno.ECONNREFUSED, "Connection refused.")
-
-
+    from httplib import responses
 
 
 
-def test_connection_type():
+from jinja2 import TemplateNotFound
 
-    http = httplib2.Http()
-
-    http.force_exception_to_status_code = False
-
-    response, content = http.request(
-
-        tests.DUMMY_URL, connection_type=tests.MockHTTPConnection
-
-    )
-
-    assert response["content-location"] == tests.DUMMY_URL
-
-    assert content == b"the body"
+from tornado import web
 
 
 
+try:
+
+    from tornado.log import app_log
+
+except ImportError:
+
+    app_log = logging.getLogger()
 
 
-def test_bad_status_line_retry():
 
-    http = httplib2.Http()
+from IPython.config import Application
 
-    old_retries = httplib2.RETRIES
+from IPython.utils.path import filefind
 
-    httplib2.RETRIES = 1
+from IPython.utils.py3compat import string_types
 
-    http.force_exception_to_status_code = False
+from IPython.html.utils import is_hidden
 
-    try:
 
-        response, content = http.request(
 
-            tests.DUMMY_URL, connection_type=tests.MockHTTPBadStatusConnection
+#-----------------------------------------------------------------------------
+
+# Top-level handlers
+
+#-----------------------------------------------------------------------------
+
+non_alphanum = re.compile(r'[^A-Za-z0-9]')
+
+
+
+class AuthenticatedHandler(web.RequestHandler):
+
+    """A RequestHandler with an authenticated user."""
+
+
+
+    def set_default_headers(self):
+
+        headers = self.settings.get('headers', {})
+
+
+
+        if "X-Frame-Options" not in headers:
+
+            headers["X-Frame-Options"] = "SAMEORIGIN"
+
+
+
+        for header_name,value in headers.items() :
+
+            try:
+
+                self.set_header(header_name, value)
+
+            except Exception:
+
+                # tornado raise Exception (not a subclass)
+
+                # if method is unsupported (websocket and Access-Control-Allow-Origin
+
+                # for example, so just ignore)
+
+                pass
+
+    
+
+    def clear_login_cookie(self):
+
+        self.clear_cookie(self.cookie_name)
+
+    
+
+    def get_current_user(self):
+
+        user_id = self.get_secure_cookie(self.cookie_name)
+
+        # For now the user_id should not return empty, but it could eventually
+
+        if user_id == '':
+
+            user_id = 'anonymous'
+
+        if user_id is None:
+
+            # prevent extra Invalid cookie sig warnings:
+
+            self.clear_login_cookie()
+
+            if not self.login_available:
+
+                user_id = 'anonymous'
+
+        return user_id
+
+
+
+    @property
+
+    def cookie_name(self):
+
+        default_cookie_name = non_alphanum.sub('-', 'username-{}'.format(
+
+            self.request.host
+
+        ))
+
+        return self.settings.get('cookie_name', default_cookie_name)
+
+    
+
+    @property
+
+    def password(self):
+
+        """our password"""
+
+        return self.settings.get('password', '')
+
+    
+
+    @property
+
+    def logged_in(self):
+
+        """Is a user currently logged in?
+
+
+
+        """
+
+        user = self.get_current_user()
+
+        return (user and not user == 'anonymous')
+
+
+
+    @property
+
+    def login_available(self):
+
+        """May a user proceed to log in?
+
+
+
+        This returns True if login capability is available, irrespective of
+
+        whether the user is already logged in or not.
+
+
+
+        """
+
+        return bool(self.settings.get('password', ''))
+
+
+
+
+
+class IPythonHandler(AuthenticatedHandler):
+
+    """IPython-specific extensions to authenticated handling
+
+    
+
+    Mostly property shortcuts to IPython-specific settings.
+
+    """
+
+    
+
+    @property
+
+    def config(self):
+
+        return self.settings.get('config', None)
+
+    
+
+    @property
+
+    def log(self):
+
+        """use the IPython log by default, falling back on tornado's logger"""
+
+        if Application.initialized():
+
+            return Application.instance().log
+
+        else:
+
+            return app_log
+
+    
+
+    #---------------------------------------------------------------
+
+    # URLs
+
+    #---------------------------------------------------------------
+
+    
+
+    @property
+
+    def mathjax_url(self):
+
+        return self.settings.get('mathjax_url', '')
+
+    
+
+    @property
+
+    def base_url(self):
+
+        return self.settings.get('base_url', '/')
+
+    
+
+    #---------------------------------------------------------------
+
+    # Manager objects
+
+    #---------------------------------------------------------------
+
+    
+
+    @property
+
+    def kernel_manager(self):
+
+        return self.settings['kernel_manager']
+
+
+
+    @property
+
+    def notebook_manager(self):
+
+        return self.settings['notebook_manager']
+
+    
+
+    @property
+
+    def cluster_manager(self):
+
+        return self.settings['cluster_manager']
+
+    
+
+    @property
+
+    def session_manager(self):
+
+        return self.settings['session_manager']
+
+    
+
+    @property
+
+    def project_dir(self):
+
+        return self.notebook_manager.notebook_dir
+
+    
+
+    #---------------------------------------------------------------
+
+    # CORS
+
+    #---------------------------------------------------------------
+
+
+
+    @property
+
+    def allow_origin(self):
+
+        """Normal Access-Control-Allow-Origin"""
+
+        return self.settings.get('allow_origin', '')
+
+
+
+    @property
+
+    def allow_origin_pat(self):
+
+        """Regular expression version of allow_origin"""
+
+        return self.settings.get('allow_origin_pat', None)
+
+
+
+    @property
+
+    def allow_credentials(self):
+
+        """Whether to set Access-Control-Allow-Credentials"""
+
+        return self.settings.get('allow_credentials', False)
+
+
+
+    def set_default_headers(self):
+
+        """Add CORS headers, if defined"""
+
+        super(IPythonHandler, self).set_default_headers()
+
+        if self.allow_origin:
+
+            self.set_header("Access-Control-Allow-Origin", self.allow_origin)
+
+        elif self.allow_origin_pat:
+
+            origin = self.get_origin()
+
+            if origin and self.allow_origin_pat.match(origin):
+
+                self.set_header("Access-Control-Allow-Origin", origin)
+
+        if self.allow_credentials:
+
+            self.set_header("Access-Control-Allow-Credentials", 'true')
+
+
+
+    def get_origin(self):
+
+        # Handle WebSocket Origin naming convention differences
+
+        # The difference between version 8 and 13 is that in 8 the
+
+        # client sends a "Sec-Websocket-Origin" header and in 13 it's
+
+        # simply "Origin".
+
+        if "Origin" in self.request.headers:
+
+            origin = self.request.headers.get("Origin")
+
+        else:
+
+            origin = self.request.headers.get("Sec-Websocket-Origin", None)
+
+        return origin
+
+
+
+    #---------------------------------------------------------------
+
+    # template rendering
+
+    #---------------------------------------------------------------
+
+    
+
+    def get_template(self, name):
+
+        """Return the jinja template object for a given name"""
+
+        return self.settings['jinja2_env'].get_template(name)
+
+    
+
+    def render_template(self, name, **ns):
+
+        ns.update(self.template_namespace)
+
+        template = self.get_template(name)
+
+        return template.render(**ns)
+
+    
+
+    @property
+
+    def template_namespace(self):
+
+        return dict(
+
+            base_url=self.base_url,
+
+            logged_in=self.logged_in,
+
+            login_available=self.login_available,
+
+            static_url=self.static_url,
 
         )
 
-    except http_client.BadStatusLine:
+    
 
-        assert tests.MockHTTPBadStatusConnection.num_calls == 2
+    def get_json_body(self):
 
-    httplib2.RETRIES = old_retries
+        """Return the body of the request as JSON data."""
 
+        if not self.request.body:
 
+            return None
 
+        # Do we need to call body.decode('utf-8') here?
 
-
-def test_unknown_server():
-
-    http = httplib2.Http()
-
-    http.force_exception_to_status_code = False
-
-    with tests.assert_raises(httplib2.ServerNotFoundError):
-
-        with mock.patch("socket.socket.connect", side_effect=socket.gaierror):
-
-            http.request("http://no-such-hostname./")
-
-
-
-    # Now test with exceptions turned off
-
-    http.force_exception_to_status_code = True
-
-    response, content = http.request("http://no-such-hostname./")
-
-    assert response["content-type"] == "text/plain"
-
-    assert content.startswith(b"Unable to find")
-
-    assert response.status == 400
-
-
-
-
-
-@pytest.mark.skipif(
-
-    os.environ.get("TRAVIS_PYTHON_VERSION") in ("2.7", "pypy"),
-
-    reason="Fails on Travis py27/pypy, works elsewhere. "
-
-    "See https://travis-ci.org/httplib2/httplib2/jobs/408769880.",
-
-)
-
-@mock.patch("socket.socket.connect", spec=True)
-
-def test_connection_refused_raises_exception(mock_socket_connect):
-
-    mock_socket_connect.side_effect = _raise_connection_refused_exception
-
-    http = httplib2.Http()
-
-    http.force_exception_to_status_code = False
-
-    with tests.assert_raises(socket.error):
-
-        http.request(tests.DUMMY_URL)
-
-
-
-
-
-@pytest.mark.skipif(
-
-    os.environ.get("TRAVIS_PYTHON_VERSION") in ("2.7", "pypy"),
-
-    reason="Fails on Travis py27/pypy, works elsewhere. "
-
-    "See https://travis-ci.org/httplib2/httplib2/jobs/408769880.",
-
-)
-
-@mock.patch("socket.socket.connect", spec=True)
-
-def test_connection_refused_returns_response(mock_socket_connect):
-
-    mock_socket_connect.side_effect = _raise_connection_refused_exception
-
-    http = httplib2.Http()
-
-    http.force_exception_to_status_code = True
-
-    response, content = http.request(tests.DUMMY_URL)
-
-    content = content.lower()
-
-    assert response["content-type"] == "text/plain"
-
-    assert (
-
-        b"connection refused" in content
-
-        or b"actively refused" in content
-
-        or b"socket is not connected" in content
-
-    )
-
-    assert response.status == 400
-
-
-
-
-
-def test_get_iri():
-
-    http = httplib2.Http()
-
-    query = u"?a=\N{CYRILLIC CAPITAL LETTER DJE}"
-
-    with tests.server_reflect() as uri:
-
-        response, content = http.request(uri + query, "GET")
-
-        assert response.status == 200
-
-        reflected = tests.HttpRequest.from_bytes(content)
-
-        assert reflected.uri == "/?a=%D0%82"
-
-
-
-
-
-def test_get_is_default_method():
-
-    # Test that GET is the default method
-
-    http = httplib2.Http()
-
-    with tests.server_reflect() as uri:
-
-        response, content = http.request(uri)
-
-        assert response.status == 200
-
-        reflected = tests.HttpRequest.from_bytes(content)
-
-        assert reflected.method == "GET"
-
-
-
-
-
-def test_different_methods():
-
-    # Test that all methods can be used
-
-    http = httplib2.Http()
-
-    methods = ["GET", "PUT", "DELETE", "POST", "unknown"]
-
-    with tests.server_reflect(request_count=len(methods)) as uri:
-
-        for method in methods:
-
-            response, content = http.request(uri, method, body=b" ")
-
-            assert response.status == 200
-
-            reflected = tests.HttpRequest.from_bytes(content)
-
-            assert reflected.method == method
-
-
-
-
-
-def test_head_read():
-
-    # Test that we don't try to read the response of a HEAD request
-
-    # since httplib blocks response.read() for HEAD requests.
-
-    http = httplib2.Http()
-
-    respond_with = b"HTTP/1.0 200 OK\r\ncontent-length: " b"14\r\n\r\nnon-empty-body"
-
-    with tests.server_const_bytes(respond_with) as uri:
-
-        response, content = http.request(uri, "HEAD")
-
-    assert response.status == 200
-
-    assert content == b""
-
-
-
-
-
-def test_get_no_cache():
-
-    # Test that can do a GET w/o the cache turned on.
-
-    http = httplib2.Http()
-
-    with tests.server_const_http() as uri:
-
-        response, content = http.request(uri, "GET")
-
-    assert response.status == 200
-
-    assert response.previous is None
-
-
-
-
-
-def test_user_agent():
-
-    # Test that we provide a default user-agent
-
-    http = httplib2.Http()
-
-    with tests.server_reflect() as uri:
-
-        response, content = http.request(uri, "GET")
-
-        assert response.status == 200
-
-        reflected = tests.HttpRequest.from_bytes(content)
-
-        assert reflected.headers.get("user-agent", "").startswith("Python-httplib2/")
-
-
-
-
-
-def test_user_agent_non_default():
-
-    # Test that the default user-agent can be over-ridden
-
-    http = httplib2.Http()
-
-    with tests.server_reflect() as uri:
-
-        response, content = http.request(uri, "GET", headers={"User-Agent": "fred/1.0"})
-
-        assert response.status == 200
-
-        reflected = tests.HttpRequest.from_bytes(content)
-
-        assert reflected.headers.get("user-agent") == "fred/1.0"
-
-
-
-
-
-def test_get_300_with_location():
-
-    # Test the we automatically follow 300 redirects if a Location: header is provided
-
-    http = httplib2.Http()
-
-    final_content = b"This is the final destination.\n"
-
-    routes = {
-
-        "/final": tests.http_response_bytes(body=final_content),
-
-        "": tests.http_response_bytes(
-
-            status="300 Multiple Choices", headers={"location": "/final"}
-
-        ),
-
-    }
-
-    with tests.server_route(routes, request_count=2) as uri:
-
-        response, content = http.request(uri, "GET")
-
-    assert response.status == 200
-
-    assert content == final_content
-
-    assert response.previous.status == 300
-
-    assert not response.previous.fromcache
-
-
-
-    # Confirm that the intermediate 300 is not cached
-
-    with tests.server_route(routes, request_count=2) as uri:
-
-        response, content = http.request(uri, "GET")
-
-    assert response.status == 200
-
-    assert content == final_content
-
-    assert response.previous.status == 300
-
-    assert not response.previous.fromcache
-
-
-
-
-
-def test_get_300_with_location_noredirect():
-
-    # Test the we automatically follow 300 redirects if a Location: header is provided
-
-    http = httplib2.Http()
-
-    http.follow_redirects = False
-
-    response = tests.http_response_bytes(
-
-        status="300 Multiple Choices",
-
-        headers={"location": "/final"},
-
-        body=b"redirect body",
-
-    )
-
-    with tests.server_const_bytes(response) as uri:
-
-        response, content = http.request(uri, "GET")
-
-    assert response.status == 300
-
-
-
-
-
-def test_get_300_without_location():
-
-    # Not giving a Location: header in a 300 response is acceptable
-
-    # In which case we just return the 300 response
-
-    http = httplib2.Http()
-
-    with tests.server_const_http(
-
-        status="300 Multiple Choices", body=b"redirect body"
-
-    ) as uri:
-
-        response, content = http.request(uri, "GET")
-
-    assert response.status == 300
-
-    assert response.previous is None
-
-    assert content == b"redirect body"
-
-
-
-
-
-def test_get_301():
-
-    # Test that we automatically follow 301 redirects
-
-    # and that we cache the 301 response
-
-    http = httplib2.Http(cache=tests.get_cache_path())
-
-    destination = ""
-
-    routes = {
-
-        "/final": tests.http_response_bytes(body=b"This is the final destination.\n"),
-
-        "": tests.http_response_bytes(
-
-            status="301 Now where did I leave that URL",
-
-            headers={"location": "/final"},
-
-            body=b"redirect body",
-
-        ),
-
-    }
-
-    with tests.server_route(routes, request_count=3) as uri:
-
-        destination = urllib.parse.urljoin(uri, "/final")
-
-        response1, content1 = http.request(uri, "GET")
-
-        response2, content2 = http.request(uri, "GET")
-
-    assert response1.status == 200
-
-    assert "content-location" in response2
-
-    assert response1["content-location"] == destination
-
-    assert content1 == b"This is the final destination.\n"
-
-    assert response1.previous.status == 301
-
-    assert not response1.previous.fromcache
-
-
-
-    assert response2.status == 200
-
-    assert response2["content-location"] == destination
-
-    assert content2 == b"This is the final destination.\n"
-
-    assert response2.previous.status == 301
-
-    assert response2.previous.fromcache
-
-
-
-
-
-@pytest.mark.skip(
-
-    not os.environ.get("httplib2_test_still_run_skipped")
-
-    and os.environ.get("TRAVIS_PYTHON_VERSION") in ("2.7", "pypy"),
-
-    reason="FIXME: timeout on Travis py27 and pypy, works elsewhere",
-
-)
-
-def test_head_301():
-
-    # Test that we automatically follow 301 redirects
-
-    http = httplib2.Http()
-
-    destination = ""
-
-    routes = {
-
-        "/final": tests.http_response_bytes(body=b"This is the final destination.\n"),
-
-        "": tests.http_response_bytes(
-
-            status="301 Now where did I leave that URL",
-
-            headers={"location": "/final"},
-
-            body=b"redirect body",
-
-        ),
-
-    }
-
-    with tests.server_route(routes, request_count=2) as uri:
-
-        destination = urllib.parse.urljoin(uri, "/final")
-
-        response, content = http.request(uri, "HEAD")
-
-    assert response.status == 200
-
-    assert response["content-location"] == destination
-
-    assert response.previous.status == 301
-
-    assert not response.previous.fromcache
-
-
-
-
-
-@pytest.mark.xfail(
-
-    reason=(
-
-        "FIXME: 301 cache works only with follow_redirects, should work " "regardless"
-
-    )
-
-)
-
-def test_get_301_no_redirect():
-
-    # Test that we cache the 301 response
-
-    http = httplib2.Http(cache=tests.get_cache_path(), timeout=0.5)
-
-    http.follow_redirects = False
-
-    response = tests.http_response_bytes(
-
-        status="301 Now where did I leave that URL",
-
-        headers={"location": "/final", "cache-control": "max-age=300"},
-
-        body=b"redirect body",
-
-        add_date=True,
-
-    )
-
-    with tests.server_const_bytes(response) as uri:
-
-        response, _ = http.request(uri, "GET")
-
-        assert response.status == 301
-
-        assert not response.fromcache
-
-        response, _ = http.request(uri, "GET")
-
-        assert response.status == 301
-
-        assert response.fromcache
-
-
-
-
-
-def test_get_302():
-
-    # Test that we automatically follow 302 redirects
-
-    # and that we DO NOT cache the 302 response
-
-    http = httplib2.Http(cache=tests.get_cache_path())
-
-    second_url, final_url = "", ""
-
-    routes = {
-
-        "/final": tests.http_response_bytes(body=b"This is the final destination.\n"),
-
-        "/second": tests.http_response_bytes(
-
-            status="302 Found", headers={"location": "/final"}, body=b"second redirect"
-
-        ),
-
-        "": tests.http_response_bytes(
-
-            status="302 Found", headers={"location": "/second"}, body=b"redirect body"
-
-        ),
-
-    }
-
-    with tests.server_route(routes, request_count=7) as uri:
-
-        second_url = urllib.parse.urljoin(uri, "/second")
-
-        final_url = urllib.parse.urljoin(uri, "/final")
-
-        response1, content1 = http.request(second_url, "GET")
-
-        response2, content2 = http.request(second_url, "GET")
-
-        response3, content3 = http.request(uri, "GET")
-
-    assert response1.status == 200
-
-    assert response1["content-location"] == final_url
-
-    assert content1 == b"This is the final destination.\n"
-
-    assert response1.previous.status == 302
-
-    assert not response1.previous.fromcache
-
-
-
-    assert response2.status == 200
-
-    # FIXME:
-
-    # assert response2.fromcache
-
-    assert response2["content-location"] == final_url
-
-    assert content2 == b"This is the final destination.\n"
-
-    assert response2.previous.status == 302
-
-    assert not response2.previous.fromcache
-
-    assert response2.previous["content-location"] == second_url
-
-
-
-    assert response3.status == 200
-
-    # FIXME:
-
-    # assert response3.fromcache
-
-    assert content3 == b"This is the final destination.\n"
-
-    assert response3.previous.status == 302
-
-    assert not response3.previous.fromcache
-
-
-
-
-
-def test_get_302_redirection_limit():
-
-    # Test that we can set a lower redirection limit
-
-    # and that we raise an exception when we exceed
-
-    # that limit.
-
-    http = httplib2.Http()
-
-    http.force_exception_to_status_code = False
-
-    routes = {
-
-        "/second": tests.http_response_bytes(
-
-            status="302 Found", headers={"location": "/final"}, body=b"second redirect"
-
-        ),
-
-        "": tests.http_response_bytes(
-
-            status="302 Found", headers={"location": "/second"}, body=b"redirect body"
-
-        ),
-
-    }
-
-    with tests.server_route(routes, request_count=4) as uri:
+        body = self.request.body.strip().decode(u'utf-8')
 
         try:
 
-            http.request(uri, "GET", redirections=1)
-
-            assert False, "This should not happen"
-
-        except httplib2.RedirectLimit:
-
-            pass
+            model = json.loads(body)
 
         except Exception:
 
-            assert False, "Threw wrong kind of exception "
+            self.log.debug("Bad JSON: %r", body)
+
+            self.log.error("Couldn't parse JSON", exc_info=True)
+
+            raise web.HTTPError(400, u'Invalid JSON in body of request')
+
+        return model
 
 
 
-        # Re-run the test with out the exceptions
+    def write_error(self, status_code, **kwargs):
 
-        http.force_exception_to_status_code = True
+        """render custom error pages"""
 
-        response, content = http.request(uri, "GET", redirections=1)
+        exc_info = kwargs.get('exc_info')
 
+        message = ''
 
+        status_message = responses.get(status_code, 'Unknown HTTP Error')
 
-    assert response.status == 500
+        if exc_info:
 
-    assert response.reason.startswith("Redirected more")
+            exception = exc_info[1]
 
-    assert response["status"] == "302"
+            # get the custom message, if defined
 
-    assert content == b"second redirect"
+            try:
 
-    assert response.previous is not None
+                message = exception.log_message % exception.args
 
+            except Exception:
 
+                pass
 
+            
 
+            # construct the custom reason, if defined
 
-def test_get_302_no_location():
+            reason = getattr(exception, 'reason', '')
 
-    # Test that we throw an exception when we get
+            if reason:
 
-    # a 302 with no Location: header.
+                status_message = reason
 
-    http = httplib2.Http()
+        
 
-    http.force_exception_to_status_code = False
+        # build template namespace
 
-    with tests.server_const_http(status="302 Found", request_count=2) as uri:
+        ns = dict(
+
+            status_code=status_code,
+
+            status_message=status_message,
+
+            message=message,
+
+            exception=exception,
+
+        )
+
+        
+
+        self.set_header('Content-Type', 'text/html')
+
+        # render the template
 
         try:
 
-            http.request(uri, "GET")
+            html = self.render_template('%s.html' % status_code, **ns)
 
-            assert False, "Should never reach here"
+        except TemplateNotFound:
 
-        except httplib2.RedirectMissingLocation:
+            self.log.debug("No template for %d", status_code)
 
-            pass
+            html = self.render_template('error.html', **ns)
+
+        
+
+        self.write(html)
+
+        
+
+
+
+
+
+class Template404(IPythonHandler):
+
+    """Render our 404 template"""
+
+    def prepare(self):
+
+        raise web.HTTPError(404)
+
+
+
+
+
+class AuthenticatedFileHandler(IPythonHandler, web.StaticFileHandler):
+
+    """static files should only be accessible when logged in"""
+
+
+
+    @web.authenticated
+
+    def get(self, path):
+
+        if os.path.splitext(path)[1] == '.ipynb':
+
+            name = os.path.basename(path)
+
+            self.set_header('Content-Type', 'application/json')
+
+            self.set_header('Content-Disposition','attachment; filename="%s"' % name)
+
+        
+
+        return web.StaticFileHandler.get(self, path)
+
+    
+
+    def compute_etag(self):
+
+        return None
+
+    
+
+    def validate_absolute_path(self, root, absolute_path):
+
+        """Validate and return the absolute path.
+
+        
+
+        Requires tornado 3.1
+
+        
+
+        Adding to tornado's own handling, forbids the serving of hidden files.
+
+        """
+
+        abs_path = super(AuthenticatedFileHandler, self).validate_absolute_path(root, absolute_path)
+
+        abs_root = os.path.abspath(root)
+
+        if is_hidden(abs_path, abs_root):
+
+            self.log.info("Refusing to serve hidden file, via 404 Error")
+
+            raise web.HTTPError(404)
+
+        return abs_path
+
+
+
+
+
+def json_errors(method):
+
+    """Decorate methods with this to return GitHub style JSON errors.
+
+    
+
+    This should be used on any JSON API on any handler method that can raise HTTPErrors.
+
+    
+
+    This will grab the latest HTTPError exception using sys.exc_info
+
+    and then:
+
+    
+
+    1. Set the HTTP status code based on the HTTPError
+
+    2. Create and return a JSON body with a message field describing
+
+       the error in a human readable form.
+
+    """
+
+    @functools.wraps(method)
+
+    def wrapper(self, *args, **kwargs):
+
+        try:
+
+            result = method(self, *args, **kwargs)
+
+        except web.HTTPError as e:
+
+            status = e.status_code
+
+            message = e.log_message
+
+            self.log.warn(message)
+
+            self.set_status(e.status_code)
+
+            self.finish(json.dumps(dict(message=message)))
 
         except Exception:
 
-            assert False, "Threw wrong kind of exception "
+            self.log.error("Unhandled error in API request", exc_info=True)
 
+            status = 500
 
+            message = "Unknown server error"
 
-        # Re-run the test with out the exceptions
+            t, value, tb = sys.exc_info()
 
-        http.force_exception_to_status_code = True
+            self.set_status(status)
 
-        response, content = http.request(uri, "GET")
+            tb_text = ''.join(traceback.format_exception(t, value, tb))
 
+            reply = dict(message=message, traceback=tb_text)
 
+            self.finish(json.dumps(reply))
 
-    assert response.status == 500
+        else:
 
-    assert response.reason.startswith("Redirected but")
+            return result
 
-    assert "302" == response["status"]
+    return wrapper
 
-    assert content == b""
 
 
 
 
 
-@pytest.mark.skip(
 
-    not os.environ.get("httplib2_test_still_run_skipped")
+#-----------------------------------------------------------------------------
 
-    and os.environ.get("TRAVIS_PYTHON_VERSION") in ("2.7", "pypy"),
+# File handler
 
-    reason="FIXME: timeout on Travis py27 and pypy, works elsewhere",
+#-----------------------------------------------------------------------------
 
-)
 
-def test_303():
 
-    # Do a follow-up GET on a Location: header
+# to minimize subclass changes:
 
-    # returned from a POST that gave a 303.
+HTTPError = web.HTTPError
 
-    http = httplib2.Http()
 
-    routes = {
 
-        "/final": tests.make_http_reflect(),
+class FileFindHandler(web.StaticFileHandler):
 
-        "": tests.make_http_reflect(
+    """subclass of StaticFileHandler for serving files from a search path"""
 
-            status="303 See Other", headers={"location": "/final"}
+    
 
-        ),
+    # cache search results, don't search for files more than once
 
-    }
+    _static_paths = {}
 
-    with tests.server_route(routes, request_count=2) as uri:
+    
 
-        response, content = http.request(uri, "POST", " ")
+    def initialize(self, path, default_filename=None):
 
-    assert response.status == 200
+        if isinstance(path, string_types):
 
-    reflected = tests.HttpRequest.from_bytes(content)
+            path = [path]
 
-    assert reflected.uri == "/final"
+        
 
-    assert response.previous.status == 303
+        self.root = tuple(
 
-
-
-    # Skip follow-up GET
-
-    http = httplib2.Http()
-
-    http.follow_redirects = False
-
-    with tests.server_route(routes, request_count=1) as uri:
-
-        response, content = http.request(uri, "POST", " ")
-
-    assert response.status == 303
-
-
-
-    # All methods can be used
-
-    http = httplib2.Http()
-
-    cases = "DELETE GET HEAD POST PUT EVEN_NEW_ONES".split(" ")
-
-    with tests.server_route(routes, request_count=len(cases) * 2) as uri:
-
-        for method in cases:
-
-            response, content = http.request(uri, method, body=b"q q")
-
-            assert response.status == 200
-
-            reflected = tests.HttpRequest.from_bytes(content)
-
-            assert reflected.method == "GET"
-
-
-
-
-
-def test_etag_used():
-
-    # Test that we use ETags properly to validate our cache
-
-    cache_path = tests.get_cache_path()
-
-    http = httplib2.Http(cache=cache_path)
-
-    response_kwargs = dict(
-
-        add_date=True,
-
-        add_etag=True,
-
-        body=b"something",
-
-        headers={"cache-control": "public,max-age=300"},
-
-    )
-
-
-
-    def handler(request):
-
-        if request.headers.get("range"):
-
-            return tests.http_response_bytes(status=206, **response_kwargs)
-
-        return tests.http_response_bytes(**response_kwargs)
-
-
-
-    with tests.server_request(handler, request_count=2) as uri:
-
-        response, _ = http.request(uri, "GET", headers={"accept-encoding": "identity"})
-
-        assert response["etag"] == '"437b930db84b8079c2dd804a71936b5f"'
-
-
-
-        http.request(uri, "GET", headers={"accept-encoding": "identity"})
-
-        response, _ = http.request(
-
-            uri,
-
-            "GET",
-
-            headers={"accept-encoding": "identity", "cache-control": "must-revalidate"},
+            os.path.abspath(os.path.expanduser(p)) + os.sep for p in path
 
         )
 
-        assert response.status == 200
+        self.default_filename = default_filename
 
-        assert response.fromcache
+    
 
+    def compute_etag(self):
 
+        return None
 
-        # TODO: API to read cache item, at least internal to tests
+    
 
-        cache_file_name = os.path.join(
+    @classmethod
 
-            cache_path, httplib2.safename(httplib2.urlnorm(uri)[-1])
+    def get_absolute_path(cls, roots, path):
 
-        )
+        """locate a file to serve on our static file search path"""
 
-        with open(cache_file_name, "r") as f:
+        with cls._lock:
 
-            status_line = f.readline()
+            if path in cls._static_paths:
 
-        assert status_line.startswith("status:")
+                return cls._static_paths[path]
 
+            try:
 
+                abspath = os.path.abspath(filefind(path, roots))
 
-        response, content = http.request(
+            except IOError:
 
-            uri, "HEAD", headers={"accept-encoding": "identity"}
+                # IOError means not found
 
-        )
+                return ''
 
-        assert response.status == 200
+            
 
-        assert response.fromcache
+            cls._static_paths[path] = abspath
 
+            return abspath
 
+    
 
-        response, content = http.request(
+    def validate_absolute_path(self, root, absolute_path):
 
-            uri, "GET", headers={"accept-encoding": "identity", "range": "bytes=0-0"}
+        """check if the file should be served (raises 404, 403, etc.)"""
 
-        )
+        if absolute_path == '':
 
-        assert response.status == 206
+            raise web.HTTPError(404)
 
-        assert not response.fromcache
+        
 
+        for root in self.root:
 
+            if (absolute_path + os.sep).startswith(root):
 
+                break
 
+        
 
-def test_etag_ignore():
+        return super(FileFindHandler, self).validate_absolute_path(root, absolute_path)
 
-    # Test that we can forcibly ignore ETags
 
-    http = httplib2.Http(cache=tests.get_cache_path())
 
-    response_kwargs = dict(add_date=True, add_etag=True)
 
-    with tests.server_reflect(request_count=3, **response_kwargs) as uri:
 
-        response, content = http.request(
+class TrailingSlashHandler(web.RequestHandler):
 
-            uri, "GET", headers={"accept-encoding": "identity"}
+    """Simple redirect handler that strips trailing slashes
 
-        )
+    
 
-        assert response.status == 200
+    This should be the first, highest priority handler.
 
-        assert response["etag"] != ""
+    """
 
+    
 
+    SUPPORTED_METHODS = ['GET']
 
-        response, content = http.request(
+    
 
-            uri,
+    def get(self):
 
-            "GET",
+        self.redirect(self.request.uri.rstrip('/'))
 
-            headers={"accept-encoding": "identity", "cache-control": "max-age=0"},
 
-        )
 
-        reflected = tests.HttpRequest.from_bytes(content)
+#-----------------------------------------------------------------------------
 
-        assert reflected.headers.get("if-none-match")
+# URL pattern fragments for re-use
 
+#-----------------------------------------------------------------------------
 
 
-        http.ignore_etag = True
 
-        response, content = http.request(
+path_regex = r"(?P<path>(?:/.*)*)"
 
-            uri,
+notebook_name_regex = r"(?P<name>[^/]+\.ipynb)"
 
-            "GET",
+notebook_path_regex = "%s/%s" % (path_regex, notebook_name_regex)
 
-            headers={"accept-encoding": "identity", "cache-control": "max-age=0"},
 
-        )
 
-        assert not response.fromcache
+#-----------------------------------------------------------------------------
 
-        reflected = tests.HttpRequest.from_bytes(content)
+# URL to handler mappings
 
-        assert not reflected.headers.get("if-none-match")
+#-----------------------------------------------------------------------------
 
 
 
 
 
-def test_etag_override():
+default_handlers = [
 
-    # Test that we can forcibly ignore ETags
+    (r".*/", TrailingSlashHandler)
 
-    http = httplib2.Http(cache=tests.get_cache_path())
-
-    response_kwargs = dict(add_date=True, add_etag=True)
-
-    with tests.server_reflect(request_count=3, **response_kwargs) as uri:
-
-        response, _ = http.request(uri, "GET", headers={"accept-encoding": "identity"})
-
-        assert response.status == 200
-
-        assert response["etag"] != ""
-
-
-
-        response, content = http.request(
-
-            uri,
-
-            "GET",
-
-            headers={"accept-encoding": "identity", "cache-control": "max-age=0"},
-
-        )
-
-        assert response.status == 200
-
-        reflected = tests.HttpRequest.from_bytes(content)
-
-        assert reflected.headers.get("if-none-match")
-
-        assert reflected.headers.get("if-none-match") != "fred"
-
-
-
-        response, content = http.request(
-
-            uri,
-
-            "GET",
-
-            headers={
-
-                "accept-encoding": "identity",
-
-                "cache-control": "max-age=0",
-
-                "if-none-match": "fred",
-
-            },
-
-        )
-
-        assert response.status == 200
-
-        reflected = tests.HttpRequest.from_bytes(content)
-
-        assert reflected.headers.get("if-none-match") == "fred"
-
-
-
-
-
-@pytest.mark.skip(reason="was commented in legacy code")
-
-def test_get_304_end_to_end():
-
-    pass
-
-    # Test that end to end headers get overwritten in the cache
-
-    # uri = urllib.parse.urljoin(base, "304/end2end.cgi")
-
-    # response, content = http.request(uri, 'GET')
-
-    # assertNotEqual(response['etag'], "")
-
-    # old_date = response['date']
-
-    # time.sleep(2)
-
-
-
-    # response, content = http.request(uri, 'GET', headers = {'Cache-Control': 'max-age=0'})
-
-    # # The response should be from the cache, but the Date: header should be updated.
-
-    # new_date = response['date']
-
-    # assert new_date != old_date
-
-    # assert response.status == 200
-
-    # assert response.fromcache == True
-
-
-
-
-
-def test_get_304_last_modified():
-
-    # Test that we can still handle a 304
-
-    # by only using the last-modified cache validator.
-
-    http = httplib2.Http(cache=tests.get_cache_path())
-
-    date = email.utils.formatdate()
-
-
-
-    def handler(read):
-
-        read()
-
-        yield tests.http_response_bytes(
-
-            status=200, body=b"something", headers={"date": date, "last-modified": date}
-
-        )
-
-
-
-        request2 = read()
-
-        assert request2.headers["if-modified-since"] == date
-
-        yield tests.http_response_bytes(status=304)
-
-
-
-    with tests.server_yield(handler, request_count=2) as uri:
-
-        response, content = http.request(uri, "GET")
-
-        assert response.get("last-modified") == date
-
-
-
-        response, content = http.request(uri, "GET")
-
-        assert response.status == 200
-
-        assert response.fromcache
-
-
-
-
-
-def test_get_307():
-
-    # Test that we do follow 307 redirects but
-
-    # do not cache the 307
-
-    http = httplib2.Http(cache=tests.get_cache_path(), timeout=1)
-
-    r307 = tests.http_response_bytes(status=307, headers={"location": "/final"})
-
-    r200 = tests.http_response_bytes(
-
-        status=200,
-
-        add_date=True,
-
-        body=b"final content\n",
-
-        headers={"cache-control": "max-age=300"},
-
-    )
-
-
-
-    with tests.server_list_http([r307, r200, r307]) as uri:
-
-        response, content = http.request(uri, "GET")
-
-        assert response.previous.status == 307
-
-        assert not response.previous.fromcache
-
-        assert response.status == 200
-
-        assert not response.fromcache
-
-        assert content == b"final content\n"
-
-
-
-        response, content = http.request(uri, "GET")
-
-        assert response.previous.status == 307
-
-        assert not response.previous.fromcache
-
-        assert response.status == 200
-
-        assert response.fromcache
-
-        assert content == b"final content\n"
-
-
-
-
-
-def test_post_307():
-
-    # 307: follow with same method
-
-    http = httplib2.Http(cache=tests.get_cache_path(), timeout=1)
-
-    http.follow_all_redirects = True
-
-    r307 = tests.http_response_bytes(status=307, headers={"location": "/final"})
-
-    r200 = tests.http_response_bytes(status=200, body=b"final content\n")
-
-
-
-    with tests.server_list_http([r307, r200, r307, r200]) as uri:
-
-        response, content = http.request(uri, "POST")
-
-        assert response.previous.status == 307
-
-        assert not response.previous.fromcache
-
-        assert response.status == 200
-
-        assert not response.fromcache
-
-        assert content == b"final content\n"
-
-
-
-        response, content = http.request(uri, "POST")
-
-        assert response.previous.status == 307
-
-        assert not response.previous.fromcache
-
-        assert response.status == 200
-
-        assert not response.fromcache
-
-        assert content == b"final content\n"
-
-
-
-
-
-def test_change_308():
-
-    # 308: follow with same method, cache redirect
-
-    http = httplib2.Http(cache=tests.get_cache_path(), timeout=1)
-
-    routes = {
-
-        "/final": tests.make_http_reflect(),
-
-        "": tests.http_response_bytes(
-
-            status="308 Permanent Redirect",
-
-            add_date=True,
-
-            headers={"cache-control": "max-age=300", "location": "/final"},
-
-        ),
-
-    }
-
-
-
-    with tests.server_route(routes, request_count=3) as uri:
-
-        response, content = http.request(uri, "CHANGE", body=b"hello308")
-
-        assert response.previous.status == 308
-
-        assert not response.previous.fromcache
-
-        assert response.status == 200
-
-        assert not response.fromcache
-
-        assert content.startswith(b"CHANGE /final HTTP")
-
-
-
-        response, content = http.request(uri, "CHANGE")
-
-        assert response.previous.status == 308
-
-        assert response.previous.fromcache
-
-        assert response.status == 200
-
-        assert not response.fromcache
-
-        assert content.startswith(b"CHANGE /final HTTP")
-
-
-
-
-
-def test_get_410():
-
-    # Test that we pass 410's through
-
-    http = httplib2.Http()
-
-    with tests.server_const_http(status=410) as uri:
-
-        response, content = http.request(uri, "GET")
-
-        assert response.status == 410
-
-
-
-
-
-def test_get_duplicate_headers():
-
-    # Test that duplicate headers get concatenated via ','
-
-    http = httplib2.Http()
-
-    response = b"""HTTP/1.0 200 OK\r\n\
-
-Link: link1\r\n\
-
-Content-Length: 7\r\n\
-
-Link: link2\r\n\r\n\
-
-content"""
-
-    with tests.server_const_bytes(response) as uri:
-
-        response, content = http.request(uri, "GET")
-
-        assert response.status == 200
-
-        assert content == b"content"
-
-        assert response["link"], "link1, link2"
-
-
-
-
-
-def test_custom_redirect_codes():
-
-    http = httplib2.Http()
-
-    http.redirect_codes = set([300])
-
-    with tests.server_const_http(status=301, request_count=1) as uri:
-
-        response, content = http.request(uri, "GET")
-
-        assert response.status == 301
-
-        assert response.previous is None
+]

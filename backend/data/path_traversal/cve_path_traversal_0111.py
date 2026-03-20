@@ -2,1298 +2,1704 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-#!/usr/bin/python
-
 # -*- coding: utf-8 -*-
 
+''' Tests for the BaseRequest and BaseResponse objects and their subclasses. '''
 
 
-# Copyright: (c) 2016-2017, Yanis Guenane <yanis+ansible@guenane.org>
 
-# Copyright: (c) 2017, Markus Teufelberger <mteufelberger+ansible@mgit.at>
+import unittest
 
-# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
+import sys
 
+import bottle
 
+from bottle import request, tob, touni, tonat, json_dumps, HTTPError, parse_date
 
-from __future__ import absolute_import, division, print_function
+from test import tools
 
-__metaclass__ = type
+import wsgiref.util
 
+import base64
 
 
 
+from bottle import BaseRequest, BaseResponse, LocalRequest
 
-DOCUMENTATION = r'''
 
----
 
-module: openssl_privatekey_info
 
-short_description: Provide information for OpenSSL private keys
 
-description:
+class TestRequest(unittest.TestCase):
 
-    - This module allows one to query information on OpenSSL private keys.
 
-    - In case the key consistency checks fail, the module will fail as this indicates a faked
 
-      private key. In this case, all return variables are still returned. Note that key consistency
+    def test_app_property(self):
 
-      checks are not available all key types; if none is available, C(none) is returned for
+        e = {}
 
-      C(key_is_consistent).
+        r = BaseRequest(e)
 
-    - It uses the pyOpenSSL or cryptography python library to interact with OpenSSL. If both the
+        self.assertRaises(RuntimeError, lambda: r.app)
 
-      cryptography and PyOpenSSL libraries are available (and meet the minimum version requirements)
+        e.update({'bottle.app': 5})
 
-      cryptography will be preferred as a backend over PyOpenSSL (unless the backend is forced with
+        self.assertEqual(r.app, 5)
 
-      C(select_crypto_backend)). Please note that the PyOpenSSL backend was deprecated in Ansible 2.9
 
-      and will be removed in community.crypto 2.0.0.
 
-requirements:
+    def test_route_property(self):
 
-    - PyOpenSSL >= 0.15 or cryptography >= 1.2.3
+        e = {'bottle.route': 5}
 
-author:
+        r = BaseRequest(e)
 
-  - Felix Fontein (@felixfontein)
+        self.assertEqual(r.route, 5)
 
-  - Yanis Guenane (@Spredzy)
 
-options:
 
-    path:
+    def test_url_for_property(self):
 
-        description:
+        e = {}
 
-            - Remote absolute path where the private key file is loaded from.
+        r = BaseRequest(e)
 
-        type: path
+        self.assertRaises(RuntimeError, lambda: r.url_args)
 
-    content:
+        e.update({'route.url_args': {'a': 5}})
 
-        description:
+        self.assertEqual(r.url_args, {'a': 5})
 
-            - Content of the private key file.
 
-            - Either I(path) or I(content) must be specified, but not both.
 
-        type: str
+    def test_path(self):
 
-        version_added: '1.0.0'
+        """ PATH_INFO normalization. """
 
-    passphrase:
+        # Legal paths
 
-        description:
+        tests = [('', '/'), ('x','/x'), ('x/', '/x/'), ('/x', '/x'), ('/x/', '/x/')]
 
-            - The passphrase for the private key.
+        for raw, norm in tests:
 
-        type: str
+            self.assertEqual(norm, BaseRequest({'PATH_INFO': raw}).path)
 
-    return_private_key_data:
+        # Strange paths
 
-        description:
+        tests = [('///', '/'), ('//x','/x')]
 
-            - Whether to return private key data.
+        for raw, norm in tests:
 
-            - Only set this to C(yes) when you want private information about this key to
+            self.assertEqual(norm, BaseRequest({'PATH_INFO': raw}).path)
 
-              leave the remote machine.
+        # No path at all
 
-            - "WARNING: you have to make sure that private key data isn't accidentally logged!"
+        self.assertEqual('/', BaseRequest({}).path)
 
-        type: bool
 
-        default: no
 
+    def test_method(self):
 
+        self.assertEqual(BaseRequest({}).method, 'GET')
 
-    select_crypto_backend:
+        self.assertEqual(BaseRequest({'REQUEST_METHOD':'GET'}).method, 'GET')
 
-        description:
+        self.assertEqual(BaseRequest({'REQUEST_METHOD':'GeT'}).method, 'GET')
 
-            - Determines which crypto backend to use.
+        self.assertEqual(BaseRequest({'REQUEST_METHOD':'get'}).method, 'GET')
 
-            - The default choice is C(auto), which tries to use C(cryptography) if available, and falls back to C(pyopenssl).
+        self.assertEqual(BaseRequest({'REQUEST_METHOD':'POst'}).method, 'POST')
 
-            - If set to C(pyopenssl), will try to use the L(pyOpenSSL,https://pypi.org/project/pyOpenSSL/) library.
+        self.assertEqual(BaseRequest({'REQUEST_METHOD':'FanTASY'}).method, 'FANTASY')
 
-            - If set to C(cryptography), will try to use the L(cryptography,https://cryptography.io/) library.
 
-            - Please note that the C(pyopenssl) backend has been deprecated in Ansible 2.9, and will be removed in community.crypto 2.0.0.
 
-              From that point on, only the C(cryptography) backend will be available.
+    def test_script_name(self):
 
-        type: str
+        """ SCRIPT_NAME normalization. """
 
-        default: auto
+        # Legal paths
 
-        choices: [ auto, cryptography, pyopenssl ]
+        tests = [('', '/'), ('x','/x/'), ('x/', '/x/'), ('/x', '/x/'), ('/x/', '/x/')]
 
+        for raw, norm in tests:
 
+            self.assertEqual(norm, BaseRequest({'SCRIPT_NAME': raw}).script_name)
 
-seealso:
+        # Strange paths
 
-- module: community.crypto.openssl_privatekey
+        tests = [('///', '/'), ('///x///','/x/')]
 
-'''
+        for raw, norm in tests:
 
+            self.assertEqual(norm, BaseRequest({'SCRIPT_NAME': raw}).script_name)
 
+        # No path at all
 
-EXAMPLES = r'''
+        self.assertEqual('/', BaseRequest({}).script_name)
 
-- name: Generate an OpenSSL private key with the default values (4096 bits, RSA)
 
-  community.crypto.openssl_privatekey:
 
-    path: /etc/ssl/private/ansible.com.pem
+    def test_pathshift(self):
 
+        """ Request.path_shift() """
 
+        def test_shift(s, p, c):
 
-- name: Get information on generated key
+            request = BaseRequest({'SCRIPT_NAME': s, 'PATH_INFO': p})
 
-  community.crypto.openssl_privatekey_info:
+            request.path_shift(c)
 
-    path: /etc/ssl/private/ansible.com.pem
+            return [request['SCRIPT_NAME'], request.path]
 
-  register: result
+        self.assertEqual(['/a/b', '/c/d'], test_shift('/a/b', '/c/d', 0))
 
+        self.assertEqual(['/a/b', '/c/d/'], test_shift('/a/b', '/c/d/', 0))
 
+        self.assertEqual(['/a/b/c', '/d'], test_shift('/a/b', '/c/d', 1))
 
-- name: Dump information
+        self.assertEqual(['/a', '/b/c/d'], test_shift('/a/b', '/c/d', -1))
 
-  debug:
+        self.assertEqual(['/a/b/c', '/d/'], test_shift('/a/b', '/c/d/', 1))
 
-    var: result
+        self.assertEqual(['/a', '/b/c/d/'], test_shift('/a/b', '/c/d/', -1))
 
-'''
+        self.assertEqual(['/a/b/c', '/d/'], test_shift('/a/b/', '/c/d/', 1))
 
+        self.assertEqual(['/a', '/b/c/d/'], test_shift('/a/b/', '/c/d/', -1))
 
+        self.assertEqual(['/a/b/c/d', '/'], test_shift('/', '/a/b/c/d', 4))
 
-RETURN = r'''
+        self.assertEqual(['/', '/a/b/c/d/'], test_shift('/a/b/c/d', '/', -4))
 
-can_load_key:
+        self.assertRaises(AssertionError, test_shift, '/a/b', '/c/d', 3)
 
-    description: Whether the module was able to load the private key from disk
+        self.assertRaises(AssertionError, test_shift, '/a/b', '/c/d', -3)
 
-    returned: always
 
-    type: bool
 
-can_parse_key:
+    def test_url(self):
 
-    description: Whether the module was able to parse the private key
+        """ Environ: URL building """
 
-    returned: always
+        request = BaseRequest({'HTTP_HOST':'example.com'})
 
-    type: bool
+        self.assertEqual('http://example.com/', request.url)
 
-key_is_consistent:
+        request = BaseRequest({'SERVER_NAME':'example.com'})
 
-    description:
+        self.assertEqual('http://example.com/', request.url)
 
-        - Whether the key is consistent. Can also return C(none) next to C(yes) and
+        request = BaseRequest({'SERVER_NAME':'example.com', 'SERVER_PORT':'81'})
 
-          C(no), to indicate that consistency couldn't be checked.
+        self.assertEqual('http://example.com:81/', request.url)
 
-        - In case the check returns C(no), the module will fail.
+        request = BaseRequest({'wsgi.url_scheme':'https', 'SERVER_NAME':'example.com'})
 
-    returned: always
+        self.assertEqual('https://example.com/', request.url)
 
-    type: bool
+        request = BaseRequest({'HTTP_HOST':'example.com', 'PATH_INFO':'/path',
 
-public_key:
+                               'QUERY_STRING':'1=b&c=d', 'SCRIPT_NAME':'/sp'})
 
-    description: Private key's public key in PEM format
+        self.assertEqual('http://example.com/sp/path?1=b&c=d', request.url)
 
-    returned: success
+        request = BaseRequest({'HTTP_HOST':'example.com', 'PATH_INFO':'/pa th',
 
-    type: str
+                               'SCRIPT_NAME':'/s p'})
 
-    sample: "-----BEGIN PUBLIC KEY-----\nMIICIjANBgkqhkiG9w0BAQEFAAOCAg8A..."
+        self.assertEqual('http://example.com/s%20p/pa%20th', request.url)
 
-public_key_fingerprints:
 
-    description:
 
-        - Fingerprints of private key's public key.
+    def test_dict_access(self):
 
-        - For every hash algorithm available, the fingerprint is computed.
+        """ Environ: request objects are environment dicts """
 
-    returned: success
+        e = {}
 
-    type: dict
+        wsgiref.util.setup_testing_defaults(e)
 
-    sample: "{'sha256': 'd4:b3:aa:6d:c8:04:ce:4e:ba:f6:29:4d:92:a3:94:b0:c2:ff:bd:bf:33:63:11:43:34:0f:51:b0:95:09:2f:63',
+        request = BaseRequest(e)
 
-              'sha512': 'f7:07:4a:f0:b0:f0:e6:8b:95:5f:f9:e6:61:0a:32:68:f1..."
+        self.assertEqual(list(request), list(e.keys()))
 
-type:
+        self.assertEqual(len(request), len(e))
 
-    description:
+        for k, v in e.items():
 
-        - The key's type.
+            self.assertTrue(k in request)
 
-        - One of C(RSA), C(DSA), C(ECC), C(Ed25519), C(X25519), C(Ed448), or C(X448).
+            self.assertEqual(request[k], v)
 
-        - Will start with C(unknown) if the key type cannot be determined.
+            request[k] = 'test'
 
-    returned: success
+            self.assertEqual(request[k], 'test')
 
-    type: str
+        del request['PATH_INFO']
 
-    sample: RSA
+        self.assertTrue('PATH_INFO' not in request)
 
-public_data:
 
-    description:
 
-        - Public key data. Depends on key type.
+    def test_readonly_environ(self):
 
-    returned: success
+        request = BaseRequest({'bottle.request.readonly':True})
 
-    type: dict
+        def test(): request['x']='y'
 
-private_data:
+        self.assertRaises(KeyError, test)
 
-    description:
 
-        - Private key data. Depends on key type.
 
-    returned: success and when I(return_private_key_data) is set to C(yes)
+    def test_header_access(self):
 
-    type: dict
+        """ Environ: Request objects decode headers """
 
-'''
+        e = {}
 
+        wsgiref.util.setup_testing_defaults(e)
 
+        e['HTTP_SOME_HEADER'] = 'some value'
 
+        request = BaseRequest(e)
 
+        request['HTTP_SOME_OTHER_HEADER'] = 'some other value'
 
-import abc
+        self.assertTrue('Some-Header' in request.headers)
 
-import os
+        self.assertTrue(request.headers['Some-Header'] == 'some value')
 
-import traceback
+        self.assertTrue(request.headers['Some-Other-Header'] == 'some other value')
 
 
 
-from distutils.version import LooseVersion
+    def test_header_access_special(self):
 
+        e = {}
 
+        wsgiref.util.setup_testing_defaults(e)
 
-from ansible.module_utils.basic import AnsibleModule, missing_required_lib
+        request = BaseRequest(e)
 
-from ansible.module_utils._text import to_native, to_bytes
+        request['CONTENT_TYPE'] = 'test'
 
+        request['CONTENT_LENGTH'] = '123'
 
+        self.assertEqual(request.headers['Content-Type'], 'test')
 
-from ansible_collections.community.crypto.plugins.module_utils.crypto.basic import (
+        self.assertEqual(request.headers['Content-Length'], '123')
 
-    CRYPTOGRAPHY_HAS_X25519,
 
-    CRYPTOGRAPHY_HAS_X448,
 
-    CRYPTOGRAPHY_HAS_ED25519,
+    def test_cookie_dict(self):
 
-    CRYPTOGRAPHY_HAS_ED448,
+        """ Environ: Cookie dict """
 
-    OpenSSLObjectError,
+        t = dict()
 
-)
+        t['a=a']      = {'a': 'a'}
 
+        t['a=a; b=b'] = {'a': 'a', 'b':'b'}
 
+        t['a=a; a=b'] = {'a': 'b'}
 
-from ansible_collections.community.crypto.plugins.module_utils.crypto.support import (
+        for k, v in t.items():
 
-    OpenSSLObject,
+            request = BaseRequest({'HTTP_COOKIE': k})
 
-    load_privatekey,
+            for n in v:
 
-    get_fingerprint_of_bytes,
+                self.assertEqual(v[n], request.cookies[n])
 
-)
+                self.assertEqual(v[n], request.get_cookie(n))
 
 
 
-from ansible_collections.community.crypto.plugins.module_utils.crypto.math import (
+    def test_get(self):
 
-    binary_exp_mod,
+        """ Environ: GET data """
 
-    quick_is_not_prime,
+        qs = tonat(tob('a=a&a=1&b=b&c=c&cn=%e7%93%b6'), 'latin1')
 
-)
+        request = BaseRequest({'QUERY_STRING':qs})
 
+        self.assertTrue('a' in request.query)
 
+        self.assertTrue('b' in request.query)
 
+        self.assertEqual(['a','1'], request.query.getall('a'))
 
+        self.assertEqual(['b'], request.query.getall('b'))
 
-MINIMAL_CRYPTOGRAPHY_VERSION = '1.2.3'
+        self.assertEqual('1', request.query['a'])
 
-MINIMAL_PYOPENSSL_VERSION = '0.15'
+        self.assertEqual('b', request.query['b'])
 
+        self.assertEqual(tonat(tob('瓶'), 'latin1'), request.query['cn'])
 
+        self.assertEqual(touni('瓶'), request.query.cn)
 
-PYOPENSSL_IMP_ERR = None
 
-try:
 
-    import OpenSSL
+    def test_post(self):
 
-    from OpenSSL import crypto
+        """ Environ: POST data """
 
-    PYOPENSSL_VERSION = LooseVersion(OpenSSL.__version__)
+        sq = tob('a=a&a=1&b=b&c=&d&cn=%e7%93%b6')
 
-except ImportError:
+        e = {}
 
-    PYOPENSSL_IMP_ERR = traceback.format_exc()
+        wsgiref.util.setup_testing_defaults(e)
 
-    PYOPENSSL_FOUND = False
+        e['wsgi.input'].write(sq)
 
-else:
+        e['wsgi.input'].seek(0)
 
-    PYOPENSSL_FOUND = True
+        e['CONTENT_LENGTH'] = str(len(sq))
 
+        e['REQUEST_METHOD'] = "POST"
 
+        request = BaseRequest(e)
 
-CRYPTOGRAPHY_IMP_ERR = None
+        self.assertTrue('a' in request.POST)
 
-try:
+        self.assertTrue('b' in request.POST)
 
-    import cryptography
+        self.assertEqual(['a','1'], request.POST.getall('a'))
 
-    from cryptography.hazmat.primitives import serialization
+        self.assertEqual(['b'], request.POST.getall('b'))
 
-    CRYPTOGRAPHY_VERSION = LooseVersion(cryptography.__version__)
+        self.assertEqual('1', request.POST['a'])
 
-except ImportError:
+        self.assertEqual('b', request.POST['b'])
 
-    CRYPTOGRAPHY_IMP_ERR = traceback.format_exc()
+        self.assertEqual('', request.POST['c'])
 
-    CRYPTOGRAPHY_FOUND = False
+        self.assertEqual('', request.POST['d'])
 
-else:
+        self.assertEqual(tonat(tob('瓶'), 'latin1'), request.POST['cn'])
 
-    CRYPTOGRAPHY_FOUND = True
+        self.assertEqual(touni('瓶'), request.POST.cn)
 
 
 
-SIGNATURE_TEST_DATA = b'1234'
+    def test_bodypost(self):
 
+        sq = tob('foobar')
 
+        e = {}
 
+        wsgiref.util.setup_testing_defaults(e)
 
+        e['wsgi.input'].write(sq)
 
-def _get_cryptography_key_info(key):
+        e['wsgi.input'].seek(0)
 
-    key_public_data = dict()
+        e['CONTENT_LENGTH'] = str(len(sq))
 
-    key_private_data = dict()
+        e['REQUEST_METHOD'] = "POST"
 
-    if isinstance(key, cryptography.hazmat.primitives.asymmetric.rsa.RSAPrivateKey):
+        request = BaseRequest(e)
 
-        key_type = 'RSA'
+        self.assertEqual('', request.POST['foobar'])
 
-        key_public_data['size'] = key.key_size
 
-        key_public_data['modulus'] = key.public_key().public_numbers().n
 
-        key_public_data['exponent'] = key.public_key().public_numbers().e
+    def test_body_noclose(self):
 
-        key_private_data['p'] = key.private_numbers().p
+        """ Test that the body file handler is not closed after request.POST """
 
-        key_private_data['q'] = key.private_numbers().q
+        sq = tob('a=a&a=1&b=b&c=&d')
 
-        key_private_data['exponent'] = key.private_numbers().d
+        e = {}
 
-    elif isinstance(key, cryptography.hazmat.primitives.asymmetric.dsa.DSAPrivateKey):
+        wsgiref.util.setup_testing_defaults(e)
 
-        key_type = 'DSA'
+        e['wsgi.input'].write(sq)
 
-        key_public_data['size'] = key.key_size
+        e['wsgi.input'].seek(0)
 
-        key_public_data['p'] = key.parameters().parameter_numbers().p
+        e['CONTENT_LENGTH'] = str(len(sq))
 
-        key_public_data['q'] = key.parameters().parameter_numbers().q
+        e['REQUEST_METHOD'] = "POST"
 
-        key_public_data['g'] = key.parameters().parameter_numbers().g
+        request = BaseRequest(e)
 
-        key_public_data['y'] = key.public_key().public_numbers().y
+        self.assertEqual(sq, request.body.read())
 
-        key_private_data['x'] = key.private_numbers().x
+        request.POST # This caused a body.close() with Python 3.x
 
-    elif CRYPTOGRAPHY_HAS_X25519 and isinstance(key, cryptography.hazmat.primitives.asymmetric.x25519.X25519PrivateKey):
+        self.assertEqual(sq, request.body.read())
 
-        key_type = 'X25519'
 
-    elif CRYPTOGRAPHY_HAS_X448 and isinstance(key, cryptography.hazmat.primitives.asymmetric.x448.X448PrivateKey):
 
-        key_type = 'X448'
+    def test_params(self):
 
-    elif CRYPTOGRAPHY_HAS_ED25519 and isinstance(key, cryptography.hazmat.primitives.asymmetric.ed25519.Ed25519PrivateKey):
+        """ Environ: GET and POST are combined in request.param """
 
-        key_type = 'Ed25519'
+        e = {}
 
-    elif CRYPTOGRAPHY_HAS_ED448 and isinstance(key, cryptography.hazmat.primitives.asymmetric.ed448.Ed448PrivateKey):
+        wsgiref.util.setup_testing_defaults(e)
 
-        key_type = 'Ed448'
+        e['wsgi.input'].write(tob('b=b&c=p'))
 
-    elif isinstance(key, cryptography.hazmat.primitives.asymmetric.ec.EllipticCurvePrivateKey):
+        e['wsgi.input'].seek(0)
 
-        key_type = 'ECC'
+        e['CONTENT_LENGTH'] = '7'
 
-        key_public_data['curve'] = key.public_key().curve.name
+        e['QUERY_STRING'] = 'a=a&c=g'
 
-        key_public_data['x'] = key.public_key().public_numbers().x
+        e['REQUEST_METHOD'] = "POST"
 
-        key_public_data['y'] = key.public_key().public_numbers().y
+        request = BaseRequest(e)
 
-        key_public_data['exponent_size'] = key.public_key().curve.key_size
+        self.assertEqual(['a','b','c'], sorted(request.params.keys()))
 
-        key_private_data['multiplier'] = key.private_numbers().private_value
+        self.assertEqual('p', request.params['c'])
 
-    else:
 
-        key_type = 'unknown ({0})'.format(type(key))
 
-    return key_type, key_public_data, key_private_data
+    def test_getpostleak(self):
 
+        """ Environ: GET and POST should not leak into each other """
 
+        e = {}
 
+        wsgiref.util.setup_testing_defaults(e)
 
+        e['wsgi.input'].write(tob('b=b'))
 
-def _check_dsa_consistency(key_public_data, key_private_data):
+        e['wsgi.input'].seek(0)
 
-    # Get parameters
+        e['CONTENT_LENGTH'] = '3'
 
-    p = key_public_data.get('p')
+        e['QUERY_STRING'] = 'a=a'
 
-    q = key_public_data.get('q')
+        e['REQUEST_METHOD'] = "POST"
 
-    g = key_public_data.get('g')
+        request = BaseRequest(e)
 
-    y = key_public_data.get('y')
+        self.assertEqual(['a'], list(request.GET.keys()))
 
-    x = key_private_data.get('x')
+        self.assertEqual(['b'], list(request.POST.keys()))
 
-    for v in (p, q, g, y, x):
 
-        if v is None:
 
-            return None
+    def test_body(self):
 
-    # Make sure that g is not 0, 1 or -1 in Z/pZ
+        """ Environ: Request.body should behave like a file object factory """
 
-    if g < 2 or g >= p - 1:
+        e = {}
 
-        return False
+        wsgiref.util.setup_testing_defaults(e)
 
-    # Make sure that x is in range
+        e['wsgi.input'].write(tob('abc'))
 
-    if x < 1 or x >= q:
+        e['wsgi.input'].seek(0)
 
-        return False
+        e['CONTENT_LENGTH'] = str(3)
 
-    # Check whether q divides p-1
+        request = BaseRequest(e)
 
-    if (p - 1) % q != 0:
+        self.assertEqual(tob('abc'), request.body.read())
 
-        return False
+        self.assertEqual(tob('abc'), request.body.read(3))
 
-    # Check that g**q mod p == 1
+        self.assertEqual(tob('abc'), request.body.readline())
 
-    if binary_exp_mod(g, q, p) != 1:
+        self.assertEqual(tob('abc'), request.body.readline(3))
 
-        return False
 
-    # Check whether g**x mod p == y
 
-    if binary_exp_mod(g, x, p) != y:
+    def test_bigbody(self):
 
-        return False
+        """ Environ: Request.body should handle big uploads using files """
 
-    # Check (quickly) whether p or q are not primes
+        e = {}
 
-    if quick_is_not_prime(q) or quick_is_not_prime(p):
+        wsgiref.util.setup_testing_defaults(e)
 
-        return False
+        e['wsgi.input'].write(tob('x')*1024*1000)
 
-    return True
+        e['wsgi.input'].seek(0)
 
+        e['CONTENT_LENGTH'] = str(1024*1000)
 
+        request = BaseRequest(e)
 
+        self.assertTrue(hasattr(request.body, 'fileno'))
 
+        self.assertEqual(1024*1000, len(request.body.read()))
 
-def _is_cryptography_key_consistent(key, key_public_data, key_private_data):
+        self.assertEqual(1024, len(request.body.read(1024)))
 
-    if isinstance(key, cryptography.hazmat.primitives.asymmetric.rsa.RSAPrivateKey):
+        self.assertEqual(1024*1000, len(request.body.readline()))
 
-        return bool(key._backend._lib.RSA_check_key(key._rsa_cdata))
+        self.assertEqual(1024, len(request.body.readline(1024)))
 
-    if isinstance(key, cryptography.hazmat.primitives.asymmetric.dsa.DSAPrivateKey):
 
-        result = _check_dsa_consistency(key_public_data, key_private_data)
 
-        if result is not None:
+    def test_tobigbody(self):
 
-            return result
+        """ Environ: Request.body should truncate to Content-Length bytes """
 
-        try:
+        e = {}
 
-            signature = key.sign(SIGNATURE_TEST_DATA, cryptography.hazmat.primitives.hashes.SHA256())
+        wsgiref.util.setup_testing_defaults(e)
 
-        except AttributeError:
+        e['wsgi.input'].write(tob('x')*1024)
 
-            # sign() was added in cryptography 1.5, but we support older versions
+        e['wsgi.input'].seek(0)
 
-            return None
+        e['CONTENT_LENGTH'] = '42'
 
-        try:
+        request = BaseRequest(e)
 
-            key.public_key().verify(
+        self.assertEqual(42, len(request.body.read()))
 
-                signature,
+        self.assertEqual(42, len(request.body.read(1024)))
 
-                SIGNATURE_TEST_DATA,
+        self.assertEqual(42, len(request.body.readline()))
 
-                cryptography.hazmat.primitives.hashes.SHA256()
+        self.assertEqual(42, len(request.body.readline(1024)))
 
-            )
 
-            return True
 
-        except cryptography.exceptions.InvalidSignature:
+    def _test_chunked(self, body, expect):
 
-            return False
+        e = {}
 
-    if isinstance(key, cryptography.hazmat.primitives.asymmetric.ec.EllipticCurvePrivateKey):
+        wsgiref.util.setup_testing_defaults(e)
 
-        try:
+        e['wsgi.input'].write(tob(body))
 
-            signature = key.sign(
+        e['wsgi.input'].seek(0)
 
-                SIGNATURE_TEST_DATA,
+        e['HTTP_TRANSFER_ENCODING'] = 'chunked'
 
-                cryptography.hazmat.primitives.asymmetric.ec.ECDSA(cryptography.hazmat.primitives.hashes.SHA256())
+        if isinstance(expect, str):
 
-            )
-
-        except AttributeError:
-
-            # sign() was added in cryptography 1.5, but we support older versions
-
-            return None
-
-        try:
-
-            key.public_key().verify(
-
-                signature,
-
-                SIGNATURE_TEST_DATA,
-
-                cryptography.hazmat.primitives.asymmetric.ec.ECDSA(cryptography.hazmat.primitives.hashes.SHA256())
-
-            )
-
-            return True
-
-        except cryptography.exceptions.InvalidSignature:
-
-            return False
-
-    has_simple_sign_function = False
-
-    if CRYPTOGRAPHY_HAS_ED25519 and isinstance(key, cryptography.hazmat.primitives.asymmetric.ed25519.Ed25519PrivateKey):
-
-        has_simple_sign_function = True
-
-    if CRYPTOGRAPHY_HAS_ED448 and isinstance(key, cryptography.hazmat.primitives.asymmetric.ed448.Ed448PrivateKey):
-
-        has_simple_sign_function = True
-
-    if has_simple_sign_function:
-
-        signature = key.sign(SIGNATURE_TEST_DATA)
-
-        try:
-
-            key.public_key().verify(signature, SIGNATURE_TEST_DATA)
-
-            return True
-
-        except cryptography.exceptions.InvalidSignature:
-
-            return False
-
-    # For X25519 and X448, there's no test yet.
-
-    return None
-
-
-
-
-
-class PrivateKeyInfo(OpenSSLObject):
-
-    def __init__(self, module, backend):
-
-        super(PrivateKeyInfo, self).__init__(
-
-            module.params['path'] or '',
-
-            'present',
-
-            False,
-
-            module.check_mode,
-
-        )
-
-        self.backend = backend
-
-        self.module = module
-
-        self.content = module.params['content']
-
-
-
-        self.passphrase = module.params['passphrase']
-
-        self.return_private_key_data = module.params['return_private_key_data']
-
-
-
-    def generate(self):
-
-        # Empty method because OpenSSLObject wants this
-
-        pass
-
-
-
-    def dump(self):
-
-        # Empty method because OpenSSLObject wants this
-
-        pass
-
-
-
-    @abc.abstractmethod
-
-    def _get_public_key(self, binary):
-
-        pass
-
-
-
-    @abc.abstractmethod
-
-    def _get_key_info(self):
-
-        pass
-
-
-
-    @abc.abstractmethod
-
-    def _is_key_consistent(self, key_public_data, key_private_data):
-
-        pass
-
-
-
-    def get_info(self):
-
-        result = dict(
-
-            can_load_key=False,
-
-            can_parse_key=False,
-
-            key_is_consistent=None,
-
-        )
-
-        if self.content is not None:
-
-            priv_key_detail = self.content.encode('utf-8')
-
-            result['can_load_key'] = True
+            self.assertEqual(tob(expect), BaseRequest(e).body.read())
 
         else:
 
-            try:
+            self.assertRaises(expect, lambda: BaseRequest(e).body)
 
-                with open(self.path, 'rb') as b_priv_key_fh:
 
-                    priv_key_detail = b_priv_key_fh.read()
 
-                result['can_load_key'] = True
+    def test_chunked(self):
 
-            except (IOError, OSError) as exc:
+        self._test_chunked('1\r\nx\r\nff\r\n' + 'y'*255 + '\r\n0\r\n',
 
-                self.module.fail_json(msg=to_native(exc), **result)
+                           'x' + 'y'*255)
 
-        try:
+        self._test_chunked('8\r\nxxxxxxxx\r\n0\r\n','xxxxxxxx')
 
-            self.key = load_privatekey(
+        self._test_chunked('0\r\n', '')
 
-                path=None,
 
-                content=priv_key_detail,
 
-                passphrase=to_bytes(self.passphrase) if self.passphrase is not None else self.passphrase,
+    def test_chunked_meta_fields(self):
 
-                backend=self.backend
+        self._test_chunked('8 ; foo\r\nxxxxxxxx\r\n0\r\n','xxxxxxxx')
 
-            )
+        self._test_chunked('8;foo\r\nxxxxxxxx\r\n0\r\n','xxxxxxxx')
 
-            result['can_parse_key'] = True
+        self._test_chunked('8;foo=bar\r\nxxxxxxxx\r\n0\r\n','xxxxxxxx')
 
-        except OpenSSLObjectError as exc:
 
-            self.module.fail_json(msg=to_native(exc), **result)
 
+    def test_chunked_not_terminated(self):
 
+        self._test_chunked('1\r\nx\r\n', HTTPError)
 
-        result['public_key'] = self._get_public_key(binary=False)
 
-        pk = self._get_public_key(binary=True)
 
-        result['public_key_fingerprints'] = get_fingerprint_of_bytes(pk) if pk is not None else dict()
+    def test_chunked_wrong_size(self):
 
+        self._test_chunked('2\r\nx\r\n', HTTPError)
 
 
-        key_type, key_public_data, key_private_data = self._get_key_info()
 
-        result['type'] = key_type
+    def test_chunked_illegal_size(self):
 
-        result['public_data'] = key_public_data
+        self._test_chunked('x\r\nx\r\n', HTTPError)
 
-        if self.return_private_key_data:
 
-            result['private_data'] = key_private_data
 
+    def test_chunked_not_chunked_at_all(self):
 
+        self._test_chunked('abcdef', HTTPError)
 
-        result['key_is_consistent'] = self._is_key_consistent(key_public_data, key_private_data)
 
-        if result['key_is_consistent'] is False:
 
-            # Only fail when it is False, to avoid to fail on None (which means "we don't know")
+    def test_multipart(self):
 
-            result['key_is_consistent'] = False
+        """ Environ: POST (multipart files and multible values per key) """
 
-            self.module.fail_json(
+        fields = [('field1','value1'), ('field2','value2'), ('field2','value3')]
 
-                msg="Private key is not consistent! (See "
+        files = [('file1','filename1.txt','content1'), ('万难','万难foo.py', 'ä\nö\rü')]
 
-                    "https://blog.hboeck.de/archives/888-How-I-tricked-Symantec-with-a-Fake-Private-Key.html)",
+        e = tools.multipart_environ(fields=fields, files=files)
 
-                **result
+        request = BaseRequest(e)
 
-            )
+        # File content
 
-        return result
+        self.assertTrue('file1' in request.POST)
 
+        self.assertTrue('file1' in request.files)
 
+        self.assertTrue('file1' not in request.forms)
 
+        cmp = tob('content1') if sys.version_info >= (3,2,0) else 'content1'
 
+        self.assertEqual(cmp, request.POST['file1'].file.read())
 
-class PrivateKeyInfoCryptography(PrivateKeyInfo):
+        # File name and meta data
 
-    """Validate the supplied private key, using the cryptography backend"""
+        self.assertTrue('万难' in request.POST)
 
-    def __init__(self, module):
+        self.assertTrue('万难' in request.files)
 
-        super(PrivateKeyInfoCryptography, self).__init__(module, 'cryptography')
+        self.assertTrue('万难' not in request.forms)
 
+        self.assertEqual('foo.py', request.POST['万难'].filename)
 
+        self.assertTrue(request.files['万难'])
 
-    def _get_public_key(self, binary):
+        self.assertFalse(request.files.file77)
 
-        return self.key.public_key().public_bytes(
+        # UTF-8 files
 
-            serialization.Encoding.DER if binary else serialization.Encoding.PEM,
+        x = request.POST['万难'].file.read()
 
-            serialization.PublicFormat.SubjectPublicKeyInfo
+        if (3,2,0) > sys.version_info >= (3,0,0):
 
-        )
+            x = x.encode('utf8')
 
+        self.assertEqual(tob('ä\nö\rü'), x)
 
+        # No file
 
-    def _get_key_info(self):
+        self.assertTrue('file3' not in request.POST)
 
-        return _get_cryptography_key_info(self.key)
+        self.assertTrue('file3' not in request.files)
 
+        self.assertTrue('file3' not in request.forms)
 
+        # Field (single)
 
-    def _is_key_consistent(self, key_public_data, key_private_data):
+        self.assertEqual('value1', request.POST['field1'])
 
-        return _is_cryptography_key_consistent(self.key, key_public_data, key_private_data)
+        self.assertTrue('field1' not in request.files)
 
+        self.assertEqual('value1', request.forms['field1'])
 
+        # Field (multi)
 
+        self.assertEqual(2, len(request.POST.getall('field2')))
 
+        self.assertEqual(['value2', 'value3'], request.POST.getall('field2'))
 
-class PrivateKeyInfoPyOpenSSL(PrivateKeyInfo):
+        self.assertEqual(['value2', 'value3'], request.forms.getall('field2'))
 
-    """validate the supplied private key."""
+        self.assertTrue('field2' not in request.files)
 
 
 
-    def __init__(self, module):
+    def test_json_empty(self):
 
-        super(PrivateKeyInfoPyOpenSSL, self).__init__(module, 'pyopenssl')
+        """ Environ: Request.json property with empty body. """
 
+        self.assertEqual(BaseRequest({}).json, None)
 
 
-    def _get_public_key(self, binary):
 
-        try:
+    def test_json_noheader(self):
 
-            return crypto.dump_publickey(
+        """ Environ: Request.json property with missing content-type header. """
 
-                crypto.FILETYPE_ASN1 if binary else crypto.FILETYPE_PEM,
+        test = dict(a=5, b='test', c=[1,2,3])
 
-                self.key
+        e = {}
 
-            )
+        wsgiref.util.setup_testing_defaults(e)
 
-        except AttributeError:
+        e['wsgi.input'].write(tob(json_dumps(test)))
 
-            try:
+        e['wsgi.input'].seek(0)
 
-                # pyOpenSSL < 16.0:
+        e['CONTENT_LENGTH'] = str(len(json_dumps(test)))
 
-                bio = crypto._new_mem_buf()
+        self.assertEqual(BaseRequest(e).json, None)
 
-                if binary:
 
-                    rc = crypto._lib.i2d_PUBKEY_bio(bio, self.key._pkey)
 
-                else:
+    def test_json_tobig(self):
 
-                    rc = crypto._lib.PEM_write_bio_PUBKEY(bio, self.key._pkey)
+        """ Environ: Request.json property with huge body. """
 
-                if rc != 1:
+        test = dict(a=5, tobig='x' * bottle.BaseRequest.MEMFILE_MAX)
 
-                    crypto._raise_current_error()
+        e = {'CONTENT_TYPE': 'application/json'}
 
-                return crypto._bio_to_string(bio)
+        wsgiref.util.setup_testing_defaults(e)
 
-            except AttributeError:
+        e['wsgi.input'].write(tob(json_dumps(test)))
 
-                self.module.warn('Your pyOpenSSL version does not support dumping public keys. '
+        e['wsgi.input'].seek(0)
 
-                                 'Please upgrade to version 16.0 or newer, or use the cryptography backend.')
+        e['CONTENT_LENGTH'] = str(len(json_dumps(test)))
 
+        self.assertRaises(HTTPError, lambda: BaseRequest(e).json)
 
 
-    def bigint_to_int(self, bn):
 
-        '''Convert OpenSSL BIGINT to Python integer'''
+    def test_json_valid(self):
 
-        if bn == OpenSSL._util.ffi.NULL:
+        """ Environ: Request.json property. """
 
-            return None
+        test = dict(a=5, b='test', c=[1,2,3])
 
-        hexstr = OpenSSL._util.lib.BN_bn2hex(bn)
+        e = {'CONTENT_TYPE': 'application/json; charset=UTF-8'}
 
-        try:
+        wsgiref.util.setup_testing_defaults(e)
 
-            return int(OpenSSL._util.ffi.string(hexstr), 16)
+        e['wsgi.input'].write(tob(json_dumps(test)))
 
-        finally:
+        e['wsgi.input'].seek(0)
 
-            OpenSSL._util.lib.OPENSSL_free(hexstr)
+        e['CONTENT_LENGTH'] = str(len(json_dumps(test)))
 
+        self.assertEqual(BaseRequest(e).json, test)
 
 
-    def _get_key_info(self):
 
-        key_public_data = dict()
+    def test_json_forged_header_issue616(self):
 
-        key_private_data = dict()
+        test = dict(a=5, b='test', c=[1,2,3])
 
-        openssl_key_type = self.key.type()
+        e = {'CONTENT_TYPE': 'text/plain;application/json'}
 
-        try_fallback = True
+        wsgiref.util.setup_testing_defaults(e)
 
-        if crypto.TYPE_RSA == openssl_key_type:
+        e['wsgi.input'].write(tob(json_dumps(test)))
 
-            key_type = 'RSA'
+        e['wsgi.input'].seek(0)
 
-            key_public_data['size'] = self.key.bits()
+        e['CONTENT_LENGTH'] = str(len(json_dumps(test)))
 
+        self.assertEqual(BaseRequest(e).json, None)
 
 
-            try:
 
-                # Use OpenSSL directly to extract key data
+    def test_json_header_empty_body(self):
 
-                key = OpenSSL._util.lib.EVP_PKEY_get1_RSA(self.key._pkey)
+        """Request Content-Type is application/json but body is empty"""
 
-                key = OpenSSL._util.ffi.gc(key, OpenSSL._util.lib.RSA_free)
+        e = {'CONTENT_TYPE': 'application/json'}
 
-                # OpenSSL 1.1 and newer have functions to extract the parameters
+        wsgiref.util.setup_testing_defaults(e)
 
-                # from the EVP PKEY data structures. Older versions didn't have
+        wsgiref.util.setup_testing_defaults(e)
 
-                # these getters, and it was common use to simply access the values
+        e['CONTENT_LENGTH'] = "0"
 
-                # directly. Since there's no guarantee that these data structures
+        self.assertEqual(BaseRequest(e).json, None)
 
-                # will still be accessible in the future, we use the getters for
 
-                # 1.1 and later, and directly access the values for 1.0.x and
 
-                # earlier.
+    def test_isajax(self):
 
-                if OpenSSL.SSL.OPENSSL_VERSION_NUMBER >= 0x10100000:
+        e = {}
 
-                    # Get modulus and exponents
+        wsgiref.util.setup_testing_defaults(e)
 
-                    n = OpenSSL._util.ffi.new("BIGNUM **")
+        self.assertFalse(BaseRequest(e.copy()).is_ajax)
 
-                    e = OpenSSL._util.ffi.new("BIGNUM **")
+        e['HTTP_X_REQUESTED_WITH'] = 'XMLHttpRequest'
 
-                    d = OpenSSL._util.ffi.new("BIGNUM **")
+        self.assertTrue(BaseRequest(e.copy()).is_ajax)
 
-                    OpenSSL._util.lib.RSA_get0_key(key, n, e, d)
 
-                    key_public_data['modulus'] = self.bigint_to_int(n[0])
 
-                    key_public_data['exponent'] = self.bigint_to_int(e[0])
+    def test_auth(self):
 
-                    key_private_data['exponent'] = self.bigint_to_int(d[0])
+        user, pwd = 'marc', 'secret'
 
-                    # Get factors
+        basic = touni(base64.b64encode(tob('%s:%s' % (user, pwd))))
 
-                    p = OpenSSL._util.ffi.new("BIGNUM **")
+        r = BaseRequest({})
 
-                    q = OpenSSL._util.ffi.new("BIGNUM **")
+        self.assertEqual(r.auth, None)
 
-                    OpenSSL._util.lib.RSA_get0_factors(key, p, q)
+        r.environ['HTTP_AUTHORIZATION'] = 'basic %s' % basic
 
-                    key_private_data['p'] = self.bigint_to_int(p[0])
+        self.assertEqual(r.auth, (user, pwd))
 
-                    key_private_data['q'] = self.bigint_to_int(q[0])
+        r.environ['REMOTE_USER'] = user
 
-                else:
+        self.assertEqual(r.auth, (user, pwd))
 
-                    # Get modulus and exponents
+        del r.environ['HTTP_AUTHORIZATION']
 
-                    key_public_data['modulus'] = self.bigint_to_int(key.n)
+        self.assertEqual(r.auth, (user, None))
 
-                    key_public_data['exponent'] = self.bigint_to_int(key.e)
 
-                    key_private_data['exponent'] = self.bigint_to_int(key.d)
 
-                    # Get factors
+    def test_remote_route(self):
 
-                    key_private_data['p'] = self.bigint_to_int(key.p)
+        ips = ['1.2.3.4', '2.3.4.5', '3.4.5.6']
 
-                    key_private_data['q'] = self.bigint_to_int(key.q)
+        r = BaseRequest({})
 
-                try_fallback = False
+        self.assertEqual(r.remote_route, [])
 
-            except AttributeError:
+        r.environ['HTTP_X_FORWARDED_FOR'] = ', '.join(ips)
 
-                # Use fallback if available
+        self.assertEqual(r.remote_route, ips)
 
-                pass
+        r.environ['REMOTE_ADDR'] = ips[1]
 
-        elif crypto.TYPE_DSA == openssl_key_type:
+        self.assertEqual(r.remote_route, ips)
 
-            key_type = 'DSA'
+        del r.environ['HTTP_X_FORWARDED_FOR']
 
-            key_public_data['size'] = self.key.bits()
+        self.assertEqual(r.remote_route, [ips[1]])
 
 
 
-            try:
+    def test_remote_addr(self):
 
-                # Use OpenSSL directly to extract key data
+        ips = ['1.2.3.4', '2.3.4.5', '3.4.5.6']
 
-                key = OpenSSL._util.lib.EVP_PKEY_get1_DSA(self.key._pkey)
+        r = BaseRequest({})
 
-                key = OpenSSL._util.ffi.gc(key, OpenSSL._util.lib.DSA_free)
+        self.assertEqual(r.remote_addr, None)
 
-                # OpenSSL 1.1 and newer have functions to extract the parameters
+        r.environ['HTTP_X_FORWARDED_FOR'] = ', '.join(ips)
 
-                # from the EVP PKEY data structures. Older versions didn't have
+        self.assertEqual(r.remote_addr, ips[0])
 
-                # these getters, and it was common use to simply access the values
+        r.environ['REMOTE_ADDR'] = ips[1]
 
-                # directly. Since there's no guarantee that these data structures
+        self.assertEqual(r.remote_addr, ips[0])
 
-                # will still be accessible in the future, we use the getters for
+        del r.environ['HTTP_X_FORWARDED_FOR']
 
-                # 1.1 and later, and directly access the values for 1.0.x and
+        self.assertEqual(r.remote_addr, ips[1])
 
-                # earlier.
 
-                if OpenSSL.SSL.OPENSSL_VERSION_NUMBER >= 0x10100000:
 
-                    # Get public parameters (primes and group element)
+    def test_user_defined_attributes(self):
 
-                    p = OpenSSL._util.ffi.new("BIGNUM **")
+        for cls in (BaseRequest, LocalRequest):
 
-                    q = OpenSSL._util.ffi.new("BIGNUM **")
+            r = cls()
 
-                    g = OpenSSL._util.ffi.new("BIGNUM **")
 
-                    OpenSSL._util.lib.DSA_get0_pqg(key, p, q, g)
 
-                    key_public_data['p'] = self.bigint_to_int(p[0])
+            # New attributes go to the environ dict.
 
-                    key_public_data['q'] = self.bigint_to_int(q[0])
+            r.foo = 'somevalue'
 
-                    key_public_data['g'] = self.bigint_to_int(g[0])
+            self.assertEqual(r.foo, 'somevalue')
 
-                    # Get public and private key exponents
+            self.assertTrue('somevalue' in r.environ.values())
 
-                    y = OpenSSL._util.ffi.new("BIGNUM **")
 
-                    x = OpenSSL._util.ffi.new("BIGNUM **")
 
-                    OpenSSL._util.lib.DSA_get0_key(key, y, x)
+            # Attributes are read-only once set.
 
-                    key_public_data['y'] = self.bigint_to_int(y[0])
+            self.assertRaises(AttributeError, setattr, r, 'foo', 'x')
 
-                    key_private_data['x'] = self.bigint_to_int(x[0])
 
-                else:
 
-                    # Get public parameters (primes and group element)
+            # Unknown attributes raise AttributeError.
 
-                    key_public_data['p'] = self.bigint_to_int(key.p)
+            self.assertRaises(AttributeError, getattr, r, 'somevalue')
 
-                    key_public_data['q'] = self.bigint_to_int(key.q)
 
-                    key_public_data['g'] = self.bigint_to_int(key.g)
 
-                    # Get public and private key exponents
 
-                    key_public_data['y'] = self.bigint_to_int(key.pub_key)
 
-                    key_private_data['x'] = self.bigint_to_int(key.priv_key)
+class TestResponse(unittest.TestCase):
 
-                try_fallback = False
 
-            except AttributeError:
 
-                # Use fallback if available
+    def test_constructor_body(self):
 
-                pass
+        self.assertEqual('',
+
+            BaseResponse('').body)
+
+
+
+        self.assertEqual('YAY',
+
+            BaseResponse('YAY').body)
+
+
+
+    def test_constructor_status(self):
+
+        self.assertEqual(200,
+
+            BaseResponse('YAY', 200).status_code)
+
+
+
+        self.assertEqual('200 OK',
+
+            BaseResponse('YAY', 200).status_line)
+
+
+
+        self.assertEqual('200 YAY',
+
+            BaseResponse('YAY', '200 YAY').status_line)
+
+
+
+        self.assertEqual('200 YAY',
+
+            BaseResponse('YAY', '200 YAY').status_line)
+
+
+
+    def test_constructor_headerlist(self):
+
+        from functools import partial
+
+        make_res = partial(BaseResponse, '', 200)
+
+
+
+        self.assertEquals('yay', make_res(x_test='yay')['x-test'])
+
+
+
+    def test_wsgi_header_values(self):
+
+        def cmp(app, wire):
+
+            rs = BaseResponse()
+
+            rs.set_header('x-test', app)
+
+            result = [v for (h, v) in rs.headerlist if h.lower()=='x-test'][0]
+
+            self.assertEquals(wire, result)
+
+
+
+        if bottle.py3k:
+
+            cmp(1, tonat('1', 'latin1'))
+
+            cmp('öäü', 'öäü'.encode('utf8').decode('latin1'))
+
+            # Dropped byte header support in Python 3:
+
+            #cmp(tob('äöü'), 'äöü'.encode('utf8').decode('latin1'))
 
         else:
 
-            # Return 'unknown'
+            cmp(1, '1')
 
-            key_type = 'unknown ({0})'.format(self.key.type())
+            cmp('öäü', 'öäü')
 
-        # If needed and if possible, fall back to cryptography
+            cmp(touni('äöü'), 'äöü')
 
-        if try_fallback and PYOPENSSL_VERSION >= LooseVersion('16.1.0') and CRYPTOGRAPHY_FOUND:
 
-            return _get_cryptography_key_info(self.key.to_cryptography_key())
 
-        return key_type, key_public_data, key_private_data
+    def test_set_status(self):
 
+        rs = BaseResponse()
 
 
-    def _is_key_consistent(self, key_public_data, key_private_data):
 
-        openssl_key_type = self.key.type()
+        rs.status = 200
 
-        if crypto.TYPE_RSA == openssl_key_type:
+        self.assertEqual(rs.status, rs.status_line)
 
-            try:
+        self.assertEqual(rs.status_code, 200)
 
-                return self.key.check()
+        self.assertEqual(rs.status_line, '200 OK')
 
-            except crypto.Error:
 
-                # OpenSSL error means that key is not consistent
 
-                return False
+        rs.status = 999
 
-        if crypto.TYPE_DSA == openssl_key_type:
+        self.assertEqual(rs.status, rs.status_line)
 
-            result = _check_dsa_consistency(key_public_data, key_private_data)
+        self.assertEqual(rs.status_code, 999)
 
-            if result is not None:
+        self.assertEqual(rs.status_line, '999 Unknown')
 
-                return result
 
-            signature = crypto.sign(self.key, SIGNATURE_TEST_DATA, 'sha256')
 
-            # Verify wants a cert (where it can get the public key from)
+        rs.status = 404
 
-            cert = crypto.X509()
+        self.assertEqual(rs.status, rs.status_line)
 
-            cert.set_pubkey(self.key)
+        self.assertEqual(rs.status_code, 404)
 
-            try:
+        self.assertEqual(rs.status_line, '404 Not Found')
 
-                crypto.verify(cert, signature, SIGNATURE_TEST_DATA, 'sha256')
 
-                return True
 
-            except crypto.Error:
+        def test(): rs.status = -200
 
-                return False
+        self.assertRaises(ValueError, test)
 
-        # If needed and if possible, fall back to cryptography
+        self.assertEqual(rs.status, rs.status_line) # last value
 
-        if PYOPENSSL_VERSION >= LooseVersion('16.1.0') and CRYPTOGRAPHY_FOUND:
+        self.assertEqual(rs.status_code, 404) # last value
 
-            return _is_cryptography_key_consistent(self.key.to_cryptography_key(), key_public_data, key_private_data)
+        self.assertEqual(rs.status_line, '404 Not Found') # last value
 
-        return None
 
 
+        def test(): rs.status = 5
 
+        self.assertRaises(ValueError, test)
 
+        self.assertEqual(rs.status, rs.status_line) # last value
 
-def main():
+        self.assertEqual(rs.status_code, 404) # last value
 
-    module = AnsibleModule(
+        self.assertEqual(rs.status_line, '404 Not Found') # last value
 
-        argument_spec=dict(
 
-            path=dict(type='path'),
 
-            content=dict(type='str'),
+        rs.status = '999 Who knows?' # Illegal, but acceptable three digit code
 
-            passphrase=dict(type='str', no_log=True),
+        self.assertEqual(rs.status, rs.status_line)
 
-            return_private_key_data=dict(type='bool', default=False),
+        self.assertEqual(rs.status_code, 999)
 
-            select_crypto_backend=dict(type='str', default='auto', choices=['auto', 'cryptography', 'pyopenssl']),
+        self.assertEqual(rs.status_line, '999 Who knows?')
 
-        ),
 
-        required_one_of=(
 
-            ['path', 'content'],
+        rs.status = 555 # Strange code
 
-        ),
+        self.assertEqual(rs.status, rs.status_line)
 
-        mutually_exclusive=(
+        self.assertEqual(rs.status_code, 555)
 
-            ['path', 'content'],
+        self.assertEqual(rs.status_line, '555 Unknown')
 
-        ),
 
-        supports_check_mode=True,
 
-    )
+        rs.status = '404 Brain not Found' # Custom reason
 
+        self.assertEqual(rs.status, rs.status_line)
 
+        self.assertEqual(rs.status_code, 404)
 
-    try:
+        self.assertEqual(rs.status_line, '404 Brain not Found')
 
-        if module.params['path'] is not None:
 
-            base_dir = os.path.dirname(module.params['path']) or '.'
 
-            if not os.path.isdir(base_dir):
+        def test(): rs.status = '5 Illegal Code'
 
-                module.fail_json(
+        self.assertRaises(ValueError, test)
 
-                    name=base_dir,
+        self.assertEqual(rs.status, rs.status_line) # last value
 
-                    msg='The directory %s does not exist or the file is not a directory' % base_dir
+        self.assertEqual(rs.status_code, 404) # last value
 
-                )
+        self.assertEqual(rs.status_line, '404 Brain not Found') # last value
 
 
 
-        backend = module.params['select_crypto_backend']
+        def test(): rs.status = '-99 Illegal Code'
 
-        if backend == 'auto':
+        self.assertRaises(ValueError, test)
 
-            # Detect what backend we can use
+        self.assertEqual(rs.status, rs.status_line) # last value
 
-            can_use_cryptography = CRYPTOGRAPHY_FOUND and CRYPTOGRAPHY_VERSION >= LooseVersion(MINIMAL_CRYPTOGRAPHY_VERSION)
+        self.assertEqual(rs.status_code, 404) # last value
 
-            can_use_pyopenssl = PYOPENSSL_FOUND and PYOPENSSL_VERSION >= LooseVersion(MINIMAL_PYOPENSSL_VERSION)
+        self.assertEqual(rs.status_line, '404 Brain not Found') # last value
 
 
 
-            # If cryptography is available we'll use it
+        def test(): rs.status = '1000 Illegal Code'
 
-            if can_use_cryptography:
+        self.assertRaises(ValueError, test)
 
-                backend = 'cryptography'
+        self.assertEqual(rs.status, rs.status_line) # last value
 
-            elif can_use_pyopenssl:
+        self.assertEqual(rs.status_code, 404) # last value
 
-                backend = 'pyopenssl'
+        self.assertEqual(rs.status_line, '404 Brain not Found') # last value
 
 
 
-            # Fail if no backend has been found
+        def test(): rs.status = '555' # No reason
 
-            if backend == 'auto':
+        self.assertRaises(ValueError, test)
 
-                module.fail_json(msg=("Can't detect any of the required Python libraries "
+        self.assertEqual(rs.status, rs.status_line) # last value
 
-                                      "cryptography (>= {0}) or PyOpenSSL (>= {1})").format(
+        self.assertEqual(rs.status_code, 404) # last value
 
-                                          MINIMAL_CRYPTOGRAPHY_VERSION,
+        self.assertEqual(rs.status_line, '404 Brain not Found') # last value
 
-                                          MINIMAL_PYOPENSSL_VERSION))
 
 
+    def test_content_type(self):
 
-        if backend == 'pyopenssl':
+        rs = BaseResponse()
 
-            if not PYOPENSSL_FOUND:
+        rs.content_type = 'test/some'
 
-                module.fail_json(msg=missing_required_lib('pyOpenSSL >= {0}'.format(MINIMAL_PYOPENSSL_VERSION)),
+        self.assertEqual('test/some', rs.headers.get('Content-Type'))
 
-                                 exception=PYOPENSSL_IMP_ERR)
 
-            module.deprecate('The module is using the PyOpenSSL backend. This backend has been deprecated',
 
-                             version='2.0.0', collection_name='community.crypto')
+    def test_charset(self):
 
-            privatekey = PrivateKeyInfoPyOpenSSL(module)
+        rs = BaseResponse()
 
-        elif backend == 'cryptography':
+        self.assertEqual(rs.charset, 'UTF-8')
 
-            if not CRYPTOGRAPHY_FOUND:
+        rs.content_type = 'text/html; charset=latin9'
 
-                module.fail_json(msg=missing_required_lib('cryptography >= {0}'.format(MINIMAL_CRYPTOGRAPHY_VERSION)),
+        self.assertEqual(rs.charset, 'latin9')
 
-                                 exception=CRYPTOGRAPHY_IMP_ERR)
+        rs.content_type = 'text/html'
 
-            privatekey = PrivateKeyInfoCryptography(module)
+        self.assertEqual(rs.charset, 'UTF-8')
 
 
 
-        result = privatekey.get_info()
+    def test_set_cookie(self):
 
-        module.exit_json(**result)
+        r = BaseResponse()
 
-    except OpenSSLObjectError as exc:
+        r.set_cookie('name1', 'value', max_age=5)
 
-        module.fail_json(msg=to_native(exc))
+        r.set_cookie('name2', 'value 2', path='/foo')
 
+        cookies = [value for name, value in r.headerlist
 
+                   if name.title() == 'Set-Cookie']
 
+        cookies.sort()
 
+        self.assertEqual(cookies[0], 'name1=value; Max-Age=5')
 
-if __name__ == "__main__":
+        self.assertEqual(cookies[1], 'name2="value 2"; Path=/foo')
 
-    main()
+
+
+    def test_set_cookie_value_long_string(self):
+
+        r = BaseResponse()
+
+        self.assertRaises(ValueError, r.set_cookie, name='test', value='x' * 4097)
+
+
+
+    def test_set_cookie_name_long_string(self):
+
+        r = BaseResponse()
+
+        self.assertRaises(ValueError, r.set_cookie, name='x' * 4097, value='simple_value')
+
+
+
+    def test_set_cookie_maxage(self):
+
+        import datetime
+
+        r = BaseResponse()
+
+        r.set_cookie('name1', 'value', max_age=5)
+
+        r.set_cookie('name2', 'value', max_age=datetime.timedelta(days=1))
+
+        cookies = sorted([value for name, value in r.headerlist
+
+                   if name.title() == 'Set-Cookie'])
+
+        self.assertEqual(cookies[0], 'name1=value; Max-Age=5')
+
+        self.assertEqual(cookies[1], 'name2=value; Max-Age=86400')
+
+
+
+    def test_set_cookie_expires(self):
+
+        import datetime
+
+        r = BaseResponse()
+
+        r.set_cookie('name1', 'value', expires=42)
+
+        r.set_cookie('name2', 'value', expires=datetime.datetime(1970,1,1,0,0,43))
+
+        cookies = sorted([value for name, value in r.headerlist
+
+                   if name.title() == 'Set-Cookie'])
+
+        self.assertEqual(cookies[0], 'name1=value; expires=Thu, 01 Jan 1970 00:00:42 GMT')
+
+        self.assertEqual(cookies[1], 'name2=value; expires=Thu, 01 Jan 1970 00:00:43 GMT')
+
+
+
+    def test_set_cookie_secure(self):
+
+        r = BaseResponse()
+
+        r.set_cookie('name1', 'value', secure=True)
+
+        r.set_cookie('name2', 'value', secure=False)
+
+        cookies = sorted([value for name, value in r.headerlist
+
+                   if name.title() == 'Set-Cookie'])
+
+        self.assertEqual(cookies[0].lower(), 'name1=value; secure')
+
+        self.assertEqual(cookies[1], 'name2=value')
+
+
+
+    def test_set_cookie_httponly(self):
+
+        if sys.version_info < (2,6,0):
+
+            return
+
+        r = BaseResponse()
+
+        r.set_cookie('name1', 'value', httponly=True)
+
+        r.set_cookie('name2', 'value', httponly=False)
+
+        cookies = sorted([value for name, value in r.headerlist
+
+                   if name.title() == 'Set-Cookie'])
+
+        self.assertEqual(cookies[0].lower(), 'name1=value; httponly')
+
+        self.assertEqual(cookies[1], 'name2=value')
+
+
+
+    def test_delete_cookie(self):
+
+        response = BaseResponse()
+
+        response.set_cookie('name', 'value')
+
+        response.delete_cookie('name')
+
+        cookies = [value for name, value in response.headerlist
+
+                   if name.title() == 'Set-Cookie']
+
+        self.assertTrue('Max-Age=-1' in cookies[0])
+
+
+
+    def test_set_header(self):
+
+        response = BaseResponse()
+
+        response['x-test'] = 'foo'
+
+        headers = [value for name, value in response.headerlist
+
+                   if name.title() == 'X-Test']
+
+        self.assertEqual(['foo'], headers)
+
+        self.assertEqual('foo', response['x-test'])
+
+
+
+        response['X-Test'] = 'bar'
+
+        headers = [value for name, value in response.headerlist
+
+                   if name.title() == 'X-Test']
+
+        self.assertEqual(['bar'], headers)
+
+        self.assertEqual('bar', response['x-test'])
+
+
+
+    def test_append_header(self):
+
+        response = BaseResponse()
+
+        response.set_header('x-test', 'foo')
+
+        headers = [value for name, value in response.headerlist
+
+                   if name.title() == 'X-Test']
+
+        self.assertEqual(['foo'], headers)
+
+        self.assertEqual('foo', response['x-test'])
+
+
+
+        response.add_header('X-Test', 'bar')
+
+        headers = [value for name, value in response.headerlist
+
+                   if name.title() == 'X-Test']
+
+        self.assertEqual(['foo', 'bar'], headers)
+
+        self.assertEqual('bar', response['x-test'])
+
+
+
+    def test_delete_header(self):
+
+        response = BaseResponse()
+
+        response['x-test'] = 'foo'
+
+        self.assertEqual('foo', response['x-test'])
+
+        del response['X-tESt']
+
+        self.assertRaises(KeyError, lambda: response['x-test'])
+
+
+
+    def test_non_string_header(self):
+
+        response = BaseResponse()
+
+        response['x-test'] = 5
+
+        self.assertEqual('5', response['x-test'])
+
+        response['x-test'] = None
+
+        self.assertEqual('None', response['x-test'])
+
+
+
+    def test_expires_header(self):
+
+        import datetime
+
+        response = BaseResponse()
+
+        now = datetime.datetime.now()
+
+        response.expires = now
+
+
+
+        def seconds(a, b):
+
+            td = max(a,b) - min(a,b)
+
+            return td.days*360*24 + td.seconds
+
+
+
+        self.assertEqual(0, seconds(response.expires, now))
+
+        now2 = datetime.datetime.utcfromtimestamp(
+
+            parse_date(response.headers['Expires']))
+
+        self.assertEqual(0, seconds(now, now2))
+
+
+
+
+
+class TestRedirect(unittest.TestCase):
+
+
+
+    def assertRedirect(self, target, result, query=None, status=303, **args):
+
+        env = {'SERVER_PROTOCOL': 'HTTP/1.1'}
+
+        for key in list(args):
+
+            if key.startswith('wsgi'):
+
+                args[key.replace('_', '.', 1)] = args[key]
+
+                del args[key]
+
+        env.update(args)
+
+        request.bind(env)
+
+        bottle.response.bind()
+
+        try:
+
+            bottle.redirect(target, **(query or {}))
+
+        except bottle.HTTPResponse as E:
+
+            self.assertEqual(status, E.status_code)
+
+            self.assertTrue(E.headers)
+
+            self.assertEqual(result, E.headers['Location'])
+
+
+
+    def test_absolute_path(self):
+
+        self.assertRedirect('/', 'http://127.0.0.1/')
+
+        self.assertRedirect('/test.html', 'http://127.0.0.1/test.html')
+
+        self.assertRedirect('/test.html', 'http://127.0.0.1/test.html',
+
+                            PATH_INFO='/some/sub/path/')
+
+        self.assertRedirect('/test.html', 'http://127.0.0.1/test.html',
+
+                            PATH_INFO='/some/sub/file.html')
+
+        self.assertRedirect('/test.html', 'http://127.0.0.1/test.html',
+
+                            SCRIPT_NAME='/some/sub/path/')
+
+        self.assertRedirect('/foo/test.html', 'http://127.0.0.1/foo/test.html')
+
+        self.assertRedirect('/foo/test.html', 'http://127.0.0.1/foo/test.html',
+
+                            PATH_INFO='/some/sub/file.html')
+
+
+
+    def test_relative_path(self):
+
+        self.assertRedirect('./', 'http://127.0.0.1/')
+
+        self.assertRedirect('./test.html', 'http://127.0.0.1/test.html')
+
+        self.assertRedirect('./test.html', 'http://127.0.0.1/foo/test.html',
+
+                            PATH_INFO='/foo/')
+
+        self.assertRedirect('./test.html', 'http://127.0.0.1/foo/test.html',
+
+                            PATH_INFO='/foo/bar.html')
+
+        self.assertRedirect('./test.html', 'http://127.0.0.1/foo/test.html',
+
+                            SCRIPT_NAME='/foo/')
+
+        self.assertRedirect('./test.html', 'http://127.0.0.1/foo/bar/test.html',
+
+                            SCRIPT_NAME='/foo/', PATH_INFO='/bar/baz.html')
+
+        self.assertRedirect('./foo/test.html', 'http://127.0.0.1/foo/test.html')
+
+        self.assertRedirect('./foo/test.html', 'http://127.0.0.1/bar/foo/test.html',
+
+                            PATH_INFO='/bar/file.html')
+
+        self.assertRedirect('../test.html', 'http://127.0.0.1/test.html',
+
+                            PATH_INFO='/foo/')
+
+        self.assertRedirect('../test.html', 'http://127.0.0.1/foo/test.html',
+
+                            PATH_INFO='/foo/bar/')
+
+        self.assertRedirect('../test.html', 'http://127.0.0.1/test.html',
+
+                            PATH_INFO='/foo/bar.html')
+
+        self.assertRedirect('../test.html', 'http://127.0.0.1/test.html',
+
+                            SCRIPT_NAME='/foo/')
+
+        self.assertRedirect('../test.html', 'http://127.0.0.1/foo/test.html',
+
+                            SCRIPT_NAME='/foo/', PATH_INFO='/bar/baz.html')
+
+        self.assertRedirect('../baz/../test.html', 'http://127.0.0.1/foo/test.html',
+
+                            PATH_INFO='/foo/bar/')
+
+
+
+    def test_sheme(self):
+
+        self.assertRedirect('./test.html', 'https://127.0.0.1/test.html',
+
+                            wsgi_url_scheme='https')
+
+        self.assertRedirect('./test.html', 'https://127.0.0.1:80/test.html',
+
+                            wsgi_url_scheme='https', SERVER_PORT='80')
+
+
+
+    def test_host_http_1_0(self):
+
+        # No HTTP_HOST, just SERVER_NAME and SERVER_PORT.
+
+        self.assertRedirect('./test.html', 'http://example.com/test.html',
+
+                            SERVER_NAME='example.com',
+
+                            SERVER_PROTOCOL='HTTP/1.0', status=302)
+
+        self.assertRedirect('./test.html', 'http://127.0.0.1:81/test.html',
+
+                            SERVER_PORT='81',
+
+                            SERVER_PROTOCOL='HTTP/1.0', status=302)
+
+
+
+    def test_host_http_1_1(self):
+
+        self.assertRedirect('./test.html', 'http://example.com/test.html',
+
+                            HTTP_HOST='example.com')
+
+        self.assertRedirect('./test.html', 'http://example.com:81/test.html',
+
+                            HTTP_HOST='example.com:81')
+
+        # Trust HTTP_HOST over SERVER_NAME and PORT.
+
+        self.assertRedirect('./test.html', 'http://example.com:81/test.html',
+
+                            HTTP_HOST='example.com:81', SERVER_NAME='foobar')
+
+        self.assertRedirect('./test.html', 'http://example.com:81/test.html',
+
+                            HTTP_HOST='example.com:81', SERVER_PORT='80')
+
+
+
+    def test_host_http_proxy(self):
+
+        # Trust proxy headers over original header.
+
+        self.assertRedirect('./test.html', 'http://example.com/test.html',
+
+                            HTTP_X_FORWARDED_HOST='example.com',
+
+                            HTTP_HOST='127.0.0.1')
+
+
+
+    def test_specialchars(self):
+
+        ''' The target URL is not quoted automatically. '''
+
+        self.assertRedirect('./te st.html',
+
+                            'http://example.com/a%20a/b%20b/te st.html',
+
+                            HTTP_HOST='example.com', SCRIPT_NAME='/a a/', PATH_INFO='/b b/')
+
+
+
+    def test_redirect_preserve_cookies(self):
+
+        env = {'SERVER_PROTOCOL':'HTTP/1.1'}
+
+        request.bind(env)
+
+        bottle.response.bind()
+
+        try:
+
+            bottle.response.set_cookie('xxx', 'yyy')
+
+            bottle.redirect('...')
+
+        except bottle.HTTPResponse as E:
+
+            h = [v for (k, v) in E.headerlist if k == 'Set-Cookie']
+
+            self.assertEqual(h, ['xxx=yyy'])
+
+
+
+class TestWSGIHeaderDict(unittest.TestCase):
+
+    def setUp(self):
+
+        self.env = {}
+
+        self.headers = bottle.WSGIHeaderDict(self.env)
+
+
+
+    def test_empty(self):
+
+        self.assertEqual(0, len(bottle.WSGIHeaderDict({})))
+
+
+
+    def test_native(self):
+
+        self.env['HTTP_TEST_HEADER'] = 'foobar'
+
+        self.assertEqual(self.headers['Test-header'], 'foobar')
+
+
+
+    def test_bytes(self):
+
+        self.env['HTTP_TEST_HEADER'] = tob('foobar')
+
+        self.assertEqual(self.headers['Test-Header'], 'foobar')
+
+
+
+    def test_unicode(self):
+
+        self.env['HTTP_TEST_HEADER'] = touni('foobar')
+
+        self.assertEqual(self.headers['Test-Header'], 'foobar')
+
+
+
+    def test_dict(self):
+
+        for key in 'foo-bar Foo-Bar foo-Bar FOO-BAR'.split():
+
+            self.assertTrue(key not in self.headers)
+
+            self.assertEqual(self.headers.get(key), None)
+
+            self.assertEqual(self.headers.get(key, 5), 5)
+
+            self.assertRaises(KeyError, lambda x: self.headers[x], key)
+
+        self.env['HTTP_FOO_BAR'] = 'test'
+
+        for key in 'foo-bar Foo-Bar foo-Bar FOO-BAR'.split():
+
+            self.assertTrue(key in self.headers)
+
+            self.assertEqual(self.headers.get(key), 'test')
+
+            self.assertEqual(self.headers.get(key, 5), 'test')

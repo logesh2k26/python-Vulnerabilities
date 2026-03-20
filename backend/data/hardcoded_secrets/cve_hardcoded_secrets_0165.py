@@ -2,1144 +2,696 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-import os
-
-import re
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
 
 
 
-from django.conf import global_settings, settings
+# Copyright 2012 OpenStack LLC
 
-from django.contrib.sites.models import Site, RequestSite
+#
 
-from django.contrib.auth.models import User
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
 
-from django.core import mail
+# not use this file except in compliance with the License. You may obtain
 
-from django.core.exceptions import SuspiciousOperation
+# a copy of the License at
 
-from django.core.urlresolvers import reverse, NoReverseMatch
+#
 
-from django.http import QueryDict, HttpRequest
+#      http://www.apache.org/licenses/LICENSE-2.0
 
-from django.utils.encoding import force_text
+#
 
-from django.utils.html import escape
+# Unless required by applicable law or agreed to in writing, software
 
-from django.utils.http import urlquote
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-from django.utils._os import upath
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
-from django.test import TestCase
+# License for the specific language governing permissions and limitations
 
-from django.test.utils import override_settings
-
-from django.middleware.csrf import CsrfViewMiddleware
-
-from django.contrib.sessions.middleware import SessionMiddleware
+# under the License.
 
 
 
-from django.contrib.auth import SESSION_KEY, REDIRECT_FIELD_NAME
-
-from django.contrib.auth.forms import (AuthenticationForm, PasswordChangeForm,
-
-                SetPasswordForm, PasswordResetForm)
-
-from django.contrib.auth.tests.utils import skipIfCustomUser
-
-from django.contrib.auth.views import login as login_view
+"""Main entry point into the EC2 Credentials service.
 
 
 
+This service allows the creation of access/secret credentials used for
+
+the ec2 interop layer of OpenStack.
 
 
-@override_settings(
 
-    LANGUAGES=(
+A user can create as many access/secret pairs, each of which map to a
 
-        ('en', 'English'),
+specific tenant.  This is required because OpenStack supports a user
 
-    ),
+belonging to multiple tenants, whereas the signatures created on ec2-style
 
-    LANGUAGE_CODE='en',
+requests don't allow specification of which tenant the user wishs to act
 
-    TEMPLATE_LOADERS=global_settings.TEMPLATE_LOADERS,
+upon.
 
-    TEMPLATE_DIRS=(
 
-        os.path.join(os.path.dirname(upath(__file__)), 'templates'),
 
-    ),
+To complete the cycle, we provide a method that OpenStack services can
 
-    USE_TZ=False,
+use to validate a signature and get a corresponding openstack token.  This
 
-    PASSWORD_HASHERS=('django.contrib.auth.hashers.SHA1PasswordHasher',),
+token allows method calls to other services within the context the
 
-)
+access/secret was created.  As an example, nova requests keystone to validate
 
-class AuthViewsTestCase(TestCase):
+the signature of a request, receives a token, and then makes a request to
+
+glance to list images needed to perform the requested task.
+
+
+
+"""
+
+
+
+import uuid
+
+
+
+from keystone import catalog
+
+from keystone import config
+
+from keystone import exception
+
+from keystone import identity
+
+from keystone import policy
+
+from keystone import service
+
+from keystone import token
+
+from keystone.common import manager
+
+from keystone.common import utils
+
+from keystone.common import wsgi
+
+
+
+
+
+CONF = config.CONF
+
+
+
+
+
+class Manager(manager.Manager):
+
+    """Default pivot point for the EC2 Credentials backend.
+
+
+
+    See :mod:`keystone.common.manager.Manager` for more details on how this
+
+    dynamically calls the backend.
+
+
 
     """
 
-    Helper base class for all the follow test cases.
 
-    """
 
-    fixtures = ['authtestdata.json']
+    def __init__(self):
 
-    urls = 'django.contrib.auth.tests.urls'
+        super(Manager, self).__init__(CONF.ec2.driver)
 
 
 
-    def login(self, password='password'):
 
-        response = self.client.post('/login/', {
 
-            'username': 'testclient',
+class Ec2Extension(wsgi.ExtensionRouter):
 
-            'password': password,
+    def add_routes(self, mapper):
 
-            })
+        ec2_controller = Ec2Controller()
 
-        self.assertEqual(response.status_code, 302)
+        # validation
 
-        self.assertTrue(response['Location'].endswith(settings.LOGIN_REDIRECT_URL))
+        mapper.connect('/ec2tokens',
 
-        self.assertTrue(SESSION_KEY in self.client.session)
+                       controller=ec2_controller,
 
+                       action='authenticate',
 
+                       conditions=dict(method=['POST']))
 
-    def assertContainsEscaped(self, response, text, **kwargs):
 
-        return self.assertContains(response, escape(force_text(text)), **kwargs)
 
+        # crud
 
+        mapper.connect('/users/{user_id}/credentials/OS-EC2',
 
+                       controller=ec2_controller,
 
+                       action='create_credential',
 
-@skipIfCustomUser
+                       conditions=dict(method=['POST']))
 
-class AuthViewNamedURLTests(AuthViewsTestCase):
+        mapper.connect('/users/{user_id}/credentials/OS-EC2',
 
-    urls = 'django.contrib.auth.urls'
+                       controller=ec2_controller,
 
+                       action='get_credentials',
 
+                       conditions=dict(method=['GET']))
 
-    def test_named_urls(self):
+        mapper.connect('/users/{user_id}/credentials/OS-EC2/{credential_id}',
 
-        "Named URLs should be reversible"
+                       controller=ec2_controller,
 
-        expected_named_urls = [
+                       action='get_credential',
 
-            ('login', [], {}),
+                       conditions=dict(method=['GET']))
 
-            ('logout', [], {}),
+        mapper.connect('/users/{user_id}/credentials/OS-EC2/{credential_id}',
 
-            ('password_change', [], {}),
+                       controller=ec2_controller,
 
-            ('password_change_done', [], {}),
+                       action='delete_credential',
 
-            ('password_reset', [], {}),
+                       conditions=dict(method=['DELETE']))
 
-            ('password_reset_done', [], {}),
 
-            ('password_reset_confirm', [], {
 
-                'uidb36': 'aaaaaaa',
 
-                'token': '1111-aaaaa',
 
-            }),
+class Ec2Controller(wsgi.Application):
 
-            ('password_reset_complete', [], {}),
+    def __init__(self):
 
-        ]
+        self.catalog_api = catalog.Manager()
 
-        for name, args, kwargs in expected_named_urls:
+        self.identity_api = identity.Manager()
 
-            try:
+        self.token_api = token.Manager()
 
-                reverse(name, args=args, kwargs=kwargs)
+        self.policy_api = policy.Manager()
 
-            except NoReverseMatch:
+        self.ec2_api = Manager()
 
-                self.fail("Reversal of url named '%s' failed with NoReverseMatch" % name)
+        super(Ec2Controller, self).__init__()
 
 
 
+    def check_signature(self, creds_ref, credentials):
 
+        signer = utils.Ec2Signer(creds_ref['secret'])
 
-@skipIfCustomUser
+        signature = signer.generate(credentials)
 
-class PasswordResetTest(AuthViewsTestCase):
+        if utils.auth_str_equal(credentials['signature'], signature):
 
+            return
 
+        # NOTE(vish): Some libraries don't use the port when signing
 
-    def test_email_not_found(self):
+        #             requests, so try again without port.
 
-        "Error is raised if the provided email address isn't currently registered"
+        elif ':' in credentials['signature']:
 
-        response = self.client.get('/password_reset/')
+            hostname, _port = credentials['host'].split(':')
 
-        self.assertEqual(response.status_code, 200)
+            credentials['host'] = hostname
 
-        response = self.client.post('/password_reset/', {'email': 'not_a_real_email@email.com'})
+            signature = signer.generate(credentials)
 
-        self.assertContainsEscaped(response, PasswordResetForm.error_messages['unknown'])
+            if not utils.auth_str_equal(credentials.signature, signature):
 
-        self.assertEqual(len(mail.outbox), 0)
-
-
-
-    def test_email_found(self):
-
-        "Email is sent if a valid email address is provided for password reset"
-
-        response = self.client.post('/password_reset/', {'email': 'staffmember@example.com'})
-
-        self.assertEqual(response.status_code, 302)
-
-        self.assertEqual(len(mail.outbox), 1)
-
-        self.assertTrue("http://" in mail.outbox[0].body)
-
-        self.assertEqual(settings.DEFAULT_FROM_EMAIL, mail.outbox[0].from_email)
-
-
-
-    def test_email_found_custom_from(self):
-
-        "Email is sent if a valid email address is provided for password reset when a custom from_email is provided."
-
-        response = self.client.post('/password_reset_from_email/', {'email': 'staffmember@example.com'})
-
-        self.assertEqual(response.status_code, 302)
-
-        self.assertEqual(len(mail.outbox), 1)
-
-        self.assertEqual("staffmember@example.com", mail.outbox[0].from_email)
-
-
-
-    @override_settings(ALLOWED_HOSTS=['adminsite.com'])
-
-    def test_admin_reset(self):
-
-        "If the reset view is marked as being for admin, the HTTP_HOST header is used for a domain override."
-
-        response = self.client.post('/admin_password_reset/',
-
-            {'email': 'staffmember@example.com'},
-
-            HTTP_HOST='adminsite.com'
-
-        )
-
-        self.assertEqual(response.status_code, 302)
-
-        self.assertEqual(len(mail.outbox), 1)
-
-        self.assertTrue("http://adminsite.com" in mail.outbox[0].body)
-
-        self.assertEqual(settings.DEFAULT_FROM_EMAIL, mail.outbox[0].from_email)
-
-
-
-    # Skip any 500 handler action (like sending more mail...)
-
-    @override_settings(DEBUG_PROPAGATE_EXCEPTIONS=True)
-
-    def test_poisoned_http_host(self):
-
-        "Poisoned HTTP_HOST headers can't be used for reset emails"
-
-        # This attack is based on the way browsers handle URLs. The colon
-
-        # should be used to separate the port, but if the URL contains an @,
-
-        # the colon is interpreted as part of a username for login purposes,
-
-        # making 'evil.com' the request domain. Since HTTP_HOST is used to
-
-        # produce a meaningful reset URL, we need to be certain that the
-
-        # HTTP_HOST header isn't poisoned. This is done as a check when get_host()
-
-        # is invoked, but we check here as a practical consequence.
-
-        with self.assertRaises(SuspiciousOperation):
-
-            self.client.post('/password_reset/',
-
-                {'email': 'staffmember@example.com'},
-
-                HTTP_HOST='www.example:dr.frankenstein@evil.tld'
-
-            )
-
-        self.assertEqual(len(mail.outbox), 0)
-
-
-
-    # Skip any 500 handler action (like sending more mail...)
-
-    @override_settings(DEBUG_PROPAGATE_EXCEPTIONS=True)
-
-    def test_poisoned_http_host_admin_site(self):
-
-        "Poisoned HTTP_HOST headers can't be used for reset emails on admin views"
-
-        with self.assertRaises(SuspiciousOperation):
-
-            self.client.post('/admin_password_reset/',
-
-                {'email': 'staffmember@example.com'},
-
-                HTTP_HOST='www.example:dr.frankenstein@evil.tld'
-
-            )
-
-        self.assertEqual(len(mail.outbox), 0)
-
-
-
-    def _test_confirm_start(self):
-
-        # Start by creating the email
-
-        response = self.client.post('/password_reset/', {'email': 'staffmember@example.com'})
-
-        self.assertEqual(response.status_code, 302)
-
-        self.assertEqual(len(mail.outbox), 1)
-
-        return self._read_signup_email(mail.outbox[0])
-
-
-
-    def _read_signup_email(self, email):
-
-        urlmatch = re.search(r"https?://[^/]*(/.*reset/\S*)", email.body)
-
-        self.assertTrue(urlmatch is not None, "No URL found in sent email")
-
-        return urlmatch.group(), urlmatch.groups()[0]
-
-
-
-    def test_confirm_valid(self):
-
-        url, path = self._test_confirm_start()
-
-        response = self.client.get(path)
-
-        # redirect to a 'complete' page:
-
-        self.assertContains(response, "Please enter your new password")
-
-
-
-    def test_confirm_invalid(self):
-
-        url, path = self._test_confirm_start()
-
-        # Let's munge the token in the path, but keep the same length,
-
-        # in case the URLconf will reject a different length.
-
-        path = path[:-5] + ("0" * 4) + path[-1]
-
-
-
-        response = self.client.get(path)
-
-        self.assertContains(response, "The password reset link was invalid")
-
-
-
-    def test_confirm_invalid_user(self):
-
-        # Ensure that we get a 200 response for a non-existant user, not a 404
-
-        response = self.client.get('/reset/123456-1-1/')
-
-        self.assertContains(response, "The password reset link was invalid")
-
-
-
-    def test_confirm_overflow_user(self):
-
-        # Ensure that we get a 200 response for a base36 user id that overflows int
-
-        response = self.client.get('/reset/zzzzzzzzzzzzz-1-1/')
-
-        self.assertContains(response, "The password reset link was invalid")
-
-
-
-    def test_confirm_invalid_post(self):
-
-        # Same as test_confirm_invalid, but trying
-
-        # to do a POST instead.
-
-        url, path = self._test_confirm_start()
-
-        path = path[:-5] + ("0" * 4) + path[-1]
-
-
-
-        self.client.post(path, {
-
-            'new_password1': 'anewpassword',
-
-            'new_password2': ' anewpassword',
-
-        })
-
-        # Check the password has not been changed
-
-        u = User.objects.get(email='staffmember@example.com')
-
-        self.assertTrue(not u.check_password("anewpassword"))
-
-
-
-    def test_confirm_complete(self):
-
-        url, path = self._test_confirm_start()
-
-        response = self.client.post(path, {'new_password1': 'anewpassword',
-
-                                           'new_password2': 'anewpassword'})
-
-        # It redirects us to a 'complete' page:
-
-        self.assertEqual(response.status_code, 302)
-
-        # Check the password has been changed
-
-        u = User.objects.get(email='staffmember@example.com')
-
-        self.assertTrue(u.check_password("anewpassword"))
-
-
-
-        # Check we can't use the link again
-
-        response = self.client.get(path)
-
-        self.assertContains(response, "The password reset link was invalid")
-
-
-
-    def test_confirm_different_passwords(self):
-
-        url, path = self._test_confirm_start()
-
-        response = self.client.post(path, {'new_password1': 'anewpassword',
-
-                                           'new_password2': 'x'})
-
-        self.assertContainsEscaped(response, SetPasswordForm.error_messages['password_mismatch'])
-
-
-
-
-
-@override_settings(AUTH_USER_MODEL='auth.CustomUser')
-
-class CustomUserPasswordResetTest(AuthViewsTestCase):
-
-    fixtures = ['custom_user.json']
-
-
-
-    def _test_confirm_start(self):
-
-        # Start by creating the email
-
-        response = self.client.post('/password_reset/', {'email': 'staffmember@example.com'})
-
-        self.assertEqual(response.status_code, 302)
-
-        self.assertEqual(len(mail.outbox), 1)
-
-        return self._read_signup_email(mail.outbox[0])
-
-
-
-    def _read_signup_email(self, email):
-
-        urlmatch = re.search(r"https?://[^/]*(/.*reset/\S*)", email.body)
-
-        self.assertTrue(urlmatch is not None, "No URL found in sent email")
-
-        return urlmatch.group(), urlmatch.groups()[0]
-
-
-
-    def test_confirm_valid_custom_user(self):
-
-        url, path = self._test_confirm_start()
-
-        response = self.client.get(path)
-
-        # redirect to a 'complete' page:
-
-        self.assertContains(response, "Please enter your new password")
-
-
-
-
-
-@skipIfCustomUser
-
-class ChangePasswordTest(AuthViewsTestCase):
-
-
-
-    def fail_login(self, password='password'):
-
-        response = self.client.post('/login/', {
-
-            'username': 'testclient',
-
-            'password': password,
-
-        })
-
-        self.assertContainsEscaped(response, AuthenticationForm.error_messages['invalid_login'] % {
-
-                'username': User._meta.get_field('username').verbose_name
-
-            })
-
-
-
-    def logout(self):
-
-        response = self.client.get('/logout/')
-
-
-
-    def test_password_change_fails_with_invalid_old_password(self):
-
-        self.login()
-
-        response = self.client.post('/password_change/', {
-
-            'old_password': 'donuts',
-
-            'new_password1': 'password1',
-
-            'new_password2': 'password1',
-
-        })
-
-        self.assertContainsEscaped(response, PasswordChangeForm.error_messages['password_incorrect'])
-
-
-
-    def test_password_change_fails_with_mismatched_passwords(self):
-
-        self.login()
-
-        response = self.client.post('/password_change/', {
-
-            'old_password': 'password',
-
-            'new_password1': 'password1',
-
-            'new_password2': 'donuts',
-
-        })
-
-        self.assertContainsEscaped(response, SetPasswordForm.error_messages['password_mismatch'])
-
-
-
-    def test_password_change_succeeds(self):
-
-        self.login()
-
-        response = self.client.post('/password_change/', {
-
-            'old_password': 'password',
-
-            'new_password1': 'password1',
-
-            'new_password2': 'password1',
-
-        })
-
-        self.assertEqual(response.status_code, 302)
-
-        self.assertTrue(response['Location'].endswith('/password_change/done/'))
-
-        self.fail_login()
-
-        self.login(password='password1')
-
-
-
-    def test_password_change_done_succeeds(self):
-
-        self.login()
-
-        response = self.client.post('/password_change/', {
-
-            'old_password': 'password',
-
-            'new_password1': 'password1',
-
-            'new_password2': 'password1',
-
-        })
-
-        self.assertEqual(response.status_code, 302)
-
-        self.assertTrue(response['Location'].endswith('/password_change/done/'))
-
-
-
-    def test_password_change_done_fails(self):
-
-        with self.settings(LOGIN_URL='/login/'):
-
-            response = self.client.get('/password_change/done/')
-
-            self.assertEqual(response.status_code, 302)
-
-            self.assertTrue(response['Location'].endswith('/login/?next=/password_change/done/'))
-
-
-
-
-
-@skipIfCustomUser
-
-class LoginTest(AuthViewsTestCase):
-
-
-
-    def test_current_site_in_context_after_login(self):
-
-        response = self.client.get(reverse('django.contrib.auth.views.login'))
-
-        self.assertEqual(response.status_code, 200)
-
-        if Site._meta.installed:
-
-            site = Site.objects.get_current()
-
-            self.assertEqual(response.context['site'], site)
-
-            self.assertEqual(response.context['site_name'], site.name)
+                raise exception.Unauthorized(message='Invalid EC2 signature.')
 
         else:
 
-            self.assertIsInstance(response.context['site'], RequestSite)
-
-        self.assertTrue(isinstance(response.context['form'], AuthenticationForm),
-
-                     'Login form is not an AuthenticationForm')
+            raise exception.Unauthorized(message='EC2 signature not supplied.')
 
 
 
-    def test_security_check(self, password='password'):
+    def authenticate(self, context, credentials=None,
 
-        login_url = reverse('django.contrib.auth.views.login')
+                         ec2Credentials=None):
 
-
-
-        # Those URLs should not pass the security check
-
-        for bad_url in ('http://example.com',
-
-                        'https://example.com',
-
-                        'ftp://exampel.com',
-
-                        '//example.com'):
+        """Validate a signed EC2 request and provide a token.
 
 
 
-            nasty_url = '%(url)s?%(next)s=%(bad_url)s' % {
+        Other services (such as Nova) use this **admin** call to determine
 
-                'url': login_url,
-
-                'next': REDIRECT_FIELD_NAME,
-
-                'bad_url': urlquote(bad_url),
-
-            }
-
-            response = self.client.post(nasty_url, {
-
-                'username': 'testclient',
-
-                'password': password,
-
-            })
-
-            self.assertEqual(response.status_code, 302)
-
-            self.assertFalse(bad_url in response['Location'],
-
-                             "%s should be blocked" % bad_url)
+        if a request they signed received is from a valid user.
 
 
 
-        # These URLs *should* still pass the security check
+        If it is a valid signature, an openstack token that maps
 
-        for good_url in ('/view/?param=http://example.com',
+        to the user/tenant is returned to the caller, along with
 
-                         '/view/?param=https://example.com',
+        all the other details returned from a normal token validation
 
-                         '/view?param=ftp://exampel.com',
-
-                         'view/?param=//example.com',
-
-                         'https:///',
-
-                         '//testserver/',
-
-                         '/url%20with%20spaces/'):  # see ticket #12534
-
-            safe_url = '%(url)s?%(next)s=%(good_url)s' % {
-
-                'url': login_url,
-
-                'next': REDIRECT_FIELD_NAME,
-
-                'good_url': urlquote(good_url),
-
-            }
-
-            response = self.client.post(safe_url, {
-
-                    'username': 'testclient',
-
-                    'password': password,
-
-            })
-
-            self.assertEqual(response.status_code, 302)
-
-            self.assertTrue(good_url in response['Location'],
-
-                            "%s should be allowed" % good_url)
+        call.
 
 
 
-    def test_login_csrf_rotate(self, password='password'):
+        The returned token is useful for making calls to other
+
+        OpenStack services within the context of the request.
+
+
+
+        :param context: standard context
+
+        :param credentials: dict of ec2 signature
+
+        :param ec2Credentials: DEPRECATED dict of ec2 signature
+
+        :returns: token: openstack token equivalent to access key along
+
+                         with the corresponding service catalog and roles
 
         """
 
-        Makes sure that a login rotates the currently-used CSRF token.
+
+
+        # FIXME(ja): validate that a service token was used!
+
+
+
+        # NOTE(termie): backwards compat hack
+
+        if not credentials and ec2Credentials:
+
+            credentials = ec2Credentials
+
+
+
+        if not 'access' in credentials:
+
+            raise exception.Unauthorized(message='EC2 signature not supplied.')
+
+
+
+        creds_ref = self._get_credentials(context,
+
+                                          credentials['access'])
+
+        self.check_signature(creds_ref, credentials)
+
+
+
+        # TODO(termie): don't create new tokens every time
+
+        # TODO(termie): this is copied from TokenController.authenticate
+
+        token_id = uuid.uuid4().hex
+
+        tenant_ref = self.identity_api.get_tenant(
+
+                context=context,
+
+                tenant_id=creds_ref['tenant_id'])
+
+        user_ref = self.identity_api.get_user(
+
+                context=context,
+
+                user_id=creds_ref['user_id'])
+
+        metadata_ref = self.identity_api.get_metadata(
+
+                context=context,
+
+                user_id=user_ref['id'],
+
+                tenant_id=tenant_ref['id'])
+
+        catalog_ref = self.catalog_api.get_catalog(
+
+                context=context,
+
+                user_id=user_ref['id'],
+
+                tenant_id=tenant_ref['id'],
+
+                    metadata=metadata_ref)
+
+
+
+        token_ref = self.token_api.create_token(
+
+                context, token_id, dict(id=token_id,
+
+                                        user=user_ref,
+
+                                        tenant=tenant_ref,
+
+                                        metadata=metadata_ref))
+
+
+
+        # TODO(termie): optimize this call at some point and put it into the
+
+        #               the return for metadata
+
+        # fill out the roles in the metadata
+
+        roles_ref = []
+
+        for role_id in metadata_ref.get('roles', []):
+
+            roles_ref.append(self.identity_api.get_role(context, role_id))
+
+
+
+        # TODO(termie): make this a util function or something
+
+        # TODO(termie): i don't think the ec2 middleware currently expects a
+
+        #               full return, but it contains a note saying that it
+
+        #               would be better to expect a full return
+
+        token_controller = service.TokenController()
+
+        return token_controller._format_authenticate(
+
+                token_ref, roles_ref, catalog_ref)
+
+
+
+    def create_credential(self, context, user_id, tenant_id):
+
+        """Create a secret/access pair for use with ec2 style auth.
+
+
+
+        Generates a new set of credentials that map the the user/tenant
+
+        pair.
+
+
+
+        :param context: standard context
+
+        :param user_id: id of user
+
+        :param tenant_id: id of tenant
+
+        :returns: credential: dict of ec2 credential
 
         """
 
-        # Do a GET to establish a CSRF token
+        if not self._is_admin(context):
 
-        # TestClient isn't used here as we're testing middleware, essentially.
+            self._assert_identity(context, user_id)
 
-        req = HttpRequest()
 
-        CsrfViewMiddleware().process_view(req, login_view, (), {})
 
-        req.META["CSRF_COOKIE_USED"] = True
+        self._assert_valid_user_id(context, user_id)
 
-        resp = login_view(req)
+        self._assert_valid_tenant_id(context, tenant_id)
 
-        resp2 = CsrfViewMiddleware().process_response(req, resp)
 
-        csrf_cookie = resp2.cookies.get(settings.CSRF_COOKIE_NAME, None)
 
-        token1 = csrf_cookie.coded_value
+        cred_ref = {'user_id': user_id,
 
+                    'tenant_id': tenant_id,
 
+                    'access': uuid.uuid4().hex,
 
-        # Prepare the POST request
+                    'secret': uuid.uuid4().hex}
 
-        req = HttpRequest()
+        self.ec2_api.create_credential(context, cred_ref['access'], cred_ref)
 
-        req.COOKIES[settings.CSRF_COOKIE_NAME] = token1
+        return {'credential': cred_ref}
 
-        req.method = "POST"
 
-        req.POST = {'username': 'testclient', 'password': password, 'csrfmiddlewaretoken': token1}
 
-        req.REQUEST = req.POST
+    def get_credentials(self, context, user_id):
 
+        """List all credentials for a user.
 
 
-        # Use POST request to log in
 
-        SessionMiddleware().process_request(req)
+        :param context: standard context
 
-        CsrfViewMiddleware().process_view(req, login_view, (), {})
+        :param user_id: id of user
 
-        req.META["SERVER_NAME"] = "testserver"  # Required to have redirect work in login view
+        :returns: credentials: list of ec2 credential dicts
 
-        req.META["SERVER_PORT"] = 80
+        """
 
-        req.META["CSRF_COOKIE_USED"] = True
+        if not self._is_admin(context):
 
-        resp = login_view(req)
+            self._assert_identity(context, user_id)
 
-        resp2 = CsrfViewMiddleware().process_response(req, resp)
+        self._assert_valid_user_id(context, user_id)
 
-        csrf_cookie = resp2.cookies.get(settings.CSRF_COOKIE_NAME, None)
+        return {'credentials': self.ec2_api.list_credentials(context, user_id)}
 
-        token2 = csrf_cookie.coded_value
 
 
+    def get_credential(self, context, user_id, credential_id):
 
-        # Check the CSRF token switched
+        """Retreive a user's access/secret pair by the access key.
 
-        self.assertNotEqual(token1, token2)
 
 
+        Grab the full access/secret pair for a given access key.
 
 
 
-@skipIfCustomUser
+        :param context: standard context
 
-class LoginURLSettings(AuthViewsTestCase):
+        :param user_id: id of user
 
+        :param credential_id: access key for credentials
 
+        :returns: credential: dict of ec2 credential
 
-    def setUp(self):
+        """
 
-        super(LoginURLSettings, self).setUp()
+        if not self._is_admin(context):
 
-        self.old_LOGIN_URL = settings.LOGIN_URL
+            self._assert_identity(context, user_id)
 
+        self._assert_valid_user_id(context, user_id)
 
+        creds = self._get_credentials(context, credential_id)
 
-    def tearDown(self):
+        return {'credential': creds}
 
-        super(LoginURLSettings, self).tearDown()
 
-        settings.LOGIN_URL = self.old_LOGIN_URL
 
+    def delete_credential(self, context, user_id, credential_id):
 
+        """Delete a user's access/secret pair.
 
-    def get_login_required_url(self, login_url):
 
-        settings.LOGIN_URL = login_url
 
-        response = self.client.get('/login_required/')
+        Used to revoke a user's access/secret pair
 
-        self.assertEqual(response.status_code, 302)
 
-        return response['Location']
 
+        :param context: standard context
 
+        :param user_id: id of user
 
-    def test_standard_login_url(self):
+        :param credential_id: access key for credentials
 
-        login_url = '/login/'
+        :returns: bool: success
 
-        login_required_url = self.get_login_required_url(login_url)
+        """
 
-        querystring = QueryDict('', mutable=True)
+        if not self._is_admin(context):
 
-        querystring['next'] = '/login_required/'
+            self._assert_identity(context, user_id)
 
-        self.assertEqual(login_required_url, 'http://testserver%s?%s' %
+            self._assert_owner(context, user_id, credential_id)
 
-                         (login_url, querystring.urlencode('/')))
 
 
+        self._assert_valid_user_id(context, user_id)
 
-    def test_remote_login_url(self):
+        self._get_credentials(context, credential_id)
 
-        login_url = 'http://remote.example.com/login'
+        return self.ec2_api.delete_credential(context, credential_id)
 
-        login_required_url = self.get_login_required_url(login_url)
 
-        querystring = QueryDict('', mutable=True)
 
-        querystring['next'] = 'http://testserver/login_required/'
+    def _get_credentials(self, context, credential_id):
 
-        self.assertEqual(login_required_url,
+        """Return credentials from an ID.
 
-                         '%s?%s' % (login_url, querystring.urlencode('/')))
 
 
+        :param context: standard context
 
-    def test_https_login_url(self):
+        :param credential_id: id of credential
 
-        login_url = 'https:///login/'
+        :raises exception.Unauthorized: when credential id is invalid
 
-        login_required_url = self.get_login_required_url(login_url)
+        :returns: credential: dict of ec2 credential.
 
-        querystring = QueryDict('', mutable=True)
+        """
 
-        querystring['next'] = 'http://testserver/login_required/'
+        creds = self.ec2_api.get_credential(context,
 
-        self.assertEqual(login_required_url,
+                                            credential_id)
 
-                         '%s?%s' % (login_url, querystring.urlencode('/')))
+        if not creds:
 
+            raise exception.Unauthorized(message='EC2 access key not found.')
 
+        return creds
 
-    def test_login_url_with_querystring(self):
 
-        login_url = '/login/?pretty=1'
 
-        login_required_url = self.get_login_required_url(login_url)
+    def _assert_identity(self, context, user_id):
 
-        querystring = QueryDict('pretty=1', mutable=True)
+        """Check that the provided token belongs to the user.
 
-        querystring['next'] = '/login_required/'
 
-        self.assertEqual(login_required_url, 'http://testserver/login/?%s' %
 
-                         querystring.urlencode('/'))
+        :param context: standard context
 
+        :param user_id: id of user
 
+        :raises exception.Forbidden: when token is invalid
 
-    def test_remote_login_url_with_next_querystring(self):
 
-        login_url = 'http://remote.example.com/login/'
 
-        login_required_url = self.get_login_required_url('%s?next=/default/' %
+        """
 
-                                                         login_url)
+        try:
 
-        querystring = QueryDict('', mutable=True)
+            token_ref = self.token_api.get_token(context=context,
 
-        querystring['next'] = 'http://testserver/login_required/'
+                    token_id=context['token_id'])
 
-        self.assertEqual(login_required_url, '%s?%s' % (login_url,
+        except exception.TokenNotFound:
 
-                                                    querystring.urlencode('/')))
+            raise exception.Unauthorized()
 
+        token_user_id = token_ref['user'].get('id')
 
+        if not token_user_id == user_id:
 
+            raise exception.Forbidden()
 
 
-@skipIfCustomUser
 
-class LogoutTest(AuthViewsTestCase):
+    def _is_admin(self, context):
 
+        """Wrap admin assertion error return statement.
 
 
-    def confirm_logged_out(self):
 
-        self.assertTrue(SESSION_KEY not in self.client.session)
+        :param context: standard context
 
+        :returns: bool: success
 
 
-    def test_logout_default(self):
 
-        "Logout without next_page option renders the default template"
+        """
 
-        self.login()
+        try:
 
-        response = self.client.get('/logout/')
+            self.assert_admin(context)
 
-        self.assertContains(response, 'Logged out')
+            return True
 
-        self.confirm_logged_out()
+        except exception.Forbidden:
 
+            return False
 
 
-    def test_14377(self):
 
-        # Bug 14377
+    def _assert_owner(self, context, user_id, credential_id):
 
-        self.login()
+        """Ensure the provided user owns the credential.
 
-        response = self.client.get('/logout/')
 
-        self.assertTrue('site' in response.context)
 
+        :param context: standard context
 
+        :param user_id: expected credential owner
 
-    def test_logout_with_overridden_redirect_url(self):
+        :param credential_id: id of credential object
 
-        # Bug 11223
+        :raises exception.Forbidden: on failure
 
-        self.login()
 
-        response = self.client.get('/logout/next_page/')
 
-        self.assertEqual(response.status_code, 302)
+        """
 
-        self.assertTrue(response['Location'].endswith('/somewhere/'))
+        cred_ref = self.ec2_api.get_credential(context, credential_id)
 
+        if not user_id == cred_ref['user_id']:
 
+            raise exception.Forbidden()
 
-        response = self.client.get('/logout/next_page/?next=/login/')
 
-        self.assertEqual(response.status_code, 302)
 
-        self.assertTrue(response['Location'].endswith('/login/'))
+    def _assert_valid_user_id(self, context, user_id):
 
+        """Ensure a valid user id.
 
 
-        self.confirm_logged_out()
 
+        :param context: standard context
 
+        :param user_id: expected credential owner
 
-    def test_logout_with_next_page_specified(self):
+        :raises exception.UserNotFound: on failure
 
-        "Logout with next_page option given redirects to specified resource"
 
-        self.login()
 
-        response = self.client.get('/logout/next_page/')
+        """
 
-        self.assertEqual(response.status_code, 302)
+        user_ref = self.identity_api.get_user(
 
-        self.assertTrue(response['Location'].endswith('/somewhere/'))
+            context=context,
 
-        self.confirm_logged_out()
+            user_id=user_id)
 
+        if not user_ref:
 
+            raise exception.UserNotFound(user_id=user_id)
 
-    def test_logout_with_redirect_argument(self):
 
-        "Logout with query string redirects to specified resource"
 
-        self.login()
+    def _assert_valid_tenant_id(self, context, tenant_id):
 
-        response = self.client.get('/logout/?next=/login/')
+        """Ensure a valid tenant id.
 
-        self.assertEqual(response.status_code, 302)
 
-        self.assertTrue(response['Location'].endswith('/login/'))
 
-        self.confirm_logged_out()
+        :param context: standard context
 
+        :param user_id: expected credential owner
 
+        :raises exception.UserNotFound: on failure
 
-    def test_logout_with_custom_redirect_argument(self):
 
-        "Logout with custom query string redirects to specified resource"
 
-        self.login()
+        """
 
-        response = self.client.get('/logout/custom_query/?follow=/somewhere/')
+        tenant_ref = self.identity_api.get_tenant(
 
-        self.assertEqual(response.status_code, 302)
+            context=context,
 
-        self.assertTrue(response['Location'].endswith('/somewhere/'))
+            tenant_id=tenant_id)
 
-        self.confirm_logged_out()
+        if not tenant_ref:
 
-
-
-    def test_security_check(self, password='password'):
-
-        logout_url = reverse('django.contrib.auth.views.logout')
-
-
-
-        # Those URLs should not pass the security check
-
-        for bad_url in ('http://example.com',
-
-                        'https://example.com',
-
-                        'ftp://exampel.com',
-
-                        '//example.com'):
-
-            nasty_url = '%(url)s?%(next)s=%(bad_url)s' % {
-
-                'url': logout_url,
-
-                'next': REDIRECT_FIELD_NAME,
-
-                'bad_url': urlquote(bad_url),
-
-            }
-
-            self.login()
-
-            response = self.client.get(nasty_url)
-
-            self.assertEqual(response.status_code, 302)
-
-            self.assertFalse(bad_url in response['Location'],
-
-                             "%s should be blocked" % bad_url)
-
-            self.confirm_logged_out()
-
-
-
-        # These URLs *should* still pass the security check
-
-        for good_url in ('/view/?param=http://example.com',
-
-                         '/view/?param=https://example.com',
-
-                         '/view?param=ftp://exampel.com',
-
-                         'view/?param=//example.com',
-
-                         'https:///',
-
-                         '//testserver/',
-
-                         '/url%20with%20spaces/'):  # see ticket #12534
-
-            safe_url = '%(url)s?%(next)s=%(good_url)s' % {
-
-                'url': logout_url,
-
-                'next': REDIRECT_FIELD_NAME,
-
-                'good_url': urlquote(good_url),
-
-            }
-
-            self.login()
-
-            response = self.client.get(safe_url)
-
-            self.assertEqual(response.status_code, 302)
-
-            self.assertTrue(good_url in response['Location'],
-
-                            "%s should be allowed" % good_url)
-
-            self.confirm_logged_out()
-
-
-
-@skipIfCustomUser
-
-class ChangelistTests(AuthViewsTestCase):
-
-    urls = 'django.contrib.auth.tests.urls_admin'
-
-
-
-    # #20078 - users shouldn't be allowed to guess password hashes via
-
-    # repeated password__startswith queries.
-
-    def test_changelist_disallows_password_lookups(self):
-
-        # Make me a superuser before loging in.
-
-        User.objects.filter(username='testclient').update(is_staff=True, is_superuser=True)
-
-        self.login()
-
-
-
-        # A lookup that tries to filter on password isn't OK
-
-        with self.assertRaises(SuspiciousOperation):
-
-            response = self.client.get('/admin/auth/user/?password__startswith=sha1$')
+            raise exception.TenantNotFound(tenant_id=tenant_id)

@@ -2,220 +2,364 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-#!/usr/bin/env python
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
 
 
 
-# Copyright 2017, New York University and the TUF contributors
+# Copyright 2012 OpenStack LLC
 
-# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright 2012 Canonical Ltd.
 
+#
 
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
 
-"""
+# not use this file except in compliance with the License. You may obtain
 
-<Program Name>
+# a copy of the License at
 
-  settings.py
+#
 
+#      http://www.apache.org/licenses/LICENSE-2.0
 
+#
 
-<Author>
+# Unless required by applicable law or agreed to in writing, software
 
-  Vladimir Diaz <vladimir.v.diaz@gmail.com>
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
+# License for the specific language governing permissions and limitations
 
-<Started>
+# under the License.
 
-  January 11, 2017
 
 
+"""Main entry point into the Catalog service."""
 
-<Copyright>
 
-  See LICENSE-MIT OR LICENSE for licensing information.
 
+import uuid
 
 
-<Purpose>
 
- A central location for TUF configuration settings.  Example options include
+from keystone import config
 
- setting the destination of temporary files and downloaded content, the maximum
+from keystone import exception
 
- length of downloaded metadata (unknown file attributes), and download
+from keystone import identity
 
- behavior.
+from keystone import policy
 
-"""
+from keystone import token
 
+from keystone.common import manager
 
+from keystone.common import wsgi
 
-# Help with Python 3 compatibility, where the print statement is a function, an
 
-# implicit relative import is invalid, and the '/' operator performs true
 
-# division.  Example:  print 'hello world' raises a 'SyntaxError' exception.
 
-from __future__ import print_function
 
-from __future__ import absolute_import
+CONF = config.CONF
 
-from __future__ import division
 
-from __future__ import unicode_literals
 
 
 
+class Manager(manager.Manager):
 
+    """Default pivot point for the Catalog backend.
 
-# Set a directory that should be used for all temporary files. If this
 
-# is None, then the system default will be used. The system default
 
-# will also be used if a directory path set here is invalid or
+    See :mod:`keystone.common.manager.Manager` for more details on how this
 
-# unusable.
+    dynamically calls the backend.
 
-temporary_directory = None
 
 
+    """
 
-# Set a local directory to store metadata that is requested from mirrors.  This
 
-# directory contains subdirectories for different repositories, where each
 
-# subdirectory contains a different set of metadata.  For example:
+    def __init__(self):
 
-# tuf.settings.repositories_directory = /tmp/repositories.  The root file for a
+        super(Manager, self).__init__(CONF.catalog.driver)
 
-# repository named 'django_repo' can be found at:
 
-# /tmp/repositories/django_repo/metadata/current/root.METADATA_EXTENSION
 
-repositories_directory = None
 
 
+class Driver(object):
 
-# The 'log.py' module manages TUF's logging system.  Users have the option to
+    """Interface description for an Catalog driver."""
 
-# enable/disable logging to a file via 'ENABLE_FILE_LOGGING', or
+    def list_services(self):
 
-# tuf.log.enable_file_logging() and tuf.log.disable_file_logging().
+        """List all service ids in catalog.
 
-ENABLE_FILE_LOGGING = False
 
 
+        Returns: list of service_ids or an empty list.
 
-# If file logging is enabled via 'ENABLE_FILE_LOGGING', TUF log messages will
 
-# be saved to 'LOG_FILENAME'
 
-LOG_FILENAME = 'tuf.log'
+        """
 
+        raise exception.NotImplemented()
 
 
-# Since the timestamp role does not have signed metadata about itself, we set a
 
-# default but sane upper bound for the number of bytes required to download it.
+    def get_service(self, service_id):
 
-DEFAULT_TIMESTAMP_REQUIRED_LENGTH = 16384 #bytes
+        """Get service by id.
 
 
 
-# The Root role may be updated without knowing its version if top-level
+        Returns: service_ref dict or None.
 
-# metadata cannot be safely downloaded (e.g., keys may have been revoked, thus
 
-# requiring a new Root file that includes the updated keys).  Set a default
 
-# upper bound for the maximum total bytes that may be downloaded for Root
+        """
 
-# metadata.
+        raise exception.NotImplemented()
 
-DEFAULT_ROOT_REQUIRED_LENGTH = 512000 #bytes
 
 
+    def delete_service(self, service_id):
 
-# Set a default, but sane, upper bound for the number of bytes required to
+        raise exception.NotImplemented()
 
-# download Snapshot metadata.
 
-DEFAULT_SNAPSHOT_REQUIRED_LENGTH = 2000000 #bytes
 
+    def create_service(self, service_id, service_ref):
 
+        raise exception.NotImplemented()
 
-# Set a default, but sane, upper bound for the number of bytes required to
 
-# download Targets metadata.
 
-DEFAULT_TARGETS_REQUIRED_LENGTH = 5000000 #bytes
+    def create_endpoint(self, endpoint_id, endpoint_ref):
 
+        raise exception.NotImplemented()
 
 
-# Set a timeout value in seconds (float) for non-blocking socket operations.
 
-SOCKET_TIMEOUT = 4 #seconds
+    def delete_endpoint(self, endpoint_id):
 
+        raise exception.NotImplemented()
 
 
-# The maximum chunk of data, in bytes, we would download in every round.
 
-CHUNK_SIZE = 400000 #bytes
+    def get_endpoint(self, endpoint_id):
 
+        """Get endpoint by id.
 
 
-# The minimum average download speed (bytes/second) that must be met to
 
-# avoid being considered as a slow retrieval attack.
+        Returns: endpoint_ref dict or None.
 
-MIN_AVERAGE_DOWNLOAD_SPEED = 50 #bytes/second
 
 
+        """
 
-# By default, limit number of delegatees we visit for any target.
+        raise exception.NotImplemented()
 
-MAX_NUMBER_OF_DELEGATIONS = 2**5
 
 
+    def list_endpoints(self):
 
-# This configuration is for indicating how consistent files should be created.
+        """List all endpoint ids in catalog.
 
-# There are two options: "copy" and "hard_link".  For "copy", the consistent
 
-# file with be a copy of root.json.  This approach will require the most disk
 
-# space out of the two options.  For "hard_link", the latest root.json will be
+        Returns: list of endpoint_ids or an empty list.
 
-# a hard link to 2.root.json (for example).  This approach is more efficient in
 
-# terms of disk space usage.  By default, we use 'copy'.
 
-CONSISTENT_METHOD = 'copy'
+        """
 
+        raise exception.NotImplemented()
 
 
-# A setting for the instances where a default hashing algorithm is needed.
 
-# This setting is currently used to calculate the path hash prefixes of hashed
+    def get_catalog(self, user_id, tenant_id, metadata=None):
 
-# bin delegations, and digests of targets filepaths.  The other instances
+        """Retreive and format the current service catalog.
 
-# (e.g., digest of files) that require a hashing algorithm rely on settings in
 
-# the securesystemslib external library.
 
-DEFAULT_HASH_ALGORITHM = 'sha256'
+        Returns: A nested dict representing the service catalog or an
 
+                 empty dict.
 
 
-# The client's update procedure (contained within a while-loop) can potentially
 
-# hog the CPU.  The following setting can be used to force the update sequence
+        Example:
 
-# to suspend execution for a specified amount of time.  See
 
-# theupdateframework/tuf/issue#338.
 
-SLEEP_BEFORE_ROUND = None
+            { 'RegionOne':
+
+                {'compute': {
+
+                    'adminURL': u'http://host:8774/v1.1/tenantid',
+
+                    'internalURL': u'http://host:8774/v1.1/tenant_id',
+
+                    'name': 'Compute Service',
+
+                    'publicURL': u'http://host:8774/v1.1/tenantid'},
+
+                 'ec2': {
+
+                    'adminURL': 'http://host:8773/services/Admin',
+
+                    'internalURL': 'http://host:8773/services/Cloud',
+
+                    'name': 'EC2 Service',
+
+                    'publicURL': 'http://host:8773/services/Cloud'}}
+
+
+
+        """
+
+        raise exception.NotImplemented()
+
+
+
+
+
+class ServiceController(wsgi.Application):
+
+    def __init__(self):
+
+        self.catalog_api = Manager()
+
+        super(ServiceController, self).__init__()
+
+
+
+    # CRUD extensions
+
+    # NOTE(termie): this OS-KSADM stuff is not very consistent
+
+    def get_services(self, context):
+
+        service_list = self.catalog_api.list_services(context)
+
+        service_refs = [self.catalog_api.get_service(context, x)
+
+                        for x in service_list]
+
+        return {'OS-KSADM:services': service_refs}
+
+
+
+    def get_service(self, context, service_id):
+
+        service_ref = self.catalog_api.get_service(context, service_id)
+
+        if not service_ref:
+
+            raise exception.ServiceNotFound(service_id=service_id)
+
+        return {'OS-KSADM:service': service_ref}
+
+
+
+    def delete_service(self, context, service_id):
+
+        service_ref = self.catalog_api.get_service(context, service_id)
+
+        if not service_ref:
+
+            raise exception.ServiceNotFound(service_id=service_id)
+
+        self.catalog_api.delete_service(context, service_id)
+
+
+
+    def create_service(self, context, OS_KSADM_service):
+
+        service_id = uuid.uuid4().hex
+
+        service_ref = OS_KSADM_service.copy()
+
+        service_ref['id'] = service_id
+
+        new_service_ref = self.catalog_api.create_service(
+
+                context, service_id, service_ref)
+
+        return {'OS-KSADM:service': new_service_ref}
+
+
+
+
+
+class EndpointController(wsgi.Application):
+
+    def __init__(self):
+
+        self.catalog_api = Manager()
+
+        self.identity_api = identity.Manager()
+
+        self.policy_api = policy.Manager()
+
+        self.token_api = token.Manager()
+
+        super(EndpointController, self).__init__()
+
+
+
+    def get_endpoints(self, context):
+
+        self.assert_admin(context)
+
+        endpoint_list = self.catalog_api.list_endpoints(context)
+
+        endpoint_refs = [self.catalog_api.get_endpoint(context, e)
+
+                         for e in endpoint_list]
+
+        return {'endpoints': endpoint_refs}
+
+
+
+    def create_endpoint(self, context, endpoint):
+
+        self.assert_admin(context)
+
+        endpoint_id = uuid.uuid4().hex
+
+        endpoint_ref = endpoint.copy()
+
+        endpoint_ref['id'] = endpoint_id
+
+
+
+        service_id = endpoint_ref['service_id']
+
+        if not self.catalog_api.get_service(context, service_id):
+
+            raise exception.ServiceNotFound(service_id=service_id)
+
+
+
+        new_endpoint_ref = self.catalog_api.create_endpoint(
+
+                                context, endpoint_id, endpoint_ref)
+
+        return {'endpoint': new_endpoint_ref}
+
+
+
+    def delete_endpoint(self, context, endpoint_id):
+
+        self.assert_admin(context)
+
+        self.catalog_api.delete_endpoint(context, endpoint_id)

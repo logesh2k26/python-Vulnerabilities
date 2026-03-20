@@ -2,492 +2,712 @@
 # Safety: safe
 # Category: safe
 
-"""
+# Copyright 2012 OpenStack LLC
 
-SVG colors.
+#
 
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
 
+# not use this file except in compliance with the License. You may obtain
 
-"""
+# a copy of the License at
 
+#
 
+#      http://www.apache.org/licenses/LICENSE-2.0
 
-import re
+#
 
+# Unless required by applicable law or agreed to in writing, software
 
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-COLORS = {
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
-    'aliceblue': (240 / 255, 248 / 255, 255 / 255, 1),
+# License for the specific language governing permissions and limitations
 
-    'antiquewhite': (250 / 255, 235 / 255, 215 / 255, 1),
+# under the License.
 
-    'aqua': (0 / 255, 255 / 255, 255 / 255, 1),
 
-    'aquamarine': (127 / 255, 255 / 255, 212 / 255, 1),
 
-    'azure': (240 / 255, 255 / 255, 255 / 255, 1),
+import time
 
-    'beige': (245 / 255, 245 / 255, 220 / 255, 1),
+import uuid
 
-    'bisque': (255 / 255, 228 / 255, 196 / 255, 1),
 
-    'black': (0 / 255, 0 / 255, 0 / 255, 1),
 
-    'blanchedalmond': (255 / 255, 235 / 255, 205 / 255, 1),
+import default_fixtures
 
-    'blue': (0 / 255, 0 / 255, 255 / 255, 1),
 
-    'blueviolet': (138 / 255, 43 / 255, 226 / 255, 1),
 
-    'brown': (165 / 255, 42 / 255, 42 / 255, 1),
+from keystone import config
 
-    'burlywood': (222 / 255, 184 / 255, 135 / 255, 1),
+from keystone import exception
 
-    'cadetblue': (95 / 255, 158 / 255, 160 / 255, 1),
+from keystone import identity
 
-    'chartreuse': (127 / 255, 255 / 255, 0 / 255, 1),
+from keystone import service
 
-    'chocolate': (210 / 255, 105 / 255, 30 / 255, 1),
+from keystone import test
 
-    'coral': (255 / 255, 127 / 255, 80 / 255, 1),
+from keystone.identity.backends import kvs as kvs_identity
 
-    'cornflowerblue': (100 / 255, 149 / 255, 237 / 255, 1),
+from keystone.openstack.common import timeutils
 
-    'cornsilk': (255 / 255, 248 / 255, 220 / 255, 1),
 
-    'crimson': (220 / 255, 20 / 255, 60 / 255, 1),
 
-    'cyan': (0 / 255, 255 / 255, 255 / 255, 1),
 
-    'darkblue': (0 / 255, 0 / 255, 139 / 255, 1),
 
-    'darkcyan': (0 / 255, 139 / 255, 139 / 255, 1),
+CONF = config.CONF
 
-    'darkgoldenrod': (184 / 255, 134 / 255, 11 / 255, 1),
 
-    'darkgray': (169 / 255, 169 / 255, 169 / 255, 1),
 
-    'darkgreen': (0 / 255, 100 / 255, 0 / 255, 1),
 
-    'darkgrey': (169 / 255, 169 / 255, 169 / 255, 1),
 
-    'darkkhaki': (189 / 255, 183 / 255, 107 / 255, 1),
+def _build_user_auth(token=None, username=None,
 
-    'darkmagenta': (139 / 255, 0 / 255, 139 / 255, 1),
+                     password=None, tenant_name=None):
 
-    'darkolivegreen': (85 / 255, 107 / 255, 47 / 255, 1),
+    """Build auth dictionary.
 
-    'darkorange': (255 / 255, 140 / 255, 0 / 255, 1),
 
-    'darkorchid': (153 / 255, 50 / 255, 204 / 255, 1),
 
-    'darkred': (139 / 255, 0 / 255, 0 / 255, 1),
+    It will create an auth dictionary based on all the arguments
 
-    'darksalmon': (233 / 255, 150 / 255, 122 / 255, 1),
-
-    'darkseagreen': (143 / 255, 188 / 255, 143 / 255, 1),
-
-    'darkslateblue': (72 / 255, 61 / 255, 139 / 255, 1),
-
-    'darkslategray': (47 / 255, 79 / 255, 79 / 255, 1),
-
-    'darkslategrey': (47 / 255, 79 / 255, 79 / 255, 1),
-
-    'darkturquoise': (0 / 255, 206 / 255, 209 / 255, 1),
-
-    'darkviolet': (148 / 255, 0 / 255, 211 / 255, 1),
-
-    'deeppink': (255 / 255, 20 / 255, 147 / 255, 1),
-
-    'deepskyblue': (0 / 255, 191 / 255, 255 / 255, 1),
-
-    'dimgray': (105 / 255, 105 / 255, 105 / 255, 1),
-
-    'dimgrey': (105 / 255, 105 / 255, 105 / 255, 1),
-
-    'dodgerblue': (30 / 255, 144 / 255, 255 / 255, 1),
-
-    'firebrick': (178 / 255, 34 / 255, 34 / 255, 1),
-
-    'floralwhite': (255 / 255, 250 / 255, 240 / 255, 1),
-
-    'forestgreen': (34 / 255, 139 / 255, 34 / 255, 1),
-
-    'fuchsia': (255 / 255, 0 / 255, 255 / 255, 1),
-
-    'gainsboro': (220 / 255, 220 / 255, 220 / 255, 1),
-
-    'ghostwhite': (248 / 255, 248 / 255, 255 / 255, 1),
-
-    'gold': (255 / 255, 215 / 255, 0 / 255, 1),
-
-    'goldenrod': (218 / 255, 165 / 255, 32 / 255, 1),
-
-    'gray': (128 / 255, 128 / 255, 128 / 255, 1),
-
-    'grey': (128 / 255, 128 / 255, 128 / 255, 1),
-
-    'green': (0 / 255, 128 / 255, 0 / 255, 1),
-
-    'greenyellow': (173 / 255, 255 / 255, 47 / 255, 1),
-
-    'honeydew': (240 / 255, 255 / 255, 240 / 255, 1),
-
-    'hotpink': (255 / 255, 105 / 255, 180 / 255, 1),
-
-    'indianred': (205 / 255, 92 / 255, 92 / 255, 1),
-
-    'indigo': (75 / 255, 0 / 255, 130 / 255, 1),
-
-    'ivory': (255 / 255, 255 / 255, 240 / 255, 1),
-
-    'khaki': (240 / 255, 230 / 255, 140 / 255, 1),
-
-    'lavender': (230 / 255, 230 / 255, 250 / 255, 1),
-
-    'lavenderblush': (255 / 255, 240 / 255, 245 / 255, 1),
-
-    'lawngreen': (124 / 255, 252 / 255, 0 / 255, 1),
-
-    'lemonchiffon': (255 / 255, 250 / 255, 205 / 255, 1),
-
-    'lightblue': (173 / 255, 216 / 255, 230 / 255, 1),
-
-    'lightcoral': (240 / 255, 128 / 255, 128 / 255, 1),
-
-    'lightcyan': (224 / 255, 255 / 255, 255 / 255, 1),
-
-    'lightgoldenrodyellow': (250 / 255, 250 / 255, 210 / 255, 1),
-
-    'lightgray': (211 / 255, 211 / 255, 211 / 255, 1),
-
-    'lightgreen': (144 / 255, 238 / 255, 144 / 255, 1),
-
-    'lightgrey': (211 / 255, 211 / 255, 211 / 255, 1),
-
-    'lightpink': (255 / 255, 182 / 255, 193 / 255, 1),
-
-    'lightsalmon': (255 / 255, 160 / 255, 122 / 255, 1),
-
-    'lightseagreen': (32 / 255, 178 / 255, 170 / 255, 1),
-
-    'lightskyblue': (135 / 255, 206 / 255, 250 / 255, 1),
-
-    'lightslategray': (119 / 255, 136 / 255, 153 / 255, 1),
-
-    'lightslategrey': (119 / 255, 136 / 255, 153 / 255, 1),
-
-    'lightsteelblue': (176 / 255, 196 / 255, 222 / 255, 1),
-
-    'lightyellow': (255 / 255, 255 / 255, 224 / 255, 1),
-
-    'lime': (0 / 255, 255 / 255, 0 / 255, 1),
-
-    'limegreen': (50 / 255, 205 / 255, 50 / 255, 1),
-
-    'linen': (250 / 255, 240 / 255, 230 / 255, 1),
-
-    'magenta': (255 / 255, 0 / 255, 255 / 255, 1),
-
-    'maroon': (128 / 255, 0 / 255, 0 / 255, 1),
-
-    'mediumaquamarine': (102 / 255, 205 / 255, 170 / 255, 1),
-
-    'mediumblue': (0 / 255, 0 / 255, 205 / 255, 1),
-
-    'mediumorchid': (186 / 255, 85 / 255, 211 / 255, 1),
-
-    'mediumpurple': (147 / 255, 112 / 255, 219 / 255, 1),
-
-    'mediumseagreen': (60 / 255, 179 / 255, 113 / 255, 1),
-
-    'mediumslateblue': (123 / 255, 104 / 255, 238 / 255, 1),
-
-    'mediumspringgreen': (0 / 255, 250 / 255, 154 / 255, 1),
-
-    'mediumturquoise': (72 / 255, 209 / 255, 204 / 255, 1),
-
-    'mediumvioletred': (199 / 255, 21 / 255, 133 / 255, 1),
-
-    'midnightblue': (25 / 255, 25 / 255, 112 / 255, 1),
-
-    'mintcream': (245 / 255, 255 / 255, 250 / 255, 1),
-
-    'mistyrose': (255 / 255, 228 / 255, 225 / 255, 1),
-
-    'moccasin': (255 / 255, 228 / 255, 181 / 255, 1),
-
-    'navajowhite': (255 / 255, 222 / 255, 173 / 255, 1),
-
-    'navy': (0 / 255, 0 / 255, 128 / 255, 1),
-
-    'oldlace': (253 / 255, 245 / 255, 230 / 255, 1),
-
-    'olive': (128 / 255, 128 / 255, 0 / 255, 1),
-
-    'olivedrab': (107 / 255, 142 / 255, 35 / 255, 1),
-
-    'orange': (255 / 255, 165 / 255, 0 / 255, 1),
-
-    'orangered': (255 / 255, 69 / 255, 0 / 255, 1),
-
-    'orchid': (218 / 255, 112 / 255, 214 / 255, 1),
-
-    'palegoldenrod': (238 / 255, 232 / 255, 170 / 255, 1),
-
-    'palegreen': (152 / 255, 251 / 255, 152 / 255, 1),
-
-    'paleturquoise': (175 / 255, 238 / 255, 238 / 255, 1),
-
-    'palevioletred': (219 / 255, 112 / 255, 147 / 255, 1),
-
-    'papayawhip': (255 / 255, 239 / 255, 213 / 255, 1),
-
-    'peachpuff': (255 / 255, 218 / 255, 185 / 255, 1),
-
-    'peru': (205 / 255, 133 / 255, 63 / 255, 1),
-
-    'pink': (255 / 255, 192 / 255, 203 / 255, 1),
-
-    'plum': (221 / 255, 160 / 255, 221 / 255, 1),
-
-    'powderblue': (176 / 255, 224 / 255, 230 / 255, 1),
-
-    'purple': (128 / 255, 0 / 255, 128 / 255, 1),
-
-    'red': (255 / 255, 0 / 255, 0 / 255, 1),
-
-    'rosybrown': (188 / 255, 143 / 255, 143 / 255, 1),
-
-    'royalblue': (65 / 255, 105 / 255, 225 / 255, 1),
-
-    'saddlebrown': (139 / 255, 69 / 255, 19 / 255, 1),
-
-    'salmon': (250 / 255, 128 / 255, 114 / 255, 1),
-
-    'sandybrown': (244 / 255, 164 / 255, 96 / 255, 1),
-
-    'seagreen': (46 / 255, 139 / 255, 87 / 255, 1),
-
-    'seashell': (255 / 255, 245 / 255, 238 / 255, 1),
-
-    'sienna': (160 / 255, 82 / 255, 45 / 255, 1),
-
-    'silver': (192 / 255, 192 / 255, 192 / 255, 1),
-
-    'skyblue': (135 / 255, 206 / 255, 235 / 255, 1),
-
-    'slateblue': (106 / 255, 90 / 255, 205 / 255, 1),
-
-    'slategray': (112 / 255, 128 / 255, 144 / 255, 1),
-
-    'slategrey': (112 / 255, 128 / 255, 144 / 255, 1),
-
-    'snow': (255 / 255, 250 / 255, 250 / 255, 1),
-
-    'springgreen': (0 / 255, 255 / 255, 127 / 255, 1),
-
-    'steelblue': (70 / 255, 130 / 255, 180 / 255, 1),
-
-    'tan': (210 / 255, 180 / 255, 140 / 255, 1),
-
-    'teal': (0 / 255, 128 / 255, 128 / 255, 1),
-
-    'thistle': (216 / 255, 191 / 255, 216 / 255, 1),
-
-    'tomato': (255 / 255, 99 / 255, 71 / 255, 1),
-
-    'turquoise': (64 / 255, 224 / 255, 208 / 255, 1),
-
-    'violet': (238 / 255, 130 / 255, 238 / 255, 1),
-
-    'wheat': (245 / 255, 222 / 255, 179 / 255, 1),
-
-    'white': (255 / 255, 255 / 255, 255 / 255, 1),
-
-    'whitesmoke': (245 / 255, 245 / 255, 245 / 255, 1),
-
-    'yellow': (255 / 255, 255 / 255, 0 / 255, 1),
-
-    'yellowgreen': (154 / 255, 205 / 255, 50 / 255, 1),
-
-
-
-    'activeborder': (0, 0, 1, 1),
-
-    'activecaption': (0, 0, 1, 1),
-
-    'appworkspace': (1, 1, 1, 1),
-
-    'background': (1, 1, 1, 1),
-
-    'buttonface': (0, 0, 0, 1),
-
-    'buttonhighlight': (0.8, 0.8, 0.8, 1),
-
-    'buttonshadow': (0.2, 0.2, 0.2, 1),
-
-    'buttontext': (0, 0, 0, 1),
-
-    'captiontext': (0, 0, 0, 1),
-
-    'graytext': (0.2, 0.2, 0.2, 1),
-
-    'highlight': (0, 0, 1, 1),
-
-    'highlighttext': (0.8, 0.8, 0.8, 1),
-
-    'inactiveborder': (0.2, 0.2, 0.2, 1),
-
-    'inactivecaption': (0.8, 0.8, 0.8, 1),
-
-    'inactivecaptiontext': (0.2, 0.2, 0.2, 1),
-
-    'infobackground': (0.8, 0.8, 0.8, 1),
-
-    'infotext': (0, 0, 0, 1),
-
-    'menu': (0.8, 0.8, 0.8, 1),
-
-    'menutext': (0.2, 0.2, 0.2, 1),
-
-    'scrollbar': (0.8, 0.8, 0.8, 1),
-
-    'threeddarkshadow': (0.2, 0.2, 0.2, 1),
-
-    'threedface': (0.8, 0.8, 0.8, 1),
-
-    'threedhighlight': (1, 1, 1, 1),
-
-    'threedlightshadow': (0.2, 0.2, 0.2, 1),
-
-    'threedshadow': (0.2, 0.2, 0.2, 1),
-
-    'window': (0.8, 0.8, 0.8, 1),
-
-    'windowframe': (0.8, 0.8, 0.8, 1),
-
-    'windowtext': (0, 0, 0, 1),
-
-
-
-    'none': (0, 0, 0, 0),
-
-    'transparent': (0, 0, 0, 0),
-
-}
-
-
-
-RGBA = re.compile(r'rgba\((.+?)\)')
-
-RGB = re.compile(r'rgb\((.+?)\)')
-
-HEX_RRGGBB = re.compile('#[0-9a-f]{6}')
-
-HEX_RGB = re.compile('#[0-9a-f]{3}')
-
-
-
-
-
-def color(string, opacity=1):
-
-    """Replace ``string`` representing a color by a RGBA tuple.
-
-
-
-    See http://www.w3.org/TR/SVG/types.html#DataTypeColor
-
-
+    that it receives.
 
     """
 
-    if not string:
+    auth_json = {}
 
-        return (0, 0, 0, 0)
+    if token is not None:
 
+        auth_json['token'] = token
 
+    if username or password:
 
-    string = string.strip().lower()
+        auth_json['passwordCredentials'] = {}
 
+    if username is not None:
 
+        auth_json['passwordCredentials']['username'] = username
 
-    if string in COLORS:
+    if password is not None:
 
-        r, g, b, a = COLORS[string]
+        auth_json['passwordCredentials']['password'] = password
 
-        return (r, g, b, a * opacity)
+    if tenant_name is not None:
 
+        auth_json['tenantName'] = tenant_name
 
-
-    match = RGBA.search(string)
-
-    if match:
-
-        r, g, b, a = tuple(
-
-            float(i.strip(' %')) / 100 if '%' in i else float(i) / 255
-
-            for i in match.group(1).strip().split(','))
-
-        return (r, g, b, a * 255 * opacity)
-
-
-
-    match = RGB.search(string)
-
-    if match:
-
-        r, g, b = tuple(
-
-            float(i.strip(' %')) / 100 if '%' in i else float(i) / 255
-
-            for i in match.group(1).strip().split(','))
-
-        return (r, g, b, opacity)
-
-
-
-    match = HEX_RRGGBB.search(string)
-
-    if match:
-
-        plain_color = tuple(
-
-            int(value, 16) / 255 for value in (
-
-                string[1:3], string[3:5], string[5:7]))
-
-        return plain_color + (opacity,)
-
-
-
-    match = HEX_RGB.search(string)
-
-    if match:
-
-        plain_color = tuple(
-
-            int(value, 16) / 15 for value in (
-
-                string[1], string[2], string[3]))
-
-        return plain_color + (opacity,)
-
-
-
-    return (0, 0, 0, 1)
+    return auth_json
 
 
 
 
 
-def negate_color(rgba_tuple):
+class TokenControllerTest(test.TestCase):
 
-    """Replace ``rgba_tuple`` with its complementary color."""
+    def setUp(self):
 
-    r, g, b, a = rgba_tuple
+        super(TokenControllerTest, self).setUp()
 
-    return (1 - r, 1 - g, 1 - b, a)
+        self.identity_api = kvs_identity.Identity()
+
+        self.load_fixtures(default_fixtures)
+
+        self.api = service.TokenController()
+
+
+
+    def assertEqualTokens(self, a, b):
+
+        """Assert that two tokens are equal.
+
+
+
+        Compare two tokens except for their ids. This also truncates
+
+        the time in the comparison.
+
+        """
+
+        def normalize(token):
+
+            token['access']['token']['id'] = 'dummy'
+
+            del token['access']['token']['expires']
+
+            del token['access']['token']['issued_at']
+
+            return token
+
+
+
+        self.assertCloseEnoughForGovernmentWork(
+
+            timeutils.parse_isotime(a['access']['token']['expires']),
+
+            timeutils.parse_isotime(b['access']['token']['expires']))
+
+        self.assertCloseEnoughForGovernmentWork(
+
+            timeutils.parse_isotime(a['access']['token']['issued_at']),
+
+            timeutils.parse_isotime(b['access']['token']['issued_at']))
+
+        return self.assertDictEqual(normalize(a), normalize(b))
+
+
+
+
+
+class AuthBadRequests(TokenControllerTest):
+
+    def setUp(self):
+
+        super(AuthBadRequests, self).setUp()
+
+
+
+    def test_no_external_auth(self):
+
+        """Verify that _authenticate_external() raises exception if
+
+        not applicable"""
+
+        self.assertRaises(
+
+            service.ExternalAuthNotApplicable,
+
+            self.api._authenticate_external,
+
+            {}, {})
+
+
+
+    def test_no_token_in_auth(self):
+
+        """Verity that _authenticate_token() raises exception if no token"""
+
+        self.assertRaises(
+
+            exception.ValidationError,
+
+            self.api._authenticate_token,
+
+            None, {})
+
+
+
+    def test_no_credentials_in_auth(self):
+
+        """Verity that _authenticate_local() raises exception if no creds"""
+
+        self.assertRaises(
+
+            exception.ValidationError,
+
+            self.api._authenticate_local,
+
+            None, {})
+
+
+
+    def test_authenticate_blank_request_body(self):
+
+        """Verify sending empty json dict raises the right exception."""
+
+        self.assertRaises(exception.ValidationError, self.api.authenticate,
+
+                          {}, {})
+
+
+
+    def test_authenticate_blank_auth(self):
+
+        """Verify sending blank 'auth' raises the right exception."""
+
+        body_dict = _build_user_auth()
+
+        self.assertRaises(exception.ValidationError, self.api.authenticate,
+
+                          {}, body_dict)
+
+
+
+    def test_authenticate_invalid_auth_content(self):
+
+        """Verify sending invalid 'auth' raises the right exception."""
+
+        self.assertRaises(exception.ValidationError, self.api.authenticate,
+
+                          {}, {'auth': 'abcd'})
+
+
+
+
+
+class AuthWithToken(TokenControllerTest):
+
+    def setUp(self):
+
+        super(AuthWithToken, self).setUp()
+
+
+
+    def test_unscoped_token(self):
+
+        """Verify getting an unscoped token with password creds"""
+
+        body_dict = _build_user_auth(username='FOO',
+
+                                     password='foo2')
+
+        unscoped_token = self.api.authenticate({}, body_dict)
+
+        tenant = unscoped_token["access"]["token"].get("tenant", None)
+
+        self.assertEqual(tenant, None)
+
+
+
+    def test_auth_invalid_token(self):
+
+        """Verify exception is raised if invalid token"""
+
+        body_dict = _build_user_auth(token={"id": uuid.uuid4().hex})
+
+        self.assertRaises(
+
+            exception.Unauthorized,
+
+            self.api.authenticate,
+
+            {}, body_dict)
+
+
+
+    def test_auth_bad_formatted_token(self):
+
+        """Verify exception is raised if invalid token"""
+
+        body_dict = _build_user_auth(token={})
+
+        self.assertRaises(
+
+            exception.ValidationError,
+
+            self.api.authenticate,
+
+            {}, body_dict)
+
+
+
+    def test_auth_unscoped_token_no_tenant(self):
+
+        """Verify getting an unscoped token with an unscoped token"""
+
+        body_dict = _build_user_auth(
+
+            username='FOO',
+
+            password='foo2')
+
+        unscoped_token = self.api.authenticate({}, body_dict)
+
+
+
+        body_dict = _build_user_auth(
+
+            token=unscoped_token["access"]["token"])
+
+        unscoped_token_2 = self.api.authenticate({}, body_dict)
+
+
+
+        self.assertEqualTokens(unscoped_token, unscoped_token_2)
+
+
+
+    def test_auth_unscoped_token_tenant(self):
+
+        """Verify getting a token in a tenant with an unscoped token"""
+
+        # Get an unscoped tenant
+
+        body_dict = _build_user_auth(
+
+            username='FOO',
+
+            password='foo2')
+
+        unscoped_token = self.api.authenticate({}, body_dict)
+
+        # Get a token on BAR tenant using the unscoped tenant
+
+        body_dict = _build_user_auth(
+
+            token=unscoped_token["access"]["token"],
+
+            tenant_name="BAR")
+
+        scoped_token = self.api.authenticate({}, body_dict)
+
+
+
+        tenant = scoped_token["access"]["token"]["tenant"]
+
+        self.assertEquals(tenant["id"], self.tenant_bar['id'])
+
+
+
+
+
+class AuthWithPasswordCredentials(TokenControllerTest):
+
+    def setUp(self):
+
+        super(AuthWithPasswordCredentials, self).setUp()
+
+
+
+    def test_auth_invalid_user(self):
+
+        """Verify exception is raised if invalid user"""
+
+        body_dict = _build_user_auth(
+
+            username=uuid.uuid4().hex,
+
+            password=uuid.uuid4().hex)
+
+        self.assertRaises(
+
+            exception.Unauthorized,
+
+            self.api.authenticate,
+
+            {}, body_dict)
+
+
+
+    def test_auth_valid_user_invalid_password(self):
+
+        """Verify exception is raised if invalid password"""
+
+        body_dict = _build_user_auth(
+
+            username="FOO",
+
+            password=uuid.uuid4().hex)
+
+        self.assertRaises(
+
+            exception.Unauthorized,
+
+            self.api.authenticate,
+
+            {}, body_dict)
+
+
+
+    def test_auth_empty_password(self):
+
+        """Verify exception is raised if empty password"""
+
+        body_dict = _build_user_auth(
+
+            username="FOO",
+
+            password="")
+
+        self.assertRaises(
+
+            exception.Unauthorized,
+
+            self.api.authenticate,
+
+            {}, body_dict)
+
+
+
+    def test_auth_no_password(self):
+
+        """Verify exception is raised if empty password"""
+
+        body_dict = _build_user_auth(username="FOO")
+
+        self.assertRaises(
+
+            exception.ValidationError,
+
+            self.api.authenticate,
+
+            {}, body_dict)
+
+
+
+    def test_authenticate_blank_password_credentials(self):
+
+        """Verify sending empty json dict as passwordCredentials raises the
+
+        right exception."""
+
+        body_dict = {'passwordCredentials': {}, 'tenantName': 'demo'}
+
+        self.assertRaises(exception.ValidationError, self.api.authenticate,
+
+                          {}, body_dict)
+
+
+
+    def test_authenticate_no_username(self):
+
+        """Verify skipping username raises the right exception."""
+
+        body_dict = _build_user_auth(password="pass",
+
+                                     tenant_name="demo")
+
+        self.assertRaises(exception.ValidationError, self.api.authenticate,
+
+                          {}, body_dict)
+
+
+
+
+
+class AuthWithRemoteUser(TokenControllerTest):
+
+    def setUp(self):
+
+        super(AuthWithRemoteUser, self).setUp()
+
+
+
+    def test_unscoped_remote_authn(self):
+
+        """Verify getting an unscoped token with external authn"""
+
+        body_dict = _build_user_auth(
+
+            username='FOO',
+
+            password='foo2')
+
+        local_token = self.api.authenticate(
+
+            {}, body_dict)
+
+
+
+        body_dict = _build_user_auth()
+
+        remote_token = self.api.authenticate(
+
+            {'REMOTE_USER': 'FOO'}, body_dict)
+
+
+
+        self.assertEqualTokens(local_token, remote_token)
+
+
+
+    def test_unscoped_remote_authn_jsonless(self):
+
+        """Verify that external auth with invalid request fails"""
+
+        self.assertRaises(
+
+            exception.ValidationError,
+
+            self.api.authenticate,
+
+            {'REMOTE_USER': 'FOO'},
+
+            None)
+
+
+
+    def test_scoped_remote_authn(self):
+
+        """Verify getting a token with external authn"""
+
+        body_dict = _build_user_auth(
+
+            username='FOO',
+
+            password='foo2',
+
+            tenant_name='BAR')
+
+        local_token = self.api.authenticate(
+
+            {}, body_dict)
+
+
+
+        body_dict = _build_user_auth(
+
+            tenant_name='BAR')
+
+        remote_token = self.api.authenticate(
+
+            {'REMOTE_USER': 'FOO'}, body_dict)
+
+
+
+        self.assertEqualTokens(local_token, remote_token)
+
+
+
+    def test_scoped_nometa_remote_authn(self):
+
+        """Verify getting a token with external authn and no metadata"""
+
+        body_dict = _build_user_auth(
+
+            username='TWO',
+
+            password='two2',
+
+            tenant_name='BAZ')
+
+        local_token = self.api.authenticate(
+
+            {}, body_dict)
+
+
+
+        body_dict = _build_user_auth(tenant_name='BAZ')
+
+        remote_token = self.api.authenticate(
+
+            {'REMOTE_USER': 'TWO'}, body_dict)
+
+
+
+        self.assertEqualTokens(local_token, remote_token)
+
+
+
+    def test_scoped_remote_authn_invalid_user(self):
+
+        """Verify that external auth with invalid user fails"""
+
+        body_dict = _build_user_auth(tenant_name="BAR")
+
+        self.assertRaises(
+
+            exception.Unauthorized,
+
+            self.api.authenticate,
+
+            {'REMOTE_USER': uuid.uuid4().hex},
+
+            body_dict)
+
+
+
+
+
+class TokenExpirationTest(test.TestCase):
+
+    def setUp(self):
+
+        super(TokenExpirationTest, self).setUp()
+
+        self.identity_api = kvs_identity.Identity()
+
+        self.load_fixtures(default_fixtures)
+
+        self.api = service.TokenController()
+
+
+
+    def _maintain_token_expiration(self):
+
+        """Token expiration should be maintained after re-auth & validation."""
+
+        r = self.api.authenticate(
+
+            {},
+
+            auth={
+
+                'passwordCredentials': {
+
+                    'username': self.user_foo['name'],
+
+                    'password': self.user_foo['password']
+
+                }
+
+            })
+
+        unscoped_token_id = r['access']['token']['id']
+
+        original_expiration = r['access']['token']['expires']
+
+
+
+        time.sleep(0.5)
+
+
+
+        r = self.api.validate_token(
+
+            dict(is_admin=True, query_string={}),
+
+            token_id=unscoped_token_id)
+
+        self.assertEqual(original_expiration, r['access']['token']['expires'])
+
+
+
+        time.sleep(0.5)
+
+
+
+        r = self.api.authenticate(
+
+            {},
+
+            auth={
+
+                'token': {
+
+                    'id': unscoped_token_id,
+
+                },
+
+                'tenantId': self.tenant_bar['id'],
+
+            })
+
+        scoped_token_id = r['access']['token']['id']
+
+        self.assertEqual(original_expiration, r['access']['token']['expires'])
+
+
+
+        time.sleep(0.5)
+
+
+
+        r = self.api.validate_token(
+
+            dict(is_admin=True, query_string={}),
+
+            token_id=scoped_token_id)
+
+        self.assertEqual(original_expiration, r['access']['token']['expires'])
+
+
+
+    def test_maintain_uuid_token_expiration(self):
+
+        self.opt_in_group('signing', token_format='UUID')
+
+        self._maintain_token_expiration()

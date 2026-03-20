@@ -2,1100 +2,462 @@
 # Safety: safe
 # Category: safe
 
-# Copyright (C) 2002-2007 Python Software Foundation
+import unittest
 
-# Contact: email-sig@python.org
+import os
 
+from getpass import getuser
 
 
-"""Email address parsing code.
 
+# import lshell specifics
 
+from lshell.shellcmd import ShellCmd
 
-Lifted directly from rfc822.py.  This should eventually be rewritten.
+from lshell.checkconfig import CheckConfig
 
-"""
+from lshell.utils import get_aliases, updateprompt
 
+from lshell.variables import builtins_list
 
+from lshell import builtins
 
-__all__ = [
+from lshell import sec
 
-    'mktime_tz',
 
-    'parsedate',
 
-    'parsedate_tz',
+TOPDIR = '%s/../' % os.path.dirname(os.path.realpath(__file__))
 
-    'quote',
 
-    ]
 
 
 
-import time, calendar
+class TestFunctions(unittest.TestCase):
 
+    args = ['--config=%s/etc/lshell.conf' % TOPDIR, "--quiet=1"]
 
+    userconf = CheckConfig(args).returnconf()
 
-SPACE = ' '
+    shell = ShellCmd(userconf, args)
 
-EMPTYSTRING = ''
 
-COMMASPACE = ', '
 
+    def test_03_checksecure_doublepipe(self):
 
+        """ U03 | double pipes should be allowed, even if pipe is forbidden """
 
-# Parse a date field
+        args = self.args + ["--forbidden=['|']"]
 
-_monthnames = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul',
+        userconf = CheckConfig(args).returnconf()
 
-               'aug', 'sep', 'oct', 'nov', 'dec',
+        INPUT = "ls || ls"
 
-               'january', 'february', 'march', 'april', 'may', 'june', 'july',
+        return self.assertEqual(sec.check_secure(INPUT, userconf)[0], 0)
 
-               'august', 'september', 'october', 'november', 'december']
 
 
+    def test_04_checksecure_forbiddenpipe(self):
 
-_daynames = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']
+        """ U04 | forbid pipe, should return 1 """
 
+        args = self.args + ["--forbidden=['|']"]
 
+        userconf = CheckConfig(args).returnconf()
 
-# The timezone table does not include the military time zones defined
+        INPUT = "ls | ls"
 
-# in RFC822, other than Z.  According to RFC1123, the description in
+        return self.assertEqual(sec.check_secure(INPUT, userconf)[0], 1)
 
-# RFC822 gets the signs wrong, so we can't rely on any such time
 
-# zones.  RFC1123 recommends that numeric timezone indicators be used
 
-# instead of timezone names.
+    def test_05_checksecure_forbiddenchar(self):
 
+        """ U05 | forbid character, should return 1 """
 
+        args = self.args + ["--forbidden=['l']"]
 
-_timezones = {'UT':0, 'UTC':0, 'GMT':0, 'Z':0,
+        userconf = CheckConfig(args).returnconf()
 
-              'AST': -400, 'ADT': -300,  # Atlantic (used in Canada)
+        INPUT = "ls"
 
-              'EST': -500, 'EDT': -400,  # Eastern
+        return self.assertEqual(sec.check_secure(INPUT, userconf)[0], 1)
 
-              'CST': -600, 'CDT': -500,  # Central
 
-              'MST': -700, 'MDT': -600,  # Mountain
 
-              'PST': -800, 'PDT': -700   # Pacific
+    def test_06_checksecure_sudo_command(self):
 
-              }
+        """ U06 | quoted text should not be forbidden """
 
+        INPUT = "sudo ls"
 
+        return self.assertEqual(sec.check_secure(INPUT, self.userconf)[0], 1)
 
 
 
-def parsedate_tz(data):
+    def test_07_checksecure_notallowed_command(self):
 
-    """Convert a date string to a time tuple.
+        """ U07 | forbidden command, should return 1 """
 
+        args = self.args + ["--allowed=['ls']"]
 
+        userconf = CheckConfig(args).returnconf()
 
-    Accounts for military timezones.
+        INPUT = "ll"
 
-    """
+        return self.assertEqual(sec.check_secure(INPUT, userconf)[0], 1)
 
-    res = _parsedate_tz(data)
 
-    if not res:
 
-        return
+    def test_08_checkpath_notallowed_path(self):
 
-    if res[9] is None:
+        """ U08 | forbidden command, should return 1 """
 
-        res[9] = 0
+        args = self.args + ["--path=['/home', '/var']"]
 
-    return tuple(res)
+        userconf = CheckConfig(args).returnconf()
 
+        INPUT = "cd /tmp"
 
+        return self.assertEqual(sec.check_path(INPUT, userconf)[0], 1)
 
-def _parsedate_tz(data):
 
-    """Convert date to extended time tuple.
 
+    def test_09_checkpath_notallowed_path_completion(self):
 
+        """ U09 | forbidden command, should return 1 """
 
-    The last (additional) element is the time zone offset in seconds, except if
+        args = self.args + ["--path=['/home', '/var']"]
 
-    the timezone was specified as -0000.  In that case the last element is
+        userconf = CheckConfig(args).returnconf()
 
-    None.  This indicates a UTC timestamp that explicitly declaims knowledge of
+        INPUT = "cd /tmp/"
 
-    the source timezone, as opposed to a +0000 timestamp that indicates the
+        return self.assertEqual(sec.check_path(INPUT,
 
-    source timezone really was UTC.
+                                               userconf,
 
+                                               completion=1)[0], 1)
 
 
-    """
 
-    if not data:
+    def test_10_checkpath_dollarparenthesis(self):
 
-        return
+        """ U10 | when $() is allowed, return 0 if path allowed """
 
-    data = data.split()
+        args = self.args + ["--forbidden=[';', '&', '|','`','>','<', '${']"]
 
-    # The FWS after the comma after the day-of-week is optional, so search and
+        userconf = CheckConfig(args).returnconf()
 
-    # adjust for this.
+        INPUT = "echo $(echo aze)"
 
-    if data[0].endswith(',') or data[0].lower() in _daynames:
+        return self.assertEqual(sec.check_path(INPUT, userconf)[0], 0)
 
-        # There's a dayname here. Skip it
 
-        del data[0]
 
-    else:
+    def test_11_checkconfig_configoverwrite(self):
 
-        i = data[0].rfind(',')
+        """ U12 | forbid ';', then check_secure should return 1 """
 
-        if i >= 0:
+        args = ['--config=%s/etc/lshell.conf' % TOPDIR, '--strict=123']
 
-            data[0] = data[0][i+1:]
+        userconf = CheckConfig(args).returnconf()
 
-    if len(data) == 3: # RFC 850 date, deprecated
+        return self.assertEqual(userconf['strict'], 123)
 
-        stuff = data[0].split('-')
 
-        if len(stuff) == 3:
 
-            data = stuff + data[1:]
+    def test_12_overssh(self):
 
-    if len(data) == 4:
+        """ U12 | command over ssh """
 
-        s = data[3]
+        args = self.args + ["--overssh=['exit']", '-c exit']
 
-        i = s.find('+')
+        os.environ['SSH_CLIENT'] = '8.8.8.8 36000 22'
 
-        if i == -1:
+        if 'SSH_TTY' in os.environ:
 
-            i = s.find('-')
+            os.environ.pop('SSH_TTY')
 
-        if i > 0:
+        with self.assertRaises(SystemExit) as cm:
 
-            data[3:] = [s[:i], s[i:]]
+            CheckConfig(args).returnconf()
 
-        else:
+        return self.assertEqual(cm.exception.code, 0)
 
-            data.append('') # Dummy tz
 
-    if len(data) < 5:
 
-        return None
+    def test_13_multiple_aliases_with_separator(self):
 
-    data = data[:5]
+        """ U13 | multiple aliases using &&, || and ; separators """
 
-    [dd, mm, yy, tm, tz] = data
+        # enable &, | and ; characters
 
-    mm = mm.lower()
+        aliases = {'foo': 'foo -l', 'bar': 'open'}
 
-    if mm not in _monthnames:
+        INPUT = "foo; fooo  ;bar&&foo  &&   foo | bar||bar   ||     foo"
 
-        dd, mm = mm, dd.lower()
+        return self.assertEqual(get_aliases(INPUT, aliases),
 
-        if mm not in _monthnames:
+                                ' foo -l; fooo  ; open&& foo -l  '
 
-            return None
+                                '&& foo -l | open|| open   || foo -l')
 
-    mm = _monthnames.index(mm) + 1
 
-    if mm > 12:
 
-        mm -= 12
+    def test_14_sudo_all_commands_expansion(self):
 
-    if dd[-1] == ',':
+        """ U14 | sudo_commands set to 'all' is equal to allowed variable """
 
-        dd = dd[:-1]
+        args = self.args + ["--sudo_commands=all"]
 
-    i = yy.find(':')
+        userconf = CheckConfig(args).returnconf()
 
-    if i > 0:
+        # exclude internal and sudo(8) commands
 
-        yy, tm = tm, yy
+        exclude = builtins_list + ['sudo']
 
-    if yy[-1] == ',':
+        allowed = [x for x in userconf['allowed'] if x not in exclude]
 
-        yy = yy[:-1]
+        # sort lists to compare
 
-    if not yy[0].isdigit():
+        userconf['sudo_commands'].sort()
 
-        yy, tz = tz, yy
+        allowed.sort()
 
-    if tm[-1] == ',':
+        return self.assertEqual(allowed, userconf['sudo_commands'])
 
-        tm = tm[:-1]
 
-    tm = tm.split(':')
 
-    if len(tm) == 2:
+    def test_15_allowed_ld_preload_cmd(self):
 
-        [thh, tmm] = tm
+        """ U15 | all allowed commands should be prepended with LD_PRELOAD """
 
-        tss = '0'
+        args = self.args + ["--allowed=['echo','export']"]
 
-    elif len(tm) == 3:
+        userconf = CheckConfig(args).returnconf()
 
-        [thh, tmm, tss] = tm
+        # sort lists to compare
 
-    elif len(tm) == 1 and '.' in tm[0]:
+        return self.assertEqual(userconf['aliases']['echo'],
 
-        # Some non-compliant MUAs use '.' to separate time elements.
+                                'LD_PRELOAD=%s echo' % userconf['path_noexec'])
 
-        tm = tm[0].split('.')
 
-        if len(tm) == 2:
 
-            [thh, tmm] = tm
+    def test_16_allowed_ld_preload_builtin(self):
 
-            tss = 0
+        """ U16 | builtin commands should NOT be prepended with LD_PRELOAD """
 
-        elif len(tm) == 3:
+        args = self.args + ["--allowed=['echo','export']"]
 
-            [thh, tmm, tss] = tm
+        userconf = CheckConfig(args).returnconf()
 
-    else:
+        # verify that export is not automatically added to the aliases (i.e.
 
-        return None
+        # prepended with LD_PRELOAD)
 
-    try:
+        return self.assertNotIn('export', userconf['aliases'])
 
-        yy = int(yy)
 
-        dd = int(dd)
 
-        thh = int(thh)
+    def test_17_allowed_exec_cmd(self):
 
-        tmm = int(tmm)
+        """ U17 | allowed_shell_escape should NOT be prepended with LD_PRELOAD
 
-        tss = int(tss)
-
-    except ValueError:
-
-        return None
-
-    # Check for a yy specified in two-digit format, then convert it to the
-
-    # appropriate four-digit format, according to the POSIX standard. RFC 822
-
-    # calls for a two-digit yy, but RFC 2822 (which obsoletes RFC 822)
-
-    # mandates a 4-digit yy. For more information, see the documentation for
-
-    # the time module.
-
-    if yy < 100:
-
-        # The year is between 1969 and 1999 (inclusive).
-
-        if yy > 68:
-
-            yy += 1900
-
-        # The year is between 2000 and 2068 (inclusive).
-
-        else:
-
-            yy += 2000
-
-    tzoffset = None
-
-    tz = tz.upper()
-
-    if tz in _timezones:
-
-        tzoffset = _timezones[tz]
-
-    else:
-
-        try:
-
-            tzoffset = int(tz)
-
-        except ValueError:
-
-            pass
-
-        if tzoffset==0 and tz.startswith('-'):
-
-            tzoffset = None
-
-    # Convert a timezone offset into seconds ; -0500 -> -18000
-
-    if tzoffset:
-
-        if tzoffset < 0:
-
-            tzsign = -1
-
-            tzoffset = -tzoffset
-
-        else:
-
-            tzsign = 1
-
-        tzoffset = tzsign * ( (tzoffset//100)*3600 + (tzoffset % 100)*60)
-
-    # Daylight Saving Time flag is set to -1, since DST is unknown.
-
-    return [yy, mm, dd, thh, tmm, tss, 0, 1, -1, tzoffset]
-
-
-
-
-
-def parsedate(data):
-
-    """Convert a time string to a time tuple."""
-
-    t = parsedate_tz(data)
-
-    if isinstance(t, tuple):
-
-        return t[:9]
-
-    else:
-
-        return t
-
-
-
-
-
-def mktime_tz(data):
-
-    """Turn a 10-tuple as returned by parsedate_tz() into a POSIX timestamp."""
-
-    if data[9] is None:
-
-        # No zone info, so localtime is better assumption than GMT
-
-        return time.mktime(data[:8] + (-1,))
-
-    else:
-
-        t = calendar.timegm(data)
-
-        return t - data[9]
-
-
-
-
-
-def quote(str):
-
-    """Prepare string to be used in a quoted string.
-
-
-
-    Turns backslash and double quote characters into quoted pairs.  These
-
-    are the only characters that need to be quoted inside a quoted string.
-
-    Does not add the surrounding double quotes.
-
-    """
-
-    return str.replace('\\', '\\\\').replace('"', '\\"')
-
-
-
-
-
-class AddrlistClass:
-
-    """Address parser class by Ben Escoto.
-
-
-
-    To understand what this class does, it helps to have a copy of RFC 2822 in
-
-    front of you.
-
-
-
-    Note: this class interface is deprecated and may be removed in the future.
-
-    Use email.utils.AddressList instead.
-
-    """
-
-
-
-    def __init__(self, field):
-
-        """Initialize a new instance.
-
-
-
-        `field' is an unparsed address header field, containing
-
-        one or more addresses.
+            The command should not be added to the aliases variable
 
         """
 
-        self.specials = '()<>@,:;.\"[]'
+        args = self.args + ["--allowed_shell_escape=['echo']"]
 
-        self.pos = 0
+        userconf = CheckConfig(args).returnconf()
 
-        self.LWS = ' \t'
+        # sort lists to compare
 
-        self.CR = '\r\n'
-
-        self.FWS = self.LWS + self.CR
-
-        self.atomends = self.specials + self.LWS + self.CR
-
-        # Note that RFC 2822 now specifies `.' as obs-phrase, meaning that it
-
-        # is obsolete syntax.  RFC 2822 requires that we recognize obsolete
-
-        # syntax, so allow dots in phrases.
-
-        self.phraseends = self.atomends.replace('.', '')
-
-        self.field = field
-
-        self.commentlist = []
+        return self.assertNotIn('echo', userconf['aliases'])
 
 
 
-    def gotonext(self):
+    def test_18_forbidden_environment(self):
 
-        """Skip white space and extract comments."""
-
-        wslist = []
-
-        while self.pos < len(self.field):
-
-            if self.field[self.pos] in self.LWS + '\n\r':
-
-                if self.field[self.pos] not in '\n\r':
-
-                    wslist.append(self.field[self.pos])
-
-                self.pos += 1
-
-            elif self.field[self.pos] == '(':
-
-                self.commentlist.append(self.getcomment())
-
-            else:
-
-                break
-
-        return EMPTYSTRING.join(wslist)
-
-
-
-    def getaddrlist(self):
-
-        """Parse all addresses.
-
-
-
-        Returns a list containing all of the addresses.
+        """ U18 | unsafe environment are forbidden
 
         """
 
-        result = []
+        INPUT = 'export LD_PRELOAD=/lib64/ld-2.21.so'
 
-        while self.pos < len(self.field):
+        args = INPUT
 
-            ad = self.getaddress()
+        retcode = builtins.export(args)[0]
 
-            if ad:
+        return self.assertEqual(retcode, 1)
 
-                result += ad
 
-            else:
 
-                result.append(('', ''))
+    def test_19_allowed_environment(self):
 
-        return result
-
-
-
-    def getaddress(self):
-
-        """Parse the next address."""
-
-        self.commentlist = []
-
-        self.gotonext()
-
-
-
-        oldpos = self.pos
-
-        oldcl = self.commentlist
-
-        plist = self.getphraselist()
-
-
-
-        self.gotonext()
-
-        returnlist = []
-
-
-
-        if self.pos >= len(self.field):
-
-            # Bad email address technically, no domain.
-
-            if plist:
-
-                returnlist = [(SPACE.join(self.commentlist), plist[0])]
-
-
-
-        elif self.field[self.pos] in '.@':
-
-            # email address is just an addrspec
-
-            # this isn't very efficient since we start over
-
-            self.pos = oldpos
-
-            self.commentlist = oldcl
-
-            addrspec = self.getaddrspec()
-
-            returnlist = [(SPACE.join(self.commentlist), addrspec)]
-
-
-
-        elif self.field[self.pos] == ':':
-
-            # address is a group
-
-            returnlist = []
-
-
-
-            fieldlen = len(self.field)
-
-            self.pos += 1
-
-            while self.pos < len(self.field):
-
-                self.gotonext()
-
-                if self.pos < fieldlen and self.field[self.pos] == ';':
-
-                    self.pos += 1
-
-                    break
-
-                returnlist = returnlist + self.getaddress()
-
-
-
-        elif self.field[self.pos] == '<':
-
-            # Address is a phrase then a route addr
-
-            routeaddr = self.getrouteaddr()
-
-
-
-            if self.commentlist:
-
-                returnlist = [(SPACE.join(plist) + ' (' +
-
-                               ' '.join(self.commentlist) + ')', routeaddr)]
-
-            else:
-
-                returnlist = [(SPACE.join(plist), routeaddr)]
-
-
-
-        else:
-
-            if plist:
-
-                returnlist = [(SPACE.join(self.commentlist), plist[0])]
-
-            elif self.field[self.pos] in self.specials:
-
-                self.pos += 1
-
-
-
-        self.gotonext()
-
-        if self.pos < len(self.field) and self.field[self.pos] == ',':
-
-            self.pos += 1
-
-        return returnlist
-
-
-
-    def getrouteaddr(self):
-
-        """Parse a route address (Return-path value).
-
-
-
-        This method just skips all the route stuff and returns the addrspec.
+        """ U19 | other environment are accepted
 
         """
 
-        if self.field[self.pos] != '<':
+        INPUT = 'export MY_PROJECT_VERSION=43'
 
-            return
+        args = INPUT
 
+        retcode = builtins.export(args)[0]
 
+        return self.assertEqual(retcode, 0)
 
-        expectroute = False
 
-        self.pos += 1
 
-        self.gotonext()
+    def test_20_winscp_allowed_commands(self):
 
-        adlist = ''
+        """ U20 | when winscp is enabled, new allowed commands are automatically
 
-        while self.pos < len(self.field):
-
-            if expectroute:
-
-                self.getdomain()
-
-                expectroute = False
-
-            elif self.field[self.pos] == '>':
-
-                self.pos += 1
-
-                break
-
-            elif self.field[self.pos] == '@':
-
-                self.pos += 1
-
-                expectroute = True
-
-            elif self.field[self.pos] == ':':
-
-                self.pos += 1
-
-            else:
-
-                adlist = self.getaddrspec()
-
-                self.pos += 1
-
-                break
-
-            self.gotonext()
-
-
-
-        return adlist
-
-
-
-    def getaddrspec(self):
-
-        """Parse an RFC 2822 addr-spec."""
-
-        aslist = []
-
-
-
-        self.gotonext()
-
-        while self.pos < len(self.field):
-
-            preserve_ws = True
-
-            if self.field[self.pos] == '.':
-
-                if aslist and not aslist[-1].strip():
-
-                    aslist.pop()
-
-                aslist.append('.')
-
-                self.pos += 1
-
-                preserve_ws = False
-
-            elif self.field[self.pos] == '"':
-
-                aslist.append('"%s"' % quote(self.getquote()))
-
-            elif self.field[self.pos] in self.atomends:
-
-                if aslist and not aslist[-1].strip():
-
-                    aslist.pop()
-
-                break
-
-            else:
-
-                aslist.append(self.getatom())
-
-            ws = self.gotonext()
-
-            if preserve_ws and ws:
-
-                aslist.append(ws)
-
-
-
-        if self.pos >= len(self.field) or self.field[self.pos] != '@':
-
-            return EMPTYSTRING.join(aslist)
-
-
-
-        aslist.append('@')
-
-        self.pos += 1
-
-        self.gotonext()
-
-        domain = self.getdomain()
-
-        if not domain:
-
-            # Invalid domain, return an empty address instead of returning a
-
-            # local part to denote failed parsing.
-
-            return EMPTYSTRING
-
-        return EMPTYSTRING.join(aslist) + domain
-
-
-
-    def getdomain(self):
-
-        """Get the complete domain name from an address."""
-
-        sdlist = []
-
-        while self.pos < len(self.field):
-
-            if self.field[self.pos] in self.LWS:
-
-                self.pos += 1
-
-            elif self.field[self.pos] == '(':
-
-                self.commentlist.append(self.getcomment())
-
-            elif self.field[self.pos] == '[':
-
-                sdlist.append(self.getdomainliteral())
-
-            elif self.field[self.pos] == '.':
-
-                self.pos += 1
-
-                sdlist.append('.')
-
-            elif self.field[self.pos] == '@':
-
-                # bpo-34155: Don't parse domains with two `@` like
-
-                # `a@malicious.org@important.com`.
-
-                return EMPTYSTRING
-
-            elif self.field[self.pos] in self.atomends:
-
-                break
-
-            else:
-
-                sdlist.append(self.getatom())
-
-        return EMPTYSTRING.join(sdlist)
-
-
-
-    def getdelimited(self, beginchar, endchars, allowcomments=True):
-
-        """Parse a header fragment delimited by special characters.
-
-
-
-        `beginchar' is the start character for the fragment.
-
-        If self is not looking at an instance of `beginchar' then
-
-        getdelimited returns the empty string.
-
-
-
-        `endchars' is a sequence of allowable end-delimiting characters.
-
-        Parsing stops when one of these is encountered.
-
-
-
-        If `allowcomments' is non-zero, embedded RFC 2822 comments are allowed
-
-        within the parsed fragment.
+            added (see man).
 
         """
 
-        if self.field[self.pos] != beginchar:
+        args = self.args + ["--allowed=[]", "--winscp=1"]
 
-            return ''
+        userconf = CheckConfig(args).returnconf()
 
+        # sort lists to compare, except 'export'
 
+        exclude = list(set(builtins_list) - set(['export']))
 
-        slist = ['']
+        expected = exclude + ['scp', 'env', 'pwd', 'groups',
 
-        quote = False
+                              'unset', 'unalias']
 
-        self.pos += 1
+        expected.sort()
 
-        while self.pos < len(self.field):
+        allowed = userconf['allowed']
 
-            if quote:
+        allowed.sort()
 
-                slist.append(self.field[self.pos])
+        return self.assertEqual(allowed, expected)
 
-                quote = False
 
-            elif self.field[self.pos] in endchars:
 
-                self.pos += 1
+    def test_21_winscp_allowed_semicolon(self):
 
-                break
+        """ U21 | when winscp is enabled, use of semicolon is allowed """
 
-            elif allowcomments and self.field[self.pos] == '(':
+        args = self.args + ["--forbidden=[';']", "--winscp=1"]
 
-                slist.append(self.getcomment())
+        userconf = CheckConfig(args).returnconf()
 
-                continue        # have already advanced pos from getcomment
+        # sort lists to compare
 
-            elif self.field[self.pos] == '\\':
+        return self.assertNotIn(';', userconf['forbidden'])
 
-                quote = True
 
-            else:
 
-                slist.append(self.field[self.pos])
+    def test_22_prompt_short_0(self):
 
-            self.pos += 1
+        """ U22 | short_prompt = 0 should show dir compared to home dir """
 
+        expected = '%s:~/foo$ ' % getuser()
 
+        args = self.args + ['--prompt_short=0']
 
-        return EMPTYSTRING.join(slist)
+        userconf = CheckConfig(args).returnconf()
 
+        currentpath = "%s/foo" % userconf['home_path']
 
+        prompt = updateprompt(currentpath, userconf)
 
-    def getquote(self):
+        # sort lists to compare
 
-        """Get a quote-delimited fragment from self's field."""
+        return self.assertEqual(prompt, expected)
 
-        return self.getdelimited('"', '"\r', False)
 
 
+    def test_23_prompt_short_1(self):
 
-    def getcomment(self):
+        """ U23 | short_prompt = 1 should show only current dir """
 
-        """Get a parenthesis-delimited fragment from self's field."""
+        expected = '%s: foo$ ' % getuser()
 
-        return self.getdelimited('(', ')\r', True)
+        args = self.args + ['--prompt_short=1']
 
+        userconf = CheckConfig(args).returnconf()
 
+        currentpath = "%s/foo" % userconf['home_path']
 
-    def getdomainliteral(self):
+        prompt = updateprompt(currentpath, userconf)
 
-        """Parse an RFC 2822 domain-literal."""
+        # sort lists to compare
 
-        return '[%s]' % self.getdelimited('[', ']\r', False)
+        return self.assertEqual(prompt, expected)
 
 
 
-    def getatom(self, atomends=None):
+    def test_24_prompt_short_2(self):
 
-        """Parse an RFC 2822 atom.
+        """ U24 | short_prompt = 2 should show full dir path """
 
+        expected = '%s: %s$ ' % (getuser(), os.getcwd())
 
+        args = self.args + ['--prompt_short=2']
 
-        Optional atomends specifies a different set of end token delimiters
+        userconf = CheckConfig(args).returnconf()
 
-        (the default is to use self.atomends).  This is used e.g. in
+        currentpath = "%s/foo" % userconf['home_path']
 
-        getphraselist() since phrase endings must not include the `.' (which
+        prompt = updateprompt(currentpath, userconf)
 
-        is legal in phrases)."""
+        # sort lists to compare
 
-        atomlist = ['']
+        return self.assertEqual(prompt, expected)
 
-        if atomends is None:
 
-            atomends = self.atomends
 
+    def test_25_disable_ld_preload(self):
 
+        """ U25 | empty path_noexec should disable LD_PRELOAD """
 
-        while self.pos < len(self.field):
+        args = self.args + ["--allowed=['echo','export']", "--path_noexec=''"]
 
-            if self.field[self.pos] in atomends:
+        userconf = CheckConfig(args).returnconf()
 
-                break
+        # verify that no alias was created containing LD_PRELOAD
 
-            else:
+        return self.assertNotIn('echo', userconf['aliases'])
 
-                atomlist.append(self.field[self.pos])
 
-            self.pos += 1
 
+    def test_26_checksecure_quoted_command(self):
 
+        """ U26 | quoted command should be parsed """
 
-        return EMPTYSTRING.join(atomlist)
+        INPUT = 'echo 1 && "bash"'
 
+        return self.assertEqual(sec.check_secure(INPUT, self.userconf)[0], 1)
 
 
-    def getphraselist(self):
 
-        """Parse a sequence of RFC 2822 phrases.
+    def test_27_checksecure_quoted_command(self):
 
+        """ U27 | quoted command should be parsed """
 
+        INPUT = '"bash" && echo 1'
 
-        A phrase is a sequence of words, which are in turn either RFC 2822
+        return self.assertEqual(sec.check_secure(INPUT, self.userconf)[0], 1)
 
-        atoms or quoted-strings.  Phrases are canonicalized by squeezing all
 
-        runs of continuous whitespace into one space.
 
-        """
+    def test_28_checksecure_quoted_command(self):
 
-        plist = []
+        """ U28 | quoted command should be parsed """
 
+        INPUT = "echo'/1.sh'"
 
+        return self.assertEqual(sec.check_secure(INPUT, self.userconf)[0], 1)
 
-        while self.pos < len(self.field):
 
-            if self.field[self.pos] in self.FWS:
 
-                self.pos += 1
+if __name__ == "__main__":
 
-            elif self.field[self.pos] == '"':
-
-                plist.append(self.getquote())
-
-            elif self.field[self.pos] == '(':
-
-                self.commentlist.append(self.getcomment())
-
-            elif self.field[self.pos] in self.phraseends:
-
-                break
-
-            else:
-
-                plist.append(self.getatom(self.phraseends))
-
-
-
-        return plist
-
-
-
-class AddressList(AddrlistClass):
-
-    """An AddressList encapsulates a list of parsed RFC 2822 addresses."""
-
-    def __init__(self, field):
-
-        AddrlistClass.__init__(self, field)
-
-        if field:
-
-            self.addresslist = self.getaddrlist()
-
-        else:
-
-            self.addresslist = []
-
-
-
-    def __len__(self):
-
-        return len(self.addresslist)
-
-
-
-    def __add__(self, other):
-
-        # Set union
-
-        newaddr = AddressList(None)
-
-        newaddr.addresslist = self.addresslist[:]
-
-        for x in other.addresslist:
-
-            if not x in self.addresslist:
-
-                newaddr.addresslist.append(x)
-
-        return newaddr
-
-
-
-    def __iadd__(self, other):
-
-        # Set union, in-place
-
-        for x in other.addresslist:
-
-            if not x in self.addresslist:
-
-                self.addresslist.append(x)
-
-        return self
-
-
-
-    def __sub__(self, other):
-
-        # Set difference
-
-        newaddr = AddressList(None)
-
-        for x in self.addresslist:
-
-            if not x in other.addresslist:
-
-                newaddr.addresslist.append(x)
-
-        return newaddr
-
-
-
-    def __isub__(self, other):
-
-        # Set difference, in-place
-
-        for x in other.addresslist:
-
-            if x in self.addresslist:
-
-                self.addresslist.remove(x)
-
-        return self
-
-
-
-    def __getitem__(self, index):
-
-        # Make indexing, slices, and 'in' work
-
-        return self.addresslist[index]
+    unittest.main()

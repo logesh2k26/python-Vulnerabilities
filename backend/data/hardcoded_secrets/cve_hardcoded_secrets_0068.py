@@ -2,1176 +2,1746 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
+from __future__ import print_function
 
 
 
-# Copyright 2012 OpenStack LLC
+import distutils.version
 
-#
+import io
 
-# Licensed under the Apache License, Version 2.0 (the "License"); you may
+import itertools
 
-# not use this file except in compliance with the License. You may obtain
+import logging
 
-# a copy of the License at
+import os
 
-#
+from collections import namedtuple
 
-#      http://www.apache.org/licenses/LICENSE-2.0
+from ctypes import c_float
 
-#
 
-# Unless required by applicable law or agreed to in writing, software
 
-# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+from PIL import Image, TiffImagePlugin, TiffTags, features
 
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+from PIL._util import py3
 
-# License for the specific language governing permissions and limitations
 
-# under the License.
 
+from .helper import PillowTestCase, hopper
 
 
-import uuid
 
+logger = logging.getLogger(__name__)
 
 
-import routes
 
 
 
-from keystone import catalog
+class LibTiffTestCase(PillowTestCase):
 
-from keystone import exception
+    def setUp(self):
 
-from keystone import identity
+        if not features.check("libtiff"):
 
-from keystone import policy
+            self.skipTest("tiff support not available")
 
-from keystone import token
 
-from keystone.common import logging
 
-from keystone.common import utils
+    def _assert_noerr(self, im):
 
-from keystone.common import wsgi
+        """Helper tests that assert basic sanity about the g4 tiff reading"""
 
+        # 1 bit
 
+        self.assertEqual(im.mode, "1")
 
 
 
-LOG = logging.getLogger(__name__)
+        # Does the data actually load
 
+        im.load()
 
+        im.getdata()
 
 
-
-class AdminRouter(wsgi.ComposingRouter):
-
-    def __init__(self):
-
-        mapper = routes.Mapper()
-
-
-
-        version_controller = VersionController('admin')
-
-        mapper.connect('/',
-
-                       controller=version_controller,
-
-                       action='get_version')
-
-
-
-        # Token Operations
-
-        auth_controller = TokenController()
-
-        mapper.connect('/tokens',
-
-                       controller=auth_controller,
-
-                       action='authenticate',
-
-                       conditions=dict(method=['POST']))
-
-        mapper.connect('/tokens/{token_id}',
-
-                       controller=auth_controller,
-
-                       action='validate_token',
-
-                       conditions=dict(method=['GET']))
-
-        mapper.connect('/tokens/{token_id}',
-
-                       controller=auth_controller,
-
-                       action='validate_token_head',
-
-                       conditions=dict(method=['HEAD']))
-
-        mapper.connect('/tokens/{token_id}',
-
-                       controller=auth_controller,
-
-                       action='delete_token',
-
-                       conditions=dict(method=['DELETE']))
-
-        mapper.connect('/tokens/{token_id}/endpoints',
-
-                       controller=auth_controller,
-
-                       action='endpoints',
-
-                       conditions=dict(method=['GET']))
-
-
-
-        # Miscellaneous Operations
-
-        extensions_controller = AdminExtensionsController()
-
-        mapper.connect('/extensions',
-
-                       controller=extensions_controller,
-
-                       action='get_extensions_info',
-
-                       conditions=dict(method=['GET']))
-
-        mapper.connect('/extensions/{extension_alias}',
-
-                       controller=extensions_controller,
-
-                       action='get_extension_info',
-
-                       conditions=dict(method=['GET']))
-
-        identity_router = identity.AdminRouter()
-
-        routers = [identity_router]
-
-        super(AdminRouter, self).__init__(mapper, routers)
-
-
-
-
-
-class PublicRouter(wsgi.ComposingRouter):
-
-    def __init__(self):
-
-        mapper = routes.Mapper()
-
-
-
-        version_controller = VersionController('public')
-
-        mapper.connect('/',
-
-                       controller=version_controller,
-
-                       action='get_version')
-
-
-
-        # Token Operations
-
-        auth_controller = TokenController()
-
-        mapper.connect('/tokens',
-
-                       controller=auth_controller,
-
-                       action='authenticate',
-
-                       conditions=dict(method=['POST']))
-
-
-
-        # Miscellaneous
-
-        extensions_controller = PublicExtensionsController()
-
-        mapper.connect('/extensions',
-
-                       controller=extensions_controller,
-
-                       action='get_extensions_info',
-
-                       conditions=dict(method=['GET']))
-
-        mapper.connect('/extensions/{extension_alias}',
-
-                       controller=extensions_controller,
-
-                       action='get_extension_info',
-
-                       conditions=dict(method=['GET']))
-
-
-
-        identity_router = identity.PublicRouter()
-
-        routers = [identity_router]
-
-
-
-        super(PublicRouter, self).__init__(mapper, routers)
-
-
-
-
-
-class PublicVersionRouter(wsgi.ComposingRouter):
-
-    def __init__(self):
-
-        mapper = routes.Mapper()
-
-        version_controller = VersionController('public')
-
-        mapper.connect('/',
-
-                       controller=version_controller,
-
-                       action='get_versions')
-
-        routers = []
-
-        super(PublicVersionRouter, self).__init__(mapper, routers)
-
-
-
-
-
-class AdminVersionRouter(wsgi.ComposingRouter):
-
-    def __init__(self):
-
-        mapper = routes.Mapper()
-
-        version_controller = VersionController('admin')
-
-        mapper.connect('/',
-
-                       controller=version_controller,
-
-                       action='get_versions')
-
-        routers = []
-
-        super(AdminVersionRouter, self).__init__(mapper, routers)
-
-
-
-
-
-class VersionController(wsgi.Application):
-
-    def __init__(self, version_type):
-
-        self.catalog_api = catalog.Manager()
-
-        self.url_key = "%sURL" % version_type
-
-
-
-        super(VersionController, self).__init__()
-
-
-
-    def _get_identity_url(self, context):
-
-        catalog_ref = self.catalog_api.get_catalog(
-
-                context=context,
-
-                user_id=None,
-
-                tenant_id=None)
-
-        for region, region_ref in catalog_ref.iteritems():
-
-            for service, service_ref in region_ref.iteritems():
-
-                if service == 'identity':
-
-                    return service_ref[self.url_key]
-
-
-
-        raise exception.NotImplemented()
-
-
-
-    def _get_versions_list(self, context):
-
-        """The list of versions is dependent on the context."""
-
-        identity_url = self._get_identity_url(context)
-
-        if not identity_url.endswith('/'):
-
-            identity_url = identity_url + '/'
-
-
-
-        versions = {}
-
-        versions['v2.0'] = {
-
-            "id": "v2.0",
-
-            "status": "beta",
-
-            "updated": "2011-11-19T00:00:00Z",
-
-            "links": [
-
-                {
-
-                    "rel": "self",
-
-                    "href": identity_url,
-
-                }, {
-
-                    "rel": "describedby",
-
-                    "type": "text/html",
-
-                    "href": "http://docs.openstack.org/api/openstack-"
-
-                                "identity-service/2.0/content/"
-
-                }, {
-
-                    "rel": "describedby",
-
-                    "type": "application/pdf",
-
-                    "href": "http://docs.openstack.org/api/openstack-"
-
-                                "identity-service/2.0/identity-dev-guide-"
-
-                                "2.0.pdf"
-
-                }
-
-            ],
-
-            "media-types": [
-
-                {
-
-                    "base": "application/json",
-
-                    "type": "application/vnd.openstack.identity-v2.0"
-
-                                "+json"
-
-                }, {
-
-                    "base": "application/xml",
-
-                    "type": "application/vnd.openstack.identity-v2.0"
-
-                                "+xml"
-
-                }
-
-            ]
-
-        }
-
-
-
-        return versions
-
-
-
-    def get_versions(self, context):
-
-        versions = self._get_versions_list(context)
-
-        return wsgi.render_response(status=(300, 'Multiple Choices'), body={
-
-            "versions": {
-
-                "values": versions.values()
-
-            }
-
-        })
-
-
-
-    def get_version(self, context):
-
-        versions = self._get_versions_list(context)
-
-        return wsgi.render_response(body={
-
-            "version": versions['v2.0']
-
-        })
-
-
-
-
-
-class NoopController(wsgi.Application):
-
-    def __init__(self):
-
-        super(NoopController, self).__init__()
-
-
-
-    def noop(self, context):
-
-        return {}
-
-
-
-
-
-class TokenController(wsgi.Application):
-
-    def __init__(self):
-
-        self.catalog_api = catalog.Manager()
-
-        self.identity_api = identity.Manager()
-
-        self.token_api = token.Manager()
-
-        self.policy_api = policy.Manager()
-
-        super(TokenController, self).__init__()
-
-
-
-    def authenticate(self, context, auth=None):
-
-        """Authenticate credentials and return a token.
-
-
-
-        Accept auth as a dict that looks like::
-
-
-
-            {
-
-                "auth":{
-
-                    "passwordCredentials":{
-
-                        "username":"test_user",
-
-                        "password":"mypass"
-
-                    },
-
-                    "tenantName":"customer-x"
-
-                }
-
-            }
-
-
-
-        In this case, tenant is optional, if not provided the token will be
-
-        considered "unscoped" and can later be used to get a scoped token.
-
-
-
-        Alternatively, this call accepts auth with only a token and tenant
-
-        that will return a token that is scoped to that tenant.
-
-        """
-
-
-
-        token_id = uuid.uuid4().hex
-
-        if 'passwordCredentials' in auth:
-
-            username = auth['passwordCredentials'].get('username', '')
-
-            password = auth['passwordCredentials'].get('password', '')
-
-            tenant_name = auth.get('tenantName', None)
-
-
-
-            user_id = auth['passwordCredentials'].get('userId', None)
-
-            if username:
-
-                user_ref = self.identity_api.get_user_by_name(
-
-                        context=context, user_name=username)
-
-                if user_ref:
-
-                    user_id = user_ref['id']
-
-
-
-            # more compat
-
-            tenant_id = auth.get('tenantId', None)
-
-            if tenant_name:
-
-                tenant_ref = self.identity_api.get_tenant_by_name(
-
-                        context=context, tenant_name=tenant_name)
-
-                if tenant_ref:
-
-                    tenant_id = tenant_ref['id']
-
-
-
-            try:
-
-                auth_info = self.identity_api.authenticate(context=context,
-
-                                                           user_id=user_id,
-
-                                                           password=password,
-
-                                                           tenant_id=tenant_id)
-
-                (user_ref, tenant_ref, metadata_ref) = auth_info
-
-
-
-                # If the user is disabled don't allow them to authenticate
-
-                if not user_ref.get('enabled', True):
-
-                    LOG.warning('User %s is disabled' % user_id)
-
-                    raise exception.Unauthorized()
-
-            except AssertionError as e:
-
-                raise exception.Unauthorized(e.message)
-
-
-
-            token_ref = self.token_api.create_token(
-
-                    context, token_id, dict(id=token_id,
-
-                                            user=user_ref,
-
-                                            tenant=tenant_ref,
-
-                                            metadata=metadata_ref))
-
-            if tenant_ref:
-
-                catalog_ref = self.catalog_api.get_catalog(
-
-                        context=context,
-
-                        user_id=user_ref['id'],
-
-                        tenant_id=tenant_ref['id'],
-
-                        metadata=metadata_ref)
-
-            else:
-
-                catalog_ref = {}
-
-
-
-        elif 'token' in auth:
-
-            token = auth['token'].get('id', None)
-
-
-
-            tenant_name = auth.get('tenantName')
-
-
-
-            # more compat
-
-            if tenant_name:
-
-                tenant_ref = self.identity_api.get_tenant_by_name(
-
-                        context=context, tenant_name=tenant_name)
-
-                tenant_id = tenant_ref['id']
-
-            else:
-
-                tenant_id = auth.get('tenantId', None)
-
-
-
-            try:
-
-                old_token_ref = self.token_api.get_token(context=context,
-
-                                                         token_id=token)
-
-            except exception.NotFound:
-
-                raise exception.Unauthorized()
-
-
-
-            user_ref = old_token_ref['user']
-
-
-
-            # If the user is disabled don't allow them to authenticate
-
-            current_user_ref = self.identity_api.get_user(
-
-                                                    context=context,
-
-                                                    user_id=user_ref['id'])
-
-            if not current_user_ref.get('enabled', True):
-
-                LOG.warning('User %s is disabled' % user_ref['id'])
-
-                raise exception.Unauthorized()
-
-
-
-            tenants = self.identity_api.get_tenants_for_user(context,
-
-                                                             user_ref['id'])
-
-            if tenant_id:
-
-                assert tenant_id in tenants
-
-
-
-            tenant_ref = self.identity_api.get_tenant(context=context,
-
-                                                      tenant_id=tenant_id)
-
-            if tenant_ref:
-
-                metadata_ref = self.identity_api.get_metadata(
-
-                        context=context,
-
-                        user_id=user_ref['id'],
-
-                        tenant_id=tenant_ref['id'])
-
-                catalog_ref = self.catalog_api.get_catalog(
-
-                        context=context,
-
-                        user_id=user_ref['id'],
-
-                        tenant_id=tenant_ref['id'],
-
-                        metadata=metadata_ref)
-
-            else:
-
-                metadata_ref = {}
-
-                catalog_ref = {}
-
-
-
-            token_ref = self.token_api.create_token(
-
-                    context, token_id, dict(id=token_id,
-
-                                            user=user_ref,
-
-                                            tenant=tenant_ref,
-
-                                            metadata=metadata_ref))
-
-
-
-        # TODO(termie): optimize this call at some point and put it into the
-
-        #               the return for metadata
-
-        # fill out the roles in the metadata
-
-        roles_ref = []
-
-        for role_id in metadata_ref.get('roles', []):
-
-            roles_ref.append(self.identity_api.get_role(context, role_id))
-
-        logging.debug('TOKEN_REF %s', token_ref)
-
-        return self._format_authenticate(token_ref, roles_ref, catalog_ref)
-
-
-
-    def _get_token_ref(self, context, token_id, belongs_to=None):
-
-        """Returns a token if a valid one exists.
-
-
-
-        Optionally, limited to a token owned by a specific tenant.
-
-
-
-        """
-
-        # TODO(termie): this stuff should probably be moved to middleware
-
-        self.assert_admin(context)
-
-
-
-        token_ref = self.token_api.get_token(context=context,
-
-                                             token_id=token_id)
-
-
-
-        if belongs_to:
-
-            assert token_ref['tenant']['id'] == belongs_to
-
-
-
-        return token_ref
-
-
-
-    # admin only
-
-    def validate_token_head(self, context, token_id):
-
-        """Check that a token is valid.
-
-
-
-        Optionally, also ensure that it is owned by a specific tenant.
-
-
-
-        Identical to ``validate_token``, except does not return a response.
-
-
-
-        """
-
-        belongs_to = context['query_string'].get("belongsTo")
-
-        assert self._get_token_ref(context, token_id, belongs_to)
-
-
-
-    # admin only
-
-    def validate_token(self, context, token_id):
-
-        """Check that a token is valid.
-
-
-
-        Optionally, also ensure that it is owned by a specific tenant.
-
-
-
-        Returns metadata about the token along any associated roles.
-
-
-
-        """
-
-        belongs_to = context['query_string'].get("belongsTo")
-
-        token_ref = self._get_token_ref(context, token_id, belongs_to)
-
-
-
-        # TODO(termie): optimize this call at some point and put it into the
-
-        #               the return for metadata
-
-        # fill out the roles in the metadata
-
-        metadata_ref = token_ref['metadata']
-
-        roles_ref = []
-
-        for role_id in metadata_ref.get('roles', []):
-
-            roles_ref.append(self.identity_api.get_role(context, role_id))
-
-
-
-        # Get a service catalog if belongs_to is not none
-
-        # This is needed for on-behalf-of requests
-
-        catalog_ref = None
-
-        if belongs_to is not None:
-
-            catalog_ref = self.catalog_api.get_catalog(
-
-                context=context,
-
-                user_id=token_ref['user']['id'],
-
-                tenant_id=token_ref['tenant']['id'],
-
-                metadata=metadata_ref)
-
-        return self._format_token(token_ref, roles_ref, catalog_ref)
-
-
-
-    def delete_token(self, context, token_id):
-
-        """Delete a token, effectively invalidating it for authz."""
-
-        # TODO(termie): this stuff should probably be moved to middleware
-
-        self.assert_admin(context)
-
-
-
-        self.token_api.delete_token(context=context, token_id=token_id)
-
-
-
-    def endpoints(self, context, token_id):
-
-        """Return a list of endpoints available to the token."""
-
-        raise exception.NotImplemented()
-
-
-
-    def _format_authenticate(self, token_ref, roles_ref, catalog_ref):
-
-        o = self._format_token(token_ref, roles_ref)
-
-        o['access']['serviceCatalog'] = self._format_catalog(catalog_ref)
-
-        return o
-
-
-
-    def _format_token(self, token_ref, roles_ref, catalog_ref=None):
-
-        user_ref = token_ref['user']
-
-        metadata_ref = token_ref['metadata']
-
-        expires = token_ref['expires']
-
-        if expires is not None:
-
-            expires = utils.isotime(expires)
-
-        o = {'access': {'token': {'id': token_ref['id'],
-
-                                  'expires': expires,
-
-                                  },
-
-                        'user': {'id': user_ref['id'],
-
-                                 'name': user_ref['name'],
-
-                                 'username': user_ref['name'],
-
-                                 'roles': roles_ref,
-
-                                 'roles_links': metadata_ref.get('roles_links',
-
-                                                               [])
-
-                                 }
-
-                        }
-
-             }
-
-        if 'tenant' in token_ref and token_ref['tenant']:
-
-            token_ref['tenant']['enabled'] = True
-
-            o['access']['token']['tenant'] = token_ref['tenant']
-
-        if catalog_ref is not None:
-
-            o['access']['serviceCatalog'] = self._format_catalog(catalog_ref)
-
-        return o
-
-
-
-    def _format_catalog(self, catalog_ref):
-
-        """Munge catalogs from internal to output format
-
-        Internal catalogs look like:
-
-
-
-        {$REGION: {
-
-            {$SERVICE: {
-
-                $key1: $value1,
-
-                ...
-
-                }
-
-            }
-
-        }
-
-
-
-        The legacy api wants them to look like
-
-
-
-        [{'name': $SERVICE[name],
-
-          'type': $SERVICE,
-
-          'endpoints': [{
-
-              'tenantId': $tenant_id,
-
-              ...
-
-              'region': $REGION,
-
-              }],
-
-          'endpoints_links': [],
-
-         }]
-
-
-
-        """
-
-        if not catalog_ref:
-
-            return {}
-
-
-
-        services = {}
-
-        for region, region_ref in catalog_ref.iteritems():
-
-            for service, service_ref in region_ref.iteritems():
-
-                new_service_ref = services.get(service, {})
-
-                new_service_ref['name'] = service_ref.pop('name')
-
-                new_service_ref['type'] = service
-
-                new_service_ref['endpoints_links'] = []
-
-                service_ref['region'] = region
-
-
-
-                endpoints_ref = new_service_ref.get('endpoints', [])
-
-                endpoints_ref.append(service_ref)
-
-
-
-                new_service_ref['endpoints'] = endpoints_ref
-
-                services[service] = new_service_ref
-
-
-
-        return services.values()
-
-
-
-
-
-class ExtensionsController(wsgi.Application):
-
-    """Base extensions controller to be extended by public and admin API's."""
-
-
-
-    def __init__(self, extensions=None):
-
-        super(ExtensionsController, self).__init__()
-
-
-
-        self.extensions = extensions or {}
-
-
-
-    def get_extensions_info(self, context):
-
-        return {'extensions': {'values': self.extensions.values()}}
-
-
-
-    def get_extension_info(self, context, extension_alias):
 
         try:
 
-            return {'extension': self.extensions[extension_alias]}
+            self.assertEqual(im._compression, "group4")
 
-        except KeyError:
+        except AttributeError:
 
-            raise exception.NotFound(target=extension_alias)
+            print("No _compression")
 
-
-
-
-
-class PublicExtensionsController(ExtensionsController):
-
-    pass
+            print(dir(im))
 
 
 
+        # can we write it back out, in a different form.
 
+        out = self.tempfile("temp.png")
 
-class AdminExtensionsController(ExtensionsController):
-
-    def __init__(self, *args, **kwargs):
-
-        super(AdminExtensionsController, self).__init__(*args, **kwargs)
+        im.save(out)
 
 
 
-        # TODO(dolph): Extensions should obviously provide this information
+        out_bytes = io.BytesIO()
 
-        #               themselves, but hardcoding it here allows us to match
+        im.save(out_bytes, format="tiff", compression="group4")
 
-        #               the API spec in the short term with minimal complexity.
 
-        self.extensions['OS-KSADM'] = {
 
-            'name': 'Openstack Keystone Admin',
 
-            'namespace': 'http://docs.openstack.org/identity/api/ext/'
 
-                         'OS-KSADM/v1.0',
+class TestFileLibTiff(LibTiffTestCase):
 
-            'alias': 'OS-KSADM',
+    def test_g4_tiff(self):
 
-            'updated': '2011-08-19T13:25:27-06:00',
+        """Test the ordinary file path load path"""
 
-            'description': 'Openstack extensions to Keystone v2.0 API '
 
-                           'enabling Admin Operations.',
 
-            'links': [
+        test_file = "Tests/images/hopper_g4_500.tif"
 
-                {
+        im = Image.open(test_file)
 
-                    'rel': 'describedby',
 
-                    # TODO(dolph): link needs to be revised after
 
-                    #              bug 928059 merges
+        self.assertEqual(im.size, (500, 500))
 
-                    'type': 'text/html',
+        self._assert_noerr(im)
 
-                    'href': ('https://github.com/openstack/'
 
-                        'identity-api'),
 
-                }
+    def test_g4_large(self):
+
+        test_file = "Tests/images/pport_g4.tif"
+
+        im = Image.open(test_file)
+
+        self._assert_noerr(im)
+
+
+
+    def test_g4_tiff_file(self):
+
+        """Testing the string load path"""
+
+
+
+        test_file = "Tests/images/hopper_g4_500.tif"
+
+        with open(test_file, "rb") as f:
+
+            im = Image.open(f)
+
+
+
+            self.assertEqual(im.size, (500, 500))
+
+            self._assert_noerr(im)
+
+
+
+    def test_g4_tiff_bytesio(self):
+
+        """Testing the stringio loading code path"""
+
+        test_file = "Tests/images/hopper_g4_500.tif"
+
+        s = io.BytesIO()
+
+        with open(test_file, "rb") as f:
+
+            s.write(f.read())
+
+            s.seek(0)
+
+        im = Image.open(s)
+
+
+
+        self.assertEqual(im.size, (500, 500))
+
+        self._assert_noerr(im)
+
+
+
+    def test_g4_non_disk_file_object(self):
+
+        """Testing loading from non-disk non-BytesIO file object"""
+
+        test_file = "Tests/images/hopper_g4_500.tif"
+
+        s = io.BytesIO()
+
+        with open(test_file, "rb") as f:
+
+            s.write(f.read())
+
+            s.seek(0)
+
+        r = io.BufferedReader(s)
+
+        im = Image.open(r)
+
+
+
+        self.assertEqual(im.size, (500, 500))
+
+        self._assert_noerr(im)
+
+
+
+    def test_g4_eq_png(self):
+
+        """ Checking that we're actually getting the data that we expect"""
+
+        png = Image.open("Tests/images/hopper_bw_500.png")
+
+        g4 = Image.open("Tests/images/hopper_g4_500.tif")
+
+
+
+        self.assert_image_equal(g4, png)
+
+
+
+    # see https://github.com/python-pillow/Pillow/issues/279
+
+    def test_g4_fillorder_eq_png(self):
+
+        """ Checking that we're actually getting the data that we expect"""
+
+        png = Image.open("Tests/images/g4-fillorder-test.png")
+
+        g4 = Image.open("Tests/images/g4-fillorder-test.tif")
+
+
+
+        self.assert_image_equal(g4, png)
+
+
+
+    def test_g4_write(self):
+
+        """Checking to see that the saved image is the same as what we wrote"""
+
+        test_file = "Tests/images/hopper_g4_500.tif"
+
+        orig = Image.open(test_file)
+
+
+
+        out = self.tempfile("temp.tif")
+
+        rot = orig.transpose(Image.ROTATE_90)
+
+        self.assertEqual(rot.size, (500, 500))
+
+        rot.save(out)
+
+
+
+        reread = Image.open(out)
+
+        self.assertEqual(reread.size, (500, 500))
+
+        self._assert_noerr(reread)
+
+        self.assert_image_equal(reread, rot)
+
+        self.assertEqual(reread.info["compression"], "group4")
+
+
+
+        self.assertEqual(reread.info["compression"], orig.info["compression"])
+
+
+
+        self.assertNotEqual(orig.tobytes(), reread.tobytes())
+
+
+
+    def test_adobe_deflate_tiff(self):
+
+        test_file = "Tests/images/tiff_adobe_deflate.tif"
+
+        im = Image.open(test_file)
+
+
+
+        self.assertEqual(im.mode, "RGB")
+
+        self.assertEqual(im.size, (278, 374))
+
+        self.assertEqual(im.tile[0][:3], ("libtiff", (0, 0, 278, 374), 0))
+
+        im.load()
+
+
+
+        self.assert_image_equal_tofile(im, "Tests/images/tiff_adobe_deflate.png")
+
+
+
+    def test_write_metadata(self):
+
+        """ Test metadata writing through libtiff """
+
+        for legacy_api in [False, True]:
+
+            img = Image.open("Tests/images/hopper_g4.tif")
+
+            f = self.tempfile("temp.tiff")
+
+
+
+            img.save(f, tiffinfo=img.tag)
+
+
+
+            if legacy_api:
+
+                original = img.tag.named()
+
+            else:
+
+                original = img.tag_v2.named()
+
+
+
+            # PhotometricInterpretation is set from SAVE_INFO,
+
+            # not the original image.
+
+            ignored = [
+
+                "StripByteCounts",
+
+                "RowsPerStrip",
+
+                "PageNumber",
+
+                "PhotometricInterpretation",
 
             ]
+
+
+
+            loaded = Image.open(f)
+
+            if legacy_api:
+
+                reloaded = loaded.tag.named()
+
+            else:
+
+                reloaded = loaded.tag_v2.named()
+
+
+
+            for tag, value in itertools.chain(reloaded.items(), original.items()):
+
+                if tag not in ignored:
+
+                    val = original[tag]
+
+                    if tag.endswith("Resolution"):
+
+                        if legacy_api:
+
+                            self.assertEqual(
+
+                                c_float(val[0][0] / val[0][1]).value,
+
+                                c_float(value[0][0] / value[0][1]).value,
+
+                                msg="%s didn't roundtrip" % tag,
+
+                            )
+
+                        else:
+
+                            self.assertEqual(
+
+                                c_float(val).value,
+
+                                c_float(value).value,
+
+                                msg="%s didn't roundtrip" % tag,
+
+                            )
+
+                    else:
+
+                        self.assertEqual(val, value, msg="%s didn't roundtrip" % tag)
+
+
+
+            # https://github.com/python-pillow/Pillow/issues/1561
+
+            requested_fields = ["StripByteCounts", "RowsPerStrip", "StripOffsets"]
+
+            for field in requested_fields:
+
+                self.assertIn(field, reloaded, "%s not in metadata" % field)
+
+
+
+    def test_additional_metadata(self):
+
+        # these should not crash. Seriously dummy data, most of it doesn't make
+
+        # any sense, so we're running up against limits where we're asking
+
+        # libtiff to do stupid things.
+
+
+
+        # Get the list of the ones that we should be able to write
+
+
+
+        core_items = {
+
+            tag: info
+
+            for tag, info in ((s, TiffTags.lookup(s)) for s in TiffTags.LIBTIFF_CORE)
+
+            if info.type is not None
 
         }
 
 
 
+        # Exclude ones that have special meaning
 
+        # that we're already testing them
 
-@logging.fail_gracefully
+        im = Image.open("Tests/images/hopper_g4.tif")
 
-def public_app_factory(global_conf, **local_conf):
+        for tag in im.tag_v2:
 
-    conf = global_conf.copy()
+            try:
 
-    conf.update(local_conf)
+                del core_items[tag]
 
-    return PublicRouter()
+            except KeyError:
 
-
-
-
-
-@logging.fail_gracefully
-
-def admin_app_factory(global_conf, **local_conf):
-
-    conf = global_conf.copy()
-
-    conf.update(local_conf)
-
-    return AdminRouter()
+                pass
 
 
 
+        # Type codes:
+
+        #     2: "ascii",
+
+        #     3: "short",
+
+        #     4: "long",
+
+        #     5: "rational",
+
+        #     12: "double",
+
+        # Type: dummy value
+
+        values = {
+
+            2: "test",
+
+            3: 1,
+
+            4: 2 ** 20,
+
+            5: TiffImagePlugin.IFDRational(100, 1),
+
+            12: 1.05,
+
+        }
 
 
-@logging.fail_gracefully
 
-def public_version_app_factory(global_conf, **local_conf):
+        new_ifd = TiffImagePlugin.ImageFileDirectory_v2()
 
-    conf = global_conf.copy()
+        for tag, info in core_items.items():
 
-    conf.update(local_conf)
+            if info.length == 1:
 
-    return PublicVersionRouter()
+                new_ifd[tag] = values[info.type]
+
+            if info.length == 0:
+
+                new_ifd[tag] = tuple(values[info.type] for _ in range(3))
+
+            else:
+
+                new_ifd[tag] = tuple(values[info.type] for _ in range(info.length))
 
 
 
+        # Extra samples really doesn't make sense in this application.
+
+        del new_ifd[338]
 
 
-@logging.fail_gracefully
 
-def admin_version_app_factory(global_conf, **local_conf):
+        out = self.tempfile("temp.tif")
 
-    conf = global_conf.copy()
+        TiffImagePlugin.WRITE_LIBTIFF = True
 
-    conf.update(local_conf)
 
-    return AdminVersionRouter()
+
+        im.save(out, tiffinfo=new_ifd)
+
+
+
+        TiffImagePlugin.WRITE_LIBTIFF = False
+
+
+
+    def test_custom_metadata(self):
+
+        tc = namedtuple("test_case", "value,type,supported_by_default")
+
+        custom = {
+
+            37000 + k: v
+
+            for k, v in enumerate(
+
+                [
+
+                    tc(4, TiffTags.SHORT, True),
+
+                    tc(123456789, TiffTags.LONG, True),
+
+                    tc(-4, TiffTags.SIGNED_BYTE, False),
+
+                    tc(-4, TiffTags.SIGNED_SHORT, False),
+
+                    tc(-123456789, TiffTags.SIGNED_LONG, False),
+
+                    tc(TiffImagePlugin.IFDRational(4, 7), TiffTags.RATIONAL, True),
+
+                    tc(4.25, TiffTags.FLOAT, True),
+
+                    tc(4.25, TiffTags.DOUBLE, True),
+
+                    tc("custom tag value", TiffTags.ASCII, True),
+
+                    tc(u"custom tag value", TiffTags.ASCII, True),
+
+                    tc(b"custom tag value", TiffTags.BYTE, True),
+
+                    tc((4, 5, 6), TiffTags.SHORT, True),
+
+                    tc((123456789, 9, 34, 234, 219387, 92432323), TiffTags.LONG, True),
+
+                    tc((-4, 9, 10), TiffTags.SIGNED_BYTE, False),
+
+                    tc((-4, 5, 6), TiffTags.SIGNED_SHORT, False),
+
+                    tc(
+
+                        (-123456789, 9, 34, 234, 219387, -92432323),
+
+                        TiffTags.SIGNED_LONG,
+
+                        False,
+
+                    ),
+
+                    tc((4.25, 5.25), TiffTags.FLOAT, True),
+
+                    tc((4.25, 5.25), TiffTags.DOUBLE, True),
+
+                    # array of TIFF_BYTE requires bytes instead of tuple for backwards
+
+                    # compatibility
+
+                    tc(bytes([4]), TiffTags.BYTE, True),
+
+                    tc(bytes((4, 9, 10)), TiffTags.BYTE, True),
+
+                ]
+
+            )
+
+        }
+
+
+
+        libtiff_version = TiffImagePlugin._libtiff_version()
+
+
+
+        libtiffs = [False]
+
+        if distutils.version.StrictVersion(
+
+            libtiff_version
+
+        ) >= distutils.version.StrictVersion("4.0"):
+
+            libtiffs.append(True)
+
+
+
+        for libtiff in libtiffs:
+
+            TiffImagePlugin.WRITE_LIBTIFF = libtiff
+
+
+
+            def check_tags(tiffinfo):
+
+                im = hopper()
+
+
+
+                out = self.tempfile("temp.tif")
+
+                im.save(out, tiffinfo=tiffinfo)
+
+
+
+                reloaded = Image.open(out)
+
+                for tag, value in tiffinfo.items():
+
+                    reloaded_value = reloaded.tag_v2[tag]
+
+                    if (
+
+                        isinstance(reloaded_value, TiffImagePlugin.IFDRational)
+
+                        and libtiff
+
+                    ):
+
+                        # libtiff does not support real RATIONALS
+
+                        self.assertAlmostEqual(float(reloaded_value), float(value))
+
+                        continue
+
+
+
+                    if libtiff and isinstance(value, bytes):
+
+                        value = value.decode()
+
+
+
+                    self.assertEqual(reloaded_value, value)
+
+
+
+            # Test with types
+
+            ifd = TiffImagePlugin.ImageFileDirectory_v2()
+
+            for tag, tagdata in custom.items():
+
+                ifd[tag] = tagdata.value
+
+                ifd.tagtype[tag] = tagdata.type
+
+            check_tags(ifd)
+
+
+
+            # Test without types. This only works for some types, int for example are
+
+            # always encoded as LONG and not SIGNED_LONG.
+
+            check_tags(
+
+                {
+
+                    tag: tagdata.value
+
+                    for tag, tagdata in custom.items()
+
+                    if tagdata.supported_by_default
+
+                }
+
+            )
+
+        TiffImagePlugin.WRITE_LIBTIFF = False
+
+
+
+    def test_int_dpi(self):
+
+        # issue #1765
+
+        im = hopper("RGB")
+
+        out = self.tempfile("temp.tif")
+
+        TiffImagePlugin.WRITE_LIBTIFF = True
+
+        im.save(out, dpi=(72, 72))
+
+        TiffImagePlugin.WRITE_LIBTIFF = False
+
+        reloaded = Image.open(out)
+
+        self.assertEqual(reloaded.info["dpi"], (72.0, 72.0))
+
+
+
+    def test_g3_compression(self):
+
+        i = Image.open("Tests/images/hopper_g4_500.tif")
+
+        out = self.tempfile("temp.tif")
+
+        i.save(out, compression="group3")
+
+
+
+        reread = Image.open(out)
+
+        self.assertEqual(reread.info["compression"], "group3")
+
+        self.assert_image_equal(reread, i)
+
+
+
+    def test_little_endian(self):
+
+        im = Image.open("Tests/images/16bit.deflate.tif")
+
+        self.assertEqual(im.getpixel((0, 0)), 480)
+
+        self.assertEqual(im.mode, "I;16")
+
+
+
+        b = im.tobytes()
+
+        # Bytes are in image native order (little endian)
+
+        if py3:
+
+            self.assertEqual(b[0], ord(b"\xe0"))
+
+            self.assertEqual(b[1], ord(b"\x01"))
+
+        else:
+
+            self.assertEqual(b[0], b"\xe0")
+
+            self.assertEqual(b[1], b"\x01")
+
+
+
+        out = self.tempfile("temp.tif")
+
+        # out = "temp.le.tif"
+
+        im.save(out)
+
+        reread = Image.open(out)
+
+
+
+        self.assertEqual(reread.info["compression"], im.info["compression"])
+
+        self.assertEqual(reread.getpixel((0, 0)), 480)
+
+        # UNDONE - libtiff defaults to writing in native endian, so
+
+        # on big endian, we'll get back mode = 'I;16B' here.
+
+
+
+    def test_big_endian(self):
+
+        im = Image.open("Tests/images/16bit.MM.deflate.tif")
+
+
+
+        self.assertEqual(im.getpixel((0, 0)), 480)
+
+        self.assertEqual(im.mode, "I;16B")
+
+
+
+        b = im.tobytes()
+
+
+
+        # Bytes are in image native order (big endian)
+
+        if py3:
+
+            self.assertEqual(b[0], ord(b"\x01"))
+
+            self.assertEqual(b[1], ord(b"\xe0"))
+
+        else:
+
+            self.assertEqual(b[0], b"\x01")
+
+            self.assertEqual(b[1], b"\xe0")
+
+
+
+        out = self.tempfile("temp.tif")
+
+        im.save(out)
+
+        reread = Image.open(out)
+
+
+
+        self.assertEqual(reread.info["compression"], im.info["compression"])
+
+        self.assertEqual(reread.getpixel((0, 0)), 480)
+
+
+
+    def test_g4_string_info(self):
+
+        """Tests String data in info directory"""
+
+        test_file = "Tests/images/hopper_g4_500.tif"
+
+        orig = Image.open(test_file)
+
+
+
+        out = self.tempfile("temp.tif")
+
+
+
+        orig.tag[269] = "temp.tif"
+
+        orig.save(out)
+
+
+
+        reread = Image.open(out)
+
+        self.assertEqual("temp.tif", reread.tag_v2[269])
+
+        self.assertEqual("temp.tif", reread.tag[269][0])
+
+
+
+    def test_12bit_rawmode(self):
+
+        """ Are we generating the same interpretation
+
+        of the image as Imagemagick is? """
+
+        TiffImagePlugin.READ_LIBTIFF = True
+
+        im = Image.open("Tests/images/12bit.cropped.tif")
+
+        im.load()
+
+        TiffImagePlugin.READ_LIBTIFF = False
+
+        # to make the target --
+
+        # convert 12bit.cropped.tif -depth 16 tmp.tif
+
+        # convert tmp.tif -evaluate RightShift 4 12in16bit2.tif
+
+        # imagemagick will auto scale so that a 12bit FFF is 16bit FFF0,
+
+        # so we need to unshift so that the integer values are the same.
+
+
+
+        self.assert_image_equal_tofile(im, "Tests/images/12in16bit.tif")
+
+
+
+    def test_blur(self):
+
+        # test case from irc, how to do blur on b/w image
+
+        # and save to compressed tif.
+
+        from PIL import ImageFilter
+
+
+
+        out = self.tempfile("temp.tif")
+
+        im = Image.open("Tests/images/pport_g4.tif")
+
+        im = im.convert("L")
+
+
+
+        im = im.filter(ImageFilter.GaussianBlur(4))
+
+        im.save(out, compression="tiff_adobe_deflate")
+
+
+
+        im2 = Image.open(out)
+
+        im2.load()
+
+
+
+        self.assert_image_equal(im, im2)
+
+
+
+    def test_compressions(self):
+
+        # Test various tiff compressions and assert similar image content but reduced
+
+        # file sizes.
+
+        im = hopper("RGB")
+
+        out = self.tempfile("temp.tif")
+
+        im.save(out)
+
+        size_raw = os.path.getsize(out)
+
+
+
+        for compression in ("packbits", "tiff_lzw"):
+
+            im.save(out, compression=compression)
+
+            size_compressed = os.path.getsize(out)
+
+            im2 = Image.open(out)
+
+            self.assert_image_equal(im, im2)
+
+
+
+        im.save(out, compression="jpeg")
+
+        size_jpeg = os.path.getsize(out)
+
+        im2 = Image.open(out)
+
+        self.assert_image_similar(im, im2, 30)
+
+
+
+        im.save(out, compression="jpeg", quality=30)
+
+        size_jpeg_30 = os.path.getsize(out)
+
+        im3 = Image.open(out)
+
+        self.assert_image_similar(im2, im3, 30)
+
+
+
+        self.assertGreater(size_raw, size_compressed)
+
+        self.assertGreater(size_compressed, size_jpeg)
+
+        self.assertGreater(size_jpeg, size_jpeg_30)
+
+
+
+    def test_quality(self):
+
+        im = hopper("RGB")
+
+        out = self.tempfile("temp.tif")
+
+
+
+        self.assertRaises(ValueError, im.save, out, compression="tiff_lzw", quality=50)
+
+        self.assertRaises(ValueError, im.save, out, compression="jpeg", quality=-1)
+
+        self.assertRaises(ValueError, im.save, out, compression="jpeg", quality=101)
+
+        self.assertRaises(ValueError, im.save, out, compression="jpeg", quality="good")
+
+        im.save(out, compression="jpeg", quality=0)
+
+        im.save(out, compression="jpeg", quality=100)
+
+
+
+    def test_cmyk_save(self):
+
+        im = hopper("CMYK")
+
+        out = self.tempfile("temp.tif")
+
+
+
+        im.save(out, compression="tiff_adobe_deflate")
+
+        im2 = Image.open(out)
+
+        self.assert_image_equal(im, im2)
+
+
+
+    def xtest_bw_compression_w_rgb(self):
+
+        """ This test passes, but when running all tests causes a failure due
+
+            to output on stderr from the error thrown by libtiff. We need to
+
+            capture that but not now"""
+
+
+
+        im = hopper("RGB")
+
+        out = self.tempfile("temp.tif")
+
+
+
+        self.assertRaises(IOError, im.save, out, compression="tiff_ccitt")
+
+        self.assertRaises(IOError, im.save, out, compression="group3")
+
+        self.assertRaises(IOError, im.save, out, compression="group4")
+
+
+
+    def test_fp_leak(self):
+
+        im = Image.open("Tests/images/hopper_g4_500.tif")
+
+        fn = im.fp.fileno()
+
+
+
+        os.fstat(fn)
+
+        im.load()  # this should close it.
+
+        self.assertRaises(OSError, os.fstat, fn)
+
+        im = None  # this should force even more closed.
+
+        self.assertRaises(OSError, os.fstat, fn)
+
+        self.assertRaises(OSError, os.close, fn)
+
+
+
+    def test_multipage(self):
+
+        # issue #862
+
+        TiffImagePlugin.READ_LIBTIFF = True
+
+        im = Image.open("Tests/images/multipage.tiff")
+
+        # file is a multipage tiff,  10x10 green, 10x10 red, 20x20 blue
+
+
+
+        im.seek(0)
+
+        self.assertEqual(im.size, (10, 10))
+
+        self.assertEqual(im.convert("RGB").getpixel((0, 0)), (0, 128, 0))
+
+        self.assertTrue(im.tag.next)
+
+
+
+        im.seek(1)
+
+        self.assertEqual(im.size, (10, 10))
+
+        self.assertEqual(im.convert("RGB").getpixel((0, 0)), (255, 0, 0))
+
+        self.assertTrue(im.tag.next)
+
+
+
+        im.seek(2)
+
+        self.assertFalse(im.tag.next)
+
+        self.assertEqual(im.size, (20, 20))
+
+        self.assertEqual(im.convert("RGB").getpixel((0, 0)), (0, 0, 255))
+
+
+
+        TiffImagePlugin.READ_LIBTIFF = False
+
+
+
+    def test_multipage_nframes(self):
+
+        # issue #862
+
+        TiffImagePlugin.READ_LIBTIFF = True
+
+        im = Image.open("Tests/images/multipage.tiff")
+
+        frames = im.n_frames
+
+        self.assertEqual(frames, 3)
+
+        for _ in range(frames):
+
+            im.seek(0)
+
+            # Should not raise ValueError: I/O operation on closed file
+
+            im.load()
+
+
+
+        TiffImagePlugin.READ_LIBTIFF = False
+
+
+
+    def test__next(self):
+
+        TiffImagePlugin.READ_LIBTIFF = True
+
+        im = Image.open("Tests/images/hopper.tif")
+
+        self.assertFalse(im.tag.next)
+
+        im.load()
+
+        self.assertFalse(im.tag.next)
+
+
+
+    def test_4bit(self):
+
+        # Arrange
+
+        test_file = "Tests/images/hopper_gray_4bpp.tif"
+
+        original = hopper("L")
+
+
+
+        # Act
+
+        TiffImagePlugin.READ_LIBTIFF = True
+
+        im = Image.open(test_file)
+
+        TiffImagePlugin.READ_LIBTIFF = False
+
+
+
+        # Assert
+
+        self.assertEqual(im.size, (128, 128))
+
+        self.assertEqual(im.mode, "L")
+
+        self.assert_image_similar(im, original, 7.3)
+
+
+
+    def test_gray_semibyte_per_pixel(self):
+
+        test_files = (
+
+            (
+
+                24.8,  # epsilon
+
+                (  # group
+
+                    "Tests/images/tiff_gray_2_4_bpp/hopper2.tif",
+
+                    "Tests/images/tiff_gray_2_4_bpp/hopper2I.tif",
+
+                    "Tests/images/tiff_gray_2_4_bpp/hopper2R.tif",
+
+                    "Tests/images/tiff_gray_2_4_bpp/hopper2IR.tif",
+
+                ),
+
+            ),
+
+            (
+
+                7.3,  # epsilon
+
+                (  # group
+
+                    "Tests/images/tiff_gray_2_4_bpp/hopper4.tif",
+
+                    "Tests/images/tiff_gray_2_4_bpp/hopper4I.tif",
+
+                    "Tests/images/tiff_gray_2_4_bpp/hopper4R.tif",
+
+                    "Tests/images/tiff_gray_2_4_bpp/hopper4IR.tif",
+
+                ),
+
+            ),
+
+        )
+
+        original = hopper("L")
+
+        for epsilon, group in test_files:
+
+            im = Image.open(group[0])
+
+            self.assertEqual(im.size, (128, 128))
+
+            self.assertEqual(im.mode, "L")
+
+            self.assert_image_similar(im, original, epsilon)
+
+            for file in group[1:]:
+
+                im2 = Image.open(file)
+
+                self.assertEqual(im2.size, (128, 128))
+
+                self.assertEqual(im2.mode, "L")
+
+                self.assert_image_equal(im, im2)
+
+
+
+    def test_save_bytesio(self):
+
+        # PR 1011
+
+        # Test TIFF saving to io.BytesIO() object.
+
+
+
+        TiffImagePlugin.WRITE_LIBTIFF = True
+
+        TiffImagePlugin.READ_LIBTIFF = True
+
+
+
+        # Generate test image
+
+        pilim = hopper()
+
+
+
+        def save_bytesio(compression=None):
+
+
+
+            buffer_io = io.BytesIO()
+
+            pilim.save(buffer_io, format="tiff", compression=compression)
+
+            buffer_io.seek(0)
+
+
+
+            pilim_load = Image.open(buffer_io)
+
+            self.assert_image_similar(pilim, pilim_load, 0)
+
+
+
+        save_bytesio()
+
+        save_bytesio("raw")
+
+        save_bytesio("packbits")
+
+        save_bytesio("tiff_lzw")
+
+
+
+        TiffImagePlugin.WRITE_LIBTIFF = False
+
+        TiffImagePlugin.READ_LIBTIFF = False
+
+
+
+    def test_crashing_metadata(self):
+
+        # issue 1597
+
+        im = Image.open("Tests/images/rdf.tif")
+
+        out = self.tempfile("temp.tif")
+
+
+
+        TiffImagePlugin.WRITE_LIBTIFF = True
+
+        # this shouldn't crash
+
+        im.save(out, format="TIFF")
+
+        TiffImagePlugin.WRITE_LIBTIFF = False
+
+
+
+    def test_page_number_x_0(self):
+
+        # Issue 973
+
+        # Test TIFF with tag 297 (Page Number) having value of 0 0.
+
+        # The first number is the current page number.
+
+        # The second is the total number of pages, zero means not available.
+
+        outfile = self.tempfile("temp.tif")
+
+        # Created by printing a page in Chrome to PDF, then:
+
+        # /usr/bin/gs -q -sDEVICE=tiffg3 -sOutputFile=total-pages-zero.tif
+
+        # -dNOPAUSE /tmp/test.pdf -c quit
+
+        infile = "Tests/images/total-pages-zero.tif"
+
+        im = Image.open(infile)
+
+        # Should not divide by zero
+
+        im.save(outfile)
+
+
+
+    def test_fd_duplication(self):
+
+        # https://github.com/python-pillow/Pillow/issues/1651
+
+
+
+        tmpfile = self.tempfile("temp.tif")
+
+        with open(tmpfile, "wb") as f:
+
+            with open("Tests/images/g4-multi.tiff", "rb") as src:
+
+                f.write(src.read())
+
+
+
+        im = Image.open(tmpfile)
+
+        im.n_frames
+
+        im.close()
+
+        # Should not raise PermissionError.
+
+        os.remove(tmpfile)
+
+
+
+    def test_read_icc(self):
+
+        with Image.open("Tests/images/hopper.iccprofile.tif") as img:
+
+            icc = img.info.get("icc_profile")
+
+            self.assertIsNotNone(icc)
+
+        TiffImagePlugin.READ_LIBTIFF = True
+
+        with Image.open("Tests/images/hopper.iccprofile.tif") as img:
+
+            icc_libtiff = img.info.get("icc_profile")
+
+            self.assertIsNotNone(icc_libtiff)
+
+        TiffImagePlugin.READ_LIBTIFF = False
+
+        self.assertEqual(icc, icc_libtiff)
+
+
+
+    def test_multipage_compression(self):
+
+        im = Image.open("Tests/images/compression.tif")
+
+
+
+        im.seek(0)
+
+        self.assertEqual(im._compression, "tiff_ccitt")
+
+        self.assertEqual(im.size, (10, 10))
+
+
+
+        im.seek(1)
+
+        self.assertEqual(im._compression, "packbits")
+
+        self.assertEqual(im.size, (10, 10))
+
+        im.load()
+
+
+
+        im.seek(0)
+
+        self.assertEqual(im._compression, "tiff_ccitt")
+
+        self.assertEqual(im.size, (10, 10))
+
+        im.load()
+
+
+
+    def test_save_tiff_with_jpegtables(self):
+
+        # Arrange
+
+        outfile = self.tempfile("temp.tif")
+
+
+
+        # Created with ImageMagick: convert hopper.jpg hopper_jpg.tif
+
+        # Contains JPEGTables (347) tag
+
+        infile = "Tests/images/hopper_jpg.tif"
+
+        im = Image.open(infile)
+
+
+
+        # Act / Assert
+
+        # Should not raise UnicodeDecodeError or anything else
+
+        im.save(outfile)
+
+
+
+    def test_16bit_RGB_tiff(self):
+
+        im = Image.open("Tests/images/tiff_16bit_RGB.tiff")
+
+
+
+        self.assertEqual(im.mode, "RGB")
+
+        self.assertEqual(im.size, (100, 40))
+
+        self.assertEqual(
+
+            im.tile,
+
+            [
+
+                (
+
+                    "libtiff",
+
+                    (0, 0, 100, 40),
+
+                    0,
+
+                    ("RGB;16N", "tiff_adobe_deflate", False, 8),
+
+                )
+
+            ],
+
+        )
+
+        im.load()
+
+
+
+        self.assert_image_equal_tofile(im, "Tests/images/tiff_16bit_RGB_target.png")
+
+
+
+    def test_16bit_RGBa_tiff(self):
+
+        im = Image.open("Tests/images/tiff_16bit_RGBa.tiff")
+
+
+
+        self.assertEqual(im.mode, "RGBA")
+
+        self.assertEqual(im.size, (100, 40))
+
+        self.assertEqual(
+
+            im.tile,
+
+            [("libtiff", (0, 0, 100, 40), 0, ("RGBa;16N", "tiff_lzw", False, 38236))],
+
+        )
+
+        im.load()
+
+
+
+        self.assert_image_equal_tofile(im, "Tests/images/tiff_16bit_RGBa_target.png")
+
+
+
+    def test_gimp_tiff(self):
+
+        # Read TIFF JPEG images from GIMP [@PIL168]
+
+
+
+        codecs = dir(Image.core)
+
+        if "jpeg_decoder" not in codecs:
+
+            self.skipTest("jpeg support not available")
+
+
+
+        filename = "Tests/images/pil168.tif"
+
+        im = Image.open(filename)
+
+
+
+        self.assertEqual(im.mode, "RGB")
+
+        self.assertEqual(im.size, (256, 256))
+
+        self.assertEqual(
+
+            im.tile, [("libtiff", (0, 0, 256, 256), 0, ("RGB", "jpeg", False, 5122))]
+
+        )
+
+        im.load()
+
+
+
+        self.assert_image_equal_tofile(im, "Tests/images/pil168.png")
+
+
+
+    def test_sampleformat(self):
+
+        # https://github.com/python-pillow/Pillow/issues/1466
+
+        im = Image.open("Tests/images/copyleft.tiff")
+
+        self.assertEqual(im.mode, "RGB")
+
+
+
+        self.assert_image_equal_tofile(im, "Tests/images/copyleft.png", mode="RGB")
+
+
+
+    def test_lzw(self):
+
+        im = Image.open("Tests/images/hopper_lzw.tif")
+
+
+
+        self.assertEqual(im.mode, "RGB")
+
+        self.assertEqual(im.size, (128, 128))
+
+        self.assertEqual(im.format, "TIFF")
+
+        im2 = hopper()
+
+        self.assert_image_similar(im, im2, 5)
+
+
+
+    def test_strip_cmyk_jpeg(self):
+
+        infile = "Tests/images/tiff_strip_cmyk_jpeg.tif"
+
+        im = Image.open(infile)
+
+
+
+        self.assert_image_similar_tofile(im, "Tests/images/pil_sample_cmyk.jpg", 0.5)
+
+
+
+    def test_strip_cmyk_16l_jpeg(self):
+
+        infile = "Tests/images/tiff_strip_cmyk_16l_jpeg.tif"
+
+        im = Image.open(infile)
+
+
+
+        self.assert_image_similar_tofile(im, "Tests/images/pil_sample_cmyk.jpg", 0.5)
+
+
+
+    def test_strip_ycbcr_jpeg_2x2_sampling(self):
+
+        infile = "Tests/images/tiff_strip_ycbcr_jpeg_2x2_sampling.tif"
+
+        im = Image.open(infile)
+
+
+
+        self.assert_image_similar_tofile(im, "Tests/images/flower.jpg", 0.5)
+
+
+
+    def test_strip_ycbcr_jpeg_1x1_sampling(self):
+
+        infile = "Tests/images/tiff_strip_ycbcr_jpeg_1x1_sampling.tif"
+
+        im = Image.open(infile)
+
+
+
+        self.assert_image_equal_tofile(im, "Tests/images/flower2.jpg")
+
+
+
+    def test_tiled_cmyk_jpeg(self):
+
+        infile = "Tests/images/tiff_tiled_cmyk_jpeg.tif"
+
+        im = Image.open(infile)
+
+
+
+        self.assert_image_similar_tofile(im, "Tests/images/pil_sample_cmyk.jpg", 0.5)
+
+
+
+    def test_tiled_ycbcr_jpeg_1x1_sampling(self):
+
+        infile = "Tests/images/tiff_tiled_ycbcr_jpeg_1x1_sampling.tif"
+
+        im = Image.open(infile)
+
+
+
+        self.assert_image_equal_tofile(im, "Tests/images/flower2.jpg")
+
+
+
+    def test_tiled_ycbcr_jpeg_2x2_sampling(self):
+
+        infile = "Tests/images/tiff_tiled_ycbcr_jpeg_2x2_sampling.tif"
+
+        im = Image.open(infile)
+
+
+
+        self.assert_image_similar_tofile(im, "Tests/images/flower.jpg", 0.5)
+
+
+
+    def test_old_style_jpeg(self):
+
+        infile = "Tests/images/old-style-jpeg-compression.tif"
+
+        im = Image.open(infile)
+
+
+
+        self.assert_image_equal_tofile(
+
+            im, "Tests/images/old-style-jpeg-compression.png"
+
+        )
+
+
+
+    def test_no_rows_per_strip(self):
+
+        # This image does not have a RowsPerStrip TIFF tag
+
+        infile = "Tests/images/no_rows_per_strip.tif"
+
+        im = Image.open(infile)
+
+        im.load()
+
+        self.assertEqual(im.size, (950, 975))
+
+
+
+    def test_orientation(self):
+
+        base_im = Image.open("Tests/images/g4_orientation_1.tif")
+
+
+
+        for i in range(2, 9):
+
+            im = Image.open("Tests/images/g4_orientation_" + str(i) + ".tif")
+
+            im.load()
+
+
+
+            self.assert_image_similar(base_im, im, 0.7)
+
+
+
+    def test_sampleformat_not_corrupted(self):
+
+        # Assert that a TIFF image with SampleFormat=UINT tag is not corrupted
+
+        # when saving to a new file.
+
+        # Pillow 6.0 fails with "OSError: cannot identify image file".
+
+        import base64
+
+
+
+        tiff = io.BytesIO(
+
+            base64.b64decode(
+
+                b"SUkqAAgAAAAPAP4ABAABAAAAAAAAAAABBAABAAAAAQAAAAEBBAABAAAAAQAA"
+
+                b"AAIBAwADAAAAwgAAAAMBAwABAAAACAAAAAYBAwABAAAAAgAAABEBBAABAAAA"
+
+                b"4AAAABUBAwABAAAAAwAAABYBBAABAAAAAQAAABcBBAABAAAACwAAABoBBQAB"
+
+                b"AAAAyAAAABsBBQABAAAA0AAAABwBAwABAAAAAQAAACgBAwABAAAAAQAAAFMB"
+
+                b"AwADAAAA2AAAAAAAAAAIAAgACAABAAAAAQAAAAEAAAABAAAAAQABAAEAAAB4"
+
+                b"nGNgYAAAAAMAAQ=="
+
+            )
+
+        )
+
+        out = io.BytesIO()
+
+        with Image.open(tiff) as im:
+
+            im.save(out, format="tiff")
+
+        out.seek(0)
+
+        with Image.open(out) as im:
+
+            im.load()

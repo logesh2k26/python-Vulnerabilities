@@ -2,172 +2,398 @@
 # Safety: safe
 # Category: safe
 
-#
+###
 
-# gravatars.py -- Decorational template tags
+# Copyright (c) 2002-2004, Jeremiah Fincher
 
-#
+# Copyright (c) 2008, James McCoy
 
-# Copyright (c) 2008-2009  Christian Hammond
-
-#
-
-# Permission is hereby granted, free of charge, to any person obtaining
-
-# a copy of this software and associated documentation files (the
-
-# "Software"), to deal in the Software without restriction, including
-
-# without limitation the rights to use, copy, modify, merge, publish,
-
-# distribute, sublicense, and/or sell copies of the Software, and to
-
-# permit persons to whom the Software is furnished to do so, subject to
-
-# the following conditions:
+# All rights reserved.
 
 #
 
-# The above copyright notice and this permission notice shall be included
+# Redistribution and use in source and binary forms, with or without
 
-# in all copies or substantial portions of the Software.
+# modification, are permitted provided that the following conditions are met:
 
 #
 
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+#   * Redistributions of source code must retain the above copyright notice,
 
-# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+#     this list of conditions, and the following disclaimer.
 
-# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+#   * Redistributions in binary form must reproduce the above copyright notice,
 
-# IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+#     this list of conditions, and the following disclaimer in the
 
-# CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+#     documentation and/or other materials provided with the distribution.
 
-# TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+#   * Neither the name of the author of this software nor the name of
 
-# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#     contributors to this software may be used to endorse or promote products
 
+#     derived from this software without specific prior written consent.
 
+#
 
-from __future__ import unicode_literals
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
 
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
 
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
 
-from django import template
+# ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
 
-from django.utils.html import format_html
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
 
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
 
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
 
-from djblets.gravatars import (get_gravatar_url,
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
 
-                               get_gravatar_url_for_email)
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 
-from djblets.util.decorators import basictag
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 
+# POSSIBILITY OF SUCH DAMAGE.
 
+###
 
 
 
-register = template.Library()
+from __future__ import print_function
 
 
 
+from supybot.test import *
 
 
-@register.tag
 
-@basictag(takes_context=True)
+class MathTestCase(PluginTestCase):
 
-def gravatar(context, user, size=None):
+    plugins = ('Math',)
 
-    """
+    def testBase(self):
 
-    Outputs the HTML for displaying a user's gravatar.
+        self.assertNotRegexp('base 56 asdflkj', 'ValueError')
 
+        self.assertResponse('base 16 2 F', '1111')
 
+        self.assertResponse('base 2 16 1111', 'F')
 
-    This can take an optional size of the image (defaults to 80 if not
+        self.assertResponse('base 20 BBBB', '92631')
 
-    specified).
+        self.assertResponse('base 10 20 92631', 'BBBB')
 
+        self.assertResponse('base 2 36 10', '2')
 
+        self.assertResponse('base 36 2 10', '100100')
 
-    This is also influenced by the following settings:
+        self.assertResponse('base 2 1010101', '85')
 
+        self.assertResponse('base 2 2 11', '11')
 
 
-        GRAVATAR_SIZE    - Default size for gravatars
 
-        GRAVATAR_RATING  - Maximum allowed rating (g, pg, r, x)
+        self.assertResponse('base 12 0', '0')
 
-        GRAVATAR_DEFAULT - Default image set to show if the user hasn't
+        self.assertResponse('base 36 2 0', '0')
 
-                           specified a gravatar (identicon, monsterid, wavatar)
 
 
 
-    See http://www.gravatar.com/ for more information.
 
-    """
+        self.assertNotError("base 36 " +\
 
-    url = get_gravatar_url(context['request'], user, size)
+            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"\
 
+            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"\
 
+            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"\
 
-    if url:
+            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"\
 
-        return format_html(
+            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"\
 
-            '<img src="{0}" width="{1}" height="{1}" alt="{2}" '
+            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"\
 
-            'class="gravatar"/>',
+            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ")
 
-            url, size, user.get_full_name() or user.username)
 
-    else:
 
-        return ''
+        self.assertResponse("base 10 36 [base 36 " +\
 
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"\
 
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"\
 
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"\
 
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"\
 
-@register.tag
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"\
 
-@basictag(takes_context=True)
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"\
 
-def gravatar_url(context, email, size=None):
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz]",
 
-    """
 
-    Outputs the URL for a gravatar for the given email address.
 
+            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"\
 
+            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"\
 
-    This can take an optional size of the image (defaults to 80 if not
+            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"\
 
-    specified).
+            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"\
 
+            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"\
 
+            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"\
 
-    This is also influenced by the following settings:
+            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ")
 
 
 
-        GRAVATAR_SIZE    - Default size for gravatars
+        self.assertResponse('base 2 10 [base 10 2 12]', '12')
 
-        GRAVATAR_RATING  - Maximum allowed rating (g, pg, r, x)
+        self.assertResponse('base 16 2 [base 2 16 110101]', '110101')
 
-        GRAVATAR_DEFAULT - Default image set to show if the user hasn't
+        self.assertResponse('base 10 8 [base 8 76532]', '76532')
 
-                           specified a gravatar (identicon, monsterid, wavatar)
+        self.assertResponse('base 10 36 [base 36 csalnwea]', 'CSALNWEA')
 
+        self.assertResponse('base 5 4 [base 4 5 212231]', '212231')
 
 
-    See http://www.gravatar.com/ for more information.
 
-    """
+        self.assertError('base 37 1')
 
-    return get_gravatar_url_for_email(context['request'], email, size)
+        self.assertError('base 1 1')
+
+        self.assertError('base 12 1 1')
+
+        self.assertError('base 1 12 1')
+
+        self.assertError('base 1.0 12 1')
+
+        self.assertError('base A 1')
+
+
+
+        self.assertError('base 4 4')
+
+        self.assertError('base 10 12 A')
+
+
+
+        self.assertRegexp('base 2 10 [base 10 2 -12]', '-12')
+
+        self.assertRegexp('base 16 2 [base 2 16 -110101]', '-110101')
+
+
+
+    def testCalc(self):
+
+        self.assertResponse('calc 5*0.06', str(5*0.06))
+
+        self.assertResponse('calc 2.0-7.0', str(2-7))
+
+        self.assertResponse('calc e**(i*pi)+1', '0')
+
+        if minisix.PY3:
+
+            # Python 2 has bad handling of exponentiation of negative numbers
+
+            self.assertResponse('calc (-1)**.5', 'i')
+
+            self.assertRegexp('calc (-5)**.5', '2.236067977[0-9]+i')
+
+            self.assertRegexp('calc -((-5)**.5)', '-2.236067977[0-9]+i')
+
+        self.assertNotRegexp('calc [9, 5] + [9, 10]', 'TypeError')
+
+        self.assertError('calc [9, 5] + [9, 10]')
+
+        self.assertNotError('calc degrees(2)')
+
+        self.assertNotError('calc (2 * 3) - 2*(3*4)')
+
+        self.assertNotError('calc (3) - 2*(3*4)')
+
+        self.assertNotError('calc (1600 * 1200) - 2*(1024*1280)')
+
+        self.assertNotError('calc 3-2*4')
+
+        self.assertNotError('calc (1600 * 1200)-2*(1024*1280)')
+
+        self.assertError('calc factorial(20000)')
+
+
+
+    def testCalcNoNameError(self):
+
+        self.assertRegexp('calc foobar(x)', 'foobar is not a defined function')
+
+
+
+    def testCalcInvalidNode(self):
+
+        self.assertRegexp('calc {"foo": "bar"}', 'Illegal construct Dict')
+
+
+
+    def testCalcImaginary(self):
+
+        self.assertResponse('calc 3 + sqrt(-1)', '3+i')
+
+
+
+    def testCalcFloorWorksWithSqrt(self):
+
+        self.assertNotError('calc floor(sqrt(5))')
+
+
+
+    def testCaseInsensitive(self):
+
+        self.assertNotError('calc PI**PI')
+
+
+
+    def testCalcMaxMin(self):
+
+        self.assertResponse('calc max(1,2)', '2')
+
+        self.assertResponse('calc min(1,2)', '1')
+
+
+
+    def testCalcStrFloat(self):
+
+        self.assertResponse('calc 3+33333333333333', '33333333333336')
+
+
+
+    def testICalc(self):
+
+        self.assertResponse('icalc 1^1', '0')
+
+        self.assertResponse('icalc 10**24', '1' + '0'*24)
+
+        self.assertRegexp('icalc 49/6', '8.16')
+
+        self.assertNotError('icalc factorial(20000)')
+
+
+
+    def testRpn(self):
+
+        self.assertResponse('rpn 5 2 +', '7')
+
+        self.assertResponse('rpn 1 2 3 +', 'Stack: [1, 5]')
+
+        self.assertResponse('rpn 1 dup', 'Stack: [1, 1]')
+
+        self.assertResponse('rpn 2 3 4 + -', str(2-7))
+
+        self.assertNotError('rpn 2 degrees')
+
+
+
+    def testRpnSwap(self):
+
+        self.assertResponse('rpn 1 2 swap', 'Stack: [2, 1]')
+
+
+
+    def testRpmNoSyntaxError(self):
+
+        self.assertNotRegexp('rpn 2 3 foobar', 'SyntaxError')
+
+
+
+    def testConvert(self):
+
+        self.assertResponse('convert 1 m to cm', '100')
+
+        self.assertResponse('convert m to cm', '100')
+
+        self.assertResponse('convert 3 metres to km', '0.003')
+
+        self.assertResponse('convert 32 F to C', '0')
+
+        self.assertResponse('convert 32 C to F', '89.6')
+
+        self.assertResponse('convert [calc 2*pi] rad to degree', '360')
+
+        self.assertResponse('convert amu to atomic mass unit',
+
+                            '1')
+
+        self.assertResponse('convert [calc 2*pi] rad to circle', '1')
+
+
+
+
+
+
+
+        self.assertError('convert 1 meatball to bananas')
+
+        self.assertError('convert 1 gram to meatballs')
+
+        self.assertError('convert 1 mol to grams')
+
+        self.assertError('convert 1 m to kpa')
+
+
+
+    def testConvertSingularPlural(self):
+
+        self.assertResponse('convert [calc 2*pi] rads to degrees', '360')
+
+        self.assertResponse('convert 1 carat to grams', '0.2')
+
+        self.assertResponse('convert 10 lbs to oz', '160')
+
+        self.assertResponse('convert mA to amps', '0.001')
+
+
+
+    def testConvertCaseSensitivity(self):
+
+        self.assertError('convert MA to amps')
+
+        self.assertError('convert M to amps')
+
+        self.assertError('convert Radians to rev')
+
+
+
+    def testUnits(self):
+
+        self.assertNotError('units')
+
+        self.assertNotError('units mass')
+
+        self.assertNotError('units flux density')
+
+
+
+    def testAbs(self):
+
+        self.assertResponse('calc abs(2)', '2')
+
+        self.assertResponse('calc abs(-2)', '2')
+
+        self.assertResponse('calc abs(2.0)', '2')
+
+        self.assertResponse('calc abs(-2.0)', '2')
+
+
+
+
+
+# vim:set shiftwidth=4 softtabstop=4 expandtab textwidth=79:

@@ -1,445 +1,359 @@
 # Source: CVEFixes dataset
-# Safety: safe
+# Safety: vulnerable
 # Category: safe
 
-# -*- coding: utf-8 -*-
+#     Copyright 2014 Netflix, Inc.
 
-from wagtail.core.models import Page
+#
 
-from wagtail.tests.testapp.models import (
+#     Licensed under the Apache License, Version 2.0 (the "License");
 
-    FormField, FormFieldWithCustomSubmission, FormPage, FormPageWithCustomSubmission,
+#     you may not use this file except in compliance with the License.
 
-    FormPageWithRedirect, RedirectFormField)
+#     You may obtain a copy of the License at
 
+#
 
+#         http://www.apache.org/licenses/LICENSE-2.0
 
+#
 
+#     Unless required by applicable law or agreed to in writing, software
 
-def make_form_page(**kwargs):
+#     distributed under the License is distributed on an "AS IS" BASIS,
 
-    kwargs.setdefault('title', "Contact us")
+#     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 
-    kwargs.setdefault('slug', "contact-us")
+#     See the License for the specific language governing permissions and
 
-    kwargs.setdefault('to_address', "to@email.com")
+#     limitations under the License.
 
-    kwargs.setdefault('from_address', "from@email.com")
 
-    kwargs.setdefault('subject', "The subject")
 
+from security_monkey import app, db
 
+from flask_wtf.csrf import generate_csrf
 
-    home_page = Page.objects.get(url_path='/home/')
+from security_monkey.auth.models import RBACRole
 
-    form_page = home_page.add_child(instance=FormPage(**kwargs))
+from security_monkey.decorators import crossdomain
 
 
 
-    FormField.objects.create(
+from flask_restful import fields, marshal, Resource, reqparse
 
-        page=form_page,
+from flask_login import current_user
 
-        sort_order=1,
 
-        label="Your email",
 
-        field_type='email',
+ORIGINS = [
 
-        required=True,
+    'https://{}:{}'.format(app.config.get('FQDN'), app.config.get('WEB_PORT')),
 
-    )
+    # Adding this next one so you can also access the dart UI by prepending /static to the path.
 
-    FormField.objects.create(
+    'https://{}:{}'.format(app.config.get('FQDN'), app.config.get('API_PORT')),
 
-        page=form_page,
+    'https://{}:{}'.format(app.config.get('FQDN'), app.config.get('NGINX_PORT')),
 
-        sort_order=2,
+    'https://{}:80'.format(app.config.get('FQDN'))
 
-        label="Your message",
+]
 
-        field_type='multiline',
 
-        required=True,
 
-        help_text="<em>please</em> be polite"
+##### Marshal Datastructures #####
 
-    )
 
-    FormField.objects.create(
 
-        page=form_page,
+# Used by RevisionGet, RevisionList, ItemList
 
-        sort_order=3,
+REVISION_FIELDS = {
 
-        label="Your choices",
+    'id': fields.Integer,
 
-        field_type='checkboxes',
+    'date_created': fields.String,
 
-        required=False,
+    'date_last_ephemeral_change': fields.String,
 
-        choices='foo,bar,baz',
+    'active': fields.Boolean,
 
-    )
+    'item_id': fields.Integer
 
+}
 
 
-    return form_page
 
+# Used by RevisionList, ItemGet, ItemList
 
+ITEM_FIELDS = {
 
+    'id': fields.Integer,
 
+    'region': fields.String,
 
-def make_form_page_with_custom_submission(**kwargs):
+    'name': fields.String
 
-    kwargs.setdefault('title', "Contact us")
+}
 
-    kwargs.setdefault('intro', "<p>Boring intro text</p>")
 
-    kwargs.setdefault('thank_you_text', "<p>Thank you for your patience!</p>")
 
-    kwargs.setdefault('slug', "contact-us")
+# Used by ItemList, Justify
 
-    kwargs.setdefault('to_address', "to@email.com")
+AUDIT_FIELDS = {
 
-    kwargs.setdefault('from_address', "from@email.com")
+    'id': fields.Integer,
 
-    kwargs.setdefault('subject', "The subject")
+    'score': fields.Integer,
 
+    'issue': fields.String,
 
+    'notes': fields.String,
 
-    home_page = Page.objects.get(url_path='/home/')
+    'justified': fields.Boolean,
 
-    form_page = home_page.add_child(instance=FormPageWithCustomSubmission(**kwargs))
+    'justification': fields.String,
 
+    'justified_date': fields.String,
 
+    'item_id': fields.Integer
 
-    FormFieldWithCustomSubmission.objects.create(
+}
 
-        page=form_page,
 
-        sort_order=1,
 
-        label="Your email",
+## Single Use Marshal Objects ##
 
-        field_type='email',
 
-        required=True,
 
-    )
+# SINGLE USE - RevisionGet
 
-    FormFieldWithCustomSubmission.objects.create(
+REVISION_COMMENT_FIELDS = {
 
-        page=form_page,
+    'id': fields.Integer,
 
-        sort_order=2,
+    'revision_id': fields.Integer,
 
-        label="Your message",
+    'date_created': fields.String,
 
-        field_type='multiline',
+    'text': fields.String
 
-        required=True,
+}
 
-    )
 
-    FormFieldWithCustomSubmission.objects.create(
 
-        page=form_page,
+# SINGLE USE - ItemGet
 
-        sort_order=3,
+ITEM_COMMENT_FIELDS = {
 
-        label="Your choices",
+    'id': fields.Integer,
 
-        field_type='checkboxes',
+    'date_created': fields.String,
 
-        required=False,
+    'text': fields.String,
 
-        choices='foo,bar,baz',
+    'item_id': fields.Integer
 
-    )
+}
 
 
 
-    return form_page
+# SINGLE USE - UserSettings
 
+USER_SETTINGS_FIELDS = {
 
+    # 'id': fields.Integer,
 
+    'daily_audit_email': fields.Boolean,
 
+    'change_reports': fields.String
 
-def make_form_page_with_redirect(**kwargs):
+}
 
-    kwargs.setdefault('title', "Contact us")
 
-    kwargs.setdefault('slug', "contact-us")
 
-    kwargs.setdefault('to_address', "to@email.com")
+# SINGLE USE - AccountGet
 
-    kwargs.setdefault('from_address', "from@email.com")
+ACCOUNT_FIELDS = {
 
-    kwargs.setdefault('subject', "The subject")
+    'id': fields.Integer,
 
+    'name': fields.String,
 
+    'identifier': fields.String,
 
+    'notes': fields.String,
 
+    'active': fields.Boolean,
 
-    home_page = Page.objects.get(url_path='/home/')
+    'third_party': fields.Boolean,
 
-    kwargs.setdefault('thank_you_redirect_page', home_page)
+    'account_type': fields.String
 
-    form_page = home_page.add_child(instance=FormPageWithRedirect(**kwargs))
+}
 
-    # form_page.thank_you_redirect_page = home_page
 
 
+USER_FIELDS = {
 
-    RedirectFormField.objects.create(
+    'id': fields.Integer,
 
-        page=form_page,
+    'active': fields.Boolean,
 
-        sort_order=1,
+    'email': fields.String,
 
-        label="Your email",
+    'role': fields.String,
 
-        field_type='email',
+    'confirmed_at': fields.String,
 
-        required=True,
+    'daily_audit_email': fields.Boolean,
 
-    )
+    'change_reports': fields.String,
 
-    RedirectFormField.objects.create(
+    'last_login_at': fields.String,
 
-        page=form_page,
+    'current_login_at': fields.String,
 
-        sort_order=2,
+    'login_count': fields.Integer,
 
-        label="Your message",
+    'last_login_ip': fields.String,
 
-        field_type='multiline',
+    'current_login_ip': fields.String
 
-        required=True,
+}
 
-    )
 
-    RedirectFormField.objects.create(
 
-        page=form_page,
+ROLE_FIELDS = {
 
-        sort_order=3,
+    'id': fields.Integer,
 
-        label="Your choices",
+    'name': fields.String,
 
-        field_type='checkboxes',
+    'description': fields.String,
 
-        required=False,
+}
 
-        choices='foo,bar,baz',
 
-    )
 
+WHITELIST_FIELDS = {
 
+    'id': fields.Integer,
 
-    return form_page
+    'name': fields.String,
 
+    'notes': fields.String,
 
+    'cidr': fields.String
 
+}
 
 
-def make_types_test_form_page(**kwargs):
 
-    kwargs.setdefault('title', "Contact us")
+IGNORELIST_FIELDS = {
 
-    kwargs.setdefault('slug', "contact-us")
+    'id': fields.Integer,
 
-    kwargs.setdefault('to_address', "to@email.com")
+    'prefix': fields.String,
 
-    kwargs.setdefault('from_address', "from@email.com")
+    'notes': fields.String,
 
-    kwargs.setdefault('subject', "The subject")
+}
 
 
 
-    home_page = Page.objects.get(url_path='/home/')
+AUDITORSETTING_FIELDS = {
 
-    form_page = home_page.add_child(instance=FormPage(**kwargs))
+    'id': fields.Integer,
 
+    'disabled': fields.Boolean,
 
+    'issue_text': fields.String
 
-    FormField.objects.create(
+}
 
-        page=form_page,
 
-        sort_order=1,
 
-        label="Single line text",
+ITEM_LINK_FIELDS = {
 
-        field_type='singleline',
+    'id': fields.Integer,
 
-        required=False,
+    'name': fields.String
 
-    )
+}
 
-    FormField.objects.create(
 
-        page=form_page,
 
-        sort_order=2,
+class AuthenticatedService(Resource):
 
-        label="Multiline",
+    def __init__(self):
 
-        field_type='multiline',
+        self.reqparse = reqparse.RequestParser()
 
-        required=False,
+        super(AuthenticatedService, self).__init__()
 
-    )
+        self.auth_dict = dict()
 
-    FormField.objects.create(
+        if current_user.is_authenticated():
 
-        page=form_page,
+            roles_marshal = []
 
-        sort_order=3,
+            for role in current_user.roles:
 
-        label="Email",
+                roles_marshal.append(marshal(role.__dict__, ROLE_FIELDS))
 
-        field_type='email',
 
-        required=False,
 
-    )
+            roles_marshal.append({"name": current_user.role})
 
-    FormField.objects.create(
 
-        page=form_page,
 
-        sort_order=4,
+            for role in RBACRole.roles[current_user.role].get_parents():
 
-        label="Number",
+                roles_marshal.append({"name": role.name})
 
-        field_type='number',
 
-        required=False,
 
-    )
+            self.auth_dict = {
 
-    FormField.objects.create(
+                "authenticated": True,
 
-        page=form_page,
+                "user": current_user.email,
 
-        sort_order=5,
+                "roles": roles_marshal
 
-        label="URL",
+            }
 
-        field_type='url',
+        else:
 
-        required=False,
+            if app.config.get('FRONTED_BY_NGINX'):
 
-    )
+                url = "https://{}:{}{}".format(app.config.get('FQDN'), app.config.get('NGINX_PORT'), '/login')
 
-    FormField.objects.create(
+            else:
 
-        page=form_page,
+                url = "http://{}:{}{}".format(app.config.get('FQDN'), app.config.get('API_PORT'), '/login')
 
-        sort_order=6,
+            self.auth_dict = {
 
-        label="Checkbox",
+                "authenticated": False,
 
-        field_type='checkbox',
+                "user": None,
 
-        required=False,
+                "url": url
 
-    )
+            }
 
-    FormField.objects.create(
 
-        page=form_page,
 
-        sort_order=7,
 
-        label="Checkboxes",
 
-        field_type='checkboxes',
+@app.after_request
 
-        required=False,
+@crossdomain(allowed_origins=ORIGINS)
 
-        choices='foo,bar,baz',
+def after(response):
 
-    )
+    response.set_cookie('XSRF-COOKIE', generate_csrf())
 
-    FormField.objects.create(
-
-        page=form_page,
-
-        sort_order=8,
-
-        label="Drop down",
-
-        field_type='dropdown',
-
-        required=False,
-
-        choices='spam,ham,eggs',
-
-    )
-
-    FormField.objects.create(
-
-        page=form_page,
-
-        sort_order=9,
-
-        label="Multiple select",
-
-        field_type='multiselect',
-
-        required=False,
-
-        choices='qux,quux,quuz,corge',
-
-    )
-
-    FormField.objects.create(
-
-        page=form_page,
-
-        sort_order=10,
-
-        label="Radio buttons",
-
-        field_type='radio',
-
-        required=False,
-
-        choices='wibble,wobble,wubble',
-
-    )
-
-    FormField.objects.create(
-
-        page=form_page,
-
-        sort_order=11,
-
-        label="Date",
-
-        field_type='date',
-
-        required=False,
-
-    )
-
-    FormField.objects.create(
-
-        page=form_page,
-
-        sort_order=12,
-
-        label="Datetime",
-
-        field_type='datetime',
-
-        required=False,
-
-    )
-
-
-
-    return form_page
+    return response

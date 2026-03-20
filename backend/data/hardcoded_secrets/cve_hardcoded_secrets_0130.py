@@ -2,1030 +2,1504 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-from __future__ import unicode_literals
+# -*- coding: utf-8 -*-
+
+"""
+
+    test_common
+
+    ~~~~~~~~~~~
+
+
+
+    Test common functionality
+
+
+
+    :copyright: (c) 2019 by J. Christopher Wagner (jwag).
+
+    :license: MIT, see LICENSE for more details.
+
+"""
 
 
 
 import base64
 
-import binascii
+import json
 
-import hashlib
-
-import importlib
-
-from collections import OrderedDict
+import pytest
 
 
 
-from django.conf import settings
+from flask import Blueprint
 
-from django.core.exceptions import ImproperlyConfigured
 
-from django.core.signals import setting_changed
 
-from django.dispatch import receiver
+from utils import (
 
-from django.utils import lru_cache
+    authenticate,
 
-from django.utils.crypto import (
+    json_authenticate,
 
-    constant_time_compare, get_random_string, pbkdf2,
+    get_num_queries,
+
+    logout,
+
+    populate_data,
+
+    verify_token,
 
 )
 
-from django.utils.encoding import force_bytes, force_str, force_text
-
-from django.utils.module_loading import import_string
-
-from django.utils.translation import ugettext_noop as _
 
 
+try:
 
-UNUSABLE_PASSWORD_PREFIX = '!'  # This will never be a valid encoded hash
+    from cookielib import Cookie
 
-UNUSABLE_PASSWORD_SUFFIX_LENGTH = 40  # number of random chars to add after UNUSABLE_PASSWORD_PREFIX
+except ImportError:
+
+    from http.cookiejar import Cookie
 
 
 
 
 
-def is_password_usable(encoded):
+def test_login_view(client):
 
-    if encoded is None or encoded.startswith(UNUSABLE_PASSWORD_PREFIX):
+    response = client.get("/login")
 
-        return False
-
-    try:
-
-        identify_hasher(encoded)
-
-    except ValueError:
-
-        return False
-
-    return True
+    assert b"<h1>Login</h1>" in response.data
 
 
 
 
 
-def check_password(password, encoded, setter=None, preferred='default'):
+def test_authenticate(client):
+
+    response = authenticate(client)
+
+    assert response.status_code == 302
+
+    response = authenticate(client, follow_redirects=True)
+
+    assert b"Welcome matt@lp.com" in response.data
+
+
+
+
+
+def test_authenticate_with_next(client):
+
+    data = dict(email="matt@lp.com", password="password")
+
+    response = client.post("/login?next=/page1", data=data, follow_redirects=True)
+
+    assert b"Page 1" in response.data
+
+
+
+
+
+def test_authenticate_with_next_bp(app, client):
+
+    api = Blueprint("api", __name__)
+
+
+
+    @api.route("/info")
+
+    def info():
+
+        pass
+
+
+
+    app.register_blueprint(api, url_prefix="/api")
+
+    data = dict(email="matt@lp.com", password="password")
+
+    response = client.post("/login?next=api.info", data=data, follow_redirects=False)
+
+    assert response.status_code == 302
+
+    assert "api/info" in response.location
+
+
+
+
+
+def test_authenticate_with_invalid_next(client, get_message):
+
+    data = dict(email="matt@lp.com", password="password")
+
+    response = client.post("/login?next=http://google.com", data=data)
+
+    assert get_message("INVALID_REDIRECT") in response.data
+
+
+
+
+
+def test_authenticate_with_invalid_malformed_next(client, get_message):
+
+    data = dict(email="matt@lp.com", password="password")
+
+    response = client.post("/login?next=http:///google.com", data=data)
+
+    assert get_message("INVALID_REDIRECT") in response.data
+
+
+
+
+
+def test_authenticate_case_insensitive_email(app, client):
+
+    response = authenticate(client, "MATT@lp.com", follow_redirects=True)
+
+    assert b"Welcome matt@lp.com" in response.data
+
+
+
+
+
+def test_authenticate_with_invalid_input(client, get_message):
+
+    response = client.post(
+
+        "/login", data="{}", headers={"Content-Type": "application/json"}
+
+    )
+
+    assert get_message("EMAIL_NOT_PROVIDED") in response.data
+
+
+
+
+
+@pytest.mark.settings(post_login_view="/post_login")
+
+def test_get_already_authenticated(client):
+
+    response = authenticate(client, follow_redirects=True)
+
+    assert b"Welcome matt@lp.com" in response.data
+
+    response = client.get("/login", follow_redirects=True)
+
+    assert b"Post Login" in response.data
+
+
+
+
+
+@pytest.mark.settings(post_login_view="/post_login")
+
+def test_get_already_authenticated_next(client):
+
+    response = authenticate(client, follow_redirects=True)
+
+    assert b"Welcome matt@lp.com" in response.data
+
+    # This should NOT override post_login_view due to potential redirect loops.
+
+    response = client.get("/login?next=/page1", follow_redirects=True)
+
+    assert b"Post Login" in response.data
+
+
+
+
+
+@pytest.mark.settings(post_login_view="/post_login")
+
+def test_post_already_authenticated(client):
+
+    response = authenticate(client, follow_redirects=True)
+
+    assert b"Welcome matt@lp.com" in response.data
+
+    data = dict(email="matt@lp.com", password="password")
+
+    response = client.post("/login", data=data, follow_redirects=True)
+
+    assert b"Post Login" in response.data
+
+    # This should NOT override post_login_view due to potential redirect loops.
+
+    response = client.post("/login?next=/page1", data=data, follow_redirects=True)
+
+    assert b"Post Login" in response.data
+
+
+
+
+
+def test_login_form(client):
+
+    response = client.post("/login", data={"email": "matt@lp.com"})
+
+    assert b"matt@lp.com" in response.data
+
+
+
+
+
+def test_unprovided_username(client, get_message):
+
+    response = authenticate(client, "")
+
+    assert get_message("EMAIL_NOT_PROVIDED") in response.data
+
+
+
+
+
+def test_unprovided_password(client, get_message):
+
+    response = authenticate(client, password="")
+
+    assert get_message("PASSWORD_NOT_PROVIDED") in response.data
+
+
+
+
+
+def test_invalid_user(client, get_message):
+
+    response = authenticate(client, email="bogus@bogus.com")
+
+    assert get_message("USER_DOES_NOT_EXIST") in response.data
+
+
+
+
+
+def test_bad_password(client, get_message):
+
+    response = authenticate(client, password="bogus")
+
+    assert get_message("INVALID_PASSWORD") in response.data
+
+
+
+
+
+def test_inactive_user(client, get_message):
+
+    response = authenticate(client, "tiya@lp.com", "password")
+
+    assert get_message("DISABLED_ACCOUNT") in response.data
+
+
+
+
+
+def test_inactive_forbids(app, client, get_message):
+
+    """ Make sure that existing session doesn't work after
+
+    user marked inactive
 
     """
 
-    Returns a boolean of whether the raw password matches the three
+    response = authenticate(client, follow_redirects=True)
 
-    part encoded digest.
+    assert response.status_code == 200
 
+    # make sure can access restricted page
 
+    response = client.get("/profile", follow_redirects=True)
 
-    If setter is specified, it'll be called when you need to
-
-    regenerate the password.
-
-    """
-
-    if password is None or not is_password_usable(encoded):
-
-        return False
+    assert b"Profile Page" in response.data
 
 
 
-    preferred = get_hasher(preferred)
+    # deactivate matt
 
-    hasher = identify_hasher(encoded)
+    with app.test_request_context("/"):
+
+        user = app.security.datastore.find_user(email="matt@lp.com")
+
+        app.security.datastore.deactivate_user(user)
+
+        app.security.datastore.commit()
 
 
 
-    must_update = hasher.algorithm != preferred.algorithm
+    response = client.get("/profile", follow_redirects=True)
 
-    if not must_update:
+    # should be thrown back to login page.
 
-        must_update = preferred.must_update(encoded)
+    assert response.status_code == 200
 
-    is_correct = hasher.verify(password, encoded)
-
-    if setter and is_correct and must_update:
-
-        setter(password)
-
-    return is_correct
+    assert b"Please log in to access this page" in response.data
 
 
 
 
 
-def make_password(password, salt=None, hasher='default'):
+@pytest.mark.settings(unauthorized_view=None)
 
-    """
+def test_inactive_forbids_token(app, client_nc, get_message):
 
-    Turn a plain-text password into a hash for database storage
+    """ Make sure that existing token doesn't work after
 
-
-
-    Same as encode() but generates a new random salt.
-
-    If password is None then a concatenation of
-
-    UNUSABLE_PASSWORD_PREFIX and a random string will be returned
-
-    which disallows logins. Additional random string reduces chances
-
-    of gaining access to staff or superuser accounts.
-
-    See ticket #20079 for more info.
+    user marked inactive
 
     """
 
-    if password is None:
+    response = json_authenticate(client_nc)
 
-        return UNUSABLE_PASSWORD_PREFIX + get_random_string(UNUSABLE_PASSWORD_SUFFIX_LENGTH)
+    assert response.status_code == 200
 
-    hasher = get_hasher(hasher)
+    token = response.json["response"]["user"]["authentication_token"]
 
+    headers = {"Authentication-Token": token}
 
+    # make sure can access restricted page
 
-    if not salt:
+    response = client_nc.get("/token", headers=headers)
 
-        salt = hasher.salt()
+    assert b"Token Authentication" in response.data
 
 
 
-    return hasher.encode(password, salt)
+    # deactivate matt
 
+    with app.test_request_context("/"):
 
+        user = app.security.datastore.find_user(email="matt@lp.com")
 
+        app.security.datastore.deactivate_user(user)
 
+        app.security.datastore.commit()
 
-@lru_cache.lru_cache()
 
-def get_hashers():
 
-    hashers = []
+    response = client_nc.get("/token", content_type="application/json", headers=headers)
 
-    for hasher_path in settings.PASSWORD_HASHERS:
+    assert response.status_code == 401
 
-        hasher_cls = import_string(hasher_path)
 
-        hasher = hasher_cls()
 
-        if not getattr(hasher, 'algorithm'):
 
-            raise ImproperlyConfigured("hasher doesn't specify an "
 
-                                       "algorithm name: %s" % hasher_path)
+def test_unset_password(client, get_message):
 
-        hashers.append(hasher)
+    response = authenticate(client, "jess@lp.com", "password")
 
-    return hashers
+    assert get_message("PASSWORD_NOT_SET") in response.data
 
 
 
 
 
-@lru_cache.lru_cache()
+def test_logout(client):
 
-def get_hashers_by_algorithm():
+    authenticate(client)
 
-    return {hasher.algorithm: hasher for hasher in get_hashers()}
+    response = logout(client, follow_redirects=True)
 
+    assert b"Home Page" in response.data
 
 
 
 
-@receiver(setting_changed)
 
-def reset_hashers(**kwargs):
+def test_logout_post(client):
 
-    if kwargs['setting'] == 'PASSWORD_HASHERS':
+    authenticate(client)
 
-        get_hashers.cache_clear()
+    response = client.post("/logout", content_type="application/json")
 
-        get_hashers_by_algorithm.cache_clear()
+    assert response.status_code == 200
 
+    assert response.json["meta"]["code"] == 200
 
 
 
 
-def get_hasher(algorithm='default'):
 
-    """
+def test_logout_with_next_invalid(client, get_message):
 
-    Returns an instance of a loaded password hasher.
+    authenticate(client)
 
+    response = client.get("/logout?next=http://google.com")
 
+    assert "google.com" not in response.location
 
-    If algorithm is 'default', the default hasher will be returned.
 
-    This function will also lazy import hashers specified in your
 
-    settings file if needed.
 
-    """
 
-    if hasattr(algorithm, 'algorithm'):
+def test_logout_with_next(client):
 
-        return algorithm
+    authenticate(client)
 
+    response = client.get("/logout?next=/page1", follow_redirects=True)
 
+    assert b"Page 1" in response.data
 
-    elif algorithm == 'default':
 
-        return get_hashers()[0]
 
 
 
-    else:
+def test_missing_session_access(client, get_message):
 
-        hashers = get_hashers_by_algorithm()
+    response = client.get("/profile", follow_redirects=True)
 
-        try:
+    assert get_message("LOGIN") in response.data
 
-            return hashers[algorithm]
 
-        except KeyError:
 
-            raise ValueError("Unknown password hashing algorithm '%s'. "
 
-                             "Did you specify it in the PASSWORD_HASHERS "
 
-                             "setting?" % algorithm)
+def test_has_session_access(client):
 
+    authenticate(client)
 
+    response = client.get("/profile", follow_redirects=True)
 
+    assert b"profile" in response.data
 
 
-def identify_hasher(encoded):
 
-    """
 
-    Returns an instance of a loaded password hasher.
 
+def test_authorized_access(client):
 
+    authenticate(client)
 
-    Identifies hasher algorithm by examining encoded hash, and calls
+    response = client.get("/admin")
 
-    get_hasher() to return hasher. Raises ValueError if
+    assert b"Admin Page" in response.data
 
-    algorithm cannot be identified, or if hasher is not loaded.
 
-    """
 
-    # Ancient versions of Django created plain MD5 passwords and accepted
 
-    # MD5 passwords with an empty salt.
 
-    if ((len(encoded) == 32 and '$' not in encoded) or
+def test_unauthorized_access(client, get_message):
 
-            (len(encoded) == 37 and encoded.startswith('md5$$'))):
+    authenticate(client, "joe@lp.com")
 
-        algorithm = 'unsalted_md5'
+    response = client.get("/admin", follow_redirects=True)
 
-    # Ancient versions of Django accepted SHA1 passwords with an empty salt.
+    assert response.status_code == 403
 
-    elif len(encoded) == 46 and encoded.startswith('sha1$$'):
 
-        algorithm = 'unsalted_sha1'
 
-    else:
 
-        algorithm = encoded.split('$', 1)[0]
 
-    return get_hasher(algorithm)
+@pytest.mark.settings(unauthorized_view=lambda: None)
 
+def test_unauthorized_access_with_referrer(client, get_message):
 
+    authenticate(client, "joe@lp.com")
 
+    response = client.get("/admin", headers={"referer": "/admin"})
 
+    assert response.headers["Location"] != "/admin"
 
-def mask_hash(hash, show=6, char="*"):
+    client.get(response.headers["Location"])
 
-    """
 
-    Returns the given hash, with only the first ``show`` number shown. The
 
-    rest are masked with ``char`` for security reasons.
+    response = client.get(
 
-    """
+        "/admin?a=b", headers={"referer": "http://localhost/admin?x=y"}
 
-    masked = hash[:show]
+    )
 
-    masked += char * len(hash[show:])
+    assert response.headers["Location"] == "http://localhost/"
 
-    return masked
+    client.get(response.headers["Location"])
 
 
 
+    response = client.get(
 
+        "/admin", headers={"referer": "/admin"}, follow_redirects=True
 
-class BasePasswordHasher(object):
+    )
 
-    """
+    assert response.data.count(get_message("UNAUTHORIZED")) == 1
 
-    Abstract base class for password hashers
 
 
+    # When referrer is from another path and unauthorized,
 
-    When creating your own hasher, you need to override algorithm,
+    # we expect a temp redirect (302) to the referer
 
-    verify(), encode() and safe_summary().
+    response = client.get("/admin?w=s", headers={"referer": "/profile"})
 
+    assert response.status_code == 302
 
+    assert response.headers["Location"] == "http://localhost/profile"
 
-    PasswordHasher objects are immutable.
 
-    """
 
-    algorithm = None
 
-    library = None
 
+@pytest.mark.settings(unauthorized_view="/unauthz")
 
+def test_roles_accepted(clients):
 
-    def _load_library(self):
+    # This specificaly tests that we can pass a URL for unauthorized_view.
 
-        if self.library is not None:
+    for user in ("matt@lp.com", "joe@lp.com"):
 
-            if isinstance(self.library, (tuple, list)):
+        authenticate(clients, user)
 
-                name, mod_path = self.library
+        response = clients.get("/admin_or_editor")
 
-            else:
+        assert b"Admin or Editor Page" in response.data
 
-                mod_path = self.library
+        logout(clients)
 
-            try:
 
-                module = importlib.import_module(mod_path)
 
-            except ImportError as e:
+    authenticate(clients, "jill@lp.com")
 
-                raise ValueError("Couldn't load %r algorithm library: %s" %
+    response = clients.get("/admin_or_editor", follow_redirects=True)
 
-                                 (self.__class__.__name__, e))
+    assert b"Unauthorized" in response.data
 
-            return module
 
-        raise ValueError("Hasher %r doesn't specify a library attribute" %
 
-                         self.__class__.__name__)
 
 
+@pytest.mark.settings(unauthorized_view="unauthz")
 
-    def salt(self):
+def test_permissions_accepted(clients):
 
-        """
+    for user in ("matt@lp.com", "joe@lp.com"):
 
-        Generates a cryptographically secure nonce salt in ASCII
+        authenticate(clients, user)
 
-        """
+        response = clients.get("/admin_perm")
 
-        return get_random_string()
+        assert b"Admin Page with full-write or super" in response.data
 
+        logout(clients)
 
 
-    def verify(self, password, encoded):
 
-        """
+    authenticate(clients, "jill@lp.com")
 
-        Checks if the given password is correct
+    response = clients.get("/admin_perm", follow_redirects=True)
 
-        """
+    assert b"Unauthorized" in response.data
 
-        raise NotImplementedError('subclasses of BasePasswordHasher must provide a verify() method')
 
 
 
-    def encode(self, password, salt):
 
-        """
+@pytest.mark.settings(unauthorized_view="unauthz")
 
-        Creates an encoded database value
+def test_permissions_required(clients):
 
+    for user in ["matt@lp.com"]:
 
+        authenticate(clients, user)
 
-        The result is normally formatted as "algorithm$salt$hash" and
+        response = clients.get("/admin_perm_required")
 
-        must be fewer than 128 characters.
+        assert b"Admin Page required" in response.data
 
-        """
+        logout(clients)
 
-        raise NotImplementedError('subclasses of BasePasswordHasher must provide an encode() method')
 
 
+    authenticate(clients, "joe@lp.com")
 
-    def safe_summary(self, encoded):
+    response = clients.get("/admin_perm_required", follow_redirects=True)
 
-        """
+    assert b"Unauthorized" in response.data
 
-        Returns a summary of safe values
 
 
 
-        The result is a dictionary and will be used where the password field
 
-        must be displayed to construct a safe representation of the password.
+@pytest.mark.settings(unauthorized_view="unauthz")
 
-        """
+def test_unauthenticated_role_required(client, get_message):
 
-        raise NotImplementedError('subclasses of BasePasswordHasher must provide a safe_summary() method')
+    response = client.get("/admin", follow_redirects=True)
 
+    assert get_message("UNAUTHORIZED") in response.data
 
 
-    def must_update(self, encoded):
 
-        return False
 
 
+@pytest.mark.settings(unauthorized_view="unauthz")
 
+def test_multiple_role_required(clients):
 
+    for user in ("matt@lp.com", "joe@lp.com"):
 
-class PBKDF2PasswordHasher(BasePasswordHasher):
+        authenticate(clients, user)
 
-    """
+        response = clients.get("/admin_and_editor", follow_redirects=True)
 
-    Secure password hashing using the PBKDF2 algorithm (recommended)
+        assert b"Unauthorized" in response.data
 
+        clients.get("/logout")
 
 
-    Configured to use PBKDF2 + HMAC + SHA256.
 
-    The result is a 64 byte binary string.  Iterations may be changed
+    authenticate(clients, "dave@lp.com")
 
-    safely but you must rename the algorithm if you change SHA256.
+    response = clients.get("/admin_and_editor", follow_redirects=True)
 
-    """
+    assert b"Admin and Editor Page" in response.data
 
-    algorithm = "pbkdf2_sha256"
 
-    iterations = 30000
 
-    digest = hashlib.sha256
 
 
+def test_ok_json_auth(client):
 
-    def encode(self, password, salt, iterations=None):
+    response = json_authenticate(client)
 
-        assert password is not None
+    assert response.json["meta"]["code"] == 200
 
-        assert salt and '$' not in salt
+    assert "authentication_token" in response.json["response"]["user"]
 
-        if not iterations:
 
-            iterations = self.iterations
 
-        hash = pbkdf2(password, salt, iterations, digest=self.digest)
 
-        hash = base64.b64encode(hash).decode('ascii').strip()
 
-        return "%s$%d$%s$%s" % (self.algorithm, iterations, salt, hash)
+def test_invalid_json_auth(client):
 
+    response = json_authenticate(client, password="junk")
 
+    assert b'"code": 400' in response.data
 
-    def verify(self, password, encoded):
 
-        algorithm, iterations, salt, hash = encoded.split('$', 3)
 
-        assert algorithm == self.algorithm
 
-        encoded_2 = self.encode(password, salt, int(iterations))
 
-        return constant_time_compare(encoded, encoded_2)
+def test_token_auth_via_querystring_valid_token(client):
 
+    response = json_authenticate(client)
 
+    token = response.json["response"]["user"]["authentication_token"]
 
-    def safe_summary(self, encoded):
+    response = client.get("/token?auth_token=" + token)
 
-        algorithm, iterations, salt, hash = encoded.split('$', 3)
+    assert b"Token Authentication" in response.data
 
-        assert algorithm == self.algorithm
 
-        return OrderedDict([
 
-            (_('algorithm'), algorithm),
 
-            (_('iterations'), iterations),
 
-            (_('salt'), mask_hash(salt)),
+def test_token_auth_via_header_valid_token(client):
 
-            (_('hash'), mask_hash(hash)),
+    response = json_authenticate(client)
 
-        ])
+    token = response.json["response"]["user"]["authentication_token"]
 
+    headers = {"Authentication-Token": token}
 
+    response = client.get("/token", headers=headers)
 
-    def must_update(self, encoded):
+    assert b"Token Authentication" in response.data
 
-        algorithm, iterations, salt, hash = encoded.split('$', 3)
 
-        return int(iterations) != self.iterations
 
 
 
+def test_token_auth_via_querystring_invalid_token(client):
 
+    response = client.get("/token?auth_token=X", headers={"Accept": "application/json"})
 
-class PBKDF2SHA1PasswordHasher(PBKDF2PasswordHasher):
+    assert response.status_code == 401
 
-    """
 
-    Alternate PBKDF2 hasher which uses SHA1, the default PRF
 
-    recommended by PKCS #5. This is compatible with other
 
-    implementations of PBKDF2, such as openssl's
 
-    PKCS5_PBKDF2_HMAC_SHA1().
+def test_token_auth_via_header_invalid_token(client):
 
-    """
+    response = client.get(
 
-    algorithm = "pbkdf2_sha1"
+        "/token", headers={"Authentication-Token": "X", "Accept": "application/json"}
 
-    digest = hashlib.sha1
+    )
 
+    assert response.status_code == 401
 
 
 
 
-class BCryptSHA256PasswordHasher(BasePasswordHasher):
 
-    """
+def test_http_auth(client):
 
-    Secure password hashing using the bcrypt algorithm (recommended)
+    # browsers expect 401 response with WWW-Authenticate header - which will prompt
 
+    # them to pop up a login form.
 
+    response = client.get("/http", headers={})
 
-    This is considered by many to be the most secure algorithm but you
+    assert response.status_code == 401
 
-    must first install the bcrypt library.  Please be warned that
+    assert b"You are not authenticated" in response.data
 
-    this library depends on native C code and might cause portability
+    assert "WWW-Authenticate" in response.headers
 
-    issues.
+    assert 'Basic realm="Login Required"' == response.headers["WWW-Authenticate"]
 
-    """
 
-    algorithm = "bcrypt_sha256"
 
-    digest = hashlib.sha256
+    # Now provide correct credentials
 
-    library = ("bcrypt", "bcrypt")
+    response = client.get(
 
-    rounds = 12
+        "/http",
 
+        headers={
 
+            "Authorization": "Basic %s"
 
-    def salt(self):
+            % base64.b64encode(b"joe@lp.com:password").decode("utf-8")
 
-        bcrypt = self._load_library()
+        },
 
-        return bcrypt.gensalt(self.rounds)
+    )
 
+    assert b"HTTP Authentication" in response.data
 
 
-    def encode(self, password, salt):
 
-        bcrypt = self._load_library()
 
-        # Hash the password prior to using bcrypt to prevent password
 
-        # truncation as described in #20138.
+@pytest.mark.settings(USER_IDENTITY_ATTRIBUTES=("email", "username"))
 
-        if self.digest is not None:
+def test_http_auth_username(client):
 
-            # Use binascii.hexlify() because a hex encoded bytestring is
+    response = client.get(
 
-            # Unicode on Python 3.
+        "/http",
 
-            password = binascii.hexlify(self.digest(force_bytes(password)).digest())
+        headers={
 
-        else:
+            "Authorization": "Basic %s"
 
-            password = force_bytes(password)
+            % base64.b64encode(b"jill:password").decode("utf-8")
 
+        },
 
+    )
 
-        data = bcrypt.hashpw(password, salt)
+    assert b"HTTP Authentication" in response.data
 
-        return "%s$%s" % (self.algorithm, force_text(data))
 
 
 
-    def verify(self, password, encoded):
 
-        algorithm, data = encoded.split('$', 1)
+def test_http_auth_no_authorization(client):
 
-        assert algorithm == self.algorithm
+    response = client.get(
 
-        bcrypt = self._load_library()
+        "/http_admin_required",
 
+        headers={
 
+            "Authorization": "Basic %s"
 
-        # Hash the password prior to using bcrypt to prevent password
+            % base64.b64encode(b"joe@lp.com:password").decode("utf-8")
 
-        # truncation as described in #20138.
+        },
 
-        if self.digest is not None:
+    )
 
-            # Use binascii.hexlify() because a hex encoded bytestring is
+    assert response.status_code == 403
 
-            # Unicode on Python 3.
 
-            password = binascii.hexlify(self.digest(force_bytes(password)).digest())
 
-        else:
 
-            password = force_bytes(password)
 
+def test_http_auth_no_authorization_json(client, get_message):
 
+    response = client.get(
 
-        # Ensure that our data is a bytestring
+        "/http_admin_required",
 
-        data = force_bytes(data)
+        headers={
 
-        # force_bytes() necessary for py-bcrypt compatibility
+            "accept": "application/json",
 
-        hashpw = force_bytes(bcrypt.hashpw(password, data))
+            "Authorization": "Basic %s"
 
+            % base64.b64encode(b"joe@lp.com:password").decode("utf-8"),
 
+        },
 
-        return constant_time_compare(data, hashpw)
+    )
 
+    assert response.status_code == 403
 
+    assert response.headers["Content-Type"] == "application/json"
 
-    def safe_summary(self, encoded):
 
-        algorithm, empty, algostr, work_factor, data = encoded.split('$', 4)
 
-        assert algorithm == self.algorithm
 
-        salt, checksum = data[:22], data[22:]
 
-        return OrderedDict([
+@pytest.mark.settings(backwards_compat_unauthn=True)
 
-            (_('algorithm'), algorithm),
+def test_http_auth_no_authentication(client, get_message):
 
-            (_('work factor'), work_factor),
+    response = client.get("/http", headers={})
 
-            (_('salt'), mask_hash(salt)),
+    assert response.status_code == 401
 
-            (_('checksum'), mask_hash(checksum)),
+    assert b"<h1>Unauthorized</h1>" in response.data
 
-        ])
+    assert "WWW-Authenticate" in response.headers
 
+    assert 'Basic realm="Login Required"' == response.headers["WWW-Authenticate"]
 
 
-    def must_update(self, encoded):
 
-        algorithm, empty, algostr, rounds, data = encoded.split('$', 4)
 
-        return int(rounds) != self.rounds
 
+@pytest.mark.settings(backwards_compat_unauthn=False)
 
+def test_http_auth_no_authentication_json(client, get_message):
 
+    response = client.get("/http", headers={"accept": "application/json"})
 
+    assert response.status_code == 401
 
-class BCryptPasswordHasher(BCryptSHA256PasswordHasher):
+    assert response.json["response"]["error"].encode("utf-8") == get_message(
 
-    """
+        "UNAUTHENTICATED"
 
-    Secure password hashing using the bcrypt algorithm
+    )
 
+    assert response.headers["Content-Type"] == "application/json"
 
+    assert "WWW-Authenticate" not in response.headers
 
-    This is considered by many to be the most secure algorithm but you
 
-    must first install the bcrypt library.  Please be warned that
 
-    this library depends on native C code and might cause portability
 
-    issues.
 
+@pytest.mark.settings(backwards_compat_unauthn=True)
 
+def test_invalid_http_auth_invalid_username(client):
 
-    This hasher does not first hash the password which means it is subject to
+    response = client.get(
 
-    the 72 character bcrypt password truncation, most use cases should prefer
+        "/http",
 
-    the BCryptSHA256PasswordHasher.
+        headers={
 
+            "Authorization": "Basic %s"
 
+            % base64.b64encode(b"bogus:bogus").decode("utf-8")
 
-    See: https://code.djangoproject.com/ticket/20138
+        },
 
-    """
+    )
 
-    algorithm = "bcrypt"
+    assert b"<h1>Unauthorized</h1>" in response.data
 
-    digest = None
+    assert "WWW-Authenticate" in response.headers
 
+    assert 'Basic realm="Login Required"' == response.headers["WWW-Authenticate"]
 
 
 
 
-class SHA1PasswordHasher(BasePasswordHasher):
 
-    """
+@pytest.mark.settings(backwards_compat_unauthn=False)
 
-    The SHA1 password hashing algorithm (not recommended)
+def test_invalid_http_auth_invalid_username_json(client, get_message):
 
-    """
+    # While Basic auth is allowed with JSON - we never expect a WWW-Authenticate
 
-    algorithm = "sha1"
+    # header - since that is captured by most browsers and they pop up a
 
+    # login form.
 
+    response = client.get(
 
-    def encode(self, password, salt):
+        "/http",
 
-        assert password is not None
+        headers={
 
-        assert salt and '$' not in salt
+            "accept": "application/json",
 
-        hash = hashlib.sha1(force_bytes(salt + password)).hexdigest()
+            "Authorization": "Basic %s"
 
-        return "%s$%s$%s" % (self.algorithm, salt, hash)
+            % base64.b64encode(b"bogus:bogus").decode("utf-8"),
 
+        },
 
+    )
 
-    def verify(self, password, encoded):
+    assert response.status_code == 401
 
-        algorithm, salt, hash = encoded.split('$', 2)
+    assert response.json["response"]["error"].encode("utf-8") == get_message(
 
-        assert algorithm == self.algorithm
+        "UNAUTHENTICATED"
 
-        encoded_2 = self.encode(password, salt)
+    )
 
-        return constant_time_compare(encoded, encoded_2)
+    assert response.headers["Content-Type"] == "application/json"
 
+    assert "WWW-Authenticate" not in response.headers
 
 
-    def safe_summary(self, encoded):
 
-        algorithm, salt, hash = encoded.split('$', 2)
 
-        assert algorithm == self.algorithm
 
-        return OrderedDict([
+@pytest.mark.settings(backwards_compat_unauthn=True)
 
-            (_('algorithm'), algorithm),
+def test_invalid_http_auth_bad_password(client):
 
-            (_('salt'), mask_hash(salt, show=2)),
+    response = client.get(
 
-            (_('hash'), mask_hash(hash)),
+        "/http",
 
-        ])
+        headers={
 
+            "Authorization": "Basic %s"
 
+            % base64.b64encode(b"joe@lp.com:bogus").decode("utf-8")
 
+        },
 
+    )
 
-class MD5PasswordHasher(BasePasswordHasher):
+    assert b"<h1>Unauthorized</h1>" in response.data
 
-    """
+    assert "WWW-Authenticate" in response.headers
 
-    The Salted MD5 password hashing algorithm (not recommended)
+    assert 'Basic realm="Login Required"' == response.headers["WWW-Authenticate"]
 
-    """
 
-    algorithm = "md5"
 
 
 
-    def encode(self, password, salt):
+@pytest.mark.settings(backwards_compat_unauthn=True)
 
-        assert password is not None
+def test_custom_http_auth_realm(client):
 
-        assert salt and '$' not in salt
+    response = client.get(
 
-        hash = hashlib.md5(force_bytes(salt + password)).hexdigest()
+        "/http_custom_realm",
 
-        return "%s$%s$%s" % (self.algorithm, salt, hash)
+        headers={
 
+            "Authorization": "Basic %s"
 
+            % base64.b64encode(b"joe@lp.com:bogus").decode("utf-8")
 
-    def verify(self, password, encoded):
+        },
 
-        algorithm, salt, hash = encoded.split('$', 2)
+    )
 
-        assert algorithm == self.algorithm
+    assert b"<h1>Unauthorized</h1>" in response.data
 
-        encoded_2 = self.encode(password, salt)
+    assert "WWW-Authenticate" in response.headers
 
-        return constant_time_compare(encoded, encoded_2)
+    assert 'Basic realm="My Realm"' == response.headers["WWW-Authenticate"]
 
 
 
-    def safe_summary(self, encoded):
 
-        algorithm, salt, hash = encoded.split('$', 2)
 
-        assert algorithm == self.algorithm
+def test_multi_auth_basic(client):
 
-        return OrderedDict([
+    response = client.get(
 
-            (_('algorithm'), algorithm),
+        "/multi_auth",
 
-            (_('salt'), mask_hash(salt, show=2)),
+        headers={
 
-            (_('hash'), mask_hash(hash)),
+            "Authorization": "Basic %s"
 
-        ])
+            % base64.b64encode(b"joe@lp.com:password").decode("utf-8")
 
+        },
 
+    )
 
+    assert b"Basic" in response.data
 
 
-class UnsaltedSHA1PasswordHasher(BasePasswordHasher):
 
-    """
+    response = client.get("/multi_auth")
 
-    Very insecure algorithm that you should *never* use; stores SHA1 hashes
+    # Default unauthn with basic is to return 401 with WWW-Authenticate Header
 
-    with an empty salt.
+    # so that browser pops up a username/password dialog
 
+    assert response.status_code == 401
 
+    assert "WWW-Authenticate" in response.headers
 
-    This class is implemented because Django used to accept such password
 
-    hashes. Some older Django installs still have these values lingering
 
-    around so we need to handle and upgrade them properly.
 
-    """
 
-    algorithm = "unsalted_sha1"
+@pytest.mark.settings(backwards_compat_unauthn=True)
 
+def test_multi_auth_basic_invalid(client):
 
+    response = client.get(
 
-    def salt(self):
+        "/multi_auth",
 
-        return ''
+        headers={
 
+            "Authorization": "Basic %s"
 
+            % base64.b64encode(b"bogus:bogus").decode("utf-8")
 
-    def encode(self, password, salt):
+        },
 
-        assert salt == ''
+    )
 
-        hash = hashlib.sha1(force_bytes(password)).hexdigest()
+    assert b"<h1>Unauthorized</h1>" in response.data
 
-        return 'sha1$$%s' % hash
+    assert "WWW-Authenticate" in response.headers
 
+    assert 'Basic realm="Login Required"' == response.headers["WWW-Authenticate"]
 
 
-    def verify(self, password, encoded):
 
-        encoded_2 = self.encode(password, '')
+    response = client.get("/multi_auth")
 
-        return constant_time_compare(encoded, encoded_2)
+    assert response.status_code == 401
 
 
 
-    def safe_summary(self, encoded):
 
-        assert encoded.startswith('sha1$$')
 
-        hash = encoded[6:]
+def test_multi_auth_token(client):
 
-        return OrderedDict([
+    response = json_authenticate(client)
 
-            (_('algorithm'), self.algorithm),
+    token = response.json["response"]["user"]["authentication_token"]
 
-            (_('hash'), mask_hash(hash)),
+    response = client.get("/multi_auth?auth_token=" + token)
 
-        ])
+    assert b"Token" in response.data
 
 
 
 
 
-class UnsaltedMD5PasswordHasher(BasePasswordHasher):
+def test_multi_auth_session(client):
 
-    """
+    authenticate(client)
 
-    Incredibly insecure algorithm that you should *never* use; stores unsalted
+    response = client.get("/multi_auth")
 
-    MD5 hashes without the algorithm prefix, also accepts MD5 hashes with an
+    assert b"Session" in response.data
 
-    empty salt.
 
 
 
-    This class is implemented because Django used to store passwords this way
 
-    and to accept such password hashes. Some older Django installs still have
+def test_authenticated_loop(client):
 
-    these values lingering around so we need to handle and upgrade them
+    # If user is already authenticated say via session, and then hits an endpoint
 
-    properly.
+    # protected with @auth_token_required() - then they will be redirected to the login
 
-    """
+    # page which will simply note the current user is already logged in and redirect
 
-    algorithm = "unsalted_md5"
+    # to POST_LOGIN_VIEW. Between 3.3.0 and 3.4.4 - this redirect would honor the 'next'
 
+    # parameter - thus redirecting back to the endpoint that caused the redirect in the
 
+    # first place - thus an infinite loop.
 
-    def salt(self):
+    authenticate(client)
 
-        return ''
 
 
+    response = client.get("/token", follow_redirects=True)
 
-    def encode(self, password, salt):
+    assert response.status_code == 200
 
-        assert salt == ''
+    assert b"Home Page" in response.data
 
-        return hashlib.md5(force_bytes(password)).hexdigest()
 
 
 
-    def verify(self, password, encoded):
 
-        if len(encoded) == 37 and encoded.startswith('md5$$'):
+def test_user_deleted_during_session_reverts_to_anonymous_user(app, client):
 
-            encoded = encoded[5:]
+    authenticate(client)
 
-        encoded_2 = self.encode(password, '')
 
-        return constant_time_compare(encoded, encoded_2)
 
+    with app.test_request_context("/"):
 
+        user = app.security.datastore.find_user(email="matt@lp.com")
 
-    def safe_summary(self, encoded):
+        app.security.datastore.delete_user(user)
 
-        return OrderedDict([
+        app.security.datastore.commit()
 
-            (_('algorithm'), self.algorithm),
 
-            (_('hash'), mask_hash(encoded, show=3)),
 
-        ])
+    response = client.get("/")
 
+    assert b"Hello matt@lp.com" not in response.data
 
 
 
 
-class CryptPasswordHasher(BasePasswordHasher):
 
-    """
+def test_remember_token(client):
 
-    Password hashing using UNIX crypt (not recommended)
+    response = authenticate(client, follow_redirects=False)
 
+    client.cookie_jar.clear_session_cookies()
 
+    response = client.get("/profile")
 
-    The crypt module is not supported on all platforms.
+    assert b"profile" in response.data
 
-    """
 
-    algorithm = "crypt"
 
-    library = "crypt"
 
 
+def test_request_loader_does_not_fail_with_invalid_token(client):
 
-    def salt(self):
+    c = Cookie(
 
-        return get_random_string(2)
+        version=0,
 
+        name="remember_token",
 
+        value="None",
 
-    def encode(self, password, salt):
+        port=None,
 
-        crypt = self._load_library()
+        port_specified=False,
 
-        assert len(salt) == 2
+        domain="www.example.com",
 
-        data = crypt.crypt(force_str(password), salt)
+        domain_specified=False,
 
-        # we don't need to store the salt, but Django used to do this
+        domain_initial_dot=False,
 
-        return "%s$%s$%s" % (self.algorithm, '', data)
+        path="/",
 
+        path_specified=True,
 
+        secure=False,
 
-    def verify(self, password, encoded):
+        expires=None,
 
-        crypt = self._load_library()
+        discard=True,
 
-        algorithm, salt, data = encoded.split('$', 2)
+        comment=None,
 
-        assert algorithm == self.algorithm
+        comment_url=None,
 
-        return constant_time_compare(data, crypt.crypt(force_str(password), data))
+        rest={"HttpOnly": None},
 
+        rfc2109=False,
 
+    )
 
-    def safe_summary(self, encoded):
 
-        algorithm, salt, data = encoded.split('$', 2)
 
-        assert algorithm == self.algorithm
+    client.cookie_jar.set_cookie(c)
 
-        return OrderedDict([
+    response = client.get("/")
 
-            (_('algorithm'), algorithm),
+    assert b"BadSignature" not in response.data
 
-            (_('salt'), salt),
 
-            (_('hash'), mask_hash(data, show=3)),
 
-        ])
+
+
+def test_sending_auth_token_with_json(client):
+
+    response = json_authenticate(client)
+
+    token = response.json["response"]["user"]["authentication_token"]
+
+    data = '{"auth_token": "%s"}' % token
+
+    response = client.post(
+
+        "/token", data=data, headers={"Content-Type": "application/json"}
+
+    )
+
+    assert b"Token Authentication" in response.data
+
+
+
+
+
+def test_json_not_dict(client):
+
+    response = client.post(
+
+        "/json",
+
+        data=json.dumps(["thing1", "thing2"]),
+
+        headers={"Content-Type": "application/json"},
+
+    )
+
+    assert response.status_code == 200
+
+
+
+
+
+def test_login_info(client):
+
+    # Make sure we can get user info when logged in already.
+
+
+
+    json_authenticate(client)
+
+    response = client.get("/login", headers={"Content-Type": "application/json"})
+
+    assert response.status_code == 200
+
+    assert response.json["response"]["user"]["id"] == "1"
+
+    assert "last_update" in response.json["response"]["user"]
+
+
+
+    response = client.get("/login", headers={"Accept": "application/json"})
+
+    assert response.status_code == 200
+
+    assert response.json["response"]["user"]["id"] == "1"
+
+    assert "last_update" in response.json["response"]["user"]
+
+
+
+
+
+@pytest.mark.registerable()
+
+@pytest.mark.settings(post_login_view="/anon_required")
+
+def test_anon_required(client, get_message):
+
+    """ If logged in, should get 'anonymous_user_required' redirect """
+
+    response = authenticate(client, follow_redirects=False)
+
+    response = client.get("/register")
+
+    assert "location" in response.headers
+
+    assert "/anon_required" in response.location
+
+
+
+
+
+@pytest.mark.registerable()
+
+@pytest.mark.settings(post_login_view="/anon_required")
+
+def test_anon_required_json(client, get_message):
+
+    """ If logged in, should get 'anonymous_user_required' response """
+
+    authenticate(client, follow_redirects=False)
+
+    response = client.get("/register", headers={"Accept": "application/json"})
+
+    assert response.status_code == 400
+
+    assert response.json["response"]["error"].encode("utf-8") == get_message(
+
+        "ANONYMOUS_USER_REQUIRED"
+
+    )
+
+
+
+
+
+@pytest.mark.settings(security_hashing_schemes=["sha256_crypt"])
+
+@pytest.mark.skip
+
+def test_auth_token_speed(app, client_nc):
+
+    # To run with old algorithm you have to comment out fs_uniquifier check in UserMixin
+
+    import timeit
+
+
+
+    response = json_authenticate(client_nc)
+
+    token = response.json["response"]["user"]["authentication_token"]
+
+
+
+    def time_get():
+
+        rp = client_nc.get(
+
+            "/login",
+
+            data={},
+
+            headers={"Content-Type": "application/json", "Authentication-Token": token},
+
+        )
+
+        assert rp.status_code == 200
+
+
+
+    t = timeit.timeit(time_get, number=50)
+
+    print("Time for 50 iterations: ", t)
+
+
+
+
+
+def test_change_uniquifier(app, client_nc):
+
+    # make sure that existing token no longer works once we change the uniquifier
+
+
+
+    response = json_authenticate(client_nc)
+
+    token = response.json["response"]["user"]["authentication_token"]
+
+    verify_token(client_nc, token)
+
+
+
+    # now change uniquifier
+
+    with app.test_request_context("/"):
+
+        user = app.security.datastore.find_user(email="matt@lp.com")
+
+        app.security.datastore.reset_user_access(user)
+
+        app.security.datastore.commit()
+
+
+
+    verify_token(client_nc, token, status=401)
+
+
+
+    # get new token and verify it works
+
+    response = json_authenticate(client_nc)
+
+    token = response.json["response"]["user"]["authentication_token"]
+
+    verify_token(client_nc, token)
+
+
+
+
+
+def test_token_query(in_app_context):
+
+    # Verify that when authenticating with auth token (and not session)
+
+    # that there is just one DB query to get user.
+
+    app = in_app_context
+
+    populate_data(app)
+
+    client_nc = app.test_client(use_cookies=False)
+
+
+
+    response = json_authenticate(client_nc)
+
+    token = response.json["response"]["user"]["authentication_token"]
+
+    current_nqueries = get_num_queries(app.security.datastore)
+
+
+
+    response = client_nc.get(
+
+        "/token",
+
+        headers={"Content-Type": "application/json", "Authentication-Token": token},
+
+    )
+
+    assert response.status_code == 200
+
+    end_nqueries = get_num_queries(app.security.datastore)
+
+    assert current_nqueries is None or end_nqueries == (current_nqueries + 1)
+
+
+
+
+
+def test_session_query(in_app_context):
+
+    # Verify that when authenticating with auth token (but also sending session)
+
+    # that there are 2 DB queries to get user.
+
+    # This is since the session will load one - but auth_token_required needs to
+
+    # verify that the TOKEN is valid (and it is possible that the user_id in the
+
+    # session is different that the one in the token (huh?)
+
+    app = in_app_context
+
+    populate_data(app)
+
+    client = app.test_client()
+
+
+
+    response = json_authenticate(client)
+
+    token = response.json["response"]["user"]["authentication_token"]
+
+    current_nqueries = get_num_queries(app.security.datastore)
+
+
+
+    response = client.get(
+
+        "/token",
+
+        headers={"Content-Type": "application/json", "Authentication-Token": token},
+
+    )
+
+    assert response.status_code == 200
+
+    end_nqueries = get_num_queries(app.security.datastore)
+
+    assert current_nqueries is None or end_nqueries == (current_nqueries + 2)

@@ -2,514 +2,952 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-"""
-
-Authenticator to use GitHub OAuth with JupyterHub
-
-"""
-
-
-
-
-
 import json
 
-import os
 
-import re
 
-import string
+from django.db.models import CharField, Q
 
-import warnings
+from django.db.models.expressions import F, OuterRef, Subquery, Value
 
+from django.db.models.functions import Cast, Concat, Substr
 
+from django.test.utils import Approximate
 
-from tornado.auth import OAuth2Mixin
 
-from tornado import web
 
+from . import PostgreSQLTestCase
 
+from .models import AggregateTestModel, StatTestModel
 
-from tornado.httputil import url_concat
 
-from tornado.httpclient import HTTPRequest, AsyncHTTPClient, HTTPError
 
+try:
 
+    from django.contrib.postgres.aggregates import (
 
-from jupyterhub.auth import LocalAuthenticator
+        ArrayAgg, BitAnd, BitOr, BoolAnd, BoolOr, Corr, CovarPop, JSONBAgg,
 
+        RegrAvgX, RegrAvgY, RegrCount, RegrIntercept, RegrR2, RegrSlope,
 
-
-from traitlets import List, Set, Unicode, default, observe
-
-
-
-from .common import next_page_from_links
-
-from .oauth2 import OAuthLoginHandler, OAuthenticator
-
-
-
-
-
-def _api_headers(access_token):
-
-    return {
-
-        "Accept": "application/json",
-
-        "User-Agent": "JupyterHub",
-
-        "Authorization": "token {}".format(access_token),
-
-    }
-
-
-
-
-
-class GitHubOAuthenticator(OAuthenticator):
-
-
-
-    # see github_scopes.md for details about scope config
-
-    # set scopes via config, e.g.
-
-    # c.GitHubOAuthenticator.scope = ['read:org']
-
-
-
-    _deprecated_aliases = {
-
-        "github_organization_whitelist": ("allowed_organizations", "0.12.0"),
-
-    }
-
-
-
-    @observe(*list(_deprecated_aliases))
-
-    def _deprecated_trait(self, change):
-
-        super()._deprecated_trait(change)
-
-
-
-    login_service = "GitHub"
-
-
-
-    github_url = Unicode("https://github.com", config=True)
-
-
-
-    @default("github_url")
-
-    def _github_url_default(self):
-
-        github_url = os.environ.get("GITHUB_URL")
-
-        if not github_url:
-
-            # fallback on older GITHUB_HOST config,
-
-            # treated the same as GITHUB_URL
-
-            host = os.environ.get("GITHUB_HOST")
-
-            if host:
-
-                if os.environ.get("GITHUB_HTTP"):
-
-                    protocol = "http"
-
-                    warnings.warn(
-
-                        'Use of GITHUB_HOST with GITHUB_HTTP might be deprecated in the future. '
-
-                        'Use GITHUB_URL=http://{} to set host and protocol together.'.format(
-
-                            host
-
-                        ),
-
-                        PendingDeprecationWarning,
-
-                    )
-
-                else:
-
-                    protocol = "https"
-
-                github_url = "{}://{}".format(protocol, host)
-
-
-
-        if github_url:
-
-            if '://' not in github_url:
-
-                # ensure protocol is included, assume https if missing
-
-                github_url = 'https://' + github_url
-
-
-
-            return github_url
-
-        else:
-
-            # nothing specified, this is the true default
-
-            github_url = "https://github.com"
-
-
-
-        # ensure no trailing slash
-
-        return github_url.rstrip("/")
-
-
-
-    github_api = Unicode("https://api.github.com", config=True)
-
-
-
-    @default("github_api")
-
-    def _github_api_default(self):
-
-        if self.github_url == "https://github.com":
-
-            return "https://api.github.com"
-
-        else:
-
-            return self.github_url + "/api/v3"
-
-
-
-    @default("authorize_url")
-
-    def _authorize_url_default(self):
-
-        return "%s/login/oauth/authorize" % (self.github_url)
-
-
-
-    @default("token_url")
-
-    def _token_url_default(self):
-
-        return "%s/login/oauth/access_token" % (self.github_url)
-
-
-
-    # deprecated names
-
-    github_client_id = Unicode(config=True, help="DEPRECATED")
-
-
-
-    def _github_client_id_changed(self, name, old, new):
-
-        self.log.warning("github_client_id is deprecated, use client_id")
-
-        self.client_id = new
-
-
-
-    github_client_secret = Unicode(config=True, help="DEPRECATED")
-
-
-
-    def _github_client_secret_changed(self, name, old, new):
-
-        self.log.warning("github_client_secret is deprecated, use client_secret")
-
-        self.client_secret = new
-
-
-
-    client_id_env = 'GITHUB_CLIENT_ID'
-
-    client_secret_env = 'GITHUB_CLIENT_SECRET'
-
-
-
-    github_organization_whitelist = Set(help="Deprecated, use `GitHubOAuthenticator.allowed_organizations`", config=True,)
-
-
-
-    allowed_organizations = Set(
-
-        config=True, help="Automatically allow members of selected organizations"
+        RegrSXX, RegrSXY, RegrSYY, StatAggregate, StringAgg,
 
     )
 
+except ImportError:
 
-
-    async def authenticate(self, handler, data=None):
-
-        """We set up auth_state based on additional GitHub info if we
-
-        receive it.
-
-        """
-
-        code = handler.get_argument("code")
-
-        # TODO: Configure the curl_httpclient for tornado
-
-        http_client = AsyncHTTPClient()
+    pass  # psycopg2 is not installed
 
 
 
-        # Exchange the OAuth code for a GitHub Access Token
-
-        #
-
-        # See: https://developer.github.com/v3/oauth/
 
 
+class TestGeneralAggregate(PostgreSQLTestCase):
 
-        # GitHub specifies a POST request yet requires URL parameters
+    @classmethod
 
-        params = dict(
+    def setUpTestData(cls):
 
-            client_id=self.client_id, client_secret=self.client_secret, code=code
+        cls.agg1 = AggregateTestModel.objects.create(boolean_field=True, char_field='Foo1', integer_field=0)
 
-        )
+        AggregateTestModel.objects.create(boolean_field=False, char_field='Foo2', integer_field=1)
 
+        AggregateTestModel.objects.create(boolean_field=False, char_field='Foo4', integer_field=2)
 
-
-        url = url_concat(self.token_url, params)
+        AggregateTestModel.objects.create(boolean_field=True, char_field='Foo3', integer_field=0)
 
 
 
-        req = HTTPRequest(
+    def test_array_agg_charfield(self):
 
-            url,
+        values = AggregateTestModel.objects.aggregate(arrayagg=ArrayAgg('char_field'))
 
-            method="POST",
-
-            headers={"Accept": "application/json"},
-
-            body='',  # Body is required for a POST...
-
-            validate_cert=self.validate_server_cert,
-
-        )
+        self.assertEqual(values, {'arrayagg': ['Foo1', 'Foo2', 'Foo4', 'Foo3']})
 
 
 
-        resp = await http_client.fetch(req)
+    def test_array_agg_charfield_ordering(self):
 
-        resp_json = json.loads(resp.body.decode('utf8', 'replace'))
+        ordering_test_cases = (
 
+            (F('char_field').desc(), ['Foo4', 'Foo3', 'Foo2', 'Foo1']),
 
+            (F('char_field').asc(), ['Foo1', 'Foo2', 'Foo3', 'Foo4']),
 
-        if 'access_token' in resp_json:
+            (F('char_field'), ['Foo1', 'Foo2', 'Foo3', 'Foo4']),
 
-            access_token = resp_json['access_token']
+            ([F('boolean_field'), F('char_field').desc()], ['Foo4', 'Foo2', 'Foo3', 'Foo1']),
 
-        elif 'error_description' in resp_json:
+            ((F('boolean_field'), F('char_field').desc()), ['Foo4', 'Foo2', 'Foo3', 'Foo1']),
 
-            raise HTTPError(
+            ('char_field', ['Foo1', 'Foo2', 'Foo3', 'Foo4']),
 
-                403,
+            ('-char_field', ['Foo4', 'Foo3', 'Foo2', 'Foo1']),
 
-                "An access token was not returned: {}".format(
+            (Concat('char_field', Value('@')), ['Foo1', 'Foo2', 'Foo3', 'Foo4']),
 
-                    resp_json['error_description']
+            (Concat('char_field', Value('@')).desc(), ['Foo4', 'Foo3', 'Foo2', 'Foo1']),
 
-                ),
+            (
 
-            )
+                (Substr('char_field', 1, 1), F('integer_field'), Substr('char_field', 4, 1).desc()),
 
-        else:
+                ['Foo3', 'Foo1', 'Foo2', 'Foo4'],
 
-            raise HTTPError(500, "Bad response: {}".format(resp))
-
-
-
-        # Determine who the logged in user is
-
-        req = HTTPRequest(
-
-            self.github_api + "/user",
-
-            method="GET",
-
-            headers=_api_headers(access_token),
-
-            validate_cert=self.validate_server_cert,
+            ),
 
         )
 
-        resp = await http_client.fetch(req)
+        for ordering, expected_output in ordering_test_cases:
 
-        resp_json = json.loads(resp.body.decode('utf8', 'replace'))
+            with self.subTest(ordering=ordering, expected_output=expected_output):
 
+                values = AggregateTestModel.objects.aggregate(
 
-
-        username = resp_json["login"]
-
-        # username is now the GitHub userid.
-
-        if not username:
-
-            return None
-
-        # Check if user is a member of any allowed organizations.
-
-        # This check is performed here, as it requires `access_token`.
-
-        if self.allowed_organizations:
-
-            for org in self.allowed_organizations:
-
-                user_in_org = await self._check_membership_allowed_organizations(
-
-                    org, username, access_token
+                    arrayagg=ArrayAgg('char_field', ordering=ordering)
 
                 )
 
-                if user_in_org:
-
-                    break
-
-            else:  # User not found in member list for any organisation
-
-                self.log.warning("User %s is not in allowed org list", username)
-
-                return None
-
-        userdict = {"name": username}
-
-        # Now we set up auth_state
-
-        userdict["auth_state"] = auth_state = {}
-
-        # Save the access token and full GitHub reply (name, id, email) in auth state
-
-        # These can be used for user provisioning in the Lab/Notebook environment.
-
-        # e.g.
-
-        #  1) stash the access token
-
-        #  2) use the GitHub ID as the id
-
-        #  3) set up name/email for .gitconfig
-
-        auth_state['access_token'] = access_token
-
-        # store the whole user model in auth_state.github_user
-
-        auth_state['github_user'] = resp_json
-
-        # A public email will return in the initial query (assuming default scope).
-
-        # Private will not.
+                self.assertEqual(values, {'arrayagg': expected_output})
 
 
 
-        return userdict
+    def test_array_agg_integerfield(self):
+
+        values = AggregateTestModel.objects.aggregate(arrayagg=ArrayAgg('integer_field'))
+
+        self.assertEqual(values, {'arrayagg': [0, 1, 2, 0]})
 
 
 
-    async def _check_membership_allowed_organizations(self, org, username, access_token):
+    def test_array_agg_integerfield_ordering(self):
 
-        http_client = AsyncHTTPClient()
+        values = AggregateTestModel.objects.aggregate(
 
-        headers = _api_headers(access_token)
-
-        # Check membership of user `username` for organization `org` via api [check-membership](https://developer.github.com/v3/orgs/members/#check-membership)
-
-        # With empty scope (even if authenticated by an org member), this
-
-        #  will only await public org members.  You want 'read:org' in order
-
-        #  to be able to iterate through all members.
-
-        check_membership_url = "%s/orgs/%s/members/%s" % (
-
-            self.github_api,
-
-            org,
-
-            username,
+            arrayagg=ArrayAgg('integer_field', ordering=F('integer_field').desc())
 
         )
 
-        req = HTTPRequest(
+        self.assertEqual(values, {'arrayagg': [2, 1, 0, 0]})
 
-            check_membership_url,
 
-            method="GET",
 
-            headers=headers,
+    def test_array_agg_booleanfield(self):
 
-            validate_cert=self.validate_server_cert,
+        values = AggregateTestModel.objects.aggregate(arrayagg=ArrayAgg('boolean_field'))
+
+        self.assertEqual(values, {'arrayagg': [True, False, False, True]})
+
+
+
+    def test_array_agg_booleanfield_ordering(self):
+
+        ordering_test_cases = (
+
+            (F('boolean_field').asc(), [False, False, True, True]),
+
+            (F('boolean_field').desc(), [True, True, False, False]),
+
+            (F('boolean_field'), [False, False, True, True]),
 
         )
 
-        self.log.debug(
+        for ordering, expected_output in ordering_test_cases:
 
-            "Checking GitHub organization membership: %s in %s?", username, org
+            with self.subTest(ordering=ordering, expected_output=expected_output):
+
+                values = AggregateTestModel.objects.aggregate(
+
+                    arrayagg=ArrayAgg('boolean_field', ordering=ordering)
+
+                )
+
+                self.assertEqual(values, {'arrayagg': expected_output})
+
+
+
+    def test_array_agg_filter(self):
+
+        values = AggregateTestModel.objects.aggregate(
+
+            arrayagg=ArrayAgg('integer_field', filter=Q(integer_field__gt=0)),
 
         )
 
-        resp = await http_client.fetch(req, raise_error=False)
+        self.assertEqual(values, {'arrayagg': [1, 2]})
 
-        print(resp)
 
-        if resp.code == 204:
 
-            self.log.info("Allowing %s as member of %s", username, org)
+    def test_array_agg_empty_result(self):
 
-            return True
+        AggregateTestModel.objects.all().delete()
 
-        else:
+        values = AggregateTestModel.objects.aggregate(arrayagg=ArrayAgg('char_field'))
 
-            try:
+        self.assertEqual(values, {'arrayagg': []})
 
-                resp_json = json.loads((resp.body or b'').decode('utf8', 'replace'))
+        values = AggregateTestModel.objects.aggregate(arrayagg=ArrayAgg('integer_field'))
 
-                message = resp_json.get('message', '')
+        self.assertEqual(values, {'arrayagg': []})
 
-            except ValueError:
+        values = AggregateTestModel.objects.aggregate(arrayagg=ArrayAgg('boolean_field'))
 
-                message = ''
+        self.assertEqual(values, {'arrayagg': []})
 
-            self.log.debug(
 
-                "%s does not appear to be a member of %s (status=%s): %s",
 
-                username,
+    def test_array_agg_lookups(self):
 
-                org,
+        aggr1 = AggregateTestModel.objects.create()
 
-                resp.code,
+        aggr2 = AggregateTestModel.objects.create()
 
-                message,
+        StatTestModel.objects.create(related_field=aggr1, int1=1, int2=0)
+
+        StatTestModel.objects.create(related_field=aggr1, int1=2, int2=0)
+
+        StatTestModel.objects.create(related_field=aggr2, int1=3, int2=0)
+
+        StatTestModel.objects.create(related_field=aggr2, int1=4, int2=0)
+
+        qs = StatTestModel.objects.values('related_field').annotate(
+
+            array=ArrayAgg('int1')
+
+        ).filter(array__overlap=[2]).values_list('array', flat=True)
+
+        self.assertCountEqual(qs.get(), [1, 2])
+
+
+
+    def test_bit_and_general(self):
+
+        values = AggregateTestModel.objects.filter(
+
+            integer_field__in=[0, 1]).aggregate(bitand=BitAnd('integer_field'))
+
+        self.assertEqual(values, {'bitand': 0})
+
+
+
+    def test_bit_and_on_only_true_values(self):
+
+        values = AggregateTestModel.objects.filter(
+
+            integer_field=1).aggregate(bitand=BitAnd('integer_field'))
+
+        self.assertEqual(values, {'bitand': 1})
+
+
+
+    def test_bit_and_on_only_false_values(self):
+
+        values = AggregateTestModel.objects.filter(
+
+            integer_field=0).aggregate(bitand=BitAnd('integer_field'))
+
+        self.assertEqual(values, {'bitand': 0})
+
+
+
+    def test_bit_and_empty_result(self):
+
+        AggregateTestModel.objects.all().delete()
+
+        values = AggregateTestModel.objects.aggregate(bitand=BitAnd('integer_field'))
+
+        self.assertEqual(values, {'bitand': None})
+
+
+
+    def test_bit_or_general(self):
+
+        values = AggregateTestModel.objects.filter(
+
+            integer_field__in=[0, 1]).aggregate(bitor=BitOr('integer_field'))
+
+        self.assertEqual(values, {'bitor': 1})
+
+
+
+    def test_bit_or_on_only_true_values(self):
+
+        values = AggregateTestModel.objects.filter(
+
+            integer_field=1).aggregate(bitor=BitOr('integer_field'))
+
+        self.assertEqual(values, {'bitor': 1})
+
+
+
+    def test_bit_or_on_only_false_values(self):
+
+        values = AggregateTestModel.objects.filter(
+
+            integer_field=0).aggregate(bitor=BitOr('integer_field'))
+
+        self.assertEqual(values, {'bitor': 0})
+
+
+
+    def test_bit_or_empty_result(self):
+
+        AggregateTestModel.objects.all().delete()
+
+        values = AggregateTestModel.objects.aggregate(bitor=BitOr('integer_field'))
+
+        self.assertEqual(values, {'bitor': None})
+
+
+
+    def test_bool_and_general(self):
+
+        values = AggregateTestModel.objects.aggregate(booland=BoolAnd('boolean_field'))
+
+        self.assertEqual(values, {'booland': False})
+
+
+
+    def test_bool_and_empty_result(self):
+
+        AggregateTestModel.objects.all().delete()
+
+        values = AggregateTestModel.objects.aggregate(booland=BoolAnd('boolean_field'))
+
+        self.assertEqual(values, {'booland': None})
+
+
+
+    def test_bool_or_general(self):
+
+        values = AggregateTestModel.objects.aggregate(boolor=BoolOr('boolean_field'))
+
+        self.assertEqual(values, {'boolor': True})
+
+
+
+    def test_bool_or_empty_result(self):
+
+        AggregateTestModel.objects.all().delete()
+
+        values = AggregateTestModel.objects.aggregate(boolor=BoolOr('boolean_field'))
+
+        self.assertEqual(values, {'boolor': None})
+
+
+
+    def test_string_agg_requires_delimiter(self):
+
+        with self.assertRaises(TypeError):
+
+            AggregateTestModel.objects.aggregate(stringagg=StringAgg('char_field'))
+
+
+
+    def test_string_agg_charfield(self):
+
+        values = AggregateTestModel.objects.aggregate(stringagg=StringAgg('char_field', delimiter=';'))
+
+        self.assertEqual(values, {'stringagg': 'Foo1;Foo2;Foo4;Foo3'})
+
+
+
+    def test_string_agg_charfield_ordering(self):
+
+        ordering_test_cases = (
+
+            (F('char_field').desc(), 'Foo4;Foo3;Foo2;Foo1'),
+
+            (F('char_field').asc(), 'Foo1;Foo2;Foo3;Foo4'),
+
+            (F('char_field'), 'Foo1;Foo2;Foo3;Foo4'),
+
+            ('char_field', 'Foo1;Foo2;Foo3;Foo4'),
+
+            ('-char_field', 'Foo4;Foo3;Foo2;Foo1'),
+
+            (Concat('char_field', Value('@')), 'Foo1;Foo2;Foo3;Foo4'),
+
+            (Concat('char_field', Value('@')).desc(), 'Foo4;Foo3;Foo2;Foo1'),
+
+        )
+
+        for ordering, expected_output in ordering_test_cases:
+
+            with self.subTest(ordering=ordering, expected_output=expected_output):
+
+                values = AggregateTestModel.objects.aggregate(
+
+                    stringagg=StringAgg('char_field', delimiter=';', ordering=ordering)
+
+                )
+
+                self.assertEqual(values, {'stringagg': expected_output})
+
+
+
+    def test_string_agg_filter(self):
+
+        values = AggregateTestModel.objects.aggregate(
+
+            stringagg=StringAgg(
+
+                'char_field',
+
+                delimiter=';',
+
+                filter=Q(char_field__endswith='3') | Q(char_field__endswith='1'),
 
             )
 
-        return False
+        )
+
+        self.assertEqual(values, {'stringagg': 'Foo1;Foo3'})
+
+
+
+    def test_string_agg_empty_result(self):
+
+        AggregateTestModel.objects.all().delete()
+
+        values = AggregateTestModel.objects.aggregate(stringagg=StringAgg('char_field', delimiter=';'))
+
+        self.assertEqual(values, {'stringagg': ''})
+
+
+
+    def test_orderable_agg_alternative_fields(self):
+
+        values = AggregateTestModel.objects.aggregate(
+
+            arrayagg=ArrayAgg('integer_field', ordering=F('char_field').asc())
+
+        )
+
+        self.assertEqual(values, {'arrayagg': [0, 1, 0, 2]})
+
+
+
+    def test_json_agg(self):
+
+        values = AggregateTestModel.objects.aggregate(jsonagg=JSONBAgg('char_field'))
+
+        self.assertEqual(values, {'jsonagg': ['Foo1', 'Foo2', 'Foo4', 'Foo3']})
+
+
+
+    def test_json_agg_empty(self):
+
+        values = AggregateTestModel.objects.none().aggregate(jsonagg=JSONBAgg('integer_field'))
+
+        self.assertEqual(values, json.loads('{"jsonagg": []}'))
+
+
+
+    def test_string_agg_array_agg_ordering_in_subquery(self):
+
+        stats = []
+
+        for i, agg in enumerate(AggregateTestModel.objects.order_by('char_field')):
+
+            stats.append(StatTestModel(related_field=agg, int1=i, int2=i + 1))
+
+            stats.append(StatTestModel(related_field=agg, int1=i + 1, int2=i))
+
+        StatTestModel.objects.bulk_create(stats)
+
+
+
+        for aggregate, expected_result in (
+
+            (
+
+                ArrayAgg('stattestmodel__int1', ordering='-stattestmodel__int2'),
+
+                [('Foo1', [0, 1]), ('Foo2', [1, 2]), ('Foo3', [2, 3]), ('Foo4', [3, 4])],
+
+            ),
+
+            (
+
+                StringAgg(
+
+                    Cast('stattestmodel__int1', CharField()),
+
+                    delimiter=';',
+
+                    ordering='-stattestmodel__int2',
+
+                ),
+
+                [('Foo1', '0;1'), ('Foo2', '1;2'), ('Foo3', '2;3'), ('Foo4', '3;4')],
+
+            ),
+
+        ):
+
+            with self.subTest(aggregate=aggregate.__class__.__name__):
+
+                subquery = AggregateTestModel.objects.filter(
+
+                    pk=OuterRef('pk'),
+
+                ).annotate(agg=aggregate).values('agg')
+
+                values = AggregateTestModel.objects.annotate(
+
+                    agg=Subquery(subquery),
+
+                ).order_by('char_field').values_list('char_field', 'agg')
+
+                self.assertEqual(list(values), expected_result)
+
+
+
+    def test_string_agg_array_agg_filter_in_subquery(self):
+
+        StatTestModel.objects.bulk_create([
+
+            StatTestModel(related_field=self.agg1, int1=0, int2=5),
+
+            StatTestModel(related_field=self.agg1, int1=1, int2=4),
+
+            StatTestModel(related_field=self.agg1, int1=2, int2=3),
+
+        ])
+
+        for aggregate, expected_result in (
+
+            (
+
+                ArrayAgg('stattestmodel__int1', filter=Q(stattestmodel__int2__gt=3)),
+
+                [('Foo1', [0, 1]), ('Foo2', None)],
+
+            ),
+
+            (
+
+                StringAgg(
+
+                    Cast('stattestmodel__int2', CharField()),
+
+                    delimiter=';',
+
+                    filter=Q(stattestmodel__int1__lt=2),
+
+                ),
+
+                [('Foo1', '5;4'), ('Foo2', None)],
+
+            ),
+
+        ):
+
+            with self.subTest(aggregate=aggregate.__class__.__name__):
+
+                subquery = AggregateTestModel.objects.filter(
+
+                    pk=OuterRef('pk'),
+
+                ).annotate(agg=aggregate).values('agg')
+
+                values = AggregateTestModel.objects.annotate(
+
+                    agg=Subquery(subquery),
+
+                ).filter(
+
+                    char_field__in=['Foo1', 'Foo2'],
+
+                ).order_by('char_field').values_list('char_field', 'agg')
+
+                self.assertEqual(list(values), expected_result)
+
+
+
+    def test_string_agg_filter_in_subquery_with_exclude(self):
+
+        subquery = AggregateTestModel.objects.annotate(
+
+            stringagg=StringAgg(
+
+                'char_field',
+
+                delimiter=';',
+
+                filter=Q(char_field__endswith='1'),
+
+            )
+
+        ).exclude(stringagg='').values('id')
+
+        self.assertSequenceEqual(
+
+            AggregateTestModel.objects.filter(id__in=Subquery(subquery)),
+
+            [self.agg1],
+
+        )
 
 
 
 
 
-class LocalGitHubOAuthenticator(LocalAuthenticator, GitHubOAuthenticator):
+class TestAggregateDistinct(PostgreSQLTestCase):
+
+    @classmethod
+
+    def setUpTestData(cls):
+
+        AggregateTestModel.objects.create(char_field='Foo')
+
+        AggregateTestModel.objects.create(char_field='Foo')
+
+        AggregateTestModel.objects.create(char_field='Bar')
 
 
 
-    """A version that mixes in local system user creation"""
+    def test_string_agg_distinct_false(self):
+
+        values = AggregateTestModel.objects.aggregate(stringagg=StringAgg('char_field', delimiter=' ', distinct=False))
+
+        self.assertEqual(values['stringagg'].count('Foo'), 2)
+
+        self.assertEqual(values['stringagg'].count('Bar'), 1)
 
 
 
-    pass
+    def test_string_agg_distinct_true(self):
+
+        values = AggregateTestModel.objects.aggregate(stringagg=StringAgg('char_field', delimiter=' ', distinct=True))
+
+        self.assertEqual(values['stringagg'].count('Foo'), 1)
+
+        self.assertEqual(values['stringagg'].count('Bar'), 1)
+
+
+
+    def test_array_agg_distinct_false(self):
+
+        values = AggregateTestModel.objects.aggregate(arrayagg=ArrayAgg('char_field', distinct=False))
+
+        self.assertEqual(sorted(values['arrayagg']), ['Bar', 'Foo', 'Foo'])
+
+
+
+    def test_array_agg_distinct_true(self):
+
+        values = AggregateTestModel.objects.aggregate(arrayagg=ArrayAgg('char_field', distinct=True))
+
+        self.assertEqual(sorted(values['arrayagg']), ['Bar', 'Foo'])
+
+
+
+
+
+class TestStatisticsAggregate(PostgreSQLTestCase):
+
+    @classmethod
+
+    def setUpTestData(cls):
+
+        StatTestModel.objects.create(
+
+            int1=1,
+
+            int2=3,
+
+            related_field=AggregateTestModel.objects.create(integer_field=0),
+
+        )
+
+        StatTestModel.objects.create(
+
+            int1=2,
+
+            int2=2,
+
+            related_field=AggregateTestModel.objects.create(integer_field=1),
+
+        )
+
+        StatTestModel.objects.create(
+
+            int1=3,
+
+            int2=1,
+
+            related_field=AggregateTestModel.objects.create(integer_field=2),
+
+        )
+
+
+
+    # Tests for base class (StatAggregate)
+
+
+
+    def test_missing_arguments_raises_exception(self):
+
+        with self.assertRaisesMessage(ValueError, 'Both y and x must be provided.'):
+
+            StatAggregate(x=None, y=None)
+
+
+
+    def test_correct_source_expressions(self):
+
+        func = StatAggregate(x='test', y=13)
+
+        self.assertIsInstance(func.source_expressions[0], Value)
+
+        self.assertIsInstance(func.source_expressions[1], F)
+
+
+
+    def test_alias_is_required(self):
+
+        class SomeFunc(StatAggregate):
+
+            function = 'TEST'
+
+        with self.assertRaisesMessage(TypeError, 'Complex aggregates require an alias'):
+
+            StatTestModel.objects.aggregate(SomeFunc(y='int2', x='int1'))
+
+
+
+    # Test aggregates
+
+
+
+    def test_corr_general(self):
+
+        values = StatTestModel.objects.aggregate(corr=Corr(y='int2', x='int1'))
+
+        self.assertEqual(values, {'corr': -1.0})
+
+
+
+    def test_corr_empty_result(self):
+
+        StatTestModel.objects.all().delete()
+
+        values = StatTestModel.objects.aggregate(corr=Corr(y='int2', x='int1'))
+
+        self.assertEqual(values, {'corr': None})
+
+
+
+    def test_covar_pop_general(self):
+
+        values = StatTestModel.objects.aggregate(covarpop=CovarPop(y='int2', x='int1'))
+
+        self.assertEqual(values, {'covarpop': Approximate(-0.66, places=1)})
+
+
+
+    def test_covar_pop_empty_result(self):
+
+        StatTestModel.objects.all().delete()
+
+        values = StatTestModel.objects.aggregate(covarpop=CovarPop(y='int2', x='int1'))
+
+        self.assertEqual(values, {'covarpop': None})
+
+
+
+    def test_covar_pop_sample(self):
+
+        values = StatTestModel.objects.aggregate(covarpop=CovarPop(y='int2', x='int1', sample=True))
+
+        self.assertEqual(values, {'covarpop': -1.0})
+
+
+
+    def test_covar_pop_sample_empty_result(self):
+
+        StatTestModel.objects.all().delete()
+
+        values = StatTestModel.objects.aggregate(covarpop=CovarPop(y='int2', x='int1', sample=True))
+
+        self.assertEqual(values, {'covarpop': None})
+
+
+
+    def test_regr_avgx_general(self):
+
+        values = StatTestModel.objects.aggregate(regravgx=RegrAvgX(y='int2', x='int1'))
+
+        self.assertEqual(values, {'regravgx': 2.0})
+
+
+
+    def test_regr_avgx_empty_result(self):
+
+        StatTestModel.objects.all().delete()
+
+        values = StatTestModel.objects.aggregate(regravgx=RegrAvgX(y='int2', x='int1'))
+
+        self.assertEqual(values, {'regravgx': None})
+
+
+
+    def test_regr_avgy_general(self):
+
+        values = StatTestModel.objects.aggregate(regravgy=RegrAvgY(y='int2', x='int1'))
+
+        self.assertEqual(values, {'regravgy': 2.0})
+
+
+
+    def test_regr_avgy_empty_result(self):
+
+        StatTestModel.objects.all().delete()
+
+        values = StatTestModel.objects.aggregate(regravgy=RegrAvgY(y='int2', x='int1'))
+
+        self.assertEqual(values, {'regravgy': None})
+
+
+
+    def test_regr_count_general(self):
+
+        values = StatTestModel.objects.aggregate(regrcount=RegrCount(y='int2', x='int1'))
+
+        self.assertEqual(values, {'regrcount': 3})
+
+
+
+    def test_regr_count_empty_result(self):
+
+        StatTestModel.objects.all().delete()
+
+        values = StatTestModel.objects.aggregate(regrcount=RegrCount(y='int2', x='int1'))
+
+        self.assertEqual(values, {'regrcount': 0})
+
+
+
+    def test_regr_intercept_general(self):
+
+        values = StatTestModel.objects.aggregate(regrintercept=RegrIntercept(y='int2', x='int1'))
+
+        self.assertEqual(values, {'regrintercept': 4})
+
+
+
+    def test_regr_intercept_empty_result(self):
+
+        StatTestModel.objects.all().delete()
+
+        values = StatTestModel.objects.aggregate(regrintercept=RegrIntercept(y='int2', x='int1'))
+
+        self.assertEqual(values, {'regrintercept': None})
+
+
+
+    def test_regr_r2_general(self):
+
+        values = StatTestModel.objects.aggregate(regrr2=RegrR2(y='int2', x='int1'))
+
+        self.assertEqual(values, {'regrr2': 1})
+
+
+
+    def test_regr_r2_empty_result(self):
+
+        StatTestModel.objects.all().delete()
+
+        values = StatTestModel.objects.aggregate(regrr2=RegrR2(y='int2', x='int1'))
+
+        self.assertEqual(values, {'regrr2': None})
+
+
+
+    def test_regr_slope_general(self):
+
+        values = StatTestModel.objects.aggregate(regrslope=RegrSlope(y='int2', x='int1'))
+
+        self.assertEqual(values, {'regrslope': -1})
+
+
+
+    def test_regr_slope_empty_result(self):
+
+        StatTestModel.objects.all().delete()
+
+        values = StatTestModel.objects.aggregate(regrslope=RegrSlope(y='int2', x='int1'))
+
+        self.assertEqual(values, {'regrslope': None})
+
+
+
+    def test_regr_sxx_general(self):
+
+        values = StatTestModel.objects.aggregate(regrsxx=RegrSXX(y='int2', x='int1'))
+
+        self.assertEqual(values, {'regrsxx': 2.0})
+
+
+
+    def test_regr_sxx_empty_result(self):
+
+        StatTestModel.objects.all().delete()
+
+        values = StatTestModel.objects.aggregate(regrsxx=RegrSXX(y='int2', x='int1'))
+
+        self.assertEqual(values, {'regrsxx': None})
+
+
+
+    def test_regr_sxy_general(self):
+
+        values = StatTestModel.objects.aggregate(regrsxy=RegrSXY(y='int2', x='int1'))
+
+        self.assertEqual(values, {'regrsxy': -2.0})
+
+
+
+    def test_regr_sxy_empty_result(self):
+
+        StatTestModel.objects.all().delete()
+
+        values = StatTestModel.objects.aggregate(regrsxy=RegrSXY(y='int2', x='int1'))
+
+        self.assertEqual(values, {'regrsxy': None})
+
+
+
+    def test_regr_syy_general(self):
+
+        values = StatTestModel.objects.aggregate(regrsyy=RegrSYY(y='int2', x='int1'))
+
+        self.assertEqual(values, {'regrsyy': 2.0})
+
+
+
+    def test_regr_syy_empty_result(self):
+
+        StatTestModel.objects.all().delete()
+
+        values = StatTestModel.objects.aggregate(regrsyy=RegrSYY(y='int2', x='int1'))
+
+        self.assertEqual(values, {'regrsyy': None})
+
+
+
+    def test_regr_avgx_with_related_obj_and_number_as_argument(self):
+
+        """
+
+        This is more complex test to check if JOIN on field and
+
+        number as argument works as expected.
+
+        """
+
+        values = StatTestModel.objects.aggregate(complex_regravgx=RegrAvgX(y=5, x='related_field__integer_field'))
+
+        self.assertEqual(values, {'complex_regravgx': 1.0})

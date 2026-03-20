@@ -2,3604 +2,3488 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-import uuid
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-from decimal import Decimal
 
-from unittest import mock
 
-from unittest.mock import ANY, patch
+# Copyright (c) 2011 X.commerce, a business unit of eBay Inc.
 
+# Copyright 2010 United States Government as represented by the
 
+# Administrator of the National Aeronautics and Space Administration.
 
-import graphene
+# All Rights Reserved.
 
-import pytest
+#
 
-from django.core.exceptions import ValidationError
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
 
-from prices import Money, TaxedMoney
+#    not use this file except in compliance with the License. You may obtain
 
+#    a copy of the License at
 
+#
 
-from saleor.checkout import calculations
+#         http://www.apache.org/licenses/LICENSE-2.0
 
-from saleor.checkout.error_codes import CheckoutErrorCode
+#
 
-from saleor.checkout.models import Checkout
+#    Unless required by applicable law or agreed to in writing, software
 
-from saleor.checkout.utils import clean_checkout, is_fully_paid
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-from saleor.core.payments import PaymentInterface
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
-from saleor.core.taxes import zero_money
+#    License for the specific language governing permissions and limitations
 
-from saleor.extensions.manager import ExtensionsManager
+#    under the License.
 
-from saleor.graphql.checkout.mutations import (
 
-    clean_shipping_method,
 
-    update_checkout_shipping_method_if_invalid,
+"""Defines interface for DB access.
 
-)
 
-from saleor.order.models import Order
 
-from saleor.payment import TransactionKind
+The underlying driver is loaded as a :class:`LazyPluggable`.
 
-from saleor.payment.interface import GatewayResponse
 
-from saleor.shipping import ShippingMethodType
 
-from saleor.shipping.models import ShippingMethod
+Functions in this module are imported into the nova.db namespace. Call these
 
-from saleor.warehouse.models import Stock
+functions from nova.db namespace, not the nova.db.api namespace.
 
-from tests.api.utils import get_graphql_content
 
 
+All functions in this module return objects that implement a dictionary-like
 
+interface. Currently, many of these objects are sqlalchemy objects that
 
+implement a dictionary interface. However, a future goal is to have all of
 
-@pytest.fixture
+these objects be simple dictionaries.
 
-def other_shipping_method(shipping_zone):
 
-    return ShippingMethod.objects.create(
 
-        name="DPD",
 
-        minimum_order_price=Money(0, "USD"),
 
-        type=ShippingMethodType.PRICE_BASED,
+**Related Flags**
 
-        price=Money(9, "USD"),
 
-        shipping_zone=shipping_zone,
 
-    )
+:db_backend:  string to lookup in the list of LazyPluggable backends.
 
+              `sqlalchemy` is the only supported backend right now.
 
 
 
+:sql_connection:  string specifying the sqlalchemy connection to use, like:
 
-@pytest.fixture(autouse=True)
+                  `sqlite:///var/lib/nova/nova.sqlite`.
 
-def setup_dummy_gateway(settings):
 
-    settings.PLUGINS = ["saleor.payment.gateways.dummy.plugin.DummyGatewayPlugin"]
 
-    return settings
+:enable_new_services:  when adding a new service to the database, is it in the
 
+                       pool of available hardware (Default: True)
 
 
-
-
-def test_clean_shipping_method_after_shipping_address_changes_stay_the_same(
-
-    checkout_with_single_item, address, shipping_method, other_shipping_method
-
-):
-
-    """Ensure the current shipping method applies to new address.
-
-
-
-    If it does, then it doesn't need to be changed.
-
-    """
-
-
-
-    checkout = checkout_with_single_item
-
-    checkout.shipping_address = address
-
-
-
-    is_valid_method = clean_shipping_method(checkout, shipping_method, [])
-
-    assert is_valid_method is True
-
-
-
-
-
-def test_clean_shipping_method_does_nothing_if_no_shipping_method(
-
-    checkout_with_single_item, address, other_shipping_method
-
-):
-
-    """If no shipping method was selected, it shouldn't return an error."""
-
-
-
-    checkout = checkout_with_single_item
-
-    checkout.shipping_address = address
-
-
-
-    is_valid_method = clean_shipping_method(checkout, None, [])
-
-    assert is_valid_method is True
-
-
-
-
-
-def test_update_checkout_shipping_method_if_invalid(
-
-    checkout_with_single_item,
-
-    address,
-
-    shipping_method,
-
-    other_shipping_method,
-
-    shipping_zone_without_countries,
-
-):
-
-    """If the shipping method is invalid, it should replace it."""
-
-
-
-    checkout = checkout_with_single_item
-
-    checkout.shipping_address = address
-
-    checkout.shipping_method = shipping_method
-
-
-
-    shipping_method.shipping_zone = shipping_zone_without_countries
-
-    shipping_method.save(update_fields=["shipping_zone"])
-
-
-
-    update_checkout_shipping_method_if_invalid(checkout, None)
-
-
-
-    assert checkout.shipping_method == other_shipping_method
-
-
-
-    # Ensure the checkout's shipping method was saved
-
-    checkout.refresh_from_db(fields=["shipping_method"])
-
-    assert checkout.shipping_method == other_shipping_method
-
-
-
-
-
-MUTATION_CHECKOUT_CREATE = """
-
-    mutation createCheckout($checkoutInput: CheckoutCreateInput!) {
-
-      checkoutCreate(input: $checkoutInput) {
-
-        created
-
-        checkout {
-
-          id
-
-          token
-
-          email
-
-          lines {
-
-            quantity
-
-          }
-
-        }
-
-        errors {
-
-          field
-
-          message
-
-        }
-
-        checkoutErrors {
-
-          field
-
-          message
-
-          code
-
-        }
-
-      }
-
-    }
 
 """
 
 
 
+from nova import exception
 
+from nova import flags
 
-def test_checkout_create(api_client, stock, graphql_address_data):
+from nova.openstack.common import cfg
 
-    """Create checkout object using GraphQL API."""
+from nova import utils
 
-    variant = stock.product_variant
 
-    variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
 
-    test_email = "test@example.com"
 
-    shipping_address = graphql_address_data
 
-    variables = {
+db_opts = [
 
-        "checkoutInput": {
+    cfg.StrOpt('db_backend',
 
-            "lines": [{"quantity": 1, "variantId": variant_id}],
+               default='sqlalchemy',
 
-            "email": test_email,
+               help='The backend to use for db'),
 
-            "shippingAddress": shipping_address,
+    cfg.BoolOpt('enable_new_services',
 
-        }
+                default=True,
 
-    }
+                help='Services to be added to the available pool on create'),
 
-    assert not Checkout.objects.exists()
+    cfg.StrOpt('instance_name_template',
 
-    response = api_client.post_graphql(MUTATION_CHECKOUT_CREATE, variables)
+               default='instance-%08x',
 
-    content = get_graphql_content(response)["data"]["checkoutCreate"]
+               help='Template string to be used to generate instance names'),
 
+    cfg.StrOpt('volume_name_template',
 
+               default='volume-%08x',
 
-    # Look at the flag to see whether a new checkout was created or not
+               help='Template string to be used to generate instance names'),
 
-    assert content["created"] is True
+    cfg.StrOpt('snapshot_name_template',
 
+               default='snapshot-%08x',
 
-
-    new_checkout = Checkout.objects.first()
-
-    assert new_checkout is not None
-
-    checkout_data = content["checkout"]
-
-    assert checkout_data["token"] == str(new_checkout.token)
-
-    assert new_checkout.lines.count() == 1
-
-    checkout_line = new_checkout.lines.first()
-
-    assert checkout_line.variant == variant
-
-    assert checkout_line.quantity == 1
-
-    assert new_checkout.shipping_address is not None
-
-    assert new_checkout.shipping_address.first_name == shipping_address["firstName"]
-
-    assert new_checkout.shipping_address.last_name == shipping_address["lastName"]
-
-    assert (
-
-        new_checkout.shipping_address.street_address_1
-
-        == shipping_address["streetAddress1"]
-
-    )
-
-    assert (
-
-        new_checkout.shipping_address.street_address_2
-
-        == shipping_address["streetAddress2"]
-
-    )
-
-    assert new_checkout.shipping_address.postal_code == shipping_address["postalCode"]
-
-    assert new_checkout.shipping_address.country == shipping_address["country"]
-
-    assert new_checkout.shipping_address.city == shipping_address["city"].upper()
-
-
-
-
-
-@pytest.mark.parametrize(
-
-    "quantity, expected_error_message, error_code",
-
-    (
-
-        (
-
-            -1,
-
-            "The quantity should be higher than zero.",
-
-            CheckoutErrorCode.ZERO_QUANTITY,
-
-        ),
-
-        (
-
-            51,
-
-            "Cannot add more than 50 times this item.",
-
-            CheckoutErrorCode.QUANTITY_GREATER_THAN_LIMIT,
-
-        ),
-
-    ),
-
-)
-
-def test_checkout_create_cannot_add_invalid_quantities(
-
-    api_client,
-
-    stock,
-
-    graphql_address_data,
-
-    quantity,
-
-    expected_error_message,
-
-    error_code,
-
-):
-
-    variant = stock.product_variant
-
-    variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
-
-    test_email = "test@example.com"
-
-    shipping_address = graphql_address_data
-
-    variables = {
-
-        "checkoutInput": {
-
-            "lines": [{"quantity": quantity, "variantId": variant_id}],
-
-            "email": test_email,
-
-            "shippingAddress": shipping_address,
-
-        }
-
-    }
-
-    assert not Checkout.objects.exists()
-
-    response = api_client.post_graphql(MUTATION_CHECKOUT_CREATE, variables)
-
-    content = get_graphql_content(response)["data"]["checkoutCreate"]
-
-    assert content["errors"]
-
-    assert content["errors"] == [
-
-        {"field": "quantity", "message": expected_error_message}
+               help='Template string to be used to generate snapshot names'),
 
     ]
 
 
 
-    assert content["checkoutErrors"] == [
+FLAGS = flags.FLAGS
 
-        {
+FLAGS.register_opts(db_opts)
 
-            "field": "quantity",
 
-            "message": expected_error_message,
 
-            "code": error_code.name,
+IMPL = utils.LazyPluggable('db_backend',
 
-        }
+                           sqlalchemy='nova.db.sqlalchemy.api')
 
-    ]
 
 
 
 
+class NoMoreNetworks(exception.Error):
 
-def test_checkout_create_reuse_checkout(checkout, user_api_client, stock):
+    """No more available networks."""
 
-    # assign user to the checkout
+    pass
 
-    checkout.user = user_api_client.user
 
-    checkout.save()
 
-    variant = stock.product_variant
 
 
+class NoMoreTargets(exception.Error):
 
-    variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
+    """No more available targets"""
 
-    variables = {"checkoutInput": {"lines": [{"quantity": 1, "variantId": variant_id}]}}
+    pass
 
-    response = user_api_client.post_graphql(MUTATION_CHECKOUT_CREATE, variables)
 
-    content = get_graphql_content(response)["data"]["checkoutCreate"]
 
 
 
-    # Look at the flag to see whether a new checkout was created or not
+###################
 
-    assert not content["created"]
 
 
 
-    # assert that existing checkout was reused and returned by mutation
 
-    checkout_data = content["checkout"]
+def service_destroy(context, instance_id):
 
-    assert checkout_data["token"] == str(checkout.token)
+    """Destroy the service or raise if it does not exist."""
 
+    return IMPL.service_destroy(context, instance_id)
 
 
-    # if checkout was reused it should be returned unmodified (e.g. without
 
-    # adding new lines that was passed)
 
-    assert checkout_data["lines"] == []
 
+def service_get(context, service_id):
 
+    """Get a service or raise if it does not exist."""
 
+    return IMPL.service_get(context, service_id)
 
 
-def test_checkout_create_required_email(api_client, stock):
 
-    variant = stock.product_variant
 
-    variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
 
-    variables = {
+def service_get_by_host_and_topic(context, host, topic):
 
-        "checkoutInput": {
+    """Get a service by host it's on and topic it listens to."""
 
-            "lines": [{"quantity": 1, "variantId": variant_id}],
+    return IMPL.service_get_by_host_and_topic(context, host, topic)
 
-            "email": "",
 
-        }
 
-    }
 
 
+def service_get_all(context, disabled=None):
 
-    response = api_client.post_graphql(MUTATION_CHECKOUT_CREATE, variables)
+    """Get all services."""
 
-    content = get_graphql_content(response)
+    return IMPL.service_get_all(context, disabled)
 
 
 
-    errors = content["data"]["checkoutCreate"]["errors"]
 
-    assert errors
 
-    assert errors[0]["field"] == "email"
+def service_get_all_by_topic(context, topic):
 
-    assert errors[0]["message"] == "This field cannot be blank."
+    """Get all services for a given topic."""
 
+    return IMPL.service_get_all_by_topic(context, topic)
 
 
-    checkout_errors = content["data"]["checkoutCreate"]["checkoutErrors"]
 
-    assert checkout_errors[0]["code"] == CheckoutErrorCode.REQUIRED.name
 
 
+def service_get_all_by_host(context, host):
 
+    """Get all services for a given host."""
 
+    return IMPL.service_get_all_by_host(context, host)
 
-def test_checkout_create_default_email_for_logged_in_customer(user_api_client, stock):
 
-    variant = stock.product_variant
 
-    variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
 
-    variables = {"checkoutInput": {"lines": [{"quantity": 1, "variantId": variant_id}]}}
 
-    response = user_api_client.post_graphql(MUTATION_CHECKOUT_CREATE, variables)
+def service_get_all_compute_by_host(context, host):
 
-    customer = user_api_client.user
+    """Get all compute services for a given host."""
 
-    content = get_graphql_content(response)
+    return IMPL.service_get_all_compute_by_host(context, host)
 
-    new_checkout = Checkout.objects.first()
 
-    assert new_checkout is not None
 
-    checkout_data = content["data"]["checkoutCreate"]["checkout"]
 
-    assert checkout_data["email"] == str(customer.email)
 
-    assert new_checkout.user.id == customer.id
+def service_get_all_compute_sorted(context):
 
-    assert new_checkout.email == customer.email
+    """Get all compute services sorted by instance count.
 
 
 
+    :returns: a list of (Service, instance_count) tuples.
 
 
-def test_checkout_create_logged_in_customer(user_api_client, stock):
-
-    variant = stock.product_variant
-
-    variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
-
-    variables = {
-
-        "checkoutInput": {
-
-            "email": user_api_client.user.email,
-
-            "lines": [{"quantity": 1, "variantId": variant_id}],
-
-        }
-
-    }
-
-    assert not Checkout.objects.exists()
-
-    response = user_api_client.post_graphql(MUTATION_CHECKOUT_CREATE, variables)
-
-    content = get_graphql_content(response)
-
-    new_checkout = Checkout.objects.first()
-
-    assert new_checkout is not None
-
-    checkout_data = content["data"]["checkoutCreate"]["checkout"]
-
-    assert checkout_data["token"] == str(new_checkout.token)
-
-    checkout_user = new_checkout.user
-
-    customer = user_api_client.user
-
-    assert customer.id == checkout_user.id
-
-    assert customer.default_shipping_address_id != new_checkout.shipping_address_id
-
-    assert (
-
-        customer.default_shipping_address.as_data()
-
-        == new_checkout.shipping_address.as_data()
-
-    )
-
-    assert customer.default_billing_address_id != new_checkout.billing_address_id
-
-    assert (
-
-        customer.default_billing_address.as_data()
-
-        == new_checkout.billing_address.as_data()
-
-    )
-
-    assert customer.email == new_checkout.email
-
-
-
-
-
-def test_checkout_create_logged_in_customer_custom_email(user_api_client, stock):
-
-    variant = stock.product_variant
-
-    variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
-
-    customer = user_api_client.user
-
-    custom_email = "custom@example.com"
-
-    variables = {
-
-        "checkoutInput": {
-
-            "lines": [{"quantity": 1, "variantId": variant_id}],
-
-            "email": custom_email,
-
-        }
-
-    }
-
-    assert not Checkout.objects.exists()
-
-    assert not custom_email == customer.email
-
-    response = user_api_client.post_graphql(MUTATION_CHECKOUT_CREATE, variables)
-
-    content = get_graphql_content(response)
-
-    new_checkout = Checkout.objects.first()
-
-    assert new_checkout is not None
-
-    checkout_data = content["data"]["checkoutCreate"]["checkout"]
-
-    assert checkout_data["token"] == str(new_checkout.token)
-
-    checkout_user = new_checkout.user
-
-    assert customer.id == checkout_user.id
-
-    assert new_checkout.email == custom_email
-
-
-
-
-
-def test_checkout_create_logged_in_customer_custom_addresses(
-
-    user_api_client, stock, graphql_address_data
-
-):
-
-    variant = stock.product_variant
-
-    variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
-
-    shipping_address = graphql_address_data
-
-    billing_address = graphql_address_data
-
-    variables = {
-
-        "checkoutInput": {
-
-            "email": user_api_client.user.email,
-
-            "lines": [{"quantity": 1, "variantId": variant_id}],
-
-            "shippingAddress": shipping_address,
-
-            "billingAddress": billing_address,
-
-        }
-
-    }
-
-    assert not Checkout.objects.exists()
-
-    response = user_api_client.post_graphql(MUTATION_CHECKOUT_CREATE, variables)
-
-    content = get_graphql_content(response)
-
-    new_checkout = Checkout.objects.first()
-
-    assert new_checkout is not None
-
-    checkout_data = content["data"]["checkoutCreate"]["checkout"]
-
-    assert checkout_data["token"] == str(new_checkout.token)
-
-    checkout_user = new_checkout.user
-
-    customer = user_api_client.user
-
-    assert customer.id == checkout_user.id
-
-    assert not (
-
-        customer.default_shipping_address_id == new_checkout.shipping_address_id
-
-    )
-
-    assert not (customer.default_billing_address_id == new_checkout.billing_address_id)
-
-    assert new_checkout.shipping_address.first_name == shipping_address["firstName"]
-
-    assert new_checkout.billing_address.first_name == billing_address["firstName"]
-
-
-
-
-
-def test_checkout_create_check_lines_quantity(
-
-    user_api_client, stock, graphql_address_data
-
-):
-
-    variant = stock.product_variant
-
-    variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
-
-    test_email = "test@example.com"
-
-    shipping_address = graphql_address_data
-
-    variables = {
-
-        "checkoutInput": {
-
-            "lines": [{"quantity": 3, "variantId": variant_id}],
-
-            "email": test_email,
-
-            "shippingAddress": shipping_address,
-
-        }
-
-    }
-
-    assert not Checkout.objects.exists()
-
-    response = user_api_client.post_graphql(MUTATION_CHECKOUT_CREATE, variables)
-
-    content = get_graphql_content(response)
-
-    data = content["data"]["checkoutCreate"]
-
-    assert data["errors"][0]["message"] == (
-
-        "Could not add item Test product (SKU_A). Only 2 remaining in stock."
-
-    )
-
-    assert data["errors"][0]["field"] == "quantity"
-
-
-
-
-
-@pytest.fixture
-
-def expected_dummy_gateway():
-
-    return {
-
-        "name": "Dummy",
-
-        "config": [{"field": "store_customer_card", "value": "false"}],
-
-    }
-
-
-
-
-
-def test_checkout_available_payment_gateways(
-
-    api_client, checkout_with_item, expected_dummy_gateway
-
-):
-
-    query = """
-
-    query getCheckout($token: UUID!) {
-
-        checkout(token: $token) {
-
-           availablePaymentGateways {
-
-               name
-
-               config {
-
-                   field
-
-                   value
-
-               }
-
-           }
-
-        }
-
-    }
 
     """
 
-    variables = {"token": str(checkout_with_item.token)}
-
-    response = api_client.post_graphql(query, variables)
-
-    content = get_graphql_content(response)
-
-    data = content["data"]["checkout"]
-
-    assert data["availablePaymentGateways"] == [expected_dummy_gateway]
+    return IMPL.service_get_all_compute_sorted(context)
 
 
 
 
 
-def test_checkout_available_shipping_methods(
+def service_get_all_volume_sorted(context):
 
-    api_client, checkout_with_item, address, shipping_zone
-
-):
-
-    checkout_with_item.shipping_address = address
-
-    checkout_with_item.save()
+    """Get all volume services sorted by volume count.
 
 
 
-    query = """
+    :returns: a list of (Service, volume_count) tuples.
 
-    query getCheckout($token: UUID!) {
 
-        checkout(token: $token) {
-
-            availableShippingMethods {
-
-                name
-
-            }
-
-        }
-
-    }
 
     """
 
-    variables = {"token": checkout_with_item.token}
-
-    response = api_client.post_graphql(query, variables)
-
-    content = get_graphql_content(response)
-
-    data = content["data"]["checkout"]
-
-
-
-    shipping_method = shipping_zone.shipping_methods.first()
-
-    assert data["availableShippingMethods"] == [{"name": shipping_method.name}]
+    return IMPL.service_get_all_volume_sorted(context)
 
 
 
 
 
-@pytest.mark.parametrize(
+def service_get_by_args(context, host, binary):
 
-    "expected_price_type, expected_price, display_gross_prices",
+    """Get the state of an service by node name and binary."""
 
-    (("gross", 13, True), ("net", 10, False)),
-
-)
-
-def test_checkout_available_shipping_methods_with_price_displayed(
-
-    expected_price_type,
-
-    expected_price,
-
-    display_gross_prices,
-
-    monkeypatch,
-
-    api_client,
-
-    checkout_with_item,
-
-    address,
-
-    shipping_zone,
-
-    site_settings,
-
-):
-
-    shipping_method = shipping_zone.shipping_methods.first()
-
-    taxed_price = TaxedMoney(net=Money(10, "USD"), gross=Money(13, "USD"))
-
-    apply_taxes_to_shipping_mock = mock.Mock(return_value=taxed_price)
-
-    monkeypatch.setattr(
-
-        ExtensionsManager, "apply_taxes_to_shipping", apply_taxes_to_shipping_mock
-
-    )
-
-    site_settings.display_gross_prices = display_gross_prices
-
-    site_settings.save()
-
-    checkout_with_item.shipping_address = address
-
-    checkout_with_item.save()
+    return IMPL.service_get_by_args(context, host, binary)
 
 
 
-    query = """
 
-    query getCheckout($token: UUID!) {
 
-        checkout(token: $token) {
+def service_create(context, values):
 
-            availableShippingMethods {
+    """Create a service from the values dictionary."""
 
-                name
+    return IMPL.service_create(context, values)
 
-                price {
 
-                    amount
 
-                }
 
-            }
 
-        }
+def service_update(context, service_id, values):
 
-    }
+    """Set the given properties on an service and update it.
+
+
+
+    Raises NotFound if service does not exist.
+
+
 
     """
 
-    variables = {"token": checkout_with_item.token}
-
-    response = api_client.post_graphql(query, variables)
-
-    content = get_graphql_content(response)
-
-    data = content["data"]["checkout"]
-
-
-
-    apply_taxes_to_shipping_mock.assert_called_once_with(
-
-        shipping_method.price, mock.ANY
-
-    )
-
-    assert data["availableShippingMethods"] == [
-
-        {"name": "DHL", "price": {"amount": expected_price}}
-
-    ]
+    return IMPL.service_update(context, service_id, values)
 
 
 
 
 
-def test_checkout_no_available_shipping_methods_without_address(
-
-    api_client, checkout_with_item
-
-):
-
-    query = """
-
-    query getCheckout($token: UUID!) {
-
-        checkout(token: $token) {
-
-            availableShippingMethods {
-
-                name
-
-            }
-
-        }
-
-    }
-
-    """
-
-    variables = {"token": checkout_with_item.token}
-
-    response = api_client.post_graphql(query, variables)
-
-    content = get_graphql_content(response)
-
-    data = content["data"]["checkout"]
-
-
-
-    assert data["availableShippingMethods"] == []
+###################
 
 
 
 
 
-def test_checkout_no_available_shipping_methods_without_lines(api_client, checkout):
+def compute_node_get(context, compute_id):
 
-    query = """
+    """Get an computeNode or raise if it does not exist."""
 
-    query getCheckout($token: UUID!) {
+    return IMPL.compute_node_get(context, compute_id)
 
-        checkout(token: $token) {
 
-            availableShippingMethods {
 
-                name
 
-            }
 
-        }
+def compute_node_get_all(context):
 
-    }
+    """Get all computeNodes."""
+
+    return IMPL.compute_node_get_all(context)
+
+
+
+
+
+def compute_node_create(context, values):
+
+    """Create a computeNode from the values dictionary."""
+
+    return IMPL.compute_node_create(context, values)
+
+
+
+
+
+def compute_node_update(context, compute_id, values, auto_adjust=True):
+
+    """Set the given properties on an computeNode and update it.
+
+
+
+    Raises NotFound if computeNode does not exist.
 
     """
 
-    variables = {"token": checkout.token}
+    return IMPL.compute_node_update(context, compute_id, values, auto_adjust)
 
-    response = api_client.post_graphql(query, variables)
 
-    content = get_graphql_content(response)
 
-    data = content["data"]["checkout"]
 
 
+def compute_node_get_by_host(context, host):
 
-    assert data["availableShippingMethods"] == []
+    return IMPL.compute_node_get_by_host(context, host)
 
 
 
 
 
-MUTATION_CHECKOUT_LINES_ADD = """
+def compute_node_utilization_update(context, host, free_ram_mb_delta=0,
 
-    mutation checkoutLinesAdd(
+                          free_disk_gb_delta=0, work_delta=0, vm_delta=0):
 
-            $checkoutId: ID!, $lines: [CheckoutLineInput!]!) {
+    return IMPL.compute_node_utilization_update(context, host,
 
-        checkoutLinesAdd(checkoutId: $checkoutId, lines: $lines) {
+                          free_ram_mb_delta, free_disk_gb_delta, work_delta,
 
-            checkout {
+                          vm_delta)
 
-                token
 
-                lines {
 
-                    quantity
 
-                    variant {
 
-                        id
+def compute_node_utilization_set(context, host, free_ram_mb=None,
 
-                    }
+                                 free_disk_gb=None, work=None, vms=None):
 
-                }
+    return IMPL.compute_node_utilization_set(context, host, free_ram_mb,
 
-            }
+                                             free_disk_gb, work, vms)
 
-            errors {
 
-                field
 
-                message
+###################
 
-            }
 
-        }
 
-    }"""
 
 
+def certificate_create(context, values):
 
+    """Create a certificate from the values dictionary."""
 
+    return IMPL.certificate_create(context, values)
 
-@mock.patch(
 
-    "saleor.graphql.checkout.mutations.update_checkout_shipping_method_if_invalid",
 
-    wraps=update_checkout_shipping_method_if_invalid,
 
-)
 
-def test_checkout_lines_add(
+def certificate_get_all_by_project(context, project_id):
 
-    mocked_update_shipping_method, user_api_client, checkout_with_item, stock
+    """Get all certificates for a project."""
 
-):
+    return IMPL.certificate_get_all_by_project(context, project_id)
 
-    variant = stock.product_variant
 
-    checkout = checkout_with_item
 
-    line = checkout.lines.first()
 
-    assert line.quantity == 3
 
-    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+def certificate_get_all_by_user(context, user_id):
 
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
+    """Get all certificates for a user."""
 
+    return IMPL.certificate_get_all_by_user(context, user_id)
 
 
-    variables = {
 
-        "checkoutId": checkout_id,
 
-        "lines": [{"variantId": variant_id, "quantity": 1}],
 
-    }
+def certificate_get_all_by_user_and_project(context, user_id, project_id):
 
-    response = user_api_client.post_graphql(MUTATION_CHECKOUT_LINES_ADD, variables)
+    """Get all certificates for a user and project."""
 
-    content = get_graphql_content(response)
+    return IMPL.certificate_get_all_by_user_and_project(context,
 
-    data = content["data"]["checkoutLinesAdd"]
+                                                        user_id,
 
-    assert not data["errors"]
+                                                        project_id)
 
-    checkout.refresh_from_db()
 
-    line = checkout.lines.latest("pk")
 
-    assert line.variant == variant
 
-    assert line.quantity == 1
 
+###################
 
 
-    mocked_update_shipping_method.assert_called_once_with(checkout, mock.ANY)
 
+def floating_ip_get(context, id):
 
+    return IMPL.floating_ip_get(context, id)
 
 
 
-def test_checkout_lines_add_too_many(user_api_client, checkout_with_item, stock):
 
-    variant = stock.product_variant
 
-    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+def floating_ip_get_pools(context):
 
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout_with_item.pk)
+    """Returns a list of floating ip pools"""
 
+    return IMPL.floating_ip_get_pools(context)
 
 
-    variables = {
 
-        "checkoutId": checkout_id,
 
-        "lines": [{"variantId": variant_id, "quantity": 51}],
 
-    }
+def floating_ip_allocate_address(context, project_id, pool):
 
-    response = user_api_client.post_graphql(MUTATION_CHECKOUT_LINES_ADD, variables)
+    """Allocate free floating ip from specified pool and return the address.
 
-    content = get_graphql_content(response)["data"]["checkoutLinesAdd"]
 
 
+    Raises if one is not available.
 
-    assert content["errors"]
 
-    assert content["errors"] == [
-
-        {"field": "quantity", "message": "Cannot add more than 50 times this item."}
-
-    ]
-
-
-
-
-
-def test_checkout_lines_add_empty_checkout(user_api_client, checkout, stock):
-
-    variant = stock.product_variant
-
-    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
-
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
-
-
-
-    variables = {
-
-        "checkoutId": checkout_id,
-
-        "lines": [{"variantId": variant_id, "quantity": 1}],
-
-    }
-
-    response = user_api_client.post_graphql(MUTATION_CHECKOUT_LINES_ADD, variables)
-
-    content = get_graphql_content(response)
-
-    data = content["data"]["checkoutLinesAdd"]
-
-    assert not data["errors"]
-
-    checkout.refresh_from_db()
-
-    line = checkout.lines.first()
-
-    assert line.variant == variant
-
-    assert line.quantity == 1
-
-
-
-
-
-def test_checkout_lines_add_check_lines_quantity(user_api_client, checkout, stock):
-
-    variant = stock.product_variant
-
-    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
-
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
-
-
-
-    variables = {
-
-        "checkoutId": checkout_id,
-
-        "lines": [{"variantId": variant_id, "quantity": 3}],
-
-    }
-
-    response = user_api_client.post_graphql(MUTATION_CHECKOUT_LINES_ADD, variables)
-
-    content = get_graphql_content(response)
-
-    data = content["data"]["checkoutLinesAdd"]
-
-    assert data["errors"][0]["message"] == (
-
-        "Could not add item Test product (SKU_A). Only 2 remaining in stock."
-
-    )
-
-    assert data["errors"][0]["field"] == "quantity"
-
-
-
-
-
-def test_checkout_lines_invalid_variant_id(user_api_client, checkout, stock):
-
-    variant = stock.product_variant
-
-    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
-
-    invalid_variant_id = "InvalidId"
-
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
-
-
-
-    variables = {
-
-        "checkoutId": checkout_id,
-
-        "lines": [
-
-            {"variantId": variant_id, "quantity": 1},
-
-            {"variantId": invalid_variant_id, "quantity": 3},
-
-        ],
-
-    }
-
-    response = user_api_client.post_graphql(MUTATION_CHECKOUT_LINES_ADD, variables)
-
-    content = get_graphql_content(response)
-
-    data = content["data"]["checkoutLinesAdd"]
-
-    error_msg = "Could not resolve to a node with the global id list of '%s'."
-
-    assert data["errors"][0]["message"] == error_msg % [invalid_variant_id]
-
-    assert data["errors"][0]["field"] == "variantId"
-
-
-
-
-
-MUTATION_CHECKOUT_LINES_UPDATE = """
-
-    mutation checkoutLinesUpdate(
-
-            $checkoutId: ID!, $lines: [CheckoutLineInput!]!) {
-
-        checkoutLinesUpdate(checkoutId: $checkoutId, lines: $lines) {
-
-            checkout {
-
-                token
-
-                lines {
-
-                    quantity
-
-                    variant {
-
-                        id
-
-                    }
-
-                }
-
-            }
-
-            errors {
-
-                field
-
-                message
-
-            }
-
-        }
-
-    }
 
     """
 
+    return IMPL.floating_ip_allocate_address(context, project_id, pool)
 
 
 
 
-@mock.patch(
 
-    "saleor.graphql.checkout.mutations.update_checkout_shipping_method_if_invalid",
+def floating_ip_create(context, values):
 
-    wraps=update_checkout_shipping_method_if_invalid,
+    """Create a floating ip from the values dictionary."""
 
-)
+    return IMPL.floating_ip_create(context, values)
 
-def test_checkout_lines_update(
 
-    mocked_update_shipping_method, user_api_client, checkout_with_item
 
-):
 
-    checkout = checkout_with_item
 
-    assert checkout.lines.count() == 1
+def floating_ip_count_by_project(context, project_id):
 
-    line = checkout.lines.first()
+    """Count floating ips used by project."""
 
-    variant = line.variant
+    return IMPL.floating_ip_count_by_project(context, project_id)
 
-    assert line.quantity == 3
 
 
 
-    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
 
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
+def floating_ip_deallocate(context, address):
 
+    """Deallocate an floating ip by address."""
 
+    return IMPL.floating_ip_deallocate(context, address)
 
-    variables = {
 
-        "checkoutId": checkout_id,
 
-        "lines": [{"variantId": variant_id, "quantity": 1}],
 
-    }
 
-    response = user_api_client.post_graphql(MUTATION_CHECKOUT_LINES_UPDATE, variables)
+def floating_ip_destroy(context, address):
 
-    content = get_graphql_content(response)
+    """Destroy the floating_ip or raise if it does not exist."""
 
+    return IMPL.floating_ip_destroy(context, address)
 
 
-    data = content["data"]["checkoutLinesUpdate"]
 
-    assert not data["errors"]
 
-    checkout.refresh_from_db()
 
-    assert checkout.lines.count() == 1
+def floating_ip_disassociate(context, address):
 
-    line = checkout.lines.first()
+    """Disassociate an floating ip from a fixed ip by address.
 
-    assert line.variant == variant
 
-    assert line.quantity == 1
 
+    :returns: the address of the existing fixed ip.
 
 
-    mocked_update_shipping_method.assert_called_once_with(checkout, mock.ANY)
-
-
-
-
-
-def test_checkout_lines_update_invalid_checkout_id(user_api_client):
-
-    variables = {"checkoutId": "test", "lines": []}
-
-    response = user_api_client.post_graphql(MUTATION_CHECKOUT_LINES_UPDATE, variables)
-
-    content = get_graphql_content(response)
-
-    data = content["data"]["checkoutLinesUpdate"]
-
-    assert data["errors"][0]["field"] == "checkoutId"
-
-
-
-
-
-def test_checkout_lines_update_check_lines_quantity(
-
-    user_api_client, checkout_with_item
-
-):
-
-    checkout = checkout_with_item
-
-    line = checkout.lines.first()
-
-    variant = line.variant
-
-
-
-    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
-
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
-
-
-
-    variables = {
-
-        "checkoutId": checkout_id,
-
-        "lines": [{"variantId": variant_id, "quantity": 10}],
-
-    }
-
-    response = user_api_client.post_graphql(MUTATION_CHECKOUT_LINES_UPDATE, variables)
-
-    content = get_graphql_content(response)
-
-
-
-    data = content["data"]["checkoutLinesUpdate"]
-
-    assert data["errors"][0]["message"] == (
-
-        "Could not add item Test product (123). Only 9 remaining in stock."
-
-    )
-
-    assert data["errors"][0]["field"] == "quantity"
-
-
-
-
-
-def test_checkout_lines_update_with_chosen_shipping(
-
-    user_api_client, checkout, stock, address, shipping_method
-
-):
-
-    checkout.shipping_address = address
-
-    checkout.shipping_method = shipping_method
-
-    checkout.save()
-
-
-
-    variant = stock.product_variant
-
-    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
-
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
-
-
-
-    variables = {
-
-        "checkoutId": checkout_id,
-
-        "lines": [{"variantId": variant_id, "quantity": 1}],
-
-    }
-
-    response = user_api_client.post_graphql(MUTATION_CHECKOUT_LINES_UPDATE, variables)
-
-    content = get_graphql_content(response)
-
-
-
-    data = content["data"]["checkoutLinesUpdate"]
-
-    assert not data["errors"]
-
-    checkout.refresh_from_db()
-
-    assert checkout.quantity == 1
-
-
-
-
-
-MUTATION_CHECKOUT_LINES_DELETE = """
-
-    mutation checkoutLineDelete($checkoutId: ID!, $lineId: ID!) {
-
-        checkoutLineDelete(checkoutId: $checkoutId, lineId: $lineId) {
-
-            checkout {
-
-                token
-
-                lines {
-
-                    quantity
-
-                    variant {
-
-                        id
-
-                    }
-
-                }
-
-            }
-
-            errors {
-
-                field
-
-                message
-
-            }
-
-        }
-
-    }
-
-"""
-
-
-
-
-
-@mock.patch(
-
-    "saleor.graphql.checkout.mutations.update_checkout_shipping_method_if_invalid",
-
-    wraps=update_checkout_shipping_method_if_invalid,
-
-)
-
-def test_checkout_line_delete(
-
-    mocked_update_shipping_method, user_api_client, checkout_with_item
-
-):
-
-    checkout = checkout_with_item
-
-    assert checkout.lines.count() == 1
-
-    line = checkout.lines.first()
-
-    assert line.quantity == 3
-
-
-
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
-
-    line_id = graphene.Node.to_global_id("CheckoutLine", line.pk)
-
-
-
-    variables = {"checkoutId": checkout_id, "lineId": line_id}
-
-    response = user_api_client.post_graphql(MUTATION_CHECKOUT_LINES_DELETE, variables)
-
-    content = get_graphql_content(response)
-
-
-
-    data = content["data"]["checkoutLineDelete"]
-
-    assert not data["errors"]
-
-    checkout.refresh_from_db()
-
-    assert checkout.lines.count() == 0
-
-    mocked_update_shipping_method.assert_called_once_with(checkout, mock.ANY)
-
-
-
-
-
-@mock.patch(
-
-    "saleor.graphql.checkout.mutations.update_checkout_shipping_method_if_invalid",
-
-    wraps=update_checkout_shipping_method_if_invalid,
-
-)
-
-def test_checkout_line_delete_by_zero_quantity(
-
-    mocked_update_shipping_method, user_api_client, checkout_with_item
-
-):
-
-    checkout = checkout_with_item
-
-    assert checkout.lines.count() == 1
-
-    line = checkout.lines.first()
-
-    variant = line.variant
-
-    assert line.quantity == 3
-
-
-
-    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
-
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
-
-
-
-    variables = {
-
-        "checkoutId": checkout_id,
-
-        "lines": [{"variantId": variant_id, "quantity": 0}],
-
-    }
-
-    response = user_api_client.post_graphql(MUTATION_CHECKOUT_LINES_UPDATE, variables)
-
-    content = get_graphql_content(response)
-
-
-
-    data = content["data"]["checkoutLinesUpdate"]
-
-    assert not data["errors"]
-
-    checkout.refresh_from_db()
-
-    assert checkout.lines.count() == 0
-
-    mocked_update_shipping_method.assert_called_once_with(checkout, mock.ANY)
-
-
-
-
-
-def test_checkout_customer_attach(user_api_client, checkout_with_item, customer_user):
-
-    checkout = checkout_with_item
-
-    assert checkout.user is None
-
-
-
-    query = """
-
-        mutation checkoutCustomerAttach($checkoutId: ID!, $customerId: ID!) {
-
-            checkoutCustomerAttach(
-
-                    checkoutId: $checkoutId, customerId: $customerId) {
-
-                checkout {
-
-                    token
-
-                }
-
-                errors {
-
-                    field
-
-                    message
-
-                }
-
-            }
-
-        }
 
     """
 
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
-
-    customer_id = graphene.Node.to_global_id("User", customer_user.pk)
-
-
-
-    variables = {"checkoutId": checkout_id, "customerId": customer_id}
-
-    response = user_api_client.post_graphql(query, variables)
-
-    content = get_graphql_content(response)
-
-
-
-    data = content["data"]["checkoutCustomerAttach"]
-
-    assert not data["errors"]
-
-    checkout.refresh_from_db()
-
-    assert checkout.user == customer_user
+    return IMPL.floating_ip_disassociate(context, address)
 
 
 
 
 
-MUTATION_CHECKOUT_CUSTOMER_DETACH = """
+def floating_ip_fixed_ip_associate(context, floating_address,
 
-    mutation checkoutCustomerDetach($checkoutId: ID!) {
+                                   fixed_address, host):
 
-        checkoutCustomerDetach(checkoutId: $checkoutId) {
+    """Associate an floating ip to a fixed_ip by address."""
 
-            checkout {
+    return IMPL.floating_ip_fixed_ip_associate(context,
 
-                token
+                                               floating_address,
 
-            }
+                                               fixed_address,
 
-            errors {
+                                               host)
 
-                field
 
-                message
 
-            }
 
-        }
 
-    }
+def floating_ip_get_all(context):
+
+    """Get all floating ips."""
+
+    return IMPL.floating_ip_get_all(context)
+
+
+
+
+
+def floating_ip_get_all_by_host(context, host):
+
+    """Get all floating ips by host."""
+
+    return IMPL.floating_ip_get_all_by_host(context, host)
+
+
+
+
+
+def floating_ip_get_all_by_project(context, project_id):
+
+    """Get all floating ips by project."""
+
+    return IMPL.floating_ip_get_all_by_project(context, project_id)
+
+
+
+
+
+def floating_ip_get_by_address(context, address):
+
+    """Get a floating ip by address or raise if it doesn't exist."""
+
+    return IMPL.floating_ip_get_by_address(context, address)
+
+
+
+
+
+def floating_ip_get_by_fixed_address(context, fixed_address):
+
+    """Get a floating ips by fixed address"""
+
+    return IMPL.floating_ip_get_by_fixed_address(context, fixed_address)
+
+
+
+
+
+def floating_ip_get_by_fixed_ip_id(context, fixed_ip_id):
+
+    """Get a floating ips by fixed address"""
+
+    return IMPL.floating_ip_get_by_fixed_ip_id(context, fixed_ip_id)
+
+
+
+
+
+def floating_ip_update(context, address, values):
+
+    """Update a floating ip by address or raise if it doesn't exist."""
+
+    return IMPL.floating_ip_update(context, address, values)
+
+
+
+
+
+def floating_ip_set_auto_assigned(context, address):
+
+    """Set auto_assigned flag to floating ip"""
+
+    return IMPL.floating_ip_set_auto_assigned(context, address)
+
+
+
+
+
+def dnsdomain_list(context):
+
+    """Get a list of all zones in our database, public and private."""
+
+    return IMPL.dnsdomain_list(context)
+
+
+
+
+
+def dnsdomain_register_for_zone(context, fqdomain, zone):
+
+    """Associated a DNS domain with an availability zone"""
+
+    return IMPL.dnsdomain_register_for_zone(context, fqdomain, zone)
+
+
+
+
+
+def dnsdomain_register_for_project(context, fqdomain, project):
+
+    """Associated a DNS domain with a project id"""
+
+    return IMPL.dnsdomain_register_for_project(context, fqdomain, project)
+
+
+
+
+
+def dnsdomain_unregister(context, fqdomain):
+
+    """Purge associations for the specified DNS zone"""
+
+    return IMPL.dnsdomain_unregister(context, fqdomain)
+
+
+
+
+
+def dnsdomain_get(context, fqdomain):
+
+    """Get the db record for the specified domain."""
+
+    return IMPL.dnsdomain_get(context, fqdomain)
+
+
+
+
+
+####################
+
+
+
+
+
+def migration_update(context, id, values):
+
+    """Update a migration instance."""
+
+    return IMPL.migration_update(context, id, values)
+
+
+
+
+
+def migration_create(context, values):
+
+    """Create a migration record."""
+
+    return IMPL.migration_create(context, values)
+
+
+
+
+
+def migration_get(context, migration_id):
+
+    """Finds a migration by the id."""
+
+    return IMPL.migration_get(context, migration_id)
+
+
+
+
+
+def migration_get_by_instance_and_status(context, instance_uuid, status):
+
+    """Finds a migration by the instance uuid its migrating."""
+
+    return IMPL.migration_get_by_instance_and_status(context, instance_uuid,
+
+            status)
+
+
+
+
+
+def migration_get_all_unconfirmed(context, confirm_window):
+
+    """Finds all unconfirmed migrations within the confirmation window."""
+
+    return IMPL.migration_get_all_unconfirmed(context, confirm_window)
+
+
+
+
+
+####################
+
+
+
+
+
+def fixed_ip_associate(context, address, instance_id, network_id=None,
+
+                       reserved=False):
+
+    """Associate fixed ip to instance.
+
+
+
+    Raises if fixed ip is not available.
+
+
 
     """
 
+    return IMPL.fixed_ip_associate(context, address, instance_id, network_id,
 
+                                   reserved)
 
 
 
-def test_checkout_customer_detach(user_api_client, checkout_with_item, customer_user):
 
-    checkout = checkout_with_item
 
-    checkout.user = customer_user
+def fixed_ip_associate_pool(context, network_id, instance_id=None, host=None):
 
-    checkout.save(update_fields=["user"])
+    """Find free ip in network and associate it to instance or host.
 
 
 
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
+    Raises if one is not available.
 
-    variables = {"checkoutId": checkout_id}
 
-    response = user_api_client.post_graphql(
-
-        MUTATION_CHECKOUT_CUSTOMER_DETACH, variables
-
-    )
-
-    content = get_graphql_content(response)
-
-
-
-    data = content["data"]["checkoutCustomerDetach"]
-
-    assert not data["errors"]
-
-    checkout.refresh_from_db()
-
-    assert checkout.user is None
-
-
-
-
-
-MUTATION_CHECKOUT_SHIPPING_ADDRESS_UPDATE = """
-
-    mutation checkoutShippingAddressUpdate(
-
-            $checkoutId: ID!, $shippingAddress: AddressInput!) {
-
-        checkoutShippingAddressUpdate(
-
-                checkoutId: $checkoutId, shippingAddress: $shippingAddress) {
-
-            checkout {
-
-                token,
-
-                id
-
-            },
-
-            errors {
-
-                field,
-
-                message,
-
-            }
-
-            checkoutErrors {
-
-                field
-
-                message
-
-                code
-
-            }
-
-        }
-
-    }"""
-
-
-
-
-
-@mock.patch(
-
-    "saleor.graphql.checkout.mutations.update_checkout_shipping_method_if_invalid",
-
-    wraps=update_checkout_shipping_method_if_invalid,
-
-)
-
-def test_checkout_shipping_address_update(
-
-    mocked_update_shipping_method,
-
-    user_api_client,
-
-    checkout_with_item,
-
-    graphql_address_data,
-
-):
-
-    checkout = checkout_with_item
-
-    assert checkout.shipping_address is None
-
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
-
-
-
-    shipping_address = graphql_address_data
-
-    variables = {"checkoutId": checkout_id, "shippingAddress": shipping_address}
-
-
-
-    response = user_api_client.post_graphql(
-
-        MUTATION_CHECKOUT_SHIPPING_ADDRESS_UPDATE, variables
-
-    )
-
-    content = get_graphql_content(response)
-
-    data = content["data"]["checkoutShippingAddressUpdate"]
-
-    assert not data["errors"]
-
-    checkout.refresh_from_db()
-
-    assert checkout.shipping_address is not None
-
-    assert checkout.shipping_address.first_name == shipping_address["firstName"]
-
-    assert checkout.shipping_address.last_name == shipping_address["lastName"]
-
-    assert (
-
-        checkout.shipping_address.street_address_1 == shipping_address["streetAddress1"]
-
-    )
-
-    assert (
-
-        checkout.shipping_address.street_address_2 == shipping_address["streetAddress2"]
-
-    )
-
-    assert checkout.shipping_address.postal_code == shipping_address["postalCode"]
-
-    assert checkout.shipping_address.country == shipping_address["country"]
-
-    assert checkout.shipping_address.city == shipping_address["city"].upper()
-
-    mocked_update_shipping_method.assert_called_once_with(checkout, mock.ANY)
-
-
-
-
-
-def test_checkout_shipping_address_with_invalid_phone_number_returns_error(
-
-    user_api_client, checkout_with_item, graphql_address_data
-
-):
-
-    checkout = checkout_with_item
-
-    assert checkout.shipping_address is None
-
-
-
-    shipping_address = graphql_address_data
-
-    shipping_address["phone"] = "+33600000"
-
-
-
-    response = get_graphql_content(
-
-        user_api_client.post_graphql(
-
-            MUTATION_CHECKOUT_SHIPPING_ADDRESS_UPDATE,
-
-            {
-
-                "checkoutId": graphene.Node.to_global_id("Checkout", checkout.pk),
-
-                "shippingAddress": shipping_address,
-
-            },
-
-        )
-
-    )["data"]["checkoutShippingAddressUpdate"]
-
-    assert response["errors"] == [
-
-        {"field": "phone", "message": "'+33600000' is not a valid phone number."}
-
-    ]
-
-    assert response["checkoutErrors"] == [
-
-        {
-
-            "field": "phone",
-
-            "message": "'+33600000' is not a valid phone number.",
-
-            "code": CheckoutErrorCode.INVALID.name,
-
-        }
-
-    ]
-
-
-
-
-
-@pytest.mark.parametrize(
-
-    "number", ["+48321321888", "+44 (113) 892-1113", "00 44 (0) 20 7839 1377"]
-
-)
-
-def test_checkout_shipping_address_update_with_phone_country_prefix(
-
-    number, user_api_client, checkout_with_item, graphql_address_data
-
-):
-
-    checkout = checkout_with_item
-
-    assert checkout.shipping_address is None
-
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
-
-
-
-    shipping_address = graphql_address_data
-
-    shipping_address["phone"] = number
-
-    variables = {"checkoutId": checkout_id, "shippingAddress": shipping_address}
-
-
-
-    response = user_api_client.post_graphql(
-
-        MUTATION_CHECKOUT_SHIPPING_ADDRESS_UPDATE, variables
-
-    )
-
-    content = get_graphql_content(response)
-
-    data = content["data"]["checkoutShippingAddressUpdate"]
-
-    assert not data["errors"]
-
-
-
-
-
-def test_checkout_shipping_address_update_without_phone_country_prefix(
-
-    user_api_client, checkout_with_item, graphql_address_data
-
-):
-
-    checkout = checkout_with_item
-
-    assert checkout.shipping_address is None
-
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
-
-
-
-    shipping_address = graphql_address_data
-
-    shipping_address["phone"] = "+1-202-555-0132"
-
-    variables = {"checkoutId": checkout_id, "shippingAddress": shipping_address}
-
-
-
-    response = user_api_client.post_graphql(
-
-        MUTATION_CHECKOUT_SHIPPING_ADDRESS_UPDATE, variables
-
-    )
-
-    content = get_graphql_content(response)
-
-    data = content["data"]["checkoutShippingAddressUpdate"]
-
-    assert not data["errors"]
-
-
-
-
-
-def test_checkout_billing_address_update(
-
-    user_api_client, checkout_with_item, graphql_address_data
-
-):
-
-    checkout = checkout_with_item
-
-    assert checkout.shipping_address is None
-
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
-
-
-
-    query = """
-
-    mutation checkoutBillingAddressUpdate(
-
-            $checkoutId: ID!, $billingAddress: AddressInput!) {
-
-        checkoutBillingAddressUpdate(
-
-                checkoutId: $checkoutId, billingAddress: $billingAddress) {
-
-            checkout {
-
-                token,
-
-                id
-
-            },
-
-            errors {
-
-                field,
-
-                message
-
-            }
-
-        }
-
-    }
 
     """
 
-    billing_address = graphql_address_data
+    return IMPL.fixed_ip_associate_pool(context, network_id,
 
+                                        instance_id, host)
 
 
-    variables = {"checkoutId": checkout_id, "billingAddress": billing_address}
 
 
 
-    response = user_api_client.post_graphql(query, variables)
+def fixed_ip_create(context, values):
 
-    content = get_graphql_content(response)
+    """Create a fixed ip from the values dictionary."""
 
-    data = content["data"]["checkoutBillingAddressUpdate"]
+    return IMPL.fixed_ip_create(context, values)
 
-    assert not data["errors"]
 
-    checkout.refresh_from_db()
 
-    assert checkout.billing_address is not None
 
-    assert checkout.billing_address.first_name == billing_address["firstName"]
 
-    assert checkout.billing_address.last_name == billing_address["lastName"]
+def fixed_ip_bulk_create(context, ips):
 
-    assert (
+    """Create a lot of fixed ips from the values dictionary."""
 
-        checkout.billing_address.street_address_1 == billing_address["streetAddress1"]
+    return IMPL.fixed_ip_bulk_create(context, ips)
 
-    )
 
-    assert (
 
-        checkout.billing_address.street_address_2 == billing_address["streetAddress2"]
 
-    )
 
-    assert checkout.billing_address.postal_code == billing_address["postalCode"]
+def fixed_ip_disassociate(context, address):
 
-    assert checkout.billing_address.country == billing_address["country"]
+    """Disassociate a fixed ip from an instance by address."""
 
-    assert checkout.billing_address.city == billing_address["city"].upper()
+    return IMPL.fixed_ip_disassociate(context, address)
 
 
 
 
 
-CHECKOUT_EMAIL_UPDATE_MUTATION = """
+def fixed_ip_disassociate_all_by_timeout(context, host, time):
 
-    mutation checkoutEmailUpdate($checkoutId: ID!, $email: String!) {
+    """Disassociate old fixed ips from host."""
 
-        checkoutEmailUpdate(checkoutId: $checkoutId, email: $email) {
+    return IMPL.fixed_ip_disassociate_all_by_timeout(context, host, time)
 
-            checkout {
 
-                id,
 
-                email
 
-            },
 
-            errors {
+def fixed_ip_get(context, id):
 
-                field,
+    """Get fixed ip by id or raise if it does not exist."""
 
-                message
+    return IMPL.fixed_ip_get(context, id)
 
-            }
 
-            checkoutErrors {
 
-                field,
 
-                message
 
-                code
+def fixed_ip_get_all(context):
 
-            }
+    """Get all defined fixed ips."""
 
-        }
+    return IMPL.fixed_ip_get_all(context)
 
-    }
 
-"""
 
 
 
+def fixed_ip_get_by_address(context, address):
 
+    """Get a fixed ip by address or raise if it does not exist."""
 
-def test_checkout_email_update(user_api_client, checkout_with_item):
+    return IMPL.fixed_ip_get_by_address(context, address)
 
-    checkout = checkout_with_item
 
-    assert not checkout.email
 
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
 
 
+def fixed_ip_get_by_instance(context, instance_id):
 
-    email = "test@example.com"
+    """Get fixed ips by instance or raise if none exist."""
 
-    variables = {"checkoutId": checkout_id, "email": email}
+    return IMPL.fixed_ip_get_by_instance(context, instance_id)
 
 
 
-    response = user_api_client.post_graphql(CHECKOUT_EMAIL_UPDATE_MUTATION, variables)
 
-    content = get_graphql_content(response)
 
-    data = content["data"]["checkoutEmailUpdate"]
+def fixed_ip_get_by_network_host(context, network_id, host):
 
-    assert not data["errors"]
+    """Get fixed ip for a host in a network."""
 
-    checkout.refresh_from_db()
+    return IMPL.fixed_ip_get_by_network_host(context, network_id, host)
 
-    assert checkout.email == email
 
 
 
 
+def fixed_ips_by_virtual_interface(context, vif_id):
 
-def test_checkout_email_update_validation(user_api_client, checkout_with_item):
+    """Get fixed ips by virtual interface or raise if none exist."""
 
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout_with_item.pk)
+    return IMPL.fixed_ips_by_virtual_interface(context, vif_id)
 
-    variables = {"checkoutId": checkout_id, "email": ""}
 
 
 
-    response = user_api_client.post_graphql(CHECKOUT_EMAIL_UPDATE_MUTATION, variables)
 
-    content = get_graphql_content(response)
+def fixed_ip_get_network(context, address):
 
+    """Get a network for a fixed ip by address."""
 
+    return IMPL.fixed_ip_get_network(context, address)
 
-    errors = content["data"]["checkoutEmailUpdate"]["errors"]
 
-    assert errors
 
-    assert errors[0]["field"] == "email"
 
-    assert errors[0]["message"] == "This field cannot be blank."
 
+def fixed_ip_update(context, address, values):
 
+    """Create a fixed ip from the values dictionary."""
 
-    checkout_errors = content["data"]["checkoutEmailUpdate"]["checkoutErrors"]
+    return IMPL.fixed_ip_update(context, address, values)
 
-    assert checkout_errors[0]["code"] == CheckoutErrorCode.REQUIRED.name
 
 
+####################
 
 
 
-MUTATION_CHECKOUT_COMPLETE = """
 
-    mutation checkoutComplete($checkoutId: ID!, $redirectUrl: String) {
 
-        checkoutComplete(checkoutId: $checkoutId, redirectUrl: $redirectUrl) {
+def virtual_interface_create(context, values):
 
-            order {
+    """Create a virtual interface record in the database."""
 
-                id,
+    return IMPL.virtual_interface_create(context, values)
 
-                token
 
-            },
 
-            errors {
 
-                field,
 
-                message
+def virtual_interface_get(context, vif_id):
 
-            }
+    """Gets a virtual interface from the table,"""
 
-        }
+    return IMPL.virtual_interface_get(context, vif_id)
 
-    }
+
+
+
+
+def virtual_interface_get_by_address(context, address):
+
+    """Gets a virtual interface from the table filtering on address."""
+
+    return IMPL.virtual_interface_get_by_address(context, address)
+
+
+
+
+
+def virtual_interface_get_by_uuid(context, vif_uuid):
+
+    """Gets a virtual interface from the table filtering on vif uuid."""
+
+    return IMPL.virtual_interface_get_by_uuid(context, vif_uuid)
+
+
+
+
+
+def virtual_interface_get_by_instance(context, instance_id):
+
+    """Gets all virtual_interfaces for instance."""
+
+    return IMPL.virtual_interface_get_by_instance(context, instance_id)
+
+
+
+
+
+def virtual_interface_get_by_instance_and_network(context, instance_id,
+
+                                                           network_id):
+
+    """Gets all virtual interfaces for instance."""
+
+    return IMPL.virtual_interface_get_by_instance_and_network(context,
+
+                                                              instance_id,
+
+                                                              network_id)
+
+
+
+
+
+def virtual_interface_delete(context, vif_id):
+
+    """Delete virtual interface record from the database."""
+
+    return IMPL.virtual_interface_delete(context, vif_id)
+
+
+
+
+
+def virtual_interface_delete_by_instance(context, instance_id):
+
+    """Delete virtual interface records associated with instance."""
+
+    return IMPL.virtual_interface_delete_by_instance(context, instance_id)
+
+
+
+
+
+def virtual_interface_get_all(context):
+
+    """Gets all virtual interfaces from the table"""
+
+    return IMPL.virtual_interface_get_all(context)
+
+
+
+
+
+####################
+
+
+
+
+
+def instance_create(context, values):
+
+    """Create an instance from the values dictionary."""
+
+    return IMPL.instance_create(context, values)
+
+
+
+
+
+def instance_data_get_for_project(context, project_id):
+
+    """Get (instance_count, total_cores, total_ram) for project."""
+
+    return IMPL.instance_data_get_for_project(context, project_id)
+
+
+
+
+
+def instance_destroy(context, instance_id):
+
+    """Destroy the instance or raise if it does not exist."""
+
+    return IMPL.instance_destroy(context, instance_id)
+
+
+
+
+
+def instance_get_by_uuid(context, uuid):
+
+    """Get an instance or raise if it does not exist."""
+
+    return IMPL.instance_get_by_uuid(context, uuid)
+
+
+
+
+
+def instance_get(context, instance_id):
+
+    """Get an instance or raise if it does not exist."""
+
+    return IMPL.instance_get(context, instance_id)
+
+
+
+
+
+def instance_get_all(context):
+
+    """Get all instances."""
+
+    return IMPL.instance_get_all(context)
+
+
+
+
+
+def instance_get_all_by_filters(context, filters, sort_key='created_at',
+
+                                sort_dir='desc'):
+
+    """Get all instances that match all filters."""
+
+    return IMPL.instance_get_all_by_filters(context, filters, sort_key,
+
+                                            sort_dir)
+
+
+
+
+
+def instance_get_active_by_window(context, begin, end=None, project_id=None):
+
+    """Get instances active during a certain time window.
+
+
+
+    Specifying a project_id will filter for a certain project."""
+
+    return IMPL.instance_get_active_by_window(context, begin, end, project_id)
+
+
+
+
+
+def instance_get_active_by_window_joined(context, begin, end=None,
+
+                                         project_id=None):
+
+    """Get instances and joins active during a certain time window.
+
+
+
+    Specifying a project_id will filter for a certain project."""
+
+    return IMPL.instance_get_active_by_window_joined(context, begin, end,
+
+                                              project_id)
+
+
+
+
+
+def instance_get_all_by_project(context, project_id):
+
+    """Get all instance belonging to a project."""
+
+    return IMPL.instance_get_all_by_project(context, project_id)
+
+
+
+
+
+def instance_get_all_by_host(context, host):
+
+    """Get all instance belonging to a host."""
+
+    return IMPL.instance_get_all_by_host(context, host)
+
+
+
+
+
+def instance_get_all_by_reservation(context, reservation_id):
+
+    """Get all instances belonging to a reservation."""
+
+    return IMPL.instance_get_all_by_reservation(context, reservation_id)
+
+
+
+
+
+def instance_get_floating_address(context, instance_id):
+
+    """Get the first floating ip address of an instance."""
+
+    return IMPL.instance_get_floating_address(context, instance_id)
+
+
+
+
+
+def instance_get_all_hung_in_rebooting(context, reboot_window):
+
+    """Get all instances stuck in a rebooting state."""
+
+    return IMPL.instance_get_all_hung_in_rebooting(context, reboot_window)
+
+
+
+
+
+def instance_test_and_set(context, instance_id, attr, ok_states,
+
+                          new_state):
+
+    """Atomically check if an instance is in a valid state, and if it is, set
+
+    the instance into a new state.
 
     """
 
+    return IMPL.instance_test_and_set(
 
+            context, instance_id, attr, ok_states, new_state)
 
 
 
-@pytest.mark.integration
 
-def test_checkout_complete(
 
-    user_api_client,
+def instance_update(context, instance_id, values):
 
-    checkout_with_gift_card,
+    """Set the given properties on an instance and update it.
 
-    gift_card,
 
-    payment_dummy,
 
-    address,
+    Raises NotFound if instance does not exist.
 
-    shipping_method,
 
-):
-
-
-
-    assert not gift_card.last_used_on
-
-
-
-    checkout = checkout_with_gift_card
-
-    checkout.shipping_address = address
-
-    checkout.shipping_method = shipping_method
-
-    checkout.billing_address = address
-
-    checkout.store_meta(namespace="PUBLIC", client="PLUGIN", item={"accepted": "true"})
-
-    checkout.store_private_meta(
-
-        namespace="PRIVATE", client="PLUGIN", item={"accepted": "true"}
-
-    )
-
-    checkout.save()
-
-
-
-    checkout_line = checkout.lines.first()
-
-    checkout_line_quantity = checkout_line.quantity
-
-    checkout_line_variant = checkout_line.variant
-
-
-
-    gift_current_balance = checkout.get_total_gift_cards_balance()
-
-    total = calculations.checkout_total(checkout)
-
-    payment = payment_dummy
-
-    payment.is_active = True
-
-    payment.order = None
-
-    payment.total = total.gross.amount
-
-    payment.currency = total.gross.currency
-
-    payment.checkout = checkout
-
-    payment.save()
-
-    assert not payment.transactions.exists()
-
-
-
-    orders_count = Order.objects.count()
-
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
-
-    variables = {"checkoutId": checkout_id, "redirectUrl": "https://www.example.com"}
-
-    response = user_api_client.post_graphql(MUTATION_CHECKOUT_COMPLETE, variables)
-
-
-
-    content = get_graphql_content(response)
-
-    data = content["data"]["checkoutComplete"]
-
-    assert not data["errors"]
-
-
-
-    order_token = data["order"]["token"]
-
-    assert Order.objects.count() == orders_count + 1
-
-    order = Order.objects.first()
-
-    assert order.token == order_token
-
-    assert order.total.gross == total.gross - gift_current_balance
-
-    assert order.meta == checkout.meta
-
-    assert order.private_meta == checkout.private_meta
-
-
-
-    order_line = order.lines.first()
-
-    assert checkout_line_quantity == order_line.quantity
-
-    assert checkout_line_variant == order_line.variant
-
-    assert order.shipping_address == address
-
-    assert order.shipping_method == checkout.shipping_method
-
-    assert order.payments.exists()
-
-    order_payment = order.payments.first()
-
-    assert order_payment == payment
-
-    assert payment.transactions.count() == 1
-
-
-
-    gift_card.refresh_from_db()
-
-    assert gift_card.current_balance == zero_money()
-
-    assert gift_card.last_used_on
-
-
-
-    assert not Checkout.objects.filter(
-
-        pk=checkout.pk
-
-    ).exists(), "Checkout should have been deleted"
-
-
-
-
-
-ERROR_GATEWAY_RESPONSE = GatewayResponse(
-
-    is_success=False,
-
-    action_required=False,
-
-    kind=TransactionKind.CAPTURE,
-
-    amount=Decimal(0),
-
-    currency="usd",
-
-    transaction_id="1234",
-
-    error="ERROR",
-
-)
-
-
-
-
-
-def _process_payment_transaction_returns_error(*args, **kwards):
-
-    return ERROR_GATEWAY_RESPONSE
-
-
-
-
-
-def _process_payment_raise_error(*args, **kwargs):
-
-    raise Exception("Oops! Something went wrong.")
-
-
-
-
-
-@pytest.fixture(
-
-    params=[_process_payment_raise_error, _process_payment_transaction_returns_error]
-
-)
-
-def error_side_effect(request):
-
-    return request.param
-
-
-
-
-
-@pytest.fixture
-
-def fake_manager(mocker):
-
-    return mocker.Mock(spec=PaymentInterface)
-
-
-
-
-
-@pytest.fixture
-
-def mock_get_manager(mocker, fake_manager):
-
-    mgr = mocker.patch(
-
-        "saleor.payment.gateway.get_extensions_manager",
-
-        autospec=True,
-
-        return_value=fake_manager,
-
-    )
-
-    yield fake_manager
-
-    mgr.assert_called_once()
-
-
-
-
-
-def test_checkout_complete_does_not_delete_checkout_after_unsuccessful_payment(
-
-    mock_get_manager,
-
-    error_side_effect,
-
-    user_api_client,
-
-    checkout_with_voucher,
-
-    voucher,
-
-    payment_dummy,
-
-    address,
-
-    shipping_method,
-
-):
-
-    mock_get_manager.process_payment.side_effect = error_side_effect
-
-    expected_voucher_usage_count = voucher.used
-
-    checkout = checkout_with_voucher
-
-    checkout.shipping_address = address
-
-    checkout.shipping_method = shipping_method
-
-    checkout.billing_address = address
-
-    checkout.save()
-
-
-
-    taxed_total = calculations.checkout_total(checkout)
-
-    payment = payment_dummy
-
-    payment.is_active = True
-
-    payment.order = None
-
-    payment.total = taxed_total.gross.amount
-
-    payment.currency = taxed_total.gross.currency
-
-    payment.checkout = checkout
-
-    payment.save()
-
-    assert not payment.transactions.exists()
-
-
-
-    orders_count = Order.objects.count()
-
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
-
-    variables = {"checkoutId": checkout_id, "redirectUrl": "https://www.example.com"}
-
-    response = user_api_client.post_graphql(MUTATION_CHECKOUT_COMPLETE, variables)
-
-    get_graphql_content(response)
-
-
-
-    assert Order.objects.count() == orders_count
-
-
-
-    payment.refresh_from_db(fields=["order"])
-
-    transaction = payment.transactions.get()
-
-    assert transaction.error
-
-    assert payment.order is None
-
-
-
-    # ensure the voucher usage count was not incremented
-
-    voucher.refresh_from_db(fields=["used"])
-
-    assert voucher.used == expected_voucher_usage_count
-
-
-
-    assert Checkout.objects.filter(
-
-        pk=checkout.pk
-
-    ).exists(), "Checkout should not have been deleted"
-
-
-
-
-
-def test_checkout_complete_invalid_checkout_id(user_api_client):
-
-    checkout_id = "invalidId"
-
-    variables = {"checkoutId": checkout_id, "redirectUrl": "https://www.example.com"}
-
-    orders_count = Order.objects.count()
-
-    response = user_api_client.post_graphql(MUTATION_CHECKOUT_COMPLETE, variables)
-
-    content = get_graphql_content(response)
-
-    data = content["data"]["checkoutComplete"]
-
-    assert data["errors"][0]["message"] == "Couldn't resolve to a node: invalidId"
-
-    assert data["errors"][0]["field"] == "checkoutId"
-
-    assert orders_count == Order.objects.count()
-
-
-
-
-
-def test_checkout_complete_no_payment(
-
-    user_api_client, checkout_with_item, address, shipping_method
-
-):
-
-    checkout = checkout_with_item
-
-    checkout.shipping_address = address
-
-    checkout.shipping_method = shipping_method
-
-    checkout.billing_address = address
-
-    checkout.save()
-
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
-
-    variables = {"checkoutId": checkout_id, "redirectUrl": "https://www.example.com"}
-
-    orders_count = Order.objects.count()
-
-    response = user_api_client.post_graphql(MUTATION_CHECKOUT_COMPLETE, variables)
-
-    content = get_graphql_content(response)
-
-    data = content["data"]["checkoutComplete"]
-
-    assert data["errors"][0]["message"] == (
-
-        "Provided payment methods can not cover the checkout's total amount"
-
-    )
-
-    assert orders_count == Order.objects.count()
-
-
-
-
-
-def test_checkout_complete_insufficient_stock(
-
-    user_api_client, checkout_with_item, address, payment_dummy, shipping_method
-
-):
-
-    checkout = checkout_with_item
-
-    checkout_line = checkout.lines.first()
-
-    stock = Stock.objects.get(product_variant=checkout_line.variant)
-
-    quantity_available = stock.quantity_available
-
-    checkout_line.quantity = quantity_available + 1
-
-    checkout_line.save()
-
-    checkout.shipping_address = address
-
-    checkout.shipping_method = shipping_method
-
-    checkout.billing_address = address
-
-    checkout.save()
-
-    total = calculations.checkout_total(checkout)
-
-    payment = payment_dummy
-
-    payment.is_active = True
-
-    payment.order = None
-
-    payment.total = total.gross.amount
-
-    payment.currency = total.gross.currency
-
-    payment.checkout = checkout
-
-    payment.save()
-
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
-
-    variables = {"checkoutId": checkout_id, "redirectUrl": "https://www.example.com"}
-
-    orders_count = Order.objects.count()
-
-    response = user_api_client.post_graphql(MUTATION_CHECKOUT_COMPLETE, variables)
-
-    content = get_graphql_content(response)
-
-    data = content["data"]["checkoutComplete"]
-
-    assert data["errors"][0]["message"] == "Insufficient product stock: 123"
-
-    assert orders_count == Order.objects.count()
-
-
-
-
-
-def test_checkout_complete_without_redirect_url(
-
-    user_api_client,
-
-    checkout_with_gift_card,
-
-    gift_card,
-
-    payment_dummy,
-
-    address,
-
-    shipping_method,
-
-):
-
-
-
-    assert not gift_card.last_used_on
-
-
-
-    checkout = checkout_with_gift_card
-
-    checkout.shipping_address = address
-
-    checkout.shipping_method = shipping_method
-
-    checkout.billing_address = address
-
-    checkout.save()
-
-
-
-    checkout_line = checkout.lines.first()
-
-    checkout_line_quantity = checkout_line.quantity
-
-    checkout_line_variant = checkout_line.variant
-
-
-
-    gift_current_balance = checkout.get_total_gift_cards_balance()
-
-    total = calculations.checkout_total(checkout)
-
-    payment = payment_dummy
-
-    payment.is_active = True
-
-    payment.order = None
-
-    payment.total = total.gross.amount
-
-    payment.currency = total.gross.currency
-
-    payment.checkout = checkout
-
-    payment.save()
-
-    assert not payment.transactions.exists()
-
-
-
-    orders_count = Order.objects.count()
-
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
-
-    variables = {"checkoutId": checkout_id}
-
-    response = user_api_client.post_graphql(MUTATION_CHECKOUT_COMPLETE, variables)
-
-
-
-    content = get_graphql_content(response)
-
-    data = content["data"]["checkoutComplete"]
-
-    assert not data["errors"]
-
-
-
-    order_token = data["order"]["token"]
-
-    assert Order.objects.count() == orders_count + 1
-
-    order = Order.objects.first()
-
-    assert order.token == order_token
-
-    assert order.total.gross == total.gross - gift_current_balance
-
-
-
-    order_line = order.lines.first()
-
-    assert checkout_line_quantity == order_line.quantity
-
-    assert checkout_line_variant == order_line.variant
-
-    assert order.shipping_address == address
-
-    assert order.shipping_method == checkout.shipping_method
-
-    assert order.payments.exists()
-
-    order_payment = order.payments.first()
-
-    assert order_payment == payment
-
-    assert payment.transactions.count() == 1
-
-
-
-    gift_card.refresh_from_db()
-
-    assert gift_card.current_balance == zero_money()
-
-    assert gift_card.last_used_on
-
-
-
-    assert not Checkout.objects.filter(
-
-        pk=checkout.pk
-
-    ).exists(), "Checkout should have been deleted"
-
-
-
-
-
-def test_fetch_checkout_by_token(user_api_client, checkout_with_item):
-
-    query = """
-
-    query getCheckout($token: UUID!) {
-
-        checkout(token: $token) {
-
-           token,
-
-           lines {
-
-                variant {
-
-                    product {
-
-                        name
-
-                    }
-
-                }
-
-           }
-
-        }
-
-    }
 
     """
 
-    variables = {"token": str(checkout_with_item.token)}
-
-    response = user_api_client.post_graphql(query, variables)
-
-    content = get_graphql_content(response)
-
-    data = content["data"]["checkout"]
-
-    assert data["token"] == str(checkout_with_item.token)
-
-    assert len(data["lines"]) == checkout_with_item.lines.count()
+    return IMPL.instance_update(context, instance_id, values)
 
 
 
 
 
-def test_fetch_checkout_invalid_token(user_api_client):
+def instance_add_security_group(context, instance_id, security_group_id):
 
-    query = """
+    """Associate the given security group with the given instance."""
 
-        query getCheckout($token: UUID!) {
+    return IMPL.instance_add_security_group(context, instance_id,
 
-            checkout(token: $token) {
-
-                token
-
-            }
-
-        }
-
-    """
-
-    variables = {"token": str(uuid.uuid4())}
-
-    response = user_api_client.post_graphql(query, variables)
-
-    content = get_graphql_content(response)
-
-    data = content["data"]["checkout"]
-
-    assert data is None
+                                            security_group_id)
 
 
 
 
 
-def test_checkout_prices(user_api_client, checkout_with_item):
+def instance_remove_security_group(context, instance_id, security_group_id):
 
-    query = """
+    """Disassociate the given security group from the given instance."""
 
-    query getCheckout($token: UUID!) {
+    return IMPL.instance_remove_security_group(context, instance_id,
 
-        checkout(token: $token) {
+                                            security_group_id)
 
-           token,
 
-           totalPrice {
 
-                currency
 
-                gross {
 
-                    amount
+def instance_action_create(context, values):
 
-                }
+    """Create an instance action from the values dictionary."""
 
-            }
+    return IMPL.instance_action_create(context, values)
 
-            subtotalPrice {
 
-                currency
 
-                gross {
 
-                    amount
 
-                }
+def instance_get_actions(context, instance_uuid):
 
-            }
+    """Get instance actions by instance uuid."""
 
-           lines {
+    return IMPL.instance_get_actions(context, instance_uuid)
 
-                totalPrice {
 
-                    currency
 
-                    gross {
 
-                        amount
 
-                    }
+def instance_get_id_to_uuid_mapping(context, ids):
 
-                }
+    """Return a dictionary containing 'ID: UUID' given the ids"""
 
-           }
+    return IMPL.instance_get_id_to_uuid_mapping(context, ids)
 
-        }
 
-    }
+
+
+
+###################
+
+
+
+
+
+def instance_info_cache_create(context, values):
+
+    """Create a new instance cache record in the table.
+
+
+
+    :param context: = request context object
+
+    :param values: = dict containing column values
 
     """
 
-    variables = {"token": str(checkout_with_item.token)}
+    return IMPL.instance_info_cache_create(context, values)
 
-    response = user_api_client.post_graphql(query, variables)
 
-    content = get_graphql_content(response)
 
-    data = content["data"]["checkout"]
 
-    assert data["token"] == str(checkout_with_item.token)
 
-    assert len(data["lines"]) == checkout_with_item.lines.count()
+def instance_info_cache_get(context, instance_uuid):
 
-    total = calculations.checkout_total(checkout_with_item)
+    """Gets an instance info cache from the table.
 
-    assert data["totalPrice"]["gross"]["amount"] == (total.gross.amount)
 
-    subtotal = calculations.checkout_subtotal(checkout_with_item)
 
-    assert data["subtotalPrice"]["gross"]["amount"] == (subtotal.gross.amount)
-
-
-
-
-
-MUTATION_UPDATE_SHIPPING_METHOD = """
-
-    mutation checkoutShippingMethodUpdate(
-
-            $checkoutId:ID!, $shippingMethodId:ID!){
-
-        checkoutShippingMethodUpdate(
-
-            checkoutId:$checkoutId, shippingMethodId:$shippingMethodId) {
-
-            errors {
-
-                field
-
-                message
-
-            }
-
-            checkout {
-
-                id
-
-            }
-
-        }
-
-    }
-
-"""
-
-
-
-
-
-@pytest.mark.parametrize("is_valid_shipping_method", (True, False))
-
-@patch("saleor.graphql.checkout.mutations.clean_shipping_method")
-
-def test_checkout_shipping_method_update(
-
-    mock_clean_shipping,
-
-    staff_api_client,
-
-    shipping_method,
-
-    checkout_with_item,
-
-    is_valid_shipping_method,
-
-):
-
-    checkout = checkout_with_item
-
-    query = MUTATION_UPDATE_SHIPPING_METHOD
-
-    mock_clean_shipping.return_value = is_valid_shipping_method
-
-
-
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
-
-    method_id = graphene.Node.to_global_id("ShippingMethod", shipping_method.id)
-
-
-
-    response = staff_api_client.post_graphql(
-
-        query, {"checkoutId": checkout_id, "shippingMethodId": method_id}
-
-    )
-
-    data = get_graphql_content(response)["data"]["checkoutShippingMethodUpdate"]
-
-
-
-    checkout.refresh_from_db()
-
-
-
-    mock_clean_shipping.assert_called_once_with(
-
-        checkout=checkout, method=shipping_method, discounts=ANY
-
-    )
-
-
-
-    if is_valid_shipping_method:
-
-        assert not data["errors"]
-
-        assert data["checkout"]["id"] == checkout_id
-
-        assert checkout.shipping_method == shipping_method
-
-    else:
-
-        assert data["errors"] == [
-
-            {
-
-                "field": "shippingMethod",
-
-                "message": "This shipping method is not applicable.",
-
-            }
-
-        ]
-
-        assert checkout.shipping_method is None
-
-
-
-
-
-def test_query_checkout_line(checkout_with_item, user_api_client):
-
-    query = """
-
-    query checkoutLine($id: ID) {
-
-        checkoutLine(id: $id) {
-
-            id
-
-        }
-
-    }
+    :param instance_uuid: = uuid of the info cache's instance
 
     """
 
-    checkout = checkout_with_item
-
-    line = checkout.lines.first()
-
-    line_id = graphene.Node.to_global_id("CheckoutLine", line.pk)
-
-    variables = {"id": line_id}
-
-    response = user_api_client.post_graphql(query, variables)
-
-    content = get_graphql_content(response)
-
-    received_id = content["data"]["checkoutLine"]["id"]
-
-    assert received_id == line_id
+    return IMPL.instance_info_cache_get(context, instance_uuid)
 
 
 
 
 
-def test_query_checkouts(
+def instance_info_cache_update(context, instance_uuid, values):
 
-    checkout_with_item, staff_api_client, permission_manage_orders
+    """Update an instance info cache record in the table.
 
-):
 
-    query = """
 
-    {
+    :param instance_uuid: = uuid of info cache's instance
 
-        checkouts(first: 20) {
-
-            edges {
-
-                node {
-
-                    token
-
-                }
-
-            }
-
-        }
-
-    }
+    :param values: = dict containing column values to update
 
     """
 
-    checkout = checkout_with_item
-
-    response = staff_api_client.post_graphql(
-
-        query, {}, permissions=[permission_manage_orders]
-
-    )
-
-    content = get_graphql_content(response)
-
-    received_checkout = content["data"]["checkouts"]["edges"][0]["node"]
-
-    assert str(checkout.token) == received_checkout["token"]
+    return IMPL.instance_info_cache_update(context, instance_uuid, values)
 
 
 
 
 
-def test_query_checkout_lines(
+def instance_info_cache_delete(context, instance_uuid):
 
-    checkout_with_item, staff_api_client, permission_manage_orders
+    """Deletes an existing instance_info_cache record
 
-):
 
-    query = """
 
-    {
-
-        checkoutLines(first: 20) {
-
-            edges {
-
-                node {
-
-                    id
-
-                }
-
-            }
-
-        }
-
-    }
+    :param instance_uuid: = uuid of the instance tied to the cache record
 
     """
 
-    checkout = checkout_with_item
+    return IMPL.instance_info_cache_delete(context, instance_uuid)
 
-    response = staff_api_client.post_graphql(
 
-        query, permissions=[permission_manage_orders]
 
-    )
 
-    content = get_graphql_content(response)
 
-    lines = content["data"]["checkoutLines"]["edges"]
+###################
 
-    checkout_lines_ids = [line["node"]["id"] for line in lines]
 
-    expected_lines_ids = [
 
-        graphene.Node.to_global_id("CheckoutLine", item.pk) for item in checkout
 
-    ]
 
-    assert expected_lines_ids == checkout_lines_ids
+def key_pair_create(context, values):
 
+    """Create a key_pair from the values dictionary."""
 
+    return IMPL.key_pair_create(context, values)
 
 
 
-def test_clean_checkout(checkout_with_item, payment_dummy, address, shipping_method):
 
-    checkout = checkout_with_item
 
-    checkout.shipping_address = address
+def key_pair_destroy(context, user_id, name):
 
-    checkout.shipping_method = shipping_method
+    """Destroy the key_pair or raise if it does not exist."""
 
-    checkout.billing_address = address
+    return IMPL.key_pair_destroy(context, user_id, name)
 
-    checkout.save()
 
-    total = calculations.checkout_total(checkout)
 
-    payment = payment_dummy
 
-    payment.is_active = True
 
-    payment.order = None
+def key_pair_destroy_all_by_user(context, user_id):
 
-    payment.total = total.gross.amount
+    """Destroy all key_pairs by user."""
 
-    payment.currency = total.gross.currency
+    return IMPL.key_pair_destroy_all_by_user(context, user_id)
 
-    payment.checkout = checkout
 
-    payment.save()
 
-    # Shouldn't raise any errors
 
-    clean_checkout(checkout, None)
 
+def key_pair_get(context, user_id, name):
 
+    """Get a key_pair or raise if it does not exist."""
 
+    return IMPL.key_pair_get(context, user_id, name)
 
 
-def test_clean_checkout_no_shipping_method(checkout_with_item, address):
 
-    checkout = checkout_with_item
 
-    checkout.shipping_address = address
 
-    checkout.save()
+def key_pair_get_all_by_user(context, user_id):
 
+    """Get all key_pairs by user."""
 
+    return IMPL.key_pair_get_all_by_user(context, user_id)
 
-    with pytest.raises(ValidationError) as e:
 
-        clean_checkout(checkout, None)
 
 
 
-    msg = "Shipping method is not set"
+####################
 
-    assert e.value.error_list[0].message == msg
 
 
 
 
+def network_associate(context, project_id, force=False):
 
-def test_clean_checkout_no_shipping_address(checkout_with_item, shipping_method):
+    """Associate a free network to a project."""
 
-    checkout = checkout_with_item
+    return IMPL.network_associate(context, project_id, force)
 
-    checkout.shipping_method = shipping_method
 
-    checkout.save()
 
 
 
-    with pytest.raises(ValidationError) as e:
+def network_count(context):
 
-        clean_checkout(checkout, None)
+    """Return the number of networks."""
 
-    msg = "Shipping address is not set"
+    return IMPL.network_count(context)
 
-    assert e.value.error_list[0].message == msg
 
 
 
 
+def network_count_reserved_ips(context, network_id):
 
-def test_clean_checkout_invalid_shipping_method(
+    """Return the number of reserved ips in the network."""
 
-    checkout_with_item, address, shipping_zone_without_countries
+    return IMPL.network_count_reserved_ips(context, network_id)
 
-):
 
-    checkout = checkout_with_item
 
-    checkout.shipping_address = address
 
-    shipping_method = shipping_zone_without_countries.shipping_methods.first()
 
-    checkout.shipping_method = shipping_method
+def network_create_safe(context, values):
 
-    checkout.save()
+    """Create a network from the values dict.
 
 
 
-    with pytest.raises(ValidationError) as e:
+    The network is only returned if the create succeeds. If the create violates
 
-        clean_checkout(checkout, None)
+    constraints because the network already exists, no exception is raised.
 
 
 
-    msg = "Shipping method is not valid for your shipping address"
+    """
 
-    assert e.value.error_list[0].message == msg
+    return IMPL.network_create_safe(context, values)
 
 
 
 
 
-def test_clean_checkout_no_billing_address(
+def network_delete_safe(context, network_id):
 
-    checkout_with_item, address, shipping_method
+    """Delete network with key network_id.
 
-):
 
-    checkout = checkout_with_item
 
-    checkout.shipping_address = address
+    This method assumes that the network is not associated with any project
 
-    checkout.shipping_method = shipping_method
 
-    checkout.save()
 
+    """
 
+    return IMPL.network_delete_safe(context, network_id)
 
-    with pytest.raises(ValidationError) as e:
 
-        clean_checkout(checkout, None)
 
-    msg = "Billing address is not set"
 
-    assert e.value.error_list[0].message == msg
 
+def network_create_fixed_ips(context, network_id, num_vpn_clients):
 
+    """Create the ips for the network, reserving sepecified ips."""
 
+    return IMPL.network_create_fixed_ips(context, network_id, num_vpn_clients)
 
 
-def test_clean_checkout_no_payment(checkout_with_item, shipping_method, address):
 
-    checkout = checkout_with_item
 
-    checkout.shipping_address = address
 
-    checkout.shipping_method = shipping_method
+def network_disassociate(context, network_id):
 
-    checkout.billing_address = address
+    """Disassociate the network from project or raise if it does not exist."""
 
-    checkout.save()
+    return IMPL.network_disassociate(context, network_id)
 
 
 
-    with pytest.raises(ValidationError) as e:
 
-        clean_checkout(checkout, None)
 
+def network_get(context, network_id):
 
+    """Get an network or raise if it does not exist."""
 
-    msg = "Provided payment methods can not cover the checkout's total amount"
+    return IMPL.network_get(context, network_id)
 
-    assert e.value.error_list[0].message == msg
 
 
 
 
+def network_get_all(context):
 
-def test_is_fully_paid(checkout_with_item, payment_dummy):
+    """Return all defined networks."""
 
-    checkout = checkout_with_item
+    return IMPL.network_get_all(context)
 
-    total = calculations.checkout_total(checkout)
 
-    payment = payment_dummy
 
-    payment.is_active = True
 
-    payment.order = None
 
-    payment.total = total.gross.amount
+def network_get_all_by_uuids(context, network_uuids, project_id=None):
 
-    payment.currency = total.gross.currency
+    """Return networks by ids."""
 
-    payment.checkout = checkout
+    return IMPL.network_get_all_by_uuids(context, network_uuids, project_id)
 
-    payment.save()
 
-    is_paid = is_fully_paid(checkout, None)
 
-    assert is_paid
 
 
+# pylint: disable=C0103
 
 
 
-def test_is_fully_paid_many_payments(checkout_with_item, payment_dummy):
 
-    checkout = checkout_with_item
 
-    total = calculations.checkout_total(checkout)
+def network_get_associated_fixed_ips(context, network_id, host=None):
 
-    payment = payment_dummy
+    """Get all network's ips that have been associated."""
 
-    payment.is_active = True
+    return IMPL.network_get_associated_fixed_ips(context, network_id, host)
 
-    payment.order = None
 
-    payment.total = total.gross.amount - 1
 
-    payment.currency = total.gross.currency
 
-    payment.checkout = checkout
 
-    payment.save()
+def network_get_by_bridge(context, bridge):
 
-    payment2 = payment_dummy
+    """Get a network by bridge or raise if it does not exist."""
 
-    payment2.pk = None
+    return IMPL.network_get_by_bridge(context, bridge)
 
-    payment2.is_active = True
 
-    payment2.order = None
 
-    payment2.total = 1
 
-    payment2.currency = total.gross.currency
 
-    payment2.checkout = checkout
+def network_get_by_uuid(context, uuid):
 
-    payment2.save()
+    """Get a network by uuid or raise if it does not exist."""
 
-    is_paid = is_fully_paid(checkout, None)
+    return IMPL.network_get_by_uuid(context, uuid)
 
-    assert is_paid
 
 
 
 
+def network_get_by_cidr(context, cidr):
 
-def test_is_fully_paid_partially_paid(checkout_with_item, payment_dummy):
+    """Get a network by cidr or raise if it does not exist"""
 
-    checkout = checkout_with_item
+    return IMPL.network_get_by_cidr(context, cidr)
 
-    total = calculations.checkout_total(checkout)
 
-    payment = payment_dummy
 
-    payment.is_active = True
 
-    payment.order = None
 
-    payment.total = total.gross.amount - 1
+def network_get_by_instance(context, instance_id):
 
-    payment.currency = total.gross.currency
+    """Get a network by instance id or raise if it does not exist."""
 
-    payment.checkout = checkout
+    return IMPL.network_get_by_instance(context, instance_id)
 
-    payment.save()
 
-    is_paid = is_fully_paid(checkout, None)
 
-    assert not is_paid
 
 
+def network_get_all_by_instance(context, instance_id):
 
+    """Get all networks by instance id or raise if none exist."""
 
+    return IMPL.network_get_all_by_instance(context, instance_id)
 
-def test_is_fully_paid_no_payment(checkout_with_item):
 
-    checkout = checkout_with_item
 
-    is_paid = is_fully_paid(checkout, None)
 
-    assert not is_paid
+
+def network_get_all_by_host(context, host):
+
+    """All networks for which the given host is the network host."""
+
+    return IMPL.network_get_all_by_host(context, host)
+
+
+
+
+
+def network_get_index(context, network_id):
+
+    """Get non-conflicting index for network."""
+
+    return IMPL.network_get_index(context, network_id)
+
+
+
+
+
+def network_set_cidr(context, network_id, cidr):
+
+    """Set the Classless Inner Domain Routing for the network."""
+
+    return IMPL.network_set_cidr(context, network_id, cidr)
+
+
+
+
+
+def network_set_host(context, network_id, host_id):
+
+    """Safely set the host for network."""
+
+    return IMPL.network_set_host(context, network_id, host_id)
+
+
+
+
+
+def network_update(context, network_id, values):
+
+    """Set the given properties on an network and update it.
+
+
+
+    Raises NotFound if network does not exist.
+
+
+
+    """
+
+    return IMPL.network_update(context, network_id, values)
+
+
+
+
+
+###################
+
+
+
+
+
+def queue_get_for(context, topic, physical_node_id):
+
+    """Return a channel to send a message to a node with a topic."""
+
+    return IMPL.queue_get_for(context, topic, physical_node_id)
+
+
+
+
+
+###################
+
+
+
+
+
+def iscsi_target_count_by_host(context, host):
+
+    """Return count of export devices."""
+
+    return IMPL.iscsi_target_count_by_host(context, host)
+
+
+
+
+
+def iscsi_target_create_safe(context, values):
+
+    """Create an iscsi_target from the values dictionary.
+
+
+
+    The device is not returned. If the create violates the unique
+
+    constraints because the iscsi_target and host already exist,
+
+    no exception is raised.
+
+
+
+    """
+
+    return IMPL.iscsi_target_create_safe(context, values)
+
+
+
+
+
+###############
+
+
+
+
+
+def auth_token_destroy(context, token_id):
+
+    """Destroy an auth token."""
+
+    return IMPL.auth_token_destroy(context, token_id)
+
+
+
+
+
+def auth_token_get(context, token_hash):
+
+    """Retrieves a token given the hash representing it."""
+
+    return IMPL.auth_token_get(context, token_hash)
+
+
+
+
+
+def auth_token_update(context, token_hash, values):
+
+    """Updates a token given the hash representing it."""
+
+    return IMPL.auth_token_update(context, token_hash, values)
+
+
+
+
+
+def auth_token_create(context, token):
+
+    """Creates a new token."""
+
+    return IMPL.auth_token_create(context, token)
+
+
+
+
+
+###################
+
+
+
+
+
+def quota_create(context, project_id, resource, limit):
+
+    """Create a quota for the given project and resource."""
+
+    return IMPL.quota_create(context, project_id, resource, limit)
+
+
+
+
+
+def quota_get(context, project_id, resource):
+
+    """Retrieve a quota or raise if it does not exist."""
+
+    return IMPL.quota_get(context, project_id, resource)
+
+
+
+
+
+def quota_get_all_by_project(context, project_id):
+
+    """Retrieve all quotas associated with a given project."""
+
+    return IMPL.quota_get_all_by_project(context, project_id)
+
+
+
+
+
+def quota_update(context, project_id, resource, limit):
+
+    """Update a quota or raise if it does not exist."""
+
+    return IMPL.quota_update(context, project_id, resource, limit)
+
+
+
+
+
+def quota_destroy(context, project_id, resource):
+
+    """Destroy the quota or raise if it does not exist."""
+
+    return IMPL.quota_destroy(context, project_id, resource)
+
+
+
+
+
+def quota_destroy_all_by_project(context, project_id):
+
+    """Destroy all quotas associated with a given project."""
+
+    return IMPL.quota_get_all_by_project(context, project_id)
+
+
+
+
+
+###################
+
+
+
+
+
+def volume_allocate_iscsi_target(context, volume_id, host):
+
+    """Atomically allocate a free iscsi_target from the pool."""
+
+    return IMPL.volume_allocate_iscsi_target(context, volume_id, host)
+
+
+
+
+
+def volume_attached(context, volume_id, instance_id, mountpoint):
+
+    """Ensure that a volume is set as attached."""
+
+    return IMPL.volume_attached(context, volume_id, instance_id, mountpoint)
+
+
+
+
+
+def volume_create(context, values):
+
+    """Create a volume from the values dictionary."""
+
+    return IMPL.volume_create(context, values)
+
+
+
+
+
+def volume_data_get_for_project(context, project_id):
+
+    """Get (volume_count, gigabytes) for project."""
+
+    return IMPL.volume_data_get_for_project(context, project_id)
+
+
+
+
+
+def volume_destroy(context, volume_id):
+
+    """Destroy the volume or raise if it does not exist."""
+
+    return IMPL.volume_destroy(context, volume_id)
+
+
+
+
+
+def volume_detached(context, volume_id):
+
+    """Ensure that a volume is set as detached."""
+
+    return IMPL.volume_detached(context, volume_id)
+
+
+
+
+
+def volume_get(context, volume_id):
+
+    """Get a volume or raise if it does not exist."""
+
+    return IMPL.volume_get(context, volume_id)
+
+
+
+
+
+def volume_get_all(context):
+
+    """Get all volumes."""
+
+    return IMPL.volume_get_all(context)
+
+
+
+
+
+def volume_get_all_by_host(context, host):
+
+    """Get all volumes belonging to a host."""
+
+    return IMPL.volume_get_all_by_host(context, host)
+
+
+
+
+
+def volume_get_all_by_instance(context, instance_id):
+
+    """Get all volumes belonging to a instance."""
+
+    return IMPL.volume_get_all_by_instance(context, instance_id)
+
+
+
+
+
+def volume_get_all_by_project(context, project_id):
+
+    """Get all volumes belonging to a project."""
+
+    return IMPL.volume_get_all_by_project(context, project_id)
+
+
+
+
+
+def volume_get_by_ec2_id(context, ec2_id):
+
+    """Get a volume by ec2 id."""
+
+    return IMPL.volume_get_by_ec2_id(context, ec2_id)
+
+
+
+
+
+def volume_get_instance(context, volume_id):
+
+    """Get the instance that a volume is attached to."""
+
+    return IMPL.volume_get_instance(context, volume_id)
+
+
+
+
+
+def volume_get_iscsi_target_num(context, volume_id):
+
+    """Get the target num (tid) allocated to the volume."""
+
+    return IMPL.volume_get_iscsi_target_num(context, volume_id)
+
+
+
+
+
+def volume_update(context, volume_id, values):
+
+    """Set the given properties on an volume and update it.
+
+
+
+    Raises NotFound if volume does not exist.
+
+
+
+    """
+
+    return IMPL.volume_update(context, volume_id, values)
+
+
+
+
+
+####################
+
+
+
+
+
+def snapshot_create(context, values):
+
+    """Create a snapshot from the values dictionary."""
+
+    return IMPL.snapshot_create(context, values)
+
+
+
+
+
+def snapshot_destroy(context, snapshot_id):
+
+    """Destroy the snapshot or raise if it does not exist."""
+
+    return IMPL.snapshot_destroy(context, snapshot_id)
+
+
+
+
+
+def snapshot_get(context, snapshot_id):
+
+    """Get a snapshot or raise if it does not exist."""
+
+    return IMPL.snapshot_get(context, snapshot_id)
+
+
+
+
+
+def snapshot_get_all(context):
+
+    """Get all snapshots."""
+
+    return IMPL.snapshot_get_all(context)
+
+
+
+
+
+def snapshot_get_all_by_project(context, project_id):
+
+    """Get all snapshots belonging to a project."""
+
+    return IMPL.snapshot_get_all_by_project(context, project_id)
+
+
+
+
+
+def snapshot_get_all_for_volume(context, volume_id):
+
+    """Get all snapshots for a volume."""
+
+    return IMPL.snapshot_get_all_for_volume(context, volume_id)
+
+
+
+
+
+def snapshot_update(context, snapshot_id, values):
+
+    """Set the given properties on an snapshot and update it.
+
+
+
+    Raises NotFound if snapshot does not exist.
+
+
+
+    """
+
+    return IMPL.snapshot_update(context, snapshot_id, values)
+
+
+
+
+
+####################
+
+
+
+
+
+def block_device_mapping_create(context, values):
+
+    """Create an entry of block device mapping"""
+
+    return IMPL.block_device_mapping_create(context, values)
+
+
+
+
+
+def block_device_mapping_update(context, bdm_id, values):
+
+    """Update an entry of block device mapping"""
+
+    return IMPL.block_device_mapping_update(context, bdm_id, values)
+
+
+
+
+
+def block_device_mapping_update_or_create(context, values):
+
+    """Update an entry of block device mapping.
+
+    If not existed, create a new entry"""
+
+    return IMPL.block_device_mapping_update_or_create(context, values)
+
+
+
+
+
+def block_device_mapping_get_all_by_instance(context, instance_id):
+
+    """Get all block device mapping belonging to a instance"""
+
+    return IMPL.block_device_mapping_get_all_by_instance(context, instance_id)
+
+
+
+
+
+def block_device_mapping_destroy(context, bdm_id):
+
+    """Destroy the block device mapping."""
+
+    return IMPL.block_device_mapping_destroy(context, bdm_id)
+
+
+
+
+
+def block_device_mapping_destroy_by_instance_and_volume(context, instance_id,
+
+                                                        volume_id):
+
+    """Destroy the block device mapping or raise if it does not exist."""
+
+    return IMPL.block_device_mapping_destroy_by_instance_and_volume(
+
+        context, instance_id, volume_id)
+
+
+
+
+
+####################
+
+
+
+
+
+def security_group_get_all(context):
+
+    """Get all security groups."""
+
+    return IMPL.security_group_get_all(context)
+
+
+
+
+
+def security_group_get(context, security_group_id):
+
+    """Get security group by its id."""
+
+    return IMPL.security_group_get(context, security_group_id)
+
+
+
+
+
+def security_group_get_by_name(context, project_id, group_name):
+
+    """Returns a security group with the specified name from a project."""
+
+    return IMPL.security_group_get_by_name(context, project_id, group_name)
+
+
+
+
+
+def security_group_get_by_project(context, project_id):
+
+    """Get all security groups belonging to a project."""
+
+    return IMPL.security_group_get_by_project(context, project_id)
+
+
+
+
+
+def security_group_get_by_instance(context, instance_id):
+
+    """Get security groups to which the instance is assigned."""
+
+    return IMPL.security_group_get_by_instance(context, instance_id)
+
+
+
+
+
+def security_group_exists(context, project_id, group_name):
+
+    """Indicates if a group name exists in a project."""
+
+    return IMPL.security_group_exists(context, project_id, group_name)
+
+
+
+
+
+def security_group_in_use(context, group_id):
+
+    """Indicates if a security group is currently in use."""
+
+    return IMPL.security_group_in_use(context, group_id)
+
+
+
+
+
+def security_group_create(context, values):
+
+    """Create a new security group."""
+
+    return IMPL.security_group_create(context, values)
+
+
+
+
+
+def security_group_destroy(context, security_group_id):
+
+    """Deletes a security group."""
+
+    return IMPL.security_group_destroy(context, security_group_id)
+
+
+
+
+
+####################
+
+
+
+
+
+def security_group_rule_create(context, values):
+
+    """Create a new security group."""
+
+    return IMPL.security_group_rule_create(context, values)
+
+
+
+
+
+def security_group_rule_get_by_security_group(context, security_group_id):
+
+    """Get all rules for a a given security group."""
+
+    return IMPL.security_group_rule_get_by_security_group(context,
+
+                                                          security_group_id)
+
+
+
+
+
+def security_group_rule_get_by_security_group_grantee(context,
+
+                                                      security_group_id):
+
+    """Get all rules that grant access to the given security group."""
+
+    return IMPL.security_group_rule_get_by_security_group_grantee(context,
+
+                                                             security_group_id)
+
+
+
+
+
+def security_group_rule_destroy(context, security_group_rule_id):
+
+    """Deletes a security group rule."""
+
+    return IMPL.security_group_rule_destroy(context, security_group_rule_id)
+
+
+
+
+
+def security_group_rule_get(context, security_group_rule_id):
+
+    """Gets a security group rule."""
+
+    return IMPL.security_group_rule_get(context, security_group_rule_id)
+
+
+
+
+
+###################
+
+
+
+
+
+def provider_fw_rule_create(context, rule):
+
+    """Add a firewall rule at the provider level (all hosts & instances)."""
+
+    return IMPL.provider_fw_rule_create(context, rule)
+
+
+
+
+
+def provider_fw_rule_get_all(context):
+
+    """Get all provider-level firewall rules."""
+
+    return IMPL.provider_fw_rule_get_all(context)
+
+
+
+
+
+def provider_fw_rule_destroy(context, rule_id):
+
+    """Delete a provider firewall rule from the database."""
+
+    return IMPL.provider_fw_rule_destroy(context, rule_id)
+
+
+
+
+
+###################
+
+
+
+
+
+def user_get(context, id):
+
+    """Get user by id."""
+
+    return IMPL.user_get(context, id)
+
+
+
+
+
+def user_get_by_uid(context, uid):
+
+    """Get user by uid."""
+
+    return IMPL.user_get_by_uid(context, uid)
+
+
+
+
+
+def user_get_by_access_key(context, access_key):
+
+    """Get user by access key."""
+
+    return IMPL.user_get_by_access_key(context, access_key)
+
+
+
+
+
+def user_create(context, values):
+
+    """Create a new user."""
+
+    return IMPL.user_create(context, values)
+
+
+
+
+
+def user_delete(context, id):
+
+    """Delete a user."""
+
+    return IMPL.user_delete(context, id)
+
+
+
+
+
+def user_get_all(context):
+
+    """Create a new user."""
+
+    return IMPL.user_get_all(context)
+
+
+
+
+
+def user_add_role(context, user_id, role):
+
+    """Add another global role for user."""
+
+    return IMPL.user_add_role(context, user_id, role)
+
+
+
+
+
+def user_remove_role(context, user_id, role):
+
+    """Remove global role from user."""
+
+    return IMPL.user_remove_role(context, user_id, role)
+
+
+
+
+
+def user_get_roles(context, user_id):
+
+    """Get global roles for user."""
+
+    return IMPL.user_get_roles(context, user_id)
+
+
+
+
+
+def user_add_project_role(context, user_id, project_id, role):
+
+    """Add project role for user."""
+
+    return IMPL.user_add_project_role(context, user_id, project_id, role)
+
+
+
+
+
+def user_remove_project_role(context, user_id, project_id, role):
+
+    """Remove project role from user."""
+
+    return IMPL.user_remove_project_role(context, user_id, project_id, role)
+
+
+
+
+
+def user_get_roles_for_project(context, user_id, project_id):
+
+    """Return list of roles a user holds on project."""
+
+    return IMPL.user_get_roles_for_project(context, user_id, project_id)
+
+
+
+
+
+def user_update(context, user_id, values):
+
+    """Update user."""
+
+    return IMPL.user_update(context, user_id, values)
+
+
+
+
+
+###################
+
+
+
+
+
+def project_get(context, id):
+
+    """Get project by id."""
+
+    return IMPL.project_get(context, id)
+
+
+
+
+
+def project_create(context, values):
+
+    """Create a new project."""
+
+    return IMPL.project_create(context, values)
+
+
+
+
+
+def project_add_member(context, project_id, user_id):
+
+    """Add user to project."""
+
+    return IMPL.project_add_member(context, project_id, user_id)
+
+
+
+
+
+def project_get_all(context):
+
+    """Get all projects."""
+
+    return IMPL.project_get_all(context)
+
+
+
+
+
+def project_get_by_user(context, user_id):
+
+    """Get all projects of which the given user is a member."""
+
+    return IMPL.project_get_by_user(context, user_id)
+
+
+
+
+
+def project_remove_member(context, project_id, user_id):
+
+    """Remove the given user from the given project."""
+
+    return IMPL.project_remove_member(context, project_id, user_id)
+
+
+
+
+
+def project_update(context, project_id, values):
+
+    """Update Remove the given user from the given project."""
+
+    return IMPL.project_update(context, project_id, values)
+
+
+
+
+
+def project_delete(context, project_id):
+
+    """Delete project."""
+
+    return IMPL.project_delete(context, project_id)
+
+
+
+
+
+def project_get_networks(context, project_id, associate=True):
+
+    """Return the network associated with the project.
+
+
+
+    If associate is true, it will attempt to associate a new
+
+    network if one is not found, otherwise it returns None.
+
+
+
+    """
+
+    return IMPL.project_get_networks(context, project_id, associate)
+
+
+
+
+
+###################
+
+
+
+
+
+def console_pool_create(context, values):
+
+    """Create console pool."""
+
+    return IMPL.console_pool_create(context, values)
+
+
+
+
+
+def console_pool_get(context, pool_id):
+
+    """Get a console pool."""
+
+    return IMPL.console_pool_get(context, pool_id)
+
+
+
+
+
+def console_pool_get_by_host_type(context, compute_host, proxy_host,
+
+                                  console_type):
+
+    """Fetch a console pool for a given proxy host, compute host, and type."""
+
+    return IMPL.console_pool_get_by_host_type(context,
+
+                                              compute_host,
+
+                                              proxy_host,
+
+                                              console_type)
+
+
+
+
+
+def console_pool_get_all_by_host_type(context, host, console_type):
+
+    """Fetch all pools for given proxy host and type."""
+
+    return IMPL.console_pool_get_all_by_host_type(context,
+
+                                                  host,
+
+                                                  console_type)
+
+
+
+
+
+def console_create(context, values):
+
+    """Create a console."""
+
+    return IMPL.console_create(context, values)
+
+
+
+
+
+def console_delete(context, console_id):
+
+    """Delete a console."""
+
+    return IMPL.console_delete(context, console_id)
+
+
+
+
+
+def console_get_by_pool_instance(context, pool_id, instance_id):
+
+    """Get console entry for a given instance and pool."""
+
+    return IMPL.console_get_by_pool_instance(context, pool_id, instance_id)
+
+
+
+
+
+def console_get_all_by_instance(context, instance_id):
+
+    """Get consoles for a given instance."""
+
+    return IMPL.console_get_all_by_instance(context, instance_id)
+
+
+
+
+
+def console_get(context, console_id, instance_id=None):
+
+    """Get a specific console (possibly on a given instance)."""
+
+    return IMPL.console_get(context, console_id, instance_id)
+
+
+
+
+
+    ##################
+
+
+
+
+
+def instance_type_create(context, values):
+
+    """Create a new instance type."""
+
+    return IMPL.instance_type_create(context, values)
+
+
+
+
+
+def instance_type_get_all(context, inactive=False, filters=None):
+
+    """Get all instance types."""
+
+    return IMPL.instance_type_get_all(
+
+        context, inactive=inactive, filters=filters)
+
+
+
+
+
+def instance_type_get(context, id):
+
+    """Get instance type by id."""
+
+    return IMPL.instance_type_get(context, id)
+
+
+
+
+
+def instance_type_get_by_name(context, name):
+
+    """Get instance type by name."""
+
+    return IMPL.instance_type_get_by_name(context, name)
+
+
+
+
+
+def instance_type_get_by_flavor_id(context, id):
+
+    """Get instance type by name."""
+
+    return IMPL.instance_type_get_by_flavor_id(context, id)
+
+
+
+
+
+def instance_type_destroy(context, name):
+
+    """Delete a instance type."""
+
+    return IMPL.instance_type_destroy(context, name)
+
+
+
+
+
+####################
+
+
+
+
+
+def cell_create(context, values):
+
+    """Create a new child Cell entry."""
+
+    return IMPL.cell_create(context, values)
+
+
+
+
+
+def cell_update(context, cell_id, values):
+
+    """Update a child Cell entry."""
+
+    return IMPL.cell_update(context, cell_id, values)
+
+
+
+
+
+def cell_delete(context, cell_id):
+
+    """Delete a child Cell."""
+
+    return IMPL.cell_delete(context, cell_id)
+
+
+
+
+
+def cell_get(context, cell_id):
+
+    """Get a specific child Cell."""
+
+    return IMPL.cell_get(context, cell_id)
+
+
+
+
+
+def cell_get_all(context):
+
+    """Get all child Cells."""
+
+    return IMPL.cell_get_all(context)
+
+
+
+
+
+####################
+
+
+
+
+
+def instance_metadata_get(context, instance_id):
+
+    """Get all metadata for an instance."""
+
+    return IMPL.instance_metadata_get(context, instance_id)
+
+
+
+
+
+def instance_metadata_delete(context, instance_id, key):
+
+    """Delete the given metadata item."""
+
+    IMPL.instance_metadata_delete(context, instance_id, key)
+
+
+
+
+
+def instance_metadata_update(context, instance_id, metadata, delete):
+
+    """Update metadata if it exists, otherwise create it."""
+
+    IMPL.instance_metadata_update(context, instance_id, metadata, delete)
+
+
+
+
+
+####################
+
+
+
+
+
+def agent_build_create(context, values):
+
+    """Create a new agent build entry."""
+
+    return IMPL.agent_build_create(context, values)
+
+
+
+
+
+def agent_build_get_by_triple(context, hypervisor, os, architecture):
+
+    """Get agent build by hypervisor/OS/architecture triple."""
+
+    return IMPL.agent_build_get_by_triple(context, hypervisor, os,
+
+            architecture)
+
+
+
+
+
+def agent_build_get_all(context):
+
+    """Get all agent builds."""
+
+    return IMPL.agent_build_get_all(context)
+
+
+
+
+
+def agent_build_destroy(context, agent_update_id):
+
+    """Destroy agent build entry."""
+
+    IMPL.agent_build_destroy(context, agent_update_id)
+
+
+
+
+
+def agent_build_update(context, agent_build_id, values):
+
+    """Update agent build entry."""
+
+    IMPL.agent_build_update(context, agent_build_id, values)
+
+
+
+
+
+####################
+
+
+
+
+
+def bw_usage_get_by_macs(context, macs, start_period):
+
+    """Return bw usages for an instance in a given audit period."""
+
+    return IMPL.bw_usage_get_by_macs(context, macs, start_period)
+
+
+
+
+
+def bw_usage_update(context,
+
+                    mac,
+
+                    start_period,
+
+                    bw_in, bw_out):
+
+    """Update cached bw usage for an instance and network
+
+       Creates new record if needed."""
+
+    return IMPL.bw_usage_update(context,
+
+                                mac,
+
+                                start_period,
+
+                                bw_in, bw_out)
+
+
+
+
+
+####################
+
+
+
+
+
+def instance_type_extra_specs_get(context, instance_type_id):
+
+    """Get all extra specs for an instance type."""
+
+    return IMPL.instance_type_extra_specs_get(context, instance_type_id)
+
+
+
+
+
+def instance_type_extra_specs_delete(context, instance_type_id, key):
+
+    """Delete the given extra specs item."""
+
+    IMPL.instance_type_extra_specs_delete(context, instance_type_id, key)
+
+
+
+
+
+def instance_type_extra_specs_update_or_create(context, instance_type_id,
+
+                                               extra_specs):
+
+    """Create or update instance type extra specs. This adds or modifies the
+
+    key/value pairs specified in the extra specs dict argument"""
+
+    IMPL.instance_type_extra_specs_update_or_create(context, instance_type_id,
+
+                                                    extra_specs)
+
+
+
+
+
+##################
+
+
+
+
+
+def volume_metadata_get(context, volume_id):
+
+    """Get all metadata for a volume."""
+
+    return IMPL.volume_metadata_get(context, volume_id)
+
+
+
+
+
+def volume_metadata_delete(context, volume_id, key):
+
+    """Delete the given metadata item."""
+
+    IMPL.volume_metadata_delete(context, volume_id, key)
+
+
+
+
+
+def volume_metadata_update(context, volume_id, metadata, delete):
+
+    """Update metadata if it exists, otherwise create it."""
+
+    IMPL.volume_metadata_update(context, volume_id, metadata, delete)
+
+
+
+
+
+##################
+
+
+
+
+
+def volume_type_create(context, values):
+
+    """Create a new volume type."""
+
+    return IMPL.volume_type_create(context, values)
+
+
+
+
+
+def volume_type_get_all(context, inactive=False):
+
+    """Get all volume types."""
+
+    return IMPL.volume_type_get_all(context, inactive)
+
+
+
+
+
+def volume_type_get(context, id):
+
+    """Get volume type by id."""
+
+    return IMPL.volume_type_get(context, id)
+
+
+
+
+
+def volume_type_get_by_name(context, name):
+
+    """Get volume type by name."""
+
+    return IMPL.volume_type_get_by_name(context, name)
+
+
+
+
+
+def volume_type_destroy(context, name):
+
+    """Delete a volume type."""
+
+    return IMPL.volume_type_destroy(context, name)
+
+
+
+
+
+####################
+
+
+
+
+
+def volume_type_extra_specs_get(context, volume_type_id):
+
+    """Get all extra specs for a volume type."""
+
+    return IMPL.volume_type_extra_specs_get(context, volume_type_id)
+
+
+
+
+
+def volume_type_extra_specs_delete(context, volume_type_id, key):
+
+    """Delete the given extra specs item."""
+
+    IMPL.volume_type_extra_specs_delete(context, volume_type_id, key)
+
+
+
+
+
+def volume_type_extra_specs_update_or_create(context, volume_type_id,
+
+                                               extra_specs):
+
+    """Create or update volume type extra specs. This adds or modifies the
+
+    key/value pairs specified in the extra specs dict argument"""
+
+    IMPL.volume_type_extra_specs_update_or_create(context, volume_type_id,
+
+                                                    extra_specs)
+
+
+
+
+
+###################
+
+
+
+
+
+def s3_image_get(context, image_id):
+
+    """Find local s3 image represented by the provided id"""
+
+    return IMPL.s3_image_get(context, image_id)
+
+
+
+
+
+def s3_image_get_by_uuid(context, image_uuid):
+
+    """Find local s3 image represented by the provided uuid"""
+
+    return IMPL.s3_image_get_by_uuid(context, image_uuid)
+
+
+
+
+
+def s3_image_create(context, image_uuid):
+
+    """Create local s3 image represented by provided uuid"""
+
+    return IMPL.s3_image_create(context, image_uuid)
+
+
+
+
+
+####################
+
+
+
+
+
+def sm_backend_conf_create(context, values):
+
+    """Create a new SM Backend Config entry."""
+
+    return IMPL.sm_backend_conf_create(context, values)
+
+
+
+
+
+def sm_backend_conf_update(context, sm_backend_conf_id, values):
+
+    """Update a SM Backend Config entry."""
+
+    return IMPL.sm_backend_conf_update(context, sm_backend_conf_id, values)
+
+
+
+
+
+def sm_backend_conf_delete(context, sm_backend_conf_id):
+
+    """Delete a SM Backend Config."""
+
+    return IMPL.sm_backend_conf_delete(context, sm_backend_conf_id)
+
+
+
+
+
+def sm_backend_conf_get(context, sm_backend_conf_id):
+
+    """Get a specific SM Backend Config."""
+
+    return IMPL.sm_backend_conf_get(context, sm_backend_conf_id)
+
+
+
+
+
+def sm_backend_conf_get_by_sr(context, sr_uuid):
+
+    """Get a specific SM Backend Config."""
+
+    return IMPL.sm_backend_conf_get_by_sr(context, sr_uuid)
+
+
+
+
+
+def sm_backend_conf_get_all(context):
+
+    """Get all SM Backend Configs."""
+
+    return IMPL.sm_backend_conf_get_all(context)
+
+
+
+
+
+####################
+
+
+
+
+
+def sm_flavor_create(context, values):
+
+    """Create a new SM Flavor entry."""
+
+    return IMPL.sm_flavor_create(context, values)
+
+
+
+
+
+def sm_flavor_update(context, sm_flavor_id, values):
+
+    """Update a SM Flavor entry."""
+
+    return IMPL.sm_flavor_update(context, values)
+
+
+
+
+
+def sm_flavor_delete(context, sm_flavor_id):
+
+    """Delete a SM Flavor."""
+
+    return IMPL.sm_flavor_delete(context, sm_flavor_id)
+
+
+
+
+
+def sm_flavor_get(context, sm_flavor):
+
+    """Get a specific SM Flavor."""
+
+    return IMPL.sm_flavor_get(context, sm_flavor)
+
+
+
+
+
+def sm_flavor_get_all(context):
+
+    """Get all SM Flavors."""
+
+    return IMPL.sm_flavor_get_all(context)
+
+
+
+
+
+####################
+
+
+
+
+
+def sm_volume_create(context, values):
+
+    """Create a new child Zone entry."""
+
+    return IMPL.sm_volume_create(context, values)
+
+
+
+
+
+def sm_volume_update(context, volume_id, values):
+
+    """Update a child Zone entry."""
+
+    return IMPL.sm_volume_update(context, values)
+
+
+
+
+
+def sm_volume_delete(context, volume_id):
+
+    """Delete a child Zone."""
+
+    return IMPL.sm_volume_delete(context, volume_id)
+
+
+
+
+
+def sm_volume_get(context, volume_id):
+
+    """Get a specific child Zone."""
+
+    return IMPL.sm_volume_get(context, volume_id)
+
+
+
+
+
+def sm_volume_get_all(context):
+
+    """Get all child Zones."""
+
+    return IMPL.sm_volume_get_all(context)
+
+
+
+
+
+####################
+
+
+
+
+
+def aggregate_create(context, values, metadata=None):
+
+    """Create a new aggregate with metadata."""
+
+    return IMPL.aggregate_create(context, values, metadata)
+
+
+
+
+
+def aggregate_get(context, aggregate_id, read_deleted='no'):
+
+    """Get a specific aggregate by id."""
+
+    return IMPL.aggregate_get(context, aggregate_id, read_deleted)
+
+
+
+
+
+def aggregate_get_by_host(context, host, read_deleted='no'):
+
+    """Get a specific aggregate by host"""
+
+    return IMPL.aggregate_get_by_host(context, host, read_deleted)
+
+
+
+
+
+def aggregate_update(context, aggregate_id, values):
+
+    """Update the attributes of an aggregates. If values contains a metadata
+
+    key, it updates the aggregate metadata too."""
+
+    return IMPL.aggregate_update(context, aggregate_id, values)
+
+
+
+
+
+def aggregate_delete(context, aggregate_id):
+
+    """Delete an aggregate."""
+
+    return IMPL.aggregate_delete(context, aggregate_id)
+
+
+
+
+
+def aggregate_get_all(context, read_deleted='yes'):
+
+    """Get all aggregates."""
+
+    return IMPL.aggregate_get_all(context, read_deleted)
+
+
+
+
+
+def aggregate_metadata_add(context, aggregate_id, metadata, set_delete=False):
+
+    """Add/update metadata. If set_delete=True, it adds only."""
+
+    IMPL.aggregate_metadata_add(context, aggregate_id, metadata, set_delete)
+
+
+
+
+
+def aggregate_metadata_get(context, aggregate_id, read_deleted='no'):
+
+    """Get metadata for the specified aggregate."""
+
+    return IMPL.aggregate_metadata_get(context, aggregate_id, read_deleted)
+
+
+
+
+
+def aggregate_metadata_delete(context, aggregate_id, key):
+
+    """Delete the given metadata key."""
+
+    IMPL.aggregate_metadata_delete(context, aggregate_id, key)
+
+
+
+
+
+def aggregate_host_add(context, aggregate_id, host):
+
+    """Add host to the aggregate."""
+
+    IMPL.aggregate_host_add(context, aggregate_id, host)
+
+
+
+
+
+def aggregate_host_get_all(context, aggregate_id, read_deleted='yes'):
+
+    """Get hosts for the specified aggregate."""
+
+    return IMPL.aggregate_host_get_all(context, aggregate_id, read_deleted)
+
+
+
+
+
+def aggregate_host_delete(context, aggregate_id, host):
+
+    """Delete the given host from the aggregate."""
+
+    IMPL.aggregate_host_delete(context, aggregate_id, host)
+
+
+
+
+
+####################
+
+
+
+
+
+def instance_fault_create(context, values):
+
+    """Create a new Instance Fault."""
+
+    return IMPL.instance_fault_create(context, values)
+
+
+
+
+
+def instance_fault_get_by_instance_uuids(context, instance_uuids):
+
+    """Get all instance faults for the provided instance_uuids."""
+
+    return IMPL.instance_fault_get_by_instance_uuids(context, instance_uuids)

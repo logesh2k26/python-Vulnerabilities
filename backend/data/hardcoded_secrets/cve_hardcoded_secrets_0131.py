@@ -2,1224 +2,380 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# -*- coding: utf-8 -*-
+# Author: Trevor Perrin
 
-#
+# See the LICENSE file for legal information regarding use of this file.
 
-# Copyright © 2012 - 2016 Michal Čihař <michal@cihar.com>
 
-#
 
-# This file is part of Weblate <https://weblate.org/>
+"""Factory functions for asymmetric cryptography."""
 
-#
 
-# This program is free software: you can redistribute it and/or modify
 
-# it under the terms of the GNU General Public License as published by
+from .compat import *
 
-# the Free Software Foundation, either version 3 of the License, or
 
-# (at your option) any later version.
 
-#
+from .rsakey import RSAKey
 
-# This program is distributed in the hope that it will be useful,
+from .python_rsakey import Python_RSAKey
 
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
+from tlslite.utils import cryptomath
 
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 
-# GNU General Public License for more details.
 
-#
+if cryptomath.m2cryptoLoaded:
 
-# You should have received a copy of the GNU General Public License
+    from .openssl_rsakey import OpenSSL_RSAKey
 
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-#
 
+if cryptomath.pycryptoLoaded:
 
+    from .pycrypto_rsakey import PyCrypto_RSAKey
 
-from __future__ import unicode_literals
 
 
+# **************************************************************************
 
-from django.shortcuts import render, get_object_or_404, redirect
+# Factory Functions for RSA Keys
 
-from django.http import HttpResponse, HttpResponseRedirect
+# **************************************************************************
 
-from django.contrib.auth import logout
 
-from django.conf import settings
 
-from django.utils.translation import ugettext as _
+def generateRSAKey(bits, implementations=["openssl", "python"]):
 
-from django.contrib.auth.decorators import login_required
+    """Generate an RSA key with the specified bit length.
 
-from django.core.mail.message import EmailMultiAlternatives
 
-from django.utils import translation
 
-from django.utils.cache import patch_response_headers
+    :type bits: int
 
-from django.utils.crypto import get_random_string
+    :param bits: Desired bit length of the new key's modulus.
 
-from django.utils.translation import get_language
 
-from django.contrib.auth.models import User
 
-from django.contrib.auth import views as auth_views
+    :rtype: ~tlslite.utils.rsakey.RSAKey
 
-from django.views.generic import TemplateView
-
-from django.contrib.auth import update_session_auth_hash
-
-from django.core.urlresolvers import reverse
-
-
-
-from rest_framework.authtoken.models import Token
-
-
-
-from six.moves.urllib.parse import urlencode
-
-
-
-from social.backends.utils import load_backends
-
-from social.apps.django_app.utils import BACKENDS
-
-from social.apps.django_app.views import complete
-
-
-
-from weblate.accounts.forms import (
-
-    RegistrationForm, PasswordForm, PasswordChangeForm, EmailForm, ResetForm,
-
-    LoginForm, HostingForm, CaptchaRegistrationForm
-
-)
-
-from weblate.logger import LOGGER
-
-from weblate.accounts.avatar import get_avatar_image, get_fallback_avatar_url
-
-from weblate.accounts.models import set_lang, remove_user, Profile
-
-from weblate.trans import messages
-
-from weblate.trans.models import Change, Project, SubProject
-
-from weblate.trans.views.helper import get_project
-
-from weblate.accounts.forms import (
-
-    ProfileForm, SubscriptionForm, UserForm, ContactForm,
-
-    SubscriptionSettingsForm, UserSettingsForm, DashboardSettingsForm
-
-)
-
-from weblate import appsettings
-
-
-
-CONTACT_TEMPLATE = '''
-
-Message from %(name)s <%(email)s>:
-
-
-
-%(message)s
-
-'''
-
-
-
-HOSTING_TEMPLATE = '''
-
-%(name)s <%(email)s> wants to host %(project)s
-
-
-
-Project:    %(project)s
-
-Website:    %(url)s
-
-Repository: %(repo)s
-
-Filemask:   %(mask)s
-
-Username:   %(username)s
-
-
-
-Additional message:
-
-
-
-%(message)s
-
-'''
-
-
-
-
-
-class RegistrationTemplateView(TemplateView):
-
-    '''
-
-    Class for rendering registration pages.
-
-    '''
-
-    def get_context_data(self, **kwargs):
-
-        '''
-
-        Creates context for rendering page.
-
-        '''
-
-        context = super(RegistrationTemplateView, self).get_context_data(
-
-            **kwargs
-
-        )
-
-        context['title'] = _('User registration')
-
-        return context
-
-
-
-
-
-def mail_admins_contact(request, subject, message, context, sender):
-
-    '''
-
-    Sends a message to the admins, as defined by the ADMINS setting.
-
-    '''
-
-    LOGGER.info(
-
-        'contact form from %s',
-
-        sender,
-
-    )
-
-    if not settings.ADMINS:
-
-        messages.error(
-
-            request,
-
-            _('Message could not be sent to administrator!')
-
-        )
-
-        LOGGER.error(
-
-            'ADMINS not configured, can not send message!'
-
-        )
-
-        return
-
-
-
-    mail = EmailMultiAlternatives(
-
-        '%s%s' % (settings.EMAIL_SUBJECT_PREFIX, subject % context),
-
-        message % context,
-
-        to=[a[1] for a in settings.ADMINS],
-
-        headers={'Reply-To': sender},
-
-    )
-
-
-
-    mail.send(fail_silently=False)
-
-
-
-    messages.success(
-
-        request,
-
-        _('Message has been sent to administrator.')
-
-    )
-
-
-
-
-
-def deny_demo(request):
+    :returns: A new RSA private key.
 
     """
 
-    Denies editing of demo account on demo server.
+    for implementation in implementations:
+
+        if implementation == "openssl" and cryptomath.m2cryptoLoaded:
+
+            return OpenSSL_RSAKey.generate(bits)
+
+        elif implementation == "python":
+
+            return Python_RSAKey.generate(bits)
+
+    raise ValueError("No acceptable implementations")
+
+
+
+#Parse as an OpenSSL or Python key
+
+def parsePEMKey(s, private=False, public=False, passwordCallback=None,
+
+                implementations=["openssl", "python"]):
+
+    """Parse a PEM-format key.
+
+
+
+    The PEM format is used by OpenSSL and other tools.  The
+
+    format is typically used to store both the public and private
+
+    components of a key.  For example::
+
+
+
+       -----BEGIN RSA PRIVATE KEY-----
+
+        MIICXQIBAAKBgQDYscuoMzsGmW0pAYsmyHltxB2TdwHS0dImfjCMfaSDkfLdZY5+
+
+        dOWORVns9etWnr194mSGA1F0Pls/VJW8+cX9+3vtJV8zSdANPYUoQf0TP7VlJxkH
+
+        dSRkUbEoz5bAAs/+970uos7n7iXQIni+3erUTdYEk2iWnMBjTljfgbK/dQIDAQAB
+
+        AoGAJHoJZk75aKr7DSQNYIHuruOMdv5ZeDuJvKERWxTrVJqE32/xBKh42/IgqRrc
+
+        esBN9ZregRCd7YtxoL+EVUNWaJNVx2mNmezEznrc9zhcYUrgeaVdFO2yBF1889zO
+
+        gCOVwrO8uDgeyj6IKa25H6c1N13ih/o7ZzEgWbGG+ylU1yECQQDv4ZSJ4EjSh/Fl
+
+        aHdz3wbBa/HKGTjC8iRy476Cyg2Fm8MZUe9Yy3udOrb5ZnS2MTpIXt5AF3h2TfYV
+
+        VoFXIorjAkEA50FcJmzT8sNMrPaV8vn+9W2Lu4U7C+K/O2g1iXMaZms5PC5zV5aV
+
+        CKXZWUX1fq2RaOzlbQrpgiolhXpeh8FjxwJBAOFHzSQfSsTNfttp3KUpU0LbiVvv
+
+        i+spVSnA0O4rq79KpVNmK44Mq67hsW1P11QzrzTAQ6GVaUBRv0YS061td1kCQHnP
+
+        wtN2tboFR6lABkJDjxoGRvlSt4SOPr7zKGgrWjeiuTZLHXSAnCY+/hr5L9Q3ZwXG
+
+        6x6iBdgLjVIe4BZQNtcCQQDXGv/gWinCNTN3MPWfTW/RGzuMYVmyBFais0/VrgdH
+
+        h1dLpztmpQqfyH/zrBXQ9qL/zR4ojS6XYneO/U18WpEe
+
+        -----END RSA PRIVATE KEY-----
+
+
+
+    To generate a key like this with OpenSSL, run::
+
+
+
+        openssl genrsa 2048 > key.pem
+
+
+
+    This format also supports password-encrypted private keys.  TLS
+
+    Lite can only handle password-encrypted private keys when OpenSSL
+
+    and M2Crypto are installed.  In this case, passwordCallback will be
+
+    invoked to query the user for the password.
+
+
+
+    :type s: str
+
+    :param s: A string containing a PEM-encoded public or private key.
+
+
+
+    :type private: bool
+
+    :param private: If True, a :py:class:`SyntaxError` will be raised if the
+
+        private key component is not present.
+
+
+
+    :type public: bool
+
+    :param public: If True, the private key component (if present) will
+
+        be discarded, so this function will always return a public key.
+
+
+
+    :type passwordCallback: callable
+
+    :param passwordCallback: This function will be called, with no
+
+        arguments, if the PEM-encoded private key is password-encrypted.
+
+        The callback should return the password string.  If the password is
+
+        incorrect, SyntaxError will be raised.  If no callback is passed
+
+        and the key is password-encrypted, a prompt will be displayed at
+
+        the console.
+
+
+
+    :rtype: ~tlslite.utils.rsakey.RSAKey
+
+    :returns: An RSA key.
+
+
+
+    :raises SyntaxError: If the key is not properly formatted.
 
     """
 
-    messages.warning(
+    for implementation in implementations:
 
-        request,
+        if implementation == "openssl" and cryptomath.m2cryptoLoaded:
 
-        _('You cannot change demo account on the demo server.')
+            key = OpenSSL_RSAKey.parse(s, passwordCallback)
 
-    )
+            break
 
-    return redirect_profile(request.POST.get('activetab'))
+        elif implementation == "python":
 
+            key = Python_RSAKey.parsePEM(s)
 
-
-
-
-def redirect_profile(page=''):
-
-    url = reverse('profile')
-
-    if page and page.startswith('#'):
-
-        url = url + page
-
-    return HttpResponseRedirect(url)
-
-
-
-
-
-@login_required
-
-def user_profile(request):
-
-
-
-    profile = request.user.profile
-
-
-
-    if not profile.language:
-
-        profile.language = get_language()
-
-        profile.save()
-
-
-
-    form_classes = [
-
-        ProfileForm,
-
-        SubscriptionForm,
-
-        SubscriptionSettingsForm,
-
-        UserSettingsForm,
-
-        DashboardSettingsForm,
-
-    ]
-
-
-
-    if request.method == 'POST':
-
-        # Parse POST params
-
-        forms = [form(request.POST, instance=profile) for form in form_classes]
-
-        forms.append(UserForm(request.POST, instance=request.user))
-
-
-
-        if appsettings.DEMO_SERVER and request.user.username == 'demo':
-
-            return deny_demo(request)
-
-
-
-        if all([form.is_valid() for form in forms]):
-
-            # Save changes
-
-            for form in forms:
-
-                form.save()
-
-
-
-            # Change language
-
-            set_lang(request, request.user.profile)
-
-
-
-            # Redirect after saving (and possibly changing language)
-
-            response = redirect_profile(request.POST.get('activetab'))
-
-
-
-            # Set language cookie and activate new language (for message below)
-
-            lang_code = profile.language
-
-            response.set_cookie(settings.LANGUAGE_COOKIE_NAME, lang_code)
-
-            translation.activate(lang_code)
-
-
-
-            messages.success(request, _('Your profile has been updated.'))
-
-
-
-            return response
+            break
 
     else:
 
-        forms = [form(instance=profile) for form in form_classes]
+        raise ValueError("No acceptable implementations")
 
-        forms.append(UserForm(instance=request.user))
 
 
+    return _parseKeyHelper(key, private, public)
 
-    social = request.user.social_auth.all()
 
-    social_names = [assoc.provider for assoc in social]
 
-    all_backends = set(load_backends(BACKENDS).keys())
 
-    new_backends = [
 
-        x for x in all_backends
+def _parseKeyHelper(key, private, public):
 
-        if x == 'email' or x not in social_names
+    if private:
 
-    ]
+        if not key.hasPrivateKey():
 
-    license_projects = SubProject.objects.filter(
+            raise SyntaxError("Not a private key!")
 
-        project__in=Project.objects.all_acl(request.user)
 
-    ).exclude(
 
-        license=''
+    if public:
 
-    )
+        return _createPublicKey(key)
 
 
 
-    result = render(
+    if private:
 
-        request,
+        if hasattr(key, "d"):
 
-        'accounts/profile.html',
+            return _createPrivateKey(key)
 
-        {
+        else:
 
-            'form': forms[0],
+            return key
 
-            'subscriptionform': forms[1],
 
-            'subscriptionsettingsform': forms[2],
 
-            'usersettingsform': forms[3],
+    return key
 
-            'dashboardsettingsform': forms[4],
 
-            'userform': forms[5],
 
-            'profile': profile,
+def parseAsPublicKey(s):
 
-            'title': _('User profile'),
+    """Parse a PEM-formatted public key.
 
-            'licenses': license_projects,
 
-            'associated': social,
 
-            'new_backends': new_backends,
+    :type s: str
 
-        }
+    :param s: A string containing a PEM-encoded public or private key.
 
-    )
 
-    result.set_cookie(
 
-        settings.LANGUAGE_COOKIE_NAME,
+    :rtype: ~tlslite.utils.rsakey.RSAKey
 
-        profile.language
+    :returns: An RSA public key.
 
-    )
 
-    return result
 
+    :raises SyntaxError: If the key is not properly formatted.
 
+    """
 
+    return parsePEMKey(s, public=True)
 
 
-@login_required
 
-def user_remove(request):
+def parsePrivateKey(s):
 
-    if appsettings.DEMO_SERVER and request.user.username == 'demo':
+    """Parse a PEM-formatted private key.
 
-        return deny_demo(request)
 
 
+    :type s: str
 
-    if request.method == 'POST':
+    :param s: A string containing a PEM-encoded private key.
 
-        remove_user(request.user)
 
 
+    :rtype: ~tlslite.utils.rsakey.RSAKey
 
-        logout(request)
+    :returns: An RSA private key.
 
 
 
-        messages.success(
+    :raises SyntaxError: If the key is not properly formatted.
 
-            request,
+    """
 
-            _('Your account has been removed.')
+    return parsePEMKey(s, private=True)
 
-        )
 
 
+def _createPublicKey(key):
 
-        return redirect('home')
+    """
 
+    Create a new public key.  Discard any private component,
 
+    and return the most efficient key possible.
 
-    return render(
+    """
 
-        request,
+    if not isinstance(key, RSAKey):
 
-        'accounts/removal.html',
+        raise AssertionError()
 
-    )
+    return _createPublicRSAKey(key.n, key.e)
 
 
 
+def _createPrivateKey(key):
 
+    """
 
-def get_initial_contact(request):
+    Create a new private key.  Return the most efficient key possible.
 
-    '''
+    """
 
-    Fills in initial contact form fields from request.
+    if not isinstance(key, RSAKey):
 
-    '''
+        raise AssertionError()
 
-    initial = {}
+    if not key.hasPrivateKey():
 
-    if request.user.is_authenticated():
+        raise AssertionError()
 
-        initial['name'] = request.user.first_name
+    return _createPrivateRSAKey(key.n, key.e, key.d, key.p, key.q, key.dP,
 
-        initial['email'] = request.user.email
+                                key.dQ, key.qInv)
 
-    return initial
 
 
+def _createPublicRSAKey(n, e, implementations = ["openssl", "pycrypto",
 
+                                                "python"]):
 
+    for implementation in implementations:
 
-def contact(request):
+        if implementation == "openssl" and cryptomath.m2cryptoLoaded:
 
-    if request.method == 'POST':
+            return OpenSSL_RSAKey(n, e)
 
-        form = ContactForm(request.POST)
+        elif implementation == "pycrypto" and cryptomath.pycryptoLoaded:
 
-        if form.is_valid():
+            return PyCrypto_RSAKey(n, e)
 
-            mail_admins_contact(
+        elif implementation == "python":
 
-                request,
+            return Python_RSAKey(n, e)
 
-                '%(subject)s',
+    raise ValueError("No acceptable implementations")
 
-                CONTACT_TEMPLATE,
 
-                form.cleaned_data,
 
-                form.cleaned_data['email'],
+def _createPrivateRSAKey(n, e, d, p, q, dP, dQ, qInv,
 
-            )
+                        implementations = ["pycrypto", "python"]):
 
-            return redirect('home')
+    for implementation in implementations:
 
-    else:
+        if implementation == "pycrypto" and cryptomath.pycryptoLoaded:
 
-        initial = get_initial_contact(request)
+            return PyCrypto_RSAKey(n, e, d, p, q, dP, dQ, qInv)
 
-        if 'subject' in request.GET:
+        elif implementation == "python":
 
-            initial['subject'] = request.GET['subject']
+            return Python_RSAKey(n, e, d, p, q, dP, dQ, qInv)
 
-        form = ContactForm(initial=initial)
-
-
-
-    return render(
-
-        request,
-
-        'accounts/contact.html',
-
-        {
-
-            'form': form,
-
-            'title': _('Contact'),
-
-        }
-
-    )
-
-
-
-
-
-@login_required
-
-def hosting(request):
-
-    '''
-
-    Form for hosting request.
-
-    '''
-
-    if not appsettings.OFFER_HOSTING:
-
-        return redirect('home')
-
-
-
-    if request.method == 'POST':
-
-        form = HostingForm(request.POST)
-
-        if form.is_valid():
-
-            context = form.cleaned_data
-
-            context['username'] = request.user.username
-
-            mail_admins_contact(
-
-                request,
-
-                'Hosting request for %(project)s',
-
-                HOSTING_TEMPLATE,
-
-                context,
-
-                form.cleaned_data['email'],
-
-            )
-
-            return redirect('home')
-
-    else:
-
-        initial = get_initial_contact(request)
-
-        form = HostingForm(initial=initial)
-
-
-
-    return render(
-
-        request,
-
-        'accounts/hosting.html',
-
-        {
-
-            'form': form,
-
-            'title': _('Hosting'),
-
-        }
-
-    )
-
-
-
-
-
-def user_page(request, user):
-
-    '''
-
-    User details page.
-
-    '''
-
-    user = get_object_or_404(User, username=user)
-
-    profile = Profile.objects.get_or_create(user=user)[0]
-
-
-
-    # Filter all user activity
-
-    all_changes = Change.objects.last_changes(request.user).filter(
-
-        user=user,
-
-    )
-
-
-
-    # Last user activity
-
-    last_changes = all_changes[:10]
-
-
-
-    # Filter where project is active
-
-    user_projects_ids = set(all_changes.values_list(
-
-        'translation__subproject__project', flat=True
-
-    ))
-
-    user_projects = Project.objects.filter(id__in=user_projects_ids)
-
-
-
-    return render(
-
-        request,
-
-        'accounts/user.html',
-
-        {
-
-            'page_profile': profile,
-
-            'page_user': user,
-
-            'last_changes': last_changes,
-
-            'last_changes_url': urlencode(
-
-                {'user': user.username.encode('utf-8')}
-
-            ),
-
-            'user_projects': user_projects,
-
-        }
-
-    )
-
-
-
-
-
-def user_avatar(request, user, size):
-
-    '''
-
-    User avatar page.
-
-    '''
-
-    user = get_object_or_404(User, username=user)
-
-
-
-    if user.email == 'noreply@weblate.org':
-
-        return redirect(get_fallback_avatar_url(size))
-
-
-
-    response = HttpResponse(
-
-        content_type='image/png',
-
-        content=get_avatar_image(request, user, size)
-
-    )
-
-
-
-    patch_response_headers(response, 3600 * 24 * 7)
-
-
-
-    return response
-
-
-
-
-
-def weblate_login(request):
-
-    '''
-
-    Login handler, just wrapper around login.
-
-    '''
-
-
-
-    # Redirect logged in users to profile
-
-    if request.user.is_authenticated():
-
-        return redirect_profile()
-
-
-
-    # Redirect if there is only one backend
-
-    auth_backends = list(load_backends(BACKENDS).keys())
-
-    if len(auth_backends) == 1 and auth_backends[0] != 'email':
-
-        return redirect('social:begin', auth_backends[0])
-
-
-
-    return auth_views.login(
-
-        request,
-
-        template_name='accounts/login.html',
-
-        authentication_form=LoginForm,
-
-        extra_context={
-
-            'login_backends': [
-
-                x for x in auth_backends if x != 'email'
-
-            ],
-
-            'can_reset': 'email' in auth_backends,
-
-            'title': _('Login'),
-
-        }
-
-    )
-
-
-
-
-
-@login_required
-
-def weblate_logout(request):
-
-    '''
-
-    Logout handler, just wrapper around standard logout.
-
-    '''
-
-    messages.info(request, _('Thanks for using Weblate!'))
-
-
-
-    return auth_views.logout(
-
-        request,
-
-        next_page=reverse('home'),
-
-    )
-
-
-
-
-
-def register(request):
-
-    '''
-
-    Registration form.
-
-    '''
-
-    if appsettings.REGISTRATION_CAPTCHA:
-
-        form_class = CaptchaRegistrationForm
-
-    else:
-
-        form_class = RegistrationForm
-
-
-
-    if request.method == 'POST':
-
-        form = form_class(request.POST)
-
-        if form.is_valid() and appsettings.REGISTRATION_OPEN:
-
-            # Ensure we do registration in separate session
-
-            # not sent to client
-
-            request.session.create()
-
-            result = complete(request, 'email')
-
-            request.session.save()
-
-            request.session = None
-
-            return result
-
-    else:
-
-        form = form_class()
-
-
-
-    backends = set(load_backends(BACKENDS).keys())
-
-
-
-    # Redirect if there is only one backend
-
-    if len(backends) == 1 and 'email' not in backends:
-
-        return redirect('social:begin', backends.pop())
-
-
-
-    return render(
-
-        request,
-
-        'accounts/register.html',
-
-        {
-
-            'registration_email': 'email' in backends,
-
-            'registration_backends': backends - set(['email']),
-
-            'title': _('User registration'),
-
-            'form': form,
-
-        }
-
-    )
-
-
-
-
-
-@login_required
-
-def email_login(request):
-
-    '''
-
-    Connect email.
-
-    '''
-
-    if request.method == 'POST':
-
-        form = EmailForm(request.POST)
-
-        if form.is_valid():
-
-            return complete(request, 'email')
-
-    else:
-
-        form = EmailForm()
-
-
-
-    return render(
-
-        request,
-
-        'accounts/email.html',
-
-        {
-
-            'title': _('Register email'),
-
-            'form': form,
-
-        }
-
-    )
-
-
-
-
-
-@login_required
-
-def password(request):
-
-    '''
-
-    Password change / set form.
-
-    '''
-
-    if appsettings.DEMO_SERVER and request.user.username == 'demo':
-
-        return deny_demo(request)
-
-
-
-    do_change = False
-
-
-
-    if not request.user.has_usable_password():
-
-        do_change = True
-
-        change_form = None
-
-    elif request.method == 'POST':
-
-        change_form = PasswordChangeForm(request.POST)
-
-        if change_form.is_valid():
-
-            cur_password = change_form.cleaned_data['password']
-
-            do_change = request.user.check_password(cur_password)
-
-            if not do_change:
-
-                messages.error(
-
-                    request,
-
-                    _('You have entered an invalid password.')
-
-                )
-
-    else:
-
-        change_form = PasswordChangeForm()
-
-
-
-    if request.method == 'POST':
-
-        form = PasswordForm(request.POST)
-
-        if form.is_valid() and do_change:
-
-
-
-            # Clear flag forcing user to set password
-
-            redirect_page = '#auth'
-
-            if 'show_set_password' in request.session:
-
-                del request.session['show_set_password']
-
-                redirect_page = ''
-
-
-
-            request.user.set_password(
-
-                form.cleaned_data['password1']
-
-            )
-
-            request.user.save()
-
-
-
-            # Update session hash
-
-            update_session_auth_hash(request, request.user)
-
-
-
-            messages.success(
-
-                request,
-
-                _('Your password has been changed.')
-
-            )
-
-            return redirect_profile(redirect_page)
-
-    else:
-
-        form = PasswordForm()
-
-
-
-    return render(
-
-        request,
-
-        'accounts/password.html',
-
-        {
-
-            'title': _('Change password'),
-
-            'change_form': change_form,
-
-            'form': form,
-
-        }
-
-    )
-
-
-
-
-
-def reset_password(request):
-
-    '''
-
-    Password reset handling.
-
-    '''
-
-    if 'email' not in load_backends(BACKENDS).keys():
-
-        messages.error(
-
-            request,
-
-            _('Can not reset password, email authentication is disabled!')
-
-        )
-
-        return redirect('login')
-
-
-
-    if request.method == 'POST':
-
-        form = ResetForm(request.POST)
-
-        if form.is_valid():
-
-            # Force creating new session
-
-            request.session.create()
-
-            if request.user.is_authenticated():
-
-                logout(request)
-
-
-
-            request.session['password_reset'] = True
-
-            return complete(request, 'email')
-
-    else:
-
-        form = ResetForm()
-
-
-
-    return render(
-
-        request,
-
-        'accounts/reset.html',
-
-        {
-
-            'title': _('Password reset'),
-
-            'form': form,
-
-        }
-
-    )
-
-
-
-
-
-@login_required
-
-def reset_api_key(request):
-
-    """Resets user API key"""
-
-    request.user.auth_token.delete()
-
-    Token.objects.create(
-
-        user=request.user,
-
-        key=get_random_string(40)
-
-    )
-
-
-
-    return redirect_profile('#api')
-
-
-
-
-
-@login_required
-
-def watch(request, project):
-
-    obj = get_project(request, project)
-
-    request.user.profile.subscriptions.add(obj)
-
-    return redirect(obj)
-
-
-
-
-
-@login_required
-
-def unwatch(request, project):
-
-    obj = get_project(request, project)
-
-    request.user.profile.subscriptions.remove(obj)
-
-    return redirect(obj)
+    raise ValueError("No acceptable implementations")

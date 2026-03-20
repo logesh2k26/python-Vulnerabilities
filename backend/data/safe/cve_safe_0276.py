@@ -2,1086 +2,1504 @@
 # Safety: safe
 # Category: safe
 
-#!/usr/bin/python
+# coding: utf-8
 
-from k5test import *
+import hashlib
 
-import time
+import warnings
 
-from itertools import imap
+import logging
 
+import io
 
+import ssl
 
-# Run kdbtest against the BDB module.
+import socket
 
-realm = K5Realm(create_kdb=False)
+from itertools import chain
 
-realm.run(['./kdbtest'])
 
 
+from mock import patch, Mock
 
-# Set up an OpenLDAP test server if we can.
+import pytest
 
 
 
-if (not os.path.exists(os.path.join(plugins, 'kdb', 'kldap.so')) and
+from urllib3 import add_stderr_logger, disable_warnings
 
-    not os.path.exists(os.path.join(buildtop, 'lib', 'libkdb_ldap.a'))):
+from urllib3.util.request import make_headers, rewind_body, _FAILEDTELL
 
-    skip_rest('LDAP KDB tests', 'LDAP KDB module not built')
+from urllib3.util.response import assert_header_parsing
 
+from urllib3.util.retry import Retry
 
+from urllib3.util.timeout import Timeout
 
-if 'SLAPD' not in os.environ and not which('slapd'):
+from urllib3.util.url import (
 
-    skip_rest('LDAP KDB tests', 'slapd not found')
+    get_host,
 
+    parse_url,
 
+    split_first,
 
-slapadd = which('slapadd')
+    Url,
 
-if not slapadd:
+)
 
-    skip_rest('LDAP KDB tests', 'slapadd not found')
+from urllib3.util.ssl_ import (
 
+    resolve_cert_reqs,
 
+    resolve_ssl_version,
 
-ldapdir = os.path.abspath('ldap')
+    ssl_wrap_socket,
 
-dbdir = os.path.join(ldapdir, 'ldap')
+    _const_compare_digest_backport,
 
-slapd_conf = os.path.join(ldapdir, 'slapd.d')
+)
 
-slapd_out = os.path.join(ldapdir, 'slapd.out')
+from urllib3.exceptions import (
 
-slapd_pidfile = os.path.join(ldapdir, 'pid')
+    LocationParseError,
 
-ldap_pwfile = os.path.join(ldapdir, 'pw')
+    TimeoutStateError,
 
-ldap_sock = os.path.join(ldapdir, 'sock')
+    InsecureRequestWarning,
 
-ldap_uri = 'ldapi://%s/' % ldap_sock.replace(os.path.sep, '%2F')
+    SNIMissingWarning,
 
-schema = os.path.join(srctop, 'plugins', 'kdb', 'ldap', 'libkdb_ldap',
+    InvalidHeader,
 
-                      'kerberos.openldap.ldif')
+    UnrewindableBodyError,
 
-top_dn = 'cn=krb5'
+)
 
-admin_dn = 'cn=admin,cn=krb5'
+from urllib3.util.connection import (
 
-admin_pw = 'admin'
+    allowed_gai_family,
 
+    _has_ipv6
 
+)
 
-shutil.rmtree(ldapdir, True)
+from urllib3.util import is_fp_closed, ssl_
 
-os.mkdir(ldapdir)
+from urllib3.packages import six
 
-os.mkdir(slapd_conf)
 
-os.mkdir(dbdir)
 
+from . import clear_warnings
 
 
-if 'SLAPD' in os.environ:
 
-    slapd = os.environ['SLAPD']
+from test import onlyPy3, onlyPy2, onlyBrotlipy, notBrotlipy
 
-else:
 
-    # Some Linux installations have AppArmor or similar restrictions
 
-    # on the slapd binary, which would prevent it from accessing the
+# This number represents a time in seconds, it doesn't mean anything in
 
-    # build directory.  Try to defeat this by copying the binary.
+# isolation. Setting to a high-ish value to avoid conflicts with the smaller
 
-    system_slapd = which('slapd')
+# numbers used for timeouts
 
-    slapd = os.path.join(ldapdir, 'slapd')
+TIMEOUT_EPOCH = 1000
 
-    shutil.copy(system_slapd, slapd)
 
 
 
-def slap_add(ldif):
 
-    proc = subprocess.Popen([slapadd, '-b', 'cn=config', '-F', slapd_conf],
+class TestUtil(object):
 
-                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
 
-                            stderr=subprocess.STDOUT)
 
-    (out, dummy) = proc.communicate(ldif)
+    url_host_map = [
 
-    output(out)
+        # Hosts
 
-    return proc.wait()
+        ('http://google.com/mail', ('http', 'google.com', None)),
 
+        ('http://google.com/mail/', ('http', 'google.com', None)),
 
+        ('google.com/mail', ('http', 'google.com', None)),
 
+        ('http://google.com/', ('http', 'google.com', None)),
 
+        ('http://google.com', ('http', 'google.com', None)),
 
-# Configure the pid file and some authorization rules we will need for
+        ('http://www.google.com', ('http', 'www.google.com', None)),
 
-# SASL testing.
+        ('http://mail.google.com', ('http', 'mail.google.com', None)),
 
-if slap_add('dn: cn=config\n'
+        ('http://google.com:8000/mail/', ('http', 'google.com', 8000)),
 
-            'objectClass: olcGlobal\n'
+        ('http://google.com:8000', ('http', 'google.com', 8000)),
 
-            'olcPidFile: %s\n'
+        ('https://google.com', ('https', 'google.com', None)),
 
-            'olcAuthzRegexp: '
+        ('https://google.com:8000', ('https', 'google.com', 8000)),
 
-            '".*uidNumber=%d,cn=peercred,cn=external,cn=auth" "%s"\n'
+        ('http://user:password@127.0.0.1:1234', ('http', '127.0.0.1', 1234)),
 
-            'olcAuthzRegexp: "uid=digestuser,cn=digest-md5,cn=auth" "%s"\n' %
+        ('http://google.com/foo=http://bar:42/baz', ('http', 'google.com', None)),
 
-            (slapd_pidfile, os.geteuid(), admin_dn, admin_dn)) != 0:
+        ('http://google.com?foo=http://bar:42/baz', ('http', 'google.com', None)),
 
-    skip_rest('LDAP KDB tests', 'slapd basic configuration failed')
+        ('http://google.com#foo=http://bar:42/baz', ('http', 'google.com', None)),
 
 
 
-# Find a working writable database type, trying mdb (added in OpenLDAP
+        # IPv4
 
-# 2.4.27) and bdb (deprecated and sometimes not built due to licensing
+        ('173.194.35.7', ('http', '173.194.35.7', None)),
 
-# incompatibilities).
+        ('http://173.194.35.7', ('http', '173.194.35.7', None)),
 
-for dbtype in ('mdb', 'bdb'):
+        ('http://173.194.35.7/test', ('http', '173.194.35.7', None)),
 
-    # Try to load the module.  This could fail if OpenLDAP is built
+        ('http://173.194.35.7:80', ('http', '173.194.35.7', 80)),
 
-    # without module support, so ignore errors.
+        ('http://173.194.35.7:80/test', ('http', '173.194.35.7', 80)),
 
-    slap_add('dn: cn=module,cn=config\n'
 
-             'objectClass: olcModuleList\n'
 
-             'olcModuleLoad: back_%s\n' % dbtype)
+        # IPv6
 
+        ('[2a00:1450:4001:c01::67]', ('http', '[2a00:1450:4001:c01::67]', None)),
 
+        ('http://[2a00:1450:4001:c01::67]', ('http', '[2a00:1450:4001:c01::67]', None)),
 
-    dbclass = 'olc%sConfig' % dbtype.capitalize()
+        ('http://[2a00:1450:4001:c01::67]/test', ('http', '[2a00:1450:4001:c01::67]', None)),
 
-    if slap_add('dn: olcDatabase=%s,cn=config\n'
+        ('http://[2a00:1450:4001:c01::67]:80', ('http', '[2a00:1450:4001:c01::67]', 80)),
 
-                'objectClass: olcDatabaseConfig\n'
+        ('http://[2a00:1450:4001:c01::67]:80/test', ('http', '[2a00:1450:4001:c01::67]', 80)),
 
-                'objectClass: %s\n'
 
-                'olcSuffix: %s\n'
 
-                'olcRootDN: %s\n'
+        # More IPv6 from http://www.ietf.org/rfc/rfc2732.txt
 
-                'olcRootPW: %s\n'
+        ('http://[fedc:ba98:7654:3210:fedc:ba98:7654:3210]:8000/index.html', (
 
-                'olcDbDirectory: %s\n' %
+            'http', '[fedc:ba98:7654:3210:fedc:ba98:7654:3210]', 8000)),
 
-                (dbtype, dbclass, top_dn, admin_dn, admin_pw, dbdir)) == 0:
+        ('http://[1080:0:0:0:8:800:200c:417a]/index.html', (
 
-        break
+            'http', '[1080:0:0:0:8:800:200c:417a]', None)),
 
-else:
+        ('http://[3ffe:2a00:100:7031::1]', ('http', '[3ffe:2a00:100:7031::1]', None)),
 
-    skip_rest('LDAP KDB tests', 'could not find working slapd db type')
+        ('http://[1080::8:800:200c:417a]/foo', ('http', '[1080::8:800:200c:417a]', None)),
 
+        ('http://[::192.9.5.5]/ipng', ('http', '[::192.9.5.5]', None)),
 
+        ('http://[::ffff:129.144.52.38]:42/index.html', ('http', '[::ffff:129.144.52.38]', 42)),
 
-if slap_add('include: file://%s\n' % schema) != 0:
+        ('http://[2010:836b:4179::836b:4179]', ('http', '[2010:836b:4179::836b:4179]', None)),
 
-    skip_rest('LDAP KDB tests', 'failed to load Kerberos schema')
 
 
+        # Hosts
 
-# Load the core schema if we can.
+        ('HTTP://GOOGLE.COM/mail/', ('http', 'google.com', None)),
 
-ldap_homes = ['/etc/ldap', '/etc/openldap', '/usr/local/etc/openldap',
+        ('GOogle.COM/mail', ('http', 'google.com', None)),
 
-              '/usr/local/etc/ldap']
+        ('HTTP://GoOgLe.CoM:8000/mail/', ('http', 'google.com', 8000)),
 
-local_schema_path = '/schema/core.ldif'
+        ('HTTP://user:password@EXAMPLE.COM:1234', ('http', 'example.com', 1234)),
 
-core_schema = next((i for i in imap(lambda x:x+local_schema_path, ldap_homes)
+        ('173.194.35.7', ('http', '173.194.35.7', None)),
 
-                    if os.path.isfile(i)), None)
+        ('HTTP://173.194.35.7', ('http', '173.194.35.7', None)),
 
-if core_schema:
+        ('HTTP://[2a00:1450:4001:c01::67]:80/test', ('http', '[2a00:1450:4001:c01::67]', 80)),
 
-    if slap_add('include: file://%s\n' % core_schema) != 0:
+        ('HTTP://[FEDC:BA98:7654:3210:FEDC:BA98:7654:3210]:8000/index.html', (
 
-        core_schema = None
+            'http', '[fedc:ba98:7654:3210:fedc:ba98:7654:3210]', 8000)),
 
+        ('HTTPS://[1080:0:0:0:8:800:200c:417A]/index.html', (
 
+            'https', '[1080:0:0:0:8:800:200c:417a]', None)),
 
-slapd_pid = -1
+        ('abOut://eXamPlE.com?info=1', ('about', 'eXamPlE.com', None)),
 
-def kill_slapd():
+        ('http+UNIX://%2fvar%2frun%2fSOCKET/path', (
 
-    global slapd_pid
+            'http+unix', '%2fvar%2frun%2fSOCKET', None)),
 
-    if slapd_pid != -1:
+    ]
 
-        os.kill(slapd_pid, signal.SIGTERM)
 
-        slapd_pid = -1
 
-atexit.register(kill_slapd)
+    @pytest.mark.parametrize('url, expected_host', url_host_map)
 
+    def test_get_host(self, url, expected_host):
 
+        returned_host = get_host(url)
 
-out = open(slapd_out, 'w')
+        assert returned_host == expected_host
 
-subprocess.call([slapd, '-h', ldap_uri, '-F', slapd_conf], stdout=out,
 
-                stderr=out)
 
-out.close()
+    # TODO: Add more tests
 
-pidf = open(slapd_pidfile, 'r')
+    @pytest.mark.parametrize('location', [
 
-slapd_pid = int(pidf.read())
+        'http://google.com:foo',
 
-pidf.close()
+        'http://::1/',
 
-output('*** Started slapd (pid %d, output in %s)\n' % (slapd_pid, slapd_out))
+        'http://::1:80/',
 
+        'http://google.com:-80',
 
+        six.u('http://google.com:\xb2\xb2'),  # \xb2 = ^2
 
-# slapd detaches before it finishes setting up its listener sockets
+    ])
 
-# (they are bound but listen() has not been called).  Give it a second
+    def test_invalid_host(self, location):
 
-# to finish.
+        with pytest.raises(LocationParseError):
 
-time.sleep(1)
+            get_host(location)
 
 
 
-# Run kdbtest against the LDAP module.
+    @pytest.mark.parametrize('url', [
 
-conf = {'realms': {'$realm': {'database_module': 'ldap'}},
+        'http://user\\@google.com',
 
-        'dbmodules': {'ldap': {'db_library': 'kldap',
+        'http://google\\.com',
 
-                               'ldap_kerberos_container_dn': top_dn,
+        'user\\@google.com',
 
-                               'ldap_kdc_dn': admin_dn,
+        'http://user@user@google.com/',
 
-                               'ldap_kadmind_dn': admin_dn,
 
-                               'ldap_service_password_file': ldap_pwfile,
 
-                               'ldap_servers': ldap_uri}}}
+        # Invalid IDNA labels
 
-realm = K5Realm(create_kdb=False, kdc_conf=conf)
+        u'http://\uD7FF.com',
 
-input = admin_pw + '\n' + admin_pw + '\n'
+        u'http://❤️',
 
-realm.run([kdb5_ldap_util, 'stashsrvpw', admin_dn], input=input)
 
-realm.run(['./kdbtest'])
 
+        # Unicode surrogates
 
+        u'http://\uD800.com',
 
-# Run a kdb5_ldap_util command using the test server's admin DN and password.
+        u'http://\uDC00.com',
 
-def kldaputil(args, **kw):
+    ])
 
-    return realm.run([kdb5_ldap_util, '-D', admin_dn, '-w', admin_pw] + args,
+    def test_invalid_url(self, url):
 
-                     **kw)
+        with pytest.raises(LocationParseError):
 
+            parse_url(url)
 
 
-# kdbtest can't currently clean up after itself since the LDAP module
 
-# doesn't support krb5_db_destroy.  So clean up after it with
+    @pytest.mark.parametrize('url, expected_normalized_url', [
 
-# kdb5_ldap_util before proceeding.
+        ('HTTP://GOOGLE.COM/MAIL/', 'http://google.com/MAIL/'),
 
-kldaputil(['destroy', '-f'])
+        ('HTTP://JeremyCline:Hunter2@Example.com:8080/',
 
+         'http://JeremyCline:Hunter2@example.com:8080/'),
 
+        ('HTTPS://Example.Com/?Key=Value', 'https://example.com/?Key=Value'),
 
-ldapmodify = which('ldapmodify')
+        ('Https://Example.Com/#Fragment', 'https://example.com/#Fragment'),
 
-ldapsearch = which('ldapsearch')
+        ('[::Ff%etH0%Ff]/%ab%Af', '[::ff%25etH0%Ff]/%AB%AF'),
 
-if not ldapmodify or not ldapsearch:
 
-    skip_rest('some LDAP KDB tests', 'ldapmodify or ldapsearch not found')
 
+        # Invalid characters for the query/fragment getting encoded
 
+        ('http://google.com/p[]?parameter[]=\"hello\"#fragment#',
 
-def ldap_search(args):
+         'http://google.com/p%5B%5D?parameter%5B%5D=%22hello%22#fragment%23'),
 
-    proc = subprocess.Popen([ldapsearch, '-H', ldap_uri, '-b', top_dn,
 
-                             '-D', admin_dn, '-w', admin_pw, args],
 
-                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        # Percent encoding isn't applied twice despite '%' being invalid
 
-                            stderr=subprocess.STDOUT)
+        # but the percent encoding is still normalized.
 
-    (out, dummy) = proc.communicate()
+        ('http://google.com/p%5B%5d?parameter%5b%5D=%22hello%22#fragment%23',
 
-    return out
+         'http://google.com/p%5B%5D?parameter%5B%5D=%22hello%22#fragment%23')
 
+    ])
 
+    def test_parse_url_normalization(self, url, expected_normalized_url):
 
-def ldap_modify(ldif, args=[]):
+        """Assert parse_url normalizes the scheme/host, and only the scheme/host"""
 
-    proc = subprocess.Popen([ldapmodify, '-H', ldap_uri, '-D', admin_dn,
+        actual_normalized_url = parse_url(url).url
 
-                             '-x', '-w', admin_pw] + args,
+        assert actual_normalized_url == expected_normalized_url
 
-                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
 
-                            stderr=subprocess.STDOUT)
 
-    (out, dummy) = proc.communicate(ldif)
+    parse_url_host_map = [
 
-    output(out)
+        ('http://google.com/mail', Url('http', host='google.com', path='/mail')),
 
+        ('http://google.com/mail/', Url('http', host='google.com', path='/mail/')),
 
+        ('http://google.com/mail', Url('http', host='google.com', path='mail')),
 
-def ldap_add(dn, objectclass, attrs=[]):
+        ('google.com/mail', Url(host='google.com', path='/mail')),
 
-    in_data = 'dn: %s\nobjectclass: %s\n' % (dn, objectclass)
+        ('http://google.com/', Url('http', host='google.com', path='/')),
 
-    in_data += '\n'.join(attrs) + '\n'
+        ('http://google.com', Url('http', host='google.com')),
 
-    ldap_modify(in_data, ['-a'])
+        ('http://google.com?foo', Url('http', host='google.com', path='', query='foo')),
 
 
 
-# Create krbContainer objects for use as subtrees.
+        # Path/query/fragment
 
-ldap_add('cn=t1,cn=krb5', 'krbContainer')
+        ('', Url()),
 
-ldap_add('cn=t2,cn=krb5', 'krbContainer')
+        ('/', Url(path='/')),
 
-ldap_add('cn=x,cn=t1,cn=krb5', 'krbContainer')
+        ('#?/!google.com/?foo', Url(path='', fragment='?/!google.com/?foo')),
 
-ldap_add('cn=y,cn=t2,cn=krb5', 'krbContainer')
+        ('/foo', Url(path='/foo')),
 
+        ('/foo?bar=baz', Url(path='/foo', query='bar=baz')),
 
+        ('/foo?bar=baz#banana?apple/orange', Url(path='/foo',
 
-# Create a realm, exercising all of the realm options.
+                                                 query='bar=baz',
 
-kldaputil(['create', '-s', '-P', 'master', '-subtrees', 'cn=t2,cn=krb5',
+                                                 fragment='banana?apple/orange')),
 
-           '-containerref', 'cn=t2,cn=krb5', '-sscope', 'one',
+        ('/redirect?target=http://localhost:61020/', Url(path='redirect',
 
-           '-maxtktlife', '5min', '-maxrenewlife', '10min', '-allow_svr'])
+                                                         query='target=http://localhost:61020/')),
 
 
 
-# Modify the realm, exercising overlapping subtree pruning.
+        # Port
 
-kldaputil(['modify', '-subtrees',
+        ('http://google.com/', Url('http', host='google.com', path='/')),
 
-           'cn=x,cn=t1,cn=krb5:cn=t1,cn=krb5:cn=t2,cn=krb5:cn=y,cn=t2,cn=krb5',
+        ('http://google.com:80/', Url('http', host='google.com', port=80, path='/')),
 
-           '-containerref', 'cn=t1,cn=krb5', '-sscope', 'sub',
+        ('http://google.com:80', Url('http', host='google.com', port=80)),
 
-           '-maxtktlife', '5hour', '-maxrenewlife', '10hour', '+allow_svr'])
 
 
+        # Auth
 
-out = kldaputil(['list'])
+        ('http://foo:bar@localhost/', Url('http', auth='foo:bar', host='localhost', path='/')),
 
-if out != 'KRBTEST.COM\n':
+        ('http://foo@localhost/', Url('http', auth='foo', host='localhost', path='/')),
 
-    fail('Unexpected kdb5_ldap_util list output')
+        ('http://foo:bar@localhost/', Url('http',
 
+                                          auth='foo:bar',
 
+                                          host='localhost',
 
-# Create a principal at a specified DN.  This is a little dodgy
+                                          path='/')),
 
-# because we're sticking a krbPrincipalAux objectclass onto a subtree
 
-# krbContainer, but it works and it avoids having to load core.schema
 
-# in the test LDAP server.
+        # Unicode type (Python 2.x)
 
-realm.run([kadminl, 'ank', '-randkey', '-x', 'dn=cn=krb5', 'princ1'],
+        (u'http://foo:bar@localhost/', Url(u'http',
 
-          expected_code=1, expected_msg='DN is out of the realm subtree')
+                                           auth=u'foo:bar',
 
-# Check that the DN container check is a hierarchy test, not a simple
+                                           host=u'localhost',
 
-# suffix match (CVE-2018-5730).  We expect this operation to fail
+                                           path=u'/')),
 
-# either way (because "xcn" isn't a valid DN tag) but the container
+        ('http://foo:bar@localhost/', Url('http',
 
-# check should happen before the DN is parsed.
+                                          auth='foo:bar',
 
-realm.run([kadminl, 'ank', '-randkey', '-x', 'dn=xcn=t1,cn=krb5', 'princ1'],
+                                          host='localhost',
 
-          expected_code=1, expected_msg='DN is out of the realm subtree')
+                                          path='/')),
 
-realm.run([kadminl, 'ank', '-randkey', '-x', 'dn=cn=t2,cn=krb5', 'princ1'])
+    ]
 
-realm.run([kadminl, 'getprinc', 'princ1'], expected_msg='Principal: princ1')
 
-realm.run([kadminl, 'ank', '-randkey', '-x', 'dn=cn=t2,cn=krb5', 'again'],
 
-          expected_code=1, expected_msg='ldap object is already kerberized')
+    non_round_tripping_parse_url_host_map = [
 
-# Check that we can't set linkdn on a non-standalone object.
+        # Path/query/fragment
 
-realm.run([kadminl, 'modprinc', '-x', 'linkdn=cn=t1,cn=krb5', 'princ1'],
+        ('?', Url(path='', query='')),
 
-          expected_code=1, expected_msg='link information can not be set')
+        ('#', Url(path='', fragment='')),
 
 
 
-# Create a principal with a specified linkdn.
+        # Path normalization
 
-realm.run([kadminl, 'ank', '-randkey', '-x', 'linkdn=cn=krb5', 'princ2'],
+        ('/abc/../def', Url(path="/def")),
 
-          expected_code=1, expected_msg='DN is out of the realm subtree')
 
-realm.run([kadminl, 'ank', '-randkey', '-x', 'linkdn=cn=t1,cn=krb5', 'princ2'])
 
-# Check that we can't reset linkdn.
+        # Empty Port
 
-realm.run([kadminl, 'modprinc', '-x', 'linkdn=cn=t2,cn=krb5', 'princ2'],
+        ('http://google.com:', Url('http', host='google.com')),
 
-          expected_code=1, expected_msg='kerberos principal is already linked')
+        ('http://google.com:/', Url('http', host='google.com', path='/')),
 
 
 
-# Create a principal with a specified containerdn.
+        # Uppercase IRI
 
-realm.run([kadminl, 'ank', '-randkey', '-x', 'containerdn=cn=krb5', 'princ3'],
+        (u'http://Königsgäßchen.de/straße',
 
-          expected_code=1, expected_msg='DN is out of the realm subtree')
+         Url('http', host='xn--knigsgchen-b4a3dun.de', path='/stra%C3%9Fe')),
 
-realm.run([kadminl, 'ank', '-randkey', '-x', 'containerdn=cn=t1,cn=krb5',
 
-           'princ3'])
 
-realm.run([kadminl, 'modprinc', '-x', 'containerdn=cn=t2,cn=krb5', 'princ3'],
+        # Unicode Surrogates
 
-          expected_code=1, expected_msg='containerdn option not supported')
+        (u'http://google.com/\uD800', Url('http', host='google.com', path='%ED%A0%80')),
 
-# Verify that containerdn is checked when linkdn is also supplied
+        (u'http://google.com?q=\uDC00',
 
-# (CVE-2018-5730).
+         Url('http', host='google.com', path='', query='q=%ED%B0%80')),
 
-realm.run([kadminl, 'ank', '-randkey', '-x', 'containerdn=cn=krb5',
+        (u'http://google.com#\uDC00',
 
-           '-x', 'linkdn=cn=t2,cn=krb5', 'princ4'], expected_code=1,
+         Url('http', host='google.com', path='', fragment='%ED%B0%80')),
 
-          expected_msg='DN is out of the realm subtree')
+    ]
 
 
 
-# Create and modify a ticket policy.
+    @pytest.mark.parametrize(
 
-kldaputil(['create_policy', '-maxtktlife', '3hour', '-maxrenewlife', '6hour',
+        'url, expected_url',
 
-           '-allow_forwardable', 'tktpol'])
+        chain(parse_url_host_map, non_round_tripping_parse_url_host_map)
 
-kldaputil(['modify_policy', '-maxtktlife', '4hour', '-maxrenewlife', '8hour',
+    )
 
-           '+requires_preauth', 'tktpol'])
+    def test_parse_url(self, url, expected_url):
 
-out = kldaputil(['view_policy', 'tktpol'])
+        returned_url = parse_url(url)
 
-if ('Ticket policy: tktpol\n' not in out or
+        assert returned_url == expected_url
 
-    'Maximum ticket life: 0 days 04:00:00\n' not in out or
 
-    'Maximum renewable life: 0 days 08:00:00\n' not in out or
 
-    'Ticket flags: DISALLOW_FORWARDABLE REQUIRES_PRE_AUTH' not in out):
+    @pytest.mark.parametrize('url, expected_url', parse_url_host_map)
 
-    fail('Unexpected kdb5_ldap_util view_policy output')
+    def test_unparse_url(self, url, expected_url):
 
+        assert url == expected_url.url
 
 
-out = kldaputil(['list_policy'])
 
-if out != 'tktpol\n':
+    @pytest.mark.parametrize(
 
-    fail('Unexpected kdb5_ldap_util list_policy output')
+        ['url', 'expected_url'],
 
+        [
 
+            # RFC 3986 5.2.4
 
-# Associate the ticket policy to a principal.
+            ('/abc/../def', Url(path="/def")),
 
-realm.run([kadminl, 'ank', '-randkey', '-x', 'tktpolicy=tktpol', 'princ4'])
+            ('/..', Url(path="/")),
 
-out = realm.run([kadminl, 'getprinc', 'princ4'])
+            ('/./abc/./def/', Url(path='/abc/def/')),
 
-if ('Maximum ticket life: 0 days 04:00:00\n' not in out or
+            ('/.', Url(path='/')),
 
-    'Maximum renewable life: 0 days 08:00:00\n' not in out or
+            ('/./', Url(path='/')),
 
-    'Attributes: DISALLOW_FORWARDABLE REQUIRES_PRE_AUTH\n' not in out):
+            ('/abc/./.././d/././e/.././f/./../../ghi', Url(path='/ghi'))
 
-    fail('Unexpected getprinc output with ticket policy')
+        ]
 
+    )
 
+    def test_parse_and_normalize_url_paths(self, url, expected_url):
 
-# Destroying the policy should fail while a principal references it.
+        actual_url = parse_url(url)
 
-kldaputil(['destroy_policy', '-force', 'tktpol'], expected_code=1)
+        assert actual_url == expected_url
 
+        assert actual_url.url == expected_url.url
 
 
-# Dissociate the ticket policy from the principal.
 
-realm.run([kadminl, 'modprinc', '-x', 'tktpolicy=', 'princ4'])
+    def test_parse_url_invalid_IPv6(self):
 
-out = realm.run([kadminl, 'getprinc', 'princ4'])
+        with pytest.raises(LocationParseError):
 
-if ('Maximum ticket life: 0 days 05:00:00\n' not in out or
+            parse_url('[::1')
 
-    'Maximum renewable life: 0 days 10:00:00\n' not in out or
 
-    'Attributes:\n' not in out):
 
-    fail('Unexpected getprinc output without ticket policy')
+    def test_parse_url_negative_port(self):
 
+        with pytest.raises(LocationParseError):
 
+            parse_url("https://www.google.com:-80/")
 
-# Destroy the ticket policy.
 
-kldaputil(['destroy_policy', '-force', 'tktpol'])
 
-kldaputil(['view_policy', 'tktpol'], expected_code=1)
+    def test_Url_str(self):
 
-out = kldaputil(['list_policy'])
+        U = Url('http', host='google.com')
 
-if out:
+        assert str(U) == U.url
 
-    fail('Unexpected kdb5_ldap_util list_policy output after destroy')
 
 
+    request_uri_map = [
 
-# Create another ticket policy to be destroyed with the realm.
+        ('http://google.com/mail', '/mail'),
 
-kldaputil(['create_policy', 'tktpol2'])
+        ('http://google.com/mail/', '/mail/'),
 
+        ('http://google.com/', '/'),
 
+        ('http://google.com', '/'),
 
-# Try to create a password policy conflicting with a ticket policy.
+        ('', '/'),
 
-realm.run([kadminl, 'addpol', 'tktpol2'], expected_code=1,
+        ('/', '/'),
 
-          expected_msg='Already exists while creating policy "tktpol2"')
+        ('?', '/?'),
 
+        ('#', '/'),
 
+        ('/foo?bar=baz', '/foo?bar=baz'),
 
-# Try to create a ticket policy conflicting with a password policy.
+    ]
 
-realm.run([kadminl, 'addpol', 'pwpol'])
 
-out = kldaputil(['create_policy', 'pwpol'], expected_code=1)
 
-if 'Already exists while creating policy object' not in out:
+    @pytest.mark.parametrize('url, expected_request_uri', request_uri_map)
 
-    fail('Expected error not seen in kdb5_ldap_util output')
+    def test_request_uri(self, url, expected_request_uri):
 
+        returned_url = parse_url(url)
 
+        assert returned_url.request_uri == expected_request_uri
 
-# Try to use a password policy as a ticket policy.
 
-realm.run([kadminl, 'modprinc', '-x', 'tktpolicy=pwpol', 'princ4'],
 
-          expected_code=1, expected_msg='Object class violation')
+    url_netloc_map = [
 
+        ('http://google.com/mail', 'google.com'),
 
+        ('http://google.com:80/mail', 'google.com:80'),
 
-# Use a ticket policy as a password policy (CVE-2014-5353).  This
+        ('google.com/foobar', 'google.com'),
 
-# works with a warning; use kadmin.local -q so the warning is shown.
+        ('google.com:12345', 'google.com:12345'),
 
-realm.run([kadminl, '-q', 'modprinc -policy tktpol2 princ4'],
+    ]
 
-          expected_msg='WARNING: policy "tktpol2" does not exist')
 
 
+    @pytest.mark.parametrize('url, expected_netloc', url_netloc_map)
 
-# Do some basic tests with a KDC against the LDAP module, exercising the
+    def test_netloc(self, url, expected_netloc):
 
-# db_args processing code.
+        assert parse_url(url).netloc == expected_netloc
 
-realm.start_kdc(['-x', 'nconns=3', '-x', 'host=' + ldap_uri,
 
-                 '-x', 'binddn=' + admin_dn, '-x', 'bindpwd=' + admin_pw])
 
-realm.addprinc(realm.user_princ, password('user'))
+    url_vulnerabilities = [
 
-realm.addprinc(realm.host_princ)
+        # urlparse doesn't follow RFC 3986 Section 3.2
 
-realm.extract_keytab(realm.host_princ, realm.keytab)
+        ("http://google.com#@evil.com/", Url("http",
 
-realm.kinit(realm.user_princ, password('user'))
+                                             host="google.com",
 
-realm.run([kvno, realm.host_princ])
+                                             path="",
 
-realm.klist(realm.user_princ, realm.host_princ)
+                                             fragment="@evil.com/")),
 
 
 
-# Test auth indicator support
+        # CVE-2016-5699
 
-realm.addprinc('authind', password('authind'))
+        ("http://127.0.0.1%0d%0aConnection%3a%20keep-alive",
 
-realm.run([kadminl, 'setstr', 'authind', 'require_auth', 'otp radius'])
+         Url("http", host="127.0.0.1%0d%0aconnection%3a%20keep-alive")),
 
 
 
-out = ldap_search('(krbPrincipalName=authind*)')
+        # NodeJS unicode -> double dot
 
-if 'krbPrincipalAuthInd: otp' not in out:
+        (u"http://google.com/\uff2e\uff2e/abc", Url("http",
 
-    fail('Expected krbPrincipalAuthInd value not in output')
+                                                    host="google.com",
 
-if 'krbPrincipalAuthInd: radius' not in out:
+                                                    path='/%EF%BC%AE%EF%BC%AE/abc')),
 
-    fail('Expected krbPrincipalAuthInd value not in output')
 
 
+        # Scheme without ://
 
-realm.run([kadminl, 'getstrs', 'authind'],
+        ("javascript:a='@google.com:12345/';alert(0)",
 
-          expected_msg='require_auth: otp radius')
+         Url(scheme="javascript",
 
+             path="a='@google.com:12345/';alert(0)")),
 
 
-# Test service principal aliases.
 
-realm.addprinc('canon', password('canon'))
+        ("//google.com/a/b/c", Url(host="google.com", path="/a/b/c")),
 
-ldap_modify('dn: krbPrincipalName=canon@KRBTEST.COM,cn=t1,cn=krb5\n'
 
-            'changetype: modify\n'
 
-            'add: krbPrincipalName\n'
+        # International URLs
 
-            'krbPrincipalName: alias@KRBTEST.COM\n'
+        (u'http://ヒ:キ@ヒ.abc.ニ/ヒ?キ#ワ', Url(u'http',
 
-            '-\n'
+                                          host=u'xn--pdk.abc.xn--idk',
 
-            'add: krbCanonicalName\n'
+                                          auth=u'%E3%83%92:%E3%82%AD',
 
-            'krbCanonicalName: canon@KRBTEST.COM\n')
+                                          path=u'/%E3%83%92',
 
-realm.run([kadminl, 'getprinc', 'alias'],
+                                          query=u'%E3%82%AD',
 
-          expected_msg='Principal: canon@KRBTEST.COM\n')
+                                          fragment=u'%E3%83%AF')),
 
-realm.run([kadminl, 'getprinc', 'canon'],
 
-          expected_msg='Principal: canon@KRBTEST.COM\n')
 
-realm.run([kvno, 'alias', 'canon'])
+        # Injected headers (CVE-2016-5699, CVE-2019-9740, CVE-2019-9947)
 
-out = realm.run([klist])
+        ("10.251.0.83:7777?a=1 HTTP/1.1\r\nX-injected: header",
 
-if 'alias@KRBTEST.COM\n' not in out or 'canon@KRBTEST.COM' not in out:
+         Url(host='10.251.0.83', port=7777, path='',
 
-    fail('After fetching alias and canon, klist is missing one or both')
+             query='a=1%20HTTP/1.1%0D%0AX-injected:%20header')),
 
-realm.kinit(realm.user_princ, password('user'), ['-S', 'alias'])
 
-realm.klist(realm.user_princ, 'alias@KRBTEST.COM')
 
+        ("http://127.0.0.1:6379?\r\nSET test failure12\r\n:8080/test/?test=a",
 
+         Url(scheme='http', host='127.0.0.1', port=6379, path='',
 
-# Make sure an alias to the local TGS is still treated like an alias.
+             query='%0D%0ASET%20test%20failure12%0D%0A:8080/test/?test=a')),
 
-ldap_modify('dn: krbPrincipalName=krbtgt/KRBTEST.COM@KRBTEST.COM,'
+    ]
 
-            'cn=KRBTEST.COM,cn=krb5\n'
 
-            'changetype: modify\n'
 
-            'add:krbPrincipalName\n'
+    @pytest.mark.parametrize("url, expected_url", url_vulnerabilities)
 
-            'krbPrincipalName: tgtalias@KRBTEST.COM\n'
+    def test_url_vulnerabilities(self, url, expected_url):
 
-            '-\n'
+        if expected_url is False:
 
-            'add: krbCanonicalName\n'
+            with pytest.raises(LocationParseError):
 
-            'krbCanonicalName: krbtgt/KRBTEST.COM@KRBTEST.COM\n')
+                parse_url(url)
 
-realm.run([kadminl, 'getprinc', 'tgtalias'],
+        else:
 
-          expected_msg='Principal: krbtgt/KRBTEST.COM@KRBTEST.COM')
+            assert parse_url(url) == expected_url
 
-realm.kinit(realm.user_princ, password('user'))
 
-realm.run([kvno, 'tgtalias'])
 
-realm.klist(realm.user_princ, 'tgtalias@KRBTEST.COM')
+    @onlyPy2
 
+    def test_parse_url_bytes_to_str_python_2(self):
 
+        url = parse_url(b"https://www.google.com/")
 
-# Make sure aliases work in header tickets.
+        assert url == Url('https', host='www.google.com', path='/')
 
-realm.run([kadminl, 'modprinc', '-maxrenewlife', '3 hours', 'user'])
 
-realm.run([kadminl, 'modprinc', '-maxrenewlife', '3 hours',
 
-           'krbtgt/KRBTEST.COM'])
+        assert isinstance(url.scheme, str)
 
-realm.kinit(realm.user_princ, password('user'), ['-l', '1h', '-r', '2h'])
+        assert isinstance(url.host, str)
 
-realm.run([kvno, 'alias'])
+        assert isinstance(url.path, str)
 
-realm.kinit(realm.user_princ, flags=['-R', '-S', 'alias'])
 
-realm.klist(realm.user_princ, 'alias@KRBTEST.COM')
 
+    @onlyPy2
 
+    def test_parse_url_unicode_python_2(self):
 
-# Test client principal aliases, with and without preauth.
+        url = parse_url(u"https://www.google.com/")
 
-realm.kinit('canon', password('canon'))
+        assert url == Url(u'https', host=u'www.google.com', path=u'/')
 
-realm.kinit('alias', password('canon'), expected_code=1,
 
-            expected_msg='not found in Kerberos database')
 
-realm.kinit('alias', password('canon'), ['-C'])
+        assert isinstance(url.scheme, six.text_type)
 
-realm.run([kvno, 'alias'])
+        assert isinstance(url.host, six.text_type)
 
-realm.klist('canon@KRBTEST.COM', 'alias@KRBTEST.COM')
+        assert isinstance(url.path, six.text_type)
 
-realm.run([kadminl, 'modprinc', '+requires_preauth', 'canon'])
 
-realm.kinit('canon', password('canon'))
 
-realm.kinit('alias', password('canon'), ['-C'])
+    @onlyPy3
 
+    def test_parse_url_bytes_type_error_python_3(self):
 
+        with pytest.raises(TypeError):
 
-# Test password history.
+            parse_url(b"https://www.google.com/")
 
-def test_pwhist(nhist):
 
-    def cpw(n, **kwargs):
 
-        realm.run([kadminl, 'cpw', '-pw', str(n), princ], **kwargs)
+    @pytest.mark.parametrize('kwargs, expected', [
 
-    def cpw_fail(n):
+        pytest.param(
 
-        cpw(n, expected_code=1)
+            {'accept_encoding': True},
 
-    output('*** Testing password history of size %d\n' % nhist)
+            {'accept-encoding': 'gzip,deflate,br'},
 
-    princ = 'pwhistprinc' + str(nhist)
+            marks=onlyBrotlipy(),
 
-    pol = 'pwhistpol' + str(nhist)
+        ),
 
-    realm.run([kadminl, 'addpol', '-history', str(nhist), pol])
+        pytest.param(
 
-    realm.run([kadminl, 'addprinc', '-policy', pol, '-nokey', princ])
+            {'accept_encoding': True},
 
-    for i in range(nhist):
+            {'accept-encoding': 'gzip,deflate'},
 
-        # Set a password, then check that all previous passwords fail.
+            marks=notBrotlipy(),
 
-        cpw(i)
+        ),
 
-        for j in range(i + 1):
+        ({'accept_encoding': 'foo,bar'},
 
-            cpw_fail(j)
+         {'accept-encoding': 'foo,bar'}),
 
-    # Set one more new password, and make sure the oldest key is
+        ({'accept_encoding': ['foo', 'bar']},
 
-    # rotated out.
+         {'accept-encoding': 'foo,bar'}),
 
-    cpw(nhist)
+        pytest.param(
 
-    cpw_fail(1)
+            {'accept_encoding': True, 'user_agent': 'banana'},
 
-    cpw(0)
+            {'accept-encoding': 'gzip,deflate,br', 'user-agent': 'banana'},
 
+            marks=onlyBrotlipy(),
 
+        ),
 
-for n in (1, 2, 3, 4, 5):
+        pytest.param(
 
-    test_pwhist(n)
+            {'accept_encoding': True, 'user_agent': 'banana'},
 
+            {'accept-encoding': 'gzip,deflate', 'user-agent': 'banana'},
 
+            marks=notBrotlipy(),
 
-# Regression test for #8193: test password character class requirements.
+        ),
 
-princ = 'charclassprinc'
+        ({'user_agent': 'banana'},
 
-pol = 'charclasspol'
+         {'user-agent': 'banana'}),
 
-realm.run([kadminl, 'addpol', '-minclasses', '3', pol])
+        ({'keep_alive': True},
 
-realm.run([kadminl, 'addprinc', '-policy', pol, '-nokey', princ])
+         {'connection': 'keep-alive'}),
 
-realm.run([kadminl, 'cpw', '-pw', 'abcdef', princ], expected_code=1)
+        ({'basic_auth': 'foo:bar'},
 
-realm.run([kadminl, 'cpw', '-pw', 'Abcdef', princ], expected_code=1)
+         {'authorization': 'Basic Zm9vOmJhcg=='}),
 
-realm.run([kadminl, 'cpw', '-pw', 'Abcdef1', princ])
+        ({'proxy_basic_auth': 'foo:bar'},
 
+         {'proxy-authorization': 'Basic Zm9vOmJhcg=='}),
 
+        ({'disable_cache': True},
 
-# Test principal renaming and make sure last modified is changed
+         {'cache-control': 'no-cache'}),
 
-def get_princ(princ):
+    ])
 
-    out = realm.run([kadminl, 'getprinc', princ])
+    def test_make_headers(self, kwargs, expected):
 
-    return dict(map(str.strip, x.split(":", 1)) for x in out.splitlines())
+        assert make_headers(**kwargs) == expected
 
 
 
-realm.addprinc("rename", password('rename'))
+    def test_rewind_body(self):
 
-renameprinc = get_princ("rename")
+        body = io.BytesIO(b'test data')
 
-realm.run([kadminl, '-p', 'fake@KRBTEST.COM', 'renprinc', 'rename', 'renamed'])
+        assert body.read() == b'test data'
 
-renamedprinc = get_princ("renamed")
 
-if renameprinc['Last modified'] == renamedprinc['Last modified']:
 
-    fail('Last modified data not updated when principal was renamed')
+        # Assert the file object has been consumed
 
+        assert body.read() == b''
 
 
-# Regression test for #7980 (fencepost when dividing keys up by kvno).
 
-realm.run([kadminl, 'addprinc', '-randkey', '-e', 'aes256-cts,aes128-cts',
+        # Rewind it back to just be b'data'
 
-           'kvnoprinc'])
+        rewind_body(body, 5)
 
-realm.run([kadminl, 'cpw', '-randkey', '-keepold', '-e',
+        assert body.read() == b'data'
 
-           'aes256-cts,aes128-cts', 'kvnoprinc'])
 
-realm.run([kadminl, 'getprinc', 'kvnoprinc'], expected_msg='Number of keys: 4')
 
-realm.run([kadminl, 'cpw', '-randkey', '-keepold', '-e',
+    def test_rewind_body_failed_tell(self):
 
-           'aes256-cts,aes128-cts', 'kvnoprinc'])
+        body = io.BytesIO(b'test data')
 
-realm.run([kadminl, 'getprinc', 'kvnoprinc'], expected_msg='Number of keys: 6')
+        body.read()  # Consume body
 
 
 
-# Regression test for #8041 (NULL dereference on keyless principals).
+        # Simulate failed tell()
 
-realm.run([kadminl, 'addprinc', '-nokey', 'keylessprinc'])
+        body_pos = _FAILEDTELL
 
-realm.run([kadminl, 'getprinc', 'keylessprinc'],
+        with pytest.raises(UnrewindableBodyError):
 
-          expected_msg='Number of keys: 0')
+            rewind_body(body, body_pos)
 
-realm.run([kadminl, 'cpw', '-randkey', '-e', 'aes256-cts,aes128-cts',
 
-           'keylessprinc'])
 
-realm.run([kadminl, 'cpw', '-randkey', '-keepold', '-e',
+    def test_rewind_body_bad_position(self):
 
-           'aes256-cts,aes128-cts', 'keylessprinc'])
+        body = io.BytesIO(b'test data')
 
-realm.run([kadminl, 'getprinc', 'keylessprinc'],
+        body.read()  # Consume body
 
-          expected_msg='Number of keys: 4')
 
-realm.run([kadminl, 'purgekeys', '-all', 'keylessprinc'])
 
-realm.run([kadminl, 'getprinc', 'keylessprinc'],
+        # Pass non-integer position
 
-          expected_msg='Number of keys: 0')
+        with pytest.raises(ValueError):
 
+            rewind_body(body, body_pos=None)
 
+        with pytest.raises(ValueError):
 
-# Test for 8354 (old password history entries when -keepold is used)
+            rewind_body(body, body_pos=object())
 
-realm.run([kadminl, 'addpol', '-history', '2', 'keepoldpasspol'])
 
-realm.run([kadminl, 'addprinc', '-policy', 'keepoldpasspol', '-pw', 'aaaa',
 
-           'keepoldpassprinc'])
+    def test_rewind_body_failed_seek(self):
 
-for p in ('bbbb', 'cccc', 'aaaa'):
+        class BadSeek():
 
-    realm.run([kadminl, 'cpw', '-keepold', '-pw', p, 'keepoldpassprinc'])
 
 
+            def seek(self, pos, offset=0):
 
-if runenv.sizeof_time_t <= 4:
+                raise IOError
 
-    skipped('y2038 LDAP test', 'platform has 32-bit time_t')
 
-else:
 
-    # Test storage of timestamps after y2038.
+        with pytest.raises(UnrewindableBodyError):
 
-    realm.run([kadminl, 'modprinc', '-pwexpire', '2040-02-03', 'user'])
+            rewind_body(BadSeek(), body_pos=2)
 
-    realm.run([kadminl, 'getprinc', 'user'], expected_msg=' 2040\n')
 
 
+    @pytest.mark.parametrize('input, expected', [
 
-realm.stop()
+        (('abcd', 'b'),  ('a', 'cd', 'b')),
 
+        (('abcd', 'cb'), ('a', 'cd', 'b')),
 
+        (('abcd', ''),   ('abcd', '', None)),
 
-# Briefly test dump and load.
+        (('abcd', 'a'),  ('', 'bcd', 'a')),
 
-dumpfile = os.path.join(realm.testdir, 'dump')
+        (('abcd', 'ab'), ('', 'bcd', 'a')),
 
-realm.run([kdb5_util, 'dump', dumpfile])
+        (('abcd', 'eb'), ('a', 'cd', 'b')),
 
-realm.run([kdb5_util, 'load', dumpfile], expected_code=1,
+    ])
 
-          expected_msg='KDB module requires -update argument')
+    def test_split_first(self, input, expected):
 
-realm.run([kdb5_util, 'load', '-update', dumpfile])
+        output = split_first(*input)
 
+        assert output == expected
 
 
-# Destroy the realm.
 
-kldaputil(['destroy', '-f'])
+    def test_add_stderr_logger(self):
 
-out = kldaputil(['list'])
+        handler = add_stderr_logger(level=logging.INFO)  # Don't actually print debug
 
-if out:
+        logger = logging.getLogger('urllib3')
 
-    fail('Unexpected kdb5_ldap_util list output after destroy')
+        assert handler in logger.handlers
 
 
 
-if not core_schema:
+        logger.debug('Testing add_stderr_logger')
 
-    skip_rest('LDAP SASL tests', 'core schema not found')
+        logger.removeHandler(handler)
 
 
 
-if runenv.have_sasl != 'yes':
+    def test_disable_warnings(self):
 
-    skip_rest('LDAP SASL tests', 'SASL support not built')
+        with warnings.catch_warnings(record=True) as w:
 
+            clear_warnings()
 
+            warnings.warn('This is a test.', InsecureRequestWarning)
 
-# Test SASL EXTERNAL auth.  Remove the DNs and service password file
+            assert len(w) == 1
 
-# from the DB module config.
+            disable_warnings()
 
-os.remove(ldap_pwfile)
+            warnings.warn('This is a test.', InsecureRequestWarning)
 
-dbmod = conf['dbmodules']['ldap']
+            assert len(w) == 1
 
-dbmod['ldap_kdc_sasl_mech'] = dbmod['ldap_kadmind_sasl_mech'] = 'EXTERNAL'
 
-del dbmod['ldap_service_password_file']
 
-del dbmod['ldap_kdc_dn'], dbmod['ldap_kadmind_dn']
+    def _make_time_pass(self, seconds, timeout, time_mock):
 
-realm = K5Realm(create_kdb=False, kdc_conf=conf)
+        """ Make some time pass for the timeout object """
 
-realm.run([kdb5_ldap_util, 'create', '-s', '-P', 'master'])
+        time_mock.return_value = TIMEOUT_EPOCH
 
-realm.start_kdc()
+        timeout.start_connect()
 
-realm.addprinc(realm.user_princ, password('user'))
+        time_mock.return_value = TIMEOUT_EPOCH + seconds
 
-realm.kinit(realm.user_princ, password('user'))
+        return timeout
 
-realm.stop()
 
-realm.run([kdb5_ldap_util, 'destroy', '-f'])
 
+    @pytest.mark.parametrize('kwargs, message', [
 
+        ({'total': -1},                 'less than'),
 
-# Test SASL DIGEST-MD5 auth.  We need to set a clear-text password for
+        ({'connect': 2, 'total': -1},   'less than'),
 
-# the admin DN, so create a person entry (requires the core schema).
+        ({'read': -1},                  'less than'),
 
-# Restore the service password file in the config and set authcids.
+        ({'connect': False},            'cannot be a boolean'),
 
-ldap_add('cn=admin,cn=krb5', 'person',
+        ({'read': True},                'cannot be a boolean'),
 
-         ['sn: dummy', 'userPassword: admin'])
+        ({'connect': 0},                'less than or equal'),
 
-dbmod['ldap_kdc_sasl_mech'] = dbmod['ldap_kadmind_sasl_mech'] = 'DIGEST-MD5'
+        ({'read': 'foo'},               'int, float or None')
 
-dbmod['ldap_kdc_sasl_authcid'] = 'digestuser'
+    ])
 
-dbmod['ldap_kadmind_sasl_authcid'] = 'digestuser'
+    def test_invalid_timeouts(self, kwargs, message):
 
-dbmod['ldap_service_password_file'] = ldap_pwfile
+        with pytest.raises(ValueError) as e:
 
-realm = K5Realm(create_kdb=False, kdc_conf=conf)
+            Timeout(**kwargs)
 
-input = admin_pw + '\n' + admin_pw + '\n'
+        assert message in str(e.value)
 
-realm.run([kdb5_ldap_util, 'stashsrvpw', 'digestuser'], input=input)
 
-realm.run([kdb5_ldap_util, 'create', '-s', '-P', 'master'])
 
-realm.start_kdc()
+    @patch('urllib3.util.timeout.current_time')
 
-realm.addprinc(realm.user_princ, password('user'))
+    def test_timeout(self, current_time):
 
-realm.kinit(realm.user_princ, password('user'))
+        timeout = Timeout(total=3)
 
-realm.stop()
 
-# Exercise DB options, which should cause binding to fail.
 
-realm.run([kadminl, '-x', 'sasl_authcid=ab', 'getprinc', 'user'],
+        # make 'no time' elapse
 
-          expected_code=1, expected_msg='Cannot bind to LDAP server')
+        timeout = self._make_time_pass(seconds=0, timeout=timeout,
 
-realm.run([kadminl, '-x', 'bindpwd=wrong', 'getprinc', 'user'],
+                                       time_mock=current_time)
 
-          expected_code=1, expected_msg='Cannot bind to LDAP server')
+        assert timeout.read_timeout == 3
 
-realm.run([kdb5_ldap_util, 'destroy', '-f'])
+        assert timeout.connect_timeout == 3
 
 
 
-# We could still use tests to exercise:
+        timeout = Timeout(total=3, connect=2)
 
-# * DB arg handling in krb5_ldap_create
+        assert timeout.connect_timeout == 2
 
-# * krbAllowedToDelegateTo attribute processing
 
-# * A load operation overwriting a standalone principal entry which
 
-#   already exists but doesn't have a krbPrincipalName attribute
+        timeout = Timeout()
 
-#   matching the principal name.
+        assert timeout.connect_timeout == Timeout.DEFAULT_TIMEOUT
 
-# * A bunch of invalid-input error conditions
 
-#
 
-# There is no coverage for the following because it would be difficult:
+        # Connect takes 5 seconds, leaving 5 seconds for read
 
-# * Out-of-memory error conditions
+        timeout = Timeout(total=10, read=7)
 
-# * Handling of failures from slapd (including krb5_retry_get_ldap_handle)
+        timeout = self._make_time_pass(seconds=5, timeout=timeout,
 
-# * Handling of servers which don't support mod-increment
+                                       time_mock=current_time)
 
-# * krb5_ldap_delete_krbcontainer (only happens if krb5_ldap_create fails)
+        assert timeout.read_timeout == 5
 
 
 
-success('LDAP and DB2 KDB tests')
+        # Connect takes 2 seconds, read timeout still 7 seconds
+
+        timeout = Timeout(total=10, read=7)
+
+        timeout = self._make_time_pass(seconds=2, timeout=timeout,
+
+                                       time_mock=current_time)
+
+        assert timeout.read_timeout == 7
+
+
+
+        timeout = Timeout(total=10, read=7)
+
+        assert timeout.read_timeout == 7
+
+
+
+        timeout = Timeout(total=None, read=None, connect=None)
+
+        assert timeout.connect_timeout is None
+
+        assert timeout.read_timeout is None
+
+        assert timeout.total is None
+
+
+
+        timeout = Timeout(5)
+
+        assert timeout.total == 5
+
+
+
+    def test_timeout_str(self):
+
+        timeout = Timeout(connect=1, read=2, total=3)
+
+        assert str(timeout) == "Timeout(connect=1, read=2, total=3)"
+
+        timeout = Timeout(connect=1, read=None, total=3)
+
+        assert str(timeout) == "Timeout(connect=1, read=None, total=3)"
+
+
+
+    @patch('urllib3.util.timeout.current_time')
+
+    def test_timeout_elapsed(self, current_time):
+
+        current_time.return_value = TIMEOUT_EPOCH
+
+        timeout = Timeout(total=3)
+
+        with pytest.raises(TimeoutStateError):
+
+            timeout.get_connect_duration()
+
+
+
+        timeout.start_connect()
+
+        with pytest.raises(TimeoutStateError):
+
+            timeout.start_connect()
+
+
+
+        current_time.return_value = TIMEOUT_EPOCH + 2
+
+        assert timeout.get_connect_duration() == 2
+
+        current_time.return_value = TIMEOUT_EPOCH + 37
+
+        assert timeout.get_connect_duration() == 37
+
+
+
+    @pytest.mark.parametrize('candidate, requirements', [
+
+        (None, ssl.CERT_REQUIRED),
+
+        (ssl.CERT_NONE, ssl.CERT_NONE),
+
+        (ssl.CERT_REQUIRED, ssl.CERT_REQUIRED),
+
+        ('REQUIRED', ssl.CERT_REQUIRED),
+
+        ('CERT_REQUIRED', ssl.CERT_REQUIRED),
+
+    ])
+
+    def test_resolve_cert_reqs(self, candidate, requirements):
+
+        assert resolve_cert_reqs(candidate) == requirements
+
+
+
+    @pytest.mark.parametrize('candidate, version', [
+
+        (ssl.PROTOCOL_TLSv1, ssl.PROTOCOL_TLSv1),
+
+        ("PROTOCOL_TLSv1", ssl.PROTOCOL_TLSv1),
+
+        ("TLSv1", ssl.PROTOCOL_TLSv1),
+
+        (ssl.PROTOCOL_SSLv23, ssl.PROTOCOL_SSLv23),
+
+    ])
+
+    def test_resolve_ssl_version(self, candidate, version):
+
+        assert resolve_ssl_version(candidate) == version
+
+
+
+    def test_is_fp_closed_object_supports_closed(self):
+
+        class ClosedFile(object):
+
+            @property
+
+            def closed(self):
+
+                return True
+
+
+
+        assert is_fp_closed(ClosedFile())
+
+
+
+    def test_is_fp_closed_object_has_none_fp(self):
+
+        class NoneFpFile(object):
+
+            @property
+
+            def fp(self):
+
+                return None
+
+
+
+        assert is_fp_closed(NoneFpFile())
+
+
+
+    def test_is_fp_closed_object_has_fp(self):
+
+        class FpFile(object):
+
+            @property
+
+            def fp(self):
+
+                return True
+
+
+
+        assert not is_fp_closed(FpFile())
+
+
+
+    def test_is_fp_closed_object_has_neither_fp_nor_closed(self):
+
+        class NotReallyAFile(object):
+
+            pass
+
+
+
+        with pytest.raises(ValueError):
+
+            is_fp_closed(NotReallyAFile())
+
+
+
+    def test_ssl_wrap_socket_loads_the_cert_chain(self):
+
+        socket = object()
+
+        mock_context = Mock()
+
+        ssl_wrap_socket(ssl_context=mock_context, sock=socket,
+
+                        certfile='/path/to/certfile')
+
+
+
+        mock_context.load_cert_chain.assert_called_once_with(
+
+            '/path/to/certfile', None
+
+        )
+
+
+
+    @patch('urllib3.util.ssl_.create_urllib3_context')
+
+    def test_ssl_wrap_socket_creates_new_context(self,
+
+                                                 create_urllib3_context):
+
+        socket = object()
+
+        ssl_wrap_socket(sock=socket, cert_reqs='CERT_REQUIRED')
+
+
+
+        create_urllib3_context.assert_called_once_with(
+
+            None, 'CERT_REQUIRED', ciphers=None
+
+        )
+
+
+
+    def test_ssl_wrap_socket_loads_verify_locations(self):
+
+        socket = object()
+
+        mock_context = Mock()
+
+        ssl_wrap_socket(ssl_context=mock_context, ca_certs='/path/to/pem',
+
+                        sock=socket)
+
+        mock_context.load_verify_locations.assert_called_once_with(
+
+            '/path/to/pem', None
+
+        )
+
+
+
+    def test_ssl_wrap_socket_loads_certificate_directories(self):
+
+        socket = object()
+
+        mock_context = Mock()
+
+        ssl_wrap_socket(ssl_context=mock_context, ca_cert_dir='/path/to/pems',
+
+                        sock=socket)
+
+        mock_context.load_verify_locations.assert_called_once_with(
+
+            None, '/path/to/pems'
+
+        )
+
+
+
+    def test_ssl_wrap_socket_with_no_sni_warns(self):
+
+        socket = object()
+
+        mock_context = Mock()
+
+        # Ugly preservation of original value
+
+        HAS_SNI = ssl_.HAS_SNI
+
+        ssl_.HAS_SNI = False
+
+        try:
+
+            with patch('warnings.warn') as warn:
+
+                ssl_wrap_socket(ssl_context=mock_context, sock=socket,
+
+                                server_hostname='www.google.com')
+
+            mock_context.wrap_socket.assert_called_once_with(socket)
+
+            assert warn.call_count >= 1
+
+            warnings = [call[0][1] for call in warn.call_args_list]
+
+            assert SNIMissingWarning in warnings
+
+        finally:
+
+            ssl_.HAS_SNI = HAS_SNI
+
+
+
+    def test_const_compare_digest_fallback(self):
+
+        target = hashlib.sha256(b'abcdef').digest()
+
+        assert _const_compare_digest_backport(target, target)
+
+
+
+        prefix = target[:-1]
+
+        assert not _const_compare_digest_backport(target, prefix)
+
+
+
+        suffix = target + b'0'
+
+        assert not _const_compare_digest_backport(target, suffix)
+
+
+
+        incorrect = hashlib.sha256(b'xyz').digest()
+
+        assert not _const_compare_digest_backport(target, incorrect)
+
+
+
+    def test_has_ipv6_disabled_on_compile(self):
+
+        with patch('socket.has_ipv6', False):
+
+            assert not _has_ipv6('::1')
+
+
+
+    def test_has_ipv6_enabled_but_fails(self):
+
+        with patch('socket.has_ipv6', True):
+
+            with patch('socket.socket') as mock:
+
+                instance = mock.return_value
+
+                instance.bind = Mock(side_effect=Exception('No IPv6 here!'))
+
+                assert not _has_ipv6('::1')
+
+
+
+    def test_has_ipv6_enabled_and_working(self):
+
+        with patch('socket.has_ipv6', True):
+
+            with patch('socket.socket') as mock:
+
+                instance = mock.return_value
+
+                instance.bind.return_value = True
+
+                assert _has_ipv6('::1')
+
+
+
+    def test_has_ipv6_disabled_on_appengine(self):
+
+        gae_patch = patch(
+
+            'urllib3.contrib._appengine_environ.is_appengine_sandbox',
+
+            return_value=True)
+
+        with gae_patch:
+
+            assert not _has_ipv6('::1')
+
+
+
+    def test_ip_family_ipv6_enabled(self):
+
+        with patch('urllib3.util.connection.HAS_IPV6', True):
+
+            assert allowed_gai_family() == socket.AF_UNSPEC
+
+
+
+    def test_ip_family_ipv6_disabled(self):
+
+        with patch('urllib3.util.connection.HAS_IPV6', False):
+
+            assert allowed_gai_family() == socket.AF_INET
+
+
+
+    @pytest.mark.parametrize('value', [
+
+        "-1",
+
+        "+1",
+
+        "1.0",
+
+        six.u("\xb2"),  # \xb2 = ^2
+
+    ])
+
+    def test_parse_retry_after_invalid(self, value):
+
+        retry = Retry()
+
+        with pytest.raises(InvalidHeader):
+
+            retry.parse_retry_after(value)
+
+
+
+    @pytest.mark.parametrize('value, expected', [
+
+        ("0", 0),
+
+        ("1000", 1000),
+
+        ("\t42 ", 42),
+
+    ])
+
+    def test_parse_retry_after(self, value, expected):
+
+        retry = Retry()
+
+        assert retry.parse_retry_after(value) == expected
+
+
+
+    @pytest.mark.parametrize('headers', [
+
+        b'foo',
+
+        None,
+
+        object,
+
+    ])
+
+    def test_assert_header_parsing_throws_typeerror_with_non_headers(self, headers):
+
+        with pytest.raises(TypeError):
+
+            assert_header_parsing(headers)

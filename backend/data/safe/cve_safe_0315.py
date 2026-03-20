@@ -2,1288 +2,544 @@
 # Safety: safe
 # Category: safe
 
-import os
+import json
 
-import shutil
+from datetime import datetime
 
-import sys
+from six.moves.urllib.parse import urljoin
 
 
 
-from PIL import Image
+import hashlib
 
-from PIL._util import py3
+import hmac
 
+from base64 import b64encode
 
+from django.core.exceptions import ImproperlyConfigured
 
-from .helper import PillowTestCase, hopper, unittest
+from django.test import override_settings
 
+from django.utils.timezone import utc
 
+from mock import ANY
 
 
 
-class TestImage(PillowTestCase):
+from anymail.signals import AnymailTrackingEvent
 
-    def test_image_modes_success(self):
+from anymail.webhooks.mandrill import MandrillCombinedWebhookView, MandrillTrackingWebhookView
 
-        for mode in [
 
-            "1",
 
-            "P",
+from .webhook_cases import WebhookTestCase, WebhookBasicAuthTestsMixin
 
-            "PA",
 
-            "L",
 
-            "LA",
+TEST_WEBHOOK_KEY = 'TEST_WEBHOOK_KEY'
 
-            "La",
 
-            "F",
 
-            "I",
 
-            "I;16",
 
-            "I;16L",
+def mandrill_args(events=None,
 
-            "I;16B",
+                  host="http://testserver/",  # Django test-client default
 
-            "I;16N",
+                  path='/anymail/mandrill/',  # Anymail urlconf default
 
-            "RGB",
+                  auth="username:password",  # WebhookTestCase default
 
-            "RGBX",
+                  key=TEST_WEBHOOK_KEY):
 
-            "RGBA",
+    """Returns TestClient.post kwargs for Mandrill webhook call with events
 
-            "RGBa",
 
-            "CMYK",
 
-            "YCbCr",
+    Computes correct signature.
 
-            "LAB",
+    """
 
-            "HSV",
+    if events is None:
 
-        ]:
+        events = []
 
-            Image.new(mode, (1, 1))
+    test_client_path = urljoin(host, path)  # https://testserver/anymail/mandrill/
 
+    if auth:
 
+        # we can get away with this simplification in these controlled tests,
 
-    def test_image_modes_fail(self):
+        # but don't ever construct urls like this in production code -- it's not safe!
 
-        for mode in [
+        full_url = test_client_path.replace("://", "://" + auth + "@")
 
-            "",
+    else:
 
-            "bad",
+        full_url = test_client_path
 
-            "very very long",
+    mandrill_events = json.dumps(events)
 
-            "BGR;15",
+    signed_data = full_url + 'mandrill_events' + mandrill_events
 
-            "BGR;16",
+    signature = b64encode(hmac.new(key=key.encode('ascii'),
 
-            "BGR;24",
+                                   msg=signed_data.encode('utf-8'),
 
-            "BGR;32",
+                                   digestmod=hashlib.sha1).digest())
 
-        ]:
+    return {
 
-            with self.assertRaises(ValueError) as e:
+        'path': test_client_path,
 
-                Image.new(mode, (1, 1))
+        'data': {'mandrill_events': mandrill_events},
 
-            self.assertEqual(str(e.exception), "unrecognized image mode")
+        'HTTP_X_MANDRILL_SIGNATURE': signature,
 
+    }
 
 
-    def test_sanity(self):
 
 
 
-        im = Image.new("L", (100, 100))
+class MandrillWebhookSettingsTestCase(WebhookTestCase):
 
-        self.assertEqual(repr(im)[:45], "<PIL.Image.Image image mode=L size=100x100 at")
+    def test_requires_webhook_key(self):
 
-        self.assertEqual(im.mode, "L")
+        with self.assertRaisesRegex(ImproperlyConfigured, r'MANDRILL_WEBHOOK_KEY'):
 
-        self.assertEqual(im.size, (100, 100))
+            self.client.post('/anymail/mandrill/',
 
+                             data={'mandrill_events': '[]'})
 
 
-        im = Image.new("RGB", (100, 100))
 
-        self.assertEqual(repr(im)[:45], "<PIL.Image.Image image mode=RGB size=100x100 ")
+    def test_head_does_not_require_webhook_key(self):
 
-        self.assertEqual(im.mode, "RGB")
+        # Mandrill issues an unsigned HEAD request to verify the wehbook url.
 
-        self.assertEqual(im.size, (100, 100))
+        # Only *after* that succeeds will Mandrill will tell you the webhook key.
 
+        # So make sure that HEAD request will go through without any key set:
 
+        response = self.client.head('/anymail/mandrill/')
 
-        Image.new("L", (100, 100), None)
+        self.assertEqual(response.status_code, 200)
 
-        im2 = Image.new("L", (100, 100), 0)
 
-        im3 = Image.new("L", (100, 100), "black")
 
 
 
-        self.assertEqual(im2.getcolors(), [(10000, 0)])
+@override_settings(ANYMAIL_MANDRILL_WEBHOOK_KEY=TEST_WEBHOOK_KEY)
 
-        self.assertEqual(im3.getcolors(), [(10000, 0)])
+class MandrillWebhookSecurityTestCase(WebhookTestCase, WebhookBasicAuthTestsMixin):
 
+    should_warn_if_no_auth = False  # because we check webhook signature
 
 
-        self.assertRaises(ValueError, Image.new, "X", (100, 100))
 
-        self.assertRaises(ValueError, Image.new, "", (100, 100))
+    def call_webhook(self):
 
-        # self.assertRaises(MemoryError, Image.new, "L", (1000000, 1000000))
+        kwargs = mandrill_args([{'event': 'send'}])
 
+        return self.client.post(**kwargs)
 
 
-    def test_width_height(self):
 
-        im = Image.new("RGB", (1, 2))
+    # Additional tests are in WebhookBasicAuthTestsMixin
 
-        self.assertEqual(im.width, 1)
 
-        self.assertEqual(im.height, 2)
 
+    def test_verifies_correct_signature(self):
 
+        kwargs = mandrill_args([{'event': 'send'}])
 
-        with self.assertRaises(AttributeError):
+        response = self.client.post(**kwargs)
 
-            im.size = (3, 4)
+        self.assertEqual(response.status_code, 200)
 
 
 
-    def test_invalid_image(self):
+    def test_verifies_missing_signature(self):
 
-        if py3:
+        response = self.client.post('/anymail/mandrill/',
 
-            import io
+                                    data={'mandrill_events': '[{"event":"send"}]'})
 
+        self.assertEqual(response.status_code, 400)
 
 
-            im = io.BytesIO(b"")
 
-        else:
+    def test_verifies_bad_signature(self):
 
-            import StringIO
+        kwargs = mandrill_args([{'event': 'send'}], key="wrong API key")
 
+        response = self.client.post(**kwargs)
 
+        self.assertEqual(response.status_code, 400)
 
-            im = StringIO.StringIO("")
 
-        self.assertRaises(IOError, Image.open, im)
 
+    @override_settings(ANYMAIL={})  # clear WEBHOOK_SECRET from WebhookTestCase
 
+    def test_no_basic_auth(self):
 
-    def test_bad_mode(self):
+        # Signature validation should work properly if you're not using basic auth
 
-        self.assertRaises(ValueError, Image.open, "filename", "bad mode")
+        self.clear_basic_auth()
 
+        kwargs = mandrill_args([{'event': 'send'}], auth="")
 
+        response = self.client.post(**kwargs)
 
-    @unittest.skipUnless(Image.HAS_PATHLIB, "requires pathlib/pathlib2")
+        self.assertEqual(response.status_code, 200)
 
-    def test_pathlib(self):
 
-        from PIL.Image import Path
 
+    @override_settings(
 
+        ALLOWED_HOSTS=['127.0.0.1', '.example.com'],
 
-        im = Image.open(Path("Tests/images/multipage-mmap.tiff"))
+        ANYMAIL={
 
-        self.assertEqual(im.mode, "P")
+            "MANDRILL_WEBHOOK_URL": "https://abcde:12345@example.com/anymail/mandrill/",
 
-        self.assertEqual(im.size, (10, 10))
+            "WEBHOOK_SECRET": "abcde:12345",
 
+        })
 
+    def test_webhook_url_setting(self):
 
-        im = Image.open(Path("Tests/images/hopper.jpg"))
+        # If Django can't build_absolute_uri correctly (e.g., because your proxy
 
-        self.assertEqual(im.mode, "RGB")
+        # frontend isn't setting the proxy headers correctly), you must set
 
-        self.assertEqual(im.size, (128, 128))
+        # MANDRILL_WEBHOOK_URL to the actual public url where Mandrill calls the webhook.
 
+        self.set_basic_auth("abcde", "12345")
 
+        kwargs = mandrill_args([{'event': 'send'}], host="https://example.com/", auth="abcde:12345")
 
-        temp_file = self.tempfile("temp.jpg")
+        response = self.client.post(SERVER_NAME="127.0.0.1", **kwargs)
 
-        if os.path.exists(temp_file):
+        self.assertEqual(response.status_code, 200)
 
-            os.remove(temp_file)
 
-        im.save(Path(temp_file))
 
+    # override WebhookBasicAuthTestsMixin version of this test
 
+    @override_settings(ANYMAIL={'WEBHOOK_SECRET': ['cred1:pass1', 'cred2:pass2']})
 
-    def test_fp_name(self):
+    def test_supports_credential_rotation(self):
 
-        temp_file = self.tempfile("temp.jpg")
+        """You can supply a list of basic auth credentials, and any is allowed"""
 
+        self.set_basic_auth('cred1', 'pass1')
 
+        response = self.client.post(**mandrill_args(auth="cred1:pass1"))
 
-        class FP(object):
+        self.assertEqual(response.status_code, 200)
 
-            def write(a, b):
 
-                pass
 
+        self.set_basic_auth('cred2', 'pass2')
 
+        response = self.client.post(**mandrill_args(auth="cred2:pass2"))
 
-        fp = FP()
+        self.assertEqual(response.status_code, 200)
 
-        fp.name = temp_file
 
 
+        self.set_basic_auth('baduser', 'wrongpassword')
 
-        im = hopper()
+        response = self.client.post(**mandrill_args(auth="baduser:wrongpassword"))
 
-        im.save(fp)
+        self.assertEqual(response.status_code, 400)
 
 
 
-    def test_tempfile(self):
 
-        # see #1460, pathlib support breaks tempfile.TemporaryFile on py27
 
-        # Will error out on save on 3.0.0
+@override_settings(ANYMAIL_MANDRILL_WEBHOOK_KEY=TEST_WEBHOOK_KEY)
 
-        import tempfile
+class MandrillTrackingTestCase(WebhookTestCase):
 
 
 
-        im = hopper()
+    def test_head_request(self):
 
-        with tempfile.TemporaryFile() as fp:
+        # Mandrill verifies webhooks at config time with a HEAD request
 
-            im.save(fp, "JPEG")
+        # (See MandrillWebhookSettingsTestCase above for equivalent without the key yet set)
 
-            fp.seek(0)
+        response = self.client.head('/anymail/mandrill/tracking/')
 
-            reloaded = Image.open(fp)
+        self.assertEqual(response.status_code, 200)
 
-            self.assert_image_similar(im, reloaded, 20)
 
 
+    def test_post_request_invalid_json(self):
 
-    def test_unknown_extension(self):
+        kwargs = mandrill_args()
 
-        im = hopper()
+        kwargs['data'] = {'mandrill_events': "GARBAGE DATA"}
 
-        temp_file = self.tempfile("temp.unknown")
+        response = self.client.post(**kwargs)
 
-        self.assertRaises(ValueError, im.save, temp_file)
+        self.assertEqual(response.status_code, 400)
 
 
 
-    def test_internals(self):
+    def test_send_event(self):
 
-        im = Image.new("L", (100, 100))
+        raw_events = [{
 
-        im.readonly = 1
+            "event": "send",
 
-        im._copy()
+            "msg": {
 
-        self.assertFalse(im.readonly)
+                "ts": 1461095211,  # time send called
 
+                "subject": "Webhook Test",
 
+                "email": "recipient@example.com",
 
-        im.readonly = 1
+                "sender": "sender@example.com",
 
-        im.paste(0, (0, 0, 100, 100))
+                "tags": ["tag1", "tag2"],
 
-        self.assertFalse(im.readonly)
+                "metadata": {"custom1": "value1", "custom2": "value2"},
 
+                "_id": "abcdef012345789abcdef012345789"
 
+            },
 
-    @unittest.skipIf(
+            "_id": "abcdef012345789abcdef012345789",
 
-        sys.platform.startswith("win32"), "Test requires opening tempfile twice"
+            "ts": 1461095246  # time of event
 
-    )
+        }]
 
-    def test_readonly_save(self):
+        response = self.client.post(**mandrill_args(events=raw_events))
 
-        temp_file = self.tempfile("temp.bmp")
+        self.assertEqual(response.status_code, 200)
 
-        shutil.copy("Tests/images/rgb32bf-rgba.bmp", temp_file)
+        kwargs = self.assert_handler_called_once_with(self.tracking_handler, sender=MandrillCombinedWebhookView,
 
+                                                      event=ANY, esp_name='Mandrill')
 
+        event = kwargs['event']
 
-        im = Image.open(temp_file)
+        self.assertIsInstance(event, AnymailTrackingEvent)
 
-        self.assertTrue(im.readonly)
+        self.assertEqual(event.event_type, "sent")
 
-        im.save(temp_file)
+        self.assertEqual(event.timestamp, datetime(2016, 4, 19, 19, 47, 26, tzinfo=utc))
 
+        self.assertEqual(event.esp_event, raw_events[0])
 
+        self.assertEqual(event.message_id, "abcdef012345789abcdef012345789")
 
-    def test_dump(self):
+        self.assertEqual(event.recipient, "recipient@example.com")
 
-        im = Image.new("L", (10, 10))
+        self.assertEqual(event.tags, ["tag1", "tag2"])
 
-        im._dump(self.tempfile("temp_L.ppm"))
+        self.assertEqual(event.metadata, {"custom1": "value1", "custom2": "value2"})
 
 
 
-        im = Image.new("RGB", (10, 10))
+    def test_hard_bounce_event(self):
 
-        im._dump(self.tempfile("temp_RGB.ppm"))
+        raw_events = [{
 
+            "event": "hard_bounce",
 
+            "msg": {
 
-        im = Image.new("HSV", (10, 10))
+                "ts": 1461095211,  # time send called
 
-        self.assertRaises(ValueError, im._dump, self.tempfile("temp_HSV.ppm"))
+                "subject": "Webhook Test",
 
+                "email": "bounce@example.com",
 
+                "sender": "sender@example.com",
 
-    def test_comparison_with_other_type(self):
+                "bounce_description": "bad_mailbox",
 
-        # Arrange
+                "bgtools_code": 10,
 
-        item = Image.new("RGB", (25, 25), "#000")
+                "diag": "smtp;550 5.1.1 The email account that you tried to reach does not exist.",
 
-        num = 12
+                "_id": "abcdef012345789abcdef012345789"
 
+            },
 
+            "_id": "abcdef012345789abcdef012345789",
 
-        # Act/Assert
+            "ts": 1461095246  # time of event
 
-        # Shouldn't cause AttributeError (#774)
+        }]
 
-        self.assertFalse(item is None)
+        response = self.client.post(**mandrill_args(events=raw_events))
 
-        self.assertFalse(item == num)
+        self.assertEqual(response.status_code, 200)
 
+        kwargs = self.assert_handler_called_once_with(self.tracking_handler, sender=MandrillCombinedWebhookView,
 
+                                                      event=ANY, esp_name='Mandrill')
 
-    def test_expand_x(self):
+        event = kwargs['event']
 
-        # Arrange
+        self.assertIsInstance(event, AnymailTrackingEvent)
 
-        im = hopper()
+        self.assertEqual(event.event_type, "bounced")
 
-        orig_size = im.size
+        self.assertEqual(event.esp_event, raw_events[0])
 
-        xmargin = 5
+        self.assertEqual(event.message_id, "abcdef012345789abcdef012345789")
 
+        self.assertEqual(event.recipient, "bounce@example.com")
 
+        self.assertEqual(event.mta_response,
 
-        # Act
+                         "smtp;550 5.1.1 The email account that you tried to reach does not exist.")
 
-        im = im._expand(xmargin)
 
 
+    def test_click_event(self):
 
-        # Assert
+        raw_events = [{
 
-        self.assertEqual(im.size[0], orig_size[0] + 2 * xmargin)
+            "event": "click",
 
-        self.assertEqual(im.size[1], orig_size[1] + 2 * xmargin)
+            "msg": {
 
+                "ts": 1461095211,  # time send called
 
+                "subject": "Webhook Test",
 
-    def test_expand_xy(self):
+                "email": "recipient@example.com",
 
-        # Arrange
+                "sender": "sender@example.com",
 
-        im = hopper()
+                "opens": [{"ts": 1461095242}],
 
-        orig_size = im.size
+                "clicks": [{"ts": 1461095246, "url": "http://example.com"}],
 
-        xmargin = 5
+                "_id": "abcdef012345789abcdef012345789"
 
-        ymargin = 3
+            },
 
+            "user_agent": "Mozilla/5.0 (Windows NT 5.1; rv:11.0) Gecko Firefox/11.0",
 
+            "url": "http://example.com",
 
-        # Act
+            "_id": "abcdef012345789abcdef012345789",
 
-        im = im._expand(xmargin, ymargin)
+            "ts": 1461095246  # time of event
 
+        }]
 
+        response = self.client.post(**mandrill_args(events=raw_events))
 
-        # Assert
+        self.assertEqual(response.status_code, 200)
 
-        self.assertEqual(im.size[0], orig_size[0] + 2 * xmargin)
+        kwargs = self.assert_handler_called_once_with(self.tracking_handler, sender=MandrillCombinedWebhookView,
 
-        self.assertEqual(im.size[1], orig_size[1] + 2 * ymargin)
+                                                      event=ANY, esp_name='Mandrill')
 
+        event = kwargs['event']
 
+        self.assertIsInstance(event, AnymailTrackingEvent)
 
-    def test_getbands(self):
+        self.assertEqual(event.event_type, "clicked")
 
-        # Assert
+        self.assertEqual(event.esp_event, raw_events[0])
 
-        self.assertEqual(hopper("RGB").getbands(), ("R", "G", "B"))
+        self.assertEqual(event.click_url, "http://example.com")
 
-        self.assertEqual(hopper("YCbCr").getbands(), ("Y", "Cb", "Cr"))
+        self.assertEqual(event.user_agent, "Mozilla/5.0 (Windows NT 5.1; rv:11.0) Gecko Firefox/11.0")
 
 
 
-    def test_getchannel_wrong_params(self):
+    def test_sync_event(self):
 
-        im = hopper()
+        # Mandrill sync events use a different format from other events
 
+        # https://mandrill.zendesk.com/hc/en-us/articles/205583297-Sync-Event-Webhook-format
 
+        raw_events = [{
 
-        self.assertRaises(ValueError, im.getchannel, -1)
+            "type": "blacklist",
 
-        self.assertRaises(ValueError, im.getchannel, 3)
+            "action": "add",
 
-        self.assertRaises(ValueError, im.getchannel, "Z")
+            "reject": {
 
-        self.assertRaises(ValueError, im.getchannel, "1")
+                "email": "recipient@example.com",
 
+                "reason": "manual edit"
 
+            }
 
-    def test_getchannel(self):
+        }]
 
-        im = hopper("YCbCr")
+        response = self.client.post(**mandrill_args(events=raw_events))
 
-        Y, Cb, Cr = im.split()
+        self.assertEqual(response.status_code, 200)
 
+        kwargs = self.assert_handler_called_once_with(self.tracking_handler, sender=MandrillCombinedWebhookView,
 
+                                                      event=ANY, esp_name='Mandrill')
 
-        self.assert_image_equal(Y, im.getchannel(0))
+        event = kwargs['event']
 
-        self.assert_image_equal(Y, im.getchannel("Y"))
+        self.assertEqual(event.event_type, "unknown")
 
-        self.assert_image_equal(Cb, im.getchannel(1))
+        self.assertEqual(event.recipient, "recipient@example.com")
 
-        self.assert_image_equal(Cb, im.getchannel("Cb"))
+        self.assertEqual(event.description, "manual edit")
 
-        self.assert_image_equal(Cr, im.getchannel(2))
 
-        self.assert_image_equal(Cr, im.getchannel("Cr"))
 
+    def test_old_tracking_url(self):
 
+        # Earlier versions of Anymail used /mandrill/tracking/ (and didn't support inbound);
 
-    def test_getbbox(self):
+        # make sure that URL continues to work.
 
-        # Arrange
+        raw_events = [{
 
-        im = hopper()
+            "event": "send",
 
+            "msg": {
 
+                "ts": 1461095211,  # time send called
 
-        # Act
+                "subject": "Webhook Test",
 
-        bbox = im.getbbox()
+                "email": "recipient@example.com",
 
+                "sender": "sender@example.com",
 
+                "tags": ["tag1", "tag2"],
 
-        # Assert
+                "metadata": {"custom1": "value1", "custom2": "value2"},
 
-        self.assertEqual(bbox, (0, 0, 128, 128))
+                "_id": "abcdef012345789abcdef012345789"
 
+            },
 
+            "_id": "abcdef012345789abcdef012345789",
 
-    def test_ne(self):
+            "ts": 1461095246  # time of event
 
-        # Arrange
+        }]
 
-        im1 = Image.new("RGB", (25, 25), "black")
+        response = self.client.post(**mandrill_args(events=raw_events, path='/anymail/mandrill/tracking/'))
 
-        im2 = Image.new("RGB", (25, 25), "white")
+        self.assertEqual(response.status_code, 200)
 
+        self.assert_handler_called_once_with(self.tracking_handler, sender=MandrillTrackingWebhookView,
 
-
-        # Act / Assert
-
-        self.assertNotEqual(im1, im2)
-
-
-
-    def test_alpha_composite(self):
-
-        # https://stackoverflow.com/questions/3374878
-
-        # Arrange
-
-        from PIL import ImageDraw
-
-
-
-        expected_colors = sorted(
-
-            [
-
-                (1122, (128, 127, 0, 255)),
-
-                (1089, (0, 255, 0, 255)),
-
-                (3300, (255, 0, 0, 255)),
-
-                (1156, (170, 85, 0, 192)),
-
-                (1122, (0, 255, 0, 128)),
-
-                (1122, (255, 0, 0, 128)),
-
-                (1089, (0, 255, 0, 0)),
-
-            ]
-
-        )
-
-
-
-        dst = Image.new("RGBA", size=(100, 100), color=(0, 255, 0, 255))
-
-        draw = ImageDraw.Draw(dst)
-
-        draw.rectangle((0, 33, 100, 66), fill=(0, 255, 0, 128))
-
-        draw.rectangle((0, 67, 100, 100), fill=(0, 255, 0, 0))
-
-        src = Image.new("RGBA", size=(100, 100), color=(255, 0, 0, 255))
-
-        draw = ImageDraw.Draw(src)
-
-        draw.rectangle((33, 0, 66, 100), fill=(255, 0, 0, 128))
-
-        draw.rectangle((67, 0, 100, 100), fill=(255, 0, 0, 0))
-
-
-
-        # Act
-
-        img = Image.alpha_composite(dst, src)
-
-
-
-        # Assert
-
-        img_colors = sorted(img.getcolors())
-
-        self.assertEqual(img_colors, expected_colors)
-
-
-
-    def test_alpha_inplace(self):
-
-        src = Image.new("RGBA", (128, 128), "blue")
-
-
-
-        over = Image.new("RGBA", (128, 128), "red")
-
-        mask = hopper("L")
-
-        over.putalpha(mask)
-
-
-
-        target = Image.alpha_composite(src, over)
-
-
-
-        # basic
-
-        full = src.copy()
-
-        full.alpha_composite(over)
-
-        self.assert_image_equal(full, target)
-
-
-
-        # with offset down to right
-
-        offset = src.copy()
-
-        offset.alpha_composite(over, (64, 64))
-
-        self.assert_image_equal(
-
-            offset.crop((64, 64, 127, 127)), target.crop((0, 0, 63, 63))
-
-        )
-
-        self.assertEqual(offset.size, (128, 128))
-
-
-
-        # offset and crop
-
-        box = src.copy()
-
-        box.alpha_composite(over, (64, 64), (0, 0, 32, 32))
-
-        self.assert_image_equal(box.crop((64, 64, 96, 96)), target.crop((0, 0, 32, 32)))
-
-        self.assert_image_equal(box.crop((96, 96, 128, 128)), src.crop((0, 0, 32, 32)))
-
-        self.assertEqual(box.size, (128, 128))
-
-
-
-        # source point
-
-        source = src.copy()
-
-        source.alpha_composite(over, (32, 32), (32, 32, 96, 96))
-
-
-
-        self.assert_image_equal(
-
-            source.crop((32, 32, 96, 96)), target.crop((32, 32, 96, 96))
-
-        )
-
-        self.assertEqual(source.size, (128, 128))
-
-
-
-        # errors
-
-        self.assertRaises(ValueError, source.alpha_composite, over, "invalid source")
-
-        self.assertRaises(
-
-            ValueError, source.alpha_composite, over, (0, 0), "invalid destination"
-
-        )
-
-        self.assertRaises(ValueError, source.alpha_composite, over, 0)
-
-        self.assertRaises(ValueError, source.alpha_composite, over, (0, 0), 0)
-
-        self.assertRaises(ValueError, source.alpha_composite, over, (0, -1))
-
-        self.assertRaises(ValueError, source.alpha_composite, over, (0, 0), (0, -1))
-
-
-
-    def test_registered_extensions_uninitialized(self):
-
-        # Arrange
-
-        Image._initialized = 0
-
-        extension = Image.EXTENSION
-
-        Image.EXTENSION = {}
-
-
-
-        # Act
-
-        Image.registered_extensions()
-
-
-
-        # Assert
-
-        self.assertEqual(Image._initialized, 2)
-
-
-
-        # Restore the original state and assert
-
-        Image.EXTENSION = extension
-
-        self.assertTrue(Image.EXTENSION)
-
-
-
-    def test_registered_extensions(self):
-
-        # Arrange
-
-        # Open an image to trigger plugin registration
-
-        Image.open("Tests/images/rgb.jpg")
-
-
-
-        # Act
-
-        extensions = Image.registered_extensions()
-
-
-
-        # Assert
-
-        self.assertTrue(extensions)
-
-        for ext in [".cur", ".icns", ".tif", ".tiff"]:
-
-            self.assertIn(ext, extensions)
-
-
-
-    def test_effect_mandelbrot(self):
-
-        # Arrange
-
-        size = (512, 512)
-
-        extent = (-3, -2.5, 2, 2.5)
-
-        quality = 100
-
-
-
-        # Act
-
-        im = Image.effect_mandelbrot(size, extent, quality)
-
-
-
-        # Assert
-
-        self.assertEqual(im.size, (512, 512))
-
-        im2 = Image.open("Tests/images/effect_mandelbrot.png")
-
-        self.assert_image_equal(im, im2)
-
-
-
-    def test_effect_mandelbrot_bad_arguments(self):
-
-        # Arrange
-
-        size = (512, 512)
-
-        # Get coordinates the wrong way round:
-
-        extent = (+3, +2.5, -2, -2.5)
-
-        # Quality < 2:
-
-        quality = 1
-
-
-
-        # Act/Assert
-
-        self.assertRaises(ValueError, Image.effect_mandelbrot, size, extent, quality)
-
-
-
-    def test_effect_noise(self):
-
-        # Arrange
-
-        size = (100, 100)
-
-        sigma = 128
-
-
-
-        # Act
-
-        im = Image.effect_noise(size, sigma)
-
-
-
-        # Assert
-
-        self.assertEqual(im.size, (100, 100))
-
-        self.assertEqual(im.mode, "L")
-
-        p0 = im.getpixel((0, 0))
-
-        p1 = im.getpixel((0, 1))
-
-        p2 = im.getpixel((0, 2))
-
-        p3 = im.getpixel((0, 3))
-
-        p4 = im.getpixel((0, 4))
-
-        self.assert_not_all_same([p0, p1, p2, p3, p4])
-
-
-
-    def test_effect_spread(self):
-
-        # Arrange
-
-        im = hopper()
-
-        distance = 10
-
-
-
-        # Act
-
-        im2 = im.effect_spread(distance)
-
-
-
-        # Assert
-
-        self.assertEqual(im.size, (128, 128))
-
-        im3 = Image.open("Tests/images/effect_spread.png")
-
-        self.assert_image_similar(im2, im3, 110)
-
-
-
-    def test_check_size(self):
-
-        # Checking that the _check_size function throws value errors
-
-        # when we want it to.
-
-        with self.assertRaises(ValueError):
-
-            Image.new("RGB", 0)  # not a tuple
-
-        with self.assertRaises(ValueError):
-
-            Image.new("RGB", (0,))  # Tuple too short
-
-        with self.assertRaises(ValueError):
-
-            Image.new("RGB", (-1, -1))  # w,h < 0
-
-
-
-        # this should pass with 0 sized images, #2259
-
-        im = Image.new("L", (0, 0))
-
-        self.assertEqual(im.size, (0, 0))
-
-
-
-        im = Image.new("L", (0, 100))
-
-        self.assertEqual(im.size, (0, 100))
-
-
-
-        im = Image.new("L", (100, 0))
-
-        self.assertEqual(im.size, (100, 0))
-
-
-
-        self.assertTrue(Image.new("RGB", (1, 1)))
-
-        # Should pass lists too
-
-        i = Image.new("RGB", [1, 1])
-
-        self.assertIsInstance(i.size, tuple)
-
-
-
-    def test_storage_neg(self):
-
-        # Storage.c accepted negative values for xsize, ysize.  Was
-
-        # test_neg_ppm, but the core function for that has been
-
-        # removed Calling directly into core to test the error in
-
-        # Storage.c, rather than the size check above
-
-
-
-        with self.assertRaises(ValueError):
-
-            Image.core.fill("RGB", (2, -2), (0, 0, 0))
-
-
-
-    def test_offset_not_implemented(self):
-
-        # Arrange
-
-        im = hopper()
-
-
-
-        # Act / Assert
-
-        self.assertRaises(NotImplementedError, im.offset, None)
-
-
-
-    def test_fromstring(self):
-
-        self.assertRaises(NotImplementedError, Image.fromstring)
-
-
-
-    def test_linear_gradient_wrong_mode(self):
-
-        # Arrange
-
-        wrong_mode = "RGB"
-
-
-
-        # Act / Assert
-
-        self.assertRaises(ValueError, Image.linear_gradient, wrong_mode)
-
-
-
-    def test_linear_gradient(self):
-
-
-
-        # Arrange
-
-        target_file = "Tests/images/linear_gradient.png"
-
-        for mode in ["L", "P"]:
-
-
-
-            # Act
-
-            im = Image.linear_gradient(mode)
-
-
-
-            # Assert
-
-            self.assertEqual(im.size, (256, 256))
-
-            self.assertEqual(im.mode, mode)
-
-            self.assertEqual(im.getpixel((0, 0)), 0)
-
-            self.assertEqual(im.getpixel((255, 255)), 255)
-
-            target = Image.open(target_file).convert(mode)
-
-            self.assert_image_equal(im, target)
-
-
-
-    def test_radial_gradient_wrong_mode(self):
-
-        # Arrange
-
-        wrong_mode = "RGB"
-
-
-
-        # Act / Assert
-
-        self.assertRaises(ValueError, Image.radial_gradient, wrong_mode)
-
-
-
-    def test_radial_gradient(self):
-
-
-
-        # Arrange
-
-        target_file = "Tests/images/radial_gradient.png"
-
-        for mode in ["L", "P"]:
-
-
-
-            # Act
-
-            im = Image.radial_gradient(mode)
-
-
-
-            # Assert
-
-            self.assertEqual(im.size, (256, 256))
-
-            self.assertEqual(im.mode, mode)
-
-            self.assertEqual(im.getpixel((0, 0)), 255)
-
-            self.assertEqual(im.getpixel((128, 128)), 0)
-
-            target = Image.open(target_file).convert(mode)
-
-            self.assert_image_equal(im, target)
-
-
-
-    def test_register_extensions(self):
-
-        test_format = "a"
-
-        exts = ["b", "c"]
-
-        for ext in exts:
-
-            Image.register_extension(test_format, ext)
-
-        ext_individual = Image.EXTENSION.copy()
-
-        for ext in exts:
-
-            del Image.EXTENSION[ext]
-
-
-
-        Image.register_extensions(test_format, exts)
-
-        ext_multiple = Image.EXTENSION.copy()
-
-        for ext in exts:
-
-            del Image.EXTENSION[ext]
-
-
-
-        self.assertEqual(ext_individual, ext_multiple)
-
-
-
-    def test_remap_palette(self):
-
-        # Test illegal image mode
-
-        im = hopper()
-
-        self.assertRaises(ValueError, im.remap_palette, None)
-
-
-
-    def test__new(self):
-
-        from PIL import ImagePalette
-
-
-
-        im = hopper("RGB")
-
-        im_p = hopper("P")
-
-
-
-        blank_p = Image.new("P", (10, 10))
-
-        blank_pa = Image.new("PA", (10, 10))
-
-        blank_p.palette = None
-
-        blank_pa.palette = None
-
-
-
-        def _make_new(base_image, im, palette_result=None):
-
-            new_im = base_image._new(im)
-
-            self.assertEqual(new_im.mode, im.mode)
-
-            self.assertEqual(new_im.size, im.size)
-
-            self.assertEqual(new_im.info, base_image.info)
-
-            if palette_result is not None:
-
-                self.assertEqual(new_im.palette.tobytes(), palette_result.tobytes())
-
-            else:
-
-                self.assertIsNone(new_im.palette)
-
-
-
-        _make_new(im, im_p, im_p.palette)
-
-        _make_new(im_p, im, None)
-
-        _make_new(im, blank_p, ImagePalette.ImagePalette())
-
-        _make_new(im, blank_pa, ImagePalette.ImagePalette())
-
-
-
-    def test_p_from_rgb_rgba(self):
-
-        for mode, color in [
-
-            ("RGB", "#DDEEFF"),
-
-            ("RGB", (221, 238, 255)),
-
-            ("RGBA", (221, 238, 255, 255)),
-
-        ]:
-
-            im = Image.new("P", (100, 100), color)
-
-            expected = Image.new(mode, (100, 100), color)
-
-            self.assert_image_equal(im.convert(mode), expected)
-
-
-
-    def test_no_resource_warning_on_save(self):
-
-        # https://github.com/python-pillow/Pillow/issues/835
-
-        # Arrange
-
-        test_file = "Tests/images/hopper.png"
-
-        temp_file = self.tempfile("temp.jpg")
-
-
-
-        # Act/Assert
-
-        with Image.open(test_file) as im:
-
-            self.assert_warning(None, im.save, temp_file)
-
-
-
-    def test_load_on_nonexclusive_multiframe(self):
-
-        with open("Tests/images/frozenpond.mpo", "rb") as fp:
-
-
-
-            def act(fp):
-
-                im = Image.open(fp)
-
-                im.load()
-
-
-
-            act(fp)
-
-
-
-            with Image.open(fp) as im:
-
-                im.load()
-
-
-
-            self.assertFalse(fp.closed)
-
-
-
-    def test_overrun(self):
-
-        for file in [
-
-            "fli_overrun.bin",
-
-            "sgi_overrun.bin",
-
-            "pcx_overrun.bin",
-
-            "pcx_overrun2.bin",
-
-        ]:
-
-            im = Image.open(os.path.join("Tests/images", file))
-
-            try:
-
-                im.load()
-
-                self.assertFail()
-
-            except IOError as e:
-
-                self.assertEqual(str(e), "buffer overrun when reading image file")
-
-
-
-        with Image.open("Tests/images/fli_overrun2.bin") as im:
-
-            try:
-
-                im.seek(1)
-
-                self.assertFail()
-
-            except IOError as e:
-
-                self.assertEqual(str(e), "buffer overrun when reading image file")
-
-
-
-
-
-class MockEncoder(object):
-
-    pass
-
-
-
-
-
-def mock_encode(*args):
-
-    encoder = MockEncoder()
-
-    encoder.args = args
-
-    return encoder
-
-
-
-
-
-class TestRegistry(PillowTestCase):
-
-    def test_encode_registry(self):
-
-
-
-        Image.register_encoder("MOCK", mock_encode)
-
-        self.assertIn("MOCK", Image.ENCODERS)
-
-
-
-        enc = Image._getencoder("RGB", "MOCK", ("args",), extra=("extra",))
-
-
-
-        self.assertIsInstance(enc, MockEncoder)
-
-        self.assertEqual(enc.args, ("RGB", "args", "extra"))
-
-
-
-    def test_encode_registry_fail(self):
-
-        self.assertRaises(
-
-            IOError,
-
-            Image._getencoder,
-
-            "RGB",
-
-            "DoesNotExist",
-
-            ("args",),
-
-            extra=("extra",),
-
-        )
+                                             event=ANY, esp_name='Mandrill')

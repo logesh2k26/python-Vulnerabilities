@@ -1,691 +1,1777 @@
 # Source: CVEFixes dataset
-# Safety: safe
+# Safety: vulnerable
 # Category: safe
 
-##############################################################################
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+
+
+
+# Copyright 2012 OpenStack LLC
 
 #
 
-# Copyright (c) 2001, 2002 Zope Foundation and Contributors.
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
 
-# All Rights Reserved.
+# not use this file except in compliance with the License. You may obtain
 
-#
-
-# This software is subject to the provisions of the Zope Public License,
-
-# Version 2.1 (ZPL).  A copy of the ZPL should accompany this distribution.
-
-# THIS SOFTWARE IS PROVIDED "AS IS" AND ANY AND ALL EXPRESS OR IMPLIED
-
-# WARRANTIES ARE DISCLAIMED, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
-
-# WARRANTIES OF TITLE, MERCHANTABILITY, AGAINST INFRINGEMENT, AND FITNESS
-
-# FOR A PARTICULAR PURPOSE.
+# a copy of the License at
 
 #
 
-##############################################################################
+#      http://www.apache.org/licenses/LICENSE-2.0
 
-"""HTTP Request Parser
+#
 
+# Unless required by applicable law or agreed to in writing, software
 
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-This server uses asyncore to accept connections and do initial
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
-processing but threads to do work.
+# License for the specific language governing permissions and limitations
 
-"""
+# under the License.
 
-import re
 
-from io import BytesIO
 
+import uuid
 
 
-from waitress.buffers import OverflowableBuffer
 
-from waitress.compat import tostr, unquote_bytes_to_wsgi, urlparse
+import nose.exc
 
-from waitress.receiver import ChunkedReceiver, FixedStreamReceiver
 
-from waitress.utilities import (
 
-    BadRequest,
+from keystone import test
 
-    RequestEntityTooLarge,
 
-    RequestHeaderFieldsTooLarge,
 
-    find_double_newline,
+import default_fixtures
 
-)
 
 
+OPENSTACK_REPO = 'https://review.openstack.org/p/openstack'
 
+KEYSTONECLIENT_REPO = '%s/python-keystoneclient.git' % OPENSTACK_REPO
 
 
-class ParsingError(Exception):
 
-    pass
 
 
+class CompatTestCase(test.TestCase):
 
+    def setUp(self):
 
+        super(CompatTestCase, self).setUp()
 
-class HTTPRequestParser(object):
 
-    """A structure that collects the HTTP request.
 
+        revdir = test.checkout_vendor(*self.get_checkout())
 
+        self.add_path(revdir)
 
-    Once the stream is completed, the instance is passed to
+        self.clear_module('keystoneclient')
 
-    a server task constructor.
 
-    """
 
+        self.load_backends()
 
+        self.load_fixtures(default_fixtures)
 
-    completed = False  # Set once request is completed.
 
-    empty = False  # Set if no request was made.
 
-    expect_continue = False  # client sent "Expect: 100-continue" header
+        self.public_server = self.serveapp('keystone', name='main')
 
-    headers_finished = False  # True when headers have been read
+        self.admin_server = self.serveapp('keystone', name='admin')
 
-    header_plus = b""
 
-    chunked = False
 
-    content_length = 0
+        # TODO(termie): is_admin is being deprecated once the policy stuff
 
-    header_bytes_received = 0
+        #               is all working
 
-    body_bytes_received = 0
+        # TODO(termie): add an admin user to the fixtures and use that user
 
-    body_rcv = None
+        # override the fixtures, for now
 
-    version = "1.0"
+        self.metadata_foobar = self.identity_api.update_metadata(
 
-    error = None
+            self.user_foo['id'], self.tenant_bar['id'],
 
-    connection_close = False
+            dict(roles=['keystone_admin'], is_admin='1'))
 
 
 
-    # Other attributes: first_line, header, headers, command, uri, version,
+    def tearDown(self):
 
-    # path, query, fragment
+        self.public_server.kill()
 
+        self.admin_server.kill()
 
+        self.public_server = None
 
-    def __init__(self, adj):
+        self.admin_server = None
 
-        """
+        super(CompatTestCase, self).tearDown()
 
-        adj is an Adjustments object.
 
-        """
 
-        # headers is a mapping containing keys translated to uppercase
+    def _public_url(self):
 
-        # with dashes turned into underscores.
+        public_port = self.public_server.socket_info['socket'][1]
 
-        self.headers = {}
+        return "http://localhost:%s/v2.0" % public_port
 
-        self.adj = adj
 
 
+    def _admin_url(self):
 
-    def received(self, data):
+        admin_port = self.admin_server.socket_info['socket'][1]
 
-        """
+        return "http://localhost:%s/v2.0" % admin_port
 
-        Receives the HTTP stream for one request.  Returns the number of
 
-        bytes consumed.  Sets the completed flag once both the header and the
 
-        body have been received.
+    def _client(self, admin=False, **kwargs):
 
-        """
+        from keystoneclient.v2_0 import client as ks_client
 
-        if self.completed:
 
-            return 0  # Can't consume any more.
 
-        datalen = len(data)
+        url = self._admin_url() if admin else self._public_url()
 
-        br = self.body_rcv
+        kc = ks_client.Client(endpoint=url,
 
-        if br is None:
+                              auth_url=self._public_url(),
 
-            # In header.
+                              **kwargs)
 
-            s = self.header_plus + data
+        kc.authenticate()
 
-            index = find_double_newline(s)
+        # have to manually overwrite the management url after authentication
 
-            if index >= 0:
+        kc.management_url = url
 
-                # Header finished.
+        return kc
 
-                header_plus = s[:index]
 
-                consumed = len(data) - (len(s) - index)
 
+    def get_client(self, user_ref=None, tenant_ref=None, admin=False):
 
+        if user_ref is None:
 
-                # Remove preceeding blank lines. This is suggested by
+            user_ref = self.user_foo
 
-                # https://tools.ietf.org/html/rfc7230#section-3.5 to support
+        if tenant_ref is None:
 
-                # clients sending an extra CR LF after another request when
+            for user in default_fixtures.USERS:
 
-                # using HTTP pipelining
+                if user['id'] == user_ref['id']:
 
-                header_plus = header_plus.lstrip()
-
-
-
-                if not header_plus:
-
-                    self.empty = True
-
-                    self.completed = True
-
-                else:
-
-                    try:
-
-                        self.parse_header(header_plus)
-
-                    except ParsingError as e:
-
-                        self.error = BadRequest(e.args[0])
-
-                        self.completed = True
-
-                    else:
-
-                        if self.body_rcv is None:
-
-                            # no content-length header and not a t-e: chunked
-
-                            # request
-
-                            self.completed = True
-
-                        if self.content_length > 0:
-
-                            max_body = self.adj.max_request_body_size
-
-                            # we won't accept this request if the content-length
-
-                            # is too large
-
-                            if self.content_length >= max_body:
-
-                                self.error = RequestEntityTooLarge(
-
-                                    "exceeds max_body of %s" % max_body
-
-                                )
-
-                                self.completed = True
-
-                self.headers_finished = True
-
-                return consumed
-
-            else:
-
-                # Header not finished yet.
-
-                self.header_bytes_received += datalen
-
-                max_header = self.adj.max_request_header_size
-
-                if self.header_bytes_received >= max_header:
-
-                    # malformed header, we need to construct some request
-
-                    # on our own. we disregard the incoming(?) requests HTTP
-
-                    # version and just use 1.0. IOW someone just sent garbage
-
-                    # over the wire
-
-                    self.parse_header(b"GET / HTTP/1.0\n")
-
-                    self.error = RequestHeaderFieldsTooLarge(
-
-                        "exceeds max_header of %s" % max_header
-
-                    )
-
-                    self.completed = True
-
-                self.header_plus = s
-
-                return datalen
+                    tenant_id = user['tenants'][0]
 
         else:
 
-            # In body.
+            tenant_id = tenant_ref['id']
 
-            consumed = br.received(data)
 
-            self.body_bytes_received += consumed
 
-            max_body = self.adj.max_request_body_size
+        return self._client(username=user_ref['name'],
 
-            if self.body_bytes_received >= max_body:
+                            password=user_ref['password'],
 
-                # this will only be raised during t-e: chunked requests
+                            tenant_id=tenant_id,
 
-                self.error = RequestEntityTooLarge("exceeds max_body of %s" % max_body)
+                            admin=admin)
 
-                self.completed = True
 
-            elif br.error:
 
-                # garbage in chunked encoding input probably
 
-                self.error = br.error
 
-                self.completed = True
+class KeystoneClientTests(object):
 
-            elif br.completed:
+    """Tests for all versions of keystoneclient."""
 
-                # The request (with the body) is ready to use.
 
-                self.completed = True
 
-                if self.chunked:
+    def test_authenticate_tenant_name_and_tenants(self):
 
-                    # We've converted the chunked transfer encoding request
+        client = self.get_client()
 
-                    # body into a normal request body, so we know its content
+        tenants = client.tenants.list()
 
-                    # length; set the header here.  We already popped the
+        self.assertEquals(tenants[0].id, self.tenant_bar['id'])
 
-                    # TRANSFER_ENCODING header in parse_header, so this will
 
-                    # appear to the client to be an entirely non-chunked HTTP
 
-                    # request with a valid content-length.
+    def test_authenticate_tenant_id_and_tenants(self):
 
-                    self.headers["CONTENT_LENGTH"] = str(br.__len__())
+        client = self._client(username=self.user_foo['name'],
 
-            return consumed
+                              password=self.user_foo['password'],
 
+                              tenant_id='bar')
 
+        tenants = client.tenants.list()
 
-    def parse_header(self, header_plus):
+        self.assertEquals(tenants[0].id, self.tenant_bar['id'])
 
-        """
 
-        Parses the header_plus block of text (the headers plus the
 
-        first line of the request).
+    def test_authenticate_invalid_tenant_id(self):
 
-        """
+        from keystoneclient import exceptions as client_exceptions
 
-        index = header_plus.find(b"\r\n")
+        self.assertRaises(client_exceptions.Unauthorized,
 
-        if index >= 0:
+                          self._client,
 
-            first_line = header_plus[:index].rstrip()
+                          username=self.user_foo['name'],
 
-            header = header_plus[index + 2 :]
+                          password=self.user_foo['password'],
 
-        else:
+                          tenant_id='baz')
 
-            raise ParsingError("HTTP message header invalid")
 
 
+    def test_authenticate_token_no_tenant(self):
 
-        if b"\r" in first_line or b"\n" in first_line:
+        client = self.get_client()
 
-            raise ParsingError("Bare CR or LF found in HTTP message")
+        token = client.auth_token
 
+        token_client = self._client(token=token)
 
+        tenants = token_client.tenants.list()
 
-        self.first_line = first_line  # for testing
+        self.assertEquals(tenants[0].id, self.tenant_bar['id'])
 
 
 
-        lines = get_header_lines(header)
+    def test_authenticate_token_tenant_id(self):
 
+        client = self.get_client()
 
+        token = client.auth_token
 
-        headers = self.headers
+        token_client = self._client(token=token, tenant_id='bar')
 
-        for line in lines:
+        tenants = token_client.tenants.list()
 
-            index = line.find(b":")
+        self.assertEquals(tenants[0].id, self.tenant_bar['id'])
 
-            if index > 0:
 
-                key = line[:index]
 
-                if b"_" in key:
+    def test_authenticate_token_invalid_tenant_id(self):
 
-                    continue
+        from keystoneclient import exceptions as client_exceptions
 
-                value = line[index + 1 :].strip()
+        client = self.get_client()
 
-                key1 = tostr(key.upper().replace(b"-", b"_"))
+        token = client.auth_token
 
-                # If a header already exists, we append subsequent values
+        self.assertRaises(client_exceptions.AuthorizationFailure,
 
-                # seperated by a comma. Applications already need to handle
+                          self._client, token=token, tenant_id='baz')
 
-                # the comma seperated values, as HTTP front ends might do
 
-                # the concatenation for you (behavior specified in RFC2616).
 
-                try:
+    def test_authenticate_token_tenant_name(self):
 
-                    headers[key1] += tostr(b", " + value)
+        client = self.get_client()
 
-                except KeyError:
+        token = client.auth_token
 
-                    headers[key1] = tostr(value)
+        token_client = self._client(token=token, tenant_name='BAR')
 
-            # else there's garbage in the headers?
+        tenants = token_client.tenants.list()
 
+        self.assertEquals(tenants[0].id, self.tenant_bar['id'])
 
+        self.assertEquals(tenants[0].id, self.tenant_bar['id'])
 
-        # command, uri, version will be bytes
 
-        command, uri, version = crack_first_line(first_line)
 
-        version = tostr(version)
+    def test_authenticate_and_delete_token(self):
 
-        command = tostr(command)
+        from keystoneclient import exceptions as client_exceptions
 
-        self.command = command
 
-        self.version = version
 
-        (
+        client = self.get_client(admin=True)
 
-            self.proxy_scheme,
+        token = client.auth_token
 
-            self.proxy_netloc,
+        token_client = self._client(token=token)
 
-            self.path,
+        tenants = token_client.tenants.list()
 
-            self.query,
+        self.assertEquals(tenants[0].id, self.tenant_bar['id'])
 
-            self.fragment,
 
-        ) = split_uri(uri)
 
-        self.url_scheme = self.adj.url_scheme
+        client.tokens.delete(token_client.auth_token)
 
-        connection = headers.get("CONNECTION", "")
 
 
+        self.assertRaises(client_exceptions.Unauthorized,
 
-        if version == "1.0":
+                          token_client.tenants.list)
 
-            if connection.lower() != "keep-alive":
 
-                self.connection_close = True
 
+    def test_authenticate_no_password(self):
 
+        from keystoneclient import exceptions as client_exceptions
 
-        if version == "1.1":
 
-            # since the server buffers data from chunked transfers and clients
 
-            # never need to deal with chunked requests, downstream clients
+        user_ref = self.user_foo.copy()
 
-            # should not see the HTTP_TRANSFER_ENCODING header; we pop it
+        user_ref['password'] = None
 
-            # here
+        self.assertRaises(client_exceptions.AuthorizationFailure,
 
-            te = headers.pop("TRANSFER_ENCODING", "")
+                          self.get_client,
 
-            if te.lower() == "chunked":
+                          user_ref)
 
-                self.chunked = True
 
-                buf = OverflowableBuffer(self.adj.inbuf_overflow)
 
-                self.body_rcv = ChunkedReceiver(buf)
+    def test_authenticate_no_username(self):
 
-            expect = headers.get("EXPECT", "").lower()
+        from keystoneclient import exceptions as client_exceptions
 
-            self.expect_continue = expect == "100-continue"
 
-            if connection.lower() == "close":
 
-                self.connection_close = True
+        user_ref = self.user_foo.copy()
 
+        user_ref['name'] = None
 
+        self.assertRaises(client_exceptions.AuthorizationFailure,
 
-        if not self.chunked:
+                          self.get_client,
 
-            try:
+                          user_ref)
 
-                cl = int(headers.get("CONTENT_LENGTH", 0))
 
-            except ValueError:
 
-                cl = 0
+    # FIXME(ja): this test should require the "keystone:admin" roled
 
-            self.content_length = cl
+    #            (probably the role set via --keystone_admin_role flag)
 
-            if cl > 0:
+    # FIXME(ja): add a test that admin endpoint is only sent to admin user
 
-                buf = OverflowableBuffer(self.adj.inbuf_overflow)
+    # FIXME(ja): add a test that admin endpoint returns unauthorized if not
 
-                self.body_rcv = FixedStreamReceiver(cl, buf)
+    #            admin
 
+    def test_tenant_create_update_and_delete(self):
 
+        from keystoneclient import exceptions as client_exceptions
 
-    def get_body_stream(self):
 
-        body_rcv = self.body_rcv
 
-        if body_rcv is not None:
+        tenant_name = 'original_tenant'
 
-            return body_rcv.getfile()
+        tenant_description = 'My original tenant!'
 
-        else:
+        tenant_enabled = True
 
-            return BytesIO()
+        client = self.get_client(admin=True)
 
 
 
-    def close(self):
+        # create, get, and list a tenant
 
-        body_rcv = self.body_rcv
+        tenant = client.tenants.create(tenant_name=tenant_name,
 
-        if body_rcv is not None:
+                                       description=tenant_description,
 
-            body_rcv.getbuf().close()
+                                       enabled=tenant_enabled)
 
+        self.assertEquals(tenant.name, tenant_name)
 
+        self.assertEquals(tenant.description, tenant_description)
 
+        self.assertEquals(tenant.enabled, tenant_enabled)
 
 
-def split_uri(uri):
 
-    # urlsplit handles byte input by returning bytes on py3, so
+        tenant = client.tenants.get(tenant_id=tenant.id)
 
-    # scheme, netloc, path, query, and fragment are bytes
+        self.assertEquals(tenant.name, tenant_name)
 
+        self.assertEquals(tenant.description, tenant_description)
 
+        self.assertEquals(tenant.enabled, tenant_enabled)
 
-    scheme = netloc = path = query = fragment = b""
 
 
+        tenant = [t for t in client.tenants.list() if t.id == tenant.id].pop()
 
-    # urlsplit below will treat this as a scheme-less netloc, thereby losing
+        self.assertEquals(tenant.name, tenant_name)
 
-    # the original intent of the request. Here we shamelessly stole 4 lines of
+        self.assertEquals(tenant.description, tenant_description)
 
-    # code from the CPython stdlib to parse out the fragment and query but
+        self.assertEquals(tenant.enabled, tenant_enabled)
 
-    # leave the path alone. See
 
-    # https://github.com/python/cpython/blob/8c9e9b0cd5b24dfbf1424d1f253d02de80e8f5ef/Lib/urllib/parse.py#L465-L468
 
-    # and https://github.com/Pylons/waitress/issues/260
+        # update, get, and list a tenant
 
+        tenant_name = 'updated_tenant'
 
+        tenant_description = 'Updated tenant!'
 
-    if uri[:2] == b"//":
+        tenant_enabled = False
 
-        path = uri
+        tenant = client.tenants.update(tenant_id=tenant.id,
 
+                                       tenant_name=tenant_name,
 
+                                       enabled=tenant_enabled,
 
-        if b"#" in path:
+                                       description=tenant_description)
 
-            path, fragment = path.split(b"#", 1)
+        self.assertEquals(tenant.name, tenant_name)
 
+        self.assertEquals(tenant.description, tenant_description)
 
+        self.assertEquals(tenant.enabled, tenant_enabled)
 
-        if b"?" in path:
 
-            path, query = path.split(b"?", 1)
 
-    else:
+        tenant = client.tenants.get(tenant_id=tenant.id)
 
-        try:
+        self.assertEquals(tenant.name, tenant_name)
 
-            scheme, netloc, path, query, fragment = urlparse.urlsplit(uri)
+        self.assertEquals(tenant.description, tenant_description)
 
-        except UnicodeError:
+        self.assertEquals(tenant.enabled, tenant_enabled)
 
-            raise ParsingError("Bad URI")
 
 
+        tenant = [t for t in client.tenants.list() if t.id == tenant.id].pop()
 
-    return (
+        self.assertEquals(tenant.name, tenant_name)
 
-        tostr(scheme),
+        self.assertEquals(tenant.description, tenant_description)
 
-        tostr(netloc),
+        self.assertEquals(tenant.enabled, tenant_enabled)
 
-        unquote_bytes_to_wsgi(path),
 
-        tostr(query),
 
-        tostr(fragment),
+        # delete, get, and list a tenant
 
-    )
+        client.tenants.delete(tenant=tenant.id)
 
+        self.assertRaises(client_exceptions.NotFound, client.tenants.get,
 
+                          tenant.id)
 
+        self.assertFalse([t for t in client.tenants.list()
 
+                           if t.id == tenant.id])
 
-def get_header_lines(header):
 
-    """
 
-    Splits the header into lines, putting multi-line headers together.
+    def test_tenant_delete_404(self):
 
-    """
+        from keystoneclient import exceptions as client_exceptions
 
-    r = []
+        client = self.get_client(admin=True)
 
-    lines = header.split(b"\r\n")
+        self.assertRaises(client_exceptions.NotFound,
 
-    for line in lines:
+                          client.tenants.delete,
 
-        if b"\r" in line or b"\n" in line:
+                          tenant=uuid.uuid4().hex)
 
-            raise ParsingError('Bare CR or LF found in header line "%s"' % tostr(line))
 
 
+    def test_tenant_get_404(self):
 
-        if line.startswith((b" ", b"\t")):
+        from keystoneclient import exceptions as client_exceptions
 
-            if not r:
+        client = self.get_client(admin=True)
 
-                # https://corte.si/posts/code/pathod/pythonservers/index.html
+        self.assertRaises(client_exceptions.NotFound,
 
-                raise ParsingError('Malformed header line "%s"' % tostr(line))
+                          client.tenants.get,
 
-            r[-1] += line
+                          tenant_id=uuid.uuid4().hex)
 
-        else:
 
-            r.append(line)
 
-    return r
+    def test_tenant_update_404(self):
 
+        from keystoneclient import exceptions as client_exceptions
 
+        client = self.get_client(admin=True)
 
+        self.assertRaises(client_exceptions.NotFound,
 
+                          client.tenants.update,
 
-first_line_re = re.compile(
+                          tenant_id=uuid.uuid4().hex)
 
-    b"([^ ]+) "
 
-    b"((?:[^ :?#]+://[^ ?#/]*(?:[0-9]{1,5})?)?[^ ]+)"
 
-    b"(( HTTP/([0-9.]+))$|$)"
+    def test_tenant_list(self):
 
-)
+        client = self.get_client()
 
+        tenants = client.tenants.list()
 
+        self.assertEquals(len(tenants), 1)
 
 
 
-def crack_first_line(line):
+        # Admin endpoint should return *all* tenants
 
-    m = first_line_re.match(line)
+        client = self.get_client(admin=True)
 
-    if m is not None and m.end() == len(line):
+        tenants = client.tenants.list()
 
-        if m.group(3):
+        self.assertEquals(len(tenants), len(default_fixtures.TENANTS))
 
-            version = m.group(5)
 
-        else:
 
-            version = b""
+    def test_invalid_password(self):
 
-        method = m.group(1)
+        from keystoneclient import exceptions as client_exceptions
 
 
 
-        # the request methods that are currently defined are all uppercase:
+        good_client = self._client(username=self.user_foo['name'],
 
-        # https://www.iana.org/assignments/http-methods/http-methods.xhtml and
+                                   password=self.user_foo['password'])
 
-        # the request method is case sensitive according to
+        good_client.tenants.list()
 
-        # https://tools.ietf.org/html/rfc7231#section-4.1
 
 
+        self.assertRaises(client_exceptions.Unauthorized,
 
-        # By disallowing anything but uppercase methods we save poor
+                          self._client,
 
-        # unsuspecting souls from sending lowercase HTTP methods to waitress
+                          username=self.user_foo['name'],
 
-        # and having the request complete, while servers like nginx drop the
+                          password='invalid')
 
-        # request onto the floor.
 
-        if method != method.upper():
 
-            raise ParsingError('Malformed HTTP method "%s"' % tostr(method))
+    def test_invalid_user_password(self):
 
-        uri = m.group(2)
+        from keystoneclient import exceptions as client_exceptions
 
-        return method, uri, version
 
-    else:
 
-        return b"", b"", b""
+        self.assertRaises(client_exceptions.Unauthorized,
+
+                          self._client,
+
+                          username='blah',
+
+                          password='blah')
+
+
+
+    def test_user_create_update_delete(self):
+
+        from keystoneclient import exceptions as client_exceptions
+
+
+
+        test_username = 'new_user'
+
+        client = self.get_client(admin=True)
+
+        user = client.users.create(name=test_username,
+
+                                   password='password',
+
+                                   email='user1@test.com')
+
+        self.assertEquals(user.name, test_username)
+
+
+
+        user = client.users.get(user=user.id)
+
+        self.assertEquals(user.name, test_username)
+
+
+
+        user = client.users.update(user=user,
+
+                                   name=test_username,
+
+                                   email='user2@test.com')
+
+        self.assertEquals(user.email, 'user2@test.com')
+
+
+
+        # NOTE(termie): update_enabled doesn't return anything, probably a bug
+
+        client.users.update_enabled(user=user, enabled=False)
+
+        user = client.users.get(user.id)
+
+        self.assertFalse(user.enabled)
+
+
+
+        self.assertRaises(client_exceptions.AuthorizationFailure,
+
+                  self._client,
+
+                  username=test_username,
+
+                  password='password')
+
+        client.users.update_enabled(user, True)
+
+
+
+        user = client.users.update_password(user=user, password='password2')
+
+
+
+        self._client(username=test_username,
+
+                     password='password2')
+
+
+
+        user = client.users.update_tenant(user=user, tenant='bar')
+
+        # TODO(ja): once keystonelight supports default tenant
+
+        #           when you login without specifying tenant, the
+
+        #           token should be scoped to tenant 'bar'
+
+
+
+        client.users.delete(user.id)
+
+        self.assertRaises(client_exceptions.NotFound, client.users.get,
+
+                          user.id)
+
+
+
+        # Test creating a user with a tenant (auto-add to tenant)
+
+        user2 = client.users.create(name=test_username,
+
+                                    password='password',
+
+                                    email='user1@test.com',
+
+                                    tenant_id='bar')
+
+        self.assertEquals(user2.name, test_username)
+
+
+
+    def test_user_create_404(self):
+
+        from keystoneclient import exceptions as client_exceptions
+
+        client = self.get_client(admin=True)
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.users.create,
+
+                          name=uuid.uuid4().hex,
+
+                          password=uuid.uuid4().hex,
+
+                          email=uuid.uuid4().hex,
+
+                          tenant_id=uuid.uuid4().hex)
+
+
+
+    def test_user_get_404(self):
+
+        from keystoneclient import exceptions as client_exceptions
+
+        client = self.get_client(admin=True)
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.users.get,
+
+                          user=uuid.uuid4().hex)
+
+
+
+    def test_user_list_404(self):
+
+        from keystoneclient import exceptions as client_exceptions
+
+        client = self.get_client(admin=True)
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.users.list,
+
+                          tenant_id=uuid.uuid4().hex)
+
+
+
+    def test_user_update_404(self):
+
+        from keystoneclient import exceptions as client_exceptions
+
+        client = self.get_client(admin=True)
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.users.update,
+
+                          user=uuid.uuid4().hex)
+
+
+
+    def test_user_update_tenant_404(self):
+
+        raise nose.exc.SkipTest('N/A')
+
+        from keystoneclient import exceptions as client_exceptions
+
+        client = self.get_client(admin=True)
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.users.update,
+
+                          user=self.user_foo['id'],
+
+                          tenant_id=uuid.uuid4().hex)
+
+
+
+    def test_user_update_password_404(self):
+
+        from keystoneclient import exceptions as client_exceptions
+
+        client = self.get_client(admin=True)
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.users.update_password,
+
+                          user=uuid.uuid4().hex,
+
+                          password=uuid.uuid4().hex)
+
+
+
+    def test_user_delete_404(self):
+
+        from keystoneclient import exceptions as client_exceptions
+
+        client = self.get_client(admin=True)
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.users.delete,
+
+                          user=uuid.uuid4().hex)
+
+
+
+    def test_user_list(self):
+
+        client = self.get_client(admin=True)
+
+        users = client.users.list()
+
+        self.assertTrue(len(users) > 0)
+
+        user = users[0]
+
+        self.assertRaises(AttributeError, lambda: user.password)
+
+
+
+    def test_user_get(self):
+
+        client = self.get_client(admin=True)
+
+        user = client.users.get(user=self.user_foo['id'])
+
+        self.assertRaises(AttributeError, lambda: user.password)
+
+
+
+    def test_role_get(self):
+
+        client = self.get_client(admin=True)
+
+        role = client.roles.get(role='keystone_admin')
+
+        self.assertEquals(role.id, 'keystone_admin')
+
+
+
+    def test_role_crud(self):
+
+        from keystoneclient import exceptions as client_exceptions
+
+
+
+        test_role = 'new_role'
+
+        client = self.get_client(admin=True)
+
+        role = client.roles.create(name=test_role)
+
+        self.assertEquals(role.name, test_role)
+
+
+
+        role = client.roles.get(role=role.id)
+
+        self.assertEquals(role.name, test_role)
+
+
+
+        client.roles.delete(role=role.id)
+
+
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.roles.delete,
+
+                          role=role.id)
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.roles.get,
+
+                          role=role.id)
+
+
+
+    def test_role_get_404(self):
+
+        from keystoneclient import exceptions as client_exceptions
+
+        client = self.get_client(admin=True)
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.roles.get,
+
+                          role=uuid.uuid4().hex)
+
+
+
+    def test_role_delete_404(self):
+
+        from keystoneclient import exceptions as client_exceptions
+
+        client = self.get_client(admin=True)
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.roles.delete,
+
+                          role=uuid.uuid4().hex)
+
+
+
+    def test_role_list_404(self):
+
+        from keystoneclient import exceptions as client_exceptions
+
+        client = self.get_client(admin=True)
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.roles.roles_for_user,
+
+                          user=uuid.uuid4().hex,
+
+                          tenant=uuid.uuid4().hex)
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.roles.roles_for_user,
+
+                          user=self.user_foo['id'],
+
+                          tenant=uuid.uuid4().hex)
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.roles.roles_for_user,
+
+                          user=uuid.uuid4().hex,
+
+                          tenant=self.tenant_bar['id'])
+
+
+
+    def test_role_list(self):
+
+        client = self.get_client(admin=True)
+
+        roles = client.roles.list()
+
+        # TODO(devcamcar): This assert should be more specific.
+
+        self.assertTrue(len(roles) > 0)
+
+
+
+    def test_ec2_credential_crud(self):
+
+        client = self.get_client()
+
+        creds = client.ec2.list(user_id=self.user_foo['id'])
+
+        self.assertEquals(creds, [])
+
+
+
+        cred = client.ec2.create(user_id=self.user_foo['id'],
+
+                                 tenant_id=self.tenant_bar['id'])
+
+        creds = client.ec2.list(user_id=self.user_foo['id'])
+
+        self.assertEquals(creds, [cred])
+
+
+
+        got = client.ec2.get(user_id=self.user_foo['id'], access=cred.access)
+
+        self.assertEquals(cred, got)
+
+
+
+        client.ec2.delete(user_id=self.user_foo['id'], access=cred.access)
+
+        creds = client.ec2.list(user_id=self.user_foo['id'])
+
+        self.assertEquals(creds, [])
+
+
+
+    def test_ec2_credentials_create_404(self):
+
+        from keystoneclient import exceptions as client_exceptions
+
+        client = self.get_client()
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.ec2.create,
+
+                          user_id=uuid.uuid4().hex,
+
+                          tenant_id=self.tenant_bar['id'])
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.ec2.create,
+
+                          user_id=self.user_foo['id'],
+
+                          tenant_id=uuid.uuid4().hex)
+
+
+
+    def test_ec2_credentials_delete_404(self):
+
+        from keystoneclient import exceptions as client_exceptions
+
+        client = self.get_client()
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.ec2.delete,
+
+                          user_id=uuid.uuid4().hex,
+
+                          access=uuid.uuid4().hex)
+
+
+
+    def test_ec2_credentials_get_404(self):
+
+        from keystoneclient import exceptions as client_exceptions
+
+        client = self.get_client()
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.ec2.get,
+
+                          user_id=uuid.uuid4().hex,
+
+                          access=uuid.uuid4().hex)
+
+
+
+    def test_ec2_credentials_list_404(self):
+
+        from keystoneclient import exceptions as client_exceptions
+
+        client = self.get_client()
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.ec2.list,
+
+                          user_id=uuid.uuid4().hex)
+
+
+
+    def test_ec2_credentials_list_user_forbidden(self):
+
+        from keystoneclient import exceptions as client_exceptions
+
+
+
+        two = self.get_client(self.user_two)
+
+        self.assertRaises(client_exceptions.Forbidden, two.ec2.list,
+
+                          user_id=self.user_foo['id'])
+
+
+
+    def test_ec2_credentials_get_user_forbidden(self):
+
+        from keystoneclient import exceptions as client_exceptions
+
+
+
+        foo = self.get_client()
+
+        cred = foo.ec2.create(user_id=self.user_foo['id'],
+
+                              tenant_id=self.tenant_bar['id'])
+
+
+
+        two = self.get_client(self.user_two)
+
+        self.assertRaises(client_exceptions.Forbidden, two.ec2.get,
+
+                          user_id=self.user_foo['id'], access=cred.access)
+
+
+
+        foo.ec2.delete(user_id=self.user_foo['id'], access=cred.access)
+
+
+
+    def test_ec2_credentials_delete_user_forbidden(self):
+
+        from keystoneclient import exceptions as client_exceptions
+
+
+
+        foo = self.get_client()
+
+        cred = foo.ec2.create(user_id=self.user_foo['id'],
+
+                              tenant_id=self.tenant_bar['id'])
+
+
+
+        two = self.get_client(self.user_two)
+
+        self.assertRaises(client_exceptions.Forbidden, two.ec2.delete,
+
+                          user_id=self.user_foo['id'], access=cred.access)
+
+
+
+        foo.ec2.delete(user_id=self.user_foo['id'], access=cred.access)
+
+
+
+    def test_service_crud(self):
+
+        from keystoneclient import exceptions as client_exceptions
+
+        client = self.get_client(admin=True)
+
+
+
+        service_name = uuid.uuid4().hex
+
+        service_type = uuid.uuid4().hex
+
+        service_desc = uuid.uuid4().hex
+
+
+
+        # create & read
+
+        service = client.services.create(name=service_name,
+
+                                         service_type=service_type,
+
+                                         description=service_desc)
+
+        self.assertEquals(service_name, service.name)
+
+        self.assertEquals(service_type, service.type)
+
+        self.assertEquals(service_desc, service.description)
+
+
+
+        service = client.services.get(id=service.id)
+
+        self.assertEquals(service_name, service.name)
+
+        self.assertEquals(service_type, service.type)
+
+        self.assertEquals(service_desc, service.description)
+
+
+
+        service = [x for x in client.services.list() if x.id == service.id][0]
+
+        self.assertEquals(service_name, service.name)
+
+        self.assertEquals(service_type, service.type)
+
+        self.assertEquals(service_desc, service.description)
+
+
+
+        # update is not supported...
+
+
+
+        # delete & read
+
+        client.services.delete(id=service.id)
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.services.get,
+
+                          id=service.id)
+
+        services = [x for x in client.services.list() if x.id == service.id]
+
+        self.assertEquals(len(services), 0)
+
+
+
+    def test_service_delete_404(self):
+
+        from keystoneclient import exceptions as client_exceptions
+
+        client = self.get_client(admin=True)
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.services.delete,
+
+                          id=uuid.uuid4().hex)
+
+
+
+    def test_service_get_404(self):
+
+        from keystoneclient import exceptions as client_exceptions
+
+        client = self.get_client(admin=True)
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.services.get,
+
+                          id=uuid.uuid4().hex)
+
+
+
+    def test_endpoint_create_404(self):
+
+        from keystoneclient import exceptions as client_exceptions
+
+        client = self.get_client(admin=True)
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.endpoints.create,
+
+                          region=uuid.uuid4().hex,
+
+                          service_id=uuid.uuid4().hex,
+
+                          publicurl=uuid.uuid4().hex,
+
+                          adminurl=uuid.uuid4().hex,
+
+                          internalurl=uuid.uuid4().hex)
+
+
+
+    def test_endpoint_delete_404(self):
+
+        # the catalog backend is expected to return Not Implemented
+
+        from keystoneclient import exceptions as client_exceptions
+
+        client = self.get_client(admin=True)
+
+        self.assertRaises(client_exceptions.HTTPNotImplemented,
+
+                          client.endpoints.delete,
+
+                          id=uuid.uuid4().hex)
+
+
+
+    def test_admin_requires_adminness(self):
+
+        from keystoneclient import exceptions as client_exceptions
+
+        # FIXME(ja): this should be Unauthorized
+
+        exception = client_exceptions.ClientException
+
+
+
+        two = self.get_client(self.user_two, admin=True)  # non-admin user
+
+
+
+        # USER CRUD
+
+        self.assertRaises(exception,
+
+                          two.users.list)
+
+        self.assertRaises(exception,
+
+                          two.users.get,
+
+                          user=self.user_two['id'])
+
+        self.assertRaises(exception,
+
+                          two.users.create,
+
+                          name='oops',
+
+                          password='password',
+
+                          email='oops@test.com')
+
+        self.assertRaises(exception,
+
+                          two.users.delete,
+
+                          user=self.user_foo['id'])
+
+
+
+        # TENANT CRUD
+
+        self.assertRaises(exception,
+
+                          two.tenants.list)
+
+        self.assertRaises(exception,
+
+                          two.tenants.get,
+
+                          tenant_id=self.tenant_bar['id'])
+
+        self.assertRaises(exception,
+
+                          two.tenants.create,
+
+                          tenant_name='oops',
+
+                          description="shouldn't work!",
+
+                          enabled=True)
+
+        self.assertRaises(exception,
+
+                          two.tenants.delete,
+
+                          tenant=self.tenant_baz['id'])
+
+
+
+        # ROLE CRUD
+
+        self.assertRaises(exception,
+
+                          two.roles.get,
+
+                          role='keystone_admin')
+
+        self.assertRaises(exception,
+
+                          two.roles.list)
+
+        self.assertRaises(exception,
+
+                          two.roles.create,
+
+                          name='oops')
+
+        self.assertRaises(exception,
+
+                          two.roles.delete,
+
+                          role='keystone_admin')
+
+
+
+        # TODO(ja): MEMBERSHIP CRUD
+
+        # TODO(ja): determine what else todo
+
+
+
+
+
+class KcMasterTestCase(CompatTestCase, KeystoneClientTests):
+
+    def get_checkout(self):
+
+        return KEYSTONECLIENT_REPO, 'master'
+
+
+
+    def test_tenant_add_and_remove_user(self):
+
+        client = self.get_client(admin=True)
+
+        client.roles.add_user_role(tenant=self.tenant_baz['id'],
+
+                                   user=self.user_foo['id'],
+
+                                   role=self.role_useless['id'])
+
+        user_refs = client.tenants.list_users(tenant=self.tenant_baz['id'])
+
+        self.assert_(self.user_foo['id'] in [x.id for x in user_refs])
+
+        client.roles.remove_user_role(tenant=self.tenant_baz['id'],
+
+                                      user=self.user_foo['id'],
+
+                                      role=self.role_useless['id'])
+
+        user_refs = client.tenants.list_users(tenant=self.tenant_baz['id'])
+
+        self.assert_(self.user_foo['id'] not in [x.id for x in user_refs])
+
+
+
+    def test_user_role_add_404(self):
+
+        from keystoneclient import exceptions as client_exceptions
+
+        client = self.get_client(admin=True)
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.roles.add_user_role,
+
+                          tenant=uuid.uuid4().hex,
+
+                          user=self.user_foo['id'],
+
+                          role=self.role_useless['id'])
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.roles.add_user_role,
+
+                          tenant=self.tenant_baz['id'],
+
+                          user=uuid.uuid4().hex,
+
+                          role=self.role_useless['id'])
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.roles.add_user_role,
+
+                          tenant=self.tenant_baz['id'],
+
+                          user=self.user_foo['id'],
+
+                          role=uuid.uuid4().hex)
+
+
+
+    def test_user_role_remove_404(self):
+
+        from keystoneclient import exceptions as client_exceptions
+
+        client = self.get_client(admin=True)
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.roles.remove_user_role,
+
+                          tenant=uuid.uuid4().hex,
+
+                          user=self.user_foo['id'],
+
+                          role=self.role_useless['id'])
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.roles.remove_user_role,
+
+                          tenant=self.tenant_baz['id'],
+
+                          user=uuid.uuid4().hex,
+
+                          role=self.role_useless['id'])
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.roles.remove_user_role,
+
+                          tenant=self.tenant_baz['id'],
+
+                          user=self.user_foo['id'],
+
+                          role=uuid.uuid4().hex)
+
+        self.assertRaises(client_exceptions.NotFound,
+
+                          client.roles.remove_user_role,
+
+                          tenant=self.tenant_baz['id'],
+
+                          user=self.user_foo['id'],
+
+                          role=self.role_useless['id'])
+
+
+
+    def test_tenant_list_marker(self):
+
+        client = self.get_client()
+
+
+
+        # Add two arbitrary tenants to user for testing purposes
+
+        for i in range(2):
+
+            tenant_id = uuid.uuid4().hex
+
+            tenant = {'name': 'tenant-%s' % tenant_id, 'id': tenant_id}
+
+            self.identity_api.create_tenant(tenant_id, tenant)
+
+            self.identity_api.add_user_to_tenant(tenant_id,
+
+                                                 self.user_foo['id'])
+
+
+
+        tenants = client.tenants.list()
+
+        self.assertEqual(len(tenants), 3)
+
+
+
+        tenants_marker = client.tenants.list(marker=tenants[0].id)
+
+        self.assertEqual(len(tenants_marker), 2)
+
+        self.assertEqual(tenants[1].name, tenants_marker[0].name)
+
+        self.assertEqual(tenants[2].name, tenants_marker[1].name)
+
+
+
+    def test_tenant_list_marker_not_found(self):
+
+        from keystoneclient import exceptions as client_exceptions
+
+
+
+        client = self.get_client()
+
+        self.assertRaises(client_exceptions.BadRequest,
+
+                          client.tenants.list, marker=uuid.uuid4().hex)
+
+
+
+    def test_tenant_list_limit(self):
+
+        client = self.get_client()
+
+
+
+        # Add two arbitrary tenants to user for testing purposes
+
+        for i in range(2):
+
+            tenant_id = uuid.uuid4().hex
+
+            tenant = {'name': 'tenant-%s' % tenant_id, 'id': tenant_id}
+
+            self.identity_api.create_tenant(tenant_id, tenant)
+
+            self.identity_api.add_user_to_tenant(tenant_id,
+
+                                                 self.user_foo['id'])
+
+
+
+        tenants = client.tenants.list()
+
+        self.assertEqual(len(tenants), 3)
+
+
+
+        tenants_limited = client.tenants.list(limit=2)
+
+        self.assertEqual(len(tenants_limited), 2)
+
+        self.assertEqual(tenants[0].name, tenants_limited[0].name)
+
+        self.assertEqual(tenants[1].name, tenants_limited[1].name)
+
+
+
+    def test_tenant_list_limit_bad_value(self):
+
+        from keystoneclient import exceptions as client_exceptions
+
+
+
+        client = self.get_client()
+
+        self.assertRaises(client_exceptions.BadRequest,
+
+                          client.tenants.list, limit='a')
+
+        self.assertRaises(client_exceptions.BadRequest,
+
+                          client.tenants.list, limit=-1)
+
+
+
+    def test_roles_get_by_user(self):
+
+        client = self.get_client(admin=True)
+
+        roles = client.roles.roles_for_user(user=self.user_foo['id'],
+
+                                            tenant=self.tenant_bar['id'])
+
+        self.assertTrue(len(roles) > 0)
+
+
+
+
+
+class KcEssex3TestCase(CompatTestCase, KeystoneClientTests):
+
+    def get_checkout(self):
+
+        return KEYSTONECLIENT_REPO, 'essex-3'
+
+
+
+    def test_tenant_add_and_remove_user(self):
+
+        client = self.get_client(admin=True)
+
+        client.roles.add_user_to_tenant(tenant_id=self.tenant_baz['id'],
+
+                                        user_id=self.user_foo['id'],
+
+                                        role_id=self.role_useless['id'])
+
+        role_refs = client.roles.get_user_role_refs(
+
+                user_id=self.user_foo['id'])
+
+        self.assert_(self.tenant_baz['id'] in [x.tenantId for x in role_refs])
+
+
+
+        # get the "role_refs" so we get the proper id, this is how the clients
+
+        # do it
+
+        roleref_refs = client.roles.get_user_role_refs(
+
+                user_id=self.user_foo['id'])
+
+        for roleref_ref in roleref_refs:
+
+            if (roleref_ref.roleId == self.role_useless['id']
+
+                and roleref_ref.tenantId == self.tenant_baz['id']):
+
+                # use python's scope fall through to leave roleref_ref set
+
+                break
+
+
+
+        client.roles.remove_user_from_tenant(tenant_id=self.tenant_baz['id'],
+
+                                             user_id=self.user_foo['id'],
+
+                                             role_id=roleref_ref.id)
+
+
+
+        role_refs = client.roles.get_user_role_refs(
+
+                user_id=self.user_foo['id'])
+
+        self.assert_(self.tenant_baz['id'] not in
+
+                     [x.tenantId for x in role_refs])
+
+
+
+    def test_roles_get_by_user(self):
+
+        client = self.get_client(admin=True)
+
+        roles = client.roles.get_user_role_refs(user_id='foo')
+
+        self.assertTrue(len(roles) > 0)
+
+
+
+    def test_role_list_404(self):
+
+        raise nose.exc.SkipTest('N/A')
+
+
+
+    def test_authenticate_and_delete_token(self):
+
+        raise nose.exc.SkipTest('N/A')
+
+
+
+    def test_user_create_update_delete(self):
+
+        from keystoneclient import exceptions as client_exceptions
+
+
+
+        test_username = 'new_user'
+
+        client = self.get_client(admin=True)
+
+        user = client.users.create(name=test_username,
+
+                                   password='password',
+
+                                   email='user1@test.com')
+
+        self.assertEquals(user.name, test_username)
+
+
+
+        user = client.users.get(user=user.id)
+
+        self.assertEquals(user.name, test_username)
+
+
+
+        user = client.users.update_email(user=user, email='user2@test.com')
+
+        self.assertEquals(user.email, 'user2@test.com')
+
+
+
+        # NOTE(termie): update_enabled doesn't return anything, probably a bug
+
+        client.users.update_enabled(user=user, enabled=False)
+
+        user = client.users.get(user.id)
+
+        self.assertFalse(user.enabled)
+
+
+
+        self.assertRaises(client_exceptions.AuthorizationFailure,
+
+                  self._client,
+
+                  username=test_username,
+
+                  password='password')
+
+        client.users.update_enabled(user, True)
+
+
+
+        user = client.users.update_password(user=user, password='password2')
+
+
+
+        self._client(username=test_username,
+
+                     password='password2')
+
+
+
+        user = client.users.update_tenant(user=user, tenant='bar')
+
+        # TODO(ja): once keystonelight supports default tenant
+
+        #           when you login without specifying tenant, the
+
+        #           token should be scoped to tenant 'bar'
+
+
+
+        client.users.delete(user.id)
+
+        self.assertRaises(client_exceptions.NotFound, client.users.get,
+
+                          user.id)
+
+
+
+    def test_user_update_404(self):
+
+        raise nose.exc.SkipTest('N/A')
+
+
+
+    def test_endpoint_create_404(self):
+
+        raise nose.exc.SkipTest('N/A')
+
+
+
+    def test_endpoint_delete_404(self):
+
+        raise nose.exc.SkipTest('N/A')

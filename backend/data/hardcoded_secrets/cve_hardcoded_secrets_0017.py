@@ -2,458 +2,758 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# This file is dual licensed under the terms of the Apache License, Version
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# 2.0, and the BSD License. See the LICENSE file in the root of this repository
 
-# for complete details.
 
+# Copyright 2010 United States Government as represented by the
 
+# Administrator of the National Aeronautics and Space Administration.
 
-from __future__ import absolute_import, division, print_function
+# All Rights Reserved.
 
+#
 
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
 
-import abc
+#    not use this file except in compliance with the License. You may obtain
 
+#    a copy of the License at
 
+#
 
-import six
+#         http://www.apache.org/licenses/LICENSE-2.0
 
+#
 
+#    Unless required by applicable law or agreed to in writing, software
 
-from cryptography import utils
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
+#    License for the specific language governing permissions and limitations
 
+#    under the License.
 
 
-@six.add_metaclass(abc.ABCMeta)
 
-class Mode(object):
+from nova import compute
 
-    @abc.abstractproperty
+from nova import context
 
-    def name(self):
+from nova import db
 
-        """
+from nova import flags
 
-        A string naming this mode (e.g. "ECB", "CBC").
+from nova import quota
 
-        """
+from nova import test
 
+from nova import volume
 
+from nova.compute import instance_types
 
-    @abc.abstractmethod
 
-    def validate_for_algorithm(self, algorithm):
 
-        """
 
-        Checks that all the necessary invariants of this (mode, algorithm)
 
-        combination are met.
+FLAGS = flags.FLAGS
 
-        """
 
 
 
 
+class QuotaTestCase(test.TestCase):
 
-@six.add_metaclass(abc.ABCMeta)
 
-class ModeWithInitializationVector(object):
 
-    @abc.abstractproperty
+    class StubImageService(object):
 
-    def initialization_vector(self):
 
-        """
 
-        The value of the initialization vector for this mode as bytes.
+        def show(self, *args, **kwargs):
 
-        """
+            return {"properties": {}}
 
 
 
+    def setUp(self):
 
+        super(QuotaTestCase, self).setUp()
 
-@six.add_metaclass(abc.ABCMeta)
+        self.flags(connection_type='fake',
 
-class ModeWithTweak(object):
+                   quota_instances=2,
 
-    @abc.abstractproperty
+                   quota_cores=4,
 
-    def tweak(self):
+                   quota_volumes=2,
 
-        """
+                   quota_gigabytes=20,
 
-        The value of the tweak for this mode as bytes.
+                   quota_floating_ips=1)
 
-        """
 
 
+        self.network = self.network = self.start_service('network')
 
+        self.user_id = 'admin'
 
+        self.project_id = 'admin'
 
-@six.add_metaclass(abc.ABCMeta)
+        self.context = context.RequestContext(self.user_id,
 
-class ModeWithNonce(object):
+                                              self.project_id,
 
-    @abc.abstractproperty
+                                              True)
 
-    def nonce(self):
 
-        """
 
-        The value of the nonce for this mode as bytes.
+    def _create_instance(self, cores=2):
 
-        """
+        """Create a test instance"""
 
+        inst = {}
 
+        inst['image_id'] = 1
 
+        inst['reservation_id'] = 'r-fakeres'
 
+        inst['user_id'] = self.user_id
 
-@six.add_metaclass(abc.ABCMeta)
+        inst['project_id'] = self.project_id
 
-class ModeWithAuthenticationTag(object):
+        inst['instance_type_id'] = '3'  # m1.large
 
-    @abc.abstractproperty
+        inst['vcpus'] = cores
 
-    def tag(self):
+        return db.instance_create(self.context, inst)['id']
 
-        """
 
-        The value of the tag supplied to the constructor of this mode.
 
-        """
+    def _create_volume(self, size=10):
 
+        """Create a test volume"""
 
+        vol = {}
 
+        vol['user_id'] = self.user_id
 
+        vol['project_id'] = self.project_id
 
-def _check_aes_key_length(self, algorithm):
+        vol['size'] = size
 
-    if algorithm.key_size > 256 and algorithm.name == "AES":
+        return db.volume_create(self.context, vol)['id']
 
-        raise ValueError(
 
-            "Only 128, 192, and 256 bit keys are allowed for this AES mode"
 
-        )
+    def _get_instance_type(self, name):
 
+        instance_types = {
 
+            'm1.tiny': dict(memory_mb=512, vcpus=1, local_gb=0, flavorid=1),
 
+            'm1.small': dict(memory_mb=2048, vcpus=1, local_gb=20, flavorid=2),
 
+            'm1.medium':
 
-def _check_iv_length(self, algorithm):
+                dict(memory_mb=4096, vcpus=2, local_gb=40, flavorid=3),
 
-    if len(self.initialization_vector) * 8 != algorithm.block_size:
+            'm1.large': dict(memory_mb=8192, vcpus=4, local_gb=80, flavorid=4),
 
-        raise ValueError("Invalid IV size ({0}) for {1}.".format(
+            'm1.xlarge':
 
-            len(self.initialization_vector), self.name
+                dict(memory_mb=16384, vcpus=8, local_gb=160, flavorid=5)}
 
-        ))
+        return instance_types[name]
 
 
 
+    def test_quota_overrides(self):
 
+        """Make sure overriding a projects quotas works"""
 
-def _check_iv_and_key_length(self, algorithm):
+        num_instances = quota.allowed_instances(self.context, 100,
 
-    _check_aes_key_length(self, algorithm)
+            self._get_instance_type('m1.small'))
 
-    _check_iv_length(self, algorithm)
+        self.assertEqual(num_instances, 2)
 
+        db.quota_create(self.context, self.project_id, 'instances', 10)
 
+        num_instances = quota.allowed_instances(self.context, 100,
 
+            self._get_instance_type('m1.small'))
 
+        self.assertEqual(num_instances, 4)
 
-@utils.register_interface(Mode)
+        db.quota_create(self.context, self.project_id, 'cores', 100)
 
-@utils.register_interface(ModeWithInitializationVector)
+        num_instances = quota.allowed_instances(self.context, 100,
 
-class CBC(object):
+            self._get_instance_type('m1.small'))
 
-    name = "CBC"
+        self.assertEqual(num_instances, 10)
 
+        db.quota_create(self.context, self.project_id, 'ram', 3 * 2048)
 
+        num_instances = quota.allowed_instances(self.context, 100,
 
-    def __init__(self, initialization_vector):
+            self._get_instance_type('m1.small'))
 
-        if not isinstance(initialization_vector, bytes):
+        self.assertEqual(num_instances, 3)
 
-            raise TypeError("initialization_vector must be bytes")
 
 
+        # metadata_items
 
-        self._initialization_vector = initialization_vector
+        too_many_items = FLAGS.quota_metadata_items + 1000
 
+        num_metadata_items = quota.allowed_metadata_items(self.context,
 
+                                                          too_many_items)
 
-    initialization_vector = utils.read_only_property("_initialization_vector")
+        self.assertEqual(num_metadata_items, FLAGS.quota_metadata_items)
 
-    validate_for_algorithm = _check_iv_and_key_length
+        db.quota_create(self.context, self.project_id, 'metadata_items', 5)
 
+        num_metadata_items = quota.allowed_metadata_items(self.context,
 
+                                                          too_many_items)
 
+        self.assertEqual(num_metadata_items, 5)
 
 
-@utils.register_interface(Mode)
 
-@utils.register_interface(ModeWithTweak)
+        # Cleanup
 
-class XTS(object):
+        db.quota_destroy_all_by_project(self.context, self.project_id)
 
-    name = "XTS"
 
 
+    def test_unlimited_instances(self):
 
-    def __init__(self, tweak):
+        self.flags(quota_instances=2, quota_ram=-1, quota_cores=-1)
 
-        if not isinstance(tweak, bytes):
+        instance_type = self._get_instance_type('m1.small')
 
-            raise TypeError("tweak must be bytes")
+        num_instances = quota.allowed_instances(self.context, 100,
 
+                                                instance_type)
 
+        self.assertEqual(num_instances, 2)
 
-        if len(tweak) != 16:
+        db.quota_create(self.context, self.project_id, 'instances', None)
 
-            raise ValueError("tweak must be 128-bits (16 bytes)")
+        num_instances = quota.allowed_instances(self.context, 100,
 
+                                                instance_type)
 
+        self.assertEqual(num_instances, 100)
 
-        self._tweak = tweak
+        num_instances = quota.allowed_instances(self.context, 101,
 
+                                                instance_type)
 
+        self.assertEqual(num_instances, 101)
 
-    tweak = utils.read_only_property("_tweak")
 
 
+    def test_unlimited_ram(self):
 
-    def validate_for_algorithm(self, algorithm):
+        self.flags(quota_instances=-1, quota_ram=2 * 2048, quota_cores=-1)
 
-        if algorithm.key_size not in (256, 512):
+        instance_type = self._get_instance_type('m1.small')
 
-            raise ValueError(
+        num_instances = quota.allowed_instances(self.context, 100,
 
-                "The XTS specification requires a 256-bit key for AES-128-XTS"
+                                                instance_type)
 
-                " and 512-bit key for AES-256-XTS"
+        self.assertEqual(num_instances, 2)
 
-            )
+        db.quota_create(self.context, self.project_id, 'ram', None)
 
+        num_instances = quota.allowed_instances(self.context, 100,
 
+                                                instance_type)
 
+        self.assertEqual(num_instances, 100)
 
+        num_instances = quota.allowed_instances(self.context, 101,
 
-@utils.register_interface(Mode)
+                                                instance_type)
 
-class ECB(object):
+        self.assertEqual(num_instances, 101)
 
-    name = "ECB"
 
 
+    def test_unlimited_cores(self):
 
-    validate_for_algorithm = _check_aes_key_length
+        self.flags(quota_instances=-1, quota_ram=-1, quota_cores=2)
 
+        instance_type = self._get_instance_type('m1.small')
 
+        num_instances = quota.allowed_instances(self.context, 100,
 
+                                                instance_type)
 
+        self.assertEqual(num_instances, 2)
 
-@utils.register_interface(Mode)
+        db.quota_create(self.context, self.project_id, 'cores', None)
 
-@utils.register_interface(ModeWithInitializationVector)
+        num_instances = quota.allowed_instances(self.context, 100,
 
-class OFB(object):
+                                                instance_type)
 
-    name = "OFB"
+        self.assertEqual(num_instances, 100)
 
+        num_instances = quota.allowed_instances(self.context, 101,
 
+                                                instance_type)
 
-    def __init__(self, initialization_vector):
+        self.assertEqual(num_instances, 101)
 
-        if not isinstance(initialization_vector, bytes):
 
-            raise TypeError("initialization_vector must be bytes")
 
+    def test_unlimited_volumes(self):
 
+        self.flags(quota_volumes=10, quota_gigabytes=-1)
 
-        self._initialization_vector = initialization_vector
+        volumes = quota.allowed_volumes(self.context, 100, 1)
 
+        self.assertEqual(volumes, 10)
 
+        db.quota_create(self.context, self.project_id, 'volumes', None)
 
-    initialization_vector = utils.read_only_property("_initialization_vector")
+        volumes = quota.allowed_volumes(self.context, 100, 1)
 
-    validate_for_algorithm = _check_iv_and_key_length
+        self.assertEqual(volumes, 100)
 
+        volumes = quota.allowed_volumes(self.context, 101, 1)
 
+        self.assertEqual(volumes, 101)
 
 
 
-@utils.register_interface(Mode)
+    def test_unlimited_gigabytes(self):
 
-@utils.register_interface(ModeWithInitializationVector)
+        self.flags(quota_volumes=-1, quota_gigabytes=10)
 
-class CFB(object):
+        volumes = quota.allowed_volumes(self.context, 100, 1)
 
-    name = "CFB"
+        self.assertEqual(volumes, 10)
 
+        db.quota_create(self.context, self.project_id, 'gigabytes', None)
 
+        volumes = quota.allowed_volumes(self.context, 100, 1)
 
-    def __init__(self, initialization_vector):
+        self.assertEqual(volumes, 100)
 
-        if not isinstance(initialization_vector, bytes):
+        volumes = quota.allowed_volumes(self.context, 101, 1)
 
-            raise TypeError("initialization_vector must be bytes")
+        self.assertEqual(volumes, 101)
 
 
 
-        self._initialization_vector = initialization_vector
+    def test_unlimited_floating_ips(self):
 
+        self.flags(quota_floating_ips=10)
 
+        floating_ips = quota.allowed_floating_ips(self.context, 100)
 
-    initialization_vector = utils.read_only_property("_initialization_vector")
+        self.assertEqual(floating_ips, 10)
 
-    validate_for_algorithm = _check_iv_and_key_length
+        db.quota_create(self.context, self.project_id, 'floating_ips', None)
 
+        floating_ips = quota.allowed_floating_ips(self.context, 100)
 
+        self.assertEqual(floating_ips, 100)
 
+        floating_ips = quota.allowed_floating_ips(self.context, 101)
 
+        self.assertEqual(floating_ips, 101)
 
-@utils.register_interface(Mode)
 
-@utils.register_interface(ModeWithInitializationVector)
 
-class CFB8(object):
+    def test_unlimited_metadata_items(self):
 
-    name = "CFB8"
+        self.flags(quota_metadata_items=10)
 
+        items = quota.allowed_metadata_items(self.context, 100)
 
+        self.assertEqual(items, 10)
 
-    def __init__(self, initialization_vector):
+        db.quota_create(self.context, self.project_id, 'metadata_items', None)
 
-        if not isinstance(initialization_vector, bytes):
+        items = quota.allowed_metadata_items(self.context, 100)
 
-            raise TypeError("initialization_vector must be bytes")
+        self.assertEqual(items, 100)
 
+        items = quota.allowed_metadata_items(self.context, 101)
 
+        self.assertEqual(items, 101)
 
-        self._initialization_vector = initialization_vector
 
 
+    def test_too_many_instances(self):
 
-    initialization_vector = utils.read_only_property("_initialization_vector")
+        instance_ids = []
 
-    validate_for_algorithm = _check_iv_and_key_length
+        for i in range(FLAGS.quota_instances):
 
+            instance_id = self._create_instance()
 
+            instance_ids.append(instance_id)
 
+        inst_type = instance_types.get_instance_type_by_name('m1.small')
 
+        self.assertRaises(quota.QuotaError, compute.API().create,
 
-@utils.register_interface(Mode)
+                                            self.context,
 
-@utils.register_interface(ModeWithNonce)
+                                            min_count=1,
 
-class CTR(object):
+                                            max_count=1,
 
-    name = "CTR"
+                                            instance_type=inst_type,
 
+                                            image_href=1)
 
+        for instance_id in instance_ids:
 
-    def __init__(self, nonce):
+            db.instance_destroy(self.context, instance_id)
 
-        if not isinstance(nonce, bytes):
 
-            raise TypeError("nonce must be bytes")
 
+    def test_too_many_cores(self):
 
+        instance_ids = []
 
-        self._nonce = nonce
+        instance_id = self._create_instance(cores=4)
 
+        instance_ids.append(instance_id)
 
+        inst_type = instance_types.get_instance_type_by_name('m1.small')
 
-    nonce = utils.read_only_property("_nonce")
+        self.assertRaises(quota.QuotaError, compute.API().create,
 
+                                            self.context,
 
+                                            min_count=1,
 
-    def validate_for_algorithm(self, algorithm):
+                                            max_count=1,
 
-        _check_aes_key_length(self, algorithm)
+                                            instance_type=inst_type,
 
-        if len(self.nonce) * 8 != algorithm.block_size:
+                                            image_href=1)
 
-            raise ValueError("Invalid nonce size ({0}) for {1}.".format(
+        for instance_id in instance_ids:
 
-                len(self.nonce), self.name
+            db.instance_destroy(self.context, instance_id)
 
-            ))
 
 
+    def test_too_many_volumes(self):
 
+        volume_ids = []
 
+        for i in range(FLAGS.quota_volumes):
 
-@utils.register_interface(Mode)
+            volume_id = self._create_volume()
 
-@utils.register_interface(ModeWithInitializationVector)
+            volume_ids.append(volume_id)
 
-@utils.register_interface(ModeWithAuthenticationTag)
+        self.assertRaises(quota.QuotaError,
 
-class GCM(object):
+                          volume.API().create,
 
-    name = "GCM"
+                          self.context,
 
-    _MAX_ENCRYPTED_BYTES = (2 ** 39 - 256) // 8
+                          size=10,
 
-    _MAX_AAD_BYTES = (2 ** 64) // 8
+                          snapshot_id=None,
 
+                          name='',
 
+                          description='')
 
-    def __init__(self, initialization_vector, tag=None, min_tag_length=16):
+        for volume_id in volume_ids:
 
-        # len(initialization_vector) must in [1, 2 ** 64), but it's impossible
+            db.volume_destroy(self.context, volume_id)
 
-        # to actually construct a bytes object that large, so we don't check
 
-        # for it
 
-        if not isinstance(initialization_vector, bytes):
+    def test_too_many_gigabytes(self):
 
-            raise TypeError("initialization_vector must be bytes")
+        volume_ids = []
 
-        self._initialization_vector = initialization_vector
+        volume_id = self._create_volume(size=20)
 
-        if tag is not None:
+        volume_ids.append(volume_id)
 
-            if not isinstance(tag, bytes):
+        self.assertRaises(quota.QuotaError,
 
-                raise TypeError("tag must be bytes or None")
+                          volume.API().create,
 
-            if min_tag_length < 4:
+                          self.context,
 
-                raise ValueError("min_tag_length must be >= 4")
+                          size=10,
 
-            if len(tag) < min_tag_length:
+                          snapshot_id=None,
 
-                raise ValueError(
+                          name='',
 
-                    "Authentication tag must be {0} bytes or longer.".format(
+                          description='')
 
-                        min_tag_length)
+        for volume_id in volume_ids:
 
-                )
+            db.volume_destroy(self.context, volume_id)
 
-        self._tag = tag
 
 
+    def test_too_many_addresses(self):
 
-    tag = utils.read_only_property("_tag")
+        address = '192.168.0.100'
 
-    initialization_vector = utils.read_only_property("_initialization_vector")
+        db.floating_ip_create(context.get_admin_context(),
 
+                              {'address': address,
 
+                               'project_id': self.project_id})
 
-    def validate_for_algorithm(self, algorithm):
+        self.assertRaises(quota.QuotaError,
 
-        _check_aes_key_length(self, algorithm)
+                          self.network.allocate_floating_ip,
+
+                          self.context,
+
+                          self.project_id)
+
+        db.floating_ip_destroy(context.get_admin_context(), address)
+
+
+
+    def test_too_many_metadata_items(self):
+
+        metadata = {}
+
+        for i in range(FLAGS.quota_metadata_items + 1):
+
+            metadata['key%s' % i] = 'value%s' % i
+
+        inst_type = instance_types.get_instance_type_by_name('m1.small')
+
+        self.assertRaises(quota.QuotaError, compute.API().create,
+
+                                            self.context,
+
+                                            min_count=1,
+
+                                            max_count=1,
+
+                                            instance_type=inst_type,
+
+                                            image_href='fake',
+
+                                            metadata=metadata)
+
+
+
+    def test_default_allowed_injected_files(self):
+
+        self.flags(quota_max_injected_files=55)
+
+        self.assertEqual(quota.allowed_injected_files(self.context, 100), 55)
+
+
+
+    def test_overridden_allowed_injected_files(self):
+
+        self.flags(quota_max_injected_files=5)
+
+        db.quota_create(self.context, self.project_id, 'injected_files', 77)
+
+        self.assertEqual(quota.allowed_injected_files(self.context, 100), 77)
+
+
+
+    def test_unlimited_default_allowed_injected_files(self):
+
+        self.flags(quota_max_injected_files=-1)
+
+        self.assertEqual(quota.allowed_injected_files(self.context, 100), 100)
+
+
+
+    def test_unlimited_db_allowed_injected_files(self):
+
+        self.flags(quota_max_injected_files=5)
+
+        db.quota_create(self.context, self.project_id, 'injected_files', None)
+
+        self.assertEqual(quota.allowed_injected_files(self.context, 100), 100)
+
+
+
+    def test_default_allowed_injected_file_content_bytes(self):
+
+        self.flags(quota_max_injected_file_content_bytes=12345)
+
+        limit = quota.allowed_injected_file_content_bytes(self.context, 23456)
+
+        self.assertEqual(limit, 12345)
+
+
+
+    def test_overridden_allowed_injected_file_content_bytes(self):
+
+        self.flags(quota_max_injected_file_content_bytes=12345)
+
+        db.quota_create(self.context, self.project_id,
+
+                        'injected_file_content_bytes', 5678)
+
+        limit = quota.allowed_injected_file_content_bytes(self.context, 23456)
+
+        self.assertEqual(limit, 5678)
+
+
+
+    def test_unlimited_default_allowed_injected_file_content_bytes(self):
+
+        self.flags(quota_max_injected_file_content_bytes=-1)
+
+        limit = quota.allowed_injected_file_content_bytes(self.context, 23456)
+
+        self.assertEqual(limit, 23456)
+
+
+
+    def test_unlimited_db_allowed_injected_file_content_bytes(self):
+
+        self.flags(quota_max_injected_file_content_bytes=12345)
+
+        db.quota_create(self.context, self.project_id,
+
+                        'injected_file_content_bytes', None)
+
+        limit = quota.allowed_injected_file_content_bytes(self.context, 23456)
+
+        self.assertEqual(limit, 23456)
+
+
+
+    def _create_with_injected_files(self, files):
+
+        self.flags(image_service='nova.image.fake.FakeImageService')
+
+        api = compute.API(image_service=self.StubImageService())
+
+        inst_type = instance_types.get_instance_type_by_name('m1.small')
+
+        api.create(self.context, min_count=1, max_count=1,
+
+                instance_type=inst_type, image_href='3',
+
+                injected_files=files)
+
+
+
+    def test_no_injected_files(self):
+
+        self.flags(image_service='nova.image.fake.FakeImageService')
+
+        api = compute.API(image_service=self.StubImageService())
+
+        inst_type = instance_types.get_instance_type_by_name('m1.small')
+
+        api.create(self.context, instance_type=inst_type, image_href='3')
+
+
+
+    def test_max_injected_files(self):
+
+        files = []
+
+        for i in xrange(FLAGS.quota_max_injected_files):
+
+            files.append(('/my/path%d' % i, 'config = test\n'))
+
+        self._create_with_injected_files(files)  # no QuotaError
+
+
+
+    def test_too_many_injected_files(self):
+
+        files = []
+
+        for i in xrange(FLAGS.quota_max_injected_files + 1):
+
+            files.append(('/my/path%d' % i, 'my\ncontent%d\n' % i))
+
+        self.assertRaises(quota.QuotaError,
+
+                          self._create_with_injected_files, files)
+
+
+
+    def test_max_injected_file_content_bytes(self):
+
+        max = FLAGS.quota_max_injected_file_content_bytes
+
+        content = ''.join(['a' for i in xrange(max)])
+
+        files = [('/test/path', content)]
+
+        self._create_with_injected_files(files)  # no QuotaError
+
+
+
+    def test_too_many_injected_file_content_bytes(self):
+
+        max = FLAGS.quota_max_injected_file_content_bytes
+
+        content = ''.join(['a' for i in xrange(max + 1)])
+
+        files = [('/test/path', content)]
+
+        self.assertRaises(quota.QuotaError,
+
+                          self._create_with_injected_files, files)
+
+
+
+    def test_allowed_injected_file_path_bytes(self):
+
+        self.assertEqual(
+
+                quota.allowed_injected_file_path_bytes(self.context),
+
+                FLAGS.quota_max_injected_file_path_bytes)
+
+
+
+    def test_max_injected_file_path_bytes(self):
+
+        max = FLAGS.quota_max_injected_file_path_bytes
+
+        path = ''.join(['a' for i in xrange(max)])
+
+        files = [(path, 'config = quotatest')]
+
+        self._create_with_injected_files(files)  # no QuotaError
+
+
+
+    def test_too_many_injected_file_path_bytes(self):
+
+        max = FLAGS.quota_max_injected_file_path_bytes
+
+        path = ''.join(['a' for i in xrange(max + 1)])
+
+        files = [(path, 'config = quotatest')]
+
+        self.assertRaises(quota.QuotaError,
+
+                          self._create_with_injected_files, files)

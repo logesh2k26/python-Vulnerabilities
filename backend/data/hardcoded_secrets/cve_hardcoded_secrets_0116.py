@@ -2,268 +2,1180 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
-
-
-# Copyright 2012 OpenStack LLC
+##############################################################################
 
 #
 
-# Licensed under the Apache License, Version 2.0 (the "License"); you may
+# Copyright (c) 2002 Zope Foundation and Contributors.
 
-# not use this file except in compliance with the License. You may obtain
-
-# a copy of the License at
+# All Rights Reserved.
 
 #
 
-#      http://www.apache.org/licenses/LICENSE-2.0
+# This software is subject to the provisions of the Zope Public License,
+
+# Version 2.1 (ZPL).  A copy of the ZPL should accompany this distribution.
+
+# THIS SOFTWARE IS PROVIDED "AS IS" AND ANY AND ALL EXPRESS OR IMPLIED
+
+# WARRANTIES ARE DISCLAIMED, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+
+# WARRANTIES OF TITLE, MERCHANTABILITY, AGAINST INFRINGEMENT, AND FITNESS
+
+# FOR A PARTICULAR PURPOSE.
 
 #
 
-# Unless required by applicable law or agreed to in writing, software
+##############################################################################
 
-# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+"""HTTP Request Parser tests
 
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+"""
 
-# License for the specific language governing permissions and limitations
+import unittest
 
-# under the License.
 
-import re
 
+from waitress.compat import text_, tobytes
 
 
 
 
-class Error(StandardError):
 
-    """Base error class.
+class TestHTTPRequestParser(unittest.TestCase):
 
+    def setUp(self):
 
+        from waitress.parser import HTTPRequestParser
 
-    Child classes should define an HTTP status code, title, and a doc string.
+        from waitress.adjustments import Adjustments
 
 
 
-    """
+        my_adj = Adjustments()
 
-    code = None
+        self.parser = HTTPRequestParser(my_adj)
 
-    title = None
 
 
+    def test_get_body_stream_None(self):
 
-    def __init__(self, message=None, **kwargs):
+        self.parser.body_recv = None
 
-        """Use the doc string as the error message by default."""
+        result = self.parser.get_body_stream()
 
-        message = message or self.__doc__ % kwargs
+        self.assertEqual(result.getvalue(), b"")
 
-        super(Error, self).__init__(message)
 
 
+    def test_get_body_stream_nonNone(self):
 
-    def __str__(self):
+        body_rcv = DummyBodyStream()
 
-        """Cleans up line breaks and indentation from doc strings."""
+        self.parser.body_rcv = body_rcv
 
-        string = super(Error, self).__str__()
+        result = self.parser.get_body_stream()
 
-        string = re.sub('[ \n]+', ' ', string)
+        self.assertEqual(result, body_rcv)
 
-        string = string.strip()
 
-        return string
 
+    def test_received_get_no_headers(self):
 
+        data = b"HTTP/1.0 GET /foobar\r\n\r\n"
 
+        result = self.parser.received(data)
 
+        self.assertEqual(result, 24)
 
-class ValidationError(Error):
+        self.assertTrue(self.parser.completed)
 
-    """Expecting to find %(attribute)s in %(target)s.
+        self.assertEqual(self.parser.headers, {})
 
 
 
-    The server could not comply with the request since it is either malformed
+    def test_received_bad_host_header(self):
 
-    or otherwise incorrect.
+        from waitress.utilities import BadRequest
 
 
 
-    The client is assumed to be in error.
+        data = b"HTTP/1.0 GET /foobar\r\n Host: foo\r\n\r\n"
 
+        result = self.parser.received(data)
 
+        self.assertEqual(result, 36)
 
-    """
+        self.assertTrue(self.parser.completed)
 
-    code = 400
+        self.assertEqual(self.parser.error.__class__, BadRequest)
 
-    title = 'Bad Request'
 
 
+    def test_received_bad_transfer_encoding(self):
 
+        from waitress.utilities import ServerNotImplemented
 
+        data = (
 
-class Unauthorized(Error):
+            b"GET /foobar HTTP/1.1\r\n"
 
-    """The request you have made requires authentication."""
+            b"Transfer-Encoding: foo\r\n"
 
-    code = 401
+            b"\r\n"
 
-    title = 'Not Authorized'
+            b"1d;\r\n"
 
+            b"This string has 29 characters\r\n"
 
+            b"0\r\n\r\n"
 
+        )
 
+        result = self.parser.received(data)
 
-class Forbidden(Error):
+        self.assertEqual(result, 48)
 
-    """You are not authorized to perform the requested action."""
+        self.assertTrue(self.parser.completed)
 
-    code = 403
+        self.assertEqual(self.parser.error.__class__, ServerNotImplemented)
 
-    title = 'Not Authorized'
 
 
+    def test_received_nonsense_nothing(self):
 
+        data = b"\r\n\r\n"
 
+        result = self.parser.received(data)
 
-class ForbiddenAction(Forbidden):
+        self.assertEqual(result, 4)
 
-    """You are not authorized to perform the requested action: %(action)s"""
+        self.assertTrue(self.parser.completed)
 
+        self.assertEqual(self.parser.headers, {})
 
 
 
+    def test_received_no_doublecr(self):
 
-class NotFound(Error):
+        data = b"GET /foobar HTTP/8.4\r\n"
 
-    """Could not find: %(target)s"""
+        result = self.parser.received(data)
 
-    code = 404
+        self.assertEqual(result, 22)
 
-    title = 'Not Found'
+        self.assertFalse(self.parser.completed)
 
+        self.assertEqual(self.parser.headers, {})
 
 
 
+    def test_received_already_completed(self):
 
-class EndpointNotFound(NotFound):
+        self.parser.completed = True
 
-    """Could not find endpoint: %(endpoint_id)s"""
+        result = self.parser.received(b"a")
 
+        self.assertEqual(result, 0)
 
 
 
+    def test_received_cl_too_large(self):
 
-class MetadataNotFound(NotFound):
+        from waitress.utilities import RequestEntityTooLarge
 
-    """An unhandled exception has occurred: Could not find metadata."""
 
-    # (dolph): metadata is not a user-facing concept,
 
-    #          so this exception should not be exposed
+        self.parser.adj.max_request_body_size = 2
 
+        data = b"GET /foobar HTTP/8.4\r\nContent-Length: 10\r\n\r\n"
 
+        result = self.parser.received(data)
 
+        self.assertEqual(result, 44)
 
+        self.assertTrue(self.parser.completed)
 
-class RoleNotFound(NotFound):
+        self.assertTrue(isinstance(self.parser.error, RequestEntityTooLarge))
 
-    """Could not find role: %(role_id)s"""
 
 
+    def test_received_headers_too_large(self):
 
+        from waitress.utilities import RequestHeaderFieldsTooLarge
 
 
-class ServiceNotFound(NotFound):
 
-    """Could not find service: %(service_id)s"""
+        self.parser.adj.max_request_header_size = 2
 
+        data = b"GET /foobar HTTP/8.4\r\nX-Foo: 1\r\n\r\n"
 
+        result = self.parser.received(data)
 
+        self.assertEqual(result, 34)
 
+        self.assertTrue(self.parser.completed)
 
-class TenantNotFound(NotFound):
+        self.assertTrue(isinstance(self.parser.error, RequestHeaderFieldsTooLarge))
 
-    """Could not find tenant: %(tenant_id)s"""
 
 
+    def test_received_body_too_large(self):
 
+        from waitress.utilities import RequestEntityTooLarge
 
 
-class TokenNotFound(NotFound):
 
-    """Could not find token: %(token_id)s"""
+        self.parser.adj.max_request_body_size = 2
 
+        data = (
 
+            b"GET /foobar HTTP/1.1\r\n"
 
+            b"Transfer-Encoding: chunked\r\n"
 
+            b"X-Foo: 1\r\n"
 
-class UserNotFound(NotFound):
+            b"\r\n"
 
-    """Could not find user: %(user_id)s"""
+            b"1d;\r\n"
 
+            b"This string has 29 characters\r\n"
 
+            b"0\r\n\r\n"
 
+        )
 
 
-class Conflict(Error):
 
-    """Conflict occurred attempting to store %(type)s.
+        result = self.parser.received(data)
 
+        self.assertEqual(result, 62)
 
+        self.parser.received(data[result:])
 
-    %(details)s
+        self.assertTrue(self.parser.completed)
 
+        self.assertTrue(isinstance(self.parser.error, RequestEntityTooLarge))
 
 
-    """
 
-    code = 409
+    def test_received_error_from_parser(self):
 
-    title = 'Conflict'
+        from waitress.utilities import BadRequest
 
 
 
+        data = (
 
+            b"GET /foobar HTTP/1.1\r\n"
 
-class UnexpectedError(Error):
+            b"Transfer-Encoding: chunked\r\n"
 
-    """An unexpected error prevented the server from fulfilling your request.
+            b"X-Foo: 1\r\n"
 
+            b"\r\n"
 
+            b"garbage\r\n"
 
-    %(exception)s
+        )
 
+        # header
 
+        result = self.parser.received(data)
 
-    """
+        # body
 
-    code = 500
+        result = self.parser.received(data[result:])
 
-    title = 'Internal Server Error'
+        self.assertEqual(result, 9)
 
+        self.assertTrue(self.parser.completed)
 
+        self.assertTrue(isinstance(self.parser.error, BadRequest))
 
 
 
-class MalformedEndpoint(UnexpectedError):
+    def test_received_chunked_completed_sets_content_length(self):
 
-    """Malformed endpoint URL (see ERROR log for details): %(endpoint)s"""
+        data = (
 
+            b"GET /foobar HTTP/1.1\r\n"
 
+            b"Transfer-Encoding: chunked\r\n"
 
+            b"X-Foo: 1\r\n"
 
+            b"\r\n"
 
-class NotImplemented(Error):
+            b"1d;\r\n"
 
-    """The action you have requested has not been implemented."""
+            b"This string has 29 characters\r\n"
 
-    code = 501
+            b"0\r\n\r\n"
 
-    title = 'Not Implemented'
+        )
+
+        result = self.parser.received(data)
+
+        self.assertEqual(result, 62)
+
+        data = data[result:]
+
+        result = self.parser.received(data)
+
+        self.assertTrue(self.parser.completed)
+
+        self.assertTrue(self.parser.error is None)
+
+        self.assertEqual(self.parser.headers["CONTENT_LENGTH"], "29")
+
+
+
+    def test_parse_header_gardenpath(self):
+
+        data = b"GET /foobar HTTP/8.4\r\nfoo: bar\r\n"
+
+        self.parser.parse_header(data)
+
+        self.assertEqual(self.parser.first_line, b"GET /foobar HTTP/8.4")
+
+        self.assertEqual(self.parser.headers["FOO"], "bar")
+
+
+
+    def test_parse_header_no_cr_in_headerplus(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        data = b"GET /foobar HTTP/8.4"
+
+
+
+        try:
+
+            self.parser.parse_header(data)
+
+        except ParsingError:
+
+            pass
+
+        else:  # pragma: nocover
+
+            self.assertTrue(False)
+
+
+
+    def test_parse_header_bad_content_length(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        data = b"GET /foobar HTTP/8.4\r\ncontent-length: abc\r\n"
+
+
+
+        try:
+
+            self.parser.parse_header(data)
+
+        except ParsingError as e:
+
+            self.assertIn("Content-Length is invalid", e.args[0])
+
+        else:  # pragma: nocover
+
+            self.assertTrue(False)
+
+
+
+    def test_parse_header_multiple_content_length(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        data = b"GET /foobar HTTP/8.4\r\ncontent-length: 10\r\ncontent-length: 20\r\n"
+
+
+
+        try:
+
+            self.parser.parse_header(data)
+
+        except ParsingError as e:
+
+            self.assertIn("Content-Length is invalid", e.args[0])
+
+        else:  # pragma: nocover
+
+            self.assertTrue(False)
+
+
+
+    def test_parse_header_11_te_chunked(self):
+
+        # NB: test that capitalization of header value is unimportant
+
+        data = b"GET /foobar HTTP/1.1\r\ntransfer-encoding: ChUnKed\r\n"
+
+        self.parser.parse_header(data)
+
+        self.assertEqual(self.parser.body_rcv.__class__.__name__, "ChunkedReceiver")
+
+
+
+
+
+    def test_parse_header_transfer_encoding_invalid(self):
+
+        from waitress.parser import TransferEncodingNotImplemented
+
+
+
+        data = b"GET /foobar HTTP/1.1\r\ntransfer-encoding: gzip\r\n"
+
+
+
+        try:
+
+            self.parser.parse_header(data)
+
+        except TransferEncodingNotImplemented as e:
+
+            self.assertIn("Transfer-Encoding requested is not supported.", e.args[0])
+
+        else:  # pragma: nocover
+
+            self.assertTrue(False)
+
+
+
+    def test_parse_header_transfer_encoding_invalid_multiple(self):
+
+        from waitress.parser import TransferEncodingNotImplemented
+
+
+
+        data = b"GET /foobar HTTP/1.1\r\ntransfer-encoding: gzip\r\ntransfer-encoding: chunked\r\n"
+
+
+
+        try:
+
+            self.parser.parse_header(data)
+
+        except TransferEncodingNotImplemented as e:
+
+            self.assertIn("Transfer-Encoding requested is not supported.", e.args[0])
+
+        else:  # pragma: nocover
+
+            self.assertTrue(False)
+
+
+
+    def test_parse_header_11_expect_continue(self):
+
+        data = b"GET /foobar HTTP/1.1\r\nexpect: 100-continue\r\n"
+
+        self.parser.parse_header(data)
+
+        self.assertEqual(self.parser.expect_continue, True)
+
+
+
+    def test_parse_header_connection_close(self):
+
+        data = b"GET /foobar HTTP/1.1\r\nConnection: close\r\n"
+
+        self.parser.parse_header(data)
+
+        self.assertEqual(self.parser.connection_close, True)
+
+
+
+    def test_close_with_body_rcv(self):
+
+        body_rcv = DummyBodyStream()
+
+        self.parser.body_rcv = body_rcv
+
+        self.parser.close()
+
+        self.assertTrue(body_rcv.closed)
+
+
+
+    def test_close_with_no_body_rcv(self):
+
+        self.parser.body_rcv = None
+
+        self.parser.close()  # doesn't raise
+
+
+
+    def test_parse_header_lf_only(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        data = b"GET /foobar HTTP/8.4\nfoo: bar"
+
+
+
+        try:
+
+            self.parser.parse_header(data)
+
+        except ParsingError:
+
+            pass
+
+        else:  # pragma: nocover
+
+            self.assertTrue(False)
+
+
+
+    def test_parse_header_cr_only(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        data = b"GET /foobar HTTP/8.4\rfoo: bar"
+
+        try:
+
+            self.parser.parse_header(data)
+
+        except ParsingError:
+
+            pass
+
+        else:  # pragma: nocover
+
+            self.assertTrue(False)
+
+
+
+    def test_parse_header_extra_lf_in_header(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        data = b"GET /foobar HTTP/8.4\r\nfoo: \nbar\r\n"
+
+        try:
+
+            self.parser.parse_header(data)
+
+        except ParsingError as e:
+
+            self.assertIn("Bare CR or LF found in header line", e.args[0])
+
+        else:  # pragma: nocover
+
+            self.assertTrue(False)
+
+
+
+    def test_parse_header_extra_lf_in_first_line(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        data = b"GET /foobar\n HTTP/8.4\r\n"
+
+        try:
+
+            self.parser.parse_header(data)
+
+        except ParsingError as e:
+
+            self.assertIn("Bare CR or LF found in HTTP message", e.args[0])
+
+        else:  # pragma: nocover
+
+            self.assertTrue(False)
+
+
+
+    def test_parse_header_invalid_whitespace(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        data = b"GET /foobar HTTP/8.4\r\nfoo : bar\r\n"
+
+        try:
+
+            self.parser.parse_header(data)
+
+        except ParsingError as e:
+
+            self.assertIn("Invalid whitespace after field-name", e.args[0])
+
+        else:  # pragma: nocover
+
+            self.assertTrue(False)
+
+
+
+
+
+class Test_split_uri(unittest.TestCase):
+
+    def _callFUT(self, uri):
+
+        from waitress.parser import split_uri
+
+
+
+        (
+
+            self.proxy_scheme,
+
+            self.proxy_netloc,
+
+            self.path,
+
+            self.query,
+
+            self.fragment,
+
+        ) = split_uri(uri)
+
+
+
+    def test_split_uri_unquoting_unneeded(self):
+
+        self._callFUT(b"http://localhost:8080/abc def")
+
+        self.assertEqual(self.path, "/abc def")
+
+
+
+    def test_split_uri_unquoting_needed(self):
+
+        self._callFUT(b"http://localhost:8080/abc%20def")
+
+        self.assertEqual(self.path, "/abc def")
+
+
+
+    def test_split_url_with_query(self):
+
+        self._callFUT(b"http://localhost:8080/abc?a=1&b=2")
+
+        self.assertEqual(self.path, "/abc")
+
+        self.assertEqual(self.query, "a=1&b=2")
+
+
+
+    def test_split_url_with_query_empty(self):
+
+        self._callFUT(b"http://localhost:8080/abc?")
+
+        self.assertEqual(self.path, "/abc")
+
+        self.assertEqual(self.query, "")
+
+
+
+    def test_split_url_with_fragment(self):
+
+        self._callFUT(b"http://localhost:8080/#foo")
+
+        self.assertEqual(self.path, "/")
+
+        self.assertEqual(self.fragment, "foo")
+
+
+
+    def test_split_url_https(self):
+
+        self._callFUT(b"https://localhost:8080/")
+
+        self.assertEqual(self.path, "/")
+
+        self.assertEqual(self.proxy_scheme, "https")
+
+        self.assertEqual(self.proxy_netloc, "localhost:8080")
+
+
+
+    def test_split_uri_unicode_error_raises_parsing_error(self):
+
+        # See https://github.com/Pylons/waitress/issues/64
+
+        from waitress.parser import ParsingError
+
+
+
+        # Either pass or throw a ParsingError, just don't throw another type of
+
+        # exception as that will cause the connection to close badly:
+
+        try:
+
+            self._callFUT(b"/\xd0")
+
+        except ParsingError:
+
+            pass
+
+
+
+    def test_split_uri_path(self):
+
+        self._callFUT(b"//testing/whatever")
+
+        self.assertEqual(self.path, "//testing/whatever")
+
+        self.assertEqual(self.proxy_scheme, "")
+
+        self.assertEqual(self.proxy_netloc, "")
+
+        self.assertEqual(self.query, "")
+
+        self.assertEqual(self.fragment, "")
+
+
+
+    def test_split_uri_path_query(self):
+
+        self._callFUT(b"//testing/whatever?a=1&b=2")
+
+        self.assertEqual(self.path, "//testing/whatever")
+
+        self.assertEqual(self.proxy_scheme, "")
+
+        self.assertEqual(self.proxy_netloc, "")
+
+        self.assertEqual(self.query, "a=1&b=2")
+
+        self.assertEqual(self.fragment, "")
+
+
+
+    def test_split_uri_path_query_fragment(self):
+
+        self._callFUT(b"//testing/whatever?a=1&b=2#fragment")
+
+        self.assertEqual(self.path, "//testing/whatever")
+
+        self.assertEqual(self.proxy_scheme, "")
+
+        self.assertEqual(self.proxy_netloc, "")
+
+        self.assertEqual(self.query, "a=1&b=2")
+
+        self.assertEqual(self.fragment, "fragment")
+
+
+
+
+
+class Test_get_header_lines(unittest.TestCase):
+
+    def _callFUT(self, data):
+
+        from waitress.parser import get_header_lines
+
+
+
+        return get_header_lines(data)
+
+
+
+    def test_get_header_lines(self):
+
+        result = self._callFUT(b"slam\r\nslim")
+
+        self.assertEqual(result, [b"slam", b"slim"])
+
+
+
+    def test_get_header_lines_folded(self):
+
+        # From RFC2616:
+
+        # HTTP/1.1 header field values can be folded onto multiple lines if the
+
+        # continuation line begins with a space or horizontal tab. All linear
+
+        # white space, including folding, has the same semantics as SP. A
+
+        # recipient MAY replace any linear white space with a single SP before
+
+        # interpreting the field value or forwarding the message downstream.
+
+
+
+        # We are just preserving the whitespace that indicates folding.
+
+        result = self._callFUT(b"slim\r\n slam")
+
+        self.assertEqual(result, [b"slim slam"])
+
+
+
+    def test_get_header_lines_tabbed(self):
+
+        result = self._callFUT(b"slam\r\n\tslim")
+
+        self.assertEqual(result, [b"slam\tslim"])
+
+
+
+    def test_get_header_lines_malformed(self):
+
+        # https://corte.si/posts/code/pathod/pythonservers/index.html
+
+        from waitress.parser import ParsingError
+
+
+
+        self.assertRaises(ParsingError, self._callFUT, b" Host: localhost\r\n\r\n")
+
+
+
+
+
+class Test_crack_first_line(unittest.TestCase):
+
+    def _callFUT(self, line):
+
+        from waitress.parser import crack_first_line
+
+
+
+        return crack_first_line(line)
+
+
+
+    def test_crack_first_line_matchok(self):
+
+        result = self._callFUT(b"GET / HTTP/1.0")
+
+        self.assertEqual(result, (b"GET", b"/", b"1.0"))
+
+
+
+    def test_crack_first_line_lowercase_method(self):
+
+        from waitress.parser import ParsingError
+
+
+
+        self.assertRaises(ParsingError, self._callFUT, b"get / HTTP/1.0")
+
+
+
+    def test_crack_first_line_nomatch(self):
+
+        result = self._callFUT(b"GET / bleh")
+
+        self.assertEqual(result, (b"", b"", b""))
+
+
+
+        result = self._callFUT(b"GET /info?txtAirPlay&txtRAOP RTSP/1.0")
+
+        self.assertEqual(result, (b"", b"", b""))
+
+
+
+    def test_crack_first_line_missing_version(self):
+
+        result = self._callFUT(b"GET /")
+
+        self.assertEqual(result, (b"GET", b"/", b""))
+
+
+
+
+
+class TestHTTPRequestParserIntegration(unittest.TestCase):
+
+    def setUp(self):
+
+        from waitress.parser import HTTPRequestParser
+
+        from waitress.adjustments import Adjustments
+
+
+
+        my_adj = Adjustments()
+
+        self.parser = HTTPRequestParser(my_adj)
+
+
+
+    def feed(self, data):
+
+        parser = self.parser
+
+
+
+        for n in range(100):  # make sure we never loop forever
+
+            consumed = parser.received(data)
+
+            data = data[consumed:]
+
+
+
+            if parser.completed:
+
+                return
+
+        raise ValueError("Looping")  # pragma: no cover
+
+
+
+    def testSimpleGET(self):
+
+        data = (
+
+            b"GET /foobar HTTP/8.4\r\n"
+
+            b"FirstName: mickey\r\n"
+
+            b"lastname: Mouse\r\n"
+
+            b"content-length: 6\r\n"
+
+            b"\r\n"
+
+            b"Hello."
+
+        )
+
+        parser = self.parser
+
+        self.feed(data)
+
+        self.assertTrue(parser.completed)
+
+        self.assertEqual(parser.version, "8.4")
+
+        self.assertFalse(parser.empty)
+
+        self.assertEqual(
+
+            parser.headers,
+
+            {"FIRSTNAME": "mickey", "LASTNAME": "Mouse", "CONTENT_LENGTH": "6",},
+
+        )
+
+        self.assertEqual(parser.path, "/foobar")
+
+        self.assertEqual(parser.command, "GET")
+
+        self.assertEqual(parser.query, "")
+
+        self.assertEqual(parser.proxy_scheme, "")
+
+        self.assertEqual(parser.proxy_netloc, "")
+
+        self.assertEqual(parser.get_body_stream().getvalue(), b"Hello.")
+
+
+
+    def testComplexGET(self):
+
+        data = (
+
+            b"GET /foo/a+%2B%2F%C3%A4%3D%26a%3Aint?d=b+%2B%2F%3D%26b%3Aint&c+%2B%2F%3D%26c%3Aint=6 HTTP/8.4\r\n"
+
+            b"FirstName: mickey\r\n"
+
+            b"lastname: Mouse\r\n"
+
+            b"content-length: 10\r\n"
+
+            b"\r\n"
+
+            b"Hello mickey."
+
+        )
+
+        parser = self.parser
+
+        self.feed(data)
+
+        self.assertEqual(parser.command, "GET")
+
+        self.assertEqual(parser.version, "8.4")
+
+        self.assertFalse(parser.empty)
+
+        self.assertEqual(
+
+            parser.headers,
+
+            {"FIRSTNAME": "mickey", "LASTNAME": "Mouse", "CONTENT_LENGTH": "10"},
+
+        )
+
+        # path should be utf-8 encoded
+
+        self.assertEqual(
+
+            tobytes(parser.path).decode("utf-8"),
+
+            text_(b"/foo/a++/\xc3\xa4=&a:int", "utf-8"),
+
+        )
+
+        self.assertEqual(
+
+            parser.query, "d=b+%2B%2F%3D%26b%3Aint&c+%2B%2F%3D%26c%3Aint=6"
+
+        )
+
+        self.assertEqual(parser.get_body_stream().getvalue(), b"Hello mick")
+
+
+
+    def testProxyGET(self):
+
+        data = (
+
+            b"GET https://example.com:8080/foobar HTTP/8.4\r\n"
+
+            b"content-length: 6\r\n"
+
+            b"\r\n"
+
+            b"Hello."
+
+        )
+
+        parser = self.parser
+
+        self.feed(data)
+
+        self.assertTrue(parser.completed)
+
+        self.assertEqual(parser.version, "8.4")
+
+        self.assertFalse(parser.empty)
+
+        self.assertEqual(parser.headers, {"CONTENT_LENGTH": "6"})
+
+        self.assertEqual(parser.path, "/foobar")
+
+        self.assertEqual(parser.command, "GET")
+
+        self.assertEqual(parser.proxy_scheme, "https")
+
+        self.assertEqual(parser.proxy_netloc, "example.com:8080")
+
+        self.assertEqual(parser.command, "GET")
+
+        self.assertEqual(parser.query, "")
+
+        self.assertEqual(parser.get_body_stream().getvalue(), b"Hello.")
+
+
+
+    def testDuplicateHeaders(self):
+
+        # Ensure that headers with the same key get concatenated as per
+
+        # RFC2616.
+
+        data = (
+
+            b"GET /foobar HTTP/8.4\r\n"
+
+            b"x-forwarded-for: 10.11.12.13\r\n"
+
+            b"x-forwarded-for: unknown,127.0.0.1\r\n"
+
+            b"X-Forwarded_for: 255.255.255.255\r\n"
+
+            b"content-length: 6\r\n"
+
+            b"\r\n"
+
+            b"Hello."
+
+        )
+
+        self.feed(data)
+
+        self.assertTrue(self.parser.completed)
+
+        self.assertEqual(
+
+            self.parser.headers,
+
+            {
+
+                "CONTENT_LENGTH": "6",
+
+                "X_FORWARDED_FOR": "10.11.12.13, unknown,127.0.0.1",
+
+            },
+
+        )
+
+
+
+    def testSpoofedHeadersDropped(self):
+
+        data = (
+
+            b"GET /foobar HTTP/8.4\r\n"
+
+            b"x-auth_user: bob\r\n"
+
+            b"content-length: 6\r\n"
+
+            b"\r\n"
+
+            b"Hello."
+
+        )
+
+        self.feed(data)
+
+        self.assertTrue(self.parser.completed)
+
+        self.assertEqual(self.parser.headers, {"CONTENT_LENGTH": "6",})
+
+
+
+
+
+class DummyBodyStream(object):
+
+    def getfile(self):
+
+        return self
+
+
+
+    def getbuf(self):
+
+        return self
+
+
+
+    def close(self):
+
+        self.closed = True

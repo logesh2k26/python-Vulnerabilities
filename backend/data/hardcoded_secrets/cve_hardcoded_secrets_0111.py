@@ -2,852 +2,756 @@
 # Safety: vulnerable
 # Category: hardcoded_secrets
 
-from collections import OrderedDict
+"""
 
-import sys
+.. module: security_monkey.sso.views
 
-import warnings
+    :platform: Unix
 
+    :copyright: (c) 2015 by Netflix Inc., see AUTHORS for more
 
+    :license: Apache, see LICENSE for more details.
 
-from django.core.exceptions import SuspiciousOperation, ImproperlyConfigured
+.. moduleauthor:: Patrick Kelley <patrick@netflix.com>
 
-from django.core.paginator import InvalidPage
+"""
 
-from django.core.urlresolvers import reverse
+import jwt
 
-from django.db import models
+import base64
 
-from django.db.models.fields import FieldDoesNotExist
-
-from django.utils import six
-
-from django.utils.deprecation import RenameMethodsBase, RemovedInDjango18Warning
-
-from django.utils.encoding import force_text
-
-from django.utils.translation import ugettext, ugettext_lazy
-
-from django.utils.http import urlencode
+import requests
 
 
 
-from django.contrib.admin import FieldListFilter
-
-from django.contrib.admin.exceptions import DisallowedModelAdminLookup
-
-from django.contrib.admin.options import IncorrectLookupParameters, IS_POPUP_VAR, TO_FIELD_VAR
-
-from django.contrib.admin.utils import (quote, get_fields_from_path,
-
-    lookup_needs_distinct, prepare_lookup_value)
+from flask import Blueprint, current_app, redirect, request
 
 
 
-# Changelist settings
+from flask.ext.restful import reqparse, Resource, Api
 
-ALL_VAR = 'all'
+from flask.ext.principal import Identity, identity_changed
 
-ORDER_VAR = 'o'
-
-ORDER_TYPE_VAR = 'ot'
-
-PAGE_VAR = 'p'
-
-SEARCH_VAR = 'q'
-
-ERROR_FLAG = 'e'
+from flask_login import login_user
 
 
 
-IGNORED_PARAMS = (
+try:
 
-    ALL_VAR, ORDER_VAR, ORDER_TYPE_VAR, SEARCH_VAR, IS_POPUP_VAR, TO_FIELD_VAR)
+    from onelogin.saml2.auth import OneLogin_Saml2_Auth
+
+    from onelogin.saml2.utils import OneLogin_Saml2_Utils
+
+    onelogin_import_success = True
+
+except ImportError:
+
+    onelogin_import_success = False
 
 
 
-# Text to display within change-list table cells if the value is blank.
+from .service import fetch_token_header_payload, get_rsa_public_key
 
-EMPTY_CHANGELIST_VALUE = ugettext_lazy('(None)')
+
+
+from security_monkey.datastore import User
+
+from security_monkey import db, rbac
+
+
+
+from urlparse import urlparse
+
+
+
+mod = Blueprint('sso', __name__)
+
+api = Api(mod)
 
 
 
 
 
-def _is_changelist_popup(request):
-
-    """
-
-    Returns True if the popup GET parameter is set.
+from flask_security.utils import validate_redirect_url
 
 
 
-    This function is introduced to facilitate deprecating the legacy
 
-    value for IS_POPUP_VAR and should be removed at the end of the
 
-    deprecation cycle.
+class Ping(Resource):
 
     """
 
+    This class serves as an example of how one might implement an SSO provider for use with Security Monkey. In
 
+    this example we use a OpenIDConnect authentication flow, that is essentially OAuth2 underneath.
 
-    if IS_POPUP_VAR in request.GET:
+    """
 
-        return True
+    decorators = [rbac.allow(["anonymous"], ["GET", "POST"])]
 
+    def __init__(self):
 
+        self.reqparse = reqparse.RequestParser()
 
-    IS_LEGACY_POPUP_VAR = 'pop'
+        super(Ping, self).__init__()
 
-    if IS_LEGACY_POPUP_VAR in request.GET:
 
-        warnings.warn(
 
-            "The `%s` GET parameter has been renamed to `%s`." %
+    def get(self):
 
-            (IS_LEGACY_POPUP_VAR, IS_POPUP_VAR),
+        return self.post()
 
-            RemovedInDjango18Warning, 2)
 
-        return True
 
+    def post(self):
 
+        if "ping" not in current_app.config.get("ACTIVE_PROVIDERS"):
 
-    return False
+            return "Ping is not enabled in the config.  See the ACTIVE_PROVIDERS section.", 404
 
 
 
+        default_state = 'clientId,{client_id},redirectUri,{redirectUri},return_to,{return_to}'.format(
 
+            client_id=current_app.config.get('PING_CLIENT_ID'),
 
-class RenameChangeListMethods(RenameMethodsBase):
+            redirectUri=current_app.config.get('PING_REDIRECT_URI'),
 
-    renamed_methods = (
+            return_to=current_app.config.get('WEB_PATH')
 
-        ('get_query_set', 'get_queryset', RemovedInDjango18Warning),
+        )
 
-    )
+        self.reqparse.add_argument('code', type=str, required=True)
 
+        self.reqparse.add_argument('state', type=str, required=False, default=default_state)
 
 
 
+        args = self.reqparse.parse_args()
 
-class ChangeList(six.with_metaclass(RenameChangeListMethods)):
+        client_id = args['state'].split(',')[1]
 
-    def __init__(self, request, model, list_display, list_display_links,
+        redirect_uri = args['state'].split(',')[3]
 
-            list_filter, date_hierarchy, search_fields, list_select_related,
+        return_to = args['state'].split(',')[5]
 
-            list_per_page, list_max_show_all, list_editable, model_admin):
 
-        self.model = model
 
-        self.opts = model._meta
+        if not validate_redirect_url(return_to):
 
-        self.lookup_opts = self.opts
+            return_to = current_app.config.get('WEB_PATH')
 
-        self.root_queryset = model_admin.get_queryset(request)
 
-        self.list_display = list_display
 
-        self.list_display_links = list_display_links
+        # take the information we have received from the provider to create a new request
 
-        self.list_filter = list_filter
+        params = {
 
-        self.date_hierarchy = date_hierarchy
+            'client_id': client_id,
 
-        self.search_fields = search_fields
+            'grant_type': 'authorization_code',
 
-        self.list_select_related = list_select_related
+            'scope': 'openid email profile address',
 
-        self.list_per_page = list_per_page
+            'redirect_uri': redirect_uri,
 
-        self.list_max_show_all = list_max_show_all
+            'code': args['code']
 
-        self.model_admin = model_admin
+        }
 
-        self.preserved_filters = model_admin.get_preserved_filters(request)
 
 
+        # you can either discover these dynamically or simply configure them
 
-        # Get search parameters from the query string.
+        access_token_url = current_app.config.get('PING_ACCESS_TOKEN_URL')
 
-        try:
+        user_api_url = current_app.config.get('PING_USER_API_URL')
 
-            self.page_num = int(request.GET.get(PAGE_VAR, 0))
 
-        except ValueError:
 
-            self.page_num = 0
+        # the secret and cliendId will be given to you when you signup for the provider
 
-        self.show_all = ALL_VAR in request.GET
+        basic = base64.b64encode(bytes('{0}:{1}'.format(client_id, current_app.config.get("PING_SECRET"))))
 
-        self.is_popup = _is_changelist_popup(request)
+        headers = {'Authorization': 'Basic {0}'.format(basic.decode('utf-8'))}
 
-        self.to_field = request.GET.get(TO_FIELD_VAR)
 
-        self.params = dict(request.GET.items())
 
-        if PAGE_VAR in self.params:
+        # exchange authorization code for access token.
 
-            del self.params[PAGE_VAR]
+        r = requests.post(access_token_url, headers=headers, params=params)
 
-        if ERROR_FLAG in self.params:
+        id_token = r.json()['id_token']
 
-            del self.params[ERROR_FLAG]
+        access_token = r.json()['access_token']
 
 
 
-        if self.is_popup:
+        # fetch token public key
 
-            self.list_editable = ()
+        header_data = fetch_token_header_payload(id_token)[0]
+
+        jwks_url = current_app.config.get('PING_JWKS_URL')
+
+
+
+        # retrieve the key material as specified by the token header
+
+        r = requests.get(jwks_url)
+
+        for key in r.json()['keys']:
+
+            if key['kid'] == header_data['kid']:
+
+                secret = get_rsa_public_key(key['n'], key['e'])
+
+                algo = header_data['alg']
+
+                break
 
         else:
 
-            self.list_editable = list_editable
+            return dict(message='Key not found'), 403
 
-        self.query = request.GET.get(SEARCH_VAR, '')
 
-        self.queryset = self.get_queryset(request)
 
-        self.get_results(request)
-
-        if self.is_popup:
-
-            title = ugettext('Select %s')
-
-        else:
-
-            title = ugettext('Select %s to change')
-
-        self.title = title % force_text(self.opts.verbose_name)
-
-        self.pk_attname = self.lookup_opts.pk.attname
-
-
-
-    @property
-
-    def root_query_set(self):
-
-        warnings.warn("`ChangeList.root_query_set` is deprecated, "
-
-                      "use `root_queryset` instead.",
-
-                      RemovedInDjango18Warning, 2)
-
-        return self.root_queryset
-
-
-
-    @property
-
-    def query_set(self):
-
-        warnings.warn("`ChangeList.query_set` is deprecated, "
-
-                      "use `queryset` instead.",
-
-                      RemovedInDjango18Warning, 2)
-
-        return self.queryset
-
-
-
-    def get_filters_params(self, params=None):
-
-        """
-
-        Returns all params except IGNORED_PARAMS
-
-        """
-
-        if not params:
-
-            params = self.params
-
-        lookup_params = params.copy()  # a dictionary of the query string
-
-        # Remove all the parameters that are globally and systematically
-
-        # ignored.
-
-        for ignored in IGNORED_PARAMS:
-
-            if ignored in lookup_params:
-
-                del lookup_params[ignored]
-
-        return lookup_params
-
-
-
-    def get_filters(self, request):
-
-        lookup_params = self.get_filters_params()
-
-        use_distinct = False
-
-
-
-        for key, value in lookup_params.items():
-
-            if not self.model_admin.lookup_allowed(key, value):
-
-                raise DisallowedModelAdminLookup("Filtering by %s not allowed" % key)
-
-
-
-        filter_specs = []
-
-        if self.list_filter:
-
-            for list_filter in self.list_filter:
-
-                if callable(list_filter):
-
-                    # This is simply a custom list filter class.
-
-                    spec = list_filter(request, lookup_params,
-
-                        self.model, self.model_admin)
-
-                else:
-
-                    field_path = None
-
-                    if isinstance(list_filter, (tuple, list)):
-
-                        # This is a custom FieldListFilter class for a given field.
-
-                        field, field_list_filter_class = list_filter
-
-                    else:
-
-                        # This is simply a field name, so use the default
-
-                        # FieldListFilter class that has been registered for
-
-                        # the type of the given field.
-
-                        field, field_list_filter_class = list_filter, FieldListFilter.create
-
-                    if not isinstance(field, models.Field):
-
-                        field_path = field
-
-                        field = get_fields_from_path(self.model, field_path)[-1]
-
-                    spec = field_list_filter_class(field, request, lookup_params,
-
-                        self.model, self.model_admin, field_path=field_path)
-
-                    # Check if we need to use distinct()
-
-                    use_distinct = (use_distinct or
-
-                                    lookup_needs_distinct(self.lookup_opts,
-
-                                                          field_path))
-
-                if spec and spec.has_output():
-
-                    filter_specs.append(spec)
-
-
-
-        # At this point, all the parameters used by the various ListFilters
-
-        # have been removed from lookup_params, which now only contains other
-
-        # parameters passed via the query string. We now loop through the
-
-        # remaining parameters both to ensure that all the parameters are valid
-
-        # fields and to determine if at least one of them needs distinct(). If
-
-        # the lookup parameters aren't real fields, then bail out.
+        # validate your token based on the key it was signed with
 
         try:
 
-            for key, value in lookup_params.items():
+            current_app.logger.debug(id_token)
 
-                lookup_params[key] = prepare_lookup_value(key, value)
+            current_app.logger.debug(secret)
 
-                use_distinct = (use_distinct or
+            current_app.logger.debug(algo)
 
-                                lookup_needs_distinct(self.lookup_opts, key))
+            jwt.decode(id_token, secret.decode('utf-8'), algorithms=[algo], audience=client_id)
 
-            return filter_specs, bool(filter_specs), lookup_params, use_distinct
+        except jwt.DecodeError:
 
-        except FieldDoesNotExist as e:
+            return dict(message='Token is invalid'), 403
 
-            six.reraise(IncorrectLookupParameters, IncorrectLookupParameters(e), sys.exc_info()[2])
+        except jwt.ExpiredSignatureError:
+
+            return dict(message='Token has expired'), 403
+
+        except jwt.InvalidTokenError:
+
+            return dict(message='Token is invalid'), 403
 
 
 
-    def get_query_string(self, new_params=None, remove=None):
+        user_params = dict(access_token=access_token, schema='profile')
 
-        if new_params is None:
 
-            new_params = {}
 
-        if remove is None:
+        # retrieve information about the current user.
 
-            remove = []
+        r = requests.get(user_api_url, params=user_params)
 
-        p = self.params.copy()
+        profile = r.json()
 
-        for r in remove:
 
-            for k in list(p):
 
-                if k.startswith(r):
+        user = User.query.filter(User.email==profile['email']).first()
 
-                    del p[k]
 
-        for k, v in new_params.items():
 
-            if v is None:
+        # if we get an sso user create them an account
 
-                if k in p:
+        if not user:
 
-                    del p[k]
+            user = User(
+
+                email=profile['email'],
+
+                active=True,
+
+                role='View'
+
+                # profile_picture=profile.get('thumbnailPhotoUrl')
+
+            )
+
+            db.session.add(user)
+
+            db.session.commit()
+
+            db.session.refresh(user)
+
+
+
+        # Tell Flask-Principal the identity changed
+
+        identity_changed.send(current_app._get_current_object(), identity=Identity(user.id))
+
+        login_user(user)
+
+
+
+        return redirect(return_to, code=302)
+
+
+
+
+
+class Google(Resource):
+
+    decorators = [rbac.allow(["anonymous"], ["GET", "POST"])]
+
+    def __init__(self):
+
+        self.reqparse = reqparse.RequestParser()
+
+        super(Google, self).__init__()
+
+
+
+    def get(self):
+
+        return self.post()
+
+
+
+    def post(self):
+
+        if "google" not in current_app.config.get("ACTIVE_PROVIDERS"):
+
+            return "Google is not enabled in the config.  See the ACTIVE_PROVIDERS section.", 404
+
+
+
+        default_state = 'clientId,{client_id},redirectUri,{redirectUri},return_to,{return_to}'.format(
+
+            client_id=current_app.config.get("GOOGLE_CLIENT_ID"),
+
+            redirectUri=api.url_for(Google),
+
+            return_to=current_app.config.get('WEB_PATH')
+
+        )
+
+        self.reqparse.add_argument('code', type=str, required=True)
+
+        self.reqparse.add_argument('state', type=str, required=False, default=default_state)
+
+
+
+        args = self.reqparse.parse_args()
+
+        client_id = args['state'].split(',')[1]
+
+        redirect_uri = args['state'].split(',')[3]
+
+        return_to = args['state'].split(',')[5]
+
+
+
+        if not validate_redirect_url(return_to):
+
+            return_to = current_app.config.get('WEB_PATH')
+
+
+
+        access_token_url = 'https://accounts.google.com/o/oauth2/token'
+
+        people_api_url = 'https://www.googleapis.com/plus/v1/people/me/openIdConnect'
+
+
+
+        args = self.reqparse.parse_args()
+
+
+
+        # Step 1. Exchange authorization code for access token
+
+        payload = {
+
+            'client_id': client_id,
+
+            'grant_type': 'authorization_code',
+
+            'redirect_uri': redirect_uri,
+
+            'code': args['code'],
+
+            'client_secret': current_app.config.get('GOOGLE_SECRET')
+
+        }
+
+
+
+        r = requests.post(access_token_url, data=payload)
+
+        token = r.json()
+
+
+
+        # Step 1bis. Validate (some information of) the id token (if necessary)
+
+        google_hosted_domain = current_app.config.get("GOOGLE_HOSTED_DOMAIN")
+
+        if google_hosted_domain is not None:
+
+            current_app.logger.debug('We need to verify that the token was issued for this hosted domain: %s ' % (google_hosted_domain))
+
+
+
+	    # Get the JSON Web Token
+
+            id_token = r.json()['id_token']
+
+            current_app.logger.debug('The id_token is: %s' % (id_token))
+
+
+
+            # Extract the payload
+
+            (header_data, payload_data) = fetch_token_header_payload(id_token)
+
+            current_app.logger.debug('id_token.header_data: %s' % (header_data))
+
+            current_app.logger.debug('id_token.payload_data: %s' % (payload_data))
+
+
+
+            token_hd = payload_data.get('hd')
+
+            if token_hd != google_hosted_domain:
+
+                current_app.logger.debug('Verification failed: %s != %s' % (token_hd, google_hosted_domain))
+
+                return dict(message='Token is invalid %s' % token), 403
+
+            current_app.logger.debug('Verification passed')
+
+
+
+        # Step 2. Retrieve information about the current user
+
+        headers = {'Authorization': 'Bearer {0}'.format(token['access_token'])}
+
+
+
+        r = requests.get(people_api_url, headers=headers)
+
+        profile = r.json()
+
+
+
+        user = User.query.filter(User.email == profile['email']).first()
+
+
+
+        # if we get an sso user create them an account
+
+        if not user:
+
+            user = User(
+
+                email=profile['email'],
+
+                active=True,
+
+                role='View'
+
+                # profile_picture=profile.get('thumbnailPhotoUrl')
+
+            )
+
+            db.session.add(user)
+
+            db.session.commit()
+
+            db.session.refresh(user)
+
+
+
+        # Tell Flask-Principal the identity changed
+
+        identity_changed.send(current_app._get_current_object(), identity=Identity(user.id))
+
+        login_user(user)
+
+
+
+        return redirect(return_to, code=302)
+
+
+
+
+
+class OneLogin(Resource):
+
+    decorators = [rbac.allow(["anonymous"], ["GET", "POST"])]
+
+    def __init__(self):
+
+        self.reqparse = reqparse.RequestParser()
+
+        self.req = OneLogin.prepare_from_flask_request(request)
+
+        super(OneLogin, self).__init__()
+
+
+
+    @staticmethod
+
+    def prepare_from_flask_request(req):
+
+        url_data = urlparse(req.url)
+
+        return {
+
+            'http_host': req.host,
+
+            'server_port': url_data.port,
+
+            'script_name': req.path,
+
+            'get_data': req.args.copy(),
+
+            'post_data': req.form.copy(),
+
+            'https': ("on" if current_app.config.get("ONELOGIN_HTTPS") else "off")
+
+    }
+
+
+
+    def get(self):
+
+        return self.post()
+
+
+
+    def _consumer(self, auth):
+
+        auth.process_response()
+
+        errors = auth.get_errors()
+
+        if not errors:
+
+            if auth.is_authenticated():
+
+                return True
 
             else:
 
-                p[k] = v
-
-        return '?%s' % urlencode(sorted(p.items()))
-
-
-
-    def get_results(self, request):
-
-        paginator = self.model_admin.get_paginator(request, self.queryset, self.list_per_page)
-
-        # Get the number of objects, with admin filters applied.
-
-        result_count = paginator.count
-
-
-
-        # Get the total number of objects, with no admin filters applied.
-
-        # Perform a slight optimization:
-
-        # full_result_count is equal to paginator.count if no filters
-
-        # were applied
-
-        if self.get_filters_params() or self.params.get(SEARCH_VAR):
-
-            full_result_count = self.root_queryset.count()
+                return False
 
         else:
 
-            full_result_count = result_count
+            current_app.logger.error('Error processing %s' % (', '.join(errors)))
 
-        can_show_all = result_count <= self.list_max_show_all
-
-        multi_page = result_count > self.list_per_page
+            return False
 
 
 
-        # Get the list of objects to display on this page.
+    def post(self):
 
-        if (self.show_all and can_show_all) or not multi_page:
+        if "onelogin" not in current_app.config.get("ACTIVE_PROVIDERS"):
 
-            result_list = self.queryset._clone()
+            return "Onelogin is not enabled in the config.  See the ACTIVE_PROVIDERS section.", 404
 
-        else:
-
-            try:
-
-                result_list = paginator.page(self.page_num + 1).object_list
-
-            except InvalidPage:
-
-                raise IncorrectLookupParameters
+        auth = OneLogin_Saml2_Auth(self.req, current_app.config.get("ONELOGIN_SETTINGS"))
 
 
 
-        self.result_count = result_count
+        self.reqparse.add_argument('return_to', required=False, default=current_app.config.get('WEB_PATH'))
 
-        self.full_result_count = full_result_count
+        self.reqparse.add_argument('acs', required=False)
 
-        self.result_list = result_list
-
-        self.can_show_all = can_show_all
-
-        self.multi_page = multi_page
-
-        self.paginator = paginator
+        self.reqparse.add_argument('sls', required=False)
 
 
 
-    def _get_default_ordering(self):
-
-        ordering = []
-
-        if self.model_admin.ordering:
-
-            ordering = self.model_admin.ordering
-
-        elif self.lookup_opts.ordering:
-
-            ordering = self.lookup_opts.ordering
-
-        return ordering
+        args = self.reqparse.parse_args()
 
 
 
-    def get_ordering_field(self, field_name):
+        return_to = args['return_to']
 
-        """
 
-        Returns the proper model field name corresponding to the given
 
-        field_name to use for ordering. field_name may either be the name of a
+        if args['acs'] != None:
 
-        proper model field or the name of a method (on the admin or model) or a
+            # valids the SAML response and checks if successfully authenticated
 
-        callable with the 'admin_order_field' attribute. Returns None if no
+            if self._consumer(auth):
 
-        proper model field name can be matched.
+                email = auth.get_attribute(current_app.config.get("ONELOGIN_EMAIL_FIELD"))[0]
 
-        """
+                user = User.query.filter(User.email == email).first()
 
-        try:
 
-            field = self.lookup_opts.get_field(field_name)
 
-            return field.name
+                # if we get an sso user create them an account
 
-        except models.FieldDoesNotExist:
+                if not user:
 
-            # See whether field_name is a name of a non-field
+                    user = User(
 
-            # that allows sorting.
+                        email=email,
 
-            if callable(field_name):
+                        active=True,
 
-                attr = field_name
+                        role=current_app.config.get('ONELOGIN_DEFAULT_ROLE')
 
-            elif hasattr(self.model_admin, field_name):
+                        # profile_picture=profile.get('thumbnailPhotoUrl')
 
-                attr = getattr(self.model_admin, field_name)
+                    )
+
+                    db.session.add(user)
+
+                    db.session.commit()
+
+                    db.session.refresh(user)
+
+
+
+                # Tell Flask-Principal the identity changed
+
+                identity_changed.send(current_app._get_current_object(), identity=Identity(user.id))
+
+                login_user(user)
+
+
+
+                self_url = OneLogin_Saml2_Utils.get_self_url(self.req)
+
+                if 'RelayState' in request.form and self_url != request.form['RelayState']:
+
+                    return redirect(auth.redirect_to(request.form['RelayState']), code=302)
+
+                else:  
+
+                    return redirect(current_app.config.get('BASE_URL'), code=302)
 
             else:
 
-                attr = getattr(self.model, field_name)
+                return dict(message='OneLogin authentication failed.'), 403
 
-            return getattr(attr, 'admin_order_field', None)
+        elif args['sls'] != None:
 
-
-
-    def get_ordering(self, request, queryset):
-
-        """
-
-        Returns the list of ordering fields for the change list.
-
-        First we check the get_ordering() method in model admin, then we check
-
-        the object's default ordering. Then, any manually-specified ordering
-
-        from the query string overrides anything. Finally, a deterministic
-
-        order is guaranteed by ensuring the primary key is used as the last
-
-        ordering field.
-
-        """
-
-        params = self.params
-
-        ordering = list(self.model_admin.get_ordering(request)
-
-                        or self._get_default_ordering())
-
-        if ORDER_VAR in params:
-
-            # Clear ordering and used params
-
-            ordering = []
-
-            order_params = params[ORDER_VAR].split('.')
-
-            for p in order_params:
-
-                try:
-
-                    none, pfx, idx = p.rpartition('-')
-
-                    field_name = self.list_display[int(idx)]
-
-                    order_field = self.get_ordering_field(field_name)
-
-                    if not order_field:
-
-                        continue  # No 'admin_order_field', skip it
-
-                    # reverse order if order_field has already "-" as prefix
-
-                    if order_field.startswith('-') and pfx == "-":
-
-                        ordering.append(order_field[1:])
-
-                    else:
-
-                        ordering.append(pfx + order_field)
-
-                except (IndexError, ValueError):
-
-                    continue  # Invalid ordering specified, skip it.
-
-
-
-        # Add the given query's ordering fields, if any.
-
-        ordering.extend(queryset.query.order_by)
-
-
-
-        # Ensure that the primary key is systematically present in the list of
-
-        # ordering fields so we can guarantee a deterministic order across all
-
-        # database backends.
-
-        pk_name = self.lookup_opts.pk.name
-
-        if not (set(ordering) & set(['pk', '-pk', pk_name, '-' + pk_name])):
-
-            # The two sets do not intersect, meaning the pk isn't present. So
-
-            # we add it.
-
-            ordering.append('-pk')
-
-
-
-        return ordering
-
-
-
-    def get_ordering_field_columns(self):
-
-        """
-
-        Returns an OrderedDict of ordering field column numbers and asc/desc
-
-        """
-
-
-
-        # We must cope with more than one column having the same underlying sort
-
-        # field, so we base things on column numbers.
-
-        ordering = self._get_default_ordering()
-
-        ordering_fields = OrderedDict()
-
-        if ORDER_VAR not in self.params:
-
-            # for ordering specified on ModelAdmin or model Meta, we don't know
-
-            # the right column numbers absolutely, because there might be more
-
-            # than one column associated with that ordering, so we guess.
-
-            for field in ordering:
-
-                if field.startswith('-'):
-
-                    field = field[1:]
-
-                    order_type = 'desc'
-
-                else:
-
-                    order_type = 'asc'
-
-                for index, attr in enumerate(self.list_display):
-
-                    if self.get_ordering_field(attr) == field:
-
-                        ordering_fields[index] = order_type
-
-                        break
+            return dict(message='OneLogin SLS not implemented yet.'), 405
 
         else:
 
-            for p in self.params[ORDER_VAR].split('.'):
+            return redirect(auth.login(return_to=return_to))
 
-                none, pfx, idx = p.rpartition('-')
 
-                try:
 
-                    idx = int(idx)
 
-                except ValueError:
 
-                    continue  # skip it
+class Providers(Resource):
 
-                ordering_fields[idx] = 'desc' if pfx == '-' else 'asc'
+    decorators = [rbac.allow(["anonymous"], ["GET"])]
 
-        return ordering_fields
+    def __init__(self):
 
+        super(Providers, self).__init__()
 
 
-    def get_queryset(self, request):
 
-        # First, we collect all the declared list filters.
+    def get(self):
 
-        (self.filter_specs, self.has_filters, remaining_lookup_params,
+        active_providers = []
 
-         filters_use_distinct) = self.get_filters(request)
 
 
+        for provider in current_app.config.get("ACTIVE_PROVIDERS"):
 
-        # Then, we let every list filter modify the queryset to its liking.
+            provider = provider.lower()
 
-        qs = self.root_queryset
 
-        for filter_spec in self.filter_specs:
 
-            new_qs = filter_spec.queryset(request, qs)
+            if provider == "ping":
 
-            if new_qs is not None:
+                active_providers.append({
 
-                qs = new_qs
+                    'name': current_app.config.get("PING_NAME"),
 
+                    'url': current_app.config.get('PING_REDIRECT_URI'),
 
+                    'redirectUri': current_app.config.get("PING_REDIRECT_URI"),
 
-        try:
+                    'clientId': current_app.config.get("PING_CLIENT_ID"),
 
-            # Finally, we apply the remaining lookup parameters from the query
+                    'responseType': 'code',
 
-            # string (i.e. those that haven't already been processed by the
+                    'scope': ['openid', 'profile', 'email'],
 
-            # filters).
+                    'scopeDelimiter': ' ',
 
-            qs = qs.filter(**remaining_lookup_params)
+                    'authorizationEndpoint': current_app.config.get("PING_AUTH_ENDPOINT"),
 
-        except (SuspiciousOperation, ImproperlyConfigured):
+                    'requiredUrlParams': ['scope'],
 
-            # Allow certain types of errors to be re-raised as-is so that the
+                    'type': '2.0'
 
-            # caller can treat them in a special way.
+                })
 
-            raise
+            elif provider == "google":
 
-        except Exception as e:
+                google_provider = {
 
-            # Every other error is caught with a naked except, because we don't
+                    'name': 'google',
 
-            # have any other way of validating lookup parameters. They might be
+                    'clientId': current_app.config.get("GOOGLE_CLIENT_ID"),
 
-            # invalid if the keyword arguments are incorrect, or if the values
+                    'url': api.url_for(Google, _external=True, _scheme='https'),
 
-            # are not in the correct type, so we might get FieldError,
+                    'redirectUri': api.url_for(Google, _external=True, _scheme='https'),
 
-            # ValueError, ValidationError, or ?.
+                    'authorizationEndpoint': current_app.config.get("GOOGLE_AUTH_ENDPOINT"),
 
-            raise IncorrectLookupParameters(e)
+                    'scope': ['openid email'],
 
+                    'responseType': 'code'
 
+                }
 
-        if not qs.query.select_related:
+                google_hosted_domain = current_app.config.get("GOOGLE_HOSTED_DOMAIN")
 
-            qs = self.apply_select_related(qs)
+                if google_hosted_domain is not None:
 
+                    google_provider['hd'] = google_hosted_domain
 
+                active_providers.append(google_provider)
 
-        # Set ordering.
+            elif provider == "onelogin":
 
-        ordering = self.get_ordering(request, qs)
+                active_providers.append({
 
-        qs = qs.order_by(*ordering)
+                    'name': 'OneLogin',
 
+                    'authorizationEndpoint': api.url_for(OneLogin)
 
-
-        # Apply search results
-
-        qs, search_use_distinct = self.model_admin.get_search_results(
-
-            request, qs, self.query)
-
-
-
-        # Remove duplicates from results, if necessary
-
-        if filters_use_distinct | search_use_distinct:
-
-            return qs.distinct()
-
-        else:
-
-            return qs
-
-
-
-    def apply_select_related(self, qs):
-
-        if self.list_select_related is True:
-
-            return qs.select_related()
-
-
-
-        if self.list_select_related is False:
-
-            if self.has_related_field_in_list_display():
-
-                return qs.select_related()
-
-
-
-        if self.list_select_related:
-
-            return qs.select_related(*self.list_select_related)
-
-        return qs
-
-
-
-    def has_related_field_in_list_display(self):
-
-        for field_name in self.list_display:
-
-            try:
-
-                field = self.lookup_opts.get_field(field_name)
-
-            except models.FieldDoesNotExist:
-
-                pass
+                })
 
             else:
 
-                if isinstance(field.rel, models.ManyToOneRel):
-
-                    return True
-
-        return False
+                raise Exception("Unknown authentication provider: {0}".format(provider))
 
 
 
-    def url_for_result(self, result):
+        return active_providers
 
-        pk = getattr(result, self.pk_attname)
 
-        return reverse('admin:%s_%s_change' % (self.opts.app_label,
 
-                                               self.opts.model_name),
 
-                       args=(quote(pk),),
 
-                       current_app=self.model_admin.admin_site.name)
+api.add_resource(Ping, '/auth/ping', endpoint='ping')
+
+api.add_resource(Google, '/auth/google', endpoint='google')
+
+api.add_resource(Providers, '/auth/providers', endpoint='providers')
+
+
+
+if onelogin_import_success:
+
+    api.add_resource(OneLogin, '/auth/onelogin', endpoint='onelogin')

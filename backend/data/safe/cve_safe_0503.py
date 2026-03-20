@@ -1,173 +1,127 @@
 # Source: CVEFixes dataset
-# Safety: vulnerable
+# Safety: safe
 # Category: safe
 
-# -*- coding: utf-8 -*-
+#     Copyright 2014 Netflix, Inc.
 
-from django.conf import settings
+#
 
-from django.contrib.auth import login as django_login
+#     Licensed under the Apache License, Version 2.0 (the "License");
 
-from django.contrib.auth import logout as django_logout
+#     you may not use this file except in compliance with the License.
 
-from django.core.exceptions import ObjectDoesNotExist
+#     You may obtain a copy of the License at
 
-from django.utils.decorators import method_decorator
+#
 
-from django.utils.translation import ugettext_lazy as _
+#         http://www.apache.org/licenses/LICENSE-2.0
 
-from django.views.decorators.debug import sensitive_post_parameters
+#
 
-from rest_framework import status
+#     Unless required by applicable law or agreed to in writing, software
 
-from rest_framework.authtoken.models import Token
+#     distributed under the License is distributed on an "AS IS" BASIS,
 
-from rest_framework.generics import GenericAPIView
+#     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 
-from rest_framework.permissions import AllowAny
+#     See the License for the specific language governing permissions and
 
-from rest_framework.response import Response
+#     limitations under the License.
 
-from rest_framework.views import APIView
+from setuptools import setup
 
 
 
-from nopassword.rest import serializers
+setup(
 
+    name='security_monkey',
 
+    version='0.8.0',
 
+    long_description=__doc__,
 
+    packages=['security_monkey'],
 
-class LoginView(GenericAPIView):
+    include_package_data=True,
 
-    serializer_class = serializers.LoginSerializer
+    zip_safe=False,
 
-    permission_classes = (AllowAny,)
+    install_requires=[
 
+        'APScheduler==2.1.2',
 
+        'Flask==0.10.1',
 
-    def post(self, request, *args, **kwargs):
+        'Flask-Mail==0.9.0',
 
-        serializer = self.get_serializer(data=request.data)
+        'Flask-Migrate==1.3.1',
 
-        serializer.is_valid(raise_exception=True)
+        'Flask-Principal==0.4.0',
 
-        serializer.save()
+        'Flask-RESTful==0.3.3',
 
+        'Flask-SQLAlchemy==1.0',
 
+        'Flask-Script==0.6.3',
 
-        return Response(
+        # 'Flask-Security==1.7.4',
 
-            {"detail": _("Login code has been sent.")},
+        'Flask-Security-Fork==1.8.2',
 
-            status=status.HTTP_200_OK
+        'Jinja2==2.8',
 
-        )
+        'SQLAlchemy==0.9.2',
 
+        'boto>=2.41.0',
 
+        'ipaddr==2.1.11',
 
+        'itsdangerous==0.23',
 
+        'psycopg2==2.6.2',
 
-@method_decorator(sensitive_post_parameters('code'), 'dispatch')
+        'bcrypt==3.1.2',
 
-class LoginCodeView(GenericAPIView):
+        'Sphinx==1.2.2',
 
-    permission_classes = (AllowAny,)
+        'gunicorn==18.0',
 
-    serializer_class = serializers.LoginCodeSerializer
+        'cryptography==1.7.1',
 
-    token_serializer_class = serializers.TokenSerializer
+        'boto3>=1.4.2',
 
-    token_model = Token
+        'botocore>=1.4.81',
 
+        'dpath==1.3.2',
 
+        'pyyaml==3.11',
 
-    def process_login(self):
+        'jira==0.32',
 
-        django_login(self.request, self.user)
+        'cloudaux>=1.0.6',
 
+        'joblib>=0.9.4',
 
+        'pyjwt>=1.01',
 
-    def login(self):
+    ],
 
-        self.user = self.serializer.validated_data['user']
+    extras_require = {
 
-        self.token, created = self.token_model.objects.get_or_create(user=self.user)
+        'onelogin': ['python-saml>=2.2.0'],
 
+        'tests': [
 
+            'nose==1.3.0',
 
-        if getattr(settings, 'REST_SESSION_LOGIN', True):
+            'mock==1.0.1',
 
-            self.process_login()
+            'moto==0.4.30',
 
+            'freezegun>=0.3.7'
 
+        ]
 
-    def get_response(self):
+    }
 
-        token_serializer = self.token_serializer_class(
-
-            instance=self.token,
-
-            context=self.get_serializer_context(),
-
-        )
-
-        data = token_serializer.data
-
-        data['next'] = self.serializer.validated_data['code'].next
-
-        return Response(data, status=status.HTTP_200_OK)
-
-
-
-    def post(self, request, *args, **kwargs):
-
-        self.serializer = self.get_serializer(data=request.data)
-
-        self.serializer.is_valid(raise_exception=True)
-
-        self.serializer.save()
-
-        self.login()
-
-        return self.get_response()
-
-
-
-
-
-class LogoutView(APIView):
-
-    permission_classes = (AllowAny,)
-
-
-
-    def post(self, request, *args, **kwargs):
-
-        return self.logout(request)
-
-
-
-    def logout(self, request):
-
-        try:
-
-            request.user.auth_token.delete()
-
-        except (AttributeError, ObjectDoesNotExist):
-
-            pass
-
-
-
-        django_logout(request)
-
-
-
-        return Response(
-
-            {"detail": _("Successfully logged out.")},
-
-            status=status.HTTP_200_OK,
-
-        )
+)

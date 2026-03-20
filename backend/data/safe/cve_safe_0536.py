@@ -2,672 +2,344 @@
 # Safety: safe
 # Category: safe
 
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
+# -*- coding: utf-8 -*-
 
-
-
-# Copyright 2010 United States Government as represented by the
-
-# Administrator of the National Aeronautics and Space Administration.
-
-# All Rights Reserved.
+# Self-tests for the user-friendly Crypto.Random interface
 
 #
 
-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
-
-#    not use this file except in compliance with the License. You may obtain
-
-#    a copy of the License at
+# Written in 2013 by Dwayne C. Litzenberger <dlitz@dlitz.net>
 
 #
 
-#         http://www.apache.org/licenses/LICENSE-2.0
+# ===================================================================
+
+# The contents of this file are dedicated to the public domain.  To
+
+# the extent that dedication to the public domain is not available,
+
+# everyone is granted a worldwide, perpetual, royalty-free,
+
+# non-exclusive license to exercise all rights associated with the
+
+# contents of this file for any purpose whatsoever.
+
+# No rights are reserved.
 
 #
 
-#    Unless required by applicable law or agreed to in writing, software
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
 
-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
 
-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
 
-#    License for the specific language governing permissions and limitations
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
 
-#    under the License.
+# BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+
+# ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+
+# SOFTWARE.
+
+# ===================================================================
 
 
 
-"""Proxy AMI-related calls from cloud controller to objectstore service."""
+"""Self-test suite for generic Crypto.Random stuff """
+
+
+
+from __future__ import nested_scopes
+
+
+
+__revision__ = "$Id$"
 
 
 
 import binascii
 
+import pprint
+
+import unittest
+
 import os
 
-import shutil
+import time
 
-import tarfile
+import sys
 
-import tempfile
+if sys.version_info[0] == 2 and sys.version_info[1] == 1:
 
-from xml.etree import ElementTree
+    from Crypto.Util.py21compat import *
 
-
-
-import boto.s3.connection
-
-import eventlet
+from Crypto.Util.py3compat import *
 
 
 
-from nova import crypto
+try:
 
-from nova import exception
+    import multiprocessing
 
-from nova import flags
+except ImportError:
 
-from nova import image
-
-from nova import log as logging
-
-from nova import utils
-
-from nova.image import service
-
-from nova.api.ec2 import ec2utils
+    multiprocessing = None
 
 
 
+import Crypto.Random._UserFriendlyRNG
 
-
-LOG = logging.getLogger("nova.image.s3")
-
-FLAGS = flags.FLAGS
-
-flags.DEFINE_string('image_decryption_dir', '/tmp',
-
-                    'parent dir for tempdir used for image decryption')
-
-flags.DEFINE_string('s3_access_key', 'notchecked',
-
-                    'access key to use for s3 server for images')
-
-flags.DEFINE_string('s3_secret_key', 'notchecked',
-
-                    'secret key to use for s3 server for images')
+import Crypto.Random.random
 
 
 
-
-
-class S3ImageService(service.BaseImageService):
-
-    """Wraps an existing image service to support s3 based register."""
+class RNGForkTest(unittest.TestCase):
 
 
 
-    def __init__(self, service=None, *args, **kwargs):
-
-        self.service = service or image.get_default_image_service()
-
-        self.service.__init__(*args, **kwargs)
-
-
-
-    def create(self, context, metadata, data=None):
-
-        """Create an image.
-
-
-
-        metadata['properties'] should contain image_location.
-
-
+    def _get_reseed_count(self):
 
         """
 
-        image = self._s3_create(context, metadata)
+        Get `FortunaAccumulator.reseed_count`, the global count of the
 
-        return image
+        number of times that the PRNG has been reseeded.
 
+        """
 
+        rng_singleton = Crypto.Random._UserFriendlyRNG._get_singleton()
 
-    def delete(self, context, image_id):
-
-        self.service.delete(context, image_id)
-
-
-
-    def update(self, context, image_id, metadata, data=None):
-
-        image = self.service.update(context, image_id, metadata, data)
-
-        return image
-
-
-
-    def index(self, context):
-
-        return self.service.index(context)
-
-
-
-    def detail(self, context):
-
-        return self.service.detail(context)
-
-
-
-    def show(self, context, image_id):
-
-        return self.service.show(context, image_id)
-
-
-
-    def show_by_name(self, context, name):
-
-        return self.service.show_by_name(context, name)
-
-
-
-    @staticmethod
-
-    def _conn(context):
-
-        # NOTE(vish): access and secret keys for s3 server are not
-
-        #             checked in nova-objectstore
-
-        access = FLAGS.s3_access_key
-
-        secret = FLAGS.s3_secret_key
-
-        calling = boto.s3.connection.OrdinaryCallingFormat()
-
-        return boto.s3.connection.S3Connection(aws_access_key_id=access,
-
-                                               aws_secret_access_key=secret,
-
-                                               is_secure=False,
-
-                                               calling_format=calling,
-
-                                               port=FLAGS.s3_port,
-
-                                               host=FLAGS.s3_host)
-
-
-
-    @staticmethod
-
-    def _download_file(bucket, filename, local_dir):
-
-        key = bucket.get_key(filename)
-
-        local_filename = os.path.join(local_dir, os.path.basename(filename))
-
-        key.get_contents_to_filename(local_filename)
-
-        return local_filename
-
-
-
-    def _s3_parse_manifest(self, context, metadata, manifest):
-
-        manifest = ElementTree.fromstring(manifest)
-
-        image_format = 'ami'
-
-        image_type = 'machine'
-
-
+        rng_singleton._lock.acquire()
 
         try:
 
-            kernel_id = manifest.find('machine_configuration/kernel_id').text
+            return rng_singleton._fa.reseed_count
 
-            if kernel_id == 'true':
+        finally:
 
-                image_format = 'aki'
+            rng_singleton._lock.release()
 
-                image_type = 'kernel'
 
-                kernel_id = None
 
-        except Exception:
+    def runTest(self):
 
-            kernel_id = None
+        # Regression test for CVE-2013-1445.  We had a bug where, under the
 
+        # right conditions, two processes might see the same random sequence.
 
 
-        try:
 
-            ramdisk_id = manifest.find('machine_configuration/ramdisk_id').text
+        if sys.platform.startswith('win'):  # windows can't fork
 
-            if ramdisk_id == 'true':
+            assert not hasattr(os, 'fork')    # ... right?
 
-                image_format = 'ari'
+            return
 
-                image_type = 'ramdisk'
 
-                ramdisk_id = None
 
-        except Exception:
+        # Wait 150 ms so that we don't trigger the rate-limit prematurely.
 
-            ramdisk_id = None
+        time.sleep(0.15)
 
 
 
-        try:
+        reseed_count_before = self._get_reseed_count()
 
-            arch = manifest.find('machine_configuration/architecture').text
 
-        except Exception:
 
-            arch = 'x86_64'
+        # One or both of these calls together should trigger a reseed right here.
 
+        Crypto.Random._UserFriendlyRNG._get_singleton().reinit()
 
+        Crypto.Random.get_random_bytes(1)
 
-        # NOTE(yamahata):
 
-        # EC2 ec2-budlne-image --block-device-mapping accepts
 
-        # <virtual name>=<device name> where
+        reseed_count_after = self._get_reseed_count()
 
-        # virtual name = {ami, root, swap, ephemeral<N>}
+        self.assertNotEqual(reseed_count_before, reseed_count_after)  # sanity check: test should reseed parent before forking
 
-        #                where N is no negative integer
 
-        # device name = the device name seen by guest kernel.
 
-        # They are converted into
+        rfiles = []
 
-        # block_device_mapping/mapping/{virtual, device}
+        for i in range(10):
 
-        #
+            rfd, wfd = os.pipe()
 
-        # Do NOT confuse this with ec2-register's block device mapping
+            if os.fork() == 0:
 
-        # argument.
+                # child
 
-        mappings = []
+                os.close(rfd)
 
-        try:
+                f = os.fdopen(wfd, "wb")
 
-            block_device_mapping = manifest.findall('machine_configuration/'
 
-                                                    'block_device_mapping/'
 
-                                                    'mapping')
+                Crypto.Random.atfork()
 
-            for bdm in block_device_mapping:
 
-                mappings.append({'virtual': bdm.find('virtual').text,
 
-                                 'device': bdm.find('device').text})
+                data = Crypto.Random.get_random_bytes(16)
 
-        except Exception:
 
-            mappings = []
 
+                f.write(data)
 
+                f.close()
 
-        properties = metadata['properties']
+                os._exit(0)
 
-        properties['project_id'] = context.project_id
+            # parent
 
-        properties['architecture'] = arch
+            os.close(wfd)
 
+            rfiles.append(os.fdopen(rfd, "rb"))
 
 
-        if kernel_id:
 
-            properties['kernel_id'] = ec2utils.ec2_id_to_id(kernel_id)
+        results = []
 
+        results_dict = {}
 
+        for f in rfiles:
 
-        if ramdisk_id:
+            data = binascii.hexlify(f.read())
 
-            properties['ramdisk_id'] = ec2utils.ec2_id_to_id(ramdisk_id)
+            results.append(data)
 
+            results_dict[data] = 1
 
+            f.close()
 
-        if mappings:
 
-            properties['mappings'] = mappings
 
+        if len(results) != len(results_dict.keys()):
 
+            raise AssertionError("RNG output duplicated across fork():\n%s" %
 
-        metadata.update({'disk_format': image_format,
+                                 (pprint.pformat(results)))
 
-                         'container_format': image_format,
 
-                         'status': 'queued',
 
-                         'is_public': False,
 
-                         'properties': properties})
 
-        metadata['properties']['image_state'] = 'pending'
+# For RNGMultiprocessingForkTest
 
-        image = self.service.create(context, metadata)
+def _task_main(q):
 
-        return manifest, image
+    a = Crypto.Random.get_random_bytes(16)
 
+    time.sleep(0.1)     # wait 100 ms
 
+    b = Crypto.Random.get_random_bytes(16)
 
-    def _s3_create(self, context, metadata):
+    q.put(binascii.b2a_hex(a))
 
-        """Gets a manifext from s3 and makes an image."""
+    q.put(binascii.b2a_hex(b))
 
+    q.put(None)      # Wait for acknowledgment
 
 
-        image_path = tempfile.mkdtemp(dir=FLAGS.image_decryption_dir)
 
 
 
-        image_location = metadata['properties']['image_location']
+class RNGMultiprocessingForkTest(unittest.TestCase):
 
-        bucket_name = image_location.split('/')[0]
 
-        manifest_path = image_location[len(bucket_name) + 1:]
 
-        bucket = self._conn(context).get_bucket(bucket_name)
+    def runTest(self):
 
-        key = bucket.get_key(manifest_path)
+        # Another regression test for CVE-2013-1445.  This is basically the
 
-        manifest = key.get_contents_as_string()
+        # same as RNGForkTest, but less compatible with old versions of Python,
 
+        # and a little easier to read.
 
 
-        manifest, image = self._s3_parse_manifest(context, metadata, manifest)
 
-        image_id = image['id']
+        n_procs = 5
 
+        manager = multiprocessing.Manager()
 
+        queues = [manager.Queue(1) for i in range(n_procs)]
 
-        def delayed_create():
 
-            """This handles the fetching and decrypting of the part files."""
 
-            log_vars = {'image_location': image_location,
+        # Reseed the pool
 
-                        'image_path': image_path}
+        time.sleep(0.15)
 
-            metadata['properties']['image_state'] = 'downloading'
+        Crypto.Random._UserFriendlyRNG._get_singleton().reinit()
 
-            self.service.update(context, image_id, metadata)
+        Crypto.Random.get_random_bytes(1)
 
 
 
-            try:
+        # Start the child processes
 
-                parts = []
+        pool = multiprocessing.Pool(processes=n_procs, initializer=Crypto.Random.atfork)
 
-                elements = manifest.find('image').getiterator('filename')
+        map_result = pool.map_async(_task_main, queues)
 
-                for fn_element in elements:
 
-                    part = self._download_file(bucket,
 
-                                               fn_element.text,
+        # Get the results, ensuring that no pool processes are reused.
 
-                                               image_path)
+        aa = [queues[i].get(30) for i in range(n_procs)]
 
-                    parts.append(part)
+        bb = [queues[i].get(30) for i in range(n_procs)]
 
+        res = list(zip(aa, bb))
 
 
-                # NOTE(vish): this may be suboptimal, should we use cat?
 
-                enc_filename = os.path.join(image_path, 'image.encrypted')
+        # Shut down the pool
 
-                with open(enc_filename, 'w') as combined:
+        map_result.get(30)
 
-                    for filename in parts:
+        pool.close()
 
-                        with open(filename) as part:
+        pool.join()
 
-                            shutil.copyfileobj(part, combined)
 
 
+        # Check that the results are unique
 
-            except Exception:
+        if len(set(aa)) != len(aa) or len(set(res)) != len(res):
 
-                LOG.exception(_("Failed to download %(image_location)s "
+            raise AssertionError("RNG output duplicated across fork():\n%s" %
 
-                                "to %(image_path)s"), log_vars)
+                                 (pprint.pformat(res),))
 
-                metadata['properties']['image_state'] = 'failed_download'
 
-                self.service.update(context, image_id, metadata)
 
-                return
 
 
+def get_tests(config={}):
 
-            metadata['properties']['image_state'] = 'decrypting'
+    tests = []
 
-            self.service.update(context, image_id, metadata)
+    tests += [RNGForkTest()]
 
+    if multiprocessing is not None:
 
+        tests += [RNGMultiprocessingForkTest()]
 
-            try:
+    return tests
 
-                hex_key = manifest.find('image/ec2_encrypted_key').text
 
-                encrypted_key = binascii.a2b_hex(hex_key)
 
-                hex_iv = manifest.find('image/ec2_encrypted_iv').text
+if __name__ == '__main__':
 
-                encrypted_iv = binascii.a2b_hex(hex_iv)
+    suite = lambda: unittest.TestSuite(get_tests())
 
+    unittest.main(defaultTest='suite')
 
 
-                # FIXME(vish): grab key from common service so this can run on
 
-                #              any host.
-
-                cloud_pk = crypto.key_path(context.project_id)
-
-
-
-                dec_filename = os.path.join(image_path, 'image.tar.gz')
-
-                self._decrypt_image(enc_filename, encrypted_key,
-
-                                    encrypted_iv, cloud_pk,
-
-                                    dec_filename)
-
-            except Exception:
-
-                LOG.exception(_("Failed to decrypt %(image_location)s "
-
-                                "to %(image_path)s"), log_vars)
-
-                metadata['properties']['image_state'] = 'failed_decrypt'
-
-                self.service.update(context, image_id, metadata)
-
-                return
-
-
-
-            metadata['properties']['image_state'] = 'untarring'
-
-            self.service.update(context, image_id, metadata)
-
-
-
-            try:
-
-                unz_filename = self._untarzip_image(image_path, dec_filename)
-
-            except Exception:
-
-                LOG.exception(_("Failed to untar %(image_location)s "
-
-                                "to %(image_path)s"), log_vars)
-
-                metadata['properties']['image_state'] = 'failed_untar'
-
-                self.service.update(context, image_id, metadata)
-
-                return
-
-
-
-            metadata['properties']['image_state'] = 'uploading'
-
-            self.service.update(context, image_id, metadata)
-
-            try:
-
-                with open(unz_filename) as image_file:
-
-                    self.service.update(context, image_id,
-
-                                        metadata, image_file)
-
-            except Exception:
-
-                LOG.exception(_("Failed to upload %(image_location)s "
-
-                                "to %(image_path)s"), log_vars)
-
-                metadata['properties']['image_state'] = 'failed_upload'
-
-                self.service.update(context, image_id, metadata)
-
-                return
-
-
-
-            metadata['properties']['image_state'] = 'available'
-
-            metadata['status'] = 'active'
-
-            self.service.update(context, image_id, metadata)
-
-
-
-            shutil.rmtree(image_path)
-
-
-
-        eventlet.spawn_n(delayed_create)
-
-
-
-        return image
-
-
-
-    @staticmethod
-
-    def _decrypt_image(encrypted_filename, encrypted_key, encrypted_iv,
-
-                       cloud_private_key, decrypted_filename):
-
-        key, err = utils.execute('openssl',
-
-                                 'rsautl',
-
-                                 '-decrypt',
-
-                                 '-inkey', '%s' % cloud_private_key,
-
-                                 process_input=encrypted_key,
-
-                                 check_exit_code=False)
-
-        if err:
-
-            raise exception.Error(_('Failed to decrypt private key: %s')
-
-                                  % err)
-
-        iv, err = utils.execute('openssl',
-
-                                'rsautl',
-
-                                '-decrypt',
-
-                                '-inkey', '%s' % cloud_private_key,
-
-                                process_input=encrypted_iv,
-
-                                check_exit_code=False)
-
-        if err:
-
-            raise exception.Error(_('Failed to decrypt initialization '
-
-                                    'vector: %s') % err)
-
-
-
-        _out, err = utils.execute('openssl', 'enc',
-
-                                  '-d', '-aes-128-cbc',
-
-                                  '-in', '%s' % (encrypted_filename,),
-
-                                  '-K', '%s' % (key,),
-
-                                  '-iv', '%s' % (iv,),
-
-                                  '-out', '%s' % (decrypted_filename,),
-
-                                  check_exit_code=False)
-
-        if err:
-
-            raise exception.Error(_('Failed to decrypt image file '
-
-                                    '%(image_file)s: %(err)s') %
-
-                                    {'image_file': encrypted_filename,
-
-                                     'err': err})
-
-
-
-    @staticmethod
-
-    def _test_for_malicious_tarball(path, filename):
-
-        """Raises exception if extracting tarball would escape extract path"""
-
-        tar_file = tarfile.open(filename, 'r|gz')
-
-        for n in tar_file.getnames():
-
-            if not os.path.abspath(os.path.join(path, n)).startswith(path):
-
-                tar_file.close()
-
-                raise exception.Error(_('Unsafe filenames in image'))
-
-        tar_file.close()
-
-
-
-    @staticmethod
-
-    def _untarzip_image(path, filename):
-
-        S3ImageService._test_for_malicious_tarball(path, filename)
-
-        tar_file = tarfile.open(filename, 'r|gz')
-
-        tar_file.extractall(path)
-
-        image_file = tar_file.getnames()[0]
-
-        tar_file.close()
-
-        return os.path.join(path, image_file)
+# vim:set ts=4 sw=4 sts=4 expandtab:

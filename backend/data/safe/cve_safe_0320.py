@@ -1,14 +1,20 @@
 # Source: CVEFixes dataset
-# Safety: safe
+# Safety: vulnerable
 # Category: safe
 
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
 
 
-# Copyright (c) 2011 OpenStack, LLC.
+# Copyright 2012 United States Government as represented by the
+
+# Administrator of the National Aeronautics and Space Administration.
 
 # All Rights Reserved.
+
+#
+
+# Copyright 2012 Nebula, Inc.
 
 #
 
@@ -36,372 +42,164 @@
 
 
 
+import logging
 
 
-from nova.rootwrap import filters
 
+from django import shortcuts
 
+from django.conf import settings
 
-filterlist = [
+from django.contrib.auth import REDIRECT_FIELD_NAME
 
-    # nova/virt/disk/mount.py: 'kpartx', '-a', device
+from django.utils.translation import ugettext as _
 
-    # nova/virt/disk/mount.py: 'kpartx', '-d', device
 
-    filters.CommandFilter("/sbin/kpartx", "root"),
 
+import horizon
 
+from horizon import api
 
-    # nova/virt/disk/mount.py: 'tune2fs', '-c', 0, '-i', 0, mapped_device
+from horizon import exceptions
 
-    # nova/virt/xenapi/vm_utils.py: "tune2fs", "-O ^has_journal", part_path
+from horizon import forms
 
-    # nova/virt/xenapi/vm_utils.py: "tune2fs", "-j", partition_path
+from horizon import users
 
-    filters.CommandFilter("/sbin/tune2fs", "root"),
+from horizon.base import Horizon
 
+from horizon.views.auth_forms import Login, LoginWithTenant, _set_session_data
 
 
-    # nova/virt/disk/mount.py: 'mount', mapped_device, mount_dir
 
-    # nova/virt/xenapi/vm_utils.py: 'mount', '-t', 'ext2,ext3,ext4,reiserfs'..
 
-    filters.CommandFilter("/bin/mount", "root"),
 
+LOG = logging.getLogger(__name__)
 
 
-    # nova/virt/disk/mount.py: 'umount', mapped_device
 
-    # nova/virt/xenapi/vm_utils.py: 'umount', dev_path
 
-    filters.CommandFilter("/bin/umount", "root"),
 
+def user_home(request):
 
+    """ Reversible named view to direct a user to the appropriate homepage. """
 
-    # nova/virt/disk/nbd.py: 'qemu-nbd', '-c', device, image
+    return shortcuts.redirect(horizon.get_user_home(request.user))
 
-    # nova/virt/disk/nbd.py: 'qemu-nbd', '-d', device
 
-    filters.CommandFilter("/usr/bin/qemu-nbd", "root"),
 
 
 
-    # nova/virt/disk/loop.py: 'losetup', '--find', '--show', image
+class LoginView(forms.ModalFormView):
 
-    # nova/virt/disk/loop.py: 'losetup', '--detach', device
+    """
 
-    filters.CommandFilter("/sbin/losetup", "root"),
+    Logs in a user and redirects them to the URL specified by
 
+    :func:`horizon.get_user_home`.
 
+    """
 
-    # nova/virt/disk/guestfs.py: 'guestmount', '--rw', '-a', image, '-i'
+    form_class = Login
 
-    # nova/virt/disk/guestfs.py: 'guestmount', '--rw', '-a', image, '-m' dev
+    template_name = "horizon/auth/login.html"
 
-    filters.CommandFilter("/usr/bin/guestmount", "root"),
 
 
+    def get_context_data(self, **kwargs):
 
-    # nova/virt/disk/guestfs.py: 'fusermount', 'u', mount_dir
+        context = super(LoginView, self).get_context_data(**kwargs)
 
-    filters.CommandFilter("/bin/fusermount", "root"),
+        redirect_to = self.request.REQUEST.get(REDIRECT_FIELD_NAME, "")
 
-    filters.CommandFilter("/usr/bin/fusermount", "root"),
+        context["redirect_field_name"] = REDIRECT_FIELD_NAME
 
+        context["next"] = redirect_to
 
+        return context
 
-    # nova/virt/disk/api.py: 'tee', metadata_path
 
-    # nova/virt/disk/api.py: 'tee', '-a', keyfile
 
-    # nova/virt/disk/api.py: 'tee', netfile
+    def get_initial(self):
 
-    filters.CommandFilter("/usr/bin/tee", "root"),
+        initial = super(LoginView, self).get_initial()
 
+        current_region = self.request.session.get('region_endpoint', None)
 
+        requested_region = self.request.GET.get('region', None)
 
-    # nova/virt/disk/api.py: 'mkdir', '-p', sshdir
+        regions = dict(getattr(settings, "AVAILABLE_REGIONS", []))
 
-    # nova/virt/disk/api.py: 'mkdir', '-p', netdir
+        if requested_region in regions and requested_region != current_region:
 
-    filters.CommandFilter("/bin/mkdir", "root"),
+            initial.update({'region': requested_region})
 
+        return initial
 
 
-    # nova/virt/disk/api.py: 'chown', 'root', sshdir
 
-    # nova/virt/disk/api.py: 'chown', 'root:root', netdir
 
-    # nova/virt/libvirt/connection.py: 'chown', os.getuid(), console_log
 
-    # nova/virt/libvirt/connection.py: 'chown', os.getuid(), console_log
+def switch_tenants(request, tenant_id):
 
-    # nova/virt/libvirt/connection.py: 'chown', 'root', basepath('disk')
+    """
 
-    # nova/utils.py: 'chown', owner_uid, path
+    Swaps a user from one tenant to another using the unscoped token from
 
-    filters.CommandFilter("/bin/chown", "root"),
+    Keystone to exchange scoped tokens for the new tenant.
 
+    """
 
+    form, handled = LoginWithTenant.maybe_handle(
 
-    # nova/virt/disk/api.py: 'chmod', '700', sshdir
+            request, initial={'tenant': tenant_id,
 
-    # nova/virt/disk/api.py: 'chmod', 755, netdir
+                              'username': request.user.username})
 
-    filters.CommandFilter("/bin/chmod", "root"),
+    if handled:
 
+        return handled
 
 
-    # nova/virt/disk/api.py: 'cp', os.path.join(fs...
 
-    filters.CommandFilter("/bin/cp", "root"),
+    unscoped_token = request.session.get('unscoped_token', None)
 
+    if unscoped_token:
 
+        try:
 
-    # nova/virt/libvirt/vif.py: 'ip', 'tuntap', 'add', dev, 'mode', 'tap'
+            token = api.token_create_scoped(request,
 
-    # nova/virt/libvirt/vif.py: 'ip', 'link', 'set', dev, 'up'
+                                            tenant_id,
 
-    # nova/virt/libvirt/vif.py: 'ip', 'link', 'delete', dev
+                                            unscoped_token)
 
-    # nova/network/linux_net.py: 'ip', 'addr', 'add', str(floating_ip)+'/32'i..
+            _set_session_data(request, token)
 
-    # nova/network/linux_net.py: 'ip', 'addr', 'del', str(floating_ip)+'/32'..
+            user = users.User(users.get_user_from_request(request))
 
-    # nova/network/linux_net.py: 'ip', 'addr', 'add', '169.254.169.254/32',..
+            return shortcuts.redirect(Horizon.get_user_home(user))
 
-    # nova/network/linux_net.py: 'ip', 'addr', 'show', 'dev', dev, 'scope',..
+        except:
 
-    # nova/network/linux_net.py: 'ip', 'addr', 'del/add', ip_params, dev)
+            exceptions.handle(request,
 
-    # nova/network/linux_net.py: 'ip', 'addr', 'del', params, fields[-1]
+                              _("You are not authorized for that tenant."))
 
-    # nova/network/linux_net.py: 'ip', 'addr', 'add', params, bridge
 
-    # nova/network/linux_net.py: 'ip', '-f', 'inet6', 'addr', 'change', ..
 
-    # nova/network/linux_net.py: 'ip', 'link', 'set', 'dev', dev, 'promisc',..
+    return shortcuts.redirect("horizon:auth_login")
 
-    # nova/network/linux_net.py: 'ip', 'link', 'add', 'link', bridge_if ...
 
-    # nova/network/linux_net.py: 'ip', 'link', 'set', interface, "address",..
 
-    # nova/network/linux_net.py: 'ip', 'link', 'set', interface, 'up'
 
-    # nova/network/linux_net.py: 'ip', 'link', 'set', bridge, 'up'
 
-    # nova/network/linux_net.py: 'ip', 'addr', 'show', 'dev', interface, ..
+def logout(request):
 
-    # nova/network/linux_net.py: 'ip', 'link', 'set', dev, "address", ..
+    """ Clears the session and logs the current user out. """
 
-    # nova/network/linux_net.py: 'ip', 'link', 'set', dev, 'up'
+    request.session.clear()
 
-    filters.CommandFilter("/sbin/ip", "root"),
+    # FIXME(gabriel): we don't ship a view named splash
 
-
-
-    # nova/virt/libvirt/vif.py: 'tunctl', '-b', '-t', dev
-
-    # nova/network/linux_net.py: 'tunctl', '-b', '-t', dev
-
-    filters.CommandFilter("/usr/sbin/tunctl", "root"),
-
-    filters.CommandFilter("/bin/tunctl", "root"),
-
-
-
-    # nova/virt/libvirt/vif.py: 'ovs-vsctl', ...
-
-    # nova/virt/libvirt/vif.py: 'ovs-vsctl', 'del-port', ...
-
-    # nova/network/linux_net.py: 'ovs-vsctl', ....
-
-    filters.CommandFilter("/usr/bin/ovs-vsctl", "root"),
-
-
-
-    # nova/network/linux_net.py: 'ovs-ofctl', ....
-
-    filters.CommandFilter("/usr/bin/ovs-ofctl", "root"),
-
-
-
-    # nova/virt/libvirt/connection.py: 'dd', "if=%s" % virsh_output, ...
-
-    filters.CommandFilter("/bin/dd", "root"),
-
-
-
-    # nova/virt/xenapi/volume_utils.py: 'iscsiadm', '-m', ...
-
-    filters.CommandFilter("/sbin/iscsiadm", "root"),
-
-
-
-    # nova/virt/xenapi/vm_utils.py: "parted", "--script", ...
-
-    # nova/virt/xenapi/vm_utils.py: 'parted', '--script', dev_path, ..*.
-
-    filters.CommandFilter("/sbin/parted", "root"),
-
-    filters.CommandFilter("/usr/sbin/parted", "root"),
-
-
-
-    # nova/virt/xenapi/vm_utils.py: fdisk %(dev_path)s
-
-    filters.CommandFilter("/sbin/fdisk", "root"),
-
-
-
-    # nova/virt/xenapi/vm_utils.py: "e2fsck", "-f", "-p", partition_path
-
-    filters.CommandFilter("/sbin/e2fsck", "root"),
-
-
-
-    # nova/virt/xenapi/vm_utils.py: "resize2fs", partition_path
-
-    filters.CommandFilter("/sbin/resize2fs", "root"),
-
-
-
-    # nova/network/linux_net.py: 'ip[6]tables-save' % (cmd,), '-t', ...
-
-    filters.CommandFilter("/sbin/iptables-save", "root"),
-
-    filters.CommandFilter("/usr/sbin/iptables-save", "root"),
-
-    filters.CommandFilter("/sbin/ip6tables-save", "root"),
-
-    filters.CommandFilter("/usr/sbin/ip6tables-save", "root"),
-
-
-
-    # nova/network/linux_net.py: 'ip[6]tables-restore' % (cmd,)
-
-    filters.CommandFilter("/sbin/iptables-restore", "root"),
-
-    filters.CommandFilter("/usr/sbin/iptables-restore", "root"),
-
-    filters.CommandFilter("/sbin/ip6tables-restore", "root"),
-
-    filters.CommandFilter("/usr/sbin/ip6tables-restore", "root"),
-
-
-
-    # nova/network/linux_net.py: 'arping', '-U', floating_ip, '-A', '-I', ...
-
-    # nova/network/linux_net.py: 'arping', '-U', network_ref['dhcp_server'],..
-
-    filters.CommandFilter("/usr/bin/arping", "root"),
-
-    filters.CommandFilter("/sbin/arping", "root"),
-
-
-
-    # nova/network/linux_net.py: 'route', '-n'
-
-    # nova/network/linux_net.py: 'route', 'del', 'default', 'gw'
-
-    # nova/network/linux_net.py: 'route', 'add', 'default', 'gw'
-
-    # nova/network/linux_net.py: 'route', '-n'
-
-    # nova/network/linux_net.py: 'route', 'del', 'default', 'gw', old_gw, ..
-
-    # nova/network/linux_net.py: 'route', 'add', 'default', 'gw', old_gateway
-
-    filters.CommandFilter("/sbin/route", "root"),
-
-
-
-    # nova/network/linux_net.py: 'dhcp_release', dev, address, mac_address
-
-    filters.CommandFilter("/usr/bin/dhcp_release", "root"),
-
-
-
-    # nova/network/linux_net.py: 'kill', '-9', pid
-
-    # nova/network/linux_net.py: 'kill', '-HUP', pid
-
-    filters.KillFilter("/bin/kill", "root",
-
-                       ['-9', '-HUP'], ['/usr/sbin/dnsmasq']),
-
-
-
-    # nova/network/linux_net.py: 'kill', pid
-
-    filters.KillFilter("/bin/kill", "root", [''], ['/usr/sbin/radvd']),
-
-
-
-    # nova/network/linux_net.py: dnsmasq call
-
-    filters.DnsmasqFilter("/usr/sbin/dnsmasq", "root"),
-
-
-
-    # nova/network/linux_net.py: 'radvd', '-C', '%s' % _ra_file(dev, 'conf'),..
-
-    filters.CommandFilter("/usr/sbin/radvd", "root"),
-
-
-
-    # nova/network/linux_net.py: 'brctl', 'addbr', bridge
-
-    # nova/network/linux_net.py: 'brctl', 'setfd', bridge, 0
-
-    # nova/network/linux_net.py: 'brctl', 'stp', bridge, 'off'
-
-    # nova/network/linux_net.py: 'brctl', 'addif', bridge, interface
-
-    filters.CommandFilter("/sbin/brctl", "root"),
-
-    filters.CommandFilter("/usr/sbin/brctl", "root"),
-
-
-
-    # nova/virt/libvirt/utils.py: 'mkswap'
-
-    # nova/virt/xenapi/vm_utils.py: 'mkswap'
-
-    filters.CommandFilter("/sbin/mkswap", "root"),
-
-
-
-    # nova/virt/xenapi/vm_utils.py: 'mkfs'
-
-    filters.CommandFilter("/sbin/mkfs", "root"),
-
-
-
-    # nova/virt/libvirt/utils.py: 'qemu-img'
-
-    filters.CommandFilter("/usr/bin/qemu-img", "root"),
-
-
-
-    # nova/virt/disk/api.py: 'readlink', '-e'
-
-    filters.CommandFilter("/usr/bin/readlink", "root"),
-
-    filters.CommandFilter("/bin/readlink", "root"),
-
-
-
-    # nova/virt/disk/api.py: 'touch', target
-
-    filters.CommandFilter("/usr/bin/touch", "root"),
-
-
-
-    # nova/virt/libvirt/connection.py:
-
-    filters.ReadFileFilter("/etc/iscsi/initiatorname.iscsi"),
-
-
-
-    ]
+    return shortcuts.redirect('splash')

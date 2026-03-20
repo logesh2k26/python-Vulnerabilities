@@ -2,1998 +2,806 @@
 # Safety: safe
 # Category: safe
 
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python
 
-'''
 
-Support for the Git SCM
 
-'''
+# Copyright 2012 - 2017, New York University and the TUF contributors
+
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+
+
+"""
+
+<Program Name>
+
+  sig.py
+
+
+
+<Author>
+
+  Vladimir Diaz <vladimir.v.diaz@gmail.com>
+
+
+
+<Started>
+
+  February 28, 2012.   Based on a previous version by Geremy Condra.
+
+
+
+<Copyright>
+
+  See LICENSE-MIT OR LICENSE for licensing information.
+
+
+
+<Purpose>
+
+  Survivable key compromise is one feature of a secure update system
+
+  incorporated into TUF's design. Responsibility separation through
+
+  the use of multiple roles, multi-signature trust, and explicit and
+
+  implicit key revocation are some of the mechanisms employed towards
+
+  this goal of survivability.  These mechanisms can all be seen in
+
+  play by the functions available in this module.
+
+
+
+  The signed metadata files utilized by TUF to download target files
+
+  securely are used and represented here as the 'signable' object.
+
+  More precisely, the signature structures contained within these metadata
+
+  files are packaged into 'signable' dictionaries.  This module makes it
+
+  possible to capture the states of these signatures by organizing the
+
+  keys into different categories.  As keys are added and removed, the
+
+  system must securely and efficiently verify the status of these signatures.
+
+  For instance, a bunch of keys have recently expired. How many valid keys
+
+  are now available to the Snapshot role?  This question can be answered by
+
+  get_signature_status(), which will return a full 'status report' of these
+
+  'signable' dicts.  This module also provides a convenient verify() function
+
+  that will determine if a role still has a sufficient number of valid keys.
+
+  If a caller needs to update the signatures of a 'signable' object, there
+
+  is also a function for that.
+
+"""
+
+
+
+# Help with Python 3 compatibility, where the print statement is a function, an
+
+# implicit relative import is invalid, and the '/' operator performs true
+
+# division.  Example:  print 'hello world' raises a 'SyntaxError' exception.
+
+from __future__ import print_function
 
 from __future__ import absolute_import
 
+from __future__ import division
 
+from __future__ import unicode_literals
 
-# Import python libs
 
-import os
 
-import re
+import logging
 
-import subprocess
 
 
+import tuf
 
-# Import salt libs
+import tuf.keydb
 
-from salt import utils
+import tuf.roledb
 
-from salt.exceptions import SaltInvocationError, CommandExecutionError
+import tuf.formats
 
-from salt.ext.six.moves.urllib.parse import urlparse as _urlparse  # pylint: disable=no-name-in-module,import-error
 
-from salt.ext.six.moves.urllib.parse import urlunparse as _urlunparse  # pylint: disable=no-name-in-module,import-error
 
+import securesystemslib
 
 
 
+# See 'log.py' to learn how logging is handled in TUF.
 
-def __virtual__():
+logger = logging.getLogger('tuf.sig')
 
-    '''
 
-    Only load if git exists on the system
 
-    '''
+# Disable 'iso8601' logger messages to prevent 'iso8601' from clogging the
 
-    return True if utils.which('git') else False
+# log file.
 
+iso8601_logger = logging.getLogger('iso8601')
 
+iso8601_logger.disabled = True
 
 
 
-def _git_run(cmd, cwd=None, runas=None, identity=None, **kwargs):
 
-    '''
 
-    simple, throw an exception with the error message on an error return code.
+def get_signature_status(signable, role=None, repository_name='default',
 
+    threshold=None, keyids=None):
 
+  """
 
-    this function may be moved to the command module, spliced with
+  <Purpose>
 
-    'cmd.run_all', and used as an alternative to 'cmd.run_all'. Some
+    Return a dictionary representing the status of the signatures listed in
 
-    commands don't return proper retcodes, so this can't replace 'cmd.run_all'.
+    'signable'. Signatures in the returned dictionary are identified by the
 
-    '''
+    signature keyid and can have a status of either:
 
-    env = {}
 
 
+    * bad -- Invalid signature
 
-    if identity:
+    * good -- Valid signature from key that is available in 'tuf.keydb', and is
 
-        stderrs = []
+      authorized for the passed role as per 'tuf.roledb' (authorization may be
 
+      overwritten by passed 'keyids').
 
+    * unknown -- Signature from key that is not available in 'tuf.keydb', or if
 
-        # if the statefile provides multiple identities, they need to be tried
+      'role' is None.
 
-        # (but also allow a string instead of a list)
+    * unknown signing schemes -- Signature from key with unknown signing
 
-        if not isinstance(identity, list):
+      scheme.
 
-            # force it into a list
+    * untrusted -- Valid signature from key that is available in 'tuf.keydb',
 
-            identity = [identity]
+      but is not trusted for the passed role as per 'tuf.roledb' or the passed
 
+      'keyids'.
 
 
-        # try each of the identities, independently
 
-        for id_file in identity:
+    NOTE: The result may contain duplicate keyids or keyids that reference the
 
-            env = {
+    same key, if 'signable' lists multiple signatures from the same key.
 
-                'GIT_IDENTITY': id_file
 
-            }
 
+  <Arguments>
 
+    signable:
 
-            # copy wrapper to area accessible by ``runas`` user
+      A dictionary containing a list of signatures and a 'signed' identifier.
 
-            # currently no suppport in windows for wrapping git ssh
+      signable = {'signed': 'signer',
 
-            if not utils.is_windows():
+                  'signatures': [{'keyid': keyid,
 
-                ssh_id_wrapper = os.path.join(utils.templates.TEMPLATE_DIRNAME,
+                                  'sig': sig}]}
 
-                                              'git/ssh-id-wrapper')
 
-                tmp_file = utils.mkstemp()
 
-                utils.files.copyfile(ssh_id_wrapper, tmp_file)
+      Conformant to tuf.formats.SIGNABLE_SCHEMA.
 
-                os.chmod(tmp_file, 0o500)
 
-                os.chown(tmp_file, __salt__['file.user_to_uid'](runas), -1)
 
-                env['GIT_SSH'] = tmp_file
+    role:
 
+      TUF role string (e.g. 'root', 'targets', 'snapshot' or timestamp).
 
 
-            try:
 
-                result = __salt__['cmd.run_all'](cmd,
+    threshold:
 
-                                                 cwd=cwd,
+      Rather than reference the role's threshold as set in tuf.roledb.py, use
 
-                                                 runas=runas,
+      the given 'threshold' to calculate the signature status of 'signable'.
 
-                                                 output_loglevel='quiet',
+      'threshold' is an integer value that sets the role's threshold value, or
 
-                                                 env=env,
+      the minimum number of signatures needed for metadata to be considered
 
-                                                 python_shell=False,
+      fully signed.
 
-                                                 **kwargs)
 
-            finally:
 
-                if 'GIT_SSH' in env:
+    keyids:
 
-                    os.remove(env['GIT_SSH'])
+      Similar to the 'threshold' argument, use the supplied list of 'keyids'
 
+      to calculate the signature status, instead of referencing the keyids
 
+      in tuf.roledb.py for 'role'.
 
-            # if the command was successful, no need to try additional IDs
 
-            if result['retcode'] == 0:
 
-                return result['stdout']
+  <Exceptions>
 
-            else:
+    securesystemslib.exceptions.FormatError, if 'signable' does not have the
 
-                stderr = _remove_sensitive_data(result['stderr'])
+    correct format.
 
-                stderrs.append(stderr)
 
 
+    tuf.exceptions.UnknownRoleError, if 'role' is not recognized.
 
-        # we've tried all IDs and still haven't passed, so error out
 
-        raise CommandExecutionError("\n\n".join(stderrs))
 
+  <Side Effects>
 
+    None.
 
-    else:
 
-        result = __salt__['cmd.run_all'](cmd,
 
-                                         cwd=cwd,
+  <Returns>
 
-                                         runas=runas,
+    A dictionary representing the status of the signatures in 'signable'.
 
-                                         output_loglevel='quiet',
+    Conformant to tuf.formats.SIGNATURESTATUS_SCHEMA.
 
-                                         env=env,
+  """
 
-                                         python_shell=False,
 
-                                         **kwargs)
 
-        retcode = result['retcode']
+  # Do the arguments have the correct format?  This check will ensure that
 
+  # arguments have the appropriate number of objects and object types, and that
 
+  # all dict keys are properly named.  Raise
 
-        if retcode == 0:
+  # 'securesystemslib.exceptions.FormatError' if the check fails.
 
-            return result['stdout']
+  tuf.formats.SIGNABLE_SCHEMA.check_match(signable)
 
-        else:
+  securesystemslib.formats.NAME_SCHEMA.check_match(repository_name)
 
-            stderr = _remove_sensitive_data(result['stderr'])
 
-            raise CommandExecutionError(
 
-                'Command {0!r} failed. Stderr: {1!r}'.format(cmd, stderr))
+  if role is not None:
 
+    tuf.formats.ROLENAME_SCHEMA.check_match(role)
 
 
 
+  if threshold is not None:
 
-def _remove_sensitive_data(sensitive_output):
+    tuf.formats.THRESHOLD_SCHEMA.check_match(threshold)
 
-    '''
 
-        Remove HTTP user and password.
 
-    '''
+  if keyids is not None:
 
-    return re.sub('(https?)://.*@', r'\1://<redacted>@', sensitive_output)
+    securesystemslib.formats.KEYIDS_SCHEMA.check_match(keyids)
 
 
 
+  # The signature status dictionary returned.
 
+  signature_status = {}
 
-def _git_getdir(cwd, user=None):
+  good_sigs = []
 
-    '''
+  bad_sigs = []
 
-    Returns the absolute path to the top-level of a given repo because some Git
+  unknown_sigs = []
 
-    commands are sensitive to where they're run from (archive for one)
+  untrusted_sigs = []
 
-    '''
+  unknown_signing_schemes = []
 
-    cmd_bare = 'git rev-parse --is-bare-repository'
 
-    is_bare = __salt__['cmd.run_stdout'](cmd_bare, cwd, runas=user) == 'true'
 
+  # Extract the relevant fields from 'signable' that will allow us to identify
 
+  # the different classes of keys (i.e., good_sigs, bad_sigs, etc.).
 
-    if is_bare:
+  signed = securesystemslib.formats.encode_canonical(signable['signed']).encode('utf-8')
 
-        return cwd
+  signatures = signable['signatures']
 
 
 
-    cmd_toplvl = 'git rev-parse --show-toplevel'
+  # Iterate the signatures and enumerate the signature_status fields.
 
-    return __salt__['cmd.run'](cmd_toplvl, cwd)
+  # (i.e., good_sigs, bad_sigs, etc.).
 
+  for signature in signatures:
 
+    keyid = signature['keyid']
 
 
 
-def _check_git():
-
-    '''
-
-    Check if git is available
-
-    '''
-
-    utils.check_or_die('git')
-
-
-
-
-
-def _add_http_basic_auth(repository, https_user=None, https_pass=None):
-
-    if https_user is None and https_pass is None:
-
-        return repository
-
-    else:
-
-        urltuple = _urlparse(repository)
-
-        if urltuple.scheme == 'https':
-
-            if https_pass:
-
-                auth_string = "{0}:{1}".format(https_user, https_pass)
-
-            else:
-
-                auth_string = https_user
-
-            netloc = "{0}@{1}".format(auth_string, urltuple.netloc)
-
-            urltuple = urltuple._replace(netloc=netloc)
-
-            return _urlunparse(urltuple)
-
-        else:
-
-            raise ValueError('Basic Auth only supported for HTTPS scheme')
-
-
-
-
-
-def current_branch(cwd, user=None):
-
-    '''
-
-    Returns the current branch name, if on a branch.
-
-
-
-    CLI Example:
-
-
-
-    .. code-block:: bash
-
-
-
-        salt '*' git.current_branch /path/to/repo
-
-    '''
-
-    cmd = r'git rev-parse --abbrev-ref HEAD'
-
-
-
-    return __salt__['cmd.run_stdout'](cmd, cwd=cwd, runas=user)
-
-
-
-
-
-def revision(cwd, rev='HEAD', short=False, user=None):
-
-    '''
-
-    Returns the long hash of a given identifier (hash, branch, tag, HEAD, etc)
-
-
-
-    cwd
-
-        The path to the Git repository
-
-
-
-    rev: HEAD
-
-        The revision
-
-
-
-    short: False
-
-        Return an abbreviated SHA1 git hash
-
-
-
-    user : None
-
-        Run git as a user other than what the minion runs as
-
-
-
-    CLI Example:
-
-
-
-    .. code-block:: bash
-
-
-
-        salt '*' git.revision /path/to/repo mybranch
-
-    '''
-
-    _check_git()
-
-
-
-    cmd = 'git rev-parse {0}{1}'.format('--short ' if short else '', rev)
-
-    return _git_run(cmd, cwd, runas=user)
-
-
-
-
-
-def clone(cwd, repository, opts=None, user=None, identity=None,
-
-          https_user=None, https_pass=None):
-
-    '''
-
-    Clone a new repository
-
-
-
-    cwd
-
-        The path to the Git repository
-
-
-
-    repository
-
-        The git URI of the repository
-
-
-
-    opts : None
-
-        Any additional options to add to the command line
-
-
-
-    user : None
-
-        Run git as a user other than what the minion runs as
-
-
-
-    identity : None
-
-        A path to a private key to use over SSH
-
-
-
-    https_user : None
-
-        HTTP Basic Auth username for HTTPS (only) clones
-
-
-
-        .. versionadded:: 20515.5.0
-
-
-
-    https_pass : None
-
-        HTTP Basic Auth password for HTTPS (only) clones
-
-
-
-        .. versionadded:: 2015.5.0
-
-
-
-    CLI Example:
-
-
-
-    .. code-block:: bash
-
-
-
-        salt '*' git.clone /path/to/repo git://github.com/saltstack/salt.git
-
-
-
-        salt '*' git.clone /path/to/repo.git\\
-
-                git://github.com/saltstack/salt.git '--bare --origin github'
-
-
-
-    '''
-
-    _check_git()
-
-
-
-    repository = _add_http_basic_auth(repository, https_user, https_pass)
-
-
-
-    if not opts:
-
-        opts = ''
-
-    if utils.is_windows():
-
-        cmd = 'git clone {0} {1} {2}'.format(repository, cwd, opts)
-
-    else:
-
-        cmd = 'git clone {0} {1!r} {2}'.format(repository, cwd, opts)
-
-
-
-    return _git_run(cmd, runas=user, identity=identity)
-
-
-
-
-
-def describe(cwd, rev='HEAD', user=None):
-
-    '''
-
-    Returns the git describe string (or the SHA hash if there are no tags) for
-
-    the given revision
-
-
-
-    cwd
-
-        The path to the Git repository
-
-
-
-    rev: HEAD
-
-        The revision to describe
-
-
-
-    user : None
-
-        Run git as a user other than what the minion runs as
-
-
-
-    CLI Examples:
-
-
-
-    .. code-block:: bash
-
-
-
-        salt '*' git.describe /path/to/repo
-
-
-
-        salt '*' git.describe /path/to/repo develop
-
-    '''
-
-    cmd = 'git describe {0}'.format(rev)
-
-    return __salt__['cmd.run_stdout'](cmd,
-
-                                      cwd=cwd,
-
-                                      runas=user,
-
-                                      python_shell=False)
-
-
-
-
-
-def archive(cwd, output, rev='HEAD', fmt=None, prefix=None, user=None):
-
-    '''
-
-    Export a tarball from the repository
-
-
-
-    cwd
-
-        The path to the Git repository
-
-
-
-    output
-
-        The path to the archive tarball
-
-
-
-    rev: HEAD
-
-        The revision to create an archive from
-
-
-
-    fmt: None
-
-        Format of the resulting archive, zip and tar are commonly used
-
-
-
-    prefix : None
-
-        Prepend <prefix>/ to every filename in the archive
-
-
-
-    user : None
-
-        Run git as a user other than what the minion runs as
-
-
-
-    If ``prefix`` is not specified it defaults to the basename of the repo
-
-    directory.
-
-
-
-    CLI Example:
-
-
-
-    .. code-block:: bash
-
-
-
-        salt '*' git.archive /path/to/repo /path/to/archive.tar.gz
-
-    '''
-
-    _check_git()
-
-
-
-    basename = '{0}/'.format(os.path.basename(_git_getdir(cwd, user=user)))
-
-
-
-    cmd = 'git archive{prefix}{fmt} -o {output} {rev}'.format(
-
-            rev=rev,
-
-            output=output,
-
-            fmt=' --format={0}'.format(fmt) if fmt else '',
-
-            prefix=' --prefix="{0}"'.format(prefix if prefix else basename)
-
-    )
-
-
-
-    return _git_run(cmd, cwd=cwd, runas=user)
-
-
-
-
-
-def fetch(cwd, opts=None, user=None, identity=None):
-
-    '''
-
-    Perform a fetch on the given repository
-
-
-
-    cwd
-
-        The path to the Git repository
-
-
-
-    opts : None
-
-        Any additional options to add to the command line
-
-
-
-    user : None
-
-        Run git as a user other than what the minion runs as
-
-
-
-    identity : None
-
-        A path to a private key to use over SSH
-
-
-
-    CLI Example:
-
-
-
-    .. code-block:: bash
-
-
-
-        salt '*' git.fetch /path/to/repo '--all'
-
-
-
-        salt '*' git.fetch cwd=/path/to/repo opts='--all' user=johnny
-
-    '''
-
-    _check_git()
-
-
-
-    if not opts:
-
-        opts = ''
-
-    cmd = 'git fetch {0}'.format(opts)
-
-
-
-    return _git_run(cmd, cwd=cwd, runas=user, identity=identity)
-
-
-
-
-
-def pull(cwd, opts=None, user=None, identity=None):
-
-    '''
-
-    Perform a pull on the given repository
-
-
-
-    cwd
-
-        The path to the Git repository
-
-
-
-    opts : None
-
-        Any additional options to add to the command line
-
-
-
-    user : None
-
-        Run git as a user other than what the minion runs as
-
-
-
-    identity : None
-
-        A path to a private key to use over SSH
-
-
-
-    CLI Example:
-
-
-
-    .. code-block:: bash
-
-
-
-        salt '*' git.pull /path/to/repo opts='--rebase origin master'
-
-    '''
-
-    _check_git()
-
-
-
-    if not opts:
-
-        opts = ''
-
-    return _git_run('git pull {0}'.format(opts),
-
-                    cwd=cwd,
-
-                    runas=user,
-
-                    identity=identity)
-
-
-
-
-
-def rebase(cwd, rev='master', opts=None, user=None):
-
-    '''
-
-    Rebase the current branch
-
-
-
-    cwd
-
-        The path to the Git repository
-
-
-
-    rev : master
-
-        The revision to rebase onto the current branch
-
-
-
-    opts : None
-
-        Any additional options to add to the command line
-
-
-
-    user : None
-
-        Run git as a user other than what the minion runs as
-
-
-
-    CLI Example:
-
-
-
-    .. code-block:: bash
-
-
-
-        salt '*' git.rebase /path/to/repo master
-
-        salt '*' git.rebase /path/to/repo 'origin master'
-
-
-
-    That is the same as:
-
-
-
-    .. code-block:: bash
-
-
-
-        git rebase master
-
-        git rebase origin master
-
-    '''
-
-    _check_git()
-
-
-
-    if not opts:
-
-        opts = ''
-
-    return _git_run('git rebase {0} {1}'.format(opts, rev),
-
-                    cwd=cwd,
-
-                    runas=user)
-
-
-
-
-
-def checkout(cwd, rev, force=False, opts=None, user=None):
-
-    '''
-
-    Checkout a given revision
-
-
-
-    cwd
-
-        The path to the Git repository
-
-
-
-    rev
-
-        The remote branch or revision to checkout
-
-
-
-    force : False
-
-        Force a checkout even if there might be overwritten changes
-
-
-
-    opts : None
-
-        Any additional options to add to the command line
-
-
-
-    user : None
-
-        Run git as a user other than what the minion runs as
-
-
-
-    CLI Examples:
-
-
-
-    .. code-block:: bash
-
-
-
-        salt '*' git.checkout /path/to/repo somebranch user=jeff
-
-
-
-        salt '*' git.checkout /path/to/repo opts='testbranch -- conf/file1 file2'
-
-
-
-        salt '*' git.checkout /path/to/repo rev=origin/mybranch opts=--track
-
-    '''
-
-    _check_git()
-
-
-
-    if not opts:
-
-        opts = ''
-
-    cmd = 'git checkout {0} {1} {2}'.format(' -f' if force else '', rev, opts)
-
-    return _git_run(cmd, cwd=cwd, runas=user)
-
-
-
-
-
-def merge(cwd, branch='@{upstream}', opts=None, user=None):
-
-    '''
-
-    Merge a given branch
-
-
-
-    cwd
-
-        The path to the Git repository
-
-
-
-    branch : @{upstream}
-
-        The remote branch or revision to merge into the current branch
-
-
-
-    opts : None
-
-        Any additional options to add to the command line
-
-
-
-    user : None
-
-        Run git as a user other than what the minion runs as
-
-
-
-    CLI Example:
-
-
-
-    .. code-block:: bash
-
-
-
-        salt '*' git.fetch /path/to/repo
-
-        salt '*' git.merge /path/to/repo @{upstream}
-
-    '''
-
-    _check_git()
-
-
-
-    if not opts:
-
-        opts = ''
-
-    cmd = 'git merge {0} {1}'.format(branch,
-
-                                     opts)
-
-
-
-    return _git_run(cmd, cwd, runas=user)
-
-
-
-
-
-def init(cwd, opts=None, user=None):
-
-    '''
-
-    Initialize a new git repository
-
-
-
-    cwd
-
-        The path to the Git repository
-
-
-
-    opts : None
-
-        Any additional options to add to the command line
-
-
-
-    user : None
-
-        Run git as a user other than what the minion runs as
-
-
-
-    CLI Example:
-
-
-
-    .. code-block:: bash
-
-
-
-        salt '*' git.init /path/to/repo.git opts='--bare'
-
-    '''
-
-    _check_git()
-
-    if not opts:
-
-        opts = ''
-
-    cmd = 'git init {0} {1}'.format(cwd, opts)
-
-    return _git_run(cmd, runas=user)
-
-
-
-
-
-def submodule(cwd, init=True, opts=None, user=None, identity=None):
-
-    '''
-
-    Initialize git submodules
-
-
-
-    cwd
-
-        The path to the Git repository
-
-
-
-    init : True
-
-        Ensure that new submodules are initialized
-
-
-
-    opts : None
-
-        Any additional options to add to the command line
-
-
-
-    user : None
-
-        Run git as a user other than what the minion runs as
-
-
-
-    identity : None
-
-        A path to a private key to use over SSH
-
-
-
-    CLI Example:
-
-
-
-    .. code-block:: bash
-
-
-
-        salt '*' git.submodule /path/to/repo.git/sub/repo
-
-    '''
-
-    _check_git()
-
-
-
-    if not opts:
-
-        opts = ''
-
-    cmd = 'git submodule update {0} {1}'.format('--init' if init else '', opts)
-
-    return _git_run(cmd, cwd=cwd, runas=user, identity=identity)
-
-
-
-
-
-def status(cwd, user=None):
-
-    '''
-
-    Return the status of the repository. The returned format uses the status
-
-    codes of git's 'porcelain' output mode
-
-
-
-    cwd
-
-        The path to the Git repository
-
-
-
-    user : None
-
-        Run git as a user other than what the minion runs as
-
-
-
-    CLI Example:
-
-
-
-    .. code-block:: bash
-
-
-
-        salt '*' git.status /path/to/git/repo
-
-    '''
-
-    cmd = 'git status -z --porcelain'
-
-    stdout = _git_run(cmd, cwd=cwd, runas=user)
-
-    state_by_file = []
-
-    for line in stdout.split("\0"):
-
-        state = line[:2]
-
-        filename = line[3:]
-
-        if filename != '' and state != '':
-
-            state_by_file.append((state, filename))
-
-    return state_by_file
-
-
-
-
-
-def add(cwd, file_name, user=None, opts=None):
-
-    '''
-
-    add a file to git
-
-
-
-    cwd
-
-        The path to the Git repository
-
-
-
-    file_name
-
-        Path to the file in the cwd
-
-
-
-    opts : None
-
-        Any additional options to add to the command line
-
-
-
-    user : None
-
-        Run git as a user other than what the minion runs as
-
-
-
-    CLI Example:
-
-
-
-    .. code-block:: bash
-
-
-
-        salt '*' git.add /path/to/git/repo /path/to/file
-
-
-
-    '''
-
-
-
-    if not opts:
-
-        opts = ''
-
-    cmd = 'git add {0} {1}'.format(file_name, opts)
-
-    return _git_run(cmd, cwd=cwd, runas=user)
-
-
-
-
-
-def rm(cwd, file_name, user=None, opts=None):
-
-    '''
-
-    Remove a file from git
-
-
-
-    cwd
-
-        The path to the Git repository
-
-
-
-    file_name
-
-        Path to the file in the cwd
-
-
-
-    opts : None
-
-        Any additional options to add to the command line
-
-
-
-    user : None
-
-        Run git as a user other than what the minion runs as
-
-
-
-    CLI Example:
-
-
-
-    .. code-block:: bash
-
-
-
-        salt '*' git.rm /path/to/git/repo /path/to/file
-
-    '''
-
-
-
-    if not opts:
-
-        opts = ''
-
-    cmd = 'git rm {0} {1}'.format(file_name, opts)
-
-    return _git_run(cmd, cwd=cwd, runas=user)
-
-
-
-
-
-def commit(cwd, message, user=None, opts=None):
-
-    '''
-
-    create a commit
-
-
-
-    cwd
-
-        The path to the Git repository
-
-
-
-    message
-
-        The commit message
-
-
-
-    opts : None
-
-        Any additional options to add to the command line
-
-
-
-    user : None
-
-        Run git as a user other than what the minion runs as
-
-
-
-    CLI Example:
-
-
-
-    .. code-block:: bash
-
-
-
-        salt '*' git.commit /path/to/git/repo 'The commit message'
-
-    '''
-
-
-
-    cmd = subprocess.list2cmdline(['git', 'commit', '-m', message])
-
-    # add opts separately; they don't need to be quoted
-
-    if opts:
-
-        cmd = cmd + ' ' + opts
-
-    return _git_run(cmd, cwd=cwd, runas=user)
-
-
-
-
-
-def push(cwd, remote_name, branch='master', user=None, opts=None,
-
-         identity=None):
-
-    '''
-
-    Push to remote
-
-
-
-    cwd
-
-        The path to the Git repository
-
-
-
-    remote_name
-
-        Name of the remote to push to
-
-
-
-    branch : master
-
-        Name of the branch to push
-
-
-
-    opts : None
-
-        Any additional options to add to the command line
-
-
-
-    user : None
-
-        Run git as a user other than what the minion runs as
-
-
-
-    identity : None
-
-        A path to a private key to use over SSH
-
-
-
-
-
-    CLI Example:
-
-
-
-    .. code-block:: bash
-
-
-
-        salt '*' git.push /path/to/git/repo remote-name
-
-    '''
-
-
-
-    if not opts:
-
-        opts = ''
-
-    cmd = 'git push {0} {1} {2}'.format(remote_name, branch, opts)
-
-    return _git_run(cmd, cwd=cwd, runas=user, identity=identity)
-
-
-
-
-
-def remotes(cwd, user=None):
-
-    '''
-
-    Get remotes like git remote -v
-
-
-
-    cwd
-
-        The path to the Git repository
-
-
-
-    user : None
-
-        Run git as a user other than what the minion runs as
-
-
-
-    CLI Example:
-
-
-
-    .. code-block:: bash
-
-
-
-        salt '*' git.remotes /path/to/repo
-
-    '''
-
-    cmd = 'git remote'
-
-    ret = _git_run(cmd, cwd=cwd, runas=user)
-
-    res = dict()
-
-    for remote_name in ret.splitlines():
-
-        remote = remote_name.strip()
-
-        res[remote] = remote_get(cwd, remote, user=user)
-
-    return res
-
-
-
-
-
-def remote_get(cwd, remote='origin', user=None):
-
-    '''
-
-    get the fetch and push URL for a specified remote name
-
-
-
-    remote : origin
-
-        the remote name used to define the fetch and push URL
-
-
-
-    user : None
-
-        Run git as a user other than what the minion runs as
-
-
-
-    CLI Example:
-
-
-
-    .. code-block:: bash
-
-
-
-        salt '*' git.remote_get /path/to/repo
-
-        salt '*' git.remote_get /path/to/repo upstream
-
-    '''
+    # Does the signature use an unrecognized key?
 
     try:
 
-        cmd = 'git remote show -n {0}'.format(remote)
+      key = tuf.keydb.get_key(keyid, repository_name)
 
-        ret = _git_run(cmd, cwd=cwd, runas=user)
 
-        lines = ret.splitlines()
 
-        remote_fetch_url = lines[1].replace('Fetch URL: ', '').strip()
+    except tuf.exceptions.UnknownKeyError:
 
-        remote_push_url = lines[2].replace('Push  URL: ', '').strip()
+      unknown_sigs.append(keyid)
 
-        if remote_fetch_url != remote and remote_push_url != remote:
+      continue
 
-            res = (remote_fetch_url, remote_push_url)
 
-            return res
 
-        else:
+    # Does the signature use an unknown/unsupported signing scheme?
 
-            return None
+    try:
 
-    except CommandExecutionError:
+      valid_sig = securesystemslib.keys.verify_signature(key, signature, signed)
 
-        return None
 
 
+    except securesystemslib.exceptions.UnsupportedAlgorithmError:
 
+      unknown_signing_schemes.append(keyid)
 
+      continue
 
-def remote_set(cwd, name='origin', url=None, user=None, https_user=None,
 
-               https_pass=None):
 
-    '''
+    # We are now dealing with either a trusted or untrusted key...
 
-    sets a remote with name and URL like git remote add <remote_name> <remote_url>
+    if valid_sig:
 
+      if role is not None:
 
 
-    remote_name : origin
 
-        defines the remote name
+        # Is this an unauthorized key? (a keyid associated with 'role')
 
+        # Note that if the role is not known, tuf.exceptions.UnknownRoleError
 
+        # is raised here.
 
-    remote_url : None
+        if keyids is None:
 
-        defines the remote URL; should not be None!
+          keyids = tuf.roledb.get_role_keyids(role, repository_name)
 
 
 
-    user : None
+        if keyid not in keyids:
 
-        Run git as a user other than what the minion runs as
+          untrusted_sigs.append(keyid)
 
+          continue
 
 
-    https_user : None
 
-        HTTP Basic Auth username for HTTPS (only) clones
+      # This is an unset role, thus an unknown signature.
 
+      else:
 
+        unknown_sigs.append(keyid)
 
-        .. versionadded:: 2015.5.0
+        continue
 
 
 
-    https_pass : None
+      # Identify good/authorized key.
 
-        HTTP Basic Auth password for HTTPS (only) clones
+      good_sigs.append(keyid)
 
 
-
-        .. versionadded:: 2015.5.0
-
-
-
-    CLI Example:
-
-
-
-    .. code-block:: bash
-
-
-
-        salt '*' git.remote_set /path/to/repo remote_url=git@github.com:saltstack/salt.git
-
-        salt '*' git.remote_set /path/to/repo origin git@github.com:saltstack/salt.git
-
-    '''
-
-    if remote_get(cwd, name):
-
-        cmd = 'git remote rm {0}'.format(name)
-
-        _git_run(cmd, cwd=cwd, runas=user)
-
-    url = _add_http_basic_auth(url, https_user, https_pass)
-
-    cmd = 'git remote add {0} {1}'.format(name, url)
-
-    _git_run(cmd, cwd=cwd, runas=user)
-
-    return remote_get(cwd=cwd, remote=name, user=None)
-
-
-
-
-
-def branch(cwd, rev, opts=None, user=None):
-
-    '''
-
-    Interacts with branches.
-
-
-
-    cwd
-
-        The path to the Git repository
-
-
-
-    rev
-
-        The branch/revision to be used in the command.
-
-
-
-    opts : None
-
-        Any additional options to add to the command line
-
-
-
-    user : None
-
-        Run git as a user other than what the minion runs as
-
-
-
-    CLI Example:
-
-
-
-    .. code-block:: bash
-
-
-
-        salt '*' git.branch mybranch --set-upstream-to=origin/mybranch
-
-    '''
-
-    cmd = 'git branch {0} {1}'.format(rev, opts)
-
-    _git_run(cmd, cwd=cwd, user=user)
-
-    return current_branch(cwd, user=user)
-
-
-
-
-
-def reset(cwd, opts=None, user=None):
-
-    '''
-
-    Reset the repository checkout
-
-
-
-    cwd
-
-        The path to the Git repository
-
-
-
-    opts : None
-
-        Any additional options to add to the command line
-
-
-
-    user : None
-
-        Run git as a user other than what the minion runs as
-
-
-
-    CLI Example:
-
-
-
-    .. code-block:: bash
-
-
-
-        salt '*' git.reset /path/to/repo master
-
-    '''
-
-    _check_git()
-
-
-
-    if not opts:
-
-        opts = ''
-
-    return _git_run('git reset {0}'.format(opts), cwd=cwd, runas=user)
-
-
-
-
-
-def stash(cwd, opts=None, user=None):
-
-    '''
-
-    Stash changes in the repository checkout
-
-
-
-    cwd
-
-        The path to the Git repository
-
-
-
-    opts : None
-
-        Any additional options to add to the command line
-
-
-
-    user : None
-
-        Run git as a user other than what the minion runs as
-
-
-
-    CLI Example:
-
-
-
-    .. code-block:: bash
-
-
-
-        salt '*' git.stash /path/to/repo master
-
-    '''
-
-    _check_git()
-
-
-
-    if not opts:
-
-        opts = ''
-
-    return _git_run('git stash {0}'.format(opts), cwd=cwd, runas=user)
-
-
-
-
-
-def config_set(cwd=None, setting_name=None, setting_value=None, user=None, is_global=False):
-
-    '''
-
-    Set a key in the git configuration file (.git/config) of the repository or
-
-    globally.
-
-
-
-    cwd : None
-
-        Options path to the Git repository
-
-
-
-        .. versionchanged:: 2014.7.0
-
-            Made ``cwd`` optional
-
-
-
-    setting_name : None
-
-        The name of the configuration key to set. Required.
-
-
-
-    setting_value : None
-
-        The (new) value to set. Required.
-
-
-
-    user : None
-
-        Run git as a user other than what the minion runs as
-
-
-
-    is_global : False
-
-        Set to True to use the '--global' flag with 'git config'
-
-
-
-    CLI Example:
-
-
-
-    .. code-block:: bash
-
-
-
-        salt '*' git.config_set /path/to/repo user.email me@example.com
-
-    '''
-
-    if setting_name is None or setting_value is None:
-
-        raise TypeError('Missing required parameter setting_name for git.config_set')
-
-    if cwd is None and not is_global:
-
-        raise SaltInvocationError('Either `is_global` must be set to True or '
-
-                                  'you must provide `cwd`')
-
-
-
-    if is_global:
-
-        cmd = 'git config --global {0} "{1}"'.format(setting_name, setting_value)
 
     else:
 
-        cmd = 'git config {0} "{1}"'.format(setting_name, setting_value)
+      # This is a bad signature for a trusted key.
 
+      bad_sigs.append(keyid)
 
 
-    _check_git()
 
+  # Retrieve the threshold value for 'role'.  Raise
 
+  # tuf.exceptions.UnknownRoleError if we were given an invalid role.
 
-    return _git_run(cmd, cwd=cwd, runas=user)
+  if role is not None:
 
+    if threshold is None:
 
+      # Note that if the role is not known, tuf.exceptions.UnknownRoleError is
 
+      # raised here.
 
+      threshold = tuf.roledb.get_role_threshold(
 
-def config_get(cwd=None, setting_name=None, user=None):
+          role, repository_name=repository_name)
 
-    '''
 
-    Get a key or keys from the git configuration file (.git/config).
 
+    else:
 
+      logger.debug('Not using roledb.py\'s threshold for ' + repr(role))
 
-    cwd : None
 
-        Optional path to a Git repository
 
+  else:
 
+    threshold = 0
 
-        .. versionchanged:: 2014.7.0
 
-            Made ``cwd`` optional
 
+  # Build the signature_status dict.
 
+  signature_status['threshold'] = threshold
 
-    setting_name : None
+  signature_status['good_sigs'] = good_sigs
 
-        The name of the configuration key to get. Required.
+  signature_status['bad_sigs'] = bad_sigs
 
+  signature_status['unknown_sigs'] = unknown_sigs
 
+  signature_status['untrusted_sigs'] = untrusted_sigs
 
-    user : None
+  signature_status['unknown_signing_schemes'] = unknown_signing_schemes
 
-        Run git as a user other than what the minion runs as
 
 
+  return signature_status
 
-    CLI Example:
 
 
 
-    .. code-block:: bash
 
 
 
-        salt '*' git.config_get setting_name=user.email
 
-        salt '*' git.config_get /path/to/repo user.name arthur
 
-    '''
 
-    if setting_name is None:
 
-        raise TypeError('Missing required parameter setting_name for git.config_get')
+def verify(signable, role, repository_name='default', threshold=None,
 
-    _check_git()
+    keyids=None):
 
+  """
 
+  <Purpose>
 
-    return _git_run('git config {0}'.format(setting_name), cwd=cwd, runas=user)
+    Verify that 'signable' has a valid threshold of authorized signatures
 
+    identified by unique keyids. The threshold and whether a keyid is
 
+    authorized is determined by querying the 'threshold' and 'keyids' info for
 
+    the passed 'role' in 'tuf.roledb'. Both values can be overwritten by
 
+    passing the 'threshold' or 'keyids' arguments.
 
-def ls_remote(cwd, repository="origin", branch="master", user=None,
 
-              identity=None, https_user=None, https_pass=None):
 
-    '''
+    NOTE:
 
-    Returns the upstream hash for any given URL and branch.
+    - Signatures with identical authorized keyids only count towards the
 
+      threshold once.
 
+    - Signatures with different authorized keyids each count towards the
 
-    cwd
+      threshold, even if the keyids identify the same key.
 
-        The path to the Git repository
 
 
+  <Arguments>
 
-    repository: origin
+    signable:
 
-        The name of the repository to get the revision from. Can be the name of
+      A dictionary containing a list of signatures and a 'signed' identifier
 
-        a remote, an URL, etc.
+      that conforms to SIGNABLE_SCHEMA, e.g.:
 
+      signable = {'signed':, 'signatures': [{'keyid':, 'method':, 'sig':}]}
 
 
-    branch: master
 
-        The name of the branch to get the revision from.
+    role:
 
+      TUF role string (e.g. 'root', 'targets', 'snapshot' or timestamp).
 
 
-    user : none
 
-        run git as a user other than what the minion runs as
+    threshold:
 
+      Rather than reference the role's threshold as set in tuf.roledb.py, use
 
+      the given 'threshold' to calculate the signature status of 'signable'.
 
-    identity : none
+      'threshold' is an integer value that sets the role's threshold value, or
 
-        a path to a private key to use over ssh
+      the minimum number of signatures needed for metadata to be considered
 
+      fully signed.
 
 
-    https_user : None
 
-        HTTP Basic Auth username for HTTPS (only) clones
+    keyids:
 
+      Similar to the 'threshold' argument, use the supplied list of 'keyids'
 
+      to calculate the signature status, instead of referencing the keyids
 
-        .. versionadded:: 2015.5.0
+      in tuf.roledb.py for 'role'.
 
 
 
-    https_pass : None
+  <Exceptions>
 
-        HTTP Basic Auth password for HTTPS (only) clones
+    tuf.exceptions.UnknownRoleError, if 'role' is not recognized.
 
 
 
-        .. versionadded:: 2015.5.0
+    securesystemslib.exceptions.FormatError, if 'signable' is not formatted
 
+    correctly.
 
 
-    CLI Example:
 
+    securesystemslib.exceptions.Error, if an invalid threshold is encountered.
 
 
-    .. code-block:: bash
 
+  <Side Effects>
 
+    tuf.sig.get_signature_status() called.  Any exceptions thrown by
 
-        salt '*' git.ls_remote /pat/to/repo origin master
+    get_signature_status() will be caught here and re-raised.
 
 
 
-    '''
+  <Returns>
 
-    _check_git()
+    Boolean.  True if the number of good unique (by keyid) signatures >= the
 
-    repository = _add_http_basic_auth(repository, https_user, https_pass)
+    role's threshold, False otherwise.
 
-    cmd = ' '.join(["git", "ls-remote", "-h", str(repository), str(branch), "| cut -f 1"])
+  """
 
-    return _git_run(cmd, cwd=cwd, runas=user, identity=identity)
+
+
+  tuf.formats.SIGNABLE_SCHEMA.check_match(signable)
+
+  tuf.formats.ROLENAME_SCHEMA.check_match(role)
+
+  securesystemslib.formats.NAME_SCHEMA.check_match(repository_name)
+
+
+
+  # Retrieve the signature status.  tuf.sig.get_signature_status() raises:
+
+  # tuf.exceptions.UnknownRoleError
+
+  # securesystemslib.exceptions.FormatError.  'threshold' and 'keyids' are also
+
+  # validated.
+
+  status = get_signature_status(signable, role, repository_name, threshold, keyids)
+
+
+
+  # Retrieve the role's threshold and the authorized keys of 'status'
+
+  threshold = status['threshold']
+
+  good_sigs = status['good_sigs']
+
+
+
+  # Does 'status' have the required threshold of signatures?
+
+  # First check for invalid threshold values before returning result.
+
+  # Note: get_signature_status() is expected to verify that 'threshold' is
+
+  # not None or <= 0.
+
+  if threshold is None or threshold <= 0: #pragma: no cover
+
+    raise securesystemslib.exceptions.Error("Invalid threshold: " + repr(threshold))
+
+
+
+  return len(set(good_sigs)) >= threshold
+
+
+
+
+
+
+
+
+
+
+
+def may_need_new_keys(signature_status):
+
+  """
+
+  <Purpose>
+
+    Return true iff downloading a new set of keys might tip this
+
+    signature status over to valid.  This is determined by checking
+
+    if either the number of unknown or untrusted keys is > 0.
+
+
+
+  <Arguments>
+
+    signature_status:
+
+      The dictionary returned by tuf.sig.get_signature_status().
+
+
+
+  <Exceptions>
+
+    securesystemslib.exceptions.FormatError, if 'signature_status does not have
+
+    the correct format.
+
+
+
+  <Side Effects>
+
+    None.
+
+
+
+  <Returns>
+
+    Boolean.
+
+  """
+
+
+
+  # Does 'signature_status' have the correct format?
+
+  # This check will ensure 'signature_status' has the appropriate number
+
+  # of objects and object types, and that all dict keys are properly named.
+
+  # Raise 'securesystemslib.exceptions.FormatError' if the check fails.
+
+  tuf.formats.SIGNATURESTATUS_SCHEMA.check_match(signature_status)
+
+
+
+  unknown = signature_status['unknown_sigs']
+
+  untrusted = signature_status['untrusted_sigs']
+
+
+
+  return len(unknown) or len(untrusted)
+
+
+
+
+
+
+
+
+
+
+
+def generate_rsa_signature(signed, rsakey_dict):
+
+  """
+
+  <Purpose>
+
+    Generate a new signature dict presumably to be added to the 'signatures'
+
+    field of 'signable'.  The 'signable' dict is of the form:
+
+
+
+    {'signed': 'signer',
+
+               'signatures': [{'keyid': keyid,
+
+                               'method': 'evp',
+
+                               'sig': sig}]}
+
+
+
+    The 'signed' argument is needed here for the signing process.
+
+    The 'rsakey_dict' argument is used to generate 'keyid', 'method', and 'sig'.
+
+
+
+    The caller should ensure the returned signature is not already in
+
+    'signable'.
+
+
+
+  <Arguments>
+
+    signed:
+
+      The data used by 'securesystemslib.keys.create_signature()' to generate
+
+      signatures.  It is stored in the 'signed' field of 'signable'.
+
+
+
+    rsakey_dict:
+
+      The RSA key, a 'securesystemslib.formats.RSAKEY_SCHEMA' dictionary.
+
+      Used here to produce 'keyid', 'method', and 'sig'.
+
+
+
+  <Exceptions>
+
+    securesystemslib.exceptions.FormatError, if 'rsakey_dict' does not have the
+
+    correct format.
+
+
+
+    TypeError, if a private key is not defined for 'rsakey_dict'.
+
+
+
+  <Side Effects>
+
+    None.
+
+
+
+  <Returns>
+
+    Signature dictionary conformant to securesystemslib.formats.SIGNATURE_SCHEMA.
+
+    Has the form:
+
+    {'keyid': keyid, 'method': 'evp', 'sig': sig}
+
+  """
+
+
+
+  # We need 'signed' in canonical JSON format to generate
+
+  # the 'method' and 'sig' fields of the signature.
+
+  signed = securesystemslib.formats.encode_canonical(signed).encode('utf-8')
+
+
+
+  # Generate the RSA signature.
+
+  # Raises securesystemslib.exceptions.FormatError and TypeError.
+
+  signature = securesystemslib.keys.create_signature(rsakey_dict, signed)
+
+
+
+  return signature

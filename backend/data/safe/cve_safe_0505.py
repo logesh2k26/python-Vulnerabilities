@@ -1,485 +1,375 @@
 # Source: CVEFixes dataset
-# Safety: safe
+# Safety: vulnerable
 # Category: safe
 
-# -*- coding: utf-8 -*-
-
-'''
-
-Wrapper around Server Density API
-
-=================================
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
 
 
 
-.. versionadded:: 2014.7.0
+# Copyright 2012 OpenStack LLC
 
-'''
+#
 
-import requests
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
 
-import json
+# not use this file except in compliance with the License. You may obtain
 
-import logging
+# a copy of the License at
+
+#
+
+#      http://www.apache.org/licenses/LICENSE-2.0
+
+#
+
+# Unless required by applicable law or agreed to in writing, software
+
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+
+# License for the specific language governing permissions and limitations
+
+# under the License.
+
+
+
+import gettext
 
 import os
 
-import tempfile
+import sys
 
 
 
-from salt.exceptions import CommandExecutionError
+from keystone.common import logging
 
+from keystone.openstack.common import cfg
 
 
-log = logging.getLogger(__name__)
 
 
 
+gettext.install('keystone', unicode=1)
 
 
-def get_sd_auth(val, sd_auth_pillar_name='serverdensity'):
 
-    '''
 
-    Returns requested Server Density authentication value from pillar.
 
+CONF = cfg.CONF
 
 
-    CLI Example:
 
 
 
-    .. code-block:: bash
+def setup_logging(conf):
 
+    """
 
+    Sets up the logging options for a log with supplied name
 
-        salt '*' serverdensity_device.get_sd_auth <val>
 
-    '''
 
-    sd_pillar = __pillar__.get(sd_auth_pillar_name)
+    :param conf: a cfg.ConfOpts object
 
-    log.debug('Server Density Pillar: {0}'.format(sd_pillar))
+    """
 
-    if not sd_pillar:
 
-        log.error('Cloud not load {0} pillar'.format(sd_auth_pillar_name))
 
-        raise CommandExecutionError(
+    if conf.log_config:
 
-            '{0} pillar is required for authentication'.format(sd_auth_pillar_name)
+        # Use a logging configuration file for all settings...
 
-        )
+        if os.path.exists(conf.log_config):
 
+            logging.config.fileConfig(conf.log_config)
 
+            return
 
-    try:
+        else:
 
-        return sd_pillar[val]
+            raise RuntimeError('Unable to locate specified logging '
 
-    except KeyError:
+                               'config file: %s' % conf.log_config)
 
-        log.error('Cloud not find value {0} in pillar'.format(val))
 
-        raise CommandExecutionError('{0} value was not found in pillar'.format(val))
 
+    root_logger = logging.root
 
+    if conf.debug:
 
+        root_logger.setLevel(logging.DEBUG)
 
+    elif conf.verbose:
 
-def _clean_salt_variables(params, variable_prefix="__"):
-
-    '''
-
-    Pops out variables from params which starts with `variable_prefix`.
-
-    '''
-
-    map(params.pop, [k for k in params if k.startswith(variable_prefix)])
-
-    return params
-
-
-
-
-
-def create(name, **params):
-
-    '''
-
-    Function to create device in Server Density. For more info, see the `API
-
-    docs`__.
-
-
-
-    .. __: https://apidocs.serverdensity.com/Inventory/Devices/Creating
-
-
-
-    CLI Example:
-
-
-
-    .. code-block:: bash
-
-
-
-        salt '*' serverdensity_device.create lama
-
-        salt '*' serverdensity_device.create rich_lama group=lama_band installedRAM=32768
-
-    '''
-
-    log.debug('Server Density params: {0}'.format(params))
-
-    params = _clean_salt_variables(params)
-
-
-
-    params['name'] = name
-
-    api_response = requests.post(
-
-        'https://api.serverdensity.io/inventory/devices/',
-
-        params={'token': get_sd_auth('api_token')},
-
-        data=params
-
-    )
-
-    log.debug('Server Density API Response: {0}'.format(api_response))
-
-    log.debug('Server Density API Response content: {0}'.format(api_response.content))
-
-    if api_response.status_code == 200:
-
-        try:
-
-            return json.loads(api_response.content)
-
-        except ValueError:
-
-            log.error('Could not parse API Response content: {0}'.format(api_response.content))
-
-            raise CommandExecutionError(
-
-                'Failed to create, API Response: {0}'.format(api_response)
-
-            )
+        root_logger.setLevel(logging.INFO)
 
     else:
 
-        return None
+        root_logger.setLevel(logging.WARNING)
 
 
 
-
-
-def delete(device_id):
-
-    '''
-
-    Delete a device from Server Density. For more information, see the `API
-
-    docs`__.
+    formatter = logging.Formatter(conf.log_format, conf.log_date_format)
 
 
 
-    .. __: https://apidocs.serverdensity.com/Inventory/Devices/Deleting
-
-
-
-    CLI Example:
-
-
-
-    .. code-block:: bash
-
-
-
-        salt '*' serverdensity_device.delete 51f7eafcdba4bb235e000ae4
-
-    '''
-
-    api_response = requests.delete(
-
-        'https://api.serverdensity.io/inventory/devices/' + device_id,
-
-        params={'token': get_sd_auth('api_token')}
-
-    )
-
-    log.debug('Server Density API Response: {0}'.format(api_response))
-
-    log.debug('Server Density API Response content: {0}'.format(api_response.content))
-
-    if api_response.status_code == 200:
+    if conf.use_syslog:
 
         try:
 
-            return json.loads(api_response.content)
+            facility = getattr(logging.SysLogHandler,
 
-        except ValueError:
+                               conf.syslog_log_facility)
 
-            log.error('Could not parse API Response content: {0}'.format(api_response.content))
+        except AttributeError:
 
-            raise CommandExecutionError(
+            raise ValueError(_('Invalid syslog facility'))
 
-                'Failed to create, API Response: {0}'.format(api_response)
 
-            )
+
+        handler = logging.SysLogHandler(address='/dev/log',
+
+                                        facility=facility)
+
+    elif conf.log_file:
+
+        logfile = conf.log_file
+
+        if conf.log_dir:
+
+            logfile = os.path.join(conf.log_dir, logfile)
+
+        handler = logging.WatchedFileHandler(logfile)
 
     else:
 
-        return None
+        handler = logging.StreamHandler(sys.stdout)
 
 
 
+    handler.setFormatter(formatter)
 
+    root_logger.addHandler(handler)
 
-def ls(**params):
 
-    '''
 
-    List devices in Server Density
 
 
+def register_str(*args, **kw):
 
-    Results will be filtered by any params passed to this function. For more
+    conf = kw.pop('conf', CONF)
 
-    information, see the API docs on listing_ and searching_.
+    group = kw.pop('group', None)
 
+    return conf.register_opt(cfg.StrOpt(*args, **kw), group=group)
 
 
-    .. _listing: https://apidocs.serverdensity.com/Inventory/Devices/Listing
 
-    .. _searching: https://apidocs.serverdensity.com/Inventory/Devices/Searching
 
 
+def register_cli_str(*args, **kw):
 
-    CLI Example:
+    conf = kw.pop('conf', CONF)
 
+    group = kw.pop('group', None)
 
+    return conf.register_cli_opt(cfg.StrOpt(*args, **kw), group=group)
 
-    .. code-block:: bash
 
 
 
-        salt '*' serverdensity_device.ls
 
-        salt '*' serverdensity_device.ls name=lama
+def register_bool(*args, **kw):
 
-        salt '*' serverdensity_device.ls name=lama group=lama_band installedRAM=32768
+    conf = kw.pop('conf', CONF)
 
-    '''
+    group = kw.pop('group', None)
 
-    params = _clean_salt_variables(params)
+    return conf.register_opt(cfg.BoolOpt(*args, **kw), group=group)
 
 
 
-    endpoint = 'devices'
 
 
+def register_cli_bool(*args, **kw):
 
-    # Change endpoint if there are params to filter by:
+    conf = kw.pop('conf', CONF)
 
-    if params:
+    group = kw.pop('group', None)
 
-        endpoint = 'resources'
+    return conf.register_cli_opt(cfg.BoolOpt(*args, **kw), group=group)
 
 
 
-    # Convert all ints to strings:
 
-    for k, v in params.items():
 
-        params[k] = str(v)
+def register_int(*args, **kw):
 
+    conf = kw.pop('conf', CONF)
 
+    group = kw.pop('group', None)
 
-    api_response = requests.get(
+    return conf.register_opt(cfg.IntOpt(*args, **kw), group=group)
 
-        'https://api.serverdensity.io/inventory/{0}'.format(endpoint),
 
-        params={'token': get_sd_auth('api_token'), 'filter': json.dumps(params)}
 
-    )
 
-    log.debug('Server Density API Response: {0}'.format(api_response))
 
-    log.debug('Server Density API Response content: {0}'.format(api_response.content))
+def register_cli_int(*args, **kw):
 
-    if api_response.status_code == 200:
+    conf = kw.pop('conf', CONF)
 
-        try:
+    group = kw.pop('group', None)
 
-            return json.loads(api_response.content)
+    return conf.register_cli_opt(cfg.IntOpt(*args, **kw), group=group)
 
-        except ValueError:
 
-            log.error(
 
-                'Could not parse Server Density API Response content: {0}'
+register_str('admin_token', default='ADMIN')
 
-                .format(api_response.content)
+register_str('bind_host', default='0.0.0.0')
 
-            )
+register_str('compute_port', default=8774)
 
-            raise CommandExecutionError(
+register_str('admin_port', default=35357)
 
-                'Failed to create, Server Density API Response: {0}'
+register_str('public_port', default=5000)
 
-                .format(api_response)
+register_str('onready')
 
-            )
+register_str('auth_admin_prefix', default='')
 
-    else:
 
-        return None
 
+#ssl options
 
+register_bool('enable', group='ssl', default=False)
 
+register_str('certfile', group='ssl', default=None)
 
+register_str('keyfile', group='ssl', default=None)
 
-def update(device_id, **params):
+register_str('ca_certs', group='ssl', default=None)
 
-    '''
+register_bool('cert_required', group='ssl', default=False)
 
-    Updates device information in Server Density. For more information see the
+#signing options
 
-    `API docs`__.
+register_str('token_format', group='signing',
 
+             default="UUID")
 
+register_str('certfile', group='signing',
 
-    .. __: https://apidocs.serverdensity.com/Inventory/Devices/Updating
+             default="/etc/keystone/ssl/certs/signing_cert.pem")
 
+register_str('keyfile', group='signing',
 
+             default="/etc/keystone/ssl/private/signing_key.pem")
 
-    CLI Example:
+register_str('ca_certs', group='signing',
 
+             default="/etc/keystone/ssl/certs/ca.pem")
 
+register_int('key_size', group='signing', default=1024)
 
-    .. code-block:: bash
+register_int('valid_days', group='signing', default=3650)
 
+register_str('ca_password', group='signing', default=None)
 
 
-        salt '*' serverdensity_device.update 51f7eafcdba4bb235e000ae4 name=lama group=lama_band
 
-        salt '*' serverdensity_device.update 51f7eafcdba4bb235e000ae4 name=better_lama group=rock_lamas swapSpace=512
 
-    '''
 
-    params = _clean_salt_variables(params)
+# sql options
 
+register_str('connection', group='sql', default='sqlite:///keystone.db')
 
+register_int('idle_timeout', group='sql', default=200)
 
-    api_response = requests.put(
 
-        'https://api.serverdensity.io/inventory/devices/' + device_id,
 
-        params={'token': get_sd_auth('api_token')},
 
-        data=params
 
-    )
+register_str('driver', group='catalog',
 
-    log.debug('Server Density API Response: {0}'.format(api_response))
+             default='keystone.catalog.backends.sql.Catalog')
 
-    log.debug('Server Density API Response content: {0}'.format(api_response.content))
+register_str('driver', group='identity',
 
-    if api_response.status_code == 200:
+             default='keystone.identity.backends.sql.Identity')
 
-        try:
+register_str('driver', group='policy',
 
-            return json.loads(api_response.content)
+             default='keystone.policy.backends.rules.Policy')
 
-        except ValueError:
+register_str('driver', group='token',
 
-            log.error(
+             default='keystone.token.backends.kvs.Token')
 
-                'Could not parse Server Density API Response content: {0}'
+register_str('driver', group='ec2',
 
-                .format(api_response.content)
+             default='keystone.contrib.ec2.backends.kvs.Ec2')
 
-            )
+register_str('driver', group='stats',
 
-            raise CommandExecutionError(
+             default='keystone.contrib.stats.backends.kvs.Stats')
 
-                'Failed to create, API Response: {0}'.format(api_response)
 
-            )
 
-    else:
+#ldap
 
-        return None
+register_str('url', group='ldap', default='ldap://localhost')
 
+register_str('user', group='ldap', default='dc=Manager,dc=example,dc=com')
 
+register_str('password', group='ldap', default='freeipa4all')
 
+register_str('suffix', group='ldap', default='cn=example,cn=com')
 
+register_bool('use_dumb_member', group='ldap', default=False)
 
-def install_agent(agent_key):
+register_str('user_name_attribute', group='ldap', default='sn')
 
-    '''
 
-    Function downloads Server Density installation agent, and installs sd-agent
 
-    with agent_key.
 
 
+register_str('user_tree_dn', group='ldap', default=None)
 
-    CLI Example:
+register_str('user_objectclass', group='ldap', default='inetOrgPerson')
 
+register_str('user_id_attribute', group='ldap', default='cn')
 
 
-    .. code-block:: bash
 
+register_str('tenant_tree_dn', group='ldap', default=None)
 
+register_str('tenant_objectclass', group='ldap', default='groupOfNames')
 
-        salt '*' serverdensity_device.install_agent c2bbdd6689ff46282bdaa07555641498
+register_str('tenant_id_attribute', group='ldap', default='cn')
 
-    '''
+register_str('tenant_member_attribute', group='ldap', default='member')
 
-    work_dir = os.path.join(__opts__['cachedir'], 'tmp')
+register_str('tenant_name_attribute', group='ldap', default='ou')
 
-    if not os.path.isdir(work_dir):
 
-        os.mkdir(work_dir)
 
-    install_file = tempfile.NamedTemporaryFile(dir=work_dir,
+register_str('role_tree_dn', group='ldap', default=None)
 
-                                                   suffix='.sh',
+register_str('role_objectclass', group='ldap', default='organizationalRole')
 
-                                                   delete=False)
+register_str('role_id_attribute', group='ldap', default='cn')
 
-    install_filename = install_file.name
+register_str('role_member_attribute', group='ldap', default='roleOccupant')
 
-    install_file.close()
 
-    account_url = get_sd_auth('account_url')
 
+#pam
 
+register_str('url', group='pam', default=None)
 
-    __salt__['cmd.run'](
+register_str('userid', group='pam', default=None)
 
-        cmd='curl https://www.serverdensity.com/downloads/agent-install.sh -o {0}'.format(install_filename),
-
-        cwd=work_dir
-
-    )
-
-    __salt__['cmd.run'](cmd='chmod +x {0}'.format(install_filename), cwd=work_dir)
-
-
-
-    return __salt__['cmd.run'](
-
-        cmd='./{filename} -a {account_url} -k {agent_key}'.format(
-
-            filename=install_filename, account_url=account_url, agent_key=agent_key),
-
-        cwd=work_dir
-
-    )
+register_str('password', group='pam', default=None)

@@ -2,756 +2,372 @@
 # Safety: safe
 # Category: safe
 
-"""
+# (c) 2012-2014, Michael DeHaan <michael.dehaan@gmail.com>
 
-Base classes for Custom Authenticator to use OAuth with JupyterHub
+#
+
+# This file is part of Ansible
+
+#
+
+# Ansible is free software: you can redistribute it and/or modify
+
+# it under the terms of the GNU General Public License as published by
+
+# the Free Software Foundation, either version 3 of the License, or
+
+# (at your option) any later version.
+
+#
+
+# Ansible is distributed in the hope that it will be useful,
+
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+
+# GNU General Public License for more details.
+
+#
+
+# You should have received a copy of the GNU General Public License
+
+# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
 
 
-
-Most of the code c/o Kyle Kelley (@rgbkrk)
-
-"""
-
-
-
-import base64
-
-import json
 
 import os
 
-from urllib.parse import quote, urlparse
+import pwd
 
-import uuid
+import sys
 
+import ConfigParser
 
+from string import ascii_letters, digits
 
-from tornado import web
 
-from tornado.auth import OAuth2Mixin
 
-from tornado.log import app_log
+# copied from utils, avoid circular reference fun :)
 
+def mk_boolean(value):
 
+    if value is None:
 
-from jupyterhub.handlers import BaseHandler
+        return False
 
-from jupyterhub.auth import Authenticator
+    val = str(value)
 
-from jupyterhub.utils import url_path_join
+    if val.lower() in [ "true", "t", "y", "1", "yes" ]:
 
+        return True
 
+    else:
 
-from traitlets import Unicode, Bool, List, Dict, default, observe
+        return False
 
 
 
+def get_config(p, section, key, env_var, default, boolean=False, integer=False, floating=False, islist=False):
 
+    ''' return a configuration variable with casting '''
 
-def guess_callback_uri(protocol, host, hub_server_url):
+    value = _get_config(p, section, key, env_var, default)
 
-    return '{proto}://{host}{path}'.format(
+    if boolean:
 
-        proto=protocol, host=host, path=url_path_join(hub_server_url, 'oauth_callback')
+        return mk_boolean(value)
 
-    )
+    if value and integer:
 
+        return int(value)
 
+    if value and floating:
 
+        return float(value)
 
+    if value and islist:
 
-STATE_COOKIE_NAME = 'oauthenticator-state'
+        return [x.strip() for x in value.split(',')]
 
+    return value
 
 
 
+def _get_config(p, section, key, env_var, default):
 
-def _serialize_state(state):
+    ''' helper function for get_config '''
 
-    """Serialize OAuth state to a base64 string after passing through JSON"""
+    if env_var is not None:
 
-    json_state = json.dumps(state)
+        value = os.environ.get(env_var, None)
 
-    return base64.urlsafe_b64encode(json_state.encode('utf8')).decode('ascii')
+        if value is not None:
 
+            return value
 
+    if p is not None:
 
+        try:
 
+            return p.get(section, key, raw=True)
 
-def _deserialize_state(b64_state):
+        except:
 
-    """Deserialize OAuth state as serialized in _serialize_state"""
+            return default
 
-    if isinstance(b64_state, str):
+    return default
 
-        b64_state = b64_state.encode('ascii')
 
-    try:
 
-        json_state = base64.urlsafe_b64decode(b64_state).decode('utf8')
+def load_config_file():
 
-    except ValueError:
+    ''' Load Config File order(first found is used): ENV, CWD, HOME, /etc/ansible '''
 
-        app_log.error("Failed to b64-decode state: %r", b64_state)
 
-        return {}
 
-    try:
+    p = ConfigParser.ConfigParser()
 
-        return json.loads(json_state)
 
-    except ValueError:
 
-        app_log.error("Failed to json-decode state: %r", json_state)
+    path0 = os.getenv("ANSIBLE_CONFIG", None)
 
-        return {}
+    if path0 is not None:
 
+        path0 = os.path.expanduser(path0)
 
+    path1 = os.getcwd() + "/ansible.cfg"
 
+    path2 = os.path.expanduser("~/.ansible.cfg")
 
+    path3 = "/etc/ansible/ansible.cfg"
 
-class OAuthLoginHandler(OAuth2Mixin, BaseHandler):
 
-    """Base class for OAuth login handler
 
+    for path in [path0, path1, path2, path3]:
 
+        if path is not None and os.path.exists(path):
 
-    Typically subclasses will need
+            p.read(path)
 
-    """
+            return p
 
+    return None
 
 
-    # these URLs are part of the OAuth2Mixin API
 
-    # get them from the Authenticator object
+def shell_expand_path(path):
 
-    @property
+    ''' shell_expand_path is needed as os.path.expanduser does not work
 
-    def _OAUTH_AUTHORIZE_URL(self):
+        when path is None, which is the default for ANSIBLE_PRIVATE_KEY_FILE '''
 
-        return self.authenticator.authorize_url
+    if path:
 
+        path = os.path.expanduser(path)
 
+    return path
 
-    @property
 
-    def _OAUTH_ACCESS_TOKEN_URL(self):
 
-        return self.authenticator.token_url
+p = load_config_file()
 
 
 
-    @property
+active_user   = pwd.getpwuid(os.geteuid())[0]
 
-    def _OAUTH_USERINFO_URL(self):
 
-        return self.authenticator.userdata_url
 
+# Needed so the RPM can call setup.py and have modules land in the
 
+# correct location. See #1277 for discussion
 
-    def set_state_cookie(self, state):
+if getattr(sys, "real_prefix", None):
 
-        self._set_cookie(STATE_COOKIE_NAME, state, expires_days=1, httponly=True)
+    # in a virtualenv
 
+    DIST_MODULE_PATH = os.path.join(sys.prefix, 'share/ansible/')
 
+else:
 
-    _state = None
+    DIST_MODULE_PATH = '/usr/share/ansible/'
 
 
 
-    def get_state(self):
+# check all of these extensions when looking for yaml files for things like
 
-        next_url = original_next_url = self.get_argument('next', None)
+# group variables -- really anything we can load
 
-        if next_url:
+YAML_FILENAME_EXTENSIONS = [ "", ".yml", ".yaml", ".json" ]
 
-            # avoid browsers treating \ as /
 
-            next_url = next_url.replace('\\', quote('\\'))
 
-            # disallow hostname-having urls,
+# sections in config file
 
-            # force absolute path redirect
+DEFAULTS='defaults'
 
-            urlinfo = urlparse(next_url)
 
-            next_url = urlinfo._replace(
 
-                scheme='', netloc='', path='/' + urlinfo.path.lstrip('/')
+# configurable things
 
-            ).geturl()
+DEFAULT_HOST_LIST         = shell_expand_path(get_config(p, DEFAULTS, 'hostfile', 'ANSIBLE_HOSTS', '/etc/ansible/hosts'))
 
-            if next_url != original_next_url:
+DEFAULT_MODULE_PATH       = get_config(p, DEFAULTS, 'library',          'ANSIBLE_LIBRARY',          DIST_MODULE_PATH)
 
-                self.log.warning(
+DEFAULT_ROLES_PATH        = shell_expand_path(get_config(p, DEFAULTS, 'roles_path',       'ANSIBLE_ROLES_PATH',       '/etc/ansible/roles'))
 
-                    "Ignoring next_url %r, using %r", original_next_url, next_url
+DEFAULT_REMOTE_TMP        = shell_expand_path(get_config(p, DEFAULTS, 'remote_tmp',       'ANSIBLE_REMOTE_TEMP',      '$HOME/.ansible/tmp'))
 
-                )
+DEFAULT_MODULE_NAME       = get_config(p, DEFAULTS, 'module_name',      None,                       'command')
 
-        if self._state is None:
+DEFAULT_PATTERN           = get_config(p, DEFAULTS, 'pattern',          None,                       '*')
 
-            self._state = _serialize_state(
+DEFAULT_FORKS             = get_config(p, DEFAULTS, 'forks',            'ANSIBLE_FORKS',            5, integer=True)
 
-                {'state_id': uuid.uuid4().hex, 'next_url': next_url}
+DEFAULT_MODULE_ARGS       = get_config(p, DEFAULTS, 'module_args',      'ANSIBLE_MODULE_ARGS',      '')
 
-            )
+DEFAULT_MODULE_LANG       = get_config(p, DEFAULTS, 'module_lang',      'ANSIBLE_MODULE_LANG',      'en_US.UTF-8')
 
-        return self._state
+DEFAULT_TIMEOUT           = get_config(p, DEFAULTS, 'timeout',          'ANSIBLE_TIMEOUT',          10, integer=True)
 
+DEFAULT_POLL_INTERVAL     = get_config(p, DEFAULTS, 'poll_interval',    'ANSIBLE_POLL_INTERVAL',    15, integer=True)
 
+DEFAULT_REMOTE_USER       = get_config(p, DEFAULTS, 'remote_user',      'ANSIBLE_REMOTE_USER',      active_user)
 
-    def get(self):
+DEFAULT_ASK_PASS          = get_config(p, DEFAULTS, 'ask_pass',  'ANSIBLE_ASK_PASS',    False, boolean=True)
 
-        redirect_uri = self.authenticator.get_callback_url(self)
+DEFAULT_PRIVATE_KEY_FILE  = shell_expand_path(get_config(p, DEFAULTS, 'private_key_file', 'ANSIBLE_PRIVATE_KEY_FILE', None))
 
-        extra_params = self.authenticator.extra_authorize_params.copy()
+DEFAULT_SUDO_USER         = get_config(p, DEFAULTS, 'sudo_user',        'ANSIBLE_SUDO_USER',        'root')
 
-        self.log.info('OAuth redirect: %r', redirect_uri)
+DEFAULT_ASK_SUDO_PASS     = get_config(p, DEFAULTS, 'ask_sudo_pass',    'ANSIBLE_ASK_SUDO_PASS',    False, boolean=True)
 
-        state = self.get_state()
+DEFAULT_REMOTE_PORT       = get_config(p, DEFAULTS, 'remote_port',      'ANSIBLE_REMOTE_PORT',      None, integer=True)
 
-        self.set_state_cookie(state)
+DEFAULT_ASK_VAULT_PASS    = get_config(p, DEFAULTS, 'ask_vault_pass',    'ANSIBLE_ASK_VAULT_PASS',    False, boolean=True)
 
-        extra_params['state'] = state
+DEFAULT_TRANSPORT         = get_config(p, DEFAULTS, 'transport',        'ANSIBLE_TRANSPORT',        'smart')
 
-        self.authorize_redirect(
+DEFAULT_SCP_IF_SSH        = get_config(p, 'ssh_connection', 'scp_if_ssh',       'ANSIBLE_SCP_IF_SSH',       False, boolean=True)
 
-            redirect_uri=redirect_uri,
+DEFAULT_MANAGED_STR       = get_config(p, DEFAULTS, 'ansible_managed',  None,           'Ansible managed: {file} modified on %Y-%m-%d %H:%M:%S by {uid} on {host}')
 
-            client_id=self.authenticator.client_id,
+DEFAULT_SYSLOG_FACILITY   = get_config(p, DEFAULTS, 'syslog_facility',  'ANSIBLE_SYSLOG_FACILITY', 'LOG_USER')
 
-            scope=self.authenticator.scope,
+DEFAULT_KEEP_REMOTE_FILES = get_config(p, DEFAULTS, 'keep_remote_files', 'ANSIBLE_KEEP_REMOTE_FILES', False, boolean=True)
 
-            extra_params=extra_params,
+DEFAULT_SUDO              = get_config(p, DEFAULTS, 'sudo', 'ANSIBLE_SUDO', False, boolean=True)
 
-            response_type='code',
+DEFAULT_SUDO_EXE          = get_config(p, DEFAULTS, 'sudo_exe', 'ANSIBLE_SUDO_EXE', 'sudo')
 
-        )
+DEFAULT_SUDO_FLAGS        = get_config(p, DEFAULTS, 'sudo_flags', 'ANSIBLE_SUDO_FLAGS', '-H')
 
+DEFAULT_HASH_BEHAVIOUR    = get_config(p, DEFAULTS, 'hash_behaviour', 'ANSIBLE_HASH_BEHAVIOUR', 'replace')
 
+DEFAULT_JINJA2_EXTENSIONS = get_config(p, DEFAULTS, 'jinja2_extensions', 'ANSIBLE_JINJA2_EXTENSIONS', None)
 
+DEFAULT_EXECUTABLE        = get_config(p, DEFAULTS, 'executable', 'ANSIBLE_EXECUTABLE', '/bin/sh')
 
+DEFAULT_SU_EXE            = get_config(p, DEFAULTS, 'su_exe', 'ANSIBLE_SU_EXE', 'su')
 
-class OAuthCallbackHandler(BaseHandler):
+DEFAULT_SU                = get_config(p, DEFAULTS, 'su', 'ANSIBLE_SU', False, boolean=True)
 
-    """Basic handler for OAuth callback. Calls authenticator to verify username."""
+DEFAULT_SU_FLAGS          = get_config(p, DEFAULTS, 'su_flags', 'ANSIBLE_SU_FLAGS', '')
 
+DEFAULT_SU_USER           = get_config(p, DEFAULTS, 'su_user', 'ANSIBLE_SU_USER', 'root')
 
+DEFAULT_ASK_SU_PASS       = get_config(p, DEFAULTS, 'ask_su_pass', 'ANSIBLE_ASK_SU_PASS', False, boolean=True)
 
-    _state_cookie = None
+DEFAULT_GATHERING         = get_config(p, DEFAULTS, 'gathering', 'ANSIBLE_GATHERING', 'implicit').lower()
 
 
 
-    def get_state_cookie(self):
+DEFAULT_ACTION_PLUGIN_PATH     = get_config(p, DEFAULTS, 'action_plugins',     'ANSIBLE_ACTION_PLUGINS', '/usr/share/ansible_plugins/action_plugins')
 
-        """Get OAuth state from cookies
+DEFAULT_CALLBACK_PLUGIN_PATH   = get_config(p, DEFAULTS, 'callback_plugins',   'ANSIBLE_CALLBACK_PLUGINS', '/usr/share/ansible_plugins/callback_plugins')
 
+DEFAULT_CONNECTION_PLUGIN_PATH = get_config(p, DEFAULTS, 'connection_plugins', 'ANSIBLE_CONNECTION_PLUGINS', '/usr/share/ansible_plugins/connection_plugins')
 
+DEFAULT_LOOKUP_PLUGIN_PATH     = get_config(p, DEFAULTS, 'lookup_plugins',     'ANSIBLE_LOOKUP_PLUGINS', '/usr/share/ansible_plugins/lookup_plugins')
 
-        To be compared with the value in redirect URL
+DEFAULT_VARS_PLUGIN_PATH       = get_config(p, DEFAULTS, 'vars_plugins',       'ANSIBLE_VARS_PLUGINS', '/usr/share/ansible_plugins/vars_plugins')
 
-        """
+DEFAULT_FILTER_PLUGIN_PATH     = get_config(p, DEFAULTS, 'filter_plugins',     'ANSIBLE_FILTER_PLUGINS', '/usr/share/ansible_plugins/filter_plugins')
 
-        if self._state_cookie is None:
+DEFAULT_LOG_PATH               = shell_expand_path(get_config(p, DEFAULTS, 'log_path',           'ANSIBLE_LOG_PATH', ''))
 
-            self._state_cookie = (
 
-                self.get_secure_cookie(STATE_COOKIE_NAME) or b''
 
-            ).decode('utf8', 'replace')
+ANSIBLE_FORCE_COLOR            = get_config(p, DEFAULTS, 'force_color', 'ANSIBLE_FORCE_COLOR', None, boolean=True)
 
-            self.clear_cookie(STATE_COOKIE_NAME)
+ANSIBLE_NOCOLOR                = get_config(p, DEFAULTS, 'nocolor', 'ANSIBLE_NOCOLOR', None, boolean=True)
 
-        return self._state_cookie
+ANSIBLE_NOCOWS                 = get_config(p, DEFAULTS, 'nocows', 'ANSIBLE_NOCOWS', None, boolean=True)
 
+DISPLAY_SKIPPED_HOSTS          = get_config(p, DEFAULTS, 'display_skipped_hosts', 'DISPLAY_SKIPPED_HOSTS', True, boolean=True)
 
+DEFAULT_UNDEFINED_VAR_BEHAVIOR = get_config(p, DEFAULTS, 'error_on_undefined_vars', 'ANSIBLE_ERROR_ON_UNDEFINED_VARS', True, boolean=True)
 
-    def get_state_url(self):
+HOST_KEY_CHECKING              = get_config(p, DEFAULTS, 'host_key_checking',  'ANSIBLE_HOST_KEY_CHECKING',    True, boolean=True)
 
-        """Get OAuth state from URL parameters
+SYSTEM_WARNINGS                = get_config(p, DEFAULTS, 'system_warnings', 'ANSIBLE_SYSTEM_WARNINGS', True, boolean=True)
 
+DEPRECATION_WARNINGS           = get_config(p, DEFAULTS, 'deprecation_warnings', 'ANSIBLE_DEPRECATION_WARNINGS', True, boolean=True)
 
+DEFAULT_CALLABLE_WHITELIST     = get_config(p, DEFAULTS, 'callable_whitelist', 'ANSIBLE_CALLABLE_WHITELIST', [], islist=True)
 
-        to be compared with the value in cookies
 
-        """
 
-        return self.get_argument("state")
+# CONNECTION RELATED
 
+ANSIBLE_SSH_ARGS               = get_config(p, 'ssh_connection', 'ssh_args', 'ANSIBLE_SSH_ARGS', None)
 
+ANSIBLE_SSH_CONTROL_PATH       = get_config(p, 'ssh_connection', 'control_path', 'ANSIBLE_SSH_CONTROL_PATH', "%(directory)s/ansible-ssh-%%h-%%p-%%r")
 
-    def check_state(self):
+ANSIBLE_SSH_PIPELINING         = get_config(p, 'ssh_connection', 'pipelining', 'ANSIBLE_SSH_PIPELINING', False, boolean=True)
 
-        """Verify OAuth state
+PARAMIKO_RECORD_HOST_KEYS      = get_config(p, 'paramiko_connection', 'record_host_keys', 'ANSIBLE_PARAMIKO_RECORD_HOST_KEYS', True, boolean=True)
 
+# obsolete -- will be formally removed in 1.6
 
+ZEROMQ_PORT                    = get_config(p, 'fireball_connection', 'zeromq_port', 'ANSIBLE_ZEROMQ_PORT', 5099, integer=True)
 
-        compare value in cookie with redirect url param
+ACCELERATE_PORT                = get_config(p, 'accelerate', 'accelerate_port', 'ACCELERATE_PORT', 5099, integer=True)
 
-        """
+ACCELERATE_TIMEOUT             = get_config(p, 'accelerate', 'accelerate_timeout', 'ACCELERATE_TIMEOUT', 30, integer=True)
 
-        cookie_state = self.get_state_cookie()
+ACCELERATE_CONNECT_TIMEOUT     = get_config(p, 'accelerate', 'accelerate_connect_timeout', 'ACCELERATE_CONNECT_TIMEOUT', 1.0, floating=True)
 
-        url_state = self.get_state_url()
+ACCELERATE_DAEMON_TIMEOUT      = get_config(p, 'accelerate', 'accelerate_daemon_timeout', 'ACCELERATE_DAEMON_TIMEOUT', 30, integer=True)
 
-        if not cookie_state:
+ACCELERATE_KEYS_DIR            = get_config(p, 'accelerate', 'accelerate_keys_dir', 'ACCELERATE_KEYS_DIR', '~/.fireball.keys')
 
-            raise web.HTTPError(400, "OAuth state missing from cookies")
+ACCELERATE_KEYS_DIR_PERMS      = get_config(p, 'accelerate', 'accelerate_keys_dir_perms', 'ACCELERATE_KEYS_DIR_PERMS', '700')
 
-        if not url_state:
+ACCELERATE_KEYS_FILE_PERMS     = get_config(p, 'accelerate', 'accelerate_keys_file_perms', 'ACCELERATE_KEYS_FILE_PERMS', '600')
 
-            raise web.HTTPError(400, "OAuth state missing from URL")
+ACCELERATE_MULTI_KEY           = get_config(p, 'accelerate', 'accelerate_multi_key', 'ACCELERATE_MULTI_KEY', False, boolean=True)
 
-        if cookie_state != url_state:
+PARAMIKO_PTY                   = get_config(p, 'paramiko_connection', 'pty', 'ANSIBLE_PARAMIKO_PTY', True, boolean=True)
 
-            self.log.warning("OAuth state mismatch: %s != %s", cookie_state, url_state)
 
-            raise web.HTTPError(400, "OAuth state mismatch")
 
+# characters included in auto-generated passwords
 
+DEFAULT_PASSWORD_CHARS = ascii_letters + digits + ".,:-_"
 
-    def check_error(self):
 
-        """Check the OAuth code"""
 
-        error = self.get_argument("error", False)
+# non-configurable things
 
-        if error:
+DEFAULT_SUDO_PASS         = None
 
-            message = self.get_argument("error_description", error)
+DEFAULT_REMOTE_PASS       = None
 
-            raise web.HTTPError(400, "OAuth error: %s" % message)
+DEFAULT_SUBSET            = None
 
+DEFAULT_SU_PASS           = None
 
+VAULT_VERSION_MIN         = 1.0
 
-    def check_code(self):
-
-        """Check the OAuth code"""
-
-        if not self.get_argument("code", False):
-
-            raise web.HTTPError(400, "OAuth callback made without a code")
-
-
-
-    def check_arguments(self):
-
-        """Validate the arguments of the redirect
-
-
-
-        Default:
-
-
-
-        - check for oauth-standard error, error_description arguments
-
-        - check that there's a code
-
-        - check that state matches
-
-        """
-
-        self.check_error()
-
-        self.check_code()
-
-        self.check_state()
-
-
-
-    def append_query_parameters(self, url, exclude=None):
-
-        """JupyterHub 1.2 appends query parameters by default in get_next_url
-
-
-
-        This is not appropriate for oauth callback handlers, where params are oauth state, code, etc.
-
-
-
-        Override the method used to append parameters to next_url to not preserve any parameters
-
-        """
-
-        return url
-
-
-
-    def get_next_url(self, user=None):
-
-        """Get the redirect target from the state field"""
-
-        state = self.get_state_url()
-
-        if state:
-
-            next_url = _deserialize_state(state).get('next_url')
-
-            if next_url:
-
-                return next_url
-
-        # JupyterHub 0.8 adds default .get_next_url for a fallback
-
-        if hasattr(BaseHandler, 'get_next_url'):
-
-            return super().get_next_url(user)
-
-        return url_path_join(self.hub.server.base_url, 'home')
-
-
-
-    async def _login_user_pre_08(self):
-
-        """login_user simplifies the login+cookie+auth_state process in JupyterHub 0.8
-
-
-
-        _login_user_07 is for backward-compatibility with JupyterHub 0.7
-
-        """
-
-        user_info = await self.authenticator.get_authenticated_user(self, None)
-
-        if user_info is None:
-
-            return
-
-        if isinstance(user_info, dict):
-
-            username = user_info['name']
-
-        else:
-
-            username = user_info
-
-        user = self.user_from_username(username)
-
-        self.set_login_cookie(user)
-
-        return user
-
-
-
-    if not hasattr(BaseHandler, 'login_user'):
-
-        # JupyterHub 0.7 doesn't have .login_user
-
-        login_user = _login_user_pre_08
-
-
-
-    async def get(self):
-
-        self.check_arguments()
-
-        user = await self.login_user()
-
-        if user is None:
-
-            # todo: custom error page?
-
-            raise web.HTTPError(403)
-
-        self.redirect(self.get_next_url(user))
-
-
-
-
-
-class OAuthenticator(Authenticator):
-
-    """Base class for OAuthenticators
-
-
-
-    Subclasses must override:
-
-
-
-    login_service (string identifying the service provider)
-
-    authenticate (method takes one arg - the request handler handling the oauth callback)
-
-    """
-
-
-
-    login_handler = OAuthLoginHandler
-
-    callback_handler = OAuthCallbackHandler
-
-
-
-    authorize_url = Unicode(
-
-        config=True, help="""The authenticate url for initiating oauth"""
-
-    )
-
-    @default("authorize_url")
-
-    def _authorize_url_default(self):
-
-        return os.environ.get("OAUTH2_AUTHORIZE_URL", "")
-
-
-
-    token_url = Unicode(
-
-        config=True,
-
-        help="""The url retrieving an access token at the completion of oauth""",
-
-    )
-
-    @default("token_url")
-
-    def _token_url_default(self):
-
-        return os.environ.get("OAUTH2_TOKEN_URL", "")
-
-
-
-    userdata_url = Unicode(
-
-        config=True,
-
-        help="""The url for retrieving user data with a completed access token""",
-
-    )
-
-    @default("userdata_url")
-
-    def _userdata_url_default(self):
-
-        return os.environ.get("OAUTH2_USERDATA_URL", "")
-
-
-
-    scope = List(
-
-        Unicode(),
-
-        config=True,
-
-        help="""The OAuth scopes to request.
-
-        See the OAuth documentation of your OAuth provider for options.
-
-        For GitHub in particular, you can see github_scopes.md in this repo.
-
-        """,
-
-    )
-
-
-
-    extra_authorize_params = Dict(
-
-        config=True,
-
-        help="""Extra GET params to send along with the initial OAuth request
-
-        to the OAuth provider.""",
-
-    )
-
-
-
-    login_service = 'override in subclass'
-
-    oauth_callback_url = Unicode(
-
-        os.getenv('OAUTH_CALLBACK_URL', ''),
-
-        config=True,
-
-        help="""Callback URL to use.
-
-        Typically `https://{host}/hub/oauth_callback`""",
-
-    )
-
-
-
-    client_id_env = ''
-
-    client_id = Unicode(config=True)
-
-
-
-    def _client_id_default(self):
-
-        if self.client_id_env:
-
-            client_id = os.getenv(self.client_id_env, '')
-
-            if client_id:
-
-                return client_id
-
-        return os.getenv('OAUTH_CLIENT_ID', '')
-
-
-
-    client_secret_env = ''
-
-    client_secret = Unicode(config=True)
-
-
-
-    def _client_secret_default(self):
-
-        if self.client_secret_env:
-
-            client_secret = os.getenv(self.client_secret_env, '')
-
-            if client_secret:
-
-                return client_secret
-
-        return os.getenv('OAUTH_CLIENT_SECRET', '')
-
-
-
-    validate_server_cert_env = 'OAUTH_TLS_VERIFY'
-
-    validate_server_cert = Bool(config=True)
-
-
-
-    def _validate_server_cert_default(self):
-
-        env_value = os.getenv(self.validate_server_cert_env, '')
-
-        if env_value == '0':
-
-            return False
-
-        else:
-
-            return True
-
-
-
-    def login_url(self, base_url):
-
-        return url_path_join(base_url, 'oauth_login')
-
-
-
-
-
-    def get_callback_url(self, handler=None):
-
-        """Get my OAuth redirect URL
-
-        
-
-        Either from config or guess based on the current request.
-
-        """
-
-        if self.oauth_callback_url:
-
-            return self.oauth_callback_url
-
-        elif handler:
-
-            return guess_callback_uri(
-
-                handler.request.protocol,
-
-                handler.request.host,
-
-                handler.hub.server.base_url,
-
-            )
-
-        else:
-
-            raise ValueError(
-
-                "Specify callback oauth_callback_url or give me a handler to guess with"
-
-            )
-
-
-
-    def get_handlers(self, app):
-
-        return [
-
-            (r'/oauth_login', self.login_handler),
-
-            (r'/oauth_callback', self.callback_handler),
-
-        ]
-
-
-
-    async def authenticate(self, handler, data=None):
-
-        raise NotImplementedError()
-
-
-
-    _deprecated_oauth_aliases = {}
-
-
-
-    def _deprecated_oauth_trait(self, change):
-
-        """observer for deprecated traits"""
-
-        old_attr = change.name
-
-        new_attr, version = self._deprecated_oauth_aliases.get(old_attr)
-
-        new_value = getattr(self, new_attr)
-
-        if new_value != change.new:
-
-            # only warn if different
-
-            # protects backward-compatible config from warnings
-
-            # if they set the same value under both names
-
-            self.log.warning(
-
-                "{cls}.{old} is deprecated in {cls} {version}, use {cls}.{new} instead".format(
-
-                    cls=self.__class__.__name__,
-
-                    old=old_attr,
-
-                    new=new_attr,
-
-                    version=version,
-
-                )
-
-            )
-
-            setattr(self, new_attr, change.new)
-
-
-
-    def __init__(self, **kwargs):
-
-        # observe deprecated config names in oauthenticator
-
-        if self._deprecated_oauth_aliases:
-
-            self.observe(
-
-                self._deprecated_oauth_trait, names=list(self._deprecated_oauth_aliases)
-
-            )
-
-        super().__init__(**kwargs)
+VAULT_VERSION_MAX         = 1.0

@@ -2,356 +2,168 @@
 # Safety: safe
 # Category: safe
 
-from __future__ import absolute_import, division, print_function, with_statement
+##############################################################################
 
+#
 
+# Copyright (c) 2002 Zope Corporation and Contributors. All Rights Reserved.
 
-import traceback
+#
 
+# This software is subject to the provisions of the Zope Public License,
 
+# Version 2.1 (ZPL).  A copy of the ZPL should accompany this distribution.
 
-from tornado.concurrent import Future
+# THIS SOFTWARE IS PROVIDED "AS IS" AND ANY AND ALL EXPRESS OR IMPLIED
 
-from tornado.httpclient import HTTPError, HTTPRequest
+# WARRANTIES ARE DISCLAIMED, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
 
-from tornado.log import gen_log
+# WARRANTIES OF TITLE, MERCHANTABILITY, AGAINST INFRINGEMENT, AND FITNESS
 
-from tornado.testing import AsyncHTTPTestCase, gen_test, bind_unused_port, ExpectLog
+# FOR A PARTICULAR PURPOSE
 
-from tornado.test.util import unittest, skipOnTravis
+#
 
-from tornado.web import Application, RequestHandler
+##############################################################################
 
+"""Zope-specific Python Expression Handler
 
 
-try:
 
-    import tornado.websocket
+Handler for Python expressions that uses the RestrictedPython package.
 
-    from tornado.util import _websocket_mask_python
 
-except ImportError:
 
-    # The unittest module presents misleading errors on ImportError
+$Id$
 
-    # (it acts as if websocket_test could not be found, hiding the underlying
+"""
 
-    # error).  If we get an ImportError here (which could happen due to
+from AccessControl import safe_builtins
 
-    # TORNADO_EXTENSION=1), print some extra information before failing.
+from AccessControl.ZopeGuards import guarded_getattr, get_safe_globals
 
-    traceback.print_exc()
+from RestrictedPython import compile_restricted_eval
 
-    raise
+from zope.tales.tales import CompilerError
 
+from zope.tales.pythonexpr import PythonExpr
 
 
-from tornado.websocket import WebSocketHandler, websocket_connect, WebSocketError
 
+class PythonExpr(PythonExpr):
 
+    _globals = get_safe_globals()
 
-try:
+    _globals['_getattr_'] = guarded_getattr
 
-    from tornado import speedups
+    _globals['__debug__' ] = __debug__
 
-except ImportError:
 
-    speedups = None
 
+    def __init__(self, name, expr, engine):
 
+        self.text = self.expr = text = expr.strip().replace('\n', ' ')
 
 
 
-class TestWebSocketHandler(WebSocketHandler):
+        # Unicode expression are not handled properly by RestrictedPython
 
-    """Base class for testing handlers that exposes the on_close event.
+        # We convert the expression to UTF-8 (ajung)
 
+        if isinstance(text, unicode):
 
+            text = text.encode('utf-8')
 
-    This allows for deterministic cleanup of the associated socket.
+        code, err, warn, use = compile_restricted_eval(text, 
 
-    """
+                                                       self.__class__.__name__)
 
-    def initialize(self, close_future):
+        if err:
 
-        self.close_future = close_future
+            raise engine.getCompilerError()('Python expression error:\n%s' %
 
+                                            '\n'.join(err))            
 
+        self._varnames = use.keys()
 
-    def on_close(self):
+        self._code = code
 
-        self.close_future.set_result(None)
 
 
+    def __call__(self, econtext):
 
+        __traceback_info__ = self.text
 
+        vars = self._bind_used_names(econtext, {})
 
-class EchoHandler(TestWebSocketHandler):
+        vars.update(self._globals)
 
-    def on_message(self, message):
+        return eval(self._code, vars, {})
 
-        self.write_message(message, isinstance(message, bytes))
 
 
+class _SecureModuleImporter:
 
+    __allow_access_to_unprotected_subobjects__ = True
 
 
-class HeaderHandler(TestWebSocketHandler):
 
-    def open(self):
+    def __getitem__(self, module):
 
-        self.write_message(self.request.headers.get('X-Test', ''))
+        mod = safe_builtins['__import__'](module)
 
+        path = module.split('.')
 
+        for name in path[1:]:
 
+            mod = getattr(mod, name)
 
+        return mod
 
-class NonWebSocketHandler(RequestHandler):
 
-    def get(self):
 
-        self.write('ok')
+from DocumentTemplate.DT_Util import TemplateDict, InstanceDict
 
+from AccessControl.DTML import RestrictedDTML
 
+class Rtd(RestrictedDTML, TemplateDict):
 
+    this = None
 
 
-class WebSocketTest(AsyncHTTPTestCase):
 
-    def get_app(self):
+def call_with_ns(f, ns, arg=1):
 
-        self.close_future = Future()
+    td = Rtd()
 
-        return Application([
+    # prefer 'context' to 'here';  fall back to 'None'
 
-            ('/echo', EchoHandler, dict(close_future=self.close_future)),
+    this = ns.get('context', ns.get('here'))
 
-            ('/non_ws', NonWebSocketHandler),
+    td.this = this
 
-            ('/header', HeaderHandler, dict(close_future=self.close_future)),
+    request = ns.get('request', {})
 
-        ])
+    if hasattr(request, 'taintWrapper'):
 
+        request = request.taintWrapper()
 
+    td._push(request)
 
-    @gen_test
+    td._push(InstanceDict(td.this, td))
 
-    def test_websocket_gen(self):
+    td._push(ns)
 
-        ws = yield websocket_connect(
+    try:
 
-            'ws://localhost:%d/echo' % self.get_http_port(),
+        if arg==2:
 
-            io_loop=self.io_loop)
+            return f(None, td)
 
-        ws.write_message('hello')
+        else:
 
-        response = yield ws.read_message()
+            return f(td)
 
-        self.assertEqual(response, 'hello')
+    finally:
 
-        ws.close()
-
-        yield self.close_future
-
-
-
-    def test_websocket_callbacks(self):
-
-        websocket_connect(
-
-            'ws://localhost:%d/echo' % self.get_http_port(),
-
-            io_loop=self.io_loop, callback=self.stop)
-
-        ws = self.wait().result()
-
-        ws.write_message('hello')
-
-        ws.read_message(self.stop)
-
-        response = self.wait().result()
-
-        self.assertEqual(response, 'hello')
-
-        ws.close()
-
-        yield self.close_future
-
-
-
-    @gen_test
-
-    def test_websocket_http_fail(self):
-
-        with self.assertRaises(HTTPError) as cm:
-
-            yield websocket_connect(
-
-                'ws://localhost:%d/notfound' % self.get_http_port(),
-
-                io_loop=self.io_loop)
-
-        self.assertEqual(cm.exception.code, 404)
-
-
-
-    @gen_test
-
-    def test_websocket_http_success(self):
-
-        with self.assertRaises(WebSocketError):
-
-            yield websocket_connect(
-
-                'ws://localhost:%d/non_ws' % self.get_http_port(),
-
-                io_loop=self.io_loop)
-
-
-
-    @skipOnTravis
-
-    @gen_test
-
-    def test_websocket_network_timeout(self):
-
-        sock, port = bind_unused_port()
-
-        sock.close()
-
-        with self.assertRaises(HTTPError) as cm:
-
-            with ExpectLog(gen_log, ".*"):
-
-                yield websocket_connect(
-
-                    'ws://localhost:%d/' % port,
-
-                    io_loop=self.io_loop,
-
-                    connect_timeout=0.01)
-
-        self.assertEqual(cm.exception.code, 599)
-
-
-
-    @gen_test
-
-    def test_websocket_network_fail(self):
-
-        sock, port = bind_unused_port()
-
-        sock.close()
-
-        with self.assertRaises(HTTPError) as cm:
-
-            with ExpectLog(gen_log, ".*"):
-
-                yield websocket_connect(
-
-                    'ws://localhost:%d/' % port,
-
-                    io_loop=self.io_loop,
-
-                    connect_timeout=3600)
-
-        self.assertEqual(cm.exception.code, 599)
-
-
-
-    @gen_test
-
-    def test_websocket_close_buffered_data(self):
-
-        ws = yield websocket_connect(
-
-            'ws://localhost:%d/echo' % self.get_http_port())
-
-        ws.write_message('hello')
-
-        ws.write_message('world')
-
-        ws.stream.close()
-
-        yield self.close_future
-
-
-
-    @gen_test
-
-    def test_websocket_headers(self):
-
-        # Ensure that arbitrary headers can be passed through websocket_connect.
-
-        ws = yield websocket_connect(
-
-            HTTPRequest('ws://localhost:%d/header' % self.get_http_port(),
-
-                        headers={'X-Test': 'hello'}))
-
-        response = yield ws.read_message()
-
-        self.assertEqual(response, 'hello')
-
-        ws.close()
-
-        yield self.close_future
-
-
-
-
-
-class MaskFunctionMixin(object):
-
-    # Subclasses should define self.mask(mask, data)
-
-    def test_mask(self):
-
-        self.assertEqual(self.mask(b'abcd', b''), b'')
-
-        self.assertEqual(self.mask(b'abcd', b'b'), b'\x03')
-
-        self.assertEqual(self.mask(b'abcd', b'54321'), b'TVPVP')
-
-        self.assertEqual(self.mask(b'ZXCV', b'98765432'), b'c`t`olpd')
-
-        # Include test cases with \x00 bytes (to ensure that the C
-
-        # extension isn't depending on null-terminated strings) and
-
-        # bytes with the high bit set (to smoke out signedness issues).
-
-        self.assertEqual(self.mask(b'\x00\x01\x02\x03',
-
-                                   b'\xff\xfb\xfd\xfc\xfe\xfa'),
-
-                         b'\xff\xfa\xff\xff\xfe\xfb')
-
-        self.assertEqual(self.mask(b'\xff\xfb\xfd\xfc',
-
-                                   b'\x00\x01\x02\x03\x04\x05'),
-
-                         b'\xff\xfa\xff\xff\xfb\xfe')
-
-
-
-
-
-class PythonMaskFunctionTest(MaskFunctionMixin, unittest.TestCase):
-
-    def mask(self, mask, data):
-
-        return _websocket_mask_python(mask, data)
-
-
-
-
-
-@unittest.skipIf(speedups is None, "tornado.speedups module not present")
-
-class CythonMaskFunctionTest(MaskFunctionMixin, unittest.TestCase):
-
-    def mask(self, mask, data):
-
-        return speedups.websocket_mask(mask, data)
+        td._pop(3)

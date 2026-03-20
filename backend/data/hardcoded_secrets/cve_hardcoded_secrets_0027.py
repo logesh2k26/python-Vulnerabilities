@@ -6,1248 +6,398 @@
 
 
 
-# Copyright 2012 OpenStack LLC
+# Copyright 2010 United States Government as represented by the
+
+# Administrator of the National Aeronautics and Space Administration.
+
+# All Rights Reserved.
 
 #
 
-# Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
 
-# not use this file except in compliance with the License. You may obtain
+#    not use this file except in compliance with the License. You may obtain
 
-# a copy of the License at
-
-#
-
-#      http://www.apache.org/licenses/LICENSE-2.0
+#    a copy of the License at
 
 #
 
-# Unless required by applicable law or agreed to in writing, software
+#         http://www.apache.org/licenses/LICENSE-2.0
 
-# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#
 
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    Unless required by applicable law or agreed to in writing, software
 
-# License for the specific language governing permissions and limitations
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 
-# under the License.
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 
+#    License for the specific language governing permissions and limitations
 
+#    under the License.
 
-"""Main entry point into the Identity service."""
 
 
+"""Quotas for instances, volumes, and floating ips."""
 
-import uuid
 
-import urllib
 
-import urlparse
+from nova import db
 
+from nova.openstack.common import cfg
 
+from nova import flags
 
-from keystone import config
 
-from keystone import exception
 
-from keystone import policy
 
-from keystone import token
 
-from keystone.common import logging
+quota_opts = [
 
-from keystone.common import manager
+    cfg.IntOpt('quota_instances',
 
-from keystone.common import wsgi
+               default=10,
 
+               help='number of instances allowed per project'),
 
+    cfg.IntOpt('quota_cores',
 
+               default=20,
 
+               help='number of instance cores allowed per project'),
 
-CONF = config.CONF
+    cfg.IntOpt('quota_ram',
 
+               default=50 * 1024,
 
+               help='megabytes of instance ram allowed per project'),
 
-LOG = logging.getLogger(__name__)
+    cfg.IntOpt('quota_volumes',
 
+               default=10,
 
+               help='number of volumes allowed per project'),
 
+    cfg.IntOpt('quota_gigabytes',
 
+               default=1000,
 
-class Manager(manager.Manager):
+               help='number of volume gigabytes allowed per project'),
 
-    """Default pivot point for the Identity backend.
+    cfg.IntOpt('quota_floating_ips',
 
+               default=10,
 
+               help='number of floating ips allowed per project'),
 
-    See :mod:`keystone.common.manager.Manager` for more details on how this
+    cfg.IntOpt('quota_metadata_items',
 
-    dynamically calls the backend.
+               default=128,
 
+               help='number of metadata items allowed per instance'),
 
+    cfg.IntOpt('quota_injected_files',
 
-    """
+               default=5,
 
+               help='number of injected files allowed'),
 
+    cfg.IntOpt('quota_injected_file_content_bytes',
 
-    def __init__(self):
+               default=10 * 1024,
 
-        super(Manager, self).__init__(CONF.identity.driver)
+               help='number of bytes allowed per injected file'),
 
+    cfg.IntOpt('quota_injected_file_path_bytes',
 
+               default=255,
 
+               help='number of bytes allowed per injected file path'),
 
+    ]
 
-class Driver(object):
 
-    """Interface description for an Identity driver."""
 
+FLAGS = flags.FLAGS
 
+FLAGS.register_opts(quota_opts)
 
-    def authenticate(self, user_id=None, tenant_id=None, password=None):
 
-        """Authenticate a given user, tenant and password.
 
 
 
-        Returns: (user, tenant, metadata).
+quota_resources = ['metadata_items', 'injected_file_content_bytes',
 
+        'volumes', 'gigabytes', 'ram', 'floating_ips', 'instances',
 
+        'injected_files', 'cores']
 
-        """
 
-        raise exception.NotImplemented()
 
 
 
-    def get_tenant(self, tenant_id):
+def _get_default_quotas():
 
-        """Get a tenant by id.
+    defaults = {
 
+        'instances': FLAGS.quota_instances,
 
+        'cores': FLAGS.quota_cores,
 
-        Returns: tenant_ref or None.
+        'ram': FLAGS.quota_ram,
 
+        'volumes': FLAGS.quota_volumes,
 
+        'gigabytes': FLAGS.quota_gigabytes,
 
-        """
+        'floating_ips': FLAGS.quota_floating_ips,
 
-        raise exception.NotImplemented()
+        'metadata_items': FLAGS.quota_metadata_items,
 
+        'injected_files': FLAGS.quota_injected_files,
 
+        'injected_file_content_bytes':
 
-    def get_tenant_by_name(self, tenant_name):
+            FLAGS.quota_injected_file_content_bytes,
 
-        """Get a tenant by name.
+    }
 
+    # -1 in the quota flags means unlimited
 
+    return defaults
 
-        Returns: tenant_ref or None.
 
 
 
-        """
 
-        raise exception.NotImplemented()
+def get_class_quotas(context, quota_class, defaults=None):
 
+    """Update defaults with the quota class values."""
 
 
-    def get_user(self, user_id):
 
-        """Get a user by id.
+    if not defaults:
 
+        defaults = _get_default_quotas()
 
 
-        Returns: user_ref or None.
 
+    quota = db.quota_class_get_all_by_name(context, quota_class)
 
+    for key in defaults.keys():
 
-        """
+        if key in quota:
 
-        raise exception.NotImplemented()
+            defaults[key] = quota[key]
 
 
 
-    def get_user_by_name(self, user_name):
+    return defaults
 
-        """Get a user by name.
 
 
 
-        Returns: user_ref or None.
 
+def get_project_quotas(context, project_id):
 
+    defaults = _get_default_quotas()
 
-        """
+    if context.quota_class:
 
-        raise exception.NotImplemented()
+        get_class_quotas(context, context.quota_class, defaults)
 
+    quota = db.quota_get_all_by_project(context, project_id)
 
+    for key in defaults.keys():
 
-    def get_role(self, role_id):
+        if key in quota:
 
-        """Get a role by id.
+            defaults[key] = quota[key]
 
+    return defaults
 
 
-        Returns: role_ref or None.
 
 
 
-        """
+def _get_request_allotment(requested, used, quota):
 
-        raise exception.NotImplemented()
+    if quota == -1:
 
+        return requested
 
+    return quota - used
 
-    def list_users(self):
 
-        """List all users in the system.
 
 
 
-        NOTE(termie): I'd prefer if this listed only the users for a given
+def allowed_instances(context, requested_instances, instance_type):
 
-                      tenant.
+    """Check quota and return min(requested_instances, allowed_instances)."""
 
+    project_id = context.project_id
 
+    context = context.elevated()
 
-        Returns: a list of user_refs or an empty list.
+    requested_cores = requested_instances * instance_type['vcpus']
 
+    requested_ram = requested_instances * instance_type['memory_mb']
 
+    usage = db.instance_data_get_for_project(context, project_id)
 
-        """
+    used_instances, used_cores, used_ram = usage
 
-        raise exception.NotImplemented()
+    quota = get_project_quotas(context, project_id)
 
+    allowed_instances = _get_request_allotment(requested_instances,
 
+                                               used_instances,
 
-    def list_roles(self):
+                                               quota['instances'])
 
-        """List all roles in the system.
+    allowed_cores = _get_request_allotment(requested_cores, used_cores,
 
+                                           quota['cores'])
 
+    allowed_ram = _get_request_allotment(requested_ram, used_ram, quota['ram'])
 
-        Returns: a list of role_refs or an empty list.
+    if instance_type['vcpus']:
 
+        allowed_instances = min(allowed_instances,
 
+                                allowed_cores // instance_type['vcpus'])
 
-        """
+    if instance_type['memory_mb']:
 
-        raise exception.NotImplemented()
+        allowed_instances = min(allowed_instances,
 
+                                allowed_ram // instance_type['memory_mb'])
 
 
-    # NOTE(termie): seven calls below should probably be exposed by the api
 
-    #               more clearly when the api redesign happens
+    return min(requested_instances, allowed_instances)
 
-    def add_user_to_tenant(self, tenant_id, user_id):
 
-        raise exception.NotImplemented()
 
 
 
-    def remove_user_from_tenant(self, tenant_id, user_id):
+def allowed_volumes(context, requested_volumes, size):
 
-        raise exception.NotImplemented()
+    """Check quota and return min(requested_volumes, allowed_volumes)."""
 
+    project_id = context.project_id
 
+    context = context.elevated()
 
-    def get_all_tenants(self):
+    size = int(size)
 
-        raise exception.NotImplemented()
+    requested_gigabytes = requested_volumes * size
 
+    used_volumes, used_gigabytes = db.volume_data_get_for_project(context,
 
+                                                                  project_id)
 
-    def get_tenants_for_user(self, user_id):
+    quota = get_project_quotas(context, project_id)
 
-        """Get the tenants associated with a given user.
+    allowed_volumes = _get_request_allotment(requested_volumes, used_volumes,
 
+                                             quota['volumes'])
 
+    allowed_gigabytes = _get_request_allotment(requested_gigabytes,
 
-        Returns: a list of tenant ids.
+                                               used_gigabytes,
 
+                                               quota['gigabytes'])
 
+    if size != 0:
 
-        """
+        allowed_volumes = min(allowed_volumes,
 
-        raise exception.NotImplemented()
+                              int(allowed_gigabytes // size))
 
+    return min(requested_volumes, allowed_volumes)
 
 
-    def get_roles_for_user_and_tenant(self, user_id, tenant_id):
 
-        """Get the roles associated with a user within given tenant.
 
 
+def allowed_floating_ips(context, requested_floating_ips):
 
-        Returns: a list of role ids.
+    """Check quota and return min(requested, allowed) floating ips."""
 
+    project_id = context.project_id
 
+    context = context.elevated()
 
-        """
+    used_floating_ips = db.floating_ip_count_by_project(context, project_id)
 
-        raise exception.NotImplemented()
+    quota = get_project_quotas(context, project_id)
 
+    allowed_floating_ips = _get_request_allotment(requested_floating_ips,
 
+                                                  used_floating_ips,
 
-    def add_role_to_user_and_tenant(self, user_id, tenant_id, role_id):
+                                                  quota['floating_ips'])
 
-        """Add a role to a user within given tenant."""
+    return min(requested_floating_ips, allowed_floating_ips)
 
-        raise exception.NotImplemented()
 
 
 
-    def remove_role_from_user_and_tenant(self, user_id, tenant_id, role_id):
 
-        """Remove a role from a user within given tenant."""
+def _calculate_simple_quota(context, resource, requested):
 
-        raise exception.NotImplemented()
+    """Check quota for resource; return min(requested, allowed)."""
 
+    quota = get_project_quotas(context, context.project_id)
 
+    allowed = _get_request_allotment(requested, 0, quota[resource])
 
-    # user crud
+    return min(requested, allowed)
 
-    def create_user(self, user_id, user):
 
-        raise exception.NotImplemented()
 
 
 
-    def update_user(self, user_id, user):
+def allowed_metadata_items(context, requested_metadata_items):
 
-        raise exception.NotImplemented()
+    """Return the number of metadata items allowed."""
 
+    return _calculate_simple_quota(context, 'metadata_items',
 
+                                   requested_metadata_items)
 
-    def delete_user(self, user_id):
 
-        raise exception.NotImplemented()
 
 
 
-    # tenant crud
+def allowed_injected_files(context, requested_injected_files):
 
-    def create_tenant(self, tenant_id, tenant):
+    """Return the number of injected files allowed."""
 
-        raise exception.NotImplemented()
+    return _calculate_simple_quota(context, 'injected_files',
 
+                                   requested_injected_files)
 
 
-    def update_tenant(self, tenant_id, tenant):
 
-        raise exception.NotImplemented()
 
 
+def allowed_injected_file_content_bytes(context, requested_bytes):
 
-    def delete_tenant(self, tenant_id, tenant):
+    """Return the number of bytes allowed per injected file content."""
 
-        raise exception.NotImplemented()
+    resource = 'injected_file_content_bytes'
 
+    return _calculate_simple_quota(context, resource, requested_bytes)
 
 
-    # metadata crud
 
 
 
-    def get_metadata(self, user_id, tenant_id):
+def allowed_injected_file_path_bytes(context):
 
-        raise exception.NotImplemented()
+    """Return the number of bytes allowed in an injected file path."""
 
-
-
-    def create_metadata(self, user_id, tenant_id, metadata):
-
-        raise exception.NotImplemented()
-
-
-
-    def update_metadata(self, user_id, tenant_id, metadata):
-
-        raise exception.NotImplemented()
-
-
-
-    def delete_metadata(self, user_id, tenant_id, metadata):
-
-        raise exception.NotImplemented()
-
-
-
-    # role crud
-
-    def create_role(self, role_id, role):
-
-        raise exception.NotImplemented()
-
-
-
-    def update_role(self, role_id, role):
-
-        raise exception.NotImplemented()
-
-
-
-    def delete_role(self, role_id):
-
-        raise exception.NotImplemented()
-
-
-
-
-
-class PublicRouter(wsgi.ComposableRouter):
-
-    def add_routes(self, mapper):
-
-        tenant_controller = TenantController()
-
-        mapper.connect('/tenants',
-
-                       controller=tenant_controller,
-
-                       action='get_tenants_for_token',
-
-                       conditions=dict(methods=['GET']))
-
-
-
-
-
-class AdminRouter(wsgi.ComposableRouter):
-
-    def add_routes(self, mapper):
-
-        # Tenant Operations
-
-        tenant_controller = TenantController()
-
-        mapper.connect('/tenants',
-
-                       controller=tenant_controller,
-
-                       action='get_all_tenants',
-
-                       conditions=dict(method=['GET']))
-
-        mapper.connect('/tenants/{tenant_id}',
-
-                       controller=tenant_controller,
-
-                       action='get_tenant',
-
-                       conditions=dict(method=['GET']))
-
-
-
-        # User Operations
-
-        user_controller = UserController()
-
-        mapper.connect('/users/{user_id}',
-
-                       controller=user_controller,
-
-                       action='get_user',
-
-                       conditions=dict(method=['GET']))
-
-
-
-        # Role Operations
-
-        roles_controller = RoleController()
-
-        mapper.connect('/tenants/{tenant_id}/users/{user_id}/roles',
-
-                       controller=roles_controller,
-
-                       action='get_user_roles',
-
-                       conditions=dict(method=['GET']))
-
-        mapper.connect('/users/{user_id}/roles',
-
-                       controller=user_controller,
-
-                       action='get_user_roles',
-
-                       conditions=dict(method=['GET']))
-
-
-
-
-
-class TenantController(wsgi.Application):
-
-    def __init__(self):
-
-        self.identity_api = Manager()
-
-        self.policy_api = policy.Manager()
-
-        self.token_api = token.Manager()
-
-        super(TenantController, self).__init__()
-
-
-
-    def get_all_tenants(self, context, **kw):
-
-        """Gets a list of all tenants for an admin user."""
-
-        self.assert_admin(context)
-
-        tenant_refs = self.identity_api.get_tenants(context)
-
-        params = {
-
-            'limit': context['query_string'].get('limit'),
-
-            'marker': context['query_string'].get('marker'),
-
-        }
-
-        return self._format_tenant_list(tenant_refs, **params)
-
-
-
-    def get_tenants_for_token(self, context, **kw):
-
-        """Get valid tenants for token based on token used to authenticate.
-
-
-
-        Pulls the token from the context, validates it and gets the valid
-
-        tenants for the user in the token.
-
-
-
-        Doesn't care about token scopedness.
-
-
-
-        """
-
-        try:
-
-            token_ref = self.token_api.get_token(context=context,
-
-                                                 token_id=context['token_id'])
-
-        except exception.NotFound:
-
-            raise exception.Unauthorized()
-
-
-
-        user_ref = token_ref['user']
-
-        tenant_ids = self.identity_api.get_tenants_for_user(
-
-                context, user_ref['id'])
-
-        tenant_refs = []
-
-        for tenant_id in tenant_ids:
-
-            tenant_refs.append(self.identity_api.get_tenant(
-
-                    context=context,
-
-                    tenant_id=tenant_id))
-
-        params = {
-
-            'limit': context['query_string'].get('limit'),
-
-            'marker': context['query_string'].get('marker'),
-
-        }
-
-        return self._format_tenant_list(tenant_refs, **params)
-
-
-
-    def get_tenant(self, context, tenant_id):
-
-        # TODO(termie): this stuff should probably be moved to middleware
-
-        self.assert_admin(context)
-
-        tenant = self.identity_api.get_tenant(context, tenant_id)
-
-        if tenant is None:
-
-            raise exception.TenantNotFound(tenant_id=tenant_id)
-
-
-
-        return {'tenant': tenant}
-
-
-
-    # CRUD Extension
-
-    def create_tenant(self, context, tenant):
-
-        tenant_ref = self._normalize_dict(tenant)
-
-        self.assert_admin(context)
-
-        tenant_id = (tenant_ref.get('id')
-
-                     and tenant_ref.get('id')
-
-                     or uuid.uuid4().hex)
-
-        tenant_ref['id'] = tenant_id
-
-
-
-        tenant = self.identity_api.create_tenant(
-
-                context, tenant_id, tenant_ref)
-
-        return {'tenant': tenant}
-
-
-
-    def update_tenant(self, context, tenant_id, tenant):
-
-        self.assert_admin(context)
-
-        if self.identity_api.get_tenant(context, tenant_id) is None:
-
-            raise exception.TenantNotFound(tenant_id=tenant_id)
-
-
-
-        tenant_ref = self.identity_api.update_tenant(
-
-                context, tenant_id, tenant)
-
-        return {'tenant': tenant_ref}
-
-
-
-    def delete_tenant(self, context, tenant_id, **kw):
-
-        self.assert_admin(context)
-
-        if self.identity_api.get_tenant(context, tenant_id) is None:
-
-            raise exception.TenantNotFound(tenant_id=tenant_id)
-
-
-
-        self.identity_api.delete_tenant(context, tenant_id)
-
-
-
-    def get_tenant_users(self, context, tenant_id, **kw):
-
-        self.assert_admin(context)
-
-        if self.identity_api.get_tenant(context, tenant_id) is None:
-
-            raise exception.TenantNotFound(tenant_id=tenant_id)
-
-
-
-        user_refs = self.identity_api.get_tenant_users(context, tenant_id)
-
-        return {'users': user_refs}
-
-
-
-    def _format_tenant_list(self, tenant_refs, **kwargs):
-
-        marker = kwargs.get('marker')
-
-        page_idx = 0
-
-        if marker is not None:
-
-            for (marker_idx, tenant) in enumerate(tenant_refs):
-
-                if tenant['id'] == marker:
-
-                    # we start pagination after the marker
-
-                    page_idx = marker_idx + 1
-
-                    break
-
-            else:
-
-                msg = 'Marker could not be found'
-
-                raise exception.ValidationError(message=msg)
-
-
-
-        limit = kwargs.get('limit')
-
-        if limit is not None:
-
-            try:
-
-                limit = int(limit)
-
-                if limit < 0:
-
-                    raise AssertionError()
-
-            except (ValueError, AssertionError):
-
-                msg = 'Invalid limit value'
-
-                raise exception.ValidationError(message=msg)
-
-
-
-        tenant_refs = tenant_refs[page_idx:limit]
-
-
-
-        for x in tenant_refs:
-
-            if 'enabled' not in x:
-
-                x['enabled'] = True
-
-        o = {'tenants': tenant_refs,
-
-             'tenants_links': []}
-
-        return o
-
-
-
-
-
-class UserController(wsgi.Application):
-
-    def __init__(self):
-
-        self.identity_api = Manager()
-
-        self.policy_api = policy.Manager()
-
-        self.token_api = token.Manager()
-
-        super(UserController, self).__init__()
-
-
-
-    def get_user(self, context, user_id):
-
-        self.assert_admin(context)
-
-        user_ref = self.identity_api.get_user(context, user_id)
-
-        if not user_ref:
-
-            raise exception.UserNotFound(user_id=user_id)
-
-
-
-        return {'user': user_ref}
-
-
-
-    def get_users(self, context):
-
-        # NOTE(termie): i can't imagine that this really wants all the data
-
-        #               about every single user in the system...
-
-        self.assert_admin(context)
-
-        user_refs = self.identity_api.list_users(context)
-
-        return {'users': user_refs}
-
-
-
-    # CRUD extension
-
-    def create_user(self, context, user):
-
-        user = self._normalize_dict(user)
-
-        self.assert_admin(context)
-
-        tenant_id = user.get('tenantId', None)
-
-        if (tenant_id is not None
-
-                and self.identity_api.get_tenant(context, tenant_id) is None):
-
-            raise exception.TenantNotFound(tenant_id=tenant_id)
-
-        user_id = uuid.uuid4().hex
-
-        user_ref = user.copy()
-
-        user_ref['id'] = user_id
-
-        new_user_ref = self.identity_api.create_user(
-
-                context, user_id, user_ref)
-
-        if tenant_id:
-
-            self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
-
-        return {'user': new_user_ref}
-
-
-
-    def update_user(self, context, user_id, user):
-
-        # NOTE(termie): this is really more of a patch than a put
-
-        self.assert_admin(context)
-
-        if self.identity_api.get_user(context, user_id) is None:
-
-            raise exception.UserNotFound(user_id=user_id)
-
-
-
-        user_ref = self.identity_api.update_user(context, user_id, user)
-
-
-
-        # If the password was changed or the user was disabled we clear tokens
-
-        if user.get('password') or user.get('enabled', True) == False:
-
-            try:
-
-                for token_id in self.token_api.list_tokens(context, user_id):
-
-                    self.token_api.delete_token(context, token_id)
-
-            except exception.NotImplemented:
-
-                # The users status has been changed but tokens remain valid for
-
-                # backends that can't list tokens for users
-
-                LOG.warning('User %s status has changed, but existing tokens '
-
-                            'remain valid' % user_id)
-
-        return {'user': user_ref}
-
-
-
-    def delete_user(self, context, user_id):
-
-        self.assert_admin(context)
-
-        if self.identity_api.get_user(context, user_id) is None:
-
-            raise exception.UserNotFound(user_id=user_id)
-
-
-
-        self.identity_api.delete_user(context, user_id)
-
-
-
-    def set_user_enabled(self, context, user_id, user):
-
-        return self.update_user(context, user_id, user)
-
-
-
-    def set_user_password(self, context, user_id, user):
-
-        return self.update_user(context, user_id, user)
-
-
-
-    def update_user_tenant(self, context, user_id, user):
-
-        """Update the default tenant."""
-
-        # ensure that we're a member of that tenant
-
-        tenant_id = user.get('tenantId')
-
-        self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
-
-        return self.update_user(context, user_id, user)
-
-
-
-
-
-class RoleController(wsgi.Application):
-
-    def __init__(self):
-
-        self.identity_api = Manager()
-
-        self.token_api = token.Manager()
-
-        self.policy_api = policy.Manager()
-
-        super(RoleController, self).__init__()
-
-
-
-    # COMPAT(essex-3)
-
-    def get_user_roles(self, context, user_id, tenant_id=None):
-
-        """Get the roles for a user and tenant pair.
-
-
-
-        Since we're trying to ignore the idea of user-only roles we're
-
-        not implementing them in hopes that the idea will die off.
-
-
-
-        """
-
-        self.assert_admin(context)
-
-        if tenant_id is None:
-
-            raise exception.NotImplemented(message='User roles not supported: '
-
-                                                   'tenant ID required')
-
-
-
-        user = self.identity_api.get_user(context, user_id)
-
-        if user is None:
-
-            raise exception.UserNotFound(user_id=user_id)
-
-        tenant = self.identity_api.get_tenant(context, tenant_id)
-
-        if tenant is None:
-
-            raise exception.TenantNotFound(tenant_id=tenant_id)
-
-
-
-        roles = self.identity_api.get_roles_for_user_and_tenant(
-
-                context, user_id, tenant_id)
-
-        return {'roles': [self.identity_api.get_role(context, x)
-
-                          for x in roles]}
-
-
-
-    # CRUD extension
-
-    def get_role(self, context, role_id):
-
-        self.assert_admin(context)
-
-        role_ref = self.identity_api.get_role(context, role_id)
-
-        if not role_ref:
-
-            raise exception.RoleNotFound(role_id=role_id)
-
-        return {'role': role_ref}
-
-
-
-    def create_role(self, context, role):
-
-        role = self._normalize_dict(role)
-
-        self.assert_admin(context)
-
-        role_id = uuid.uuid4().hex
-
-        role['id'] = role_id
-
-        role_ref = self.identity_api.create_role(context, role_id, role)
-
-        return {'role': role_ref}
-
-
-
-    def delete_role(self, context, role_id):
-
-        self.assert_admin(context)
-
-        self.get_role(context, role_id)
-
-        self.identity_api.delete_role(context, role_id)
-
-
-
-    def get_roles(self, context):
-
-        self.assert_admin(context)
-
-        roles = self.identity_api.list_roles(context)
-
-        # TODO(termie): probably inefficient at some point
-
-        return {'roles': roles}
-
-
-
-    def add_role_to_user(self, context, user_id, role_id, tenant_id=None):
-
-        """Add a role to a user and tenant pair.
-
-
-
-        Since we're trying to ignore the idea of user-only roles we're
-
-        not implementing them in hopes that the idea will die off.
-
-
-
-        """
-
-        self.assert_admin(context)
-
-        if tenant_id is None:
-
-            raise exception.NotImplemented(message='User roles not supported: '
-
-                                                   'tenant_id required')
-
-        if self.identity_api.get_user(context, user_id) is None:
-
-            raise exception.UserNotFound(user_id=user_id)
-
-        if self.identity_api.get_tenant(context, tenant_id) is None:
-
-            raise exception.TenantNotFound(tenant_id=tenant_id)
-
-        if self.identity_api.get_role(context, role_id) is None:
-
-            raise exception.RoleNotFound(role_id=role_id)
-
-
-
-        # This still has the weird legacy semantics that adding a role to
-
-        # a user also adds them to a tenant
-
-        self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
-
-        self.identity_api.add_role_to_user_and_tenant(
-
-                context, user_id, tenant_id, role_id)
-
-        role_ref = self.identity_api.get_role(context, role_id)
-
-        return {'role': role_ref}
-
-
-
-    def remove_role_from_user(self, context, user_id, role_id, tenant_id=None):
-
-        """Remove a role from a user and tenant pair.
-
-
-
-        Since we're trying to ignore the idea of user-only roles we're
-
-        not implementing them in hopes that the idea will die off.
-
-
-
-        """
-
-        self.assert_admin(context)
-
-        if tenant_id is None:
-
-            raise exception.NotImplemented(message='User roles not supported: '
-
-                                                   'tenant_id required')
-
-        if self.identity_api.get_user(context, user_id) is None:
-
-            raise exception.UserNotFound(user_id=user_id)
-
-        if self.identity_api.get_tenant(context, tenant_id) is None:
-
-            raise exception.TenantNotFound(tenant_id=tenant_id)
-
-        if self.identity_api.get_role(context, role_id) is None:
-
-            raise exception.RoleNotFound(role_id=role_id)
-
-
-
-        # This still has the weird legacy semantics that adding a role to
-
-        # a user also adds them to a tenant, so we must follow up on that
-
-        self.identity_api.remove_role_from_user_and_tenant(
-
-                context, user_id, tenant_id, role_id)
-
-        roles = self.identity_api.get_roles_for_user_and_tenant(
-
-                context, user_id, tenant_id)
-
-        if not roles:
-
-            self.identity_api.remove_user_from_tenant(
-
-                    context, tenant_id, user_id)
-
-        return
-
-
-
-    # COMPAT(diablo): CRUD extension
-
-    def get_role_refs(self, context, user_id):
-
-        """Ultimate hack to get around having to make role_refs first-class.
-
-
-
-        This will basically iterate over the various roles the user has in
-
-        all tenants the user is a member of and create fake role_refs where
-
-        the id encodes the user-tenant-role information so we can look
-
-        up the appropriate data when we need to delete them.
-
-
-
-        """
-
-        self.assert_admin(context)
-
-        user_ref = self.identity_api.get_user(context, user_id)
-
-        tenant_ids = self.identity_api.get_tenants_for_user(context, user_id)
-
-        o = []
-
-        for tenant_id in tenant_ids:
-
-            role_ids = self.identity_api.get_roles_for_user_and_tenant(
-
-                    context, user_id, tenant_id)
-
-            for role_id in role_ids:
-
-                ref = {'roleId': role_id,
-
-                       'tenantId': tenant_id,
-
-                       'userId': user_id}
-
-                ref['id'] = urllib.urlencode(ref)
-
-                o.append(ref)
-
-        return {'roles': o}
-
-
-
-    # COMPAT(diablo): CRUD extension
-
-    def create_role_ref(self, context, user_id, role):
-
-        """This is actually used for adding a user to a tenant.
-
-
-
-        In the legacy data model adding a user to a tenant required setting
-
-        a role.
-
-
-
-        """
-
-        self.assert_admin(context)
-
-        # TODO(termie): for now we're ignoring the actual role
-
-        tenant_id = role.get('tenantId')
-
-        role_id = role.get('roleId')
-
-        self.identity_api.add_user_to_tenant(context, tenant_id, user_id)
-
-        self.identity_api.add_role_to_user_and_tenant(
-
-                context, user_id, tenant_id, role_id)
-
-        role_ref = self.identity_api.get_role(context, role_id)
-
-        return {'role': role_ref}
-
-
-
-    # COMPAT(diablo): CRUD extension
-
-    def delete_role_ref(self, context, user_id, role_ref_id):
-
-        """This is actually used for deleting a user from a tenant.
-
-
-
-        In the legacy data model removing a user from a tenant required
-
-        deleting a role.
-
-
-
-        To emulate this, we encode the tenant and role in the role_ref_id,
-
-        and if this happens to be the last role for the user-tenant pair,
-
-        we remove the user from the tenant.
-
-
-
-        """
-
-        self.assert_admin(context)
-
-        # TODO(termie): for now we're ignoring the actual role
-
-        role_ref_ref = urlparse.parse_qs(role_ref_id)
-
-        tenant_id = role_ref_ref.get('tenantId')[0]
-
-        role_id = role_ref_ref.get('roleId')[0]
-
-        self.identity_api.remove_role_from_user_and_tenant(
-
-                context, user_id, tenant_id, role_id)
-
-        roles = self.identity_api.get_roles_for_user_and_tenant(
-
-                context, user_id, tenant_id)
-
-        if not roles:
-
-            self.identity_api.remove_user_from_tenant(
-
-                    context, tenant_id, user_id)
+    return FLAGS.quota_injected_file_path_bytes

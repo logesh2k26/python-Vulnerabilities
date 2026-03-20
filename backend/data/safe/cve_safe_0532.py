@@ -2,960 +2,2288 @@
 # Safety: safe
 # Category: safe
 
+# coding: utf-8
+
+"""A tornado based IPython notebook server."""
+
+
+
+# Copyright (c) Jupyter Development Team.
+
+# Distributed under the terms of the Modified BSD License.
+
+
+
+from __future__ import absolute_import, print_function
+
+
+
+import base64
+
+import datetime
+
+import errno
+
+import importlib
+
+import io
+
 import json
 
+import logging
+
+import os
+
+import random
+
+import re
+
+import select
+
+import signal
+
+import socket
+
+import ssl
+
+import sys
+
+import threading
+
+import webbrowser
 
 
-from django.db.models import CharField, Q
-
-from django.db.models.expressions import F, OuterRef, Subquery, Value
-
-from django.db.models.functions import Cast, Concat, Substr
-
-from django.test.utils import Approximate
 
 
 
-from . import PostgreSQLTestCase
-
-from .models import AggregateTestModel, StatTestModel
+from jinja2 import Environment, FileSystemLoader
 
 
+
+# Install the pyzmq ioloop. This has to be done before anything else from
+
+# tornado is imported.
+
+from zmq.eventloop import ioloop
+
+ioloop.install()
+
+
+
+# check for tornado 3.1.0
+
+msg = "The IPython Notebook requires tornado >= 4.0"
 
 try:
 
-    from django.contrib.postgres.aggregates import (
-
-        ArrayAgg, BitAnd, BitOr, BoolAnd, BoolOr, Corr, CovarPop, JSONBAgg,
-
-        RegrAvgX, RegrAvgY, RegrCount, RegrIntercept, RegrR2, RegrSlope,
-
-        RegrSXX, RegrSXY, RegrSYY, StatAggregate, StringAgg,
-
-    )
+    import tornado
 
 except ImportError:
 
-    pass  # psycopg2 is not installed
+    raise ImportError(msg)
+
+try:
+
+    version_info = tornado.version_info
+
+except AttributeError:
+
+    raise ImportError(msg + ", but you have < 1.1.0")
+
+if version_info < (4,0):
+
+    raise ImportError(msg + ", but you have %s" % tornado.version)
+
+
+
+from tornado import httpserver
+
+from tornado import web
+
+from tornado.log import LogFormatter, app_log, access_log, gen_log
+
+
+
+from notebook import (
+
+    DEFAULT_STATIC_FILES_PATH,
+
+    DEFAULT_TEMPLATE_PATH_LIST,
+
+    __version__,
+
+)
+
+from .base.handlers import Template404
+
+from .log import log_request
+
+from .services.kernels.kernelmanager import MappingKernelManager
+
+from .services.config import ConfigManager
+
+from .services.contents.manager import ContentsManager
+
+from .services.contents.filemanager import FileContentsManager
+
+from .services.sessions.sessionmanager import SessionManager
+
+
+
+from .auth.login import LoginHandler
+
+from .auth.logout import LogoutHandler
+
+from .base.handlers import FileFindHandler, IPythonHandler
+
+
+
+from traitlets.config import Config
+
+from traitlets.config.application import catch_config_error, boolean_flag
+
+from jupyter_core.application import (
+
+    JupyterApp, base_flags, base_aliases,
+
+)
+
+from jupyter_client import KernelManager
+
+from jupyter_client.kernelspec import KernelSpecManager, NoSuchKernel, NATIVE_KERNEL_NAME
+
+from jupyter_client.session import Session
+
+from nbformat.sign import NotebookNotary
+
+from traitlets import (
+
+    Dict, Unicode, Integer, List, Bool, Bytes, Instance,
+
+    TraitError, Type,
+
+)
+
+from ipython_genutils import py3compat
+
+from IPython.paths import get_ipython_dir
+
+from jupyter_core.paths import jupyter_runtime_dir, jupyter_path
+
+from notebook._sysinfo import get_sys_info
+
+
+
+from .utils import url_path_join, check_pid
+
+
+
+#-----------------------------------------------------------------------------
+
+# Module globals
+
+#-----------------------------------------------------------------------------
+
+
+
+_examples = """
+
+ipython notebook                       # start the notebook
+
+ipython notebook --profile=sympy       # use the sympy profile
+
+ipython notebook --certfile=mycert.pem # use SSL/TLS certificate
+
+"""
+
+
+
+#-----------------------------------------------------------------------------
+
+# Helper functions
+
+#-----------------------------------------------------------------------------
+
+
+
+def random_ports(port, n):
+
+    """Generate a list of n random ports near the given port.
+
+
+
+    The first 5 ports will be sequential, and the remaining n-5 will be
+
+    randomly selected in the range [port-2*n, port+2*n].
+
+    """
+
+    for i in range(min(5, n)):
+
+        yield port + i
+
+    for i in range(n-5):
+
+        yield max(1, port + random.randint(-2*n, 2*n))
+
+
+
+def load_handlers(name):
+
+    """Load the (URL pattern, handler) tuples for each component."""
+
+    name = 'notebook.' + name
+
+    mod = __import__(name, fromlist=['default_handlers'])
+
+    return mod.default_handlers
 
 
 
 
 
-class TestGeneralAggregate(PostgreSQLTestCase):
+class DeprecationHandler(IPythonHandler):
 
-    @classmethod
+    def get(self, url_path):
 
-    def setUpTestData(cls):
+        self.set_header("Content-Type", 'text/javascript')
 
-        cls.agg1 = AggregateTestModel.objects.create(boolean_field=True, char_field='Foo1', integer_field=0)
+        self.finish("""
 
-        AggregateTestModel.objects.create(boolean_field=False, char_field='Foo2', integer_field=1)
+            console.warn('`/static/widgets/js` is deprecated.  Use `/nbextensions/widgets/widgets/js` instead.');
 
-        AggregateTestModel.objects.create(boolean_field=False, char_field='Foo4', integer_field=2)
+            define(['%s'], function(x) { return x; });
 
-        AggregateTestModel.objects.create(boolean_field=True, char_field='Foo3', integer_field=0)
+        """ % url_path_join('nbextensions', 'widgets', 'widgets', url_path.rstrip('.js')))
 
-
-
-    def test_array_agg_charfield(self):
-
-        values = AggregateTestModel.objects.aggregate(arrayagg=ArrayAgg('char_field'))
-
-        self.assertEqual(values, {'arrayagg': ['Foo1', 'Foo2', 'Foo4', 'Foo3']})
+        self.log.warn('Deprecated widget Javascript path /static/widgets/js/*.js was used')
 
 
 
-    def test_array_agg_charfield_ordering(self):
+#-----------------------------------------------------------------------------
 
-        ordering_test_cases = (
+# The Tornado web application
 
-            (F('char_field').desc(), ['Foo4', 'Foo3', 'Foo2', 'Foo1']),
+#-----------------------------------------------------------------------------
 
-            (F('char_field').asc(), ['Foo1', 'Foo2', 'Foo3', 'Foo4']),
 
-            (F('char_field'), ['Foo1', 'Foo2', 'Foo3', 'Foo4']),
 
-            ([F('boolean_field'), F('char_field').desc()], ['Foo4', 'Foo2', 'Foo3', 'Foo1']),
+class NotebookWebApplication(web.Application):
 
-            ((F('boolean_field'), F('char_field').desc()), ['Foo4', 'Foo2', 'Foo3', 'Foo1']),
 
-            ('char_field', ['Foo1', 'Foo2', 'Foo3', 'Foo4']),
 
-            ('-char_field', ['Foo4', 'Foo3', 'Foo2', 'Foo1']),
+    def __init__(self, ipython_app, kernel_manager, contents_manager,
 
-            (Concat('char_field', Value('@')), ['Foo1', 'Foo2', 'Foo3', 'Foo4']),
+                 session_manager, kernel_spec_manager,
 
-            (Concat('char_field', Value('@')).desc(), ['Foo4', 'Foo3', 'Foo2', 'Foo1']),
+                 config_manager, log,
 
-            (
+                 base_url, default_url, settings_overrides, jinja_env_options):
 
-                (Substr('char_field', 1, 1), F('integer_field'), Substr('char_field', 4, 1).desc()),
 
-                ['Foo3', 'Foo1', 'Foo2', 'Foo4'],
 
-            ),
+        settings = self.init_settings(
+
+            ipython_app, kernel_manager, contents_manager,
+
+            session_manager, kernel_spec_manager, config_manager, log, base_url,
+
+            default_url, settings_overrides, jinja_env_options)
+
+        handlers = self.init_handlers(settings)
+
+
+
+        super(NotebookWebApplication, self).__init__(handlers, **settings)
+
+
+
+    def init_settings(self, ipython_app, kernel_manager, contents_manager,
+
+                      session_manager, kernel_spec_manager,
+
+                      config_manager,
+
+                      log, base_url, default_url, settings_overrides,
+
+                      jinja_env_options=None):
+
+
+
+        _template_path = settings_overrides.get(
+
+            "template_path",
+
+            ipython_app.template_file_path,
 
         )
 
-        for ordering, expected_output in ordering_test_cases:
+        if isinstance(_template_path, py3compat.string_types):
 
-            with self.subTest(ordering=ordering, expected_output=expected_output):
+            _template_path = (_template_path,)
 
-                values = AggregateTestModel.objects.aggregate(
-
-                    arrayagg=ArrayAgg('char_field', ordering=ordering)
-
-                )
-
-                self.assertEqual(values, {'arrayagg': expected_output})
+        template_path = [os.path.expanduser(path) for path in _template_path]
 
 
 
-    def test_array_agg_integerfield(self):
+        jenv_opt = {"autoescape": True}
 
-        values = AggregateTestModel.objects.aggregate(arrayagg=ArrayAgg('integer_field'))
-
-        self.assertEqual(values, {'arrayagg': [0, 1, 2, 0]})
+        jenv_opt.update(jinja_env_options if jinja_env_options else {})
 
 
 
-    def test_array_agg_integerfield_ordering(self):
+        env = Environment(loader=FileSystemLoader(template_path), **jenv_opt)
 
-        values = AggregateTestModel.objects.aggregate(
+        
 
-            arrayagg=ArrayAgg('integer_field', ordering=F('integer_field').desc())
+        sys_info = get_sys_info()
+
+        if sys_info['commit_source'] == 'repository':
+
+            # don't cache (rely on 304) when working from master
+
+            version_hash = ''
+
+        else:
+
+            # reset the cache on server restart
+
+            version_hash = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+
+
+
+        settings = dict(
+
+            # basics
+
+            log_function=log_request,
+
+            base_url=base_url,
+
+            default_url=default_url,
+
+            template_path=template_path,
+
+            static_path=ipython_app.static_file_path,
+
+            static_custom_path=ipython_app.static_custom_path,
+
+            static_handler_class = FileFindHandler,
+
+            static_url_prefix = url_path_join(base_url,'/static/'),
+
+            static_handler_args = {
+
+                # don't cache custom.js
+
+                'no_cache_paths': [url_path_join(base_url, 'static', 'custom')],
+
+            },
+
+            version_hash=version_hash,
+
+            
+
+            # authentication
+
+            cookie_secret=ipython_app.cookie_secret,
+
+            login_url=url_path_join(base_url,'/login'),
+
+            login_handler_class=ipython_app.login_handler_class,
+
+            logout_handler_class=ipython_app.logout_handler_class,
+
+            password=ipython_app.password,
+
+
+
+            # managers
+
+            kernel_manager=kernel_manager,
+
+            contents_manager=contents_manager,
+
+            session_manager=session_manager,
+
+            kernel_spec_manager=kernel_spec_manager,
+
+            config_manager=config_manager,
+
+
+
+            # IPython stuff
+
+            jinja_template_vars=ipython_app.jinja_template_vars,
+
+            nbextensions_path=ipython_app.nbextensions_path,
+
+            websocket_url=ipython_app.websocket_url,
+
+            mathjax_url=ipython_app.mathjax_url,
+
+            config=ipython_app.config,
+
+            config_dir=ipython_app.config_dir,
+
+            jinja2_env=env,
+
+            terminals_available=False,  # Set later if terminals are available
 
         )
 
-        self.assertEqual(values, {'arrayagg': [2, 1, 0, 0]})
 
 
+        # allow custom overrides for the tornado web app.
 
-    def test_array_agg_booleanfield(self):
+        settings.update(settings_overrides)
 
-        values = AggregateTestModel.objects.aggregate(arrayagg=ArrayAgg('boolean_field'))
+        return settings
 
-        self.assertEqual(values, {'arrayagg': [True, False, False, True]})
 
 
+    def init_handlers(self, settings):
 
-    def test_array_agg_booleanfield_ordering(self):
+        """Load the (URL pattern, handler) tuples for each component."""
 
-        ordering_test_cases = (
+        
 
-            (F('boolean_field').asc(), [False, False, True, True]),
+        # Order matters. The first handler to match the URL will handle the request.
 
-            (F('boolean_field').desc(), [True, True, False, False]),
+        handlers = []
 
-            (F('boolean_field'), [False, False, True, True]),
+        handlers.append((r'/deprecatedwidgets/(.*)', DeprecationHandler))
 
-        )
+        handlers.extend(load_handlers('tree.handlers'))
 
-        for ordering, expected_output in ordering_test_cases:
+        handlers.extend([(r"/login", settings['login_handler_class'])])
 
-            with self.subTest(ordering=ordering, expected_output=expected_output):
+        handlers.extend([(r"/logout", settings['logout_handler_class'])])
 
-                values = AggregateTestModel.objects.aggregate(
+        handlers.extend(load_handlers('files.handlers'))
 
-                    arrayagg=ArrayAgg('boolean_field', ordering=ordering)
+        handlers.extend(load_handlers('notebook.handlers'))
 
-                )
+        handlers.extend(load_handlers('nbconvert.handlers'))
 
-                self.assertEqual(values, {'arrayagg': expected_output})
+        handlers.extend(load_handlers('kernelspecs.handlers'))
 
+        handlers.extend(load_handlers('edit.handlers'))
 
+        handlers.extend(load_handlers('services.api.handlers'))
 
-    def test_array_agg_filter(self):
+        handlers.extend(load_handlers('services.config.handlers'))
 
-        values = AggregateTestModel.objects.aggregate(
+        handlers.extend(load_handlers('services.kernels.handlers'))
 
-            arrayagg=ArrayAgg('integer_field', filter=Q(integer_field__gt=0)),
+        handlers.extend(load_handlers('services.contents.handlers'))
 
-        )
+        handlers.extend(load_handlers('services.sessions.handlers'))
 
-        self.assertEqual(values, {'arrayagg': [1, 2]})
+        handlers.extend(load_handlers('services.nbconvert.handlers'))
 
+        handlers.extend(load_handlers('services.kernelspecs.handlers'))
 
+        handlers.extend(load_handlers('services.security.handlers'))
 
-    def test_array_agg_empty_result(self):
+        
 
-        AggregateTestModel.objects.all().delete()
+        # BEGIN HARDCODED WIDGETS HACK
 
-        values = AggregateTestModel.objects.aggregate(arrayagg=ArrayAgg('char_field'))
+        try:
 
-        self.assertEqual(values, {'arrayagg': []})
+            import ipywidgets
 
-        values = AggregateTestModel.objects.aggregate(arrayagg=ArrayAgg('integer_field'))
+            handlers.append(
 
-        self.assertEqual(values, {'arrayagg': []})
+                (r"/nbextensions/widgets/(.*)", FileFindHandler, {
 
-        values = AggregateTestModel.objects.aggregate(arrayagg=ArrayAgg('boolean_field'))
+                    'path': ipywidgets.find_static_assets(),
 
-        self.assertEqual(values, {'arrayagg': []})
+                    'no_cache_paths': ['/'], # don't cache anything in nbextensions
 
-
-
-    def test_array_agg_lookups(self):
-
-        aggr1 = AggregateTestModel.objects.create()
-
-        aggr2 = AggregateTestModel.objects.create()
-
-        StatTestModel.objects.create(related_field=aggr1, int1=1, int2=0)
-
-        StatTestModel.objects.create(related_field=aggr1, int1=2, int2=0)
-
-        StatTestModel.objects.create(related_field=aggr2, int1=3, int2=0)
-
-        StatTestModel.objects.create(related_field=aggr2, int1=4, int2=0)
-
-        qs = StatTestModel.objects.values('related_field').annotate(
-
-            array=ArrayAgg('int1')
-
-        ).filter(array__overlap=[2]).values_list('array', flat=True)
-
-        self.assertCountEqual(qs.get(), [1, 2])
-
-
-
-    def test_bit_and_general(self):
-
-        values = AggregateTestModel.objects.filter(
-
-            integer_field__in=[0, 1]).aggregate(bitand=BitAnd('integer_field'))
-
-        self.assertEqual(values, {'bitand': 0})
-
-
-
-    def test_bit_and_on_only_true_values(self):
-
-        values = AggregateTestModel.objects.filter(
-
-            integer_field=1).aggregate(bitand=BitAnd('integer_field'))
-
-        self.assertEqual(values, {'bitand': 1})
-
-
-
-    def test_bit_and_on_only_false_values(self):
-
-        values = AggregateTestModel.objects.filter(
-
-            integer_field=0).aggregate(bitand=BitAnd('integer_field'))
-
-        self.assertEqual(values, {'bitand': 0})
-
-
-
-    def test_bit_and_empty_result(self):
-
-        AggregateTestModel.objects.all().delete()
-
-        values = AggregateTestModel.objects.aggregate(bitand=BitAnd('integer_field'))
-
-        self.assertEqual(values, {'bitand': None})
-
-
-
-    def test_bit_or_general(self):
-
-        values = AggregateTestModel.objects.filter(
-
-            integer_field__in=[0, 1]).aggregate(bitor=BitOr('integer_field'))
-
-        self.assertEqual(values, {'bitor': 1})
-
-
-
-    def test_bit_or_on_only_true_values(self):
-
-        values = AggregateTestModel.objects.filter(
-
-            integer_field=1).aggregate(bitor=BitOr('integer_field'))
-
-        self.assertEqual(values, {'bitor': 1})
-
-
-
-    def test_bit_or_on_only_false_values(self):
-
-        values = AggregateTestModel.objects.filter(
-
-            integer_field=0).aggregate(bitor=BitOr('integer_field'))
-
-        self.assertEqual(values, {'bitor': 0})
-
-
-
-    def test_bit_or_empty_result(self):
-
-        AggregateTestModel.objects.all().delete()
-
-        values = AggregateTestModel.objects.aggregate(bitor=BitOr('integer_field'))
-
-        self.assertEqual(values, {'bitor': None})
-
-
-
-    def test_bool_and_general(self):
-
-        values = AggregateTestModel.objects.aggregate(booland=BoolAnd('boolean_field'))
-
-        self.assertEqual(values, {'booland': False})
-
-
-
-    def test_bool_and_empty_result(self):
-
-        AggregateTestModel.objects.all().delete()
-
-        values = AggregateTestModel.objects.aggregate(booland=BoolAnd('boolean_field'))
-
-        self.assertEqual(values, {'booland': None})
-
-
-
-    def test_bool_or_general(self):
-
-        values = AggregateTestModel.objects.aggregate(boolor=BoolOr('boolean_field'))
-
-        self.assertEqual(values, {'boolor': True})
-
-
-
-    def test_bool_or_empty_result(self):
-
-        AggregateTestModel.objects.all().delete()
-
-        values = AggregateTestModel.objects.aggregate(boolor=BoolOr('boolean_field'))
-
-        self.assertEqual(values, {'boolor': None})
-
-
-
-    def test_string_agg_requires_delimiter(self):
-
-        with self.assertRaises(TypeError):
-
-            AggregateTestModel.objects.aggregate(stringagg=StringAgg('char_field'))
-
-
-
-    def test_string_agg_delimiter_escaping(self):
-
-        values = AggregateTestModel.objects.aggregate(stringagg=StringAgg('char_field', delimiter="'"))
-
-        self.assertEqual(values, {'stringagg': "Foo1'Foo2'Foo4'Foo3"})
-
-
-
-    def test_string_agg_charfield(self):
-
-        values = AggregateTestModel.objects.aggregate(stringagg=StringAgg('char_field', delimiter=';'))
-
-        self.assertEqual(values, {'stringagg': 'Foo1;Foo2;Foo4;Foo3'})
-
-
-
-    def test_string_agg_charfield_ordering(self):
-
-        ordering_test_cases = (
-
-            (F('char_field').desc(), 'Foo4;Foo3;Foo2;Foo1'),
-
-            (F('char_field').asc(), 'Foo1;Foo2;Foo3;Foo4'),
-
-            (F('char_field'), 'Foo1;Foo2;Foo3;Foo4'),
-
-            ('char_field', 'Foo1;Foo2;Foo3;Foo4'),
-
-            ('-char_field', 'Foo4;Foo3;Foo2;Foo1'),
-
-            (Concat('char_field', Value('@')), 'Foo1;Foo2;Foo3;Foo4'),
-
-            (Concat('char_field', Value('@')).desc(), 'Foo4;Foo3;Foo2;Foo1'),
-
-        )
-
-        for ordering, expected_output in ordering_test_cases:
-
-            with self.subTest(ordering=ordering, expected_output=expected_output):
-
-                values = AggregateTestModel.objects.aggregate(
-
-                    stringagg=StringAgg('char_field', delimiter=';', ordering=ordering)
-
-                )
-
-                self.assertEqual(values, {'stringagg': expected_output})
-
-
-
-    def test_string_agg_filter(self):
-
-        values = AggregateTestModel.objects.aggregate(
-
-            stringagg=StringAgg(
-
-                'char_field',
-
-                delimiter=';',
-
-                filter=Q(char_field__endswith='3') | Q(char_field__endswith='1'),
+                }),
 
             )
 
-        )
+        except:
 
-        self.assertEqual(values, {'stringagg': 'Foo1;Foo3'})
+            app_log.warn('ipywidgets package not installed.  Widgets are unavailable.')
 
+        # END HARDCODED WIDGETS HACK
 
+        
 
-    def test_string_agg_empty_result(self):
+        handlers.append(
 
-        AggregateTestModel.objects.all().delete()
+            (r"/nbextensions/(.*)", FileFindHandler, {
 
-        values = AggregateTestModel.objects.aggregate(stringagg=StringAgg('char_field', delimiter=';'))
+                'path': settings['nbextensions_path'],
 
-        self.assertEqual(values, {'stringagg': ''})
+                'no_cache_paths': ['/'], # don't cache anything in nbextensions
 
-
-
-    def test_orderable_agg_alternative_fields(self):
-
-        values = AggregateTestModel.objects.aggregate(
-
-            arrayagg=ArrayAgg('integer_field', ordering=F('char_field').asc())
+            }),
 
         )
 
-        self.assertEqual(values, {'arrayagg': [0, 1, 0, 2]})
+        handlers.append(
 
+            (r"/custom/(.*)", FileFindHandler, {
 
+                'path': settings['static_custom_path'],
 
-    def test_json_agg(self):
+                'no_cache_paths': ['/'], # don't cache anything in custom
 
-        values = AggregateTestModel.objects.aggregate(jsonagg=JSONBAgg('char_field'))
+            })
 
-        self.assertEqual(values, {'jsonagg': ['Foo1', 'Foo2', 'Foo4', 'Foo3']})
+        )
 
+        # register base handlers last
 
+        handlers.extend(load_handlers('base.handlers'))
 
-    def test_json_agg_empty(self):
+        # set the URL that will be redirected from `/`
 
-        values = AggregateTestModel.objects.none().aggregate(jsonagg=JSONBAgg('integer_field'))
+        handlers.append(
 
-        self.assertEqual(values, json.loads('{"jsonagg": []}'))
+            (r'/?', web.RedirectHandler, {
 
+                'url' : settings['default_url'],
 
+                'permanent': False, # want 302, not 301
 
-    def test_string_agg_array_agg_ordering_in_subquery(self):
+            })
 
-        stats = []
+        )
 
-        for i, agg in enumerate(AggregateTestModel.objects.order_by('char_field')):
 
-            stats.append(StatTestModel(related_field=agg, int1=i, int2=i + 1))
 
-            stats.append(StatTestModel(related_field=agg, int1=i + 1, int2=i))
+        # prepend base_url onto the patterns that we match
 
-        StatTestModel.objects.bulk_create(stats)
+        new_handlers = []
 
+        for handler in handlers:
 
+            pattern = url_path_join(settings['base_url'], handler[0])
 
-        for aggregate, expected_result in (
+            new_handler = tuple([pattern] + list(handler[1:]))
 
-            (
+            new_handlers.append(new_handler)
 
-                ArrayAgg('stattestmodel__int1', ordering='-stattestmodel__int2'),
+        # add 404 on the end, which will catch everything that falls through
 
-                [('Foo1', [0, 1]), ('Foo2', [1, 2]), ('Foo3', [2, 3]), ('Foo4', [3, 4])],
+        new_handlers.append((r'(.*)', Template404))
 
-            ),
+        return new_handlers
 
-            (
 
-                StringAgg(
 
-                    Cast('stattestmodel__int1', CharField()),
 
-                    delimiter=';',
 
-                    ordering='-stattestmodel__int2',
+class NbserverListApp(JupyterApp):
 
-                ),
+    version = __version__
 
-                [('Foo1', '0;1'), ('Foo2', '1;2'), ('Foo3', '2;3'), ('Foo4', '3;4')],
+    description="List currently running notebook servers in this profile."
 
-            ),
+    
 
-        ):
+    flags = dict(
 
-            with self.subTest(aggregate=aggregate.__class__.__name__):
+        json=({'NbserverListApp': {'json': True}},
 
-                subquery = AggregateTestModel.objects.filter(
+              "Produce machine-readable JSON output."),
 
-                    pk=OuterRef('pk'),
+    )
 
-                ).annotate(agg=aggregate).values('agg')
+    
 
-                values = AggregateTestModel.objects.annotate(
+    json = Bool(False, config=True,
 
-                    agg=Subquery(subquery),
+          help="If True, each line of output will be a JSON object with the "
 
-                ).order_by('char_field').values_list('char_field', 'agg')
+                  "details from the server info file.")
 
-                self.assertEqual(list(values), expected_result)
 
 
+    def start(self):
 
-    def test_string_agg_array_agg_filter_in_subquery(self):
+        if not self.json:
 
-        StatTestModel.objects.bulk_create([
+            print("Currently running servers:")
 
-            StatTestModel(related_field=self.agg1, int1=0, int2=5),
+        for serverinfo in list_running_servers(self.runtime_dir):
 
-            StatTestModel(related_field=self.agg1, int1=1, int2=4),
+            if self.json:
 
-            StatTestModel(related_field=self.agg1, int1=2, int2=3),
+                print(json.dumps(serverinfo))
 
-        ])
+            else:
 
-        for aggregate, expected_result in (
+                print(serverinfo['url'], "::", serverinfo['notebook_dir'])
 
-            (
 
-                ArrayAgg('stattestmodel__int1', filter=Q(stattestmodel__int2__gt=3)),
 
-                [('Foo1', [0, 1]), ('Foo2', None)],
+#-----------------------------------------------------------------------------
 
-            ),
+# Aliases and Flags
 
-            (
+#-----------------------------------------------------------------------------
 
-                StringAgg(
 
-                    Cast('stattestmodel__int2', CharField()),
 
-                    delimiter=';',
+flags = dict(base_flags)
 
-                    filter=Q(stattestmodel__int1__lt=2),
+flags['no-browser']=(
 
-                ),
+    {'NotebookApp' : {'open_browser' : False}},
 
-                [('Foo1', '5;4'), ('Foo2', None)],
+    "Don't open the notebook in a browser after startup."
 
-            ),
+)
 
-        ):
+flags['pylab']=(
 
-            with self.subTest(aggregate=aggregate.__class__.__name__):
+    {'NotebookApp' : {'pylab' : 'warn'}},
 
-                subquery = AggregateTestModel.objects.filter(
+    "DISABLED: use %pylab or %matplotlib in the notebook to enable matplotlib."
 
-                    pk=OuterRef('pk'),
+)
 
-                ).annotate(agg=aggregate).values('agg')
+flags['no-mathjax']=(
 
-                values = AggregateTestModel.objects.annotate(
+    {'NotebookApp' : {'enable_mathjax' : False}},
 
-                    agg=Subquery(subquery),
+    """Disable MathJax
 
-                ).filter(
+    
 
-                    char_field__in=['Foo1', 'Foo2'],
+    MathJax is the javascript library IPython uses to render math/LaTeX. It is
 
-                ).order_by('char_field').values_list('char_field', 'agg')
+    very large, so you may want to disable it if you have a slow internet
 
-                self.assertEqual(list(values), expected_result)
+    connection, or for offline use of the notebook.
 
+    
 
+    When disabled, equations etc. will appear as their untransformed TeX source.
 
-    def test_string_agg_filter_in_subquery_with_exclude(self):
+    """
 
-        subquery = AggregateTestModel.objects.annotate(
+)
 
-            stringagg=StringAgg(
 
-                'char_field',
 
-                delimiter=';',
+# Add notebook manager flags
 
-                filter=Q(char_field__endswith='1'),
+flags.update(boolean_flag('script', 'FileContentsManager.save_script',
+
+               'DEPRECATED, IGNORED',
+
+               'DEPRECATED, IGNORED'))
+
+
+
+aliases = dict(base_aliases)
+
+
+
+aliases.update({
+
+    'ip': 'NotebookApp.ip',
+
+    'port': 'NotebookApp.port',
+
+    'port-retries': 'NotebookApp.port_retries',
+
+    'transport': 'KernelManager.transport',
+
+    'keyfile': 'NotebookApp.keyfile',
+
+    'certfile': 'NotebookApp.certfile',
+
+    'notebook-dir': 'NotebookApp.notebook_dir',
+
+    'browser': 'NotebookApp.browser',
+
+    'pylab': 'NotebookApp.pylab',
+
+})
+
+
+
+#-----------------------------------------------------------------------------
+
+# NotebookApp
+
+#-----------------------------------------------------------------------------
+
+
+
+class NotebookApp(JupyterApp):
+
+
+
+    name = 'jupyter-notebook'
+
+    version = __version__
+
+    description = """
+
+        The Jupyter HTML Notebook.
+
+        
+
+        This launches a Tornado based HTML Notebook Server that serves up an
+
+        HTML5/Javascript Notebook client.
+
+    """
+
+    examples = _examples
+
+    aliases = aliases
+
+    flags = flags
+
+    
+
+    classes = [
+
+        KernelManager, Session, MappingKernelManager,
+
+        ContentsManager, FileContentsManager, NotebookNotary,
+
+        KernelSpecManager,
+
+    ]
+
+    flags = Dict(flags)
+
+    aliases = Dict(aliases)
+
+    
+
+    subcommands = dict(
+
+        list=(NbserverListApp, NbserverListApp.description.splitlines()[0]),
+
+    )
+
+
+
+    _log_formatter_cls = LogFormatter
+
+
+
+    def _log_level_default(self):
+
+        return logging.INFO
+
+
+
+    def _log_datefmt_default(self):
+
+        """Exclude date from default date format"""
+
+        return "%H:%M:%S"
+
+    
+
+    def _log_format_default(self):
+
+        """override default log format to include time"""
+
+        return u"%(color)s[%(levelname)1.1s %(asctime)s.%(msecs).03d %(name)s]%(end_color)s %(message)s"
+
+
+
+    # create requested profiles by default, if they don't exist:
+
+    auto_create = Bool(True)
+
+
+
+    # file to be opened in the notebook server
+
+    file_to_run = Unicode('', config=True)
+
+
+
+    # Network related information
+
+    
+
+    allow_origin = Unicode('', config=True,
+
+        help="""Set the Access-Control-Allow-Origin header
+
+        
+
+        Use '*' to allow any origin to access your server.
+
+        
+
+        Takes precedence over allow_origin_pat.
+
+        """
+
+    )
+
+    
+
+    allow_origin_pat = Unicode('', config=True,
+
+        help="""Use a regular expression for the Access-Control-Allow-Origin header
+
+        
+
+        Requests from an origin matching the expression will get replies with:
+
+        
+
+            Access-Control-Allow-Origin: origin
+
+        
+
+        where `origin` is the origin of the request.
+
+        
+
+        Ignored if allow_origin is set.
+
+        """
+
+    )
+
+    
+
+    allow_credentials = Bool(False, config=True,
+
+        help="Set the Access-Control-Allow-Credentials: true header"
+
+    )
+
+    
+
+    default_url = Unicode('/tree', config=True,
+
+        help="The default URL to redirect to from `/`"
+
+    )
+
+    
+
+    ip = Unicode('localhost', config=True,
+
+        help="The IP address the notebook server will listen on."
+
+    )
+
+    def _ip_default(self):
+
+        """Return localhost if available, 127.0.0.1 otherwise.
+
+        
+
+        On some (horribly broken) systems, localhost cannot be bound.
+
+        """
+
+        s = socket.socket()
+
+        try:
+
+            s.bind(('localhost', 0))
+
+        except socket.error as e:
+
+            self.log.warn("Cannot bind to localhost, using 127.0.0.1 as default ip\n%s", e)
+
+            return '127.0.0.1'
+
+        else:
+
+            s.close()
+
+            return 'localhost'
+
+
+
+    def _ip_changed(self, name, old, new):
+
+        if new == u'*': self.ip = u''
+
+
+
+    port = Integer(8888, config=True,
+
+        help="The port the notebook server will listen on."
+
+    )
+
+    port_retries = Integer(50, config=True,
+
+        help="The number of additional ports to try if the specified port is not available."
+
+    )
+
+
+
+    certfile = Unicode(u'', config=True, 
+
+        help="""The full path to an SSL/TLS certificate file."""
+
+    )
+
+    
+
+    keyfile = Unicode(u'', config=True, 
+
+        help="""The full path to a private key file for usage with SSL/TLS."""
+
+    )
+
+    
+
+    cookie_secret_file = Unicode(config=True,
+
+        help="""The file where the cookie secret is stored."""
+
+    )
+
+    def _cookie_secret_file_default(self):
+
+        return os.path.join(self.runtime_dir, 'notebook_cookie_secret')
+
+    
+
+    cookie_secret = Bytes(b'', config=True,
+
+        help="""The random bytes used to secure cookies.
+
+        By default this is a new random number every time you start the Notebook.
+
+        Set it to a value in a config file to enable logins to persist across server sessions.
+
+        
+
+        Note: Cookie secrets should be kept private, do not share config files with
+
+        cookie_secret stored in plaintext (you can read the value from a file).
+
+        """
+
+    )
+
+    def _cookie_secret_default(self):
+
+        if os.path.exists(self.cookie_secret_file):
+
+            with io.open(self.cookie_secret_file, 'rb') as f:
+
+                return f.read()
+
+        else:
+
+            secret = base64.encodestring(os.urandom(1024))
+
+            self._write_cookie_secret_file(secret)
+
+            return secret
+
+    
+
+    def _write_cookie_secret_file(self, secret):
+
+        """write my secret to my secret_file"""
+
+        self.log.info("Writing notebook server cookie secret to %s", self.cookie_secret_file)
+
+        with io.open(self.cookie_secret_file, 'wb') as f:
+
+            f.write(secret)
+
+        try:
+
+            os.chmod(self.cookie_secret_file, 0o600)
+
+        except OSError:
+
+            self.log.warn(
+
+                "Could not set permissions on %s",
+
+                self.cookie_secret_file
 
             )
 
-        ).exclude(stringagg='').values('id')
 
-        self.assertSequenceEqual(
 
-            AggregateTestModel.objects.filter(id__in=Subquery(subquery)),
+    password = Unicode(u'', config=True,
 
-            [self.agg1],
+                      help="""Hashed password to use for web authentication.
 
-        )
 
 
+                      To generate, type in a python/IPython shell:
 
 
 
-class TestAggregateDistinct(PostgreSQLTestCase):
+                        from notebook.auth import passwd; passwd()
 
-    @classmethod
 
-    def setUpTestData(cls):
 
-        AggregateTestModel.objects.create(char_field='Foo')
+                      The string should be of the form type:salt:hashed-password.
 
-        AggregateTestModel.objects.create(char_field='Foo')
+                      """
 
-        AggregateTestModel.objects.create(char_field='Bar')
+    )
 
 
 
-    def test_string_agg_distinct_false(self):
+    open_browser = Bool(True, config=True,
 
-        values = AggregateTestModel.objects.aggregate(stringagg=StringAgg('char_field', delimiter=' ', distinct=False))
+                        help="""Whether to open in a browser after starting.
 
-        self.assertEqual(values['stringagg'].count('Foo'), 2)
+                        The specific browser used is platform dependent and
 
-        self.assertEqual(values['stringagg'].count('Bar'), 1)
+                        determined by the python standard library `webbrowser`
 
+                        module, unless it is overridden using the --browser
 
+                        (NotebookApp.browser) configuration option.
 
-    def test_string_agg_distinct_true(self):
+                        """)
 
-        values = AggregateTestModel.objects.aggregate(stringagg=StringAgg('char_field', delimiter=' ', distinct=True))
 
-        self.assertEqual(values['stringagg'].count('Foo'), 1)
 
-        self.assertEqual(values['stringagg'].count('Bar'), 1)
+    browser = Unicode(u'', config=True,
 
+                      help="""Specify what command to use to invoke a web
 
+                      browser when opening the notebook. If not specified, the
 
-    def test_array_agg_distinct_false(self):
+                      default browser will be determined by the `webbrowser`
 
-        values = AggregateTestModel.objects.aggregate(arrayagg=ArrayAgg('char_field', distinct=False))
+                      standard library module, which allows setting of the
 
-        self.assertEqual(sorted(values['arrayagg']), ['Bar', 'Foo', 'Foo'])
+                      BROWSER environment variable to override it.
 
+                      """)
 
+    
 
-    def test_array_agg_distinct_true(self):
+    webapp_settings = Dict(config=True,
 
-        values = AggregateTestModel.objects.aggregate(arrayagg=ArrayAgg('char_field', distinct=True))
+        help="DEPRECATED, use tornado_settings"
 
-        self.assertEqual(sorted(values['arrayagg']), ['Bar', 'Foo'])
+    )
 
+    def _webapp_settings_changed(self, name, old, new):
 
+        self.log.warn("\n    webapp_settings is deprecated, use tornado_settings.\n")
 
+        self.tornado_settings = new
 
+    
 
-class TestStatisticsAggregate(PostgreSQLTestCase):
+    tornado_settings = Dict(config=True,
 
-    @classmethod
+            help="Supply overrides for the tornado.web.Application that the "
 
-    def setUpTestData(cls):
+                 "IPython notebook uses.")
 
-        StatTestModel.objects.create(
+    
 
-            int1=1,
+    ssl_options = Dict(config=True,
 
-            int2=3,
+            help="""Supply SSL options for the tornado HTTPServer.
 
-            related_field=AggregateTestModel.objects.create(integer_field=0),
+            See the tornado docs for details.""")
 
-        )
+    
 
-        StatTestModel.objects.create(
+    jinja_environment_options = Dict(config=True, 
 
-            int1=2,
+            help="Supply extra arguments that will be passed to Jinja environment.")
 
-            int2=2,
 
-            related_field=AggregateTestModel.objects.create(integer_field=1),
 
-        )
+    jinja_template_vars = Dict(
 
-        StatTestModel.objects.create(
+        config=True,
 
-            int1=3,
+        help="Extra variables to supply to jinja templates when rendering.",
 
-            int2=1,
+    )
 
-            related_field=AggregateTestModel.objects.create(integer_field=2),
+    
 
-        )
+    enable_mathjax = Bool(True, config=True,
 
+        help="""Whether to enable MathJax for typesetting math/TeX
 
 
-    # Tests for base class (StatAggregate)
 
+        MathJax is the javascript library IPython uses to render math/LaTeX. It is
 
+        very large, so you may want to disable it if you have a slow internet
 
-    def test_missing_arguments_raises_exception(self):
+        connection, or for offline use of the notebook.
 
-        with self.assertRaisesMessage(ValueError, 'Both y and x must be provided.'):
 
-            StatAggregate(x=None, y=None)
 
-
-
-    def test_correct_source_expressions(self):
-
-        func = StatAggregate(x='test', y=13)
-
-        self.assertIsInstance(func.source_expressions[0], Value)
-
-        self.assertIsInstance(func.source_expressions[1], F)
-
-
-
-    def test_alias_is_required(self):
-
-        class SomeFunc(StatAggregate):
-
-            function = 'TEST'
-
-        with self.assertRaisesMessage(TypeError, 'Complex aggregates require an alias'):
-
-            StatTestModel.objects.aggregate(SomeFunc(y='int2', x='int1'))
-
-
-
-    # Test aggregates
-
-
-
-    def test_corr_general(self):
-
-        values = StatTestModel.objects.aggregate(corr=Corr(y='int2', x='int1'))
-
-        self.assertEqual(values, {'corr': -1.0})
-
-
-
-    def test_corr_empty_result(self):
-
-        StatTestModel.objects.all().delete()
-
-        values = StatTestModel.objects.aggregate(corr=Corr(y='int2', x='int1'))
-
-        self.assertEqual(values, {'corr': None})
-
-
-
-    def test_covar_pop_general(self):
-
-        values = StatTestModel.objects.aggregate(covarpop=CovarPop(y='int2', x='int1'))
-
-        self.assertEqual(values, {'covarpop': Approximate(-0.66, places=1)})
-
-
-
-    def test_covar_pop_empty_result(self):
-
-        StatTestModel.objects.all().delete()
-
-        values = StatTestModel.objects.aggregate(covarpop=CovarPop(y='int2', x='int1'))
-
-        self.assertEqual(values, {'covarpop': None})
-
-
-
-    def test_covar_pop_sample(self):
-
-        values = StatTestModel.objects.aggregate(covarpop=CovarPop(y='int2', x='int1', sample=True))
-
-        self.assertEqual(values, {'covarpop': -1.0})
-
-
-
-    def test_covar_pop_sample_empty_result(self):
-
-        StatTestModel.objects.all().delete()
-
-        values = StatTestModel.objects.aggregate(covarpop=CovarPop(y='int2', x='int1', sample=True))
-
-        self.assertEqual(values, {'covarpop': None})
-
-
-
-    def test_regr_avgx_general(self):
-
-        values = StatTestModel.objects.aggregate(regravgx=RegrAvgX(y='int2', x='int1'))
-
-        self.assertEqual(values, {'regravgx': 2.0})
-
-
-
-    def test_regr_avgx_empty_result(self):
-
-        StatTestModel.objects.all().delete()
-
-        values = StatTestModel.objects.aggregate(regravgx=RegrAvgX(y='int2', x='int1'))
-
-        self.assertEqual(values, {'regravgx': None})
-
-
-
-    def test_regr_avgy_general(self):
-
-        values = StatTestModel.objects.aggregate(regravgy=RegrAvgY(y='int2', x='int1'))
-
-        self.assertEqual(values, {'regravgy': 2.0})
-
-
-
-    def test_regr_avgy_empty_result(self):
-
-        StatTestModel.objects.all().delete()
-
-        values = StatTestModel.objects.aggregate(regravgy=RegrAvgY(y='int2', x='int1'))
-
-        self.assertEqual(values, {'regravgy': None})
-
-
-
-    def test_regr_count_general(self):
-
-        values = StatTestModel.objects.aggregate(regrcount=RegrCount(y='int2', x='int1'))
-
-        self.assertEqual(values, {'regrcount': 3})
-
-
-
-    def test_regr_count_empty_result(self):
-
-        StatTestModel.objects.all().delete()
-
-        values = StatTestModel.objects.aggregate(regrcount=RegrCount(y='int2', x='int1'))
-
-        self.assertEqual(values, {'regrcount': 0})
-
-
-
-    def test_regr_intercept_general(self):
-
-        values = StatTestModel.objects.aggregate(regrintercept=RegrIntercept(y='int2', x='int1'))
-
-        self.assertEqual(values, {'regrintercept': 4})
-
-
-
-    def test_regr_intercept_empty_result(self):
-
-        StatTestModel.objects.all().delete()
-
-        values = StatTestModel.objects.aggregate(regrintercept=RegrIntercept(y='int2', x='int1'))
-
-        self.assertEqual(values, {'regrintercept': None})
-
-
-
-    def test_regr_r2_general(self):
-
-        values = StatTestModel.objects.aggregate(regrr2=RegrR2(y='int2', x='int1'))
-
-        self.assertEqual(values, {'regrr2': 1})
-
-
-
-    def test_regr_r2_empty_result(self):
-
-        StatTestModel.objects.all().delete()
-
-        values = StatTestModel.objects.aggregate(regrr2=RegrR2(y='int2', x='int1'))
-
-        self.assertEqual(values, {'regrr2': None})
-
-
-
-    def test_regr_slope_general(self):
-
-        values = StatTestModel.objects.aggregate(regrslope=RegrSlope(y='int2', x='int1'))
-
-        self.assertEqual(values, {'regrslope': -1})
-
-
-
-    def test_regr_slope_empty_result(self):
-
-        StatTestModel.objects.all().delete()
-
-        values = StatTestModel.objects.aggregate(regrslope=RegrSlope(y='int2', x='int1'))
-
-        self.assertEqual(values, {'regrslope': None})
-
-
-
-    def test_regr_sxx_general(self):
-
-        values = StatTestModel.objects.aggregate(regrsxx=RegrSXX(y='int2', x='int1'))
-
-        self.assertEqual(values, {'regrsxx': 2.0})
-
-
-
-    def test_regr_sxx_empty_result(self):
-
-        StatTestModel.objects.all().delete()
-
-        values = StatTestModel.objects.aggregate(regrsxx=RegrSXX(y='int2', x='int1'))
-
-        self.assertEqual(values, {'regrsxx': None})
-
-
-
-    def test_regr_sxy_general(self):
-
-        values = StatTestModel.objects.aggregate(regrsxy=RegrSXY(y='int2', x='int1'))
-
-        self.assertEqual(values, {'regrsxy': -2.0})
-
-
-
-    def test_regr_sxy_empty_result(self):
-
-        StatTestModel.objects.all().delete()
-
-        values = StatTestModel.objects.aggregate(regrsxy=RegrSXY(y='int2', x='int1'))
-
-        self.assertEqual(values, {'regrsxy': None})
-
-
-
-    def test_regr_syy_general(self):
-
-        values = StatTestModel.objects.aggregate(regrsyy=RegrSYY(y='int2', x='int1'))
-
-        self.assertEqual(values, {'regrsyy': 2.0})
-
-
-
-    def test_regr_syy_empty_result(self):
-
-        StatTestModel.objects.all().delete()
-
-        values = StatTestModel.objects.aggregate(regrsyy=RegrSYY(y='int2', x='int1'))
-
-        self.assertEqual(values, {'regrsyy': None})
-
-
-
-    def test_regr_avgx_with_related_obj_and_number_as_argument(self):
+        When disabled, equations etc. will appear as their untransformed TeX source.
 
         """
 
-        This is more complex test to check if JOIN on field and
+    )
 
-        number as argument works as expected.
+    def _enable_mathjax_changed(self, name, old, new):
+
+        """set mathjax url to empty if mathjax is disabled"""
+
+        if not new:
+
+            self.mathjax_url = u''
+
+
+
+    base_url = Unicode('/', config=True,
+
+                               help='''The base URL for the notebook server.
+
+
+
+                               Leading and trailing slashes can be omitted,
+
+                               and will automatically be added.
+
+                               ''')
+
+    def _base_url_changed(self, name, old, new):
+
+        if not new.startswith('/'):
+
+            self.base_url = '/'+new
+
+        elif not new.endswith('/'):
+
+            self.base_url = new+'/'
+
+    
+
+    base_project_url = Unicode('/', config=True, help="""DEPRECATED use base_url""")
+
+    def _base_project_url_changed(self, name, old, new):
+
+        self.log.warn("base_project_url is deprecated, use base_url")
+
+        self.base_url = new
+
+
+
+    extra_static_paths = List(Unicode(), config=True,
+
+        help="""Extra paths to search for serving static files.
+
+        
+
+        This allows adding javascript/css to be available from the notebook server machine,
+
+        or overriding individual files in the IPython"""
+
+    )
+
+    
+
+    @property
+
+    def static_file_path(self):
+
+        """return extra paths + the default location"""
+
+        return self.extra_static_paths + [DEFAULT_STATIC_FILES_PATH]
+
+    
+
+    static_custom_path = List(Unicode(),
+
+        help="""Path to search for custom.js, css"""
+
+    )
+
+    def _static_custom_path_default(self):
+
+        return [
+
+            os.path.join(d, 'custom') for d in (
+
+                self.config_dir,
+
+                # FIXME: serve IPython profile while we don't have `jupyter migrate`
+
+                os.path.join(get_ipython_dir(), 'profile_default', 'static'),
+
+                DEFAULT_STATIC_FILES_PATH)
+
+        ]
+
+
+
+    extra_template_paths = List(Unicode(), config=True,
+
+        help="""Extra paths to search for serving jinja templates.
+
+
+
+        Can be used to override templates from notebook.templates."""
+
+    )
+
+
+
+    @property
+
+    def template_file_path(self):
+
+        """return extra paths + the default locations"""
+
+        return self.extra_template_paths + DEFAULT_TEMPLATE_PATH_LIST
+
+
+
+    extra_nbextensions_path = List(Unicode(), config=True,
+
+        help="""extra paths to look for Javascript notebook extensions"""
+
+    )
+
+    
+
+    @property
+
+    def nbextensions_path(self):
+
+        """The path to look for Javascript notebook extensions"""
+
+        path = self.extra_nbextensions_path + jupyter_path('nbextensions')
+
+        # FIXME: remove IPython nbextensions path once migration is setup
+
+        path.append(os.path.join(get_ipython_dir(), 'nbextensions'))
+
+        return path
+
+
+
+    websocket_url = Unicode("", config=True,
+
+        help="""The base URL for websockets,
+
+        if it differs from the HTTP server (hint: it almost certainly doesn't).
+
+        
+
+        Should be in the form of an HTTP origin: ws[s]://hostname[:port]
 
         """
 
-        values = StatTestModel.objects.aggregate(complex_regravgx=RegrAvgX(y=5, x='related_field__integer_field'))
+    )
 
-        self.assertEqual(values, {'complex_regravgx': 1.0})
+    mathjax_url = Unicode("", config=True,
+
+        help="""The url for MathJax.js."""
+
+    )
+
+    def _mathjax_url_default(self):
+
+        if not self.enable_mathjax:
+
+            return u''
+
+        static_url_prefix = self.tornado_settings.get("static_url_prefix",
+
+                         url_path_join(self.base_url, "static")
+
+        )
+
+        return url_path_join(static_url_prefix, 'components', 'MathJax', 'MathJax.js')
+
+    
+
+    def _mathjax_url_changed(self, name, old, new):
+
+        if new and not self.enable_mathjax:
+
+            # enable_mathjax=False overrides mathjax_url
+
+            self.mathjax_url = u''
+
+        else:
+
+            self.log.info("Using MathJax: %s", new)
+
+
+
+    contents_manager_class = Type(
+
+        default_value=FileContentsManager,
+
+        klass=ContentsManager,
+
+        config=True,
+
+        help='The notebook manager class to use.'
+
+    )
+
+    kernel_manager_class = Type(
+
+        default_value=MappingKernelManager,
+
+        config=True,
+
+        help='The kernel manager class to use.'
+
+    )
+
+    session_manager_class = Type(
+
+        default_value=SessionManager,
+
+        config=True,
+
+        help='The session manager class to use.'
+
+    )
+
+
+
+    config_manager_class = Type(
+
+        default_value=ConfigManager,
+
+        config = True,
+
+        help='The config manager class to use'
+
+    )
+
+
+
+    kernel_spec_manager = Instance(KernelSpecManager, allow_none=True)
+
+
+
+    kernel_spec_manager_class = Type(
+
+        default_value=KernelSpecManager,
+
+        config=True,
+
+        help="""
+
+        The kernel spec manager class to use. Should be a subclass
+
+        of `jupyter_client.kernelspec.KernelSpecManager`.
+
+
+
+        The Api of KernelSpecManager is provisional and might change
+
+        without warning between this version of IPython and the next stable one.
+
+        """
+
+    )
+
+
+
+    login_handler_class = Type(
+
+        default_value=LoginHandler,
+
+        klass=web.RequestHandler,
+
+        config=True,
+
+        help='The login handler class to use.',
+
+    )
+
+
+
+    logout_handler_class = Type(
+
+        default_value=LogoutHandler,
+
+        klass=web.RequestHandler,
+
+        config=True,
+
+        help='The logout handler class to use.',
+
+    )
+
+
+
+    trust_xheaders = Bool(False, config=True,
+
+        help=("Whether to trust or not X-Scheme/X-Forwarded-Proto and X-Real-Ip/X-Forwarded-For headers"
+
+              "sent by the upstream reverse proxy. Necessary if the proxy handles SSL")
+
+    )
+
+
+
+    info_file = Unicode()
+
+
+
+    def _info_file_default(self):
+
+        info_file = "nbserver-%s.json" % os.getpid()
+
+        return os.path.join(self.runtime_dir, info_file)
+
+    
+
+    pylab = Unicode('disabled', config=True,
+
+        help="""
+
+        DISABLED: use %pylab or %matplotlib in the notebook to enable matplotlib.
+
+        """
+
+    )
+
+    def _pylab_changed(self, name, old, new):
+
+        """when --pylab is specified, display a warning and exit"""
+
+        if new != 'warn':
+
+            backend = ' %s' % new
+
+        else:
+
+            backend = ''
+
+        self.log.error("Support for specifying --pylab on the command line has been removed.")
+
+        self.log.error(
+
+            "Please use `%pylab{0}` or `%matplotlib{0}` in the notebook itself.".format(backend)
+
+        )
+
+        self.exit(1)
+
+
+
+    notebook_dir = Unicode(config=True,
+
+        help="The directory to use for notebooks and kernels."
+
+    )
+
+
+
+    def _notebook_dir_default(self):
+
+        if self.file_to_run:
+
+            return os.path.dirname(os.path.abspath(self.file_to_run))
+
+        else:
+
+            return py3compat.getcwd()
+
+
+
+    def _notebook_dir_changed(self, name, old, new):
+
+        """Do a bit of validation of the notebook dir."""
+
+        if not os.path.isabs(new):
+
+            # If we receive a non-absolute path, make it absolute.
+
+            self.notebook_dir = os.path.abspath(new)
+
+            return
+
+        if not os.path.isdir(new):
+
+            raise TraitError("No such notebook dir: %r" % new)
+
+        
+
+        # setting App.notebook_dir implies setting notebook and kernel dirs as well
+
+        self.config.FileContentsManager.root_dir = new
+
+        self.config.MappingKernelManager.root_dir = new
+
+
+
+    server_extensions = List(Unicode(), config=True,
+
+        help=("Python modules to load as notebook server extensions. "
+
+              "This is an experimental API, and may change in future releases.")
+
+    )
+
+
+
+    reraise_server_extension_failures = Bool(
+
+        False,
+
+        config=True,
+
+        help="Reraise exceptions encountered loading server extensions?",
+
+    )
+
+
+
+    def parse_command_line(self, argv=None):
+
+        super(NotebookApp, self).parse_command_line(argv)
+
+        
+
+        if self.extra_args:
+
+            arg0 = self.extra_args[0]
+
+            f = os.path.abspath(arg0)
+
+            self.argv.remove(arg0)
+
+            if not os.path.exists(f):
+
+                self.log.critical("No such file or directory: %s", f)
+
+                self.exit(1)
+
+            
+
+            # Use config here, to ensure that it takes higher priority than
+
+            # anything that comes from the profile.
+
+            c = Config()
+
+            if os.path.isdir(f):
+
+                c.NotebookApp.notebook_dir = f
+
+            elif os.path.isfile(f):
+
+                c.NotebookApp.file_to_run = f
+
+            self.update_config(c)
+
+
+
+    def init_configurables(self):
+
+        self.kernel_spec_manager = self.kernel_spec_manager_class(
+
+            parent=self,
+
+        )
+
+        self.kernel_manager = self.kernel_manager_class(
+
+            parent=self,
+
+            log=self.log,
+
+            connection_dir=self.runtime_dir,
+
+            kernel_spec_manager=self.kernel_spec_manager,
+
+        )
+
+        self.contents_manager = self.contents_manager_class(
+
+            parent=self,
+
+            log=self.log,
+
+        )
+
+        self.session_manager = self.session_manager_class(
+
+            parent=self,
+
+            log=self.log,
+
+            kernel_manager=self.kernel_manager,
+
+            contents_manager=self.contents_manager,
+
+        )
+
+        self.config_manager = self.config_manager_class(
+
+            parent=self,
+
+            log=self.log,
+
+            config_dir=os.path.join(self.config_dir, 'nbconfig'),
+
+        )
+
+
+
+    def init_logging(self):
+
+        # This prevents double log messages because tornado use a root logger that
+
+        # self.log is a child of. The logging module dipatches log messages to a log
+
+        # and all of its ancenstors until propagate is set to False.
+
+        self.log.propagate = False
+
+        
+
+        for log in app_log, access_log, gen_log:
+
+            # consistent log output name (NotebookApp instead of tornado.access, etc.)
+
+            log.name = self.log.name
+
+        # hook up tornado 3's loggers to our app handlers
+
+        logger = logging.getLogger('tornado')
+
+        logger.propagate = True
+
+        logger.parent = self.log
+
+        logger.setLevel(self.log.level)
+
+    
+
+    def init_webapp(self):
+
+        """initialize tornado webapp and httpserver"""
+
+        self.tornado_settings['allow_origin'] = self.allow_origin
+
+        if self.allow_origin_pat:
+
+            self.tornado_settings['allow_origin_pat'] = re.compile(self.allow_origin_pat)
+
+        self.tornado_settings['allow_credentials'] = self.allow_credentials
+
+        # ensure default_url starts with base_url
+
+        if not self.default_url.startswith(self.base_url):
+
+            self.default_url = url_path_join(self.base_url, self.default_url)
+
+        
+
+        self.web_app = NotebookWebApplication(
+
+            self, self.kernel_manager, self.contents_manager,
+
+            self.session_manager, self.kernel_spec_manager,
+
+            self.config_manager,
+
+            self.log, self.base_url, self.default_url, self.tornado_settings,
+
+            self.jinja_environment_options
+
+        )
+
+        ssl_options = self.ssl_options
+
+        if self.certfile:
+
+            ssl_options['certfile'] = self.certfile
+
+        if self.keyfile:
+
+            ssl_options['keyfile'] = self.keyfile
+
+        if not ssl_options:
+
+            # None indicates no SSL config
+
+            ssl_options = None
+
+        else:
+
+            # Disable SSLv3, since its use is discouraged.
+
+            ssl_options['ssl_version']=ssl.PROTOCOL_TLSv1
+
+        self.login_handler_class.validate_security(self, ssl_options=ssl_options)
+
+        self.http_server = httpserver.HTTPServer(self.web_app, ssl_options=ssl_options,
+
+                                                 xheaders=self.trust_xheaders)
+
+
+
+        success = None
+
+        for port in random_ports(self.port, self.port_retries+1):
+
+            try:
+
+                self.http_server.listen(port, self.ip)
+
+            except socket.error as e:
+
+                if e.errno == errno.EADDRINUSE:
+
+                    self.log.info('The port %i is already in use, trying another random port.' % port)
+
+                    continue
+
+                elif e.errno in (errno.EACCES, getattr(errno, 'WSAEACCES', errno.EACCES)):
+
+                    self.log.warn("Permission to listen on port %i denied" % port)
+
+                    continue
+
+                else:
+
+                    raise
+
+            else:
+
+                self.port = port
+
+                success = True
+
+                break
+
+        if not success:
+
+            self.log.critical('ERROR: the notebook server could not be started because '
+
+                              'no available port could be found.')
+
+            self.exit(1)
+
+    
+
+    @property
+
+    def display_url(self):
+
+        ip = self.ip if self.ip else '[all ip addresses on your system]'
+
+        return self._url(ip)
+
+
+
+    @property
+
+    def connection_url(self):
+
+        ip = self.ip if self.ip else 'localhost'
+
+        return self._url(ip)
+
+
+
+    def _url(self, ip):
+
+        proto = 'https' if self.certfile else 'http'
+
+        return "%s://%s:%i%s" % (proto, ip, self.port, self.base_url)
+
+
+
+    def init_terminals(self):
+
+        try:
+
+            from .terminal import initialize
+
+            initialize(self.web_app, self.notebook_dir, self.connection_url)
+
+            self.web_app.settings['terminals_available'] = True
+
+        except ImportError as e:
+
+            log = self.log.debug if sys.platform == 'win32' else self.log.warn
+
+            log("Terminals not available (error was %s)", e)
+
+
+
+    def init_signal(self):
+
+        if not sys.platform.startswith('win') and sys.stdin.isatty():
+
+            signal.signal(signal.SIGINT, self._handle_sigint)
+
+        signal.signal(signal.SIGTERM, self._signal_stop)
+
+        if hasattr(signal, 'SIGUSR1'):
+
+            # Windows doesn't support SIGUSR1
+
+            signal.signal(signal.SIGUSR1, self._signal_info)
+
+        if hasattr(signal, 'SIGINFO'):
+
+            # only on BSD-based systems
+
+            signal.signal(signal.SIGINFO, self._signal_info)
+
+    
+
+    def _handle_sigint(self, sig, frame):
+
+        """SIGINT handler spawns confirmation dialog"""
+
+        # register more forceful signal handler for ^C^C case
+
+        signal.signal(signal.SIGINT, self._signal_stop)
+
+        # request confirmation dialog in bg thread, to avoid
+
+        # blocking the App
+
+        thread = threading.Thread(target=self._confirm_exit)
+
+        thread.daemon = True
+
+        thread.start()
+
+    
+
+    def _restore_sigint_handler(self):
+
+        """callback for restoring original SIGINT handler"""
+
+        signal.signal(signal.SIGINT, self._handle_sigint)
+
+    
+
+    def _confirm_exit(self):
+
+        """confirm shutdown on ^C
+
+        
+
+        A second ^C, or answering 'y' within 5s will cause shutdown,
+
+        otherwise original SIGINT handler will be restored.
+
+        
+
+        This doesn't work on Windows.
+
+        """
+
+        info = self.log.info
+
+        info('interrupted')
+
+        print(self.notebook_info())
+
+        sys.stdout.write("Shutdown this notebook server (y/[n])? ")
+
+        sys.stdout.flush()
+
+        r,w,x = select.select([sys.stdin], [], [], 5)
+
+        if r:
+
+            line = sys.stdin.readline()
+
+            if line.lower().startswith('y') and 'n' not in line.lower():
+
+                self.log.critical("Shutdown confirmed")
+
+                ioloop.IOLoop.current().stop()
+
+                return
+
+        else:
+
+            print("No answer for 5s:", end=' ')
+
+        print("resuming operation...")
+
+        # no answer, or answer is no:
+
+        # set it back to original SIGINT handler
+
+        # use IOLoop.add_callback because signal.signal must be called
+
+        # from main thread
+
+        ioloop.IOLoop.current().add_callback(self._restore_sigint_handler)
+
+    
+
+    def _signal_stop(self, sig, frame):
+
+        self.log.critical("received signal %s, stopping", sig)
+
+        ioloop.IOLoop.current().stop()
+
+
+
+    def _signal_info(self, sig, frame):
+
+        print(self.notebook_info())
+
+    
+
+    def init_components(self):
+
+        """Check the components submodule, and warn if it's unclean"""
+
+        # TODO: this should still check, but now we use bower, not git submodule
+
+        pass
+
+
+
+    def init_server_extensions(self):
+
+        """Load any extensions specified by config.
+
+
+
+        Import the module, then call the load_jupyter_server_extension function,
+
+        if one exists.
+
+        
+
+        The extension API is experimental, and may change in future releases.
+
+        """
+
+        for modulename in self.server_extensions:
+
+            try:
+
+                mod = importlib.import_module(modulename)
+
+                func = getattr(mod, 'load_jupyter_server_extension', None)
+
+                if func is not None:
+
+                    func(self)
+
+            except Exception:
+
+                if self.reraise_server_extension_failures:
+
+                    raise
+
+                self.log.warn("Error loading server extension %s", modulename,
+
+                              exc_info=True)
+
+    
+
+    @catch_config_error
+
+    def initialize(self, argv=None):
+
+        super(NotebookApp, self).initialize(argv)
+
+        self.init_logging()
+
+        self.init_configurables()
+
+        self.init_components()
+
+        self.init_webapp()
+
+        self.init_terminals()
+
+        self.init_signal()
+
+        self.init_server_extensions()
+
+
+
+    def cleanup_kernels(self):
+
+        """Shutdown all kernels.
+
+        
+
+        The kernels will shutdown themselves when this process no longer exists,
+
+        but explicit shutdown allows the KernelManagers to cleanup the connection files.
+
+        """
+
+        self.log.info('Shutting down kernels')
+
+        self.kernel_manager.shutdown_all()
+
+
+
+    def notebook_info(self):
+
+        "Return the current working directory and the server url information"
+
+        info = self.contents_manager.info_string() + "\n"
+
+        info += "%d active kernels \n" % len(self.kernel_manager._kernels)
+
+        return info + "The IPython Notebook is running at: %s" % self.display_url
+
+
+
+    def server_info(self):
+
+        """Return a JSONable dict of information about this server."""
+
+        return {'url': self.connection_url,
+
+                'hostname': self.ip if self.ip else 'localhost',
+
+                'port': self.port,
+
+                'secure': bool(self.certfile),
+
+                'base_url': self.base_url,
+
+                'notebook_dir': os.path.abspath(self.notebook_dir),
+
+                'pid': os.getpid()
+
+               }
+
+
+
+    def write_server_info_file(self):
+
+        """Write the result of server_info() to the JSON file info_file."""
+
+        with open(self.info_file, 'w') as f:
+
+            json.dump(self.server_info(), f, indent=2)
+
+
+
+    def remove_server_info_file(self):
+
+        """Remove the nbserver-<pid>.json file created for this server.
+
+        
+
+        Ignores the error raised when the file has already been removed.
+
+        """
+
+        try:
+
+            os.unlink(self.info_file)
+
+        except OSError as e:
+
+            if e.errno != errno.ENOENT:
+
+                raise
+
+
+
+    def start(self):
+
+        """ Start the IPython Notebook server app, after initialization
+
+        
+
+        This method takes no arguments so all configuration and initialization
+
+        must be done prior to calling this method."""
+
+        super(NotebookApp, self).start()
+
+
+
+        info = self.log.info
+
+        for line in self.notebook_info().split("\n"):
+
+            info(line)
+
+        info("Use Control-C to stop this server and shut down all kernels (twice to skip confirmation).")
+
+
+
+        self.write_server_info_file()
+
+
+
+        if self.open_browser or self.file_to_run:
+
+            try:
+
+                browser = webbrowser.get(self.browser or None)
+
+            except webbrowser.Error as e:
+
+                self.log.warn('No web browser found: %s.' % e)
+
+                browser = None
+
+            
+
+            if self.file_to_run:
+
+                if not os.path.exists(self.file_to_run):
+
+                    self.log.critical("%s does not exist" % self.file_to_run)
+
+                    self.exit(1)
+
+
+
+                relpath = os.path.relpath(self.file_to_run, self.notebook_dir)
+
+                uri = url_path_join('notebooks', *relpath.split(os.sep))
+
+            else:
+
+                uri = 'tree'
+
+            if browser:
+
+                b = lambda : browser.open(url_path_join(self.connection_url, uri),
+
+                                          new=2)
+
+                threading.Thread(target=b).start()
+
+        
+
+        self.io_loop = ioloop.IOLoop.current()
+
+        if sys.platform.startswith('win'):
+
+            # add no-op to wake every 5s
+
+            # to handle signals that may be ignored by the inner loop
+
+            pc = ioloop.PeriodicCallback(lambda : None, 5000)
+
+            pc.start()
+
+        try:
+
+            self.io_loop.start()
+
+        except KeyboardInterrupt:
+
+            info("Interrupted...")
+
+        finally:
+
+            self.cleanup_kernels()
+
+            self.remove_server_info_file()
+
+    
+
+    def stop(self):
+
+        def _stop():
+
+            self.http_server.stop()
+
+            self.io_loop.stop()
+
+        self.io_loop.add_callback(_stop)
+
+
+
+
+
+def list_running_servers(runtime_dir=None):
+
+    """Iterate over the server info files of running notebook servers.
+
+    
+
+    Given a profile name, find nbserver-* files in the security directory of
+
+    that profile, and yield dicts of their information, each one pertaining to
+
+    a currently running notebook server instance.
+
+    """
+
+    if runtime_dir is None:
+
+        runtime_dir = jupyter_runtime_dir()
+
+
+
+    # The runtime dir might not exist
+
+    if not os.path.isdir(runtime_dir):
+
+        return
+
+
+
+    for file in os.listdir(runtime_dir):
+
+        if file.startswith('nbserver-'):
+
+            with io.open(os.path.join(runtime_dir, file), encoding='utf-8') as f:
+
+                info = json.load(f)
+
+
+
+            # Simple check whether that process is really still running
+
+            # Also remove leftover files from IPython 2.x without a pid field
+
+            if ('pid' in info) and check_pid(info['pid']):
+
+                yield info
+
+            else:
+
+                # If the process has died, try to delete its info file
+
+                try:
+
+                    os.unlink(file)
+
+                except OSError:
+
+                    pass  # TODO: This should warn or log or something
+
+#-----------------------------------------------------------------------------
+
+# Main entry point
+
+#-----------------------------------------------------------------------------
+
+
+
+main = launch_new_instance = NotebookApp.launch_instance

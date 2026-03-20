@@ -45,7 +45,7 @@ class EmbeddingGenerator:
         if token in self.token_vocab:
             emb[self.token_vocab[token] % 32] = 1.0
         else:
-            h = int(hashlib.md5(token.encode()).hexdigest()[:8], 16)
+            h = int(hashlib.sha256(token.encode()).hexdigest()[:8], 16)
             for i in range(4):
                 emb[(h >> (i * 8)) % 32] += 0.25
         if isinstance(token, str):

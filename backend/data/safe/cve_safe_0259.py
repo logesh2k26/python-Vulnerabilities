@@ -1,359 +1,729 @@
 # Source: CVEFixes dataset
-# Safety: vulnerable
+# Safety: safe
 # Category: safe
 
-#     Copyright 2014 Netflix, Inc.
+##############################################################################
 
 #
 
-#     Licensed under the Apache License, Version 2.0 (the "License");
+# Copyright (c) 2001, 2002 Zope Foundation and Contributors.
 
-#     you may not use this file except in compliance with the License.
-
-#     You may obtain a copy of the License at
+# All Rights Reserved.
 
 #
 
-#         http://www.apache.org/licenses/LICENSE-2.0
+# This software is subject to the provisions of the Zope Public License,
+
+# Version 2.1 (ZPL).  A copy of the ZPL should accompany this distribution.
+
+# THIS SOFTWARE IS PROVIDED "AS IS" AND ANY AND ALL EXPRESS OR IMPLIED
+
+# WARRANTIES ARE DISCLAIMED, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+
+# WARRANTIES OF TITLE, MERCHANTABILITY, AGAINST INFRINGEMENT, AND FITNESS
+
+# FOR A PARTICULAR PURPOSE.
 
 #
 
-#     Unless required by applicable law or agreed to in writing, software
+##############################################################################
 
-#     distributed under the License is distributed on an "AS IS" BASIS,
+"""HTTP Request Parser
 
-#     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 
-#     See the License for the specific language governing permissions and
 
-#     limitations under the License.
+This server uses asyncore to accept connections and do initial
 
+processing but threads to do work.
 
+"""
 
-from security_monkey import app, db
+import re
 
-from flask_wtf.csrf import generate_csrf
+from io import BytesIO
 
-from security_monkey.auth.models import RBACRole
 
-from security_monkey.decorators import crossdomain
 
+from waitress.buffers import OverflowableBuffer
 
+from waitress.compat import tostr, unquote_bytes_to_wsgi, urlparse
 
-from flask_restful import fields, marshal, Resource, reqparse
+from waitress.receiver import ChunkedReceiver, FixedStreamReceiver
 
-from flask_login import current_user
+from waitress.utilities import (
 
+    BadRequest,
 
+    RequestEntityTooLarge,
 
-ORIGINS = [
+    RequestHeaderFieldsTooLarge,
 
-    'https://{}:{}'.format(app.config.get('FQDN'), app.config.get('WEB_PORT')),
+    find_double_newline,
 
-    # Adding this next one so you can also access the dart UI by prepending /static to the path.
+)
 
-    'https://{}:{}'.format(app.config.get('FQDN'), app.config.get('API_PORT')),
 
-    'https://{}:{}'.format(app.config.get('FQDN'), app.config.get('NGINX_PORT')),
 
-    'https://{}:80'.format(app.config.get('FQDN'))
 
-]
 
+class ParsingError(Exception):
 
+    pass
 
-##### Marshal Datastructures #####
 
 
 
-# Used by RevisionGet, RevisionList, ItemList
 
-REVISION_FIELDS = {
+class HTTPRequestParser(object):
 
-    'id': fields.Integer,
+    """A structure that collects the HTTP request.
 
-    'date_created': fields.String,
 
-    'date_last_ephemeral_change': fields.String,
 
-    'active': fields.Boolean,
+    Once the stream is completed, the instance is passed to
 
-    'item_id': fields.Integer
+    a server task constructor.
 
-}
+    """
 
 
 
-# Used by RevisionList, ItemGet, ItemList
+    completed = False  # Set once request is completed.
 
-ITEM_FIELDS = {
+    empty = False  # Set if no request was made.
 
-    'id': fields.Integer,
+    expect_continue = False  # client sent "Expect: 100-continue" header
 
-    'region': fields.String,
+    headers_finished = False  # True when headers have been read
 
-    'name': fields.String
+    header_plus = b""
 
-}
+    chunked = False
 
+    content_length = 0
 
+    header_bytes_received = 0
 
-# Used by ItemList, Justify
+    body_bytes_received = 0
 
-AUDIT_FIELDS = {
+    body_rcv = None
 
-    'id': fields.Integer,
+    version = "1.0"
 
-    'score': fields.Integer,
+    error = None
 
-    'issue': fields.String,
+    connection_close = False
 
-    'notes': fields.String,
 
-    'justified': fields.Boolean,
 
-    'justification': fields.String,
+    # Other attributes: first_line, header, headers, command, uri, version,
 
-    'justified_date': fields.String,
+    # path, query, fragment
 
-    'item_id': fields.Integer
 
-}
 
+    def __init__(self, adj):
 
+        """
 
-## Single Use Marshal Objects ##
+        adj is an Adjustments object.
 
+        """
 
+        # headers is a mapping containing keys translated to uppercase
 
-# SINGLE USE - RevisionGet
+        # with dashes turned into underscores.
 
-REVISION_COMMENT_FIELDS = {
+        self.headers = {}
 
-    'id': fields.Integer,
+        self.adj = adj
 
-    'revision_id': fields.Integer,
 
-    'date_created': fields.String,
 
-    'text': fields.String
+    def received(self, data):
 
-}
+        """
 
+        Receives the HTTP stream for one request.  Returns the number of
 
+        bytes consumed.  Sets the completed flag once both the header and the
 
-# SINGLE USE - ItemGet
+        body have been received.
 
-ITEM_COMMENT_FIELDS = {
+        """
 
-    'id': fields.Integer,
+        if self.completed:
 
-    'date_created': fields.String,
+            return 0  # Can't consume any more.
 
-    'text': fields.String,
 
-    'item_id': fields.Integer
 
-}
+        datalen = len(data)
 
+        br = self.body_rcv
 
+        if br is None:
 
-# SINGLE USE - UserSettings
+            # In header.
 
-USER_SETTINGS_FIELDS = {
+            max_header = self.adj.max_request_header_size
 
-    # 'id': fields.Integer,
 
-    'daily_audit_email': fields.Boolean,
 
-    'change_reports': fields.String
+            s = self.header_plus + data
 
-}
+            index = find_double_newline(s)
 
+            consumed = 0
 
 
-# SINGLE USE - AccountGet
 
-ACCOUNT_FIELDS = {
+            if index >= 0:
 
-    'id': fields.Integer,
+                # If the headers have ended, and we also have part of the body
 
-    'name': fields.String,
+                # message in data we still want to validate we aren't going
 
-    'identifier': fields.String,
+                # over our limit for received headers.
 
-    'notes': fields.String,
+                self.header_bytes_received += index
 
-    'active': fields.Boolean,
-
-    'third_party': fields.Boolean,
-
-    'account_type': fields.String
-
-}
-
-
-
-USER_FIELDS = {
-
-    'id': fields.Integer,
-
-    'active': fields.Boolean,
-
-    'email': fields.String,
-
-    'role': fields.String,
-
-    'confirmed_at': fields.String,
-
-    'daily_audit_email': fields.Boolean,
-
-    'change_reports': fields.String,
-
-    'last_login_at': fields.String,
-
-    'current_login_at': fields.String,
-
-    'login_count': fields.Integer,
-
-    'last_login_ip': fields.String,
-
-    'current_login_ip': fields.String
-
-}
-
-
-
-ROLE_FIELDS = {
-
-    'id': fields.Integer,
-
-    'name': fields.String,
-
-    'description': fields.String,
-
-}
-
-
-
-WHITELIST_FIELDS = {
-
-    'id': fields.Integer,
-
-    'name': fields.String,
-
-    'notes': fields.String,
-
-    'cidr': fields.String
-
-}
-
-
-
-IGNORELIST_FIELDS = {
-
-    'id': fields.Integer,
-
-    'prefix': fields.String,
-
-    'notes': fields.String,
-
-}
-
-
-
-AUDITORSETTING_FIELDS = {
-
-    'id': fields.Integer,
-
-    'disabled': fields.Boolean,
-
-    'issue_text': fields.String
-
-}
-
-
-
-ITEM_LINK_FIELDS = {
-
-    'id': fields.Integer,
-
-    'name': fields.String
-
-}
-
-
-
-class AuthenticatedService(Resource):
-
-    def __init__(self):
-
-        self.reqparse = reqparse.RequestParser()
-
-        super(AuthenticatedService, self).__init__()
-
-        self.auth_dict = dict()
-
-        if current_user.is_authenticated():
-
-            roles_marshal = []
-
-            for role in current_user.roles:
-
-                roles_marshal.append(marshal(role.__dict__, ROLE_FIELDS))
-
-
-
-            roles_marshal.append({"name": current_user.role})
-
-
-
-            for role in RBACRole.roles[current_user.role].get_parents():
-
-                roles_marshal.append({"name": role.name})
-
-
-
-            self.auth_dict = {
-
-                "authenticated": True,
-
-                "user": current_user.email,
-
-                "roles": roles_marshal
-
-            }
-
-        else:
-
-            if app.config.get('FRONTED_BY_NGINX'):
-
-                url = "https://{}:{}{}".format(app.config.get('FQDN'), app.config.get('NGINX_PORT'), '/login')
+                consumed = datalen - (len(s) - index)
 
             else:
 
-                url = "http://{}:{}{}".format(app.config.get('FQDN'), app.config.get('API_PORT'), '/login')
+                self.header_bytes_received += datalen
 
-            self.auth_dict = {
-
-                "authenticated": False,
-
-                "user": None,
-
-                "url": url
-
-            }
+                consumed = datalen
 
 
 
+            # If the first line + headers is over the max length, we return a
+
+            # RequestHeaderFieldsTooLarge error rather than continuing to
+
+            # attempt to parse the headers.
+
+            if self.header_bytes_received >= max_header:
+
+                self.parse_header(b"GET / HTTP/1.0\r\n")
+
+                self.error = RequestHeaderFieldsTooLarge(
+
+                    "exceeds max_header of %s" % max_header
+
+                )
+
+                self.completed = True
+
+                return consumed
 
 
-@app.after_request
 
-@crossdomain(allowed_origins=ORIGINS)
+            if index >= 0:
 
-def after(response):
+                # Header finished.
 
-    response.set_cookie('XSRF-COOKIE', generate_csrf())
+                header_plus = s[:index]
 
-    return response
+
+
+                # Remove preceeding blank lines. This is suggested by
+
+                # https://tools.ietf.org/html/rfc7230#section-3.5 to support
+
+                # clients sending an extra CR LF after another request when
+
+                # using HTTP pipelining
+
+                header_plus = header_plus.lstrip()
+
+
+
+                if not header_plus:
+
+                    self.empty = True
+
+                    self.completed = True
+
+                else:
+
+                    try:
+
+                        self.parse_header(header_plus)
+
+                    except ParsingError as e:
+
+                        self.error = BadRequest(e.args[0])
+
+                        self.completed = True
+
+                    else:
+
+                        if self.body_rcv is None:
+
+                            # no content-length header and not a t-e: chunked
+
+                            # request
+
+                            self.completed = True
+
+                        if self.content_length > 0:
+
+                            max_body = self.adj.max_request_body_size
+
+                            # we won't accept this request if the content-length
+
+                            # is too large
+
+                            if self.content_length >= max_body:
+
+                                self.error = RequestEntityTooLarge(
+
+                                    "exceeds max_body of %s" % max_body
+
+                                )
+
+                                self.completed = True
+
+                self.headers_finished = True
+
+                return consumed
+
+
+
+            # Header not finished yet.
+
+            self.header_plus = s
+
+            return datalen
+
+        else:
+
+            # In body.
+
+            consumed = br.received(data)
+
+            self.body_bytes_received += consumed
+
+            max_body = self.adj.max_request_body_size
+
+            if self.body_bytes_received >= max_body:
+
+                # this will only be raised during t-e: chunked requests
+
+                self.error = RequestEntityTooLarge("exceeds max_body of %s" % max_body)
+
+                self.completed = True
+
+            elif br.error:
+
+                # garbage in chunked encoding input probably
+
+                self.error = br.error
+
+                self.completed = True
+
+            elif br.completed:
+
+                # The request (with the body) is ready to use.
+
+                self.completed = True
+
+                if self.chunked:
+
+                    # We've converted the chunked transfer encoding request
+
+                    # body into a normal request body, so we know its content
+
+                    # length; set the header here.  We already popped the
+
+                    # TRANSFER_ENCODING header in parse_header, so this will
+
+                    # appear to the client to be an entirely non-chunked HTTP
+
+                    # request with a valid content-length.
+
+                    self.headers["CONTENT_LENGTH"] = str(br.__len__())
+
+
+
+            return consumed
+
+
+
+    def parse_header(self, header_plus):
+
+        """
+
+        Parses the header_plus block of text (the headers plus the
+
+        first line of the request).
+
+        """
+
+        index = header_plus.find(b"\r\n")
+
+        if index >= 0:
+
+            first_line = header_plus[:index].rstrip()
+
+            header = header_plus[index + 2 :]
+
+        else:
+
+            raise ParsingError("HTTP message header invalid")
+
+
+
+        if b"\r" in first_line or b"\n" in first_line:
+
+            raise ParsingError("Bare CR or LF found in HTTP message")
+
+
+
+        self.first_line = first_line  # for testing
+
+
+
+        lines = get_header_lines(header)
+
+
+
+        headers = self.headers
+
+        for line in lines:
+
+            index = line.find(b":")
+
+            if index > 0:
+
+                key = line[:index]
+
+
+
+                if key != key.strip():
+
+                    raise ParsingError("Invalid whitespace after field-name")
+
+
+
+                if b"_" in key:
+
+                    continue
+
+                value = line[index + 1 :].strip()
+
+                key1 = tostr(key.upper().replace(b"-", b"_"))
+
+                # If a header already exists, we append subsequent values
+
+                # seperated by a comma. Applications already need to handle
+
+                # the comma seperated values, as HTTP front ends might do
+
+                # the concatenation for you (behavior specified in RFC2616).
+
+                try:
+
+                    headers[key1] += tostr(b", " + value)
+
+                except KeyError:
+
+                    headers[key1] = tostr(value)
+
+            # else there's garbage in the headers?
+
+
+
+        # command, uri, version will be bytes
+
+        command, uri, version = crack_first_line(first_line)
+
+        version = tostr(version)
+
+        command = tostr(command)
+
+        self.command = command
+
+        self.version = version
+
+        (
+
+            self.proxy_scheme,
+
+            self.proxy_netloc,
+
+            self.path,
+
+            self.query,
+
+            self.fragment,
+
+        ) = split_uri(uri)
+
+        self.url_scheme = self.adj.url_scheme
+
+        connection = headers.get("CONNECTION", "")
+
+
+
+        if version == "1.0":
+
+            if connection.lower() != "keep-alive":
+
+                self.connection_close = True
+
+
+
+        if version == "1.1":
+
+            # since the server buffers data from chunked transfers and clients
+
+            # never need to deal with chunked requests, downstream clients
+
+            # should not see the HTTP_TRANSFER_ENCODING header; we pop it
+
+            # here
+
+            te = headers.pop("TRANSFER_ENCODING", "")
+
+            if te.lower() == "chunked":
+
+                self.chunked = True
+
+                buf = OverflowableBuffer(self.adj.inbuf_overflow)
+
+                self.body_rcv = ChunkedReceiver(buf)
+
+            expect = headers.get("EXPECT", "").lower()
+
+            self.expect_continue = expect == "100-continue"
+
+            if connection.lower() == "close":
+
+                self.connection_close = True
+
+
+
+        if not self.chunked:
+
+            try:
+
+                cl = int(headers.get("CONTENT_LENGTH", 0))
+
+            except ValueError:
+
+                raise ParsingError("Content-Length is invalid")
+
+
+
+            self.content_length = cl
+
+            if cl > 0:
+
+                buf = OverflowableBuffer(self.adj.inbuf_overflow)
+
+                self.body_rcv = FixedStreamReceiver(cl, buf)
+
+
+
+    def get_body_stream(self):
+
+        body_rcv = self.body_rcv
+
+        if body_rcv is not None:
+
+            return body_rcv.getfile()
+
+        else:
+
+            return BytesIO()
+
+
+
+    def close(self):
+
+        body_rcv = self.body_rcv
+
+        if body_rcv is not None:
+
+            body_rcv.getbuf().close()
+
+
+
+
+
+def split_uri(uri):
+
+    # urlsplit handles byte input by returning bytes on py3, so
+
+    # scheme, netloc, path, query, and fragment are bytes
+
+
+
+    scheme = netloc = path = query = fragment = b""
+
+
+
+    # urlsplit below will treat this as a scheme-less netloc, thereby losing
+
+    # the original intent of the request. Here we shamelessly stole 4 lines of
+
+    # code from the CPython stdlib to parse out the fragment and query but
+
+    # leave the path alone. See
+
+    # https://github.com/python/cpython/blob/8c9e9b0cd5b24dfbf1424d1f253d02de80e8f5ef/Lib/urllib/parse.py#L465-L468
+
+    # and https://github.com/Pylons/waitress/issues/260
+
+
+
+    if uri[:2] == b"//":
+
+        path = uri
+
+
+
+        if b"#" in path:
+
+            path, fragment = path.split(b"#", 1)
+
+
+
+        if b"?" in path:
+
+            path, query = path.split(b"?", 1)
+
+    else:
+
+        try:
+
+            scheme, netloc, path, query, fragment = urlparse.urlsplit(uri)
+
+        except UnicodeError:
+
+            raise ParsingError("Bad URI")
+
+
+
+    return (
+
+        tostr(scheme),
+
+        tostr(netloc),
+
+        unquote_bytes_to_wsgi(path),
+
+        tostr(query),
+
+        tostr(fragment),
+
+    )
+
+
+
+
+
+def get_header_lines(header):
+
+    """
+
+    Splits the header into lines, putting multi-line headers together.
+
+    """
+
+    r = []
+
+    lines = header.split(b"\r\n")
+
+    for line in lines:
+
+        if b"\r" in line or b"\n" in line:
+
+            raise ParsingError('Bare CR or LF found in header line "%s"' % tostr(line))
+
+
+
+        if line.startswith((b" ", b"\t")):
+
+            if not r:
+
+                # https://corte.si/posts/code/pathod/pythonservers/index.html
+
+                raise ParsingError('Malformed header line "%s"' % tostr(line))
+
+            r[-1] += line
+
+        else:
+
+            r.append(line)
+
+    return r
+
+
+
+
+
+first_line_re = re.compile(
+
+    b"([^ ]+) "
+
+    b"((?:[^ :?#]+://[^ ?#/]*(?:[0-9]{1,5})?)?[^ ]+)"
+
+    b"(( HTTP/([0-9.]+))$|$)"
+
+)
+
+
+
+
+
+def crack_first_line(line):
+
+    m = first_line_re.match(line)
+
+    if m is not None and m.end() == len(line):
+
+        if m.group(3):
+
+            version = m.group(5)
+
+        else:
+
+            version = b""
+
+        method = m.group(1)
+
+
+
+        # the request methods that are currently defined are all uppercase:
+
+        # https://www.iana.org/assignments/http-methods/http-methods.xhtml and
+
+        # the request method is case sensitive according to
+
+        # https://tools.ietf.org/html/rfc7231#section-4.1
+
+
+
+        # By disallowing anything but uppercase methods we save poor
+
+        # unsuspecting souls from sending lowercase HTTP methods to waitress
+
+        # and having the request complete, while servers like nginx drop the
+
+        # request onto the floor.
+
+        if method != method.upper():
+
+            raise ParsingError('Malformed HTTP method "%s"' % tostr(method))
+
+        uri = m.group(2)
+
+        return method, uri, version
+
+    else:
+
+        return b"", b"", b""
