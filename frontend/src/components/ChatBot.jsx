@@ -3,7 +3,7 @@ import ReactMarkdown from 'react-markdown';
 import './ChatBot.css';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api/v1';
-const API_KEY = import.meta.env.VITE_API_KEY || 'test-secret-key-12345';
+const API_KEY = import.meta.env.VITE_API_KEY || '';
 
 function ChatBot({ vulnerability, onClose }) {
     const [messages, setMessages] = useState([]);

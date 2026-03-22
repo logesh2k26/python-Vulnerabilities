@@ -1,17 +1,31 @@
-# Environment variables
+# ==========================================
+# Environment variables (NEVER commit these)
+# ==========================================
 .env
 .env.*
 !.env.example
 
+# ==========================================
+# Python
+# ==========================================
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+.venv/
+venv/
+ENV/
 env/
+env.bak/
+venv.bak/
+
+# ==========================================
+# Build & Distribution
+# ==========================================
 build/
-develop-eggs/
 dist/
+develop-eggs/
 downloads/
 eggs/
 .eggs/
@@ -24,30 +38,48 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-.venv
-venv/
-ENV/
-env/
-env.bak/
-venv.bak/
-# Node
+
+# ==========================================
+# Node.js
+# ==========================================
 node_modules/
 npm-debug.log
 yarn-error.log
-# VS Code
+frontend/dist/
+
+# ==========================================
+# Logs
+# ==========================================
+*.log
+
+# ==========================================
+# IDE & OS
+# ==========================================
 .vscode/
-# Custom
+.idea/
 .DS_Store
+Thumbs.db
+
+# ==========================================
+# Model & Training artifacts
+# ==========================================
+backend/pretrained/
 backend/training/dummy_data/
 backend/training/dummy_model.pt
-backend/pretrained/
+*.pt
+
+# ==========================================
+# Data
+# ==========================================
 backend/data/raw/
-*.txt
-!backend/data/
-!backend/data/*/
+
+# ==========================================
+# Preserve important files
+# ==========================================
 !backend/requirements.txt
 !README.md
 !walkthrough.md
 !system_architecture.md
-
+!backend/data/
+!backend/data/*/
 

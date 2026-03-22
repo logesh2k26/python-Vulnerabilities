@@ -12,7 +12,6 @@ const CodeEditor = forwardRef(function CodeEditor({ value, onChange, highlights 
                 editorRef.current.setPosition({ lineNumber, column: 1 })
                 editorRef.current.focus()
 
-                // Flash highlight on the target line
                 if (monacoRef.current) {
                     const flashDecoration = editorRef.current.createDecorationsCollection([
                         {
@@ -20,18 +19,16 @@ const CodeEditor = forwardRef(function CodeEditor({ value, onChange, highlights 
                             options: {
                                 isWholeLine: true,
                                 className: 'highlight-flash',
-                                minimap: { color: '#00d4ff', position: 1 }
+                                minimap: { color: '#00f0ff', position: 1 }
                             }
                         }
                     ])
-                    // Remove flash after animation
                     setTimeout(() => flashDecoration.clear(), 1500)
                 }
             }
         }
     }))
 
-    // React to targetLine changes from parent
     useEffect(() => {
         if (targetLine && editorRef.current) {
             editorRef.current.revealLineInCenter(targetLine)
@@ -45,7 +42,7 @@ const CodeEditor = forwardRef(function CodeEditor({ value, onChange, highlights 
                         options: {
                             isWholeLine: true,
                             className: 'highlight-flash',
-                            minimap: { color: '#00d4ff', position: 1 }
+                            minimap: { color: '#00f0ff', position: 1 }
                         }
                     }
                 ])
@@ -67,7 +64,7 @@ const CodeEditor = forwardRef(function CodeEditor({ value, onChange, highlights 
                 className: h.score > 0.7 ? 'highlight-critical' :
                     h.score > 0.4 ? 'highlight-high' : 'highlight-medium',
                 glyphMarginClassName: 'glyph-vulnerability',
-                minimap: { color: h.score > 0.7 ? '#ef4444' : '#eab308', position: 1 }
+                minimap: { color: h.score > 0.7 ? '#ff2d55' : '#ff9500', position: 1 }
             }
         }))
     }, [highlights])
@@ -76,28 +73,49 @@ const CodeEditor = forwardRef(function CodeEditor({ value, onChange, highlights 
         editorRef.current = editor
         monacoRef.current = monaco
 
-        monaco.editor.defineTheme('vuln-dark', {
+        // Antigravity neon dark theme
+        monaco.editor.defineTheme('antigravity-void', {
             base: 'vs-dark',
             inherit: true,
             rules: [
-                { token: 'comment', foreground: '6b7280', fontStyle: 'italic' },
-                { token: 'keyword', foreground: 'c084fc' },
-                { token: 'string', foreground: '34d399' },
+                { token: 'comment', foreground: '5c5e7a', fontStyle: 'italic' },
+                { token: 'keyword', foreground: '00f0ff' },
+                { token: 'keyword.control', foreground: 'a855f7' },
+                { token: 'string', foreground: 'ff6bcb' },
+                { token: 'string.escape', foreground: 'fbbf24' },
                 { token: 'number', foreground: 'fbbf24' },
-                { token: 'function', foreground: '60a5fa' },
+                { token: 'function', foreground: '4d7cff' },
+                { token: 'variable', foreground: 'eef0ff' },
+                { token: 'type', foreground: '39ff14' },
+                { token: 'operator', foreground: '00f0ff' },
+                { token: 'decorator', foreground: 'ff9500' },
+                { token: 'constant', foreground: 'ff2d55' },
             ],
             colors: {
-                'editor.background': '#12121a',
-                'editor.foreground': '#f8fafc',
-                'editor.lineHighlightBackground': '#1e1e2e',
-                'editor.selectionBackground': '#3b82f680',
-                'editorCursor.foreground': '#00d4ff',
-                'editorLineNumber.foreground': '#4b5563',
-                'editorLineNumber.activeForeground': '#9ca3af',
-                'editor.inactiveSelectionBackground': '#3b82f640',
+                'editor.background': '#08071200',
+                'editor.foreground': '#eef0ff',
+                'editor.lineHighlightBackground': '#ffffff06',
+                'editor.lineHighlightBorder': '#ffffff08',
+                'editor.selectionBackground': '#4d7cff30',
+                'editor.inactiveSelectionBackground': '#4d7cff18',
+                'editorCursor.foreground': '#00f0ff',
+                'editorLineNumber.foreground': '#3a3c5a',
+                'editorLineNumber.activeForeground': '#8b8da8',
+                'editorIndentGuide.background': '#ffffff0a',
+                'editorIndentGuide.activeBackground': '#ffffff15',
+                'editorWhitespace.foreground': '#ffffff08',
+                'editor.selectionHighlightBackground': '#4d7cff15',
+                'editorBracketMatch.background': '#00f0ff18',
+                'editorBracketMatch.border': '#00f0ff40',
+                'editorGutter.background': '#08071200',
+                'minimap.background': '#0a091800',
+                'scrollbar.shadow': '#00000000',
+                'scrollbarSlider.background': '#ffffff12',
+                'scrollbarSlider.hoverBackground': '#00f0ff25',
+                'scrollbarSlider.activeBackground': '#00f0ff35',
             }
         })
-        monaco.editor.setTheme('vuln-dark')
+        monaco.editor.setTheme('antigravity-void')
 
         if (decorations.length > 0) {
             editor.createDecorationsCollection(decorations)
@@ -114,18 +132,25 @@ const CodeEditor = forwardRef(function CodeEditor({ value, onChange, highlights 
             options={{
                 fontSize: 14,
                 fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
+                fontLigatures: true,
                 lineHeight: 24,
                 padding: { top: 16, bottom: 16 },
-                minimap: { enabled: true, scale: 1 },
+                minimap: { enabled: true, scale: 1, renderCharacters: false },
                 scrollBeyondLastLine: false,
                 smoothScrolling: true,
                 cursorBlinking: 'smooth',
                 cursorSmoothCaretAnimation: 'on',
+                cursorStyle: 'line',
+                cursorWidth: 2,
                 renderLineHighlight: 'all',
                 automaticLayout: true,
                 glyphMargin: true,
                 folding: true,
-                bracketPairColorization: { enabled: true }
+                bracketPairColorization: { enabled: true },
+                guides: { bracketPairs: true, indentation: true },
+                overviewRulerLanes: 0,
+                hideCursorInOverviewRuler: true,
+                overviewRulerBorder: false,
             }}
         />
     )

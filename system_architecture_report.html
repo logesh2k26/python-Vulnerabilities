@@ -1,0 +1,903 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Python Vulnerability Detector — System Architecture</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
+
+        :root {
+            --primary: #6366f1;
+            --primary-light: #818cf8;
+            --accent: #f59e0b;
+            --bg: #0f172a;
+            --surface: #1e293b;
+            --surface2: #334155;
+            --text: #e2e8f0;
+            --text-muted: #94a3b8;
+            --border: #475569;
+            --red: #ef4444;
+            --orange: #f97316;
+            --yellow: #eab308;
+            --green: #22c55e;
+            --cyan: #06b6d4;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Inter', -apple-system, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.7;
+            padding: 0;
+        }
+
+        /* ── Cover Page ─────────────────────────────────── */
+        .cover-page {
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 50%, #0f172a 100%);
+            position: relative;
+            overflow: hidden;
+            page-break-after: always;
+        }
+
+        .cover-page::before {
+            content: '';
+            position: absolute;
+            width: 600px;
+            height: 600px;
+            background: radial-gradient(circle, rgba(99,102,241,0.15) 0%, transparent 70%);
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            border-radius: 50%;
+        }
+
+        .cover-shield {
+            font-size: 100px;
+            margin-bottom: 24px;
+            position: relative;
+            z-index: 1;
+            filter: drop-shadow(0 0 30px rgba(99,102,241,0.4));
+        }
+
+        .cover-title {
+            font-size: 48px;
+            font-weight: 800;
+            background: linear-gradient(135deg, #818cf8, #06b6d4, #818cf8);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 16px;
+            position: relative;
+            z-index: 1;
+        }
+
+        .cover-subtitle {
+            font-size: 22px;
+            color: var(--text-muted);
+            font-weight: 300;
+            margin-bottom: 48px;
+            position: relative;
+            z-index: 1;
+        }
+
+        .cover-meta {
+            font-size: 14px;
+            color: var(--text-muted);
+            position: relative;
+            z-index: 1;
+            border-top: 1px solid var(--border);
+            padding-top: 24px;
+            width: 300px;
+        }
+
+        .cover-meta span { display: block; margin: 4px 0; }
+
+        /* ── Content Container ──────────────────────────── */
+        .content {
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 60px 48px;
+        }
+
+        /* ── Section Styling ────────────────────────────── */
+        .section {
+            margin-bottom: 56px;
+            page-break-inside: avoid;
+        }
+
+        h1 {
+            font-size: 36px;
+            font-weight: 800;
+            margin-bottom: 12px;
+            background: linear-gradient(135deg, #818cf8, #06b6d4);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            padding-bottom: 16px;
+            border-bottom: 2px solid var(--surface2);
+        }
+
+        h2 {
+            font-size: 26px;
+            font-weight: 700;
+            color: var(--primary-light);
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        h2 .icon { font-size: 28px; }
+
+        h3 {
+            font-size: 18px;
+            font-weight: 600;
+            color: var(--cyan);
+            margin: 24px 0 12px 0;
+        }
+
+        p {
+            color: var(--text);
+            margin-bottom: 16px;
+            font-size: 15px;
+        }
+
+        .muted { color: var(--text-muted); }
+
+        /* ── Overview Box ───────────────────────────────── */
+        .overview-box {
+            background: linear-gradient(135deg, rgba(99,102,241,0.1), rgba(6,182,212,0.1));
+            border: 1px solid rgba(99,102,241,0.3);
+            border-radius: 16px;
+            padding: 28px 32px;
+            margin-bottom: 40px;
+        }
+
+        .overview-box p {
+            font-size: 16px;
+            line-height: 1.8;
+        }
+
+        .highlight { color: var(--accent); font-weight: 600; }
+
+        /* ── Diagram Container ──────────────────────────── */
+        .diagram-container {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 32px;
+            margin: 24px 0 40px 0;
+            overflow-x: auto;
+        }
+
+        .diagram-container .mermaid {
+            display: flex;
+            justify-content: center;
+        }
+
+        .diagram-label {
+            font-size: 13px;
+            color: var(--text-muted);
+            text-align: center;
+            font-style: italic;
+            margin-top: 12px;
+        }
+
+        /* ── Step Cards ─────────────────────────────────── */
+        .step-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 28px 32px;
+            margin-bottom: 24px;
+            position: relative;
+            overflow: hidden;
+            page-break-inside: avoid;
+        }
+
+        .step-card::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 0;
+            bottom: 0;
+            width: 4px;
+            background: linear-gradient(180deg, var(--primary), var(--cyan));
+            border-radius: 4px 0 0 4px;
+        }
+
+        .step-header {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            margin-bottom: 16px;
+        }
+
+        .step-number {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, var(--primary), var(--cyan));
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 16px;
+            color: white;
+            flex-shrink: 0;
+        }
+
+        .step-title {
+            font-size: 20px;
+            font-weight: 700;
+            color: var(--text);
+        }
+
+        .step-card p {
+            margin-left: 56px;
+            font-size: 14.5px;
+        }
+
+        .step-card ul {
+            margin: 8px 0 8px 76px;
+            color: var(--text-muted);
+            font-size: 14px;
+        }
+
+        .step-card li { margin: 6px 0; }
+
+        /* ── Tables ─────────────────────────────────────── */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 16px 0 24px 0;
+            font-size: 14px;
+        }
+
+        thead th {
+            background: var(--surface2);
+            color: var(--primary-light);
+            font-weight: 600;
+            text-align: left;
+            padding: 12px 16px;
+            border-bottom: 2px solid var(--primary);
+        }
+
+        thead th:first-child { border-radius: 8px 0 0 0; }
+        thead th:last-child { border-radius: 0 8px 0 0; }
+
+        tbody td {
+            padding: 10px 16px;
+            border-bottom: 1px solid var(--surface2);
+            color: var(--text);
+        }
+
+        tbody tr:hover { background: rgba(99,102,241,0.05); }
+
+        .severity-critical { color: var(--red); font-weight: 600; }
+        .severity-high { color: var(--orange); font-weight: 600; }
+        .severity-medium { color: var(--yellow); font-weight: 600; }
+
+        code {
+            font-family: 'JetBrains Mono', monospace;
+            background: var(--surface2);
+            padding: 2px 8px;
+            border-radius: 6px;
+            font-size: 13px;
+            color: var(--cyan);
+        }
+
+        .formula-box {
+            background: rgba(99,102,241,0.1);
+            border: 1px solid rgba(99,102,241,0.3);
+            border-radius: 12px;
+            padding: 20px 28px;
+            margin: 16px 0 16px 56px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 15px;
+            color: var(--accent);
+            text-align: center;
+        }
+
+        /* ── Tech Stack Grid ────────────────────────────── */
+        .tech-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            margin: 20px 0;
+        }
+
+        .tech-item {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 16px 20px;
+        }
+
+        .tech-item .label {
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--text-muted);
+            margin-bottom: 6px;
+        }
+
+        .tech-item .value {
+            font-size: 15px;
+            font-weight: 600;
+            color: var(--text);
+        }
+
+        /* ── Directory Tree ─────────────────────────────── */
+        .dir-tree {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 24px 28px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 13px;
+            line-height: 1.9;
+            color: var(--text-muted);
+            white-space: pre;
+            overflow-x: auto;
+        }
+
+        .dir-tree .folder { color: var(--primary-light); font-weight: 600; }
+        .dir-tree .file { color: var(--text); }
+        .dir-tree .comment { color: var(--text-muted); font-style: italic; }
+
+        /* ── Print / PDF Styles ─────────────────────────── */
+        @media print {
+            body { background: #0f172a; }
+            .cover-page { min-height: 100vh; }
+            .step-card, .diagram-container { break-inside: avoid; }
+            .section { break-inside: avoid; }
+        }
+
+        .page-break { page-break-before: always; }
+
+        /* ── Footer ─────────────────────────────────────── */
+        .doc-footer {
+            text-align: center;
+            padding: 40px;
+            border-top: 1px solid var(--border);
+            margin-top: 60px;
+            color: var(--text-muted);
+            font-size: 13px;
+        }
+
+        /* PDF Button */
+        .pdf-btn {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            background: linear-gradient(135deg, var(--primary), #4f46e5);
+            color: white;
+            border: none;
+            padding: 16px 32px;
+            border-radius: 50px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            box-shadow: 0 8px 32px rgba(99,102,241,0.4);
+            z-index: 1000;
+            transition: transform 0.2s;
+            font-family: 'Inter', sans-serif;
+        }
+
+        .pdf-btn:hover { transform: translateY(-2px); }
+
+        @media print { .pdf-btn { display: none; } }
+    </style>
+</head>
+<body>
+
+    <!-- Save as PDF Button -->
+    <button class="pdf-btn" onclick="window.print()">📄 Save as PDF</button>
+
+    <!-- ═══════ COVER PAGE ═══════ -->
+    <div class="cover-page">
+        <div class="cover-shield">🛡️</div>
+        <div class="cover-title">Python Vulnerability Detector</div>
+        <div class="cover-subtitle">System Architecture &amp; Walkthrough</div>
+        <div class="cover-meta">
+            <span><strong>Project:</strong> PyVulnDetect</span>
+            <span><strong>Version:</strong> 1.0</span>
+            <span><strong>Date:</strong> March 21, 2026</span>
+            <span><strong>Author:</strong> System Architecture Document</span>
+        </div>
+    </div>
+
+    <!-- ═══════ CONTENT ═══════ -->
+    <div class="content">
+
+        <!-- Overview -->
+        <div class="section">
+            <h1>1. High-Level Overview</h1>
+            <div class="overview-box">
+                <p>
+                    This project is a <span class="highlight">full-stack AI-powered security tool</span> that detects vulnerabilities 
+                    in Python source code using a hybrid approach: <span class="highlight">rule-based pattern detectors</span> combined with a 
+                    <span class="highlight">Graph Neural Network (GNN)</span> machine learning model. It features a React frontend, 
+                    FastAPI backend, real-time WebSocket analysis, and an AI chatbot powered by Google Gemini 2.0 for 
+                    vulnerability explanations.
+                </p>
+            </div>
+        </div>
+
+        <!-- System Architecture Diagram -->
+        <div class="section">
+            <h2><span class="icon">🏗️</span> System Architecture Diagram</h2>
+            <div class="diagram-container">
+                <pre class="mermaid">
+graph TB
+    subgraph USER["👤 User"]
+        Browser["Browser Client"]
+    end
+
+    subgraph FRONTEND["🎨 Frontend — Vite + React"]
+        App["App.jsx — Router & State"]
+        Dashboard["Dashboard"]
+        CodeEditor["CodeEditor"]
+        FileUpload["FileUpload"]
+        ResultsPanel["ResultsPanel"]
+        ChatBot["FloatingChatBot"]
+        Reports["ReportsPage"]
+    end
+
+    subgraph BACKEND["⚙️ Backend — FastAPI"]
+        subgraph API["API Layer"]
+            REST["REST API Routes"]
+            WS["WebSocket Handler"]
+            ChatAPI["Chat API"]
+        end
+
+        subgraph SECURITY["🔒 Security"]
+            Auth["API Key Auth"]
+            RateLimiter["Rate Limiter"]
+            Validators["Input Validators"]
+        end
+
+        subgraph ENGINE["🧠 Inference Engine"]
+            VulnInference["VulnerabilityInference"]
+        end
+
+        subgraph CORE["📐 Core Pipeline"]
+            ASTParser["AST Parser"]
+            GraphBuilder["Graph Builder"]
+            TaintAnalyzer["Taint Analyzer"]
+            SanitizerDetector["Sanitizer Detector"]
+            SeverityAdjuster["Severity Adjuster"]
+        end
+
+        subgraph DETECTORS["🔍 Rule-Based Detectors"]
+            D1["Eval/Exec"]
+            D2["Command Injection"]
+            D3["Deserialization"]
+            D4["Hardcoded Secrets"]
+            D5["XSS / XXE / ReDoS"]
+        end
+
+        subgraph ML["🤖 GNN Model"]
+            GNN["VulnerabilityGNN"]
+            GAT["Graph Attention Layers"]
+            Classifier["Classification Head"]
+        end
+    end
+
+    subgraph EXTERNAL["☁️ External"]
+        OpenRouter["OpenRouter / Gemini 2.0"]
+    end
+
+    Browser -->|"HTTP + WS"| API
+    ChatAPI -->|"HTTPS"| OpenRouter
+    REST --> SECURITY --> VulnInference
+    WS --> VulnInference
+    VulnInference --> CORE
+    VulnInference --> DETECTORS
+    VulnInference --> GNN
+    GNN --> GAT --> Classifier
+                </pre>
+            </div>
+            <p class="diagram-label">Figure 1 — High-level system architecture showing all major components and data flow</p>
+        </div>
+
+        <div class="page-break"></div>
+
+        <!-- Data Flow Sequence -->
+        <div class="section">
+            <h2><span class="icon">🔄</span> Data Flow — Sequence Diagram</h2>
+            <div class="diagram-container">
+                <pre class="mermaid">
+sequenceDiagram
+    participant U as 👤 User
+    participant FE as 🎨 Frontend
+    participant API as ⚙️ FastAPI
+    participant SEC as 🔒 Security
+    participant ENG as 🧠 Engine
+    participant AST as 📐 AST Parser
+    participant GB as 📊 Graph Builder
+    participant TA as 🔬 Taint Analyzer
+    participant DET as 🔍 Detectors
+    participant GNN as 🤖 GNN Model
+    participant SA as ⚖️ Severity Adj.
+
+    U->>FE: Paste code / upload file
+    FE->>API: POST /api/v1/analyze
+    API->>SEC: Verify API Key + Rate Limit
+    SEC->>ENG: Forward validated request
+    ENG->>AST: 1. Parse to AST nodes
+    AST-->>ENG: AST nodes + tree
+    ENG->>GB: 2. Build Code Property Graph
+    GB-->>ENG: Graph with features
+    ENG->>TA: 3. Taint analysis
+    TA-->>ENG: Source→Sink paths
+    ENG->>DET: 4. Run 9 rule detectors
+    DET-->>ENG: Detection results
+    ENG->>SA: 5. Adjust severity
+    SA-->>ENG: Adjusted results
+    ENG->>GNN: 6. GNN inference
+    GNN-->>ENG: ML predictions
+    ENG->>ENG: 7. Combine (70% rule + 30% ML)
+    ENG-->>API: Analysis result
+    API-->>FE: JSON response
+    FE-->>U: Display results
+                </pre>
+            </div>
+            <p class="diagram-label">Figure 2 — Complete data flow from user input to vulnerability report</p>
+        </div>
+
+        <div class="page-break"></div>
+
+        <!-- Step-by-Step Walkthrough -->
+        <div class="section">
+            <h1>2. Step-by-Step Process Walkthrough</h1>
+            <p class="muted" style="margin-bottom:32px;">Each step below describes a stage in the vulnerability detection pipeline, from user input to final report.</p>
+
+            <!-- Step 1 -->
+            <div class="step-card">
+                <div class="step-header">
+                    <div class="step-number">1</div>
+                    <div class="step-title">User Input</div>
+                </div>
+                <p>The user interacts with the <strong>React frontend</strong> by either:</p>
+                <ul>
+                    <li><strong>Pasting Python code</strong> into the code editor (<code>CodeEditor.jsx</code>)</li>
+                    <li><strong>Uploading <code>.py</code> files</strong> via drag-and-drop (<code>FileUpload.jsx</code>)</li>
+                </ul>
+                <p>The frontend sends the code to the backend via <code>POST /api/v1/analyze</code> (REST) or through a <strong>WebSocket</strong> connection for real-time analysis.</p>
+            </div>
+
+            <!-- Step 2 -->
+            <div class="step-card">
+                <div class="step-header">
+                    <div class="step-number">2</div>
+                    <div class="step-title">Security Middleware</div>
+                </div>
+                <p>Before any analysis begins, the request passes through <strong>three security layers</strong>:</p>
+                <table>
+                    <thead>
+                        <tr><th>Layer</th><th>File</th><th>Purpose</th></tr>
+                    </thead>
+                    <tbody>
+                        <tr><td>API Key Auth</td><td><code>auth.py</code></td><td>Validates <code>X-API-Key</code> header</td></tr>
+                        <tr><td>Rate Limiter</td><td><code>rate_limiter.py</code></td><td>Prevents abuse via SlowAPI</td></tr>
+                        <tr><td>Input Validators</td><td><code>validators.py</code></td><td>Sanitizes filenames, checks file size, validates extensions</td></tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Step 3 -->
+            <div class="step-card">
+                <div class="step-header">
+                    <div class="step-number">3</div>
+                    <div class="step-title">AST Parsing</div>
+                </div>
+                <p>The <code>ASTParser</code> (<code>ast_parser.py</code>) uses Python's built-in <code>ast</code> module to parse source code into an <strong>Abstract Syntax Tree</strong>. Each node — function call, assignment, import, etc. — becomes a structured node for downstream analysis.</p>
+            </div>
+
+            <!-- Step 4 -->
+            <div class="step-card">
+                <div class="step-header">
+                    <div class="step-number">4</div>
+                    <div class="step-title">Graph Building</div>
+                </div>
+                <p>The <code>GraphBuilder</code> (<code>graph_builder.py</code>) transforms the AST into a <strong>Code Property Graph (CPG)</strong> containing:</p>
+                <ul>
+                    <li><strong>Control flow edges</strong> — how execution flows between statements</li>
+                    <li><strong>Data flow edges</strong> — how variables pass data between nodes</li>
+                    <li><strong>Call edges</strong> — function call relationships</li>
+                    <li><strong>Node features</strong> — 128-dimensional embeddings via <code>EmbeddingGenerator</code></li>
+                </ul>
+            </div>
+
+            <!-- Step 5 -->
+            <div class="step-card">
+                <div class="step-header">
+                    <div class="step-number">5</div>
+                    <div class="step-title">Taint Analysis</div>
+                </div>
+                <p>The <code>TaintAnalyzer</code> (<code>taint_analyzer.py</code>) tracks how <strong>untrusted data</strong> (user input, network data, file reads) flows through the code to <strong>dangerous sinks</strong> (eval, exec, SQL queries, system commands). It identifies complete <strong>source → sink paths</strong> that represent exploitable vulnerabilities.</p>
+            </div>
+
+            <!-- Step 6 -->
+            <div class="step-card">
+                <div class="step-header">
+                    <div class="step-number">6</div>
+                    <div class="step-title">Sanitizer Detection</div>
+                </div>
+                <p>The <code>SanitizerDetector</code> (<code>sanitizer_detector.py</code>) identifies security mitigations already present in the code:</p>
+                <ul>
+                    <li>Input validation functions</li>
+                    <li>Parameterized queries</li>
+                    <li>HTML escaping / encoding</li>
+                    <li>Type checks and whitelists</li>
+                </ul>
+                <p>Found sanitizers reduce vulnerability severity in the next step.</p>
+            </div>
+
+            <div class="page-break"></div>
+
+            <!-- Step 7 -->
+            <div class="step-card">
+                <div class="step-header">
+                    <div class="step-number">7</div>
+                    <div class="step-title">Rule-Based Detection</div>
+                </div>
+                <p><strong>Nine specialized detectors</strong> scan the AST nodes for known vulnerability patterns:</p>
+                <table>
+                    <thead>
+                        <tr><th>Detector</th><th>Vulnerability</th><th>Severity</th></tr>
+                    </thead>
+                    <tbody>
+                        <tr><td><code>eval_exec.py</code></td><td>eval()/exec() Injection</td><td class="severity-critical">🔴 Critical</td></tr>
+                        <tr><td><code>command_injection.py</code></td><td>os.system(), subprocess with shell=True</td><td class="severity-critical">🔴 Critical</td></tr>
+                        <tr><td><code>deserialization.py</code></td><td>pickle.loads(), unsafe YAML</td><td class="severity-critical">🔴 Critical</td></tr>
+                        <tr><td><code>hardcoded_secrets.py</code></td><td>API keys, passwords in code</td><td class="severity-high">🟠 High</td></tr>
+                        <tr><td><code>cryptography.py</code></td><td>Weak ciphers, MD5/SHA1</td><td class="severity-medium">🟡 Medium</td></tr>
+                        <tr><td><code>xxe.py</code></td><td>XML External Entity attacks</td><td class="severity-high">🟠 High</td></tr>
+                        <tr><td><code>redos.py</code></td><td>Regex Denial of Service</td><td class="severity-medium">🟡 Medium</td></tr>
+                        <tr><td><code>xss_detector.py</code></td><td>Cross-Site Scripting</td><td class="severity-high">🟠 High</td></tr>
+                        <tr><td><code>logic_flaws.py</code></td><td>Authentication / Logic bugs</td><td class="severity-high">🟠 High</td></tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Step 8 -->
+            <div class="step-card">
+                <div class="step-header">
+                    <div class="step-number">8</div>
+                    <div class="step-title">Severity Adjustment</div>
+                </div>
+                <p>The <code>SeverityAdjuster</code> (<code>severity_adjuster.py</code>) cross-references rule detections against sanitizers and taint paths:</p>
+                <ul>
+                    <li>If a sanitizer fully mitigates a vulnerability → marked <strong>SAFE</strong> (skipped)</li>
+                    <li>If a taint path exists but is partially sanitized → severity <strong>reduced</strong></li>
+                    <li>Vulnerabilities without taint paths may have severity <strong>lowered</strong></li>
+                </ul>
+            </div>
+
+            <!-- Step 9 -->
+            <div class="step-card">
+                <div class="step-header">
+                    <div class="step-number">9</div>
+                    <div class="step-title">GNN Model Inference</div>
+                </div>
+                <p>The <code>VulnerabilityGNN</code> (<code>gnn_model.py</code>) processes the code graph through:</p>
+                <ul>
+                    <li><strong>Input Projection</strong> — 128 → 256 dimensional linear layer</li>
+                    <li><strong>Multi-Head Graph Attention</strong> — 3 layers × 4 heads, learns which nodes are important</li>
+                    <li><strong>Global Attention Pooling</strong> — aggregates all node features into a single graph embedding</li>
+                    <li><strong>Classification Head</strong> — outputs probabilities for 7 vulnerability classes</li>
+                </ul>
+                <p>The pretrained model weights are stored in <code>vulnerability_gnn.pt</code> (~10 MB).</p>
+            </div>
+
+            <!-- Step 10 -->
+            <div class="step-card">
+                <div class="step-header">
+                    <div class="step-number">10</div>
+                    <div class="step-title">Result Combination</div>
+                </div>
+                <p>The <code>VulnerabilityInference</code> engine (<code>inference.py</code>) combines both detection methods using a weighted formula:</p>
+                <div class="formula-box">
+                    Final Confidence = (Rule-Based × 0.7) + (ML Model × 0.3)
+                </div>
+                <ul>
+                    <li>Vulnerabilities above the <strong>confidence threshold</strong> are reported</li>
+                    <li>ML-only detections require <strong>&gt;80% confidence</strong></li>
+                    <li>Results are sorted by confidence (highest first)</li>
+                </ul>
+            </div>
+
+            <!-- Step 11 -->
+            <div class="step-card">
+                <div class="step-header">
+                    <div class="step-number">11</div>
+                    <div class="step-title">Explainability &amp; Visualization</div>
+                </div>
+                <p>The attention weights from the GNN model are used to <strong>highlight suspicious code lines</strong>:</p>
+                <ul>
+                    <li><code>AttentionMapper</code> — maps node attention weights to code regions</li>
+                    <li><code>Highlighter</code> — generates highlighted line data with importance scores</li>
+                </ul>
+                <p>The frontend renders these via the <code>ResultsPanel</code> and <code>TraceVisualizer</code> components, showing exactly which lines are most suspicious.</p>
+            </div>
+
+            <!-- Step 12 -->
+            <div class="step-card">
+                <div class="step-header">
+                    <div class="step-number">12</div>
+                    <div class="step-title">AI Chatbot Explanation</div>
+                </div>
+                <p>Users can ask the <strong>AI Assistant</strong> (<code>FloatingChatBot.jsx</code>) to explain any detected vulnerability. The backend <code>chat.py</code> forwards the conversation to the <strong>OpenRouter API</strong> (Google Gemini 2.0 Flash) with full vulnerability context for multi-turn discussions.</p>
+                <p>This provides <strong>natural-language explanations</strong> of why code is dangerous, how it can be exploited, and how to fix it.</p>
+            </div>
+        </div>
+
+        <div class="page-break"></div>
+
+        <!-- Component Architecture -->
+        <div class="section">
+            <h1>3. Component Architecture</h1>
+            <div class="diagram-container">
+                <pre class="mermaid">
+graph LR
+    subgraph FE["🎨 Frontend Components"]
+        direction TB
+        AppJSX["App.jsx"]
+        AppJSX --> Login["LoginPage"]
+        AppJSX --> Dash["Dashboard"]
+        AppJSX --> Scans["ScansPage"]
+        AppJSX --> Reports["ReportsPage"]
+        AppJSX --> Settings["SettingsPage"]
+        AppJSX --> Profile["ProfilePage"]
+        AppJSX --> AppInfo["AppInfoPage"]
+        AppJSX --> FloatChat["FloatingChatBot"]
+        Dash --> CE["CodeEditor"]
+        Dash --> FU["FileUpload"]
+        Dash --> RP["ResultsPanel"]
+        RP --> TV["TraceVisualizer"]
+        RP --> CB["ChatBot"]
+    end
+
+    subgraph BE["⚙️ Backend Modules"]
+        direction TB
+        Main["main.py"]
+        Main --> Routes["routes.py"]
+        Main --> WSock["websocket.py"]
+        Main --> Chat["chat.py"]
+        Routes --> Inference["inference.py"]
+        WSock --> Inference
+        Inference --> Core["Core Pipeline"]
+        Inference --> Detectors["9 Detectors"]
+        Inference --> Model["GNN Model"]
+        Inference --> Explain["Explainability"]
+    end
+
+    subgraph TRAIN["🏋️ Training"]
+        direction TB
+        Train["train.py"]
+        Eval["evaluate.py"]
+        Analyzer["dataset_analyzer.py"]
+        Validator["dataset_validator.py"]
+    end
+
+    FE -->|"REST + WebSocket"| BE
+    TRAIN -->|"Produces model"| Model
+                </pre>
+            </div>
+            <p class="diagram-label">Figure 3 — Component relationship diagram for frontend, backend, and training pipeline</p>
+        </div>
+
+        <!-- Technology Stack -->
+        <div class="section">
+            <h1>4. Technology Stack</h1>
+            <div class="tech-grid">
+                <div class="tech-item">
+                    <div class="label">Frontend</div>
+                    <div class="value">React 18, Vite, Vanilla CSS</div>
+                </div>
+                <div class="tech-item">
+                    <div class="label">Backend</div>
+                    <div class="value">FastAPI, Uvicorn, Python 3.x</div>
+                </div>
+                <div class="tech-item">
+                    <div class="label">ML Framework</div>
+                    <div class="value">PyTorch, torch-scatter</div>
+                </div>
+                <div class="tech-item">
+                    <div class="label">GNN Architecture</div>
+                    <div class="value">Multi-head Graph Attention (GAT)</div>
+                </div>
+                <div class="tech-item">
+                    <div class="label">AI Chatbot</div>
+                    <div class="value">OpenRouter → Google Gemini 2.0 Flash</div>
+                </div>
+                <div class="tech-item">
+                    <div class="label">Security</div>
+                    <div class="value">SlowAPI, API Key Auth, Input Sanitization</div>
+                </div>
+                <div class="tech-item">
+                    <div class="label">Communication</div>
+                    <div class="value">REST API, WebSocket (real-time)</div>
+                </div>
+                <div class="tech-item">
+                    <div class="label">Data Format</div>
+                    <div class="value">JSON, Pydantic Schemas</div>
+                </div>
+                <div class="tech-item">
+                    <div class="label">Model Storage</div>
+                    <div class="value">.pt serialized PyTorch state dict</div>
+                </div>
+                <div class="tech-item">
+                    <div class="label">Training Data</div>
+                    <div class="value">13 vulnerability categories, labeled Python samples</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Directory Structure -->
+        <div class="section">
+            <h1>5. Directory Structure</h1>
+            <div class="dir-tree"><span class="folder">python-vulnerability-detector/</span>
+├── <span class="folder">frontend/</span>                    <span class="comment"># Vite + React SPA</span>
+│   ├── <span class="folder">src/</span>
+│   │   ├── <span class="file">App.jsx</span>              <span class="comment"># Main router & state</span>
+│   │   ├── <span class="file">index.css</span>            <span class="comment"># Global styles</span>
+│   │   └── <span class="folder">components/</span>          <span class="comment"># 15 React components</span>
+│   └── <span class="file">vite.config.js</span>           <span class="comment"># Dev server + API proxy</span>
+│
+├── <span class="folder">backend/</span>
+│   ├── <span class="folder">app/</span>
+│   │   ├── <span class="file">main.py</span>              <span class="comment"># FastAPI entry point</span>
+│   │   ├── <span class="file">config.py</span>            <span class="comment"># Settings & environment</span>
+│   │   ├── <span class="folder">api/</span>                 <span class="comment"># REST, WebSocket, Chat</span>
+│   │   ├── <span class="folder">core/</span>                <span class="comment"># AST, graphs, taint, sanitizers</span>
+│   │   ├── <span class="folder">detectors/</span>           <span class="comment"># 9 vulnerability detectors</span>
+│   │   ├── <span class="folder">models/</span>              <span class="comment"># GNN model + inference</span>
+│   │   ├── <span class="folder">explainability/</span>      <span class="comment"># Attention mapping</span>
+│   │   ├── <span class="folder">schemas/</span>             <span class="comment"># Pydantic data models</span>
+│   │   └── <span class="folder">security/</span>            <span class="comment"># Auth, rate limit, validation</span>
+│   ├── <span class="folder">pretrained/</span>              <span class="comment"># Saved model weights (.pt)</span>
+│   ├── <span class="folder">data/</span>                    <span class="comment"># 13 vulnerability sample dirs</span>
+│   └── <span class="folder">training/</span>                <span class="comment"># Model training pipeline</span>
+│
+└── <span class="folder">samples/</span>                     <span class="comment"># Example vulnerable files</span></div>
+        </div>
+
+        <div class="doc-footer">
+            <p>📄 Python Vulnerability Detector — System Architecture Document</p>
+            <p>Generated on March 21, 2026 &nbsp;|&nbsp; Version 1.0</p>
+        </div>
+    </div>
+
+    <script>
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                primaryColor: '#6366f1',
+                primaryTextColor: '#e2e8f0',
+                primaryBorderColor: '#818cf8',
+                lineColor: '#94a3b8',
+                secondaryColor: '#1e293b',
+                tertiaryColor: '#334155',
+                fontFamily: 'Inter, sans-serif',
+                fontSize: '14px',
+            },
+            flowchart: { curve: 'basis', padding: 20 },
+            sequence: { actorMargin: 40, messageMargin: 30 }
+        });
+    </script>
+</body>
+</html>
