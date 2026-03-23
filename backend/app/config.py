@@ -18,8 +18,13 @@ class Settings(BaseSettings):
     API_SECRET_KEY: str = ""  # Set in .env for production
     OPENROUTER_API_KEY: str = ""  # Set in .env for production
 
-    # CORS Settings — only the dev frontend by default
-    CORS_ORIGINS: List[str] = ["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:5174", "http://127.0.0.1:5174"]
+    # CORS Settings — allow localhost and Vercel deployments
+    CORS_ORIGINS: List[str] = [
+        "http://localhost:5173", 
+        "http://127.0.0.1:5173", 
+        "https://*.vercel.app",
+        "https://python-vulnerability-detector.vercel.app"
+    ]
     CORS_ALLOW_METHODS: List[str] = ["GET", "POST"]
     CORS_ALLOW_HEADERS: List[str] = ["Content-Type", "Authorization", "X-API-Key"]
 
