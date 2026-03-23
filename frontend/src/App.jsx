@@ -3,11 +3,11 @@ import Dashboard from './components/Dashboard'
 import DashboardOverview from './components/DashboardOverview'
 import ScansPage from './components/ScansPage'
 import ReportsPage from './components/ReportsPage'
-import SettingsPage from './components/SettingsPage'
+
 import ProfilePage from './components/ProfilePage'
 import AIAssistantPage from './components/AIAssistantPage'
 import LoginPage from './components/LoginPage'
-import AppInfoPage from './components/AppInfoPage'
+
 import FloatingChatBot from './components/FloatingChatBot'
 import './index.css'
 
@@ -177,14 +177,12 @@ function App() {
                 return <ScansPage scanHistory={scanHistory} onNavigate={navigate} />
             case 'reports':
                 return <ReportsPage scanHistory={scanHistory} />
-            case 'settings':
-                return <SettingsPage onNavigate={navigate} />
+
             case 'profile':
                 return <ProfilePage user={user} onLogout={handleLogout} />
             case 'ai':
                 return <AIAssistantPage />
-            case 'appinfo':
-                return <AppInfoPage onNavigate={navigate} />
+
             default:
                 return null
         }
@@ -233,13 +231,6 @@ function App() {
                 </nav>
 
                 <div className="sd-sidebar-bottom">
-                    <button
-                        className={`sd-nav-item sd-settings-nav ${currentView === 'settings' ? 'active' : ''}`}
-                        onClick={() => navigate('settings')}
-                    >
-                        <span className="material-symbols-outlined sd-nav-icon" style={currentView === 'settings' ? { fontVariationSettings: "'FILL' 1" } : {}}>settings</span>
-                        <span>Settings</span>
-                    </button>
                     <button
                         className="sd-new-scan-btn"
                         onClick={() => navigate('scans')}

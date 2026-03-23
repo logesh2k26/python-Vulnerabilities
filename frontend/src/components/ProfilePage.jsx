@@ -9,15 +9,13 @@ function ProfilePage({ user, onLogout }) {
         joined: "Mar '22" 
     }
 
-    const [apiKey, setApiKey] = useState('sk_live_51M0...9y7z2')
-    const [apiEnabled, setApiEnabled] = useState(true)
 
     return (
         <div className="ps-container">
             {/* Page Header */}
             <header className="ps-header">
-                <h1 className="ps-title">Profile Settings</h1>
-                <p className="ps-subtitle">Manage your cryptographic identity and access credentials.</p>
+                <h1 className="ps-title">Profile Info</h1>
+                <p className="ps-subtitle">Your identity and creator credentials.</p>
             </header>
 
             <div className="ps-layout">
@@ -81,10 +79,8 @@ function ProfilePage({ user, onLogout }) {
                                     <label className="ps-label">DISPLAY NAME</label>
                                     <input type="text" className="ps-input" defaultValue={displayUser.name} />
                                 </div>
-                                <div className="ps-field">
-                                    <label className="ps-label">JOB TITLE</label>
-                                    <input type="text" className="ps-input" defaultValue={displayUser.role} />
-                                </div>
+
+
                             </div>
 
                             <div className="ps-field ps-field-full">
@@ -95,33 +91,47 @@ function ProfilePage({ user, onLogout }) {
                                 </div>
                             </div>
 
-                            {/* API Access Section */}
-                            <div className="ps-api-section">
-                                <div className="ps-api-header">
-                                    <div className="ps-api-info">
-                                        <h4 className="ps-api-title">API Access</h4>
-                                        <p className="ps-api-desc">Allow third-party ledger integrations</p>
-                                    </div>
-                                    <label className="ps-switch">
-                                        <input 
-                                            type="checkbox" 
-                                            checked={apiEnabled} 
-                                            onChange={() => setApiEnabled(!apiEnabled)} 
-                                        />
-                                        <span className="ps-switch-slider"></span>
-                                    </label>
-                                </div>
-                                <div className="ps-api-key-wrap">
-                                    <code className="ps-api-key">{apiKey}</code>
-                                    <button className="ps-copy-btn">
-                                        <span className="material-symbols-outlined">content_copy</span>
-                                    </button>
-                                </div>
-                            </div>
+
 
                             <div className="ps-form-actions">
                                 <button className="ps-save-btn">Save Changes</button>
                                 <button className="ps-cancel-btn">Cancel</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            {/* Creator Info Section */}
+            <div className="ps-creator-section">
+                <div className="ps-card ps-creator-card">
+                    <div className="ps-details-header">
+                        <div className="ps-details-title-wrap">
+                            <span className="material-symbols-outlined ps-details-icon">person</span>
+                            <h3 className="ps-details-title">Creator Info</h3>
+                        </div>
+                    </div>
+                    <div className="ps-creator-content">
+                        <div className="ps-creator-avatar">
+                            <div className="ps-creator-img">
+                                <span className="ps-creator-initial">L</span>
+                            </div>
+                        </div>
+                        <div className="ps-creator-details">
+                            <span className="ps-creator-label">DESIGNED & BUILT BY</span>
+                            <h2 className="ps-creator-name">Logesh D</h2>
+                            <p className="ps-creator-quote">
+                                "We aren't just building software; we are crafting the digital infrastructure that keeps our collective data secure. Precision is not optional."
+                            </p>
+                            <div className="ps-creator-links">
+                                <a href="https://github.com/logesh2k26" target="_blank" rel="noopener noreferrer" className="ps-creator-link">
+                                    <span className="material-symbols-outlined">code</span>
+                                    <span>View GitHub</span>
+                                </a>
+                                <a href="https://www.linkedin.com/in/logesh-d-b9ba442aa/" target="_blank" rel="noopener noreferrer" className="ps-creator-link">
+                                    <span className="material-symbols-outlined">person_search</span>
+                                    <span>Connect on LinkedIn</span>
+                                </a>
                             </div>
                         </div>
                     </div>
@@ -502,6 +512,95 @@ function ProfilePage({ user, onLogout }) {
                 @media (max-width: 900px) {
                     .ps-layout { grid-template-columns: 1fr; }
                     .ps-form-grid { grid-template-columns: 1fr; }
+                }
+
+                /* Creator Info Section */
+                .ps-creator-section {
+                    margin-top: 32px;
+                    max-width: 1200px;
+                }
+                .ps-creator-card {
+                    padding: 32px;
+                }
+                .ps-creator-content {
+                    display: flex;
+                    gap: 32px;
+                    align-items: flex-start;
+                    margin-top: 24px;
+                }
+                .ps-creator-avatar {
+                    flex-shrink: 0;
+                }
+                .ps-creator-img {
+                    width: 80px;
+                    height: 80px;
+                    border-radius: 50%;
+                    background: linear-gradient(135deg, #4f46e5, #7c3aed);
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    box-shadow: 0 4px 20px rgba(79, 70, 229, 0.3);
+                }
+                .ps-creator-initial {
+                    font-size: 32px;
+                    font-weight: 800;
+                    color: #fff;
+                    font-family: 'Manrope', sans-serif;
+                }
+                .ps-creator-details {
+                    flex: 1;
+                }
+                .ps-creator-label {
+                    font-size: 11px;
+                    font-weight: 700;
+                    letter-spacing: 1.5px;
+                    color: #94a3b8;
+                    text-transform: uppercase;
+                }
+                .ps-creator-name {
+                    font-family: 'Manrope', sans-serif;
+                    font-size: 28px;
+                    font-weight: 800;
+                    color: #0f172a;
+                    margin: 6px 0 12px;
+                }
+                .ps-creator-quote {
+                    font-size: 14px;
+                    color: #64748b;
+                    line-height: 1.7;
+                    font-style: italic;
+                    margin: 0 0 20px;
+                    border-left: 3px solid #e2e8f0;
+                    padding-left: 16px;
+                }
+                .ps-creator-links {
+                    display: flex;
+                    gap: 12px;
+                }
+                .ps-creator-link {
+                    display: flex;
+                    align-items: center;
+                    gap: 8px;
+                    padding: 10px 20px;
+                    background: #f1f5f9;
+                    border-radius: 8px;
+                    color: #334155;
+                    text-decoration: none;
+                    font-size: 13px;
+                    font-weight: 600;
+                    transition: all 0.2s;
+                }
+                .ps-creator-link:hover {
+                    background: #4f46e5;
+                    color: #fff;
+                }
+                .ps-creator-link span.material-symbols-outlined {
+                    font-size: 18px;
+                }
+                @media (max-width: 600px) {
+                    .ps-creator-content { flex-direction: column; align-items: center; text-align: center; }
+                    .ps-creator-quote { border-left: none; padding-left: 0; }
+                    .ps-creator-links { justify-content: center; }
                 }
             `}</style>
         </div>

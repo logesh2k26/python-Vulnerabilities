@@ -86,10 +86,7 @@ function AIAssistantPage() {
                             Navigate the complexities of cybersecurity with an assistant that doesn't just find vulnerabilities—it explains their DNA and guides your recovery.
                         </p>
                     </div>
-                    <div className="ap-accuracy-block">
-                        <span className="ap-accuracy-val">99.8%</span>
-                        <span className="ap-accuracy-label">Accuracy Rating</span>
-                    </div>
+
                 </div>
             </section>
 
@@ -297,24 +294,7 @@ function AIAssistantPage() {
                     max-width: 580px;
                     line-height: 1.6;
                 }
-                .ap-accuracy-block {
-                    display: flex;
-                    flex-direction: column;
-                    align-items: flex-end;
-                }
-                .ap-accuracy-val {
-                    font-family: 'Manrope', sans-serif;
-                    font-size: 40px;
-                    font-weight: 800;
-                    color: #29343a;
-                }
-                .ap-accuracy-label {
-                    font-size: 11px;
-                    font-weight: 700;
-                    text-transform: uppercase;
-                    letter-spacing: 0.15em;
-                    color: #717c84;
-                }
+
 
                 /* Main Grid */
                 .ap-interface-grid {
