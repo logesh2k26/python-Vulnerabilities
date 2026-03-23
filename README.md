@@ -18,7 +18,22 @@ AI-powered security scanner for Python code using semantic AST embeddings and Gr
 
 ## Quick Start
 
-### Backend
+### 1. Environment Setup
+
+```bash
+# Copy the example env file and fill in your API keys
+cp .env.example .env
+cp backend/.env.example backend/.env
+```
+
+Edit the `.env` files and add your keys:
+- `GEMINI_API_KEY` — Google Gemini API key ([get one here](https://aistudio.google.com/apikey))
+- `OPENROUTER_API_KEY` — OpenRouter API key ([get one here](https://openrouter.ai/keys))
+- `API_SECRET_KEY` — Any strong random string for API authentication
+
+> ⚠️ **Never commit `.env` files** — they are excluded via `.gitignore`.
+
+### 2. Backend
 
 ```bash
 cd backend
@@ -26,7 +41,7 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
 ```
 
-### Frontend
+### 3. Frontend
 
 ```bash
 cd frontend

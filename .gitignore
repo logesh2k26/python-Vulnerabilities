@@ -74,6 +74,23 @@ backend/training/dummy_model.pt
 backend/data/raw/
 
 # ==========================================
+# Temp output files
+# ==========================================
+backend/out.txt
+backend/test_out.txt
+backend/test_output.txt
+backend/test_result.txt
+backend/pentest_result.txt
+backend/stress_result.txt
+backend/models.txt
+
+# ==========================================
+# IDE & Agent config
+# ==========================================
+.gemini/
+.antigravityignore
+
+# ==========================================
 # Preserve important files
 # ==========================================
 !backend/requirements.txt

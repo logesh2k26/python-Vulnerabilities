@@ -1,29 +1,27 @@
-import React, { useState, useEffect, useCallback } from 'react'
+import React, { useState, useCallback, useEffect } from 'react'
 
 const DEFAULT_SETTINGS = {
-    darkMode: true,
-    autoScan: false,
+    displayName: 'Admin User',
+    jobTitle: 'Security Architect',
+    email: 'admin@pyvulndetect.io',
+    autoScan: true,
     notifications: true,
-    apiKey: '',
-    scanDepth: 'deep',
-    maxFileSize: 500,
-    showMinimap: true,
+    pushAlerts: true,
+    emailDigests: true,
+    scanDepth: 'standard',
+    darkMode: false,
     fontSize: 14,
 }
 
 function loadSettings() {
     try {
         const stored = localStorage.getItem('pyvuln_settings')
-        if (stored) {
-            return { ...DEFAULT_SETTINGS, ...JSON.parse(stored) }
-        }
-    } catch (e) {
-        console.warn('Failed to load settings:', e)
-    }
+        if (stored) return { ...DEFAULT_SETTINGS, ...JSON.parse(stored) }
+    } catch (e) { console.warn('Failed to load settings:', e) }
     return { ...DEFAULT_SETTINGS }
 }
 
-function saveSettings(settings) {
+function saveSettingsToStorage(settings) {
     try {
         localStorage.setItem('pyvuln_settings', JSON.stringify(settings))
         return true
@@ -33,9 +31,31 @@ function saveSettings(settings) {
     }
 }
 
-function SettingsPage() {
+function SettingsPage({ onNavigate }) {
     const [settings, setSettings] = useState(loadSettings)
+    const [activeSection, setActiveSection] = useState('appearance')
     const [toast, setToast] = useState(null)
+
+    // Apply dark mode in real-time
+    useEffect(() => {
+        const root = document.documentElement
+        if (settings.darkMode) {
+            root.classList.add('dark-mode')
+        } else {
+            root.classList.remove('dark-mode')
+        }
+    }, [settings.darkMode])
+
+    // Apply font size in real-time (only to content area)
+    useEffect(() => {
+        const content = document.querySelector('.sd-content')
+        if (content) {
+            content.style.fontSize = settings.fontSize + 'px'
+        }
+        return () => {
+            if (content) content.style.fontSize = ''
+        }
+    }, [settings.fontSize])
 
     const showToast = useCallback((msg, type = 'success') => {
         setToast({ msg, type })
@@ -43,279 +63,563 @@ function SettingsPage() {
     }, [])
 
     const update = useCallback((key, value) => {
-        setSettings(prev => {
-            const next = { ...prev, [key]: value }
-            if (saveSettings(next)) {
-                showToast('Settings saved')
-            } else {
-                showToast('Failed to save', 'error')
-            }
-            return next
-        })
+        setSettings(prev => ({ ...prev, [key]: value }))
+    }, [])
+
+    const handleSave = useCallback(() => {
+        if (saveSettingsToStorage(settings)) {
+            showToast('Preferences saved successfully')
+        } else {
+            showToast('Failed to save preferences', 'error')
+        }
+    }, [settings, showToast])
+
+    const handleDiscard = useCallback(() => {
+        setSettings(loadSettings())
+        showToast('Changes discarded')
     }, [showToast])
 
-    const resetDefaults = useCallback(() => {
-        setSettings({ ...DEFAULT_SETTINGS })
-        if (saveSettings(DEFAULT_SETTINGS)) {
-            showToast('Reset to defaults')
-        }
-    }, [showToast])
+    const sections = [
+        { id: 'appearance', label: 'Appearance' },
+        { id: 'analysis', label: 'Analysis Engine' },
+        { id: 'notifications', label: 'Notifications' },
+        { id: 'privacy', label: 'Privacy & Vault' },
+        { id: 'advanced', label: 'Advanced Ledger' },
+    ]
 
     return (
-        <div className="page-container">
-            <div className="page-header">
-                <h1 className="page-title">⚙️ Settings</h1>
-                <p className="page-subtitle">Configure your scanning preferences</p>
-            </div>
+        <div className="st-container">
+            {/* Page Header */}
+            <header className="st-header">
+                <h2 className="st-title">Settings</h2>
+                <p className="st-subtitle">Manage your architectural security preferences and environment.</p>
+            </header>
 
-            <div className="st-sections">
-                {/* Appearance */}
-                <section className="glass-card st-section">
-                    <h3 className="st-section-title">🎨 Appearance</h3>
-                    <ToggleRow label="Dark Mode" desc="Use dark cosmic theme" checked={settings.darkMode} onToggle={() => update('darkMode', !settings.darkMode)} />
-                    <ToggleRow label="Show Minimap" desc="Show code minimap in editor" checked={settings.showMinimap} onToggle={() => update('showMinimap', !settings.showMinimap)} />
-                    <RangeRow label="Font Size" desc="Code editor font size" value={settings.fontSize} min={10} max={24} onChange={v => update('fontSize', v)} />
-                </section>
+            <div className="st-layout">
+                {/* Internal Navigation Column */}
+                <div className="st-nav-col">
+                    <nav className="st-nav">
+                        {sections.map(s => (
+                            <button
+                                key={s.id}
+                                className={`st-nav-item ${activeSection === s.id ? 'active' : ''}`}
+                                onClick={() => setActiveSection(s.id)}
+                            >
+                                {s.label}
+                            </button>
+                        ))}
+                        {/* App Info Link moved inside sticky nav */}
+                        <button
+                            className="st-appinfo-btn"
+                            onClick={() => onNavigate && onNavigate('appinfo')}
+                        >
+                            <span className="material-symbols-outlined">info</span>
+                            App Information
+                        </button>
+                    </nav>
+                </div>
 
-                {/* Analysis */}
-                <section className="glass-card st-section">
-                    <h3 className="st-section-title">🔬 Analysis</h3>
-                    <ToggleRow label="Auto-Scan on Paste" desc="Automatically scan when code is pasted" checked={settings.autoScan} onToggle={() => update('autoScan', !settings.autoScan)} />
-                    <SelectRow
-                        label="Scan Depth"
-                        desc="How thorough the analysis should be"
-                        value={settings.scanDepth}
-                        options={[
-                            { value: 'quick', label: 'Quick — AST only' },
-                            { value: 'deep', label: 'Deep — AST + GNN' },
-                            { value: 'full', label: 'Full — AST + GNN + Taint' },
-                        ]}
-                        onChange={v => update('scanDepth', v)}
-                    />
-                    <RangeRow label="Max File Size" desc="Maximum file size in KB" value={settings.maxFileSize} min={100} max={2000} step={100} onChange={v => update('maxFileSize', v)} />
-                </section>
-
-                {/* Notifications */}
-                <section className="glass-card st-section">
-                    <h3 className="st-section-title">🔔 Notifications</h3>
-                    <ToggleRow label="Enable Notifications" desc="Get alerts for critical vulnerabilities" checked={settings.notifications} onToggle={() => update('notifications', !settings.notifications)} />
-                </section>
-
-                {/* API */}
-                <section className="glass-card st-section">
-                    <h3 className="st-section-title">🔑 API Configuration</h3>
-                    <div className="st-row">
-                        <div className="st-info">
-                            <span className="st-label">API Key</span>
-                            <span className="st-desc">Backend authentication key</span>
+                {/* Settings Forms Column */}
+                <div className="st-forms-col">
+                    {/* Appearance Section */}
+                    <section className="st-card">
+                        <div className="st-card-header">
+                            <span className="material-symbols-outlined st-card-icon">palette</span>
+                            <h3 className="st-card-title">Appearance</h3>
                         </div>
-                        <input
-                            type="password"
-                            className="st-text-input"
-                            value={settings.apiKey}
-                            onChange={e => update('apiKey', e.target.value)}
-                        />
-                    </div>
-                </section>
+                        <div className="st-card-body">
+                            {/* Dark Mode Toggle */}
+                            <div className="st-row">
+                                <div className="st-row-info">
+                                    <p className="st-row-label">Dark Mode</p>
+                                    <p className="st-row-desc">Switch to a low-light interface for nightly audits.</p>
+                                </div>
+                                <label className="st-switch">
+                                    <input
+                                        type="checkbox"
+                                        checked={settings.darkMode}
+                                        onChange={() => update('darkMode', !settings.darkMode)}
+                                    />
+                                    <span className="st-switch-slider"></span>
+                                </label>
+                            </div>
 
-                {/* Actions */}
-                <div className="st-actions">
-                    <button className="st-reset-btn" onClick={resetDefaults}>↺ Reset to Defaults</button>
+                            {/* Font Size Slider */}
+                            <div className="st-slider-block">
+                                <div className="st-slider-header">
+                                    <div>
+                                        <p className="st-row-label">Interface Scale</p>
+                                        <p className="st-row-desc">Adjust text size for optimal ledger readability.</p>
+                                    </div>
+                                    <span className="st-slider-badge">{settings.fontSize}PX (DEFAULT)</span>
+                                </div>
+                                <input
+                                    type="range"
+                                    min="12"
+                                    max="20"
+                                    value={settings.fontSize}
+                                    onChange={e => update('fontSize', parseInt(e.target.value))}
+                                    className="st-range"
+                                />
+                                <div className="st-range-labels">
+                                    <span>COMPACT</span>
+                                    <span>EXPANDED</span>
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+
+                    {/* Analysis Engine Section */}
+                    <section className="st-card">
+                        <div className="st-card-header">
+                            <span className="material-symbols-outlined st-card-icon">analytics</span>
+                            <h3 className="st-card-title">Analysis Engine</h3>
+                        </div>
+                        <div className="st-card-body">
+                            {/* Auto Scan Toggle */}
+                            <div className="st-row">
+                                <div className="st-row-info">
+                                    <p className="st-row-label">Auto-Scan Incoming Triggers</p>
+                                    <p className="st-row-desc">Perform background checks on every detected activity.</p>
+                                </div>
+                                <label className="st-switch">
+                                    <input
+                                        type="checkbox"
+                                        checked={settings.autoScan}
+                                        onChange={() => update('autoScan', !settings.autoScan)}
+                                    />
+                                    <span className="st-switch-slider"></span>
+                                </label>
+                            </div>
+
+                            {/* Scan Depth Dropdown */}
+                            <div className="st-select-block">
+                                <label className="st-row-label">Scan Depth</label>
+                                <div className="st-select-wrap">
+                                    <select
+                                        className="st-select"
+                                        value={settings.scanDepth}
+                                        onChange={e => update('scanDepth', e.target.value)}
+                                    >
+                                        <option value="surface">Surface Audit (Fast)</option>
+                                        <option value="standard">Standard Architectural Review (Recommended)</option>
+                                        <option value="deep">Deep Ledger Analysis (Intensive)</option>
+                                    </select>
+                                    <span className="material-symbols-outlined st-select-arrow">expand_more</span>
+                                </div>
+                                <p className="st-select-hint">Intensive scans may impact performance during high-traffic sessions.</p>
+                            </div>
+                        </div>
+                    </section>
+
+                    {/* Notifications Section */}
+                    <section className="st-card">
+                        <div className="st-card-header">
+                            <span className="material-symbols-outlined st-card-icon" style={{ fontVariationSettings: "'FILL' 1" }}>notifications_active</span>
+                            <h3 className="st-card-title">Notifications</h3>
+                        </div>
+                        <div className="st-notif-grid">
+                            <div className="st-notif-card" onClick={() => update('emailDigests', !settings.emailDigests)}>
+                                <div className="st-notif-top">
+                                    <div className="st-notif-label">
+                                        <span className="material-symbols-outlined st-notif-icon">mail</span>
+                                        <span className="st-notif-name">Email Digests</span>
+                                    </div>
+                                    <input type="checkbox" checked={settings.emailDigests} readOnly className="st-checkbox" />
+                                </div>
+                                <p className="st-notif-desc">Weekly summaries of your ledger's health and detected anomalies.</p>
+                            </div>
+                            <div className="st-notif-card" onClick={() => update('pushAlerts', !settings.pushAlerts)}>
+                                <div className="st-notif-top">
+                                    <div className="st-notif-label">
+                                        <span className="material-symbols-outlined st-notif-icon">smartphone</span>
+                                        <span className="st-notif-name">Push Alerts</span>
+                                    </div>
+                                    <input type="checkbox" checked={settings.pushAlerts} readOnly className="st-checkbox" />
+                                </div>
+                                <p className="st-notif-desc">Immediate mobile notifications for critical security events.</p>
+                            </div>
+                        </div>
+                    </section>
+
+                    {/* Footer Actions */}
+                    <div className="st-actions">
+                        <button className="st-discard-btn" onClick={handleDiscard}>Discard Changes</button>
+                        <button className="st-save-btn" onClick={handleSave}>Save Preferences</button>
+                    </div>
                 </div>
             </div>
 
             {/* Toast */}
             {toast && (
-                <div className={`st-toast ${toast.type}`}>
+                <div className={`st-toast st-toast-${toast.type}`}>
                     {toast.type === 'success' ? '✓' : '✕'} {toast.msg}
                 </div>
             )}
 
             <style>{`
-                .st-sections {
-                    display: flex;
-                    flex-direction: column;
-                    gap: 18px;
-                    max-width: 680px;
-                }
-                .st-section {
-                    padding: 24px 28px;
-                }
-                .st-section-title {
-                    font-family: var(--font-heading);
-                    font-size: 15px;
-                    font-weight: 600;
-                    color: var(--text-primary);
-                    margin: 0 0 18px;
-                    padding-bottom: 12px;
-                    border-bottom: 1px solid rgba(130, 120, 200, 0.08);
+                .st-container {
+                    max-width: 1100px;
+                    margin: 0 auto;
+                    padding: 48px 48px 80px;
                 }
 
+                /* Header */
+                .st-header { margin-bottom: 48px; }
+                .st-title {
+                    font-family: 'Manrope', sans-serif;
+                    font-size: 40px;
+                    font-weight: 900;
+                    letter-spacing: -0.03em;
+                    color: #29343a;
+                    margin: 0 0 8px;
+                }
+                .st-subtitle {
+                    font-size: 15px;
+                    color: #566168;
+                    margin: 0;
+                }
+
+                /* Layout */
+                .st-layout {
+                    display: grid;
+                    grid-template-columns: 220px 1fr;
+                    gap: 40px;
+                }
+                @media (max-width: 900px) {
+                    .st-layout { grid-template-columns: 1fr; }
+                }
+
+                /* Nav Column */
+                .st-nav-col {
+                    display: flex;
+                    flex-direction: column;
+                    gap: 24px;
+                }
+                .st-nav {
+                    position: sticky;
+                    top: 100px;
+                    display: flex;
+                    flex-direction: column;
+                    gap: 4px;
+                }
+                .st-nav-item {
+                    padding: 10px 16px;
+                    background: none;
+                    border: none;
+                    text-align: left;
+                    font-size: 14px;
+                    font-weight: 500;
+                    color: #566168;
+                    border-radius: 10px;
+                    cursor: pointer;
+                    transition: all 0.15s;
+                }
+                .st-nav-item:hover { background: #e8eff4; }
+                .st-nav-item.active {
+                    background: #d9e4ec;
+                    color: #4c56af;
+                    font-weight: 700;
+                }
+
+                .st-appinfo-btn {
+                    display: flex;
+                    align-items: center;
+                    gap: 10px;
+                    padding: 12px 16px;
+                    background: none;
+                    border: 1px solid rgba(168,179,187,0.15);
+                    border-radius: 12px;
+                    font-size: 13px;
+                    font-weight: 600;
+                    color: #566168;
+                    cursor: pointer;
+                    transition: all 0.2s;
+                    margin-top: 24px;
+                }
+                .st-appinfo-btn:hover {
+                    background: #f0f4f8;
+                    border-color: #4c56af;
+                    color: #4c56af;
+                }
+                .st-appinfo-btn .material-symbols-outlined {
+                    font-size: 20px;
+                }
+
+                /* Forms Column */
+                .st-forms-col {
+                    display: flex;
+                    flex-direction: column;
+                    gap: 28px;
+                }
+
+                /* Card */
+                .st-card {
+                    background: #fff;
+                    border-radius: 16px;
+                    padding: 32px;
+                    box-shadow: 0 4px 24px -8px rgba(0,0,0,0.04);
+                }
+                .st-card-header {
+                    display: flex;
+                    align-items: center;
+                    gap: 12px;
+                    margin-bottom: 28px;
+                }
+                .st-card-icon {
+                    color: #4c56af;
+                    font-size: 24px;
+                }
+                .st-card-title {
+                    font-family: 'Manrope', sans-serif;
+                    font-size: 20px;
+                    font-weight: 800;
+                    color: #29343a;
+                    margin: 0;
+                }
+
+                .st-card-body {
+                    display: flex;
+                    flex-direction: column;
+                    gap: 28px;
+                }
+
+                /* Row (Toggle) */
                 .st-row {
                     display: flex;
                     justify-content: space-between;
                     align-items: center;
-                    padding: 14px 0;
-                    gap: 16px;
                 }
-                .st-row + .st-row {
-                    border-top: 1px solid rgba(130, 120, 200, 0.04);
-                }
-                .st-info {
+                .st-row-info {
                     display: flex;
                     flex-direction: column;
-                    gap: 3px;
-                    flex: 1;
-                    min-width: 0;
+                    gap: 2px;
                 }
-                .st-label {
-                    font-size: 14px;
-                    font-weight: 500;
-                    color: var(--text-primary);
+                .st-row-label {
+                    font-size: 15px;
+                    font-weight: 600;
+                    color: #29343a;
+                    margin: 0;
                 }
-                .st-desc {
-                    font-size: 12px;
-                    color: var(--text-muted);
+                .st-row-desc {
+                    font-size: 13px;
+                    color: #566168;
+                    margin: 0;
                 }
 
                 /* Toggle Switch */
-                .st-toggle {
-                    width: 48px;
-                    height: 26px;
-                    border-radius: 13px;
-                    border: none;
-                    cursor: pointer;
+                .st-switch {
                     position: relative;
-                    transition: all 0.35s cubic-bezier(0.22, 1, 0.36, 1);
-                    flex-shrink: 0;
-                    outline: none;
+                    display: inline-flex;
+                    align-items: center;
+                    cursor: pointer;
                 }
-                .st-toggle[data-on="true"] {
-                    background: linear-gradient(135deg, var(--neon-cyan), var(--neon-violet));
-                    box-shadow: 0 0 14px rgba(34, 211, 238, 0.2);
+                .st-switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+                .st-switch-slider {
+                    width: 44px;
+                    height: 24px;
+                    background: #d9e4ec;
+                    border-radius: 12px;
+                    position: relative;
+                    transition: background 0.3s;
                 }
-                .st-toggle[data-on="false"] {
-                    background: rgba(130, 120, 200, 0.15);
-                }
-                .st-toggle::after {
+                .st-switch-slider::after {
                     content: '';
                     position: absolute;
-                    top: 3px;
+                    top: 2px;
+                    left: 2px;
                     width: 20px;
                     height: 20px;
                     border-radius: 50%;
-                    background: white;
-                    transition: all 0.35s cubic-bezier(0.22, 1, 0.36, 1);
-                    box-shadow: 0 2px 6px rgba(0,0,0,0.25);
+                    background: #fff;
+                    border: 1px solid rgba(0,0,0,0.08);
+                    transition: transform 0.3s;
+                    box-shadow: 0 1px 3px rgba(0,0,0,0.12);
                 }
-                .st-toggle[data-on="true"]::after { left: 25px; }
-                .st-toggle[data-on="false"]::after { left: 3px; }
-                .st-toggle:hover {
-                    filter: brightness(1.1);
+                .st-switch input:checked + .st-switch-slider {
+                    background: #4c56af;
                 }
-
-                /* Select */
-                .st-select {
-                    background: rgba(255, 255, 255, 0.04);
-                    border: 1px solid rgba(130, 120, 200, 0.12);
-                    border-radius: 12px;
-                    padding: 9px 14px;
-                    color: var(--text-primary);
-                    font-family: var(--font-main);
-                    font-size: 13px;
-                    outline: none;
-                    cursor: pointer;
-                    appearance: none;
-                    min-width: 180px;
-                    transition: all 0.25s;
-                }
-                .st-select:focus {
-                    border-color: rgba(34, 211, 238, 0.3);
-                    box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.06);
-                }
-                .st-select option {
-                    background: #12101e;
-                    color: var(--text-primary);
+                .st-switch input:checked + .st-switch-slider::after {
+                    transform: translateX(20px);
                 }
 
-                /* Text Input */
-                .st-text-input {
-                    background: rgba(255, 255, 255, 0.04);
-                    border: 1px solid rgba(130, 120, 200, 0.12);
-                    border-radius: 12px;
-                    padding: 9px 14px;
-                    color: var(--text-primary);
-                    font-family: var(--font-code);
-                    font-size: 13px;
-                    outline: none;
-                    width: 260px;
-                    transition: all 0.25s;
-                }
-                .st-text-input:focus {
-                    border-color: rgba(34, 211, 238, 0.3);
-                    box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.06);
-                }
-
-                /* Range */
-                .st-range-wrap {
+                /* Slider */
+                .st-slider-block {
                     display: flex;
-                    align-items: center;
-                    gap: 14px;
-                    flex-shrink: 0;
+                    flex-direction: column;
+                    gap: 16px;
+                }
+                .st-slider-header {
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: flex-end;
+                }
+                .st-slider-badge {
+                    font-size: 11px;
+                    font-weight: 800;
+                    color: #4c56af;
+                    padding: 4px 10px;
+                    background: #e0e0ff;
+                    border-radius: 6px;
+                    letter-spacing: 0.04em;
                 }
                 .st-range {
-                    -webkit-appearance: none;
-                    appearance: none;
-                    width: 140px;
-                    height: 5px;
+                    width: 100%;
+                    height: 6px;
+                    background: #e1e9f0;
                     border-radius: 3px;
-                    background: rgba(130, 120, 200, 0.15);
+                    appearance: none;
+                    cursor: pointer;
                     outline: none;
                 }
                 .st-range::-webkit-slider-thumb {
-                    -webkit-appearance: none;
+                    appearance: none;
                     width: 18px;
                     height: 18px;
                     border-radius: 50%;
-                    background: var(--neon-cyan);
+                    background: #4c56af;
+                    box-shadow: 0 2px 6px rgba(76,86,175,0.3);
                     cursor: pointer;
-                    box-shadow: 0 0 10px rgba(34, 211, 238, 0.25);
-                    transition: transform 0.2s;
                 }
-                .st-range::-webkit-slider-thumb:hover {
-                    transform: scale(1.2);
+                .st-range-labels {
+                    display: flex;
+                    justify-content: space-between;
+                    font-size: 10px;
+                    font-weight: 800;
+                    color: #717c84;
+                    letter-spacing: 0.15em;
+                    text-transform: uppercase;
                 }
-                .st-range-val {
-                    font-family: var(--font-code);
-                    font-size: 13px;
-                    color: var(--neon-cyan);
-                    min-width: 36px;
-                    text-align: right;
-                    font-weight: 500;
+
+                /* Select */
+                .st-select-block {
+                    display: flex;
+                    flex-direction: column;
+                    gap: 8px;
+                }
+                .st-select-wrap {
+                    position: relative;
+                }
+                .st-select {
+                    width: 100%;
+                    background: #fff;
+                    border: 1px solid rgba(168,179,187,0.2);
+                    border-radius: 12px;
+                    padding: 14px 44px 14px 16px;
+                    font-size: 14px;
+                    color: #29343a;
+                    outline: none;
+                    appearance: none;
+                    cursor: pointer;
+                    font-family: 'Inter', sans-serif;
+                    transition: border-color 0.2s;
+                }
+                .st-select:focus {
+                    border-color: #4c56af;
+                    box-shadow: 0 0 0 3px rgba(76,86,175,0.08);
+                }
+                .st-select-arrow {
+                    position: absolute;
+                    right: 14px;
+                    top: 50%;
+                    transform: translateY(-50%);
+                    color: #717c84;
+                    pointer-events: none;
+                    font-size: 20px;
+                }
+                .st-select-hint {
+                    font-size: 12px;
+                    color: #566168;
+                    font-style: italic;
+                    margin: 0;
+                }
+
+                /* Notifications Grid */
+                .st-notif-grid {
+                    display: grid;
+                    grid-template-columns: 1fr 1fr;
+                    gap: 16px;
+                    padding: 0;
+                }
+                .st-notif-card {
+                    padding: 20px;
+                    border: 1px solid rgba(168,179,187,0.1);
+                    border-radius: 14px;
+                    background: #f7f9fc;
+                    cursor: pointer;
+                    transition: all 0.2s;
+                }
+                .st-notif-card:hover { background: #f0f4f8; }
+                .st-notif-top {
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: flex-start;
+                    margin-bottom: 10px;
+                }
+                .st-notif-label {
+                    display: flex;
+                    align-items: center;
+                    gap: 10px;
+                }
+                .st-notif-icon {
+                    color: #4c56af;
+                    font-size: 22px;
+                }
+                .st-notif-name {
+                    font-size: 14px;
+                    font-weight: 700;
+                    color: #29343a;
+                }
+                .st-notif-desc {
+                    font-size: 12px;
+                    color: #566168;
+                    margin: 0;
+                    line-height: 1.5;
+                }
+                .st-checkbox {
+                    width: 18px;
+                    height: 18px;
+                    border-radius: 4px;
+                    accent-color: #4c56af;
+                    cursor: pointer;
                 }
 
                 /* Actions */
                 .st-actions {
                     display: flex;
                     justify-content: flex-end;
+                    gap: 12px;
+                    padding-top: 12px;
                 }
-                .st-reset-btn {
-                    padding: 11px 24px;
-                    border: 1px solid rgba(251, 146, 60, 0.2);
-                    border-radius: 14px;
-                    background: rgba(251, 146, 60, 0.06);
-                    color: var(--neon-orange);
-                    font-family: var(--font-main);
-                    font-size: 13px;
-                    font-weight: 500;
+                .st-discard-btn {
+                    padding: 12px 24px;
+                    background: none;
+                    border: none;
+                    color: #566168;
+                    font-size: 14px;
+                    font-weight: 600;
                     cursor: pointer;
-                    transition: all 0.25s;
+                    border-radius: 12px;
+                    transition: background 0.15s;
                 }
-                .st-reset-btn:hover {
-                    background: rgba(251, 146, 60, 0.12);
-                    box-shadow: 0 0 16px rgba(251, 146, 60, 0.08);
-                    transform: translateY(-1px);
+                .st-discard-btn:hover { background: #e8eff4; }
+                .st-save-btn {
+                    padding: 12px 32px;
+                    background: #4c56af;
+                    color: #f9f6ff;
+                    border: none;
+                    border-radius: 12px;
+                    font-size: 14px;
+                    font-weight: 700;
+                    cursor: pointer;
+                    box-shadow: 0 4px 16px rgba(76,86,175,0.2);
+                    transition: all 0.2s;
                 }
+                .st-save-btn:hover {
+                    background: #4049a2;
+                    box-shadow: 0 6px 20px rgba(76,86,175,0.3);
+                }
+                .st-save-btn:active { transform: scale(0.97); }
 
                 /* Toast */
                 .st-toast {
@@ -326,86 +630,18 @@ function SettingsPage() {
                     padding: 12px 28px;
                     border-radius: 14px;
                     font-size: 14px;
-                    font-weight: 500;
-                    backdrop-filter: blur(20px);
-                    -webkit-backdrop-filter: blur(20px);
-                    box-shadow: 0 8px 32px rgba(0,0,0,0.35);
+                    font-weight: 600;
                     z-index: 9000;
-                    animation: st-toast-in 0.4s cubic-bezier(0.22, 1, 0.36, 1);
+                    animation: st-fade-in 0.35s ease;
+                    box-shadow: 0 4px 16px rgba(0,0,0,0.12);
                 }
-                .st-toast.success {
-                    background: rgba(74, 222, 128, 0.1);
-                    border: 1px solid rgba(74, 222, 128, 0.2);
-                    color: var(--neon-green);
-                }
-                .st-toast.error {
-                    background: rgba(248, 113, 113, 0.1);
-                    border: 1px solid rgba(248, 113, 113, 0.2);
-                    color: var(--neon-red);
-                }
-                @keyframes st-toast-in {
-                    from { transform: translateX(-50%) translateY(20px); opacity: 0; }
+                .st-toast-success { background: #fff; color: #16a34a; border: 1px solid rgba(22,163,74,0.2); }
+                .st-toast-error { background: #fff; color: #9f403d; border: 1px solid rgba(159,64,61,0.2); }
+                @keyframes st-fade-in {
+                    from { transform: translateX(-50%) translateY(16px); opacity: 0; }
                     to { transform: translateX(-50%) translateY(0); opacity: 1; }
                 }
             `}</style>
-        </div>
-    )
-}
-
-// ── Sub-components ──
-
-function ToggleRow({ label, desc, checked, onToggle }) {
-    return (
-        <div className="st-row">
-            <div className="st-info">
-                <span className="st-label">{label}</span>
-                <span className="st-desc">{desc}</span>
-            </div>
-            <button
-                className="st-toggle"
-                data-on={String(!!checked)}
-                onClick={onToggle}
-                role="switch"
-                aria-checked={checked}
-                aria-label={label}
-            />
-        </div>
-    )
-}
-
-function SelectRow({ label, desc, value, options, onChange }) {
-    return (
-        <div className="st-row">
-            <div className="st-info">
-                <span className="st-label">{label}</span>
-                <span className="st-desc">{desc}</span>
-            </div>
-            <select className="st-select" value={value} onChange={e => onChange(e.target.value)}>
-                {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-            </select>
-        </div>
-    )
-}
-
-function RangeRow({ label, desc, value, min, max, step = 1, onChange }) {
-    return (
-        <div className="st-row">
-            <div className="st-info">
-                <span className="st-label">{label}</span>
-                <span className="st-desc">{desc}</span>
-            </div>
-            <div className="st-range-wrap">
-                <input
-                    type="range"
-                    className="st-range"
-                    min={min}
-                    max={max}
-                    step={step}
-                    value={value}
-                    onChange={e => onChange(Number(e.target.value))}
-                />
-                <span className="st-range-val">{value}</span>
-            </div>
         </div>
     )
 }
