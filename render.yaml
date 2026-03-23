@@ -1,14 +1,13 @@
 services:
   - type: web
     name: python-vulnerability-detector-backend
-    env: docker
+    env: python
     plan: free
     region: ohio
-    dockerContext: backend
-    dockerfilePath: Dockerfile
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port 10000
+    rootDir: backend
     envVars:
-      - key: PORT
-        value: 8000
       - key: GEMINI_API_KEY
         sync: false
       - key: OPENROUTER_API_KEY
