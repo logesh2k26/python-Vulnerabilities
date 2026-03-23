@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: python-vulnerability-detector-backend
+    env: docker
+    plan: free
+    region: ohio
+    dockerContext: backend
+    dockerfilePath: backend/Dockerfile
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: API_SECRET_KEY
+        sync: false

@@ -1,0 +1,15 @@
+.venv
+__pycache__
+*.pyc
+.env
+.pytest_cache
+tests
+data
+pretrained
+training
+out.txt
+pentest_result.txt
+stress_result.txt
+test_out.txt
+test_output.txt
+test_result.txt
