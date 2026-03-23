@@ -12,6 +12,7 @@ import FloatingChatBot from './components/FloatingChatBot'
 import './index.css'
 
 // API key for backend authentication
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api/v1'
 const API_KEY = import.meta.env.VITE_API_KEY || ''
 
 function App() {
@@ -82,7 +83,7 @@ function App() {
         setError(null)
 
         try {
-            const response = await fetch('/api/v1/analyze', {
+            const response = await fetch(`${API_BASE_URL}/analyze`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'X-API-Key': API_KEY },
                 body: JSON.stringify({ content: code, filename })
@@ -117,7 +118,7 @@ function App() {
         )
 
         try {
-            const response = await fetch('/api/v1/analyze/batch', {
+            const response = await fetch(`${API_BASE_URL}/analyze/batch`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'X-API-Key': API_KEY },
                 body: JSON.stringify({ files: fileContents })
