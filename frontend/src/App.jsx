@@ -5,7 +5,7 @@ import ScansPage from './components/ScansPage'
 import ReportsPage from './components/ReportsPage'
 
 import ProfilePage from './components/ProfilePage'
-import AIAssistantPage from './components/AIAssistantPage'
+
 import LoginPage from './components/LoginPage'
 
 import FloatingChatBot from './components/FloatingChatBot'
@@ -181,8 +181,7 @@ function App() {
 
             case 'profile':
                 return <ProfilePage user={user} onLogout={handleLogout} />
-            case 'ai':
-                return <AIAssistantPage />
+
 
             default:
                 return null
@@ -193,7 +192,7 @@ function App() {
     const navItems = [
         { id: 'dashboard', label: 'Dashboard', icon: 'dashboard' },
         { id: 'scans', label: 'Scan Code', icon: 'qr_code_scanner' },
-        { id: 'ai', label: 'AI Assistant', icon: 'auto_awesome' },
+
         { id: 'history', label: 'History', icon: 'history' },
         { id: 'reports', label: 'Reports', icon: 'assessment' },
     ]
