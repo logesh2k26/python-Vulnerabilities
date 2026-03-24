@@ -147,9 +147,9 @@ function ProfilePage({ user, onLogout }) {
                     <span className="material-symbols-outlined">public</span>
                     <span>IP: 192.168.1.104</span>
                 </div>
-                <button className="ps-deactivate-btn">
+                <button className="ps-deactivate-btn" onClick={onLogout}>
                     <span className="material-symbols-outlined">logout</span>
-                    Deactivate Account
+                    Logout
                 </button>
             </footer>
 
