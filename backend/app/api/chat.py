@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["chat"])
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL_NAME = "google/gemini-2.0-flash-001"
+MODEL_NAME = "google/gemini-2.5-flash"
 
 SYSTEM_PROMPT = """You are an expert cybersecurity analyst embedded in a Python vulnerability detection tool. 
 You help developers understand security vulnerabilities found in their code.
@@ -134,6 +134,7 @@ async def _call_openrouter(messages: list) -> str:
     body = {
         "model": MODEL_NAME,
         "messages": messages,
+        "max_tokens": 2000,
     }
 
     async with httpx.AsyncClient(timeout=60.0) as client:
