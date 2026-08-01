@@ -1,4 +1,4 @@
-# Python Vulnerability Detector  # #UNDER WORKING   # ITS NOT COMPLETED YET
+# Python Vulnerability Detector # Fully completed # 
 
 AI-powered security scanner for Python code using semantic AST embeddings and Graph Neural Networks.
 
